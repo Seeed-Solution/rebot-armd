@@ -164,3 +164,52 @@ fn repeated_texture_along_the_epipolar_lines_is_rejected_as_ambiguous() {
     assert!(rec.stats.ambiguous > rec.stats.features / 2, "{:?}", rec.stats);
     assert!(bad * 10 <= rec.stats.features.max(1), "{bad} false points: {:?}", rec.stats);
 }
+
+/// Compute time of one measurement (3 and 5 views) and of a 640x640 snapshot decode. On the
+/// host: `cargo test --release --test test_mview_stereo bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_compute_and_decode() {
+    let b = BoxObj { xy: [0.30, 0.01], yaw: 0.3, size: [0.05, 0.03, 0.04] };
+    let scene = Scene::new(0.0, vec![b]);
+    let pivot = [0.30, 0.01, 0.02];
+    let el = 55f64.to_radians();
+    let cam0 = render::look_at([pivot[0] - 0.35 * el.cos(), pivot[1], pivot[2] + 0.35 * el.sin()], pivot, FX, SIZE);
+    for n in [3usize, 5] {
+        let offsets = armd::measure_multiview::view_offsets(n, 0.08);
+        let views: Vec<View> = offsets.iter().enumerate().map(|(i, &o)| {
+            let cam = render::orbit(&cam0, pivot, o);
+            View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 90 + i as u64), cam }
+        }).collect();
+        let reference = n / 2;
+        let bx = render::box_px(&scene, &b, &views[reference].cam);
+        let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
+        let region = [bx[0] - 0.5 * w - 16.0, bx[1] - 0.5 * h - 16.0, bx[2] + 0.5 * w + 16.0, bx[3] + 0.5 * h + 16.0];
+        let p = Params::new(0.0);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let rec = mview_stereo::reconstruct(&views, reference, region, bx, &p);
+            let m = mview_stereo::measure(&rec.points, &p).unwrap();
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert!((m.height_m - 0.04).abs() < 0.002);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("{n} views: compute median {:.1} ms (min {:.1}, max {:.1})", times[2], times[0], times[4]);
+    }
+    // snapshot decode: the frame letterboxed into 640x640, JPEG quality 90
+    let img = render::render(&scene, &cam0, 640, 360, 1, Noise { sigma: 2.0, ..Noise::default() }, 7);
+    let mut sq = vec![0u8; 640 * 640];
+    sq[140 * 640..500 * 640].copy_from_slice(&img.px);
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 90).encode(&sq, 640, 640, jpeg_encoder::ColorType::Luma).unwrap();
+    let mut rgb = Vec::with_capacity(640 * 640 * 3);
+    for v in &sq { rgb.extend_from_slice(&[*v, *v, *v]); }
+    let mut jpeg_rgb = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg_rgb, 90).encode(&rgb, 640, 640, jpeg_encoder::ColorType::Rgb).unwrap();
+    for (what, data) in [("luma", &jpeg), ("ycbcr 4:2:0", &jpeg_rgb)] {
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 { armd::measure_multiview::decode_frame(data, SIZE).unwrap(); }
+        println!("decode 640x640 {what} ({} KB): {:.1} ms", data.len() / 1024, t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    }
+}

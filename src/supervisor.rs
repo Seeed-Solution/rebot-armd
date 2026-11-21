@@ -2899,7 +2899,7 @@ impl SupervisorInner {
             approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
             phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
             constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
-            durability_confirmed: None, durability_warning: None, policy_stats: None,
+            durability_confirmed: None, durability_warning: None, policy_stats: None, measurement: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -3190,7 +3190,7 @@ impl SupervisorInner {
     }
 
     /// The commanded joints with the arm joints replaced by `q` (gripper and extra joints kept).
-    fn joint_goal_target(&self, q: &[f64; 6]) -> Vec<f32> {
+    pub(crate) fn joint_goal_target(&self, q: &[f64; 6]) -> Vec<f32> {
         let arm_dof = self.config.arm_dof();
         let gripper_idx = self.config.gripper_index();
         let mut target = self.commanded_positions.clone();
@@ -3201,7 +3201,7 @@ impl SupervisorInner {
     }
 
     /// `planning_limits()` with the non-gripper velocities times `speed_scale` (as `move_to_pose`).
-    fn joint_goal_limits(&self, speed_scale: f64) -> Vec<crate::model::JointLimit> {
+    pub(crate) fn joint_goal_limits(&self, speed_scale: f64) -> Vec<crate::model::JointLimit> {
         let gripper_idx = self.config.gripper_index();
         let mut limits = self.planning_limits();
         for (i, l) in limits.iter_mut().enumerate() {

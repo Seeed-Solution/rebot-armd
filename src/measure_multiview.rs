@@ -1,0 +1,678 @@
+//! Multi-view object measurement (motion stereo): action `/api/v1/action/measure_multiview` (WS,
+//! lease, operator session when armd enforces the PIN; capability `measure_multiview`).
+//!
+//! From the current pose (the camera sees the object), the arm moves to view poses displaced
+//! laterally around the object, captures a camera snapshot and a detection at each settled pose
+//! and triangulates object points from the images ([`crate::mview_stereo`]). The geometry uses
+//! only the camera intrinsics (grasp setup), the hand-eye mount and the kinematics (FK of the
+//! measured joints at each capture, kinematic correction included); no depth model, no depth
+//! calibration.
+//!
+//! - Body `{label?, min_score? (0..1, 0.3), target? {box_norm, frame_id?}, views? (2..5, 3),
+//!   baseline_m? (0.03..0.12, 0.08), speed_scale? (0.1..0.5, 0.3), return_to_start? (true)}`.
+//! - View poses: the start pose turned about the look-at point X (ray through the target box
+//!   centre at [`LOOK_AT_ABOVE_TABLE_M`] above the table) about the axis perpendicular to that ray
+//!   and to the camera's image x axis, so the camera centre moves by the chord `offset` along the
+//!   image x axis at the same distance from X and X stays at the same pixel. Offsets are spread
+//!   evenly over [-baseline/2, +baseline/2] (`views` 3: -B/2, 0 (the start pose), +B/2).
+//! - Motion: IK of the view pose ([`motion::solve_goal_joints`]), then the joint-space quintic of
+//!   `path: "joint"` at `speed_scale` with every check of a joint move (swept workspace, keep-out
+//!   boxes, link capsules, power budget, torque and collision holds). A view refused before it
+//!   moves ([`PLAN_REFUSALS`]) is retried at the mirrored offset (when unused), then at 0.75 and
+//!   0.5 of the offset on either side; when all are refused the action fails with the refusal code.
+//! - Capture: settle >= [`MIN_SETTLE_S`] after the motion settled, joints still, discard
+//!   [`DISCARD_SNAPSHOTS`] snapshots, then one snapshot and one YOLO trigger (a frame newer than
+//!   the request); the joints must not move during the capture (`MOVED`).
+//! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
+//!   (the supervisor ends it; [`recheck`] between steps). A measurement failure after motion
+//!   ([`RETURN_AFTER`], `TOO_FEW_POINTS`) returns to the start joints first when `return_to_start`.
+//! - The image computation runs in `spawn_blocking`, while the arm returns to the start pose.
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Map, Value};
+
+use crate::grasp::{self, CamModel, Detection, DetectionSource, GraspSetup};
+use crate::kinematics::{self, Pose, Vec3};
+use crate::macro_action::{arm_fail, fail, MacroCtx, Stop, POLL};
+use crate::motion::{self, MotionError, PathOpts};
+use crate::mview_stereo::{self, Camera, Gray, Params, View};
+use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+
+pub const PATH: &str = "/api/v1/action/measure_multiview";
+pub const MIN_VIEWS: usize = 2;
+pub const MAX_VIEWS: usize = 5;
+pub const DEFAULT_VIEWS: usize = 3;
+pub const BASELINE_M: [f64; 2] = [0.03, 0.12];
+pub const DEFAULT_BASELINE_M: f64 = 0.08;
+pub const SPEED_SCALE: [f64; 2] = [0.1, 0.5];
+pub const DEFAULT_SPEED_SCALE: f64 = 0.3;
+/// Wait after a view motion settled, before the first snapshot (s).
+pub const MIN_SETTLE_S: f64 = 1.0;
+/// Snapshots thrown away after the settle (the snapshot lags 1-2 frames after motion).
+pub const DISCARD_SNAPSHOTS: usize = 2;
+/// Time between the snapshots of one capture.
+const SNAPSHOT_GAP: Duration = Duration::from_millis(150);
+/// Look-at point: the ray through the target box centre at this height above the table (m).
+pub const LOOK_AT_ABOVE_TABLE_M: f64 = 0.02;
+/// Fallback offsets as fractions of the refused one (after the mirrored offset).
+pub const FALLBACK_SCALES: [f64; 2] = [0.75, 0.5];
+/// Planning refusals before a view's motion: the view is retried at a fallback offset.
+pub const PLAN_REFUSALS: [&str; 4] = ["IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED"];
+/// Failures after the arm moved that still return to the start joints (`return_to_start`).
+pub const RETURN_AFTER: [&str; 7] = ["TARGET_LOST", "DETECTION_UNAVAILABLE", "UNSUPPORTED", "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED"];
+/// The views' extreme offsets must stay at least this far apart (m) after fallbacks.
+pub const MIN_EFFECTIVE_BASELINE_M: f64 = 0.02;
+/// Every arm joint within this of the settled position during a capture (rad).
+pub const STILL_RAD: f32 = 0.003;
+pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
+/// A view's target detection: centre at most this far (normalised image units) from where the
+/// start view saw it.
+pub const TARGET_MAX_SHIFT_NORM: f64 = 0.2;
+/// The start detection matching `target.box_norm`: IoU at least this.
+pub const TARGET_MIN_IOU: f64 = 0.3;
+/// Feature region: the reference box grown by this fraction of its size on each side plus 16 px.
+const REGION_GROW: f64 = 0.5;
+const TRIGGER_WAIT_MS: u64 = 1500;
+const TRIGGERS: usize = 3;
+const YOLO: &[&str] = &["yolo"];
+
+fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.into()).into() }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub label: Option<String>,
+    pub min_score: f64,
+    pub target_box: Option<[f64; 4]>,
+    pub target_frame_id: Option<u64>,
+    pub views: usize,
+    pub baseline_m: f64,
+    pub speed_scale: f64,
+    pub return_to_start: bool,
+}
+
+fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, ArmError> {
+    match o.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_f64().filter(|x| x.is_finite() && (lo..=hi).contains(x)).ok_or_else(|| invalid(format!("{key} must be a number in [{lo}, {hi}]"))),
+    }
+}
+
+/// The request body (see the module doc); unknown fields are refused.
+pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
+    let empty = Map::new();
+    let o = match body { Value::Null => &empty, Value::Object(o) => o, _ => return Err(invalid("Command body must be an object")) };
+    const KEYS: [&str; 7] = ["label", "min_score", "target", "views", "baseline_m", "speed_scale", "return_to_start"];
+    if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) { return Err(invalid(format!("unknown field {k} ({})", KEYS.join(", ")))); }
+    let label = match o.get("label") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= 128 => Some(s.clone()),
+        Some(_) => return Err(invalid("label must be a non-empty string (at most 128 characters)")),
+    };
+    let (target_box, target_frame_id) = match o.get("target") {
+        None | Some(Value::Null) => (None, None),
+        Some(Value::Object(t)) => {
+            if let Some(k) = t.keys().find(|k| !matches!(k.as_str(), "box_norm" | "frame_id")) { return Err(invalid(format!("unknown target field {k} (box_norm, frame_id)"))); }
+            let b = t.get("box_norm").and_then(Value::as_array).filter(|a| a.len() == 4)
+                .and_then(|a| a.iter().map(|v| v.as_f64().filter(|x| x.is_finite() && (0.0..=1.0).contains(x))).collect::<Option<Vec<f64>>>())
+                .filter(|b| b[2] > b[0] && b[3] > b[1])
+                .ok_or_else(|| invalid("target.box_norm must be [x0, y0, x1, y1] in [0, 1] with x1 > x0, y1 > y0"))?;
+            let fid = match t.get("frame_id") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_u64().ok_or_else(|| invalid("target.frame_id must be a non-negative integer"))?),
+            };
+            (Some([b[0], b[1], b[2], b[3]]), fid)
+        }
+        Some(_) => return Err(invalid("target must be an object {box_norm, frame_id?}")),
+    };
+    let views = match o.get("views") {
+        None | Some(Value::Null) => DEFAULT_VIEWS,
+        Some(v) => v.as_u64().filter(|n| (MIN_VIEWS as u64..=MAX_VIEWS as u64).contains(n))
+            .ok_or_else(|| invalid(format!("views must be an integer in [{MIN_VIEWS}, {MAX_VIEWS}]")))? as usize,
+    };
+    let return_to_start = match o.get("return_to_start") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid("return_to_start must be a boolean")),
+    };
+    Ok(Request {
+        label,
+        min_score: num(o, "min_score", 0.3, 0.0, 1.0)?,
+        target_box, target_frame_id, views,
+        baseline_m: num(o, "baseline_m", DEFAULT_BASELINE_M, BASELINE_M[0], BASELINE_M[1])?,
+        speed_scale: num(o, "speed_scale", DEFAULT_SPEED_SCALE, SPEED_SCALE[0], SPEED_SCALE[1])?,
+        return_to_start,
+    })
+}
+
+/// Chord offsets (m) of `n` views spread evenly over [-baseline/2, +baseline/2].
+pub fn view_offsets(n: usize, baseline_m: f64) -> Vec<f64> {
+    (0..n).map(|i| -baseline_m / 2.0 + baseline_m * i as f64 / (n - 1).max(1) as f64).map(|o| if o.abs() < 1e-9 { 0.0 } else { o }).collect()
+}
+
+/// The order the views are visited from the start pose: the start view (offset 0) first, then
+/// the negative side outward, then the positive side outward.
+pub fn visit_order(offsets: &[f64]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..offsets.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let key = |o: f64| (if o == 0.0 { 0 } else if o < 0.0 { 1 } else { 2 }, o.abs());
+        let (ka, kb) = (key(offsets[a]), key(offsets[b]));
+        ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
+    });
+    idx
+}
+
+/// Offsets to try after `o` was refused, given the offsets already planned or captured.
+pub fn fallback_offsets(o: f64, used: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let free = |c: f64, out: &[f64]| c.abs() >= 0.005 && used.iter().chain(out).all(|u| (u - c).abs() > 0.004);
+    if free(-o, &out) { out.push(-o); }
+    for s in FALLBACK_SCALES {
+        for c in [o * s, -o * s] { if free(c, &out) { out.push(c); } }
+    }
+    out
+}
+
+/// The pose `pose` turned about `pivot` so that the camera centre `cam_c` moves by the chord
+/// `offset_m` along `lat` (unit, perpendicular to the ray from the camera to the pivot).
+pub fn orbit_pose(pose: &Pose, cam_c: &Vec3, pivot: &Vec3, lat: &Vec3, offset_m: f64) -> Pose {
+    if offset_m == 0.0 { return *pose; }
+    let ray = kinematics::unit(&kinematics::sub(pivot, cam_c));
+    let d = kinematics::norm(&kinematics::sub(pivot, cam_c));
+    let axis = kinematics::unit(&kinematics::cross(lat, &ray));
+    let theta = 2.0 * (offset_m / (2.0 * d)).clamp(-1.0, 1.0).asin();
+    let r = kinematics::axis_r(&axis, theta);
+    Pose::new(kinematics::mat_mul(&r, &pose.r), kinematics::add(pivot, &kinematics::mat_vec(&r, &kinematics::sub(&pose.p, pivot))))
+}
+
+/// Camera of the stereo geometry at the end_link pose `pose`.
+pub fn camera_at(cam: &CamModel, pose: &Pose) -> Camera {
+    Camera { r: cam.rotation(pose), c: cam.origin(pose), fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy }
+}
+
+/// Decode a snapshot JPEG to the camera model's grayscale frame. The snapshot is the frame
+/// letterboxed into a square (rebot-vision: 640x640 with the 640x360 frame in rows 140..499): a
+/// width equal to the model's and a taller image is cropped to the centred rows.
+pub fn decode_frame(jpeg: &[u8], size: [f64; 2]) -> Result<Gray, String> {
+    use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::Luma).set_max_width(4096).set_max_height(4096);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), opts);
+    let px = dec.decode().map_err(|e| format!("snapshot is not a JPEG: {e:?}"))?;
+    let info = dec.info().ok_or("snapshot without a JPEG header")?;
+    let (w, h) = (usize::from(info.width), usize::from(info.height));
+    if px.len() != w * h { return Err(format!("snapshot decoded to {} bytes for {w}x{h} grayscale", px.len())); }
+    let (cw, ch) = (size[0].round() as usize, size[1].round() as usize);
+    if w != cw || h < ch {
+        return Err(format!("snapshot is {w}x{h}; the camera model (grasp setup image_size_px) is {cw}x{ch}"));
+    }
+    let top = (h - ch) / 2;
+    Gray::new(cw, ch, px[top * w..(top + ch) * w].to_vec()).ok_or_else(|| "snapshot crop failed".to_string())
+}
+
+/// A checked run, ready to begin.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub request: Request,
+    pub epoch: u64,
+    pub workspace_revision: u64,
+    pub calibration_revision: u64,
+    pub setup: GraspSetup,
+    pub cam: CamModel,
+    /// Commanded joints at the start (all joints).
+    pub start: Vec<f32>,
+    pub arm_dof: usize,
+    pub deadline_s: f64,
+}
+
+/// Check the run under the lock.
+pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan, ArmError> {
+    let request = parse_request(body)?;
+    if epoch != inner.safety.epoch_id() {
+        return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
+    }
+    let Some(setup) = inner.grasp_setup() else {
+        return Err(MotionError::Unsupported("measure_multiview needs a profile with kinematics, a gripper policy and a grasp setup (camera intrinsics)".into()).into());
+    };
+    inner.plan_input()?;
+    if !inner.is_torqued { return Err(crate::safety::SafetyError::NotArmed(inner.safety.state().clone()).into()); }
+    let cam = CamModel::assumed(&inner.config.arm_model, &setup, &inner.config.camera_mount);
+    // bound: per view one joint move (up to 2 rad at the slowest planning speed), settle, captures
+    let vmin = inner.planning_limits().iter().take(inner.config.arm_dof()).map(|l| l.max_velocity).fold(f32::INFINITY, f32::min).max(0.05);
+    let move_s = 2.0 / (f64::from(vmin) * request.speed_scale) + crate::motion::SETTLE_MAX_S;
+    let capture_s = MIN_SETTLE_S + (DISCARD_SNAPSHOTS + 1) as f64 * 3.5 + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
+    let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
+    let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
+    Ok(Plan {
+        request, epoch, workspace_revision: inner.workspace_revision, calibration_revision: inner.calibration_revision,
+        setup, cam, start: inner.commanded_positions.clone(), arm_dof: inner.config.arm_dof(), deadline_s,
+    })
+}
+
+/// Begin the action and spawn its orchestrator. Returns (action id, deadline bound s).
+pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, plan: Plan, source: Arc<dyn DetectionSource>) -> Result<(u64, f64), ArmError> {
+    let id = inner.begin_orchestrated_action("measure_multiview", None, plan.epoch)?;
+    let deadline = plan.deadline_s;
+    tracing::info!("measure_multiview {id} started ({} views, baseline {:.3} m, speed_scale {:.2}, bound {deadline:.0} s)",
+        plan.request.views, plan.request.baseline_m, plan.request.speed_scale);
+    let sup = sup.clone();
+    tokio::spawn(async move {
+        let worker = { let sup = sup.clone(); tokio::spawn(async move { run(sup, id, plan, source).await }) };
+        if let Err(e) = worker.await {
+            tracing::error!("measure_multiview {id} orchestrator failed: {e}");
+            sup.inner().write().await.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("orchestrator failed: {e}")), None, None);
+        }
+    });
+    Ok((id, deadline))
+}
+
+/// Alive, nothing the run was checked against changed, telemetry fresh, torque on.
+async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
+    let mut inner = ctx.sup.inner().write().await;
+    if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
+    if inner.safety.epoch_id() != plan.epoch { return Err(fail("PLAN_STALE", "the epoch changed during the measurement (stop or e-stop)")); }
+    if inner.workspace_revision != plan.workspace_revision { return Err(fail("PLAN_STALE", "the workspace, keep-out boxes or camera mount changed during the measurement")); }
+    if inner.calibration_revision != plan.calibration_revision { return Err(fail("CALIBRATION_CHANGED", "the joint zero or the kinematic correction changed during the measurement")); }
+    if inner.active_lease.as_ref().map(|l| l.generation) != inner.action_lease_generation {
+        let id = ctx.id;
+        inner.finish_macro(id, "cancelled", Some("LEASE_LOST"), Some("Control lease lost or released".into()), None, None);
+        return Err(Stop::Cancelled);
+    }
+    if !inner.is_torqued { return Err(fail("NOT_ARMED", "torque went off during the measurement")); }
+    if !inner.hardware_feedback_fresh(FEEDBACK_MAX_AGE) { return Err(fail("STALE_TELEMETRY", "joint feedback is stale")); }
+    if Instant::now() > ctx.deadline { return Err(fail(ctx.timeout_code, ctx.timeout_message.clone())); }
+    Ok(())
+}
+
+/// Measured joints and whether every arm joint is still.
+async fn measured(ctx: &MacroCtx) -> (Vec<f32>, bool) {
+    let inner = ctx.sup.inner().read().await;
+    let still = inner.config.arm_joint_indices().iter().all(|&i| inner.measured_velocities.get(i).is_none_or(|v| v.abs() <= 0.02));
+    (inner.measured_positions.clone(), still)
+}
+
+/// One view's capture.
+struct Capture {
+    offset_m: f64,
+    pose: Pose,
+    img: Gray,
+    frame_id: u64,
+    detections: Vec<Detection>,
+}
+
+fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
+
+/// Settle, discard snapshots, take a snapshot and a detection at still joints.
+async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset_m: f64) -> Result<Capture, Stop> {
+    let until = Instant::now() + Duration::from_secs_f64(MIN_SETTLE_S);
+    while Instant::now() < until {
+        ctx.check().await?;
+        tokio::time::sleep(POLL).await;
+    }
+    recheck(ctx, plan).await?;
+    let (settled, still) = measured(ctx).await;
+    if !still { return Err(fail("NOT_SETTLED", "the arm is still moving after the settle time")); }
+    for _ in 0..DISCARD_SNAPSHOTS {
+        src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+        tokio::time::sleep(SNAPSHOT_GAP).await;
+        ctx.check().await?;
+    }
+    let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+    let mut frame = None;
+    for _ in 0..TRIGGERS {
+        ctx.check().await?;
+        if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
+    }
+    let mut frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
+    let (joints, still) = measured(ctx).await;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    if !still || arm.iter().any(|&i| (joints[i] - settled[i]).abs() > STILL_RAD) { return Err(fail("MOVED", "the arm moved during the capture")); }
+    recheck(ctx, plan).await?;
+    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&settled) }
+        .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
+    grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
+    let size = plan.cam.size;
+    let img = tokio::task::spawn_blocking(move || decode_frame(&jpeg, size)).await
+        .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?
+        .map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
+    Ok(Capture { offset_m, pose, img, frame_id: frame.frame_id, detections: frame.detections })
+}
+
+fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
+
+/// The target at the start view: best IoU with `target_box`, else the best score.
+fn pick_start(req: &Request, dets: &[Detection]) -> Option<Detection> {
+    let c = dets.iter().filter(|d| d.score >= req.min_score && label_ok(d, req.label.as_deref()));
+    match req.target_box {
+        Some(t) => c.map(|d| (grasp::iou(&d.box_norm, &t), d)).filter(|(i, _)| *i >= TARGET_MIN_IOU).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, d)| d.clone()),
+        None => c.max_by(|a, b| a.score.total_cmp(&b.score)).cloned(),
+    }
+}
+
+/// The target in another view: same label, nearest to the start view's box centre.
+fn pick_view(target: &Detection, min_score: f64, dets: &[Detection]) -> Option<Detection> {
+    let c0 = grasp::box_centre(&target.box_norm);
+    dets.iter().filter(|d| d.score >= min_score && d.label.eq_ignore_ascii_case(&target.label))
+        .map(|d| { let c = grasp::box_centre(&d.box_norm); ((c[0] - c0[0]).hypot(c[1] - c0[1]), d) })
+        .filter(|(dist, _)| *dist <= TARGET_MAX_SHIFT_NORM)
+        .min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, d)| d.clone())
+}
+
+/// Plan and run the joint-space move to the arm joints solving `goal`. The `bool` of the error
+/// is true when the motion was installed (a failure after the arm moved).
+async fn move_to_goal(ctx: &MacroCtx, plan: &Plan, phase: &str, goal: Pose) -> Result<(), (Stop, bool)> {
+    let before = |s: Stop| (s, false);
+    let (input, seeds) = {
+        let inner = ctx.sup.inner().read().await;
+        if !inner.macro_alive(ctx.id) { return Err(before(Stop::Cancelled)); }
+        let input = inner.plan_input().map_err(arm_fail).map_err(before)?;
+        let mut extra = inner.goal_seed_poses();
+        extra.push(kinematics::q6(&plan.start[..plan.arm_dof.min(plan.start.len())]));
+        let seeds = motion::goal_seeds(&input, &goal, &extra);
+        (input, seeds)
+    };
+    let opts = PathOpts { yaw_free: plan.arm_dof < 6, yaw_outward: false };
+    let q = tokio::task::spawn_blocking(move || motion::solve_goal_joints(&input, &goal, opts, &seeds)).await
+        .map_err(|e| before(fail("INTERNAL", format!("IK task failed: {e}"))))?
+        .map_err(|e| before(arm_fail(e.into())))?;
+    move_joints(ctx, plan, phase, &q).await
+}
+
+/// Joint-space quintic sub-motion to the arm joints `q` (gripper kept).
+async fn move_joints(ctx: &MacroCtx, plan: &Plan, phase: &str, q: &[f64; 6]) -> Result<(), (Stop, bool)> {
+    let limit = {
+        let mut inner = ctx.sup.inner().write().await;
+        if !inner.macro_alive(ctx.id) { return Err((Stop::Cancelled, false)); }
+        let target = inner.joint_goal_target(q);
+        let limits = inner.joint_goal_limits(plan.request.speed_scale);
+        inner.set_action_phase(ctx.id, phase, 0.0, None, None);
+        match inner.install_macro_quintic(ctx.id, target, &limits) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(detail) = e.workspace_detail() { inner.set_action_workspace_violation(ctx.id, detail); }
+                return Err((arm_fail(e), false));
+            }
+        }
+    };
+    ctx.wait_sub(phase, limit * 2.0 + 5.0).await.map(|_| ()).map_err(|s| (s, true))
+}
+
+fn is_refusal(s: &Stop) -> bool { matches!(s, Stop::Fail(code, _) if PLAN_REFUSALS.contains(&code.as_str())) }
+
+fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
+
+/// The `measurement` value of the action (see docs/agent_action_api.md).
+fn measurement_value(caps: &[Capture], target: &Detection, table_z: f64, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
+    table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, fallbacks: &[Value], compute_ms: f64) -> Value {
+    let views: Vec<Value> = caps.iter().map(|c| json!({
+        "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
+        "frame_id": c.frame_id, "offset_m": r4(c.offset_m),
+    })).collect();
+    let (objects, why) = match result {
+        Ok(m) => (vec![json!({
+            "label": target.label, "score": target.score,
+            "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
+            "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": (m.yaw_deg * 10.0).round() / 10.0,
+            "n_points": m.n_points, "reproj_rms_px": (m.reproj_rms_px * 100.0).round() / 100.0, "views_used": caps.len(),
+        })], Value::Null),
+        Err(w) => (Vec::new(), json!(w)),
+    };
+    let mm = |v: Option<f64>| v.map_or(Value::Null, |x| json!((x * 100.0).round() / 100.0));
+    json!({
+        "method": "motion_stereo",
+        "objects": objects,
+        "table_check": {"n_points": table.n_points, "median_abs_mm": mm(table.median_abs_mm), "p90_abs_mm": mm(table.p90_abs_mm), "median_mm": mm(table.median_mm)},
+        "views": views,
+        "why": why,
+        "table_z_m": table_z,
+        "baseline_m": r4(caps.iter().map(|c| c.offset_m).fold(f64::NEG_INFINITY, f64::max) - caps.iter().map(|c| c.offset_m).fold(f64::INFINITY, f64::min)),
+        "fallbacks": fallbacks,
+        "stats": stats,
+        "compute_ms": compute_ms.round(),
+    })
+}
+
+/// Everything after the start capture, until the views are captured.
+async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps: &mut Vec<Capture>, target: &Detection,
+    fallbacks: &mut Vec<Value>) -> Result<(), (Stop, bool)> {
+    let start = &caps[0];
+    let pose0 = start.pose;
+    let cam0 = camera_at(&plan.cam, &pose0);
+    let centre = plan.cam.to_px(grasp::box_centre(&target.box_norm));
+    let table_z = plan.setup.table_z_m;
+    let pivot = plan.cam.plane_point(&pose0, centre, table_z + LOOK_AT_ABOVE_TABLE_M).unwrap_or_else(|| {
+        let d = kinematics::unit(&cam0.ray(centre));
+        kinematics::add(&cam0.c, &[0.35 * d[0], 0.35 * d[1], 0.35 * d[2]])
+    });
+    let ray = kinematics::unit(&kinematics::sub(&pivot, &cam0.c));
+    let xc = kinematics::column(&cam0.r, 0);
+    let lat = kinematics::unit(&kinematics::sub(&xc, &[ray[0] * kinematics::dot(&ray, &xc), ray[1] * kinematics::dot(&ray, &xc), ray[2] * kinematics::dot(&ray, &xc)]));
+    let offsets = view_offsets(plan.request.views, plan.request.baseline_m);
+    let order = visit_order(&offsets);
+    let mut used: Vec<f64> = offsets.clone();
+    let total = order.len() as f32;
+    for (k, &i) in order.iter().enumerate() {
+        let o = offsets[i];
+        if o == 0.0 { continue; } // the start capture
+        ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("view:{k}"), k as f32 / (total + 1.0), None, None);
+        let mut candidates = vec![o];
+        let mut tried = 0;
+        let mut last_refusal: Option<Stop> = None;
+        let mut done = false;
+        while tried < candidates.len() {
+            let c = candidates[tried];
+            tried += 1;
+            recheck(ctx, plan).await.map_err(|s| (s, true))?;
+            let goal = orbit_pose(&pose0, &cam0.c, &pivot, &lat, c);
+            match move_to_goal(ctx, plan, &format!("move:{k}"), goal).await {
+                Ok(()) => {
+                    if c != o {
+                        fallbacks.push(json!({"offset_m": r4(o), "used_offset_m": r4(c), "code": last_refusal.as_ref().map(|s| match s { Stop::Fail(c, _) => c.clone(), Stop::Cancelled => String::new() })}));
+                        used.retain(|u| (u - o).abs() > 1e-9);
+                        used.push(c);
+                    }
+                    ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
+                    let cap = capture(ctx, plan, src, c).await.map_err(|s| (s, true))?;
+                    if pick_view(target, plan.request.min_score, &cap.detections).is_none() {
+                        return Err((fail("TARGET_LOST", format!("the {} is not detected at the view offset {c:+.3} m", target.label)), true));
+                    }
+                    caps.push(cap);
+                    done = true;
+                    break;
+                }
+                Err((s, false)) if is_refusal(&s) => {
+                    if let Stop::Fail(code, msg) = &s { tracing::info!("measure_multiview {}: view offset {c:+.3} m refused ({code}: {msg})", ctx.id); }
+                    if tried == 1 { candidates.extend(fallback_offsets(o, &used)); }
+                    last_refusal = Some(s);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !done {
+            let s = last_refusal.unwrap_or_else(|| fail("IK_UNREACHABLE", "no view pose"));
+            // nothing moved for this view; earlier views may have moved the arm
+            return Err((s, caps.len() > 1));
+        }
+    }
+    let lo = caps.iter().map(|c| c.offset_m).fold(f64::INFINITY, f64::min);
+    let hi = caps.iter().map(|c| c.offset_m).fold(f64::NEG_INFINITY, f64::max);
+    if hi - lo < MIN_EFFECTIVE_BASELINE_M {
+        return Err((fail("IK_UNREACHABLE", format!("the reachable view poses span {:.3} m (minimum {MIN_EFFECTIVE_BASELINE_M})", hi - lo)), true));
+    }
+    Ok(())
+}
+
+/// The reconstruction of the captures (blocking; spawn_blocking).
+fn compute(views: Vec<View>, reference: usize, ref_box_px: [f64; 4], table_z: f64) -> (Result<mview_stereo::ObjectMeasure, &'static str>, mview_stereo::TableCheck, mview_stereo::Stats, f64) {
+    let t0 = Instant::now();
+    let (w, h) = (ref_box_px[2] - ref_box_px[0], ref_box_px[3] - ref_box_px[1]);
+    let region = [ref_box_px[0] - REGION_GROW * w - 16.0, ref_box_px[1] - REGION_GROW * h - 16.0, ref_box_px[2] + REGION_GROW * w + 16.0, ref_box_px[3] + REGION_GROW * h + 16.0];
+    let p = Params::new(table_z);
+    let rec = mview_stereo::reconstruct(&views, reference, region, ref_box_px, &p);
+    let m = mview_stereo::measure(&rec.points, &p);
+    let t = mview_stereo::table_check(&rec.points, &p);
+    (m, t, rec.stats, t0.elapsed().as_secs_f64() * 1000.0)
+}
+
+async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn DetectionSource>) {
+    let ctx = MacroCtx {
+        sup: sup.clone(), id,
+        deadline: Instant::now() + Duration::from_secs_f64(plan.deadline_s),
+        phase_timeout_s: plan.deadline_s,
+        timeout_code: "MEASURE_TIMEOUT",
+        timeout_message: "the measurement did not finish within its time bound".into(),
+    };
+    let outcome = measure_run(&ctx, &plan, src.as_ref()).await;
+    let mut inner = sup.inner().write().await;
+    match outcome {
+        Ok(None) => inner.finish_macro(id, "done", None, None, None, None),
+        Ok(Some((code, message))) => inner.finish_macro(id, "failed", Some(&code), Some(message), None, None),
+        Err(Stop::Fail(code, message)) => inner.finish_macro(id, "failed", Some(&code), Some(message), None, None),
+        Err(Stop::Cancelled) => {}
+    }
+    let a = inner.last_action.as_ref().filter(|a| a.id == id).map(|a| (a.state.clone(), a.code.clone()));
+    drop(inner);
+    tracing::info!("measure_multiview {id} ended: {a:?}");
+}
+
+/// Return to the start joints when asked (a failure there ends the action with its own code).
+async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
+    if !plan.request.return_to_start { return Ok(()); }
+    recheck(ctx, plan).await?;
+    let q = kinematics::q6(&plan.start[..plan.arm_dof.min(plan.start.len())]);
+    move_joints(ctx, plan, "return", &q).await.map_err(|(s, _)| s)
+}
+
+/// The run; Ok(Some((code, message))): a measurement failure after the views (the action fails
+/// with it, after the return to the start pose).
+async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> Result<Option<(String, String)>, Stop> {
+    recheck(ctx, plan).await?;
+    match src.per_request_pipelines().await {
+        Ok(true) => {}
+        Ok(false) => return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)")),
+        Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
+    }
+    ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
+    let first = capture(ctx, plan, src, 0.0).await?;
+    let Some(target) = pick_start(&plan.request, &first.detections) else {
+        let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
+        return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
+            if plan.request.target_box.is_some() { " overlapping target.box_norm" } else { "" })));
+    };
+    let mut caps = vec![first];
+    let mut fallbacks = Vec::new();
+    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks).await;
+    if let Err((stop, moved)) = views_res {
+        // a measurement failure goes back to the start first; a stop, fault, collision, torque
+        // limit, lease loss or anything else ends the action where the arm is
+        if let (Stop::Fail(code, message), true) = (&stop, moved) {
+            if RETURN_AFTER.contains(&code.as_str()) && ctx.alive().await {
+                if let Err(e) = back_to_start(ctx, plan).await {
+                    tracing::warn!("measure_multiview {}: return to start failed: {e:?}", ctx.id);
+                }
+                return Ok(Some((code.clone(), message.clone())));
+            }
+        }
+        return Err(stop);
+    }
+    // reference: the view closest to the start pose; its own detection box
+    caps.sort_by(|a, b| a.offset_m.total_cmp(&b.offset_m));
+    let reference = (0..caps.len()).min_by(|&a, &b| caps[a].offset_m.abs().total_cmp(&caps[b].offset_m.abs())).unwrap_or(0);
+    let ref_det = pick_view(&target, plan.request.min_score, &caps[reference].detections).unwrap_or_else(|| target.clone());
+    let b = ref_det.box_norm;
+    let ref_box_px = [b[0] * plan.cam.size[0], b[1] * plan.cam.size[1], b[2] * plan.cam.size[0], b[3] * plan.cam.size[1]];
+    let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
+    let table_z = plan.setup.table_z_m;
+    ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
+    let task = tokio::task::spawn_blocking(move || compute(views, reference, ref_box_px, table_z));
+    let back = back_to_start(ctx, plan).await;
+    let (m, t, stats, ms) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
+    tracing::info!("measure_multiview {}: {} views, {stats:?}, {ms:.0} ms, {:?}", ctx.id, caps.len(), m.as_ref().map(|m| m.height_m));
+    let value = measurement_value(&caps, &ref_det, table_z, &m, &t, &stats, &fallbacks, ms);
+    ctx.sup.inner().write().await.update_action(ctx.id, |a| a.measurement = Some(value));
+    back?;
+    Ok(m.err().map(|_| ("TOO_FEW_POINTS".to_string(),
+        format!("fewer than {} object points above the table in the target box ({} points triangulated; features {}, no peak {}, ambiguous {}, left-right {}, reprojection {})",
+            Params::new(table_z).min_object_points, stats.points, stats.features, stats.no_peak, stats.ambiguous, stats.lr_rejected, stats.reproj_rejected))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_parsing_and_bounds() {
+        let r = parse_request(&Value::Null).unwrap();
+        assert_eq!((r.views, r.baseline_m, r.speed_scale, r.return_to_start, r.min_score), (3, 0.08, 0.3, true, 0.3));
+        let r = parse_request(&json!({"label": "cup", "target": {"box_norm": [0.1, 0.2, 0.3, 0.4], "frame_id": 7}, "views": 5, "baseline_m": 0.12, "speed_scale": 0.5, "return_to_start": false})).unwrap();
+        assert_eq!((r.target_box, r.target_frame_id, r.views, r.return_to_start), (Some([0.1, 0.2, 0.3, 0.4]), Some(7), 5, false));
+        for bad in [json!({"views": 1}), json!({"views": 6}), json!({"baseline_m": 0.02}), json!({"baseline_m": 0.13}), json!({"speed_scale": 0.6}),
+                    json!({"speed_scale": 0.05}), json!({"target": {"box_norm": [0.3, 0.2, 0.1, 0.4]}}), json!({"target": {"box_norm": [0, 0, 1]}}),
+                    json!({"target": [0, 0, 1, 1]}), json!({"foo": 1}), json!({"return_to_start": 1}), json!({"label": ""}), json!([1])] {
+            let e = crate::api::rest::ApiError::from(parse_request(&bad).unwrap_err());
+            assert_eq!(e.code.as_deref(), Some("INVALID_COMMAND"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn offsets_order_and_fallbacks() {
+        assert_eq!(view_offsets(3, 0.08), vec![-0.04, 0.0, 0.04]);
+        assert_eq!(view_offsets(2, 0.08), vec![-0.04, 0.04]);
+        let o5 = view_offsets(5, 0.08);
+        assert!((o5[1] + 0.02).abs() < 1e-12 && o5[2] == 0.0);
+        assert_eq!(visit_order(&o5), vec![2, 1, 0, 3, 4]);
+        // the mirror is in use: the smaller offsets on both sides
+        let f = fallback_offsets(0.04, &[-0.04, 0.0, 0.04]);
+        assert_eq!(f.iter().map(|x| (x * 1000.0).round() as i64).collect::<Vec<_>>(), vec![30, -30, 20, -20]);
+        // views 2 with the mirror free (refused first)
+        let f = fallback_offsets(-0.04, &[0.04]);
+        assert_eq!(f.iter().map(|x| (x * 1000.0).round() as i64).collect::<Vec<_>>(), vec![-30, 30, -20, 20]);
+        let f = fallback_offsets(-0.04, &[-0.04]);
+        assert_eq!((f[0] * 1000.0).round(), 40.0);
+    }
+
+    #[test]
+    fn orbit_keeps_the_pivot_on_the_same_pixel_and_the_distance() {
+        let arm = crate::chain::ArmModel::default();
+        let setup = GraspSetup::default();
+        let cam = CamModel::assumed(&arm, &setup, &crate::model::CameraMount::default());
+        let pose = arm.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 0.0]);
+        let c0 = camera_at(&cam, &pose);
+        let centre = [cam.cx + 20.0, cam.cy + 10.0];
+        let pivot = cam.plane_point(&pose, centre, 0.02).unwrap();
+        let ray = kinematics::unit(&kinematics::sub(&pivot, &c0.c));
+        let xc = kinematics::column(&c0.r, 0);
+        let k = kinematics::dot(&ray, &xc);
+        let lat = kinematics::unit(&kinematics::sub(&xc, &[ray[0] * k, ray[1] * k, ray[2] * k]));
+        for o in [-0.06, -0.04, 0.03] {
+            let p = orbit_pose(&pose, &c0.c, &pivot, &lat, o);
+            let c = camera_at(&cam, &p);
+            let px = c.project(&pivot).unwrap();
+            assert!((px[0] - centre[0]).abs() < 1e-6 && (px[1] - centre[1]).abs() < 1e-6, "{px:?}");
+            let chord = kinematics::norm(&kinematics::sub(&c.c, &c0.c));
+            assert!((chord - o.abs()).abs() < 1e-9, "{chord}");
+            let along = kinematics::dot(&kinematics::sub(&c.c, &c0.c), &lat);
+            assert!(along * o > 0.0 && (along.abs() - o.abs()).abs() < 0.002, "{along}");
+            assert!((kinematics::norm(&kinematics::sub(&c.c, &pivot)) - kinematics::norm(&kinematics::sub(&c0.c, &pivot))).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn letterboxed_snapshots_are_cropped_to_the_frame() {
+        // a 64x64 JPEG with the 64x36 frame in rows 14..49 (grey 200), black bars
+        let (w, h) = (64usize, 64usize);
+        let mut img = vec![0u8; w * h];
+        for y in 14..50 { for x in 0..w { img[y * w + x] = 200; } }
+        let mut out = Vec::new();
+        jpeg(&img, w, h, &mut out);
+        let g = decode_frame(&out, [64.0, 36.0]).unwrap();
+        assert_eq!((g.w, g.h), (64, 36));
+        let mean = g.px.iter().map(|&v| f64::from(v)).sum::<f64>() / g.px.len() as f64;
+        assert!((mean - 200.0).abs() < 6.0, "{mean}");
+        assert!(decode_frame(&out, [32.0, 18.0]).unwrap_err().contains("64x64"));
+        assert!(decode_frame(b"not a jpeg", [64.0, 36.0]).is_err());
+    }
+
+    fn jpeg(img: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+        jpeg_encoder::Encoder::new(out, 90).encode(img, w as u16, h as u16, jpeg_encoder::ColorType::Luma).unwrap();
+    }
+}

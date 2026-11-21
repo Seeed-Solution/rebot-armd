@@ -42,6 +42,8 @@ serialport = { version = "4", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 libc = "0.2"
 tract-onnx = { version = "0.21", default-features = false, optional = true }
+# camera snapshots of the multi-view measurement (src/measure_multiview.rs); pure Rust, no SIMD
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 
 # Style lints that the code base does not follow; everything else is denied in CI
 # (`cargo clippy --all-targets -- -D warnings`).
@@ -56,6 +58,7 @@ type_complexity = "allow"
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio-tungstenite = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
+jpeg-encoder = "0.6"
 
 [profile.release]
 lto = "fat"
