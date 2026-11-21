@@ -175,13 +175,14 @@ fn bench_compute_and_decode() {
     let pivot = [0.30, 0.01, 0.02];
     let el = 55f64.to_radians();
     let cam0 = render::look_at([pivot[0] - 0.35 * el.cos(), pivot[1], pivot[2] + 0.35 * el.sin()], pivot, FX, SIZE);
-    for n in [3usize, 5] {
-        let offsets = armd::measure_multiview::view_offsets(n, 0.08);
-        let views: Vec<View> = offsets.iter().enumerate().map(|(i, &o)| {
-            let cam = render::orbit(&cam0, pivot, o);
+    use armd::measure_multiview::{view_offsets, Axes};
+    for (n, axes, motion) in [(3usize, Axes::X, Motion::Orbit), (5, Axes::X, Motion::Orbit), (5, Axes::Xy, Motion::Translate), (5, Axes::Xy, Motion::Orbit)] {
+        let offsets = view_offsets(n, 0.08, axes);
+        let views: Vec<View> = offsets.iter().enumerate().map(|(i, o)| {
+            let cam = match motion { Motion::Orbit => render::orbit_xy(&cam0, pivot, *o), Motion::Translate => render::translate(&cam0, *o) };
             View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 90 + i as u64), cam }
         }).collect();
-        let reference = n / 2;
+        let reference = offsets.iter().position(|o| o[0] == 0.0 && o[1] == 0.0).unwrap();
         let bx = render::box_px(&scene, &b, &views[reference].cam);
         let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
         let region = [bx[0] - 0.25 * w - 12.0, bx[1] - 0.25 * h - 12.0, bx[2] + 0.25 * w + 12.0, bx[3] + 0.25 * h + 12.0];
@@ -195,7 +196,7 @@ fn bench_compute_and_decode() {
             assert!((m.height_m - 0.04).abs() < 0.002);
         }
         times.sort_by(f64::total_cmp);
-        println!("{n} views: compute median {:.1} ms (min {:.1}, max {:.1})", times[2], times[0], times[4]);
+        println!("{n} views {} {motion:?}: compute median {:.1} ms (min {:.1}, max {:.1})", axes.name(), times[2], times[0], times[4]);
         let rec = mview_stereo::reconstruct(&views, reference, region, bx, &p);
         let st = rec.stats;
         println!("  stages ms: pyramid {:.1}, features {:.1}, sweep {:.1}, refine {:.1}, triangulate {:.2}, total {:.1}; features {} (corners {}, edges {}), points {}",
