@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
+import struct
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -18,6 +21,72 @@ from .scene import JAW_GEOMS, LIFTED_M
 
 PACK_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
+MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
+MAX_XML_BYTES = 512 * 1024  # 512 KiB
+MAX_XML_DEPTH = 32
+MAX_PACK_TOTAL_BYTES = 10 * 1024 * 1024  # 10 MiB
+MAX_SINGLE_MESH_BYTES = 4 * 1024 * 1024  # 4 MiB
+MAX_MESH_FILES = 16
+MAX_TOTAL_VERTICES = 150_000
+
+_FORBIDDEN_XML_TAGS = frozenset({"include", "plugin", "custom", "extension"})
+_PATH_ATTRS = frozenset(
+    {
+        "file",
+        "fileright",
+        "fileleft",
+        "fileup",
+        "filedown",
+        "filefront",
+        "fileback",
+        "meshdir",
+        "texturedir",
+        "assetdir",
+        "filename",
+    }
+)
+_TEXTURE_FILE_ATTRS = (
+    "file",
+    "fileright",
+    "fileleft",
+    "fileup",
+    "filedown",
+    "filefront",
+    "fileback",
+)
+_ALLOWED_OBJ_DIRECTIVES = frozenset({"v", "vn", "vt", "f", "g", "o", "s", "#", "usemtl"})
+_ALLOWED_STL_KEYWORDS = frozenset(
+    {"solid", "endsolid", "facet", "endfacet", "outer", "endloop", "vertex"}
+)
+
+
+class PackValidationError(ValueError):
+    """Raised when a scene or tool pack fails security, format, or budget validation."""
+
+    def __init__(self, message: str, code: str = "INVALID_PACK", status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def _ascii_lower(s: str) -> str:
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in s)
+
+
+def normalize_robot_id(raw: str | None) -> str | None:
+    """Normalize robot/profile identifiers to canonical IDs ('b601dm', 'so-arm101')."""
+    if raw is None or not isinstance(raw, str):
+        return None
+    norm = _ascii_lower(raw.strip())
+    if not norm:
+        return None
+    collapsed = norm.replace("_", "-")
+    if collapsed in {"b601dm", "b601-dm", "rebot-dm", "rebot-b601dm", "rebot-b601-dm"}:
+        return "b601dm"
+    if collapsed in {"so-arm101", "soarm101", "so101", "so-101"}:
+        return "so-arm101"
+    return collapsed
+
 
 def is_valid_pack_slug(val: Any) -> bool:
     """Return True if val is a strict slug ID (1..64 chars, starting with alphanumeric), empty, or 'default'."""
@@ -25,10 +94,847 @@ def is_valid_pack_slug(val: Any) -> bool:
         return True
     if not isinstance(val, str):
         return False
-    raw = val.strip()
-    if not raw or raw in {"default", "default_world"}:
+    if not val or val in {"default", "default_world"}:
         return True
-    return bool(PACK_SLUG_RE.match(raw))
+    return bool(PACK_SLUG_RE.fullmatch(val))
+
+
+def _is_unsafe_rel_path(val: str, *, allow_dot_dir: bool = False) -> bool:
+    s = val.strip()
+    if not s or "\x00" in s:
+        return True
+    if s.startswith(("/", "\\")):
+        return True
+    if re.match(r"^[A-Za-z]:", s):
+        return True
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", s):
+        return True
+    norm = s.replace("\\", "/")
+    if allow_dot_dir:
+        norm = norm.rstrip("/")
+        if norm == ".":
+            return False
+    parts = norm.split("/")
+    return any(seg in {"", ".", ".."} or seg.startswith(".") for seg in parts)
+
+
+def _local_tag(tag: str) -> str:
+    if "}" in tag:
+        tag = tag.split("}", 1)[1]
+    return tag.lower()
+
+
+def _check_contained(root: Path, candidate: Path, label: str) -> Path:
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise PackValidationError(
+            f"{label} does not exist or cannot be resolved: {exc}",
+            code="INVALID_PACK",
+        ) from None
+    root_resolved = root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise PackValidationError(
+            f"{label} escapes pack directory via symlink",
+            code="PATH_ESCAPE",
+        )
+    return resolved
+
+
+def _validate_binary_stl(data: bytes, label: str, vertex_budget_used: int) -> int:
+    if len(data) < 84:
+        raise PackValidationError(f"Truncated binary STL {label}", code="INVALID_PACK")
+    tri_count = struct.unpack_from("<I", data, 80)[0]
+    expected_len = 84 + 50 * tri_count
+    if len(data) != expected_len:
+        raise PackValidationError(
+            f"Binary STL {label} byte length {len(data)} != expected {expected_len}",
+            code="INVALID_PACK",
+        )
+    verts = tri_count * 3
+    if vertex_budget_used + verts > MAX_TOTAL_VERTICES:
+        raise PackValidationError(
+            f"Total vertex count {vertex_budget_used + verts} exceeds budget {MAX_TOTAL_VERTICES}",
+            code="PACK_TOO_LARGE",
+        )
+    for i in range(tri_count):
+        vals = struct.unpack_from("<12f", data, 84 + i * 50)
+        if not all(math.isfinite(v) for v in vals):
+            raise PackValidationError(
+                f"Non-finite float in binary STL {label} triangle {i}",
+                code="INVALID_PACK",
+            )
+    return verts
+
+
+def _validate_ascii_stl(data: bytes, label: str, vertex_budget_used: int) -> int:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PackValidationError(
+            f"Invalid UTF-8 in ASCII STL {label}: {exc}", code="INVALID_PACK"
+        ) from None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        raise PackValidationError(f"Empty ASCII STL {label}", code="INVALID_PACK")
+    if lines[0].split()[0].lower() != "solid":
+        raise PackValidationError(
+            f"ASCII STL {label} must start with 'solid'", code="INVALID_PACK"
+        )
+    if lines[-1].split()[0].lower() != "endsolid":
+        raise PackValidationError(
+            f"ASCII STL {label} must end with 'endsolid'", code="INVALID_PACK"
+        )
+    verts = 0
+    # Strict ASCII STL state machine: solid -> (facet -> outer loop -> 3x vertex -> endloop -> endfacet)* -> endsolid
+    state = "EXPECT_SOLID"
+    loop_verts = 0
+    for ln in lines:
+        parts = ln.split()
+        kw = parts[0].lower()
+        if kw not in _ALLOWED_STL_KEYWORDS:
+            raise PackValidationError(
+                f"Unexpected directive {kw!r} in ASCII STL {label}",
+                code="INVALID_PACK",
+            )
+        if kw == "solid":
+            if state != "EXPECT_SOLID":
+                raise PackValidationError(
+                    f"Unexpected 'solid' in ASCII STL {label}", code="INVALID_PACK"
+                )
+            state = "IN_SOLID"
+        elif kw == "endsolid":
+            if state != "IN_SOLID":
+                raise PackValidationError(
+                    f"Unexpected 'endsolid' while in state {state} in ASCII STL {label}",
+                    code="INVALID_PACK",
+                )
+            state = "DONE"
+        elif kw == "facet":
+            if state != "IN_SOLID" or len(parts) != 5 or parts[1].lower() != "normal":
+                raise PackValidationError(
+                    f"Invalid or unexpected facet normal in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                )
+            try:
+                normals = [float(parts[2]), float(parts[3]), float(parts[4])]
+            except ValueError:
+                raise PackValidationError(
+                    f"Non-numeric normal in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                ) from None
+            if not all(math.isfinite(v) for v in normals):
+                raise PackValidationError(
+                    f"Non-finite normal in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                )
+            state = "IN_FACET"
+        elif kw == "outer":
+            if state != "IN_FACET" or len(parts) != 2 or parts[1].lower() != "loop":
+                raise PackValidationError(
+                    f"Invalid or unexpected outer loop in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                )
+            state = "IN_LOOP"
+            loop_verts = 0
+        elif kw == "vertex":
+            if state != "IN_LOOP" or len(parts) != 4:
+                raise PackValidationError(
+                    f"Invalid or unexpected vertex line in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                )
+            try:
+                coords = [float(parts[1]), float(parts[2]), float(parts[3])]
+            except ValueError:
+                raise PackValidationError(
+                    f"Non-numeric vertex in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                ) from None
+            if not all(math.isfinite(v) for v in coords):
+                raise PackValidationError(
+                    f"Non-finite vertex in ASCII STL {label}: {ln!r}",
+                    code="INVALID_PACK",
+                )
+            loop_verts += 1
+            if loop_verts > 3:
+                raise PackValidationError(
+                    f"Too many vertices in loop in ASCII STL {label}",
+                    code="INVALID_PACK",
+                )
+            verts += 1
+            if vertex_budget_used + verts > MAX_TOTAL_VERTICES:
+                raise PackValidationError(
+                    f"Total vertex count {vertex_budget_used + verts} exceeds budget {MAX_TOTAL_VERTICES}",
+                    code="PACK_TOO_LARGE",
+                )
+        elif kw == "endloop":
+            if state != "IN_LOOP" or loop_verts != 3:
+                raise PackValidationError(
+                    f"Invalid endloop (expected 3 vertices, got {loop_verts}) in ASCII STL {label}",
+                    code="INVALID_PACK",
+                )
+            state = "AFTER_LOOP"
+        elif kw == "endfacet":
+            if state != "AFTER_LOOP":
+                raise PackValidationError(
+                    f"Unexpected 'endfacet' in ASCII STL {label}", code="INVALID_PACK"
+                )
+            state = "IN_SOLID"
+    if state != "DONE":
+        raise PackValidationError(
+            f"Incomplete ASCII STL {label} (ended in state {state})",
+            code="INVALID_PACK",
+        )
+    return verts
+
+
+def _validate_stl_file(path: Path, label: str, vertex_budget_used: int) -> int:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise PackValidationError(f"Cannot stat mesh {label}: {exc}", code="INVALID_PACK") from None
+    if size > MAX_SINGLE_MESH_BYTES:
+        raise PackValidationError(
+            f"Mesh {label} size {size} exceeds {MAX_SINGLE_MESH_BYTES} bytes",
+            code="PACK_TOO_LARGE",
+        )
+    data = path.read_bytes()
+    # Distinguish binary vs ASCII STL: check exact binary STL length BEFORE startswith(b"solid")
+    if len(data) >= 84:
+        tri_count = struct.unpack_from("<I", data, 80)[0]
+        if len(data) == 84 + 50 * tri_count:
+            return _validate_binary_stl(data, label, vertex_budget_used)
+    stripped_l = data.lstrip()
+    if stripped_l[:5].lower() == b"solid" and (
+        b"facet" in data.lower()
+        or b"endsolid" in data.lower()
+        or b"vertex" in data.lower()
+        or len(data) < 84
+    ):
+        return _validate_ascii_stl(data, label, vertex_budget_used)
+    return _validate_binary_stl(data, label, vertex_budget_used)
+
+
+def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise PackValidationError(f"Cannot stat mesh {label}: {exc}", code="INVALID_PACK") from None
+    if size > MAX_SINGLE_MESH_BYTES:
+        raise PackValidationError(
+            f"Mesh {label} size {size} exceeds {MAX_SINGLE_MESH_BYTES} bytes",
+            code="PACK_TOO_LARGE",
+        )
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PackValidationError(
+            f"Invalid UTF-8 in OBJ {label}: {exc}", code="INVALID_PACK"
+        ) from None
+    verts = 0
+    vt_count = 0
+    vn_count = 0
+    faces: list[tuple[int, list[str]]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        directive = parts[0]
+        if directive == "mtllib":
+            raise PackValidationError(
+                f"Forbidden 'mtllib' directive in OBJ {label}", code="INVALID_PACK"
+            )
+        if directive not in _ALLOWED_OBJ_DIRECTIVES:
+            raise PackValidationError(
+                f"Forbidden directive {directive!r} in OBJ {label}",
+                code="INVALID_PACK",
+            )
+        if directive in {"v", "vn", "vt"}:
+            if directive == "v" and len(parts) not in (4, 5):
+                raise PackValidationError(
+                    f"Invalid vertex line in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                )
+            if directive == "vn" and len(parts) != 4:
+                raise PackValidationError(
+                    f"Invalid normal line in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                )
+            if directive == "vt" and len(parts) not in (2, 3, 4):
+                raise PackValidationError(
+                    f"Invalid texcoord line in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                )
+            try:
+                coords = [float(x) for x in parts[1:]]
+            except ValueError:
+                raise PackValidationError(
+                    f"Non-numeric coordinate in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                ) from None
+            if not all(math.isfinite(v) for v in coords):
+                raise PackValidationError(
+                    f"Non-finite coordinate in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                )
+            if directive == "v":
+                verts += 1
+                if vertex_budget_used + verts > MAX_TOTAL_VERTICES:
+                    raise PackValidationError(
+                        f"Total vertex count {vertex_budget_used + verts} exceeds budget {MAX_TOTAL_VERTICES}",
+                        code="PACK_TOO_LARGE",
+                    )
+            elif directive == "vt":
+                vt_count += 1
+            elif directive == "vn":
+                vn_count += 1
+        elif directive == "f":
+            if len(parts) < 4:
+                raise PackValidationError(
+                    f"Invalid face line in OBJ {label}: {stripped!r}",
+                    code="INVALID_PACK",
+                )
+            for tok in parts[1:]:
+                idx_parts = tok.split("/")
+                if len(idx_parts) > 3 or not idx_parts[0]:
+                    raise PackValidationError(
+                        f"Invalid face vertex index {tok!r} in OBJ {label}",
+                        code="INVALID_PACK",
+                    )
+                for p in idx_parts:
+                    if p:
+                        try:
+                            val = int(p)
+                        except ValueError:
+                            raise PackValidationError(
+                                f"Invalid face index {tok!r} in OBJ {label}",
+                                code="INVALID_PACK",
+                            ) from None
+                        if val == 0:
+                            raise PackValidationError(
+                                f"Zero face index {tok!r} in OBJ {label}",
+                                code="INVALID_PACK",
+                            )
+            faces.append((verts, vt_count, vn_count, parts[1:]))  # type: ignore[arg-type]
+
+    for cur_v, cur_vt, cur_vn, ftoks in faces:  # type: ignore[misc]
+        for tok in ftoks:
+            idx_parts = tok.split("/")
+            v_idx = int(idx_parts[0])
+            if (v_idx > 0 and v_idx > verts) or (v_idx < 0 and -v_idx > cur_v):
+                raise PackValidationError(
+                    f"Out-of-bounds vertex index {v_idx} in OBJ {label}",
+                    code="INVALID_PACK",
+                )
+            if len(idx_parts) >= 2 and idx_parts[1]:
+                vt_idx = int(idx_parts[1])
+                if (vt_idx > 0 and vt_idx > vt_count) or (vt_idx < 0 and -vt_idx > cur_vt):
+                    raise PackValidationError(
+                        f"Out-of-bounds texcoord index {vt_idx} in OBJ {label}",
+                        code="INVALID_PACK",
+                    )
+            if len(idx_parts) == 3 and idx_parts[2]:
+                vn_idx = int(idx_parts[2])
+                if (vn_idx > 0 and vn_idx > vn_count) or (vn_idx < 0 and -vn_idx > cur_vn):
+                    raise PackValidationError(
+                        f"Out-of-bounds normal index {vn_idx} in OBJ {label}",
+                        code="INVALID_PACK",
+                    )
+    return verts
+
+
+def _validate_mesh_file(path: Path, label: str, vertex_budget_used: int) -> int:
+    suffix = path.suffix.lower()
+    if suffix == ".urdf":
+        raise PackValidationError(
+            f"URDF files are not supported: {label}", code="UNSUPPORTED_FORMAT"
+        )
+    if suffix == ".stl":
+        return _validate_stl_file(path, label, vertex_budget_used)
+    if suffix == ".obj":
+        return _validate_obj_file(path, label, vertex_budget_used)
+    raise PackValidationError(
+        f"Unsupported mesh format {suffix!r} for {label}", code="UNSUPPORTED_FORMAT"
+    )
+
+
+def _walk_pack_files(root: Path, *, check_urdf: bool = True) -> list[tuple[str, Path]]:
+    """Walk pack directory matching Rust enumeration: skip hidden entries, reject symlinks escaping root."""
+    root_resolved = root.resolve()
+    files: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root_resolved, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        filenames = sorted(f for f in filenames if not f.startswith("."))
+        cur = Path(dirpath)
+        for dname in list(dirnames):
+            dp = cur / dname
+            if dp.is_symlink():
+                _check_contained(root_resolved, dp, dp.relative_to(root_resolved).as_posix())
+                # Do not traverse symlinked directories repeatedly; reject or verify contained
+                dirnames.remove(dname)
+        for fname in filenames:
+            fp = cur / fname
+            rel = fp.relative_to(root_resolved).as_posix()
+            if check_urdf and fname.lower().endswith(".urdf"):
+                raise PackValidationError(
+                    f"URDF files are not supported: {rel}", code="UNSUPPORTED_FORMAT"
+                )
+            resolved = _check_contained(root_resolved, fp, rel)
+            if resolved.is_file():
+                if check_urdf and resolved.suffix.lower() == ".urdf":
+                    raise PackValidationError(
+                        f"URDF files are not supported: {rel}", code="UNSUPPORTED_FORMAT"
+                    )
+                files.append((rel, resolved))
+    files.sort(key=lambda item: item[0])
+    return files
+
+
+def validate_xml_file_security(
+    xml_path: Path,
+    root_dir: Path,
+    *,
+    vertex_budget_used: int = 0,
+    mesh_count_used: int = 0,
+    validate_refs: bool = True,
+    validate_mesh_files: bool = True,
+) -> tuple[list[Path], int, int, list[Path]]:
+    """Validate XML security/budget rules, inline mesh budgets, and referenced asset closure within root_dir.
+
+    Returns (referenced_meshes, inline_mesh_count, inline_verts + ref_mesh_verts, all_referenced_files).
+    """
+    if xml_path.suffix.lower() == ".urdf":
+        raise PackValidationError(
+            f"URDF files are not supported: {xml_path.name}", code="UNSUPPORTED_FORMAT"
+        )
+    root_resolved = root_dir.resolve()
+    xml_resolved = _check_contained(root_resolved, xml_path, xml_path.name)
+    try:
+        xml_size = xml_resolved.stat().st_size
+    except OSError as exc:
+        raise PackValidationError(
+            f"Cannot stat XML file {xml_path.name}: {exc}", code="INVALID_PACK"
+        ) from None
+    if xml_size > MAX_XML_BYTES:
+        raise PackValidationError(
+            f"XML file {xml_path.name} size {xml_size} exceeds {MAX_XML_BYTES} bytes",
+            code="PACK_TOO_LARGE",
+        )
+    raw_bytes = xml_resolved.read_bytes()
+    if len(raw_bytes) > MAX_XML_BYTES:
+        raise PackValidationError(
+            f"XML file {xml_path.name} size {len(raw_bytes)} exceeds {MAX_XML_BYTES} bytes",
+            code="PACK_TOO_LARGE",
+        )
+    try:
+        xml_text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PackValidationError(
+            f"XML file {xml_path.name} is not valid UTF-8: {exc}", code="INVALID_PACK"
+        ) from None
+
+    upper = xml_text.upper()
+    if "<!DOCTYPE" in upper:
+        raise PackValidationError(
+            f"Forbidden <!DOCTYPE construct in {xml_path.name}", code="INVALID_PACK"
+        )
+    if "<!ENTITY" in upper:
+        raise PackValidationError(
+            f"Forbidden <!ENTITY construct in {xml_path.name}", code="INVALID_PACK"
+        )
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise PackValidationError(
+            f"Malformed XML in {xml_path.name}: {exc}", code="INVALID_PACK"
+        ) from None
+
+    if _local_tag(root.tag) == "robot":
+        raise PackValidationError(
+            f"URDF <robot> XML is not supported: {xml_path.name}",
+            code="UNSUPPORTED_FORMAT",
+        )
+
+    # Pass 1: depth, forbidden tags, path attribute safety, inline mesh budgets, and <compiler> dirs
+    mesh_base = xml_resolved.parent
+    tex_base = xml_resolved.parent
+    asset_base = xml_resolved.parent
+    has_meshdir = False
+    has_texturedir = False
+
+    ref_elements: list[tuple[str, str, str]] = []
+    inline_mesh_count = 0
+    inline_verts = 0
+
+    stack: list[tuple[ET.Element, int]] = [(root, 1)]
+    while stack:
+        el, depth = stack.pop()
+        if depth > MAX_XML_DEPTH:
+            raise PackValidationError(
+                f"XML nesting depth {depth} exceeds limit {MAX_XML_DEPTH} in {xml_path.name}",
+                code="INVALID_PACK",
+            )
+        tag = _local_tag(el.tag)
+        if tag in _FORBIDDEN_XML_TAGS:
+            raise PackValidationError(
+                f"Forbidden XML element <{tag}> in {xml_path.name}",
+                code="INVALID_PACK",
+            )
+        for attr, val in el.attrib.items():
+            attr_l = _local_tag(attr)
+            if attr_l in _PATH_ATTRS:
+                is_dir_attr = attr_l in {"meshdir", "texturedir", "assetdir"}
+                if _is_unsafe_rel_path(val, allow_dot_dir=is_dir_attr):
+                    raise PackValidationError(
+                        f"Unsafe path {val!r} in attribute {attr_l!r} of <{tag}>",
+                        code="PATH_ESCAPE",
+                    )
+                if val.strip().lower().endswith(".urdf"):
+                    raise PackValidationError(
+                        f"URDF reference {val!r} is not supported",
+                        code="UNSUPPORTED_FORMAT",
+                    )
+
+        if tag == "compiler":
+            for dir_attr in ("assetdir", "meshdir", "texturedir"):
+                if dir_attr in el.attrib:
+                    d_val = el.attrib[dir_attr].strip()
+                    d_resolved = _check_contained(
+                        root_resolved, xml_resolved.parent / d_val, f"{dir_attr}={d_val!r}"
+                    )
+                    if not d_resolved.is_dir():
+                        raise PackValidationError(
+                            f"Compiler {dir_attr}={d_val!r} is not a directory",
+                            code="INVALID_PACK",
+                        )
+                    if dir_attr == "assetdir":
+                        asset_base = d_resolved
+                    elif dir_attr == "meshdir":
+                        mesh_base = d_resolved
+                        has_meshdir = True
+                    else:
+                        tex_base = d_resolved
+                        has_texturedir = True
+
+        if tag == "mesh" and "vertex" in el.attrib:
+            raw_v = el.attrib["vertex"].strip()
+            toks = raw_v.split()
+            try:
+                floats = [float(t) for t in toks]
+            except ValueError:
+                raise PackValidationError(
+                    f"Non-numeric inline mesh vertex data in {xml_path.name}",
+                    code="INVALID_PACK",
+                ) from None
+            if not floats or len(floats) % 3 != 0 or not all(math.isfinite(x) for x in floats):
+                raise PackValidationError(
+                    f"Invalid inline mesh vertex data in {xml_path.name}",
+                    code="INVALID_PACK",
+                )
+            inline_mesh_count += 1
+            if mesh_count_used + inline_mesh_count > MAX_MESH_FILES:
+                raise PackValidationError(
+                    f"Mesh count {mesh_count_used + inline_mesh_count} exceeds limit {MAX_MESH_FILES}",
+                    code="PACK_TOO_LARGE",
+                )
+            v_add = len(floats) // 3
+            inline_verts += v_add
+            if vertex_budget_used + inline_verts > MAX_TOTAL_VERTICES:
+                raise PackValidationError(
+                    f"Total vertex count {vertex_budget_used + inline_verts} exceeds budget {MAX_TOTAL_VERTICES}",
+                    code="PACK_TOO_LARGE",
+                )
+
+        if tag in {"mesh", "hfield", "skin", "model"} and "file" in el.attrib:
+            ref_elements.append((tag, "file", el.attrib["file"].strip()))
+        elif tag == "texture":
+            for t_attr in _TEXTURE_FILE_ATTRS:
+                if t_attr in el.attrib:
+                    ref_elements.append((tag, t_attr, el.attrib[t_attr].strip()))
+
+        for child in reversed(list(el)):
+            stack.append((child, depth + 1))
+
+    # Pass 2: resolve references relative to XML's own parent dir / compiler dirs
+    referenced_meshes: list[Path] = []
+    all_referenced_files: list[Path] = []
+    verts_added = inline_verts
+    if validate_refs:
+        for tag, attr_name, rel_file in ref_elements:
+            if tag == "mesh":
+                base = mesh_base if has_meshdir else asset_base
+            elif tag == "texture":
+                base = tex_base if has_texturedir else asset_base
+            else:
+                base = asset_base
+            resolved_ref = _check_contained(
+                root_resolved, base / rel_file, f"<{tag} {attr_name}={rel_file!r}>"
+            )
+            if not resolved_ref.is_file():
+                raise PackValidationError(
+                    f"Referenced <{tag} {attr_name}={rel_file!r}> is not a regular file",
+                    code="INVALID_PACK",
+                )
+            if resolved_ref not in all_referenced_files:
+                all_referenced_files.append(resolved_ref)
+            if tag == "mesh":
+                if resolved_ref not in referenced_meshes:
+                    referenced_meshes.append(resolved_ref)
+                if validate_mesh_files:
+                    verts_added += _validate_mesh_file(
+                        resolved_ref, rel_file, vertex_budget_used + verts_added
+                    )
+
+    return referenced_meshes, inline_mesh_count, verts_added, all_referenced_files
+
+
+def compute_pack_digest(pack_dir: Path | str) -> str:
+    """Compute deterministic SHA-256 hex digest over sorted relative paths and file bytes."""
+    root = Path(pack_dir).resolve()
+    if root.is_file():
+        h = hashlib.sha256()
+        data = root.read_bytes()
+        h.update(root.name.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(len(data).to_bytes(8, "little"))
+        h.update(data)
+        return h.hexdigest()
+
+    files = _walk_pack_files(root, check_urdf=False)
+    h = hashlib.sha256()
+    for rel, resolved in files:
+        if resolved.stat().st_size > MAX_PACK_TOTAL_BYTES:
+            raise PackValidationError(
+                f"File {rel} exceeds max pack size {MAX_PACK_TOTAL_BYTES} bytes",
+                code="PACK_TOO_LARGE",
+            )
+        data = resolved.read_bytes()
+        h.update(rel.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(len(data).to_bytes(8, "little"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def _compute_standalone_xml_digest(xml_path: Path, ref_files: list[Path]) -> str:
+    root = xml_path.parent.resolve()
+    entries: list[tuple[str, Path]] = []
+    seen: set[Path] = set()
+    for p in [xml_path.resolve(), *ref_files]:
+        rp = p.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        entries.append((rp.relative_to(root).as_posix(), rp))
+    entries.sort(key=lambda item: item[0])
+    h = hashlib.sha256()
+    for rel, resolved in entries:
+        data = resolved.read_bytes()
+        h.update(rel.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(len(data).to_bytes(8, "little"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def _validate_standalone_xml(xml_path: Path) -> str:
+    """Validate standalone XML slug, security, aggregate asset budgets, and compute digest."""
+    if not PACK_SLUG_RE.fullmatch(xml_path.stem):
+        raise PackValidationError(
+            f"Invalid standalone pack id {xml_path.stem!r}: must match {PACK_SLUG_RE.pattern}",
+            code="INVALID_PACK",
+        )
+    root = xml_path.parent.resolve()
+    ref_meshes, inline_count, total_verts, all_refs = validate_xml_file_security(
+        xml_path, root, validate_refs=True, validate_mesh_files=True
+    )
+    if inline_count + len(ref_meshes) > MAX_MESH_FILES:
+        raise PackValidationError(
+            f"Mesh count {inline_count + len(ref_meshes)} exceeds limit {MAX_MESH_FILES}",
+            code="PACK_TOO_LARGE",
+        )
+    if total_verts > MAX_TOTAL_VERTICES:
+        raise PackValidationError(
+            f"Total vertex count {total_verts} exceeds budget {MAX_TOTAL_VERTICES}",
+            code="PACK_TOO_LARGE",
+        )
+    total_bytes = xml_path.stat().st_size + sum(p.stat().st_size for p in all_refs)
+    if total_bytes > MAX_PACK_TOTAL_BYTES:
+        raise PackValidationError(
+            f"Standalone XML pack size {total_bytes} exceeds budget {MAX_PACK_TOTAL_BYTES} bytes",
+            code="PACK_TOO_LARGE",
+        )
+    return _compute_standalone_xml_digest(xml_path, all_refs)
+
+
+def validate_pack_security(
+    pack_dir: Path | str,
+    kind: str,
+    manifest: dict[str, Any] | None = None,
+    *,
+    expected_digest: str | None = None,
+) -> str:
+    """Validate pack ID, XML security/budgets, mesh budgets/geometry, and reference closure.
+
+    Returns the deterministic SHA-256 pack digest.
+    """
+    raw_path = Path(pack_dir)
+    if str(pack_dir).strip().lower().endswith(".urdf"):
+        raise PackValidationError(
+            f"URDF files are not supported: {pack_dir}", code="UNSUPPORTED_FORMAT"
+        )
+    if not raw_path.exists():
+        raise PackValidationError(
+            f"Pack directory not found: {pack_dir}", code="PACK_NOT_FOUND"
+        )
+    root = raw_path.resolve()
+    if not root.is_dir():
+        raise PackValidationError(
+            f"Pack path is not a directory: {pack_dir}", code="INVALID_PACK"
+        )
+
+    manifest_name = "scene.json" if kind in {"scene", "scenes"} else "tool.json"
+    if manifest is None and (root / manifest_name).is_file():
+        manifest_file = _check_contained(root, root / manifest_name, manifest_name)
+        if manifest_file.stat().st_size > MAX_MANIFEST_BYTES:
+            raise PackValidationError(
+                f"Manifest {manifest_name} size exceeds {MAX_MANIFEST_BYTES} bytes",
+                code="PACK_TOO_LARGE",
+            )
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise PackValidationError(
+                f"Invalid {manifest_name}: {exc}", code="INVALID_PACK"
+            ) from None
+        if not isinstance(manifest, dict):
+            raise PackValidationError(
+                f"{manifest_name} must be a JSON object", code="INVALID_PACK"
+            )
+
+    pack_id = manifest.get("id") if isinstance(manifest, dict) else root.name
+    if not isinstance(pack_id, str) or not PACK_SLUG_RE.fullmatch(pack_id):
+        raise PackValidationError(
+            f"Invalid pack id {pack_id!r}: must match {PACK_SLUG_RE.pattern}",
+            code="INVALID_PACK",
+        )
+
+    # Walk pack_dir: skip hidden entries, reject escaping symlinks & .urdf, check sizes before read
+    walked_files = _walk_pack_files(root, check_urdf=True)
+    total_bytes = 0
+    mesh_files: dict[Path, str] = {}
+    xml_files: list[Path] = []
+    for rel, resolved in walked_files:
+        size = resolved.stat().st_size
+        total_bytes += size
+        if total_bytes > MAX_PACK_TOTAL_BYTES:
+            raise PackValidationError(
+                f"Total pack size {total_bytes} exceeds budget {MAX_PACK_TOTAL_BYTES} bytes",
+                code="PACK_TOO_LARGE",
+            )
+        suf = resolved.suffix.lower()
+        if suf in {".stl", ".obj"}:
+            mesh_files[resolved] = rel
+        elif suf == ".xml":
+            xml_files.append(resolved)
+
+    if len(mesh_files) > MAX_MESH_FILES:
+        raise PackValidationError(
+            f"Mesh file count {len(mesh_files)} exceeds limit {MAX_MESH_FILES}",
+            code="PACK_TOO_LARGE",
+        )
+
+    # Validate required manifest assets
+    if isinstance(manifest, dict) and isinstance(manifest.get("assets"), list):
+        for entry in manifest["assets"]:
+            required = True
+            rel_asset = None
+            if isinstance(entry, str):
+                rel_asset = entry
+            elif isinstance(entry, dict):
+                required = bool(entry.get("required", True))
+                for k in ("path", "target", "filename"):
+                    if isinstance(entry.get(k), str) and entry[k].strip():
+                        rel_asset = entry[k]
+                        break
+            if rel_asset is not None:
+                if _is_unsafe_rel_path(rel_asset):
+                    raise PackValidationError(
+                        f"Unsafe asset path {rel_asset!r} in {manifest_name}",
+                        code="PATH_ESCAPE",
+                    )
+                if required:
+                    resolved_asset = _check_contained(
+                        root, root / rel_asset.strip(), f"manifest asset {rel_asset!r}"
+                    )
+                    if not resolved_asset.is_file():
+                        raise PackValidationError(
+                            f"Required manifest asset not found: {rel_asset!r}",
+                            code="INVALID_PACK",
+                        )
+
+    # Primary XML check
+    default_xml = "world.xml" if kind in {"scene", "scenes"} else "tool.xml"
+    xml_rel = (
+        str(manifest.get("world_xml" if kind in {"scene", "scenes"} else "tool_xml", default_xml))
+        if isinstance(manifest, dict)
+        else default_xml
+    )
+    if _is_unsafe_rel_path(xml_rel):
+        raise PackValidationError(
+            f"Unsafe XML path {xml_rel!r} in {manifest_name}", code="PATH_ESCAPE"
+        )
+    if xml_rel.strip().lower().endswith(".urdf"):
+        raise PackValidationError(
+            f"URDF XML {xml_rel!r} is not supported", code="UNSUPPORTED_FORMAT"
+        )
+    primary_xml = _check_contained(root, root / xml_rel, xml_rel)
+    if not primary_xml.is_file():
+        raise PackValidationError(
+            f"Pack XML file not found: {xml_rel}", code="INVALID_PACK"
+        )
+    if primary_xml not in xml_files:
+        xml_files.append(primary_xml)
+
+    # Validate ALL XML files in the pack (including inline mesh counts/vertices + reference closure)
+    inline_mesh_total = 0
+    total_vertices = 0
+    for xf in xml_files:
+        ref_meshes, inline_cnt, inline_verts, _ = validate_xml_file_security(
+            xf,
+            root,
+            vertex_budget_used=total_vertices,
+            mesh_count_used=len(mesh_files) + inline_mesh_total,
+            validate_refs=True,
+            validate_mesh_files=False,
+        )
+        inline_mesh_total += inline_cnt
+        total_vertices += inline_verts
+        for rm in ref_meshes:
+            if rm not in mesh_files:
+                mesh_files[rm] = rm.relative_to(root).as_posix()
+
+    if len(mesh_files) + inline_mesh_total > MAX_MESH_FILES:
+        raise PackValidationError(
+            f"Mesh count {len(mesh_files) + inline_mesh_total} exceeds limit {MAX_MESH_FILES}",
+            code="PACK_TOO_LARGE",
+        )
+
+    # Sum vertices across ALL mesh files in pack_dir (referenced or unreferenced) + inline meshes
+    for mpath, mrel in sorted(mesh_files.items(), key=lambda item: item[1]):
+        total_vertices += _validate_mesh_file(mpath, mrel, total_vertices)
+
+    digest = compute_pack_digest(root)
+    if expected_digest is not None and expected_digest.strip():
+        if digest != expected_digest.strip().lower():
+            raise PackValidationError(
+                f"Pack digest mismatch: expected {expected_digest!r}, got {digest!r}",
+                code="DIGEST_MISMATCH",
+            )
+    return digest
 
 
 _DEFAULT_SUCTION_XML = """<mujoco model="builtin_suction_tool">
@@ -114,16 +1020,31 @@ def _cache_scene_dir(pack_id: str) -> Path:
     return base / pack_id
 
 
-def resolve_pack_path(ref: str | Path | None, kind: str) -> Path | None:
+def resolve_pack_path(
+    ref: str | Path | None, kind: str, *, prefer_disk: bool = False
+) -> Path | None:
     """Resolve a local path or named built-in pack id ('coffee_kiosk', 'wide_cup_gripper')."""
     if ref is None:
         return None
     raw = str(ref).strip()
-    if not raw or raw in {"default", "default_world"}:
+    if not prefer_disk and (not raw or raw in {"default", "default_world"}):
         return None
+    if not raw:
+        raise FileNotFoundError(f"Empty {kind} pack path: {ref!r}")
+    if raw.lower().endswith(".urdf"):
+        raise PackValidationError(
+            f"URDF files are not supported: {ref!r}", code="UNSUPPORTED_FORMAT"
+        )
     direct = Path(raw).expanduser()
     if direct.exists():
-        return direct.resolve()
+        resolved = direct.resolve()
+        if resolved.suffix.lower() == ".urdf":
+            raise PackValidationError(
+                f"URDF files are not supported: {ref!r}", code="UNSUPPORTED_FORMAT"
+            )
+        return resolved
+    if prefer_disk:
+        raise FileNotFoundError(f"Missing {kind} directory: {ref!r}")
     sub = "scenes" if kind in {"scene", "scenes"} else "tools"
     for root in _search_pack_roots():
         candidate = root / sub / raw
@@ -166,6 +1087,8 @@ class ToolPack:
     suction_range_m: float = 0.030
     io: list[dict[str, Any]] = field(default_factory=list)
     source_ref: str = "default"
+    robots: list[str] = field(default_factory=list)
+    digest: str | None = None
 
     @property
     def is_default(self) -> bool:
@@ -212,68 +1135,76 @@ def _infer_tool_joints_from_xml(
     return driven, coupled, actuator_name
 
 
-def load_tool_pack(ref: str | Path | None) -> ToolPack:
+def load_tool_pack(ref: str | Path | None, *, prefer_disk: bool = False) -> ToolPack:
     """Load a preset tool ('default', 'suction', 'screwdriver'), pack dir, tool.json, or raw XML."""
     raw = str(ref).strip() if ref is not None else "default"
-    if not raw or raw == "default":
-        return ToolPack(
-            id="default",
-            name="Stock Parallel Jaw Gripper",
-            kind="gripper",
-            source_ref="default",
-        )
+    has_path_hint = (
+        prefer_disk
+        or isinstance(ref, Path)
+        or os.sep in raw
+        or (bool(os.altsep) and os.altsep in raw)
+    )
+    if not has_path_hint:
+        if not raw or raw == "default":
+            return ToolPack(
+                id="default",
+                name="Stock Parallel Jaw Gripper",
+                kind="gripper",
+                source_ref="default",
+            )
 
-    if raw == "suction":
-        return ToolPack(
-            id="suction",
-            name="Vacuum Suction End-Effector",
-            kind="suction",
-            tool_spec_xml=_DEFAULT_SUCTION_XML,
-            driven_joint="suction_valve",
-            actuator="m7_suction",
-            motor_to_joint_scale=0.007456140350877194,
-            io=[
-                {
-                    "name": "vacuum",
-                    "kind": "bool",
-                    "direction": "output",
-                    "default": False,
-                },
-                {
-                    "name": "vacuum_engaged",
-                    "kind": "bool",
-                    "direction": "input",
-                    "default": False,
-                },
-            ],
-            source_ref="suction",
-        )
+        if raw == "suction":
+            return ToolPack(
+                id="suction",
+                name="Vacuum Suction End-Effector",
+                kind="suction",
+                tool_spec_xml=_DEFAULT_SUCTION_XML,
+                driven_joint="suction_valve",
+                actuator="m7_suction",
+                motor_to_joint_scale=0.007456140350877194,
+                io=[
+                    {
+                        "name": "vacuum",
+                        "kind": "bool",
+                        "direction": "output",
+                        "default": False,
+                    },
+                    {
+                        "name": "vacuum_engaged",
+                        "kind": "bool",
+                        "direction": "input",
+                        "default": False,
+                    },
+                ],
+                source_ref="suction",
+            )
 
-    if raw == "screwdriver":
-        return ToolPack(
-            id="screwdriver",
-            name="Spindle Electric Screwdriver",
-            kind="screwdriver",
-            tool_spec_xml=_DEFAULT_SCREWDRIVER_XML,
-            driven_joint="spindle_joint",
-            actuator="m7_spindle",
-            motor_to_joint_scale=1.0,
-            io=[
-                {
-                    "name": "spindle_rpm",
-                    "kind": "float",
-                    "direction": "output",
-                    "default": 0.0,
-                }
-            ],
-            source_ref="screwdriver",
-        )
+        if raw == "screwdriver":
+            return ToolPack(
+                id="screwdriver",
+                name="Spindle Electric Screwdriver",
+                kind="screwdriver",
+                tool_spec_xml=_DEFAULT_SCREWDRIVER_XML,
+                driven_joint="spindle_joint",
+                actuator="m7_spindle",
+                motor_to_joint_scale=1.0,
+                io=[
+                    {
+                        "name": "spindle_rpm",
+                        "kind": "float",
+                        "direction": "output",
+                        "default": 0.0,
+                    }
+                ],
+                source_ref="screwdriver",
+            )
 
-    path = resolve_pack_path(raw, "tool")
+    path = resolve_pack_path(ref if prefer_disk else raw, "tool", prefer_disk=prefer_disk)
     if path is None:
         return ToolPack(id="default", name="Stock Parallel Jaw Gripper", kind="gripper")
 
     if path.is_file() and path.suffix.lower() == ".xml":
+        digest = _validate_standalone_xml(path)
         driven, coupled, act = _infer_tool_joints_from_xml(path)
         return ToolPack(
             id=path.stem,
@@ -285,6 +1216,7 @@ def load_tool_pack(ref: str | Path | None) -> ToolPack:
             actuator=act,
             motor_to_joint_scale=-0.007456140350877194,
             source_ref=str(path),
+            digest=digest,
         )
 
     tool_json = (
@@ -292,8 +1224,18 @@ def load_tool_pack(ref: str | Path | None) -> ToolPack:
     )
     if not tool_json.is_file():
         raise FileNotFoundError(f"Expected tool.json or .xml file in {path}")
-    data = json.loads(tool_json.read_text(encoding="utf-8"))
+    if tool_json.stat().st_size > MAX_MANIFEST_BYTES:
+        raise PackValidationError(
+            f"tool.json size exceeds {MAX_MANIFEST_BYTES} bytes", code="PACK_TOO_LARGE"
+        )
+    try:
+        data = json.loads(tool_json.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise PackValidationError(f"Invalid tool.json: {exc}", code="INVALID_PACK") from None
+    if not isinstance(data, dict):
+        raise PackValidationError("tool.json must be a JSON object", code="INVALID_PACK")
     tool_dir = tool_json.parent
+    digest = validate_pack_security(tool_dir, "tool", manifest=data)
     tool_xml = _resolve_within(tool_dir, str(data.get("tool_xml", "tool.xml")))
     if not tool_xml.is_file():
         raise FileNotFoundError(f"Tool XML not found: {tool_xml}")
@@ -324,6 +1266,8 @@ def load_tool_pack(ref: str | Path | None) -> ToolPack:
         suction_range_m=float(data.get("suction_range_m", 0.030)),
         io=[dict(ch) for ch in data.get("io", [])],
         source_ref=str(tool_dir),
+        robots=[str(r) for r in data.get("robots", [])],
+        digest=digest,
     )
 
 
@@ -343,6 +1287,8 @@ class ScenePack:
     default_tool: str = "default"
     assets: list[dict[str, Any]] = field(default_factory=list)
     source_ref: str = ""
+    robots: list[str] = field(default_factory=list)
+    digest: str | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -387,26 +1333,40 @@ def _discover_freejoint_objects(world_xml: Path) -> list[dict[str, Any]]:
     return objs
 
 
-def load_scene_pack(ref: str | Path | None) -> ScenePack | None:
+def load_scene_pack(
+    ref: str | Path | None, *, prefer_disk: bool = False
+) -> ScenePack | None:
     """Load a scene pack from built-in id, directory, scene.json, or standalone world XML."""
-    path = resolve_pack_path(ref, "scene")
+    path = resolve_pack_path(ref, "scene", prefer_disk=prefer_disk)
     if path is None:
         return None
     if path.is_file() and path.suffix.lower() == ".xml":
+        digest = _validate_standalone_xml(path)
         return ScenePack(
             id=path.stem,
             name=path.stem.replace("_", " ").title(),
             world_xml_path=path,
             objects=_discover_freejoint_objects(path),
             source_ref=str(path),
+            digest=digest,
         )
     scene_json = (
         path if path.is_file() and path.name == "scene.json" else path / "scene.json"
     )
     if not scene_json.is_file():
         raise FileNotFoundError(f"Expected scene.json or .xml in {path}")
-    data = json.loads(scene_json.read_text(encoding="utf-8"))
+    if scene_json.stat().st_size > MAX_MANIFEST_BYTES:
+        raise PackValidationError(
+            f"scene.json size exceeds {MAX_MANIFEST_BYTES} bytes", code="PACK_TOO_LARGE"
+        )
+    try:
+        data = json.loads(scene_json.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise PackValidationError(f"Invalid scene.json: {exc}", code="INVALID_PACK") from None
+    if not isinstance(data, dict):
+        raise PackValidationError("scene.json must be a JSON object", code="INVALID_PACK")
     scene_dir = scene_json.parent
+    digest = validate_pack_security(scene_dir, "scene", manifest=data)
     world_xml = _resolve_within(scene_dir, str(data.get("world_xml", "world.xml")))
     if not world_xml.is_file():
         raise FileNotFoundError(f"Scene world XML not found: {world_xml}")
@@ -426,6 +1386,8 @@ def load_scene_pack(ref: str | Path | None) -> ScenePack | None:
         default_tool=str(data.get("default_tool", "default")),
         assets=[dict(a) for a in data.get("assets", [])],
         source_ref=str(scene_dir),
+        robots=[str(r) for r in data.get("robots", [])],
+        digest=digest,
     )
 
 
@@ -453,9 +1415,23 @@ def compose_spec(
 
         if scene_pack is not None:
             _delete_named(spec, "bodies", ["cube"])
+            scene_root = (
+                Path(scene_pack.source_ref)
+                if scene_pack.source_ref and Path(scene_pack.source_ref).is_dir()
+                else scene_pack.world_xml_path.parent
+            )
+            ref_meshes, _, _, _ = validate_xml_file_security(scene_pack.world_xml_path, scene_root)
+            has_local_meshes = bool(ref_meshes) or (
+                bool(scene_pack.source_ref)
+                and Path(scene_pack.source_ref).is_dir()
+                and any(
+                    p.suffix.lower() in {".stl", ".obj"}
+                    for _, p in _walk_pack_files(scene_root, check_urdf=False)
+                )
+            )
             world_spec = mujoco.MjSpec.from_file(str(scene_pack.world_xml_path))
             cache_dir = _cache_scene_dir(scene_pack.id)
-            if cache_dir.is_dir() and not world_spec.meshdir:
+            if not has_local_meshes and cache_dir.is_dir() and not world_spec.meshdir:
                 world_spec.meshdir = str(cache_dir)
             frame = spec.worldbody.add_frame()
             spec.attach(world_spec, frame=frame, prefix="", suffix="")
@@ -484,6 +1460,12 @@ def compose_spec(
             if tool_pack.tool_spec_xml is not None:
                 tool_spec = mujoco.MjSpec.from_string(tool_pack.tool_spec_xml)
             elif tool_pack.tool_xml_path is not None:
+                tool_root = (
+                    Path(tool_pack.source_ref)
+                    if tool_pack.source_ref and Path(tool_pack.source_ref).is_dir()
+                    else tool_pack.tool_xml_path.parent
+                )
+                validate_xml_file_security(tool_pack.tool_xml_path, tool_root)
                 tool_spec = mujoco.MjSpec.from_file(str(tool_pack.tool_xml_path))
             else:
                 raise ValueError(

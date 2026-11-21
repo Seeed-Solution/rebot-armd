@@ -28,13 +28,19 @@ import socket
 import sys
 import threading
 import time
+import uuid
 
 import mujoco
 import numpy as np
 
 from .camera import PROFILE, SO101_PROFILE, CameraMount
 from .model import DOF, MODEL_OFFSETS_RAD, Indexer, load_model
-from .pack import is_valid_pack_slug
+from .pack import (
+    PackValidationError,
+    is_valid_pack_slug,
+    normalize_robot_id,
+    validate_pack_security,
+)
 from .scene import Scene, parse_objects
 
 PROTOCOL_VERSION = 1
@@ -263,6 +269,7 @@ class Simulator:
         tool: str | None = None,
     ):
         self.robot = (robot or os.environ.get("REBOT_SIM_ROBOT") or "b601dm").lower()
+        self.robot_id = normalize_robot_id(self.robot) or "b601dm"
         self.damping = damping
         self.frictionloss = frictionloss
         self.mount = camera_mount
@@ -282,6 +289,15 @@ class Simulator:
             None  # set when the camera process died while running
         )
         self._pending_scene: dict | None = None
+        self.active_tx_id: str | None = None
+        self.camera_tx_id: str | None = None
+        self.activation_state: str = "COMMITTED"
+        self._staged_tx: dict | None = None
+        self._tx_lock = threading.Lock()
+        self._committed_tx_payloads: dict[str, tuple] = {}
+        self._camera_prepare_cb = None
+        self._camera_commit_cb = None
+        self._camera_abort_cb = None
         self.torque_report = torque_report
         # --torque-report mean: torques of the last physics steps and the command period in steps
         self.tau_hist: collections.deque = collections.deque(maxlen=256)
@@ -295,6 +311,8 @@ class Simulator:
             self.tool_pack,
             self.objects,
         ) = self._build_world(scene=scene, tool=tool, objects=objects, seed=seed)
+        self.active_scene_digest: str | None = getattr(self.scene_pack, "digest", None)
+        self.active_tool_digest: str | None = getattr(self.tool_pack, "digest", None)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
         self.sock.setblocking(False)
@@ -312,17 +330,24 @@ class Simulator:
             self.viewer = mj_viewer.launch_passive(self.model, self.data)
 
     def _build_world(
-        self, scene: str | None, tool: str | None, objects: str, seed: int | None
+        self,
+        scene: str | None,
+        tool: str | None,
+        objects: str,
+        seed: int | None,
+        *,
+        scene_is_dir: bool = False,
+        tool_is_dir: bool = False,
     ):
         from .pack import PackScene, load_scene_pack, load_tool_pack
 
-        scene_pack = load_scene_pack(scene)
+        scene_pack = load_scene_pack(scene, prefer_disk=scene_is_dir)
         effective_tool = (
             tool
             if tool is not None
             else (scene_pack.default_tool if scene_pack else "default")
         )
-        tool_pack = load_tool_pack(effective_tool)
+        tool_pack = load_tool_pack(effective_tool, prefer_disk=tool_is_dir and tool is not None)
 
         if scene_pack is not None:
             model = load_model(
@@ -503,6 +528,13 @@ class Simulator:
             "objects": self.scene.state(d),
             "scene": self.scene_pack.id if self.scene_pack else "default",
             "tool": self.tool_pack.id,
+            "robot": self.robot_id,
+            "tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+            "scene_digest": self.active_scene_digest,
+            "tool_digest": self.active_tool_digest,
+            "activation_state": self.activation_state,
+            "degraded": self.activation_state == "DEGRADED_SPLIT",
         }
         if hasattr(self.scene, "io_state"):
             out["io"] = self.scene.io_state(d)
@@ -556,15 +588,787 @@ class Simulator:
                     pass
             return {"io": io}
 
+    def set_camera_hooks(self, prepare_cb=None, commit_cb=None, abort_cb=None) -> None:
+        """Register optional in-process camera prepare/commit/abort callbacks."""
+        self._camera_prepare_cb = prepare_cb
+        self._camera_commit_cb = commit_cb
+        self._camera_abort_cb = abort_cb
+
+    def _cleanup_staged_tx_locked(self) -> None:
+        if self._staged_tx is not None:
+            new_shared = self._staged_tx.get("new_shared")
+            if new_shared is not None and new_shared is not self.shared:
+                try:
+                    new_shared.close()
+                except Exception:
+                    pass
+            staged_cam = self._staged_tx.get("staged_cam")
+            if staged_cam is not None and self._camera_abort_cb is not None:
+                try:
+                    self._camera_abort_cb(staged_cam)
+                except Exception:
+                    pass
+            self._staged_tx = None
+
+    def _snapshot_active_locked(self) -> dict:
+        return {
+            "model": self.model,
+            "data": self.data,
+            "motors": self.motors,
+            "scene": self.scene,
+            "scene_pack": self.scene_pack,
+            "tool_pack": self.tool_pack,
+            "objects": self.objects,
+            "scene_ref": self.scene_ref,
+            "tool_ref": self.tool_ref,
+            "objects_spec": self.objects_spec,
+            "shared": self.shared,
+            "tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+            "scene_digest": self.active_scene_digest,
+            "tool_digest": self.active_tool_digest,
+        }
+
+    def _restore_snapshot_locked(self, snap: dict) -> None:
+        self.tau_hist.clear()
+        self.steps_since_cmd = 0
+        self.model = snap["model"]
+        self.data = snap["data"]
+        self.motors = snap["motors"]
+        self.scene = snap["scene"]
+        self.scene_pack = snap["scene_pack"]
+        self.tool_pack = snap["tool_pack"]
+        self.objects = snap["objects"]
+        self.scene_ref = snap["scene_ref"]
+        self.tool_ref = snap["tool_ref"]
+        self.objects_spec = snap["objects_spec"]
+        self.shared = snap["shared"]
+        self.active_tx_id = snap["tx_id"]
+        self.camera_tx_id = snap["camera_tx_id"]
+        self.active_scene_digest = snap["scene_digest"]
+        self.active_tool_digest = snap["tool_digest"]
+
+    def _close_old_shared_locked(self) -> None:
+        for old_s in self._old_shared:
+            if old_s is not self.shared:
+                try:
+                    old_s.close()
+                except Exception:
+                    pass
+        self._old_shared.clear()
+
+    @staticmethod
+    def _tx_fingerprint(params: dict, scene_ref, tool_ref, objects_str, seed) -> tuple:
+        return (
+            str(scene_ref) if scene_ref is not None else None,
+            str(tool_ref) if tool_ref is not None else None,
+            params.get("scene_dir"),
+            params.get("tool_dir"),
+            params.get("scene_digest"),
+            params.get("tool_digest"),
+            normalize_robot_id(params.get("robot")) if isinstance(params.get("robot"), str) else params.get("robot"),
+            str(objects_str),
+            seed,
+        )
+
+    def _record_committed_tx_locked(self, tx_id: str, fingerprint: tuple) -> None:
+        self._committed_tx_payloads[tx_id] = fingerprint
+        if len(self._committed_tx_payloads) > 256:
+            oldest = next(iter(self._committed_tx_payloads))
+            self._committed_tx_payloads.pop(oldest, None)
+
+    def _tx_prepare_locked(self, params: dict) -> dict:
+        if self.activation_state == "DEGRADED_SPLIT":
+            return {
+                "_http_status": 503,
+                "error": "SIM_ACTIVATION_DEGRADED",
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+                "robot": self.robot_id,
+            }
+        if self.activation_state == "COMMITTING":
+            return {
+                "_http_status": 409,
+                "error": "commit in progress",
+                "code": "TX_BUSY",
+                "state": "ABORTED",
+            }
+        if not isinstance(params, dict):
+            return {
+                "_http_status": 400,
+                "error": "request body must be a JSON object",
+                "code": "INVALID_REQUEST",
+                "state": "ABORTED",
+            }
+        tx_id = params.get("tx_id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            return {
+                "_http_status": 400,
+                "error": "tx_id must be a non-empty string",
+                "code": "INVALID_TX_ID",
+                "state": "ABORTED",
+            }
+        tx_id = tx_id.strip()
+
+        req_robot = params.get("robot")
+        if req_robot is not None:
+            norm_req = normalize_robot_id(req_robot) if isinstance(req_robot, str) else None
+            if norm_req != self.robot_id:
+                return {
+                    "_http_status": 400,
+                    "error": f"Robot {req_robot!r} is incompatible with running robot {self.robot_id!r}",
+                    "code": "ROBOT_INCOMPATIBLE",
+                    "expected_robot": self.robot_id,
+                    "got_robot": req_robot,
+                    "state": "ABORTED",
+                }
+
+        scene_param = params.get("scene")
+        tool_param = params.get("tool")
+        scene_dir = params.get("scene_dir")
+        tool_dir = params.get("tool_dir")
+
+        if scene_param is not None and not is_valid_pack_slug(scene_param):
+            return {
+                "_http_status": 400,
+                "error": f"invalid scene slug: {scene_param!r}",
+                "code": "INVALID_PACK",
+                "state": "ABORTED",
+            }
+        if tool_param is not None and not is_valid_pack_slug(tool_param):
+            return {
+                "_http_status": 400,
+                "error": f"invalid tool slug: {tool_param!r}",
+                "code": "INVALID_PACK",
+                "state": "ABORTED",
+            }
+
+        if scene_dir is not None:
+            if not isinstance(scene_dir, str) or not scene_dir.strip():
+                return {
+                    "_http_status": 400,
+                    "error": "scene_dir must be a non-empty string",
+                    "code": "INVALID_PACK",
+                    "state": "ABORTED",
+                }
+            scene_ref = scene_dir.strip()
+        elif "scene" in params:
+            scene_ref = scene_param
+        else:
+            scene_ref = self.scene_ref
+
+        if tool_dir is not None:
+            if not isinstance(tool_dir, str) or not tool_dir.strip():
+                return {
+                    "_http_status": 400,
+                    "error": "tool_dir must be a non-empty string",
+                    "code": "INVALID_PACK",
+                    "state": "ABORTED",
+                }
+            tool_ref = tool_dir.strip()
+        elif "tool" in params:
+            tool_ref = tool_param
+        elif "scene" in params or scene_dir is not None:
+            tool_ref = None
+        else:
+            tool_ref = self.tool_ref
+
+        seed = params.get("seed", self.scene.seed)
+        objects_str = params.get("objects", self.objects_spec)
+        fingerprint = self._tx_fingerprint(params, scene_ref, tool_ref, objects_str, seed)
+        if tx_id in self._committed_tx_payloads:
+            if self._committed_tx_payloads[tx_id] != fingerprint or tx_id != self.active_tx_id:
+                return {
+                    "_http_status": 409,
+                    "error": f"tx_id {tx_id!r} was already committed",
+                    "code": "TX_ID_CONFLICT",
+                    "state": "ABORTED",
+                }
+
+        exp_scene_digest = params.get("scene_digest")
+        exp_tool_digest = params.get("tool_digest")
+
+        try:
+            if scene_dir is not None:
+                validate_pack_security(
+                    scene_ref,
+                    "scene",
+                    expected_digest=exp_scene_digest if isinstance(exp_scene_digest, str) else None,
+                )
+            if tool_dir is not None:
+                validate_pack_security(
+                    tool_ref,
+                    "tool",
+                    expected_digest=exp_tool_digest if isinstance(exp_tool_digest, str) else None,
+                )
+            model, data, motors, scene, scene_pack, tool_pack, parsed_objs = (
+                self._build_world(
+                    scene=scene_ref,
+                    tool=tool_ref,
+                    objects=objects_str,
+                    seed=seed,
+                    scene_is_dir=(scene_dir is not None),
+                    tool_is_dir=(tool_dir is not None),
+                )
+            )
+            if (
+                scene_dir is not None
+                and scene_param
+                and scene_param not in {"default", "default_world"}
+                and scene_pack is not None
+                and scene_pack.id != scene_param
+            ):
+                raise PackValidationError(
+                    f"Scene pack id {scene_pack.id!r} does not match requested {scene_param!r}",
+                    code="INVALID_PACK",
+                )
+            if (
+                tool_dir is not None
+                and tool_param
+                and tool_param != "default"
+                and tool_pack.id != tool_param
+            ):
+                raise PackValidationError(
+                    f"Tool pack id {tool_pack.id!r} does not match requested {tool_param!r}",
+                    code="INVALID_PACK",
+                )
+            if scene_pack is not None and scene_pack.robots:
+                allowed = {normalize_robot_id(r) for r in scene_pack.robots}
+                if self.robot_id not in allowed:
+                    return {
+                        "_http_status": 400,
+                        "error": f"Scene {scene_pack.id!r} does not support robot {self.robot_id!r}",
+                        "code": "ROBOT_INCOMPATIBLE",
+                        "expected_robot": self.robot_id,
+                        "got_robot": scene_pack.robots,
+                        "state": "ABORTED",
+                    }
+            if tool_pack.robots:
+                allowed = {normalize_robot_id(r) for r in tool_pack.robots}
+                if self.robot_id not in allowed:
+                    return {
+                        "_http_status": 400,
+                        "error": f"Tool {tool_pack.id!r} does not support robot {self.robot_id!r}",
+                        "code": "ROBOT_INCOMPATIBLE",
+                        "expected_robot": self.robot_id,
+                        "got_robot": tool_pack.robots,
+                        "state": "ABORTED",
+                    }
+            actual_scene_digest = scene_pack.digest if scene_pack is not None else None
+            actual_tool_digest = tool_pack.digest if tool_pack is not None else None
+            if exp_scene_digest is not None:
+                if not isinstance(exp_scene_digest, str):
+                    raise PackValidationError("scene_digest must be a string or null", code="DIGEST_MISMATCH")
+                if exp_scene_digest.strip():
+                    if actual_scene_digest is None or actual_scene_digest != exp_scene_digest.strip().lower():
+                        raise PackValidationError(
+                            f"Scene digest mismatch: expected {exp_scene_digest!r}, got {actual_scene_digest!r}",
+                            code="DIGEST_MISMATCH",
+                        )
+            if exp_tool_digest is not None:
+                if not isinstance(exp_tool_digest, str):
+                    raise PackValidationError("tool_digest must be a string or null", code="DIGEST_MISMATCH")
+                if exp_tool_digest.strip():
+                    if actual_tool_digest is None or actual_tool_digest != exp_tool_digest.strip().lower():
+                        raise PackValidationError(
+                            f"Tool digest mismatch: expected {exp_tool_digest!r}, got {actual_tool_digest!r}",
+                            code="DIGEST_MISMATCH",
+                        )
+        except PackValidationError as exc:
+            return {
+                "_http_status": exc.status,
+                "error": str(exc),
+                "code": exc.code,
+                "state": "ABORTED",
+            }
+        except FileNotFoundError as exc:
+            return {
+                "_http_status": 400,
+                "error": str(exc),
+                "code": "PACK_NOT_FOUND",
+                "state": "ABORTED",
+            }
+        except (ValueError, TypeError) as exc:
+            return {
+                "_http_status": 400,
+                "error": f"scene prepare failed: {exc}",
+                "code": "INVALID_PACK",
+                "state": "ABORTED",
+            }
+        except Exception as exc:
+            return {
+                "_http_status": 422,
+                "error": f"scene compile failed: {exc}",
+                "code": "COMPILE_FAILED",
+                "state": "ABORTED",
+            }
+
+        new_shared = None
+        shm_dict = None
+        if self.shared is not None:
+            try:
+                from .perception import SharedState
+
+                new_shared = SharedState(model.nq, model.nv, lock=self.shared.lock)
+                new_shared.write(data)
+                shm_dict = {"name": new_shared.shm.name, "nq": model.nq, "nv": model.nv}
+            except Exception as exc:
+                if new_shared is not None:
+                    try:
+                        new_shared.close()
+                    except Exception:
+                        pass
+                return {
+                    "_http_status": 500,
+                    "error": f"shared memory allocation failed: {exc}",
+                    "code": "SHM_ALLOC_FAILED",
+                    "state": "ABORTED",
+                }
+
+        staged_cam = None
+        if self._camera_prepare_cb is not None:
+            try:
+                staged_cam = self._camera_prepare_cb(
+                    {
+                        "tx_id": tx_id,
+                        "model": model,
+                        "data": data,
+                        "scene": scene,
+                        "scene_pack": scene_pack,
+                        "tool_pack": tool_pack,
+                        "scene_ref": scene_ref,
+                        "tool_ref": tool_ref,
+                        "objects_str": objects_str,
+                        "scene_digest": actual_scene_digest,
+                        "tool_digest": actual_tool_digest,
+                    }
+                )
+            except Exception as exc:
+                if new_shared is not None:
+                    try:
+                        new_shared.close()
+                    except Exception:
+                        pass
+                return {
+                    "_http_status": 422,
+                    "error": f"camera prepare failed: {exc}",
+                    "code": "CAMERA_PREPARE_FAILED",
+                    "state": "ABORTED",
+                }
+
+        self._cleanup_staged_tx_locked()
+        self._staged_tx = {
+            "tx_id": tx_id,
+            "fingerprint": fingerprint,
+            "physics_committed": False,
+            "model": model,
+            "data": data,
+            "motors": motors,
+            "scene": scene,
+            "scene_pack": scene_pack,
+            "tool_pack": tool_pack,
+            "parsed_objs": parsed_objs,
+            "scene_ref": scene_ref,
+            "tool_ref": tool_ref,
+            "objects_str": objects_str,
+            "scene_digest": actual_scene_digest,
+            "tool_digest": actual_tool_digest,
+            "new_shared": new_shared,
+            "staged_cam": staged_cam,
+            "prev_snapshot": None,
+        }
+
+        out = {
+            "_http_status": 200,
+            "ok": True,
+            "state": "PREPARED",
+            "tx_id": tx_id,
+            "robot": self.robot_id,
+            "scene": scene_pack.id if scene_pack else "default",
+            "tool": tool_pack.id,
+            "scene_digest": actual_scene_digest,
+            "tool_digest": actual_tool_digest,
+            "_scene_ref": scene_ref,
+            "_tool_ref": tool_ref,
+            "_scene_is_dir": scene_dir is not None,
+            "_tool_is_dir": tool_dir is not None,
+            "_objects_spec": objects_str,
+            "_scene_digest": actual_scene_digest,
+            "_tool_digest": actual_tool_digest,
+        }
+        if shm_dict is not None:
+            out["_shm"] = shm_dict
+        return out
+
+    def _tx_commit_physics_locked(self, params: dict) -> dict:
+        if not isinstance(params, dict):
+            return {
+                "_http_status": 400,
+                "error": "request body must be a JSON object",
+                "code": "INVALID_REQUEST",
+            }
+        tx_id = params.get("tx_id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            return {
+                "_http_status": 400,
+                "error": "tx_id must be a non-empty string",
+                "code": "INVALID_TX_ID",
+            }
+        tx_id = tx_id.strip()
+        if self.activation_state == "COMMITTING":
+            return {
+                "_http_status": 409,
+                "error": "commit already in progress",
+                "code": "TX_BUSY",
+            }
+        if self.activation_state == "DEGRADED_SPLIT":
+            return {
+                "_http_status": 503,
+                "error": "SIM_ACTIVATION_DEGRADED",
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+                "robot": self.robot_id,
+            }
+        if self._staged_tx is None or self._staged_tx["tx_id"] != tx_id:
+            return {
+                "_http_status": 409,
+                "error": f"tx {tx_id!r} is not prepared",
+                "code": "TX_NOT_PREPARED",
+            }
+        staged = self._staged_tx
+        if staged.get("physics_committed"):
+            return {
+                "_http_status": 409,
+                "error": f"tx {tx_id!r} physics already committed",
+                "code": "TX_BUSY",
+            }
+        snap = self._snapshot_active_locked()
+        self.activation_state = "COMMITTING"
+        try:
+            self.tau_hist.clear()
+            self.steps_since_cmd = 0
+            self.model = staged["model"]
+            self.data = staged["data"]
+            self.motors = staged["motors"]
+            self.scene = staged["scene"]
+            self.scene_pack = staged["scene_pack"]
+            self.tool_pack = staged["tool_pack"]
+            self.objects = staged["parsed_objs"]
+            self.scene_ref = staged["scene_ref"]
+            self.tool_ref = staged["tool_ref"]
+            self.objects_spec = staged["objects_str"]
+            self.active_scene_digest = staged["scene_digest"]
+            self.active_tool_digest = staged["tool_digest"]
+            if staged["new_shared"] is not None:
+                self.shared = staged["new_shared"]
+            staged["prev_snapshot"] = snap
+            staged["physics_committed"] = True
+        except Exception as exc:
+            self._restore_snapshot_locked(snap)
+            self.activation_state = "COMMITTED"
+            self._cleanup_staged_tx_locked()
+            return {
+                "_http_status": 500,
+                "error": f"physics commit failed: {exc}",
+                "code": "PHYSICS_COMMIT_FAILED",
+                "state": "ABORTED",
+            }
+        return {
+            "_http_status": 200,
+            "ok": True,
+            "tx_id": tx_id,
+            "robot": self.robot_id,
+            "scene": self.scene_pack.id if self.scene_pack else "default",
+            "tool": self.tool_pack.id,
+            "scene_digest": self.active_scene_digest,
+            "tool_digest": self.active_tool_digest,
+        }
+
+    def _tx_mark_degraded_locked(self, params: dict) -> dict:
+        tx_id = str(params.get("tx_id") or "")
+        err = str(params.get("error") or "camera commit failed")
+        self.active_tx_id = tx_id or self.active_tx_id
+        self.activation_state = "DEGRADED_SPLIT"
+        return {
+            "_http_status": 503,
+            "error": err,
+            "code": "SIM_ACTIVATION_DEGRADED",
+            "state": "DEGRADED_SPLIT",
+            "tx_id": self.active_tx_id,
+            "physics_tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+            "robot": self.robot_id,
+        }
+
+    def _tx_finalize_locked(self, params: dict) -> dict:
+        tx_id = params.get("tx_id")
+        if (
+            not isinstance(tx_id, str)
+            or self._staged_tx is None
+            or self._staged_tx.get("tx_id") != tx_id
+        ):
+            return {
+                "_http_status": 409,
+                "error": f"tx {tx_id!r} is not staged for finalization",
+                "code": "TX_NOT_PREPARED",
+            }
+        staged = self._staged_tx
+        if staged.get("prev_snapshot") is not None:
+            old_shared = staged["prev_snapshot"].get("shared")
+            if old_shared is not None and old_shared is not self.shared:
+                self._old_shared.append(old_shared)
+        self._close_old_shared_locked()
+        self._record_committed_tx_locked(tx_id, staged["fingerprint"])
+        self.active_tx_id = tx_id
+        self.camera_tx_id = tx_id
+        self.activation_state = "COMMITTED"
+        self._staged_tx = None
+        return {
+            "_http_status": 200,
+            "ok": True,
+            "state": "COMMITTED",
+            "tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+            "robot": self.robot_id,
+            "scene": self.scene_pack.id if self.scene_pack else "default",
+            "tool": self.tool_pack.id,
+            "scene_digest": self.active_scene_digest,
+            "tool_digest": self.active_tool_digest,
+        }
+
+    def _tx_rollback_physics_locked(self, params: dict) -> dict:
+        tx_id = params.get("tx_id")
+        if (
+            self.activation_state not in {"DEGRADED_SPLIT", "COMMITTING"}
+            or self._staged_tx is None
+            or self._staged_tx.get("tx_id") != tx_id
+            or self._staged_tx.get("prev_snapshot") is None
+        ):
+            return {
+                "_http_status": 409,
+                "error": f"tx {tx_id!r} is not in DEGRADED_SPLIT",
+                "code": "TX_NOT_PREPARED",
+            }
+        staged = self._staged_tx
+        if staged.get("staged_cam") is not None and self._camera_abort_cb is not None:
+            try:
+                self._camera_abort_cb(staged["staged_cam"])
+            except Exception as exc:
+                self.activation_state = "DEGRADED_SPLIT"
+                return {
+                    "_http_status": 503,
+                    "error": f"camera abort failed: {exc}",
+                    "code": "CAMERA_ABORT_FAILED",
+                    "state": "DEGRADED_SPLIT",
+                }
+        snap = staged["prev_snapshot"]
+        self._restore_snapshot_locked(snap)
+        if staged.get("new_shared") is not None and staged["new_shared"] is not self.shared:
+            try:
+                staged["new_shared"].close()
+            except Exception:
+                pass
+        self._staged_tx = None
+        self.activation_state = "COMMITTED"
+        return {
+            "_http_status": 200,
+            "ok": True,
+            "state": "ABORTED",
+            "restored_tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+            "robot": self.robot_id,
+            "scene": self.scene_pack.id if self.scene_pack else "default",
+            "tool": self.tool_pack.id,
+            "scene_digest": self.active_scene_digest,
+            "tool_digest": self.active_tool_digest,
+        }
+
+    def _tx_commit_locked(self, params: dict) -> dict:
+        if not isinstance(params, dict):
+            return {
+                "_http_status": 400,
+                "error": "request body must be a JSON object",
+                "code": "INVALID_REQUEST",
+            }
+        tx_id = params.get("tx_id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            return {
+                "_http_status": 400,
+                "error": "tx_id must be a non-empty string",
+                "code": "INVALID_TX_ID",
+            }
+        tx_id = tx_id.strip()
+        phase = params.get("phase", "all")
+        if not isinstance(phase, str) or phase not in {"all", "camera_only", "rollback_physics"}:
+            return {
+                "_http_status": 400,
+                "error": f"invalid commit phase: {phase!r}",
+                "code": "INVALID_PHASE",
+            }
+
+        if phase == "all" and self.activation_state == "COMMITTING":
+            return {
+                "_http_status": 409,
+                "error": "commit already in progress",
+                "code": "TX_BUSY",
+            }
+
+        if (
+            phase in {"all", "camera_only"}
+            and tx_id == self.active_tx_id
+            and self.camera_tx_id == tx_id
+            and self.activation_state == "COMMITTED"
+        ):
+            return {
+                "_http_status": 200,
+                "ok": True,
+                "state": "COMMITTED",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+                "robot": self.robot_id,
+                "scene": self.scene_pack.id if self.scene_pack else "default",
+                "tool": self.tool_pack.id,
+                "scene_digest": self.active_scene_digest,
+                "tool_digest": self.active_tool_digest,
+            }
+
+        if phase == "rollback_physics":
+            return self._tx_rollback_physics_locked({"tx_id": tx_id})
+
+        if phase == "camera_only":
+            if (
+                self.activation_state != "DEGRADED_SPLIT"
+                or self._staged_tx is None
+                or self._staged_tx.get("tx_id") != tx_id
+            ):
+                return {
+                    "_http_status": 409,
+                    "error": f"tx {tx_id!r} is not in DEGRADED_SPLIT",
+                    "code": "TX_NOT_PREPARED",
+                }
+            if self._camera_commit_cb is not None:
+                try:
+                    self._camera_commit_cb(self._staged_tx.get("staged_cam"))
+                except Exception as exc:
+                    return self._tx_mark_degraded_locked({"tx_id": tx_id, "error": str(exc)})
+            return self._tx_finalize_locked({"tx_id": tx_id})
+
+        # phase == "all"
+        phys = self._tx_commit_physics_locked({"tx_id": tx_id})
+        if phys.get("_http_status", 200) != 200:
+            return phys
+
+        if self._camera_commit_cb is not None:
+            try:
+                self._camera_commit_cb(self._staged_tx.get("staged_cam"))
+            except Exception as exc:
+                return self._tx_mark_degraded_locked({"tx_id": tx_id, "error": str(exc)})
+
+        return self._tx_finalize_locked({"tx_id": tx_id})
+
+    def _tx_abort_locked(self, params: dict) -> dict:
+        if not isinstance(params, dict):
+            return {
+                "_http_status": 400,
+                "error": "request body must be a JSON object",
+                "code": "INVALID_REQUEST",
+            }
+        tx_id = params.get("tx_id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            return {
+                "_http_status": 400,
+                "error": "tx_id must be a non-empty string",
+                "code": "MISSING_TX_ID",
+            }
+        tx_id = tx_id.strip()
+        if self.activation_state == "COMMITTING":
+            return {
+                "_http_status": 409,
+                "error": "commit in progress",
+                "code": "TX_BUSY",
+            }
+        if self.activation_state == "DEGRADED_SPLIT":
+            return {
+                "_http_status": 503,
+                "error": "SIM_ACTIVATION_DEGRADED",
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+                "robot": self.robot_id,
+            }
+        if self._staged_tx is not None and self._staged_tx.get("tx_id") == tx_id:
+            self._cleanup_staged_tx_locked()
+            self._close_old_shared_locked()
+        return {"_http_status": 200, "ok": True, "state": "ABORTED", "tx_id": tx_id}
+
+    @staticmethod
+    def _public_tx_reply(res: dict) -> tuple[int, dict]:
+        status = int(res.pop("_http_status", 200))
+        cleaned = {k: v for k, v in res.items() if not k.startswith("_")}
+        return status, cleaned
+
+    def prepare_scene(self, params: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY", "state": "ABORTED"}
+        try:
+            with self.lock:
+                return self._public_tx_reply(self._tx_prepare_locked(params))
+        finally:
+            self._tx_lock.release()
+
+    def commit_scene(self, params: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
+        try:
+            with self.lock:
+                return self._public_tx_reply(self._tx_commit_locked(params))
+        finally:
+            self._tx_lock.release()
+
+    def abort_scene(self, params: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
+        try:
+            with self.lock:
+                return self._public_tx_reply(self._tx_abort_locked(params))
+        finally:
+            self._tx_lock.release()
+
     def _prepare_scene_locked(self, params: dict) -> dict:
+        if self.activation_state == "DEGRADED_SPLIT":
+            return {
+                "_http_status": 503,
+                "error": "SIM_ACTIVATION_DEGRADED",
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+            }
         if not isinstance(params, dict):
             return {"error": "request body must be a JSON object"}
+        req_robot = params.get("robot")
+        if req_robot is not None:
+            norm_req = normalize_robot_id(req_robot) if isinstance(req_robot, str) else None
+            if norm_req != self.robot_id:
+                return {
+                    "_http_status": 400,
+                    "error": f"Robot {req_robot!r} is incompatible with running robot {self.robot_id!r}",
+                    "code": "ROBOT_INCOMPATIBLE",
+                    "expected_robot": self.robot_id,
+                    "got_robot": req_robot,
+                    "state": "ABORTED",
+                }
         if "scene" in params and params["scene"] is not None:
             if not is_valid_pack_slug(params["scene"]):
-                return {"error": f"invalid scene slug: {params['scene']!r}"}
+                return {"error": f"invalid scene slug: {params['scene']!r}", "code": "INVALID_PACK"}
         if "tool" in params and params["tool"] is not None:
             if not is_valid_pack_slug(params["tool"]):
-                return {"error": f"invalid tool slug: {params['tool']!r}"}
+                return {"error": f"invalid tool slug: {params['tool']!r}", "code": "INVALID_PACK"}
         scene_ref = params["scene"] if "scene" in params else self.scene_ref
         if "tool" in params:
             tool_ref = params["tool"]
@@ -577,20 +1381,33 @@ class Simulator:
         try:
             model, data, motors, scene, scene_pack, tool_pack, parsed_objs = (
                 self._build_world(
-                    scene=scene_ref, tool=tool_ref, objects=objects_str, seed=seed
+                    scene=scene_ref,
+                    tool=tool_ref,
+                    objects=objects_str,
+                    seed=seed,
                 )
             )
+        except PackValidationError as exc:
+            return {"_http_status": exc.status, "error": str(exc), "code": exc.code}
         except Exception as exc:
             return {"error": f"scene load failed: {exc}"}
 
         new_shared = None
         shm_dict = None
         if self.shared is not None:
-            from .perception import SharedState
+            try:
+                from .perception import SharedState
 
-            new_shared = SharedState(model.nq, model.nv, lock=self.shared.lock)
-            new_shared.write(data)
-            shm_dict = {"name": new_shared.shm.name, "nq": model.nq, "nv": model.nv}
+                new_shared = SharedState(model.nq, model.nv, lock=self.shared.lock)
+                new_shared.write(data)
+                shm_dict = {"name": new_shared.shm.name, "nq": model.nq, "nv": model.nv}
+            except Exception as exc:
+                if new_shared is not None:
+                    try:
+                        new_shared.close()
+                    except Exception:
+                        pass
+                return {"_http_status": 500, "error": f"shared memory allocation failed: {exc}", "code": "SHM_ALLOC_FAILED"}
 
         self._pending_scene = {
             "model": model,
@@ -640,12 +1457,35 @@ class Simulator:
             p["tool_ref"],
             p["objects_str"],
         )
+        self.active_scene_digest = getattr(self.scene_pack, "digest", None)
+        self.active_tool_digest = getattr(self.tool_pack, "digest", None)
 
         if p["new_shared"] is not None:
             old_shared = self.shared
             self.shared = p["new_shared"]
             if old_shared is not None:
                 self._old_shared.append(old_shared)
+        self._close_old_shared_locked()
+
+        self._cleanup_staged_tx_locked()
+        legacy_tx = f"legacy-{uuid.uuid4().hex[:12]}"
+        self.active_tx_id = legacy_tx
+        self.camera_tx_id = legacy_tx
+        self.activation_state = "COMMITTED"
+        self._record_committed_tx_locked(
+            legacy_tx,
+            (
+                str(self.scene_ref) if self.scene_ref is not None else None,
+                str(self.tool_ref) if self.tool_ref is not None else None,
+                None,
+                None,
+                None,
+                None,
+                self.robot_id,
+                str(self.objects_spec),
+                self.scene.seed,
+            ),
+        )
 
         return self._scene_info_locked()
 
@@ -781,6 +1621,14 @@ class Simulator:
             self.cam_conn = None
         if self._pending_scene is not None:
             self._abort_scene_locked()
+        if self._staged_tx is not None:
+            snap = self._staged_tx.get("prev_snapshot")
+            if snap is not None and snap.get("shared") is not None and snap["shared"] is not self.shared:
+                try:
+                    snap["shared"].close()
+                except Exception:
+                    pass
+            self._cleanup_staged_tx_locked()
         if self.shared is not None:
             shared, self.shared = self.shared, None
             shared.close()
@@ -818,6 +1666,20 @@ class Simulator:
                     self.cam_conn.send(
                         (rid, self._load_scene_locked(msg[2], include_shm=True))
                     )
+                elif op == "tx_prepare":
+                    self.cam_conn.send((rid, self._tx_prepare_locked(msg[2])))
+                elif op == "tx_commit":
+                    self.cam_conn.send((rid, self._tx_commit_locked(msg[2])))
+                elif op == "tx_commit_physics":
+                    self.cam_conn.send((rid, self._tx_commit_physics_locked(msg[2])))
+                elif op == "tx_mark_degraded":
+                    self.cam_conn.send((rid, self._tx_mark_degraded_locked(msg[2])))
+                elif op == "tx_finalize":
+                    self.cam_conn.send((rid, self._tx_finalize_locked(msg[2])))
+                elif op == "tx_rollback_physics":
+                    self.cam_conn.send((rid, self._tx_rollback_physics_locked(msg[2])))
+                elif op == "tx_abort":
+                    self.cam_conn.send((rid, self._tx_abort_locked(msg[2])))
                 elif op == "io_get":
                     io = (
                         self.scene.io_state(self.data)

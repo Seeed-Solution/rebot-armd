@@ -1,5 +1,44 @@
 //! Pure MJCF composition and manifests.
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Security & budget constants
+// ---------------------------------------------------------------------------
+
+pub const MAX_XML_BYTES: usize = 524_288; // 512 KiB
+pub const MAX_XML_DEPTH: usize = 32;
+pub const MAX_PACK_TOTAL_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+pub const MAX_MESH_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+pub const MAX_MESH_FILES: usize = 16;
+pub const MAX_TOTAL_MESH_VERTICES: usize = 150_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackValidationError {
+    UnsupportedFormat(String),
+    InvalidPack(String),
+}
+
+impl PackValidationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            PackValidationError::UnsupportedFormat(_) => "UNSUPPORTED_FORMAT",
+            PackValidationError::InvalidPack(_) => "INVALID_PACK",
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            PackValidationError::UnsupportedFormat(m) | PackValidationError::InvalidPack(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for PackValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Path and ID validation
@@ -34,17 +73,777 @@ pub fn is_safe_relative_path(rel: &str) -> bool {
     })
 }
 
-pub fn validate_xml_security(xml: &str, required_elem: Option<&str>) -> Result<(), String> {
-    if xml.contains("<!DOCTYPE") || xml.contains("<!ENTITY") {
-        return Err("XML DOCTYPE and ENTITY declarations are forbidden".into());
+pub fn is_urdf_path(path: &str) -> bool {
+    path.trim().to_ascii_lowercase().ends_with(".urdf")
+}
+
+fn validate_attr_rel_path(attr_name: &str, raw: &str, allow_dot_dir: bool) -> Result<String, PackValidationError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML attribute '{attr_name}' cannot be empty"
+        )));
     }
-    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("XML parse failure: {e}"))?;
-    if let Some(req) = required_elem {
-        if !doc.descendants().any(|n| n.is_element() && n.tag_name().name() == req) {
-            return Err(format!("Missing required <{req}> element"));
+    if trimmed.contains('\0')
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || (trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':')
+        || trimmed.contains("://")
+    {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML attribute '{attr_name}' must be a relative path within the pack: {trimmed:?}"
+        )));
+    }
+    if is_urdf_path(trimmed) {
+        return Err(PackValidationError::UnsupportedFormat(format!(
+            "URDF references are not supported ({attr_name}={trimmed:?})"
+        )));
+    }
+    let norm_slashes = trimmed.replace('\\', "/");
+    let norm = if allow_dot_dir {
+        norm_slashes.trim_end_matches('/')
+    } else {
+        norm_slashes.as_str()
+    };
+    if allow_dot_dir && norm == "." {
+        return Ok(String::new());
+    }
+    if norm.split('/').any(|seg| seg == ".." || seg == "." || seg.is_empty() || seg.starts_with('.')) {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML attribute '{attr_name}' contains traversal or invalid path segment: {trimmed:?}"
+        )));
+    }
+    if !is_safe_relative_path(norm) {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML attribute '{attr_name}' is not a safe relative path: {trimmed:?}"
+        )));
+    }
+    Ok(norm.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmlAssetRef {
+    pub tag: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XmlValidationSummary {
+    pub refs: Vec<XmlAssetRef>,
+    pub inline_mesh_count: usize,
+    pub inline_vertex_count: usize,
+}
+
+fn xml_parent_dir(xml_rel: &str) -> &str {
+    match xml_rel.rsplit_once('/') {
+        Some((parent, _)) => parent,
+        None => "",
+    }
+}
+
+fn join_rel_parts(parts: &[&str]) -> Result<String, PackValidationError> {
+    let mut joined = String::new();
+    for &p in parts {
+        if p.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push('/');
+        }
+        joined.push_str(p);
+    }
+    if !is_safe_relative_path(&joined) {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Resolved asset path '{joined}' is invalid or exceeds depth limit"
+        )));
+    }
+    Ok(joined)
+}
+
+#[derive(Default)]
+struct CompilerDirs {
+    meshdir: Option<String>,
+    texturedir: Option<String>,
+    assetdir: Option<String>,
+}
+
+fn pass1_xml_security<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    depth: usize,
+    dirs: &mut CompilerDirs,
+) -> Result<(), PackValidationError> {
+    if !node.is_element() {
+        return Ok(());
+    }
+    if depth > MAX_XML_DEPTH {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML nesting depth {depth} exceeds maximum of {MAX_XML_DEPTH}"
+        )));
+    }
+
+    let tag = node.tag_name().name();
+    let tag_lower = tag.to_ascii_lowercase();
+    if tag_lower == "urdf" || (depth == 1 && tag_lower == "robot") {
+        return Err(PackValidationError::UnsupportedFormat(format!(
+            "URDF content (<{tag}>) is not supported; expected MJCF <mujoco>"
+        )));
+    }
+    if matches!(tag_lower.as_str(), "include" | "plugin" | "custom" | "extension") {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Forbidden XML construct <{tag}>"
+        )));
+    }
+
+    for attr in node.attributes() {
+        let aname = attr.name();
+        let aname_lower = aname.to_ascii_lowercase();
+        let aval = attr.value();
+        match aname_lower.as_str() {
+            "meshdir" => {
+                let d = validate_attr_rel_path(aname, aval, true)?;
+                if tag_lower == "compiler" {
+                    dirs.meshdir = if d.is_empty() { None } else { Some(d) };
+                }
+            }
+            "texturedir" => {
+                let d = validate_attr_rel_path(aname, aval, true)?;
+                if tag_lower == "compiler" {
+                    dirs.texturedir = if d.is_empty() { None } else { Some(d) };
+                }
+            }
+            "assetdir" => {
+                let d = validate_attr_rel_path(aname, aval, true)?;
+                if tag_lower == "compiler" {
+                    dirs.assetdir = if d.is_empty() { None } else { Some(d) };
+                }
+            }
+            "file" => {
+                let _ = validate_attr_rel_path(aname, aval, false)?;
+            }
+            "fileright" | "fileleft" | "fileup" | "filedown" | "filefront" | "fileback"
+                if tag_lower == "texture" =>
+            {
+                let _ = validate_attr_rel_path(aname, aval, false)?;
+            }
+            _ => {}
+        }
+    }
+
+    for child in node.children() {
+        if child.is_element() {
+            pass1_xml_security(child, depth + 1, dirs)?;
         }
     }
     Ok(())
+}
+
+fn pass2_collect_refs<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    xml_parent: &str,
+    dirs: &CompilerDirs,
+    summary: &mut XmlValidationSummary,
+) -> Result<(), PackValidationError> {
+    if !node.is_element() {
+        return Ok(());
+    }
+    let tag_lower = node.tag_name().name().to_ascii_lowercase();
+
+    if tag_lower == "mesh" {
+        if let Some(vertex_attr) = node.attribute("vertex") {
+            let mut float_count = 0usize;
+            for tok in vertex_attr.split_ascii_whitespace() {
+                parse_finite_f32(tok, "<mesh vertex>")?;
+                float_count += 1;
+            }
+            if float_count == 0 || !float_count.is_multiple_of(3) {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Inline <mesh vertex> must contain a non-empty multiple of 3 finite floats (got {float_count})"
+                )));
+            }
+            summary.inline_mesh_count += 1;
+            if summary.inline_mesh_count > MAX_MESH_FILES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
+                )));
+            }
+            summary.inline_vertex_count = summary.inline_vertex_count.saturating_add(float_count / 3);
+            if summary.inline_vertex_count > MAX_TOTAL_MESH_VERTICES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Inline mesh vertices ({}) exceed budget of {MAX_TOTAL_MESH_VERTICES}",
+                    summary.inline_vertex_count
+                )));
+            }
+        }
+    }
+
+    let dir_for_tag = match tag_lower.as_str() {
+        "mesh" => dirs.meshdir.as_deref().or(dirs.assetdir.as_deref()).unwrap_or(""),
+        "texture" => dirs.texturedir.as_deref().or(dirs.assetdir.as_deref()).unwrap_or(""),
+        "hfield" | "skin" | "model" => dirs.assetdir.as_deref().unwrap_or(""),
+        _ => "",
+    };
+
+    if matches!(tag_lower.as_str(), "mesh" | "texture" | "hfield" | "skin" | "model") {
+        for attr in node.attributes() {
+            let aname_lower = attr.name().to_ascii_lowercase();
+            let is_file_attr = aname_lower == "file"
+                || (tag_lower == "texture"
+                    && matches!(
+                        aname_lower.as_str(),
+                        "fileright" | "fileleft" | "fileup" | "filedown" | "filefront" | "fileback"
+                    ));
+            if is_file_attr {
+                let f = validate_attr_rel_path(attr.name(), attr.value(), false)?;
+                let resolved = join_rel_parts(&[xml_parent, dir_for_tag, &f])?;
+                summary.refs.push(XmlAssetRef {
+                    tag: tag_lower.clone(),
+                    path: resolved,
+                });
+            }
+        }
+    }
+
+    for child in node.children() {
+        if child.is_element() {
+            pass2_collect_refs(child, xml_parent, dirs, summary)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_xml_and_collect_summary_for_path(
+    xml_rel: &str,
+    xml: &str,
+    required_elem: Option<&str>,
+) -> Result<XmlValidationSummary, PackValidationError> {
+    if xml.len() > MAX_XML_BYTES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "XML '{xml_rel}' exceeds {MAX_XML_BYTES} byte limit (got {} bytes)",
+            xml.len()
+        )));
+    }
+    let upper = xml.to_ascii_uppercase();
+    if upper.contains("<!DOCTYPE") || upper.contains("<!ENTITY") {
+        return Err(PackValidationError::InvalidPack(
+            "XML DOCTYPE and ENTITY declarations are forbidden".into(),
+        ));
+    }
+    let doc = roxmltree::Document::parse(xml)
+        .map_err(|e| PackValidationError::InvalidPack(format!("XML parse failure in '{xml_rel}': {e}")))?;
+
+    let mut dirs = CompilerDirs::default();
+    pass1_xml_security(doc.root_element(), 1, &mut dirs)?;
+
+    if let Some(req) = required_elem {
+        if !doc.descendants().any(|n| n.is_element() && n.tag_name().name() == req) {
+            return Err(PackValidationError::InvalidPack(format!(
+                "Missing required <{req}> element in '{xml_rel}'"
+            )));
+        }
+    }
+
+    let mut summary = XmlValidationSummary::default();
+    let parent = xml_parent_dir(xml_rel);
+    pass2_collect_refs(doc.root_element(), parent, &dirs, &mut summary)?;
+    Ok(summary)
+}
+
+pub fn validate_xml_and_collect_refs(
+    xml: &str,
+    required_elem: Option<&str>,
+) -> Result<Vec<XmlAssetRef>, PackValidationError> {
+    validate_xml_and_collect_summary_for_path("world.xml", xml, required_elem).map(|s| s.refs)
+}
+
+pub fn validate_xml_security(xml: &str, required_elem: Option<&str>) -> Result<(), String> {
+    validate_xml_and_collect_refs(xml, required_elem)
+        .map(|_| ())
+        .map_err(|e| e.message().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Mesh (STL / OBJ) & Pack validation
+// ---------------------------------------------------------------------------
+
+fn parse_finite_f32(tok: &str, ctx: &str) -> Result<f32, PackValidationError> {
+    let v: f32 = tok
+        .parse()
+        .map_err(|_| PackValidationError::InvalidPack(format!("{ctx}: invalid float '{tok}'")))?;
+    if !v.is_finite() {
+        return Err(PackValidationError::InvalidPack(format!(
+            "{ctx}: non-finite float '{tok}'"
+        )));
+    }
+    Ok(v)
+}
+
+fn validate_ascii_stl(path: &str, text: &str) -> Result<usize, PackValidationError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AsciiStlState {
+        BeforeSolid,
+        InSolid,
+        InFacet,
+        InLoop(usize),
+        AfterLoop,
+        AfterEndSolid,
+    }
+
+    let mut state = AsciiStlState::BeforeSolid;
+    let mut vertex_count: usize = 0;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_ascii_whitespace();
+        let Some(kw) = parts.next() else {
+            continue;
+        };
+        match (state, kw) {
+            (AsciiStlState::BeforeSolid | AsciiStlState::AfterEndSolid, "solid") => {
+                state = AsciiStlState::InSolid;
+            }
+            (AsciiStlState::InSolid, "endsolid") => {
+                state = AsciiStlState::AfterEndSolid;
+            }
+            (AsciiStlState::InSolid, "facet") => {
+                if parts.next() != Some("normal") {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': expected 'facet normal'"
+                    )));
+                }
+                let coords: Vec<&str> = parts.collect();
+                if coords.len() != 3 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': 'facet normal' requires 3 floats"
+                    )));
+                }
+                for c in coords {
+                    parse_finite_f32(c, path)?;
+                }
+                state = AsciiStlState::InFacet;
+            }
+            (AsciiStlState::InFacet, "outer") => {
+                if parts.next() != Some("loop") || parts.next().is_some() {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': expected 'outer loop'"
+                    )));
+                }
+                state = AsciiStlState::InLoop(0);
+            }
+            (AsciiStlState::InLoop(n), "vertex") => {
+                if n >= 3 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': facet loop has more than 3 vertices"
+                    )));
+                }
+                let coords: Vec<&str> = parts.collect();
+                if coords.len() != 3 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': 'vertex' requires 3 floats"
+                    )));
+                }
+                for c in coords {
+                    parse_finite_f32(c, path)?;
+                }
+                vertex_count += 1;
+                if vertex_count > MAX_TOTAL_MESH_VERTICES {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "STL '{path}' exceeds vertex budget of {MAX_TOTAL_MESH_VERTICES}"
+                    )));
+                }
+                state = AsciiStlState::InLoop(n + 1);
+            }
+            (AsciiStlState::InLoop(3), "endloop") => {
+                if parts.next().is_some() {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': unexpected trailing token after 'endloop'"
+                    )));
+                }
+                state = AsciiStlState::AfterLoop;
+            }
+            (AsciiStlState::AfterLoop, "endfacet") => {
+                if parts.next().is_some() {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "ASCII STL '{path}': unexpected trailing token after 'endfacet'"
+                    )));
+                }
+                state = AsciiStlState::InSolid;
+            }
+            _ => {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "ASCII STL '{path}': invalid or out-of-order directive '{line}'"
+                )));
+            }
+        }
+    }
+
+    if state != AsciiStlState::AfterEndSolid {
+        return Err(PackValidationError::InvalidPack(format!(
+            "ASCII STL '{path}' is incomplete or missing 'endsolid'"
+        )));
+    }
+    Ok(vertex_count)
+}
+
+pub fn validate_stl_bytes(path: &str, bytes: &[u8]) -> Result<usize, PackValidationError> {
+    if bytes.len() > MAX_MESH_FILE_BYTES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "STL '{path}' exceeds single mesh limit of {MAX_MESH_FILE_BYTES} bytes"
+        )));
+    }
+    if bytes.len() < 5 {
+        return Err(PackValidationError::InvalidPack(format!(
+            "STL '{path}' is truncated ({} bytes)",
+            bytes.len()
+        )));
+    }
+
+    // Disambiguate ASCII vs Binary STL:
+    // Treat as ASCII only if valid UTF-8 without NUL/unexpected control characters AND starts with `solid`.
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let no_ctrl = !text
+            .bytes()
+            .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'));
+        let trimmed = text.trim_start();
+        if no_ctrl
+            && (trimmed == "solid"
+                || trimmed.starts_with("solid ")
+                || trimmed.starts_with("solid\t")
+                || trimmed.starts_with("solid\n")
+                || trimmed.starts_with("solid\r"))
+        {
+            return validate_ascii_stl(path, text);
+        }
+    }
+
+    if bytes.len() < 84 {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Binary STL '{path}' is truncated ({} bytes < 84)",
+            bytes.len()
+        )));
+    }
+    let tri_count = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+    let expected_len = tri_count
+        .checked_mul(50)
+        .and_then(|n| n.checked_add(84))
+        .ok_or_else(|| {
+            PackValidationError::InvalidPack(format!("Binary STL '{path}' triangle count overflow"))
+        })?;
+    if bytes.len() != expected_len {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Binary STL '{path}' length {} does not match header tri_count {} (expected {expected_len} bytes)",
+            bytes.len(),
+            tri_count
+        )));
+    }
+    let vertex_count = tri_count.checked_mul(3).ok_or_else(|| {
+        PackValidationError::InvalidPack(format!("Binary STL '{path}' vertex count overflow"))
+    })?;
+    if vertex_count > MAX_TOTAL_MESH_VERTICES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Binary STL '{path}' vertex count {vertex_count} exceeds budget of {MAX_TOTAL_MESH_VERTICES}"
+        )));
+    }
+    for i in 0..tri_count {
+        let base = 84 + i * 50;
+        for j in 0..12 {
+            let off = base + j * 4;
+            let f = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+            if !f.is_finite() {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Binary STL '{path}' contains non-finite float in triangle {i}"
+                )));
+            }
+        }
+    }
+    Ok(vertex_count)
+}
+
+fn check_obj_index_in_bounds(
+    raw: &str,
+    table_len: usize,
+    kind: &str,
+    path: &str,
+    line_no: usize,
+) -> Result<(), PackValidationError> {
+    let parsed: isize = raw.parse().map_err(|_| {
+        PackValidationError::InvalidPack(format!(
+            "OBJ '{path}' line {line_no}: non-integer {kind} index '{raw}'"
+        ))
+    })?;
+    if parsed == 0 || parsed.unsigned_abs() > table_len {
+        return Err(PackValidationError::InvalidPack(format!(
+            "OBJ '{path}' line {line_no}: out-of-bounds {kind} index {parsed} (table size {table_len})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_obj_face_vertex(
+    tok: &str,
+    v_count: usize,
+    vt_count: usize,
+    vn_count: usize,
+    path: &str,
+    line_no: usize,
+) -> Result<(), PackValidationError> {
+    let segs: Vec<&str> = tok.split('/').collect();
+    if segs.is_empty() || segs.len() > 3 || segs[0].is_empty() {
+        return Err(PackValidationError::InvalidPack(format!(
+            "OBJ '{path}' line {line_no}: invalid face token '{tok}'"
+        )));
+    }
+    check_obj_index_in_bounds(segs[0], v_count, "v", path, line_no)?;
+    if segs.len() >= 2 {
+        if segs[1].is_empty() {
+            if segs.len() == 2 {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "OBJ '{path}' line {line_no}: empty vt index in face token '{tok}'"
+                )));
+            }
+        } else {
+            check_obj_index_in_bounds(segs[1], vt_count, "vt", path, line_no)?;
+        }
+    }
+    if segs.len() == 3 {
+        if segs[2].is_empty() {
+            return Err(PackValidationError::InvalidPack(format!(
+                "OBJ '{path}' line {line_no}: empty vn index in face token '{tok}'"
+            )));
+        }
+        check_obj_index_in_bounds(segs[2], vn_count, "vn", path, line_no)?;
+    }
+    Ok(())
+}
+
+pub fn validate_obj_bytes(path: &str, bytes: &[u8]) -> Result<usize, PackValidationError> {
+    if bytes.len() > MAX_MESH_FILE_BYTES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "OBJ '{path}' exceeds single mesh limit of {MAX_MESH_FILE_BYTES} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        PackValidationError::InvalidPack(format!("OBJ '{path}' is not valid UTF-8"))
+    })?;
+    let mut vertex_count: usize = 0;
+    let mut vt_count: usize = 0;
+    let mut vn_count: usize = 0;
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_ascii_whitespace();
+        let directive = parts.next().unwrap();
+        match directive {
+            "mtllib" => {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "OBJ '{path}' line {line_no}: 'mtllib' directive is forbidden"
+                )));
+            }
+            "v" => {
+                let coords: Vec<&str> = parts.collect();
+                if coords.len() != 3 && coords.len() != 4 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "OBJ '{path}' line {line_no}: 'v' requires 3 or 4 floats"
+                    )));
+                }
+                for c in coords {
+                    parse_finite_f32(c, path)?;
+                }
+                vertex_count += 1;
+                if vertex_count > MAX_TOTAL_MESH_VERTICES {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "OBJ '{path}' exceeds vertex budget of {MAX_TOTAL_MESH_VERTICES}"
+                    )));
+                }
+            }
+            "vn" => {
+                let coords: Vec<&str> = parts.collect();
+                if coords.len() != 3 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "OBJ '{path}' line {line_no}: 'vn' requires 3 floats"
+                    )));
+                }
+                for c in coords {
+                    parse_finite_f32(c, path)?;
+                }
+                vn_count += 1;
+            }
+            "vt" => {
+                let coords: Vec<&str> = parts.collect();
+                if !(1..=3).contains(&coords.len()) {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "OBJ '{path}' line {line_no}: 'vt' requires 1..=3 floats"
+                    )));
+                }
+                for c in coords {
+                    parse_finite_f32(c, path)?;
+                }
+                vt_count += 1;
+            }
+            "f" => {
+                let verts: Vec<&str> = parts.collect();
+                if verts.len() < 3 {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "OBJ '{path}' line {line_no}: 'f' requires at least 3 vertices"
+                    )));
+                }
+                for vtok in verts {
+                    validate_obj_face_vertex(vtok, vertex_count, vt_count, vn_count, path, line_no)?;
+                }
+            }
+            "g" | "o" | "s" | "usemtl" => {}
+            other => {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "OBJ '{path}' line {line_no}: unsupported directive '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok(vertex_count)
+}
+
+pub fn compute_pack_digest<'a, I>(files: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    let sorted: BTreeMap<&'a str, &'a [u8]> = files.into_iter().collect();
+    let mut hasher = crate::gravity::Sha256::new();
+    for (rel, bytes) in sorted {
+        hasher.update(rel.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    hasher.finalize_hex()
+}
+
+pub fn validate_pack_map(
+    primary_xml_rel: &str,
+    required_elem: Option<&str>,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<String, PackValidationError> {
+    if !is_safe_relative_path(primary_xml_rel) {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Invalid primary XML path '{primary_xml_rel}'"
+        )));
+    }
+    if is_urdf_path(primary_xml_rel) {
+        return Err(PackValidationError::UnsupportedFormat(format!(
+            "URDF files are not supported: '{primary_xml_rel}'"
+        )));
+    }
+
+    let mut total_bytes: usize = 0;
+    for (rel, bytes) in files {
+        if !is_safe_relative_path(rel) {
+            return Err(PackValidationError::InvalidPack(format!(
+                "Invalid or escaping relative path '{rel}'"
+            )));
+        }
+        if is_urdf_path(rel) {
+            return Err(PackValidationError::UnsupportedFormat(format!(
+                "URDF files are not supported in pack: '{rel}'"
+            )));
+        }
+        total_bytes = total_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            PackValidationError::InvalidPack("Pack size overflow".into())
+        })?;
+        if total_bytes > MAX_PACK_TOTAL_BYTES {
+            return Err(PackValidationError::InvalidPack(format!(
+                "Total decoded pack size exceeds {MAX_PACK_TOTAL_BYTES} byte limit"
+            )));
+        }
+    }
+
+    if !files.contains_key(primary_xml_rel) {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Missing primary XML file '{primary_xml_rel}'"
+        )));
+    }
+
+    let mut mesh_refs = std::collections::BTreeSet::new();
+    let mut mesh_count: usize = 0;
+    let mut total_vertices: usize = 0;
+
+    for (rel, bytes) in files {
+        if rel == primary_xml_rel || rel.to_ascii_lowercase().ends_with(".xml") {
+            let xml_str = std::str::from_utf8(bytes).map_err(|_| {
+                PackValidationError::InvalidPack(format!("XML '{rel}' is not valid UTF-8"))
+            })?;
+            let req = if rel == primary_xml_rel { required_elem } else { None };
+            let summary = validate_xml_and_collect_summary_for_path(rel, xml_str, req)?;
+            mesh_count = mesh_count.saturating_add(summary.inline_mesh_count);
+            if mesh_count > MAX_MESH_FILES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
+                )));
+            }
+            total_vertices = total_vertices.saturating_add(summary.inline_vertex_count);
+            if total_vertices > MAX_TOTAL_MESH_VERTICES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Total mesh vertices ({total_vertices}) exceed budget of {MAX_TOTAL_MESH_VERTICES}"
+                )));
+            }
+            for asset_ref in &summary.refs {
+                if is_urdf_path(&asset_ref.path) {
+                    return Err(PackValidationError::UnsupportedFormat(format!(
+                        "URDF reference '{}' is not supported",
+                        asset_ref.path
+                    )));
+                }
+                if !files.contains_key(&asset_ref.path) {
+                    return Err(PackValidationError::InvalidPack(format!(
+                        "Dangling <{} file=\"{}\"> reference in '{rel}'",
+                        asset_ref.tag, asset_ref.path
+                    )));
+                }
+                if asset_ref.tag == "mesh" {
+                    mesh_refs.insert(asset_ref.path.clone());
+                }
+            }
+        }
+    }
+
+    for (rel, bytes) in files {
+        let lower = rel.to_ascii_lowercase();
+        let is_stl = lower.ends_with(".stl");
+        let is_obj = lower.ends_with(".obj");
+        let is_referenced_mesh = mesh_refs.contains(rel);
+        if is_stl || is_obj || is_referenced_mesh {
+            mesh_count += 1;
+            if mesh_count > MAX_MESH_FILES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
+                )));
+            }
+            let verts = if is_stl {
+                validate_stl_bytes(rel, bytes)?
+            } else if is_obj {
+                validate_obj_bytes(rel, bytes)?
+            } else {
+                return Err(PackValidationError::UnsupportedFormat(format!(
+                    "Unsupported mesh format for '{rel}'; expected .stl or .obj"
+                )));
+            };
+            total_vertices = total_vertices.saturating_add(verts);
+            if total_vertices > MAX_TOTAL_MESH_VERTICES {
+                return Err(PackValidationError::InvalidPack(format!(
+                    "Total mesh vertices ({total_vertices}) exceed budget of {MAX_TOTAL_MESH_VERTICES}"
+                )));
+            }
+        }
+    }
+
+    Ok(compute_pack_digest(
+        files.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
+    ))
 }
 
 // ---------------------------------------------------------------------------

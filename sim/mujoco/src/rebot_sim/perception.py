@@ -325,6 +325,12 @@ class Perception:
                 "depth" in t["pipelines"] and t["called"] < captured for t in self.pending
             )
 
+    def clear_latest(self) -> None:
+        with self.cond:
+            self.latest = None
+            self.frame = None
+            self.cond.notify_all()
+
     def on_frame(
         self,
         frame_id: int,
@@ -622,6 +628,25 @@ def _pipelines(v, allowed: tuple[str, ...] = PIPELINES) -> list[str]:
     return [p for p in allowed if p in v]
 
 
+def _is_degraded(sim) -> bool:
+    return getattr(sim, "activation_state", "COMMITTED") == "DEGRADED_SPLIT"
+
+
+def _degraded_response(sim) -> tuple[int, dict]:
+    body: dict = {
+        "error": "SIM_ACTIVATION_DEGRADED",
+        "code": "SIM_ACTIVATION_DEGRADED",
+        "state": "DEGRADED_SPLIT",
+    }
+    if hasattr(sim, "active_tx_id"):
+        body["tx_id"] = sim.active_tx_id
+    if hasattr(sim, "camera_tx_id"):
+        body["camera_tx_id"] = sim.camera_tx_id
+    if hasattr(sim, "robot_id"):
+        body["robot"] = sim.robot_id
+    return 503, body
+
+
 class PerceptionServer:
     """HTTP routes over a Perception state and the simulator (reset / state / camera info)."""
 
@@ -638,6 +663,16 @@ class PerceptionServer:
         self, method: str, path: str, qs: dict, body: dict
     ) -> tuple[int, dict]:
         p = self.p
+        if _is_degraded(self.sim) and (
+            (path == "/sim/camera" and method == "GET")
+            or (path == "/api/detect" and method == "POST")
+            or (path == "/api/detections" and method == "GET")
+            or (path == "/api/trigger" and method == "POST")
+            or (path == "/api/results/latest" and method == "GET")
+            or (path == "/sim/scene" and method == "POST")
+            or (path == "/sim/scene/prepare" and method == "POST")
+        ):
+            return _degraded_response(self.sim)
         if (path == "/api/mode" or path == "/api/status") and method == "GET":
             with p.cond:
                 return 200, p.mode_body()
@@ -743,9 +778,9 @@ class PerceptionServer:
                     "active_fps": p.max_fps,
                     "idle_fps": IDLE_FPS,
                 }
-        if path == "/api/trigger" and method == "POST":
+        if path in {"/api/trigger", "/api/detect"} and method == "POST":
             return self.trigger(qs, body)
-        if path == "/api/results/latest" and method == "GET":
+        if path in {"/api/results/latest", "/api/detections"} and method == "GET":
             return self.latest(qs)
         if path == "/api/subscribe" and method == "POST":
             return self.subscribe(body)
@@ -796,7 +831,24 @@ class PerceptionServer:
         if path == "/sim/state" and method == "GET":
             return 200, self.sim.sim_state()
         if path == "/sim/camera" and method == "GET":
+            if not hasattr(self.sim, "camera_info"):
+                return 404, {"error": "camera not enabled"}
             return 200, self.sim.camera_info()
+        if path == "/sim/scene/prepare" and method == "POST":
+            if not hasattr(self.sim, "prepare_scene"):
+                return 404, {"error": "not found"}
+            return self.sim.prepare_scene(body)
+        if path == "/sim/scene/commit" and method == "POST":
+            if not hasattr(self.sim, "commit_scene"):
+                return 404, {"error": "not found"}
+            status, out = self.sim.commit_scene(body)
+            if status == 200:
+                p.clear_latest()
+            return status, out
+        if path == "/sim/scene/abort" and method == "POST":
+            if not hasattr(self.sim, "abort_scene"):
+                return 404, {"error": "not found"}
+            return self.sim.abort_scene(body)
         if path == "/sim/scene":
             if method == "GET":
                 if not hasattr(self.sim, "get_scene"):
@@ -811,9 +863,18 @@ class PerceptionServer:
                     if key in body:
                         val = body[key]
                         if val is not None and not is_valid_pack_slug(val):
-                            return 400, {"error": f"invalid {key} slug: {val!r}"}
+                            return 400, {"error": f"invalid {key} slug: {val!r}", "code": "INVALID_PACK"}
                 out = self.sim.load_scene(body)
-                return (400 if "error" in out else 200), out
+                if isinstance(out, dict) and "_http_status" in out:
+                    status = int(out.pop("_http_status"))
+                    cleaned = {k: v for k, v in out.items() if not k.startswith("_")}
+                    if status == 200:
+                        p.clear_latest()
+                    return status, cleaned
+                status = 400 if "error" in out else 200
+                if status == 200:
+                    p.clear_latest()
+                return status, out
         if path == "/sim/io":
             if method == "GET":
                 if not hasattr(self.sim, "get_io"):
@@ -870,6 +931,8 @@ class PerceptionServer:
                 ok = p.cond.wait_for(fresh, wait / 1000)
             finally:
                 p.pending.remove(entry)
+            if _is_degraded(self.sim):
+                return _degraded_response(self.sim)
             if not ok:
                 return 200, {
                     "api_version": API_VERSION,
@@ -894,6 +957,8 @@ class PerceptionServer:
                 lambda: p.latest is not None and p.latest["frame_id"] > after,
                 wait / 1000,
             )
+            if _is_degraded(self.sim):
+                return _degraded_response(self.sim)
             enabled = p.continuous()["active"]
             if p.latest is None:
                 return 200, {
@@ -1078,8 +1143,17 @@ class CameraRig:
         self.mount = cam.CameraMount(*cfg["mount"])
         self._cam = cam
         self.reload_lock = threading.Lock()
+        self._reload_op_lock = threading.Lock()
+        self._tx_lock = threading.Lock()
         self._reload_req = None
         self.reload_wake_event = threading.Event()
+        self.activation_state = "COMMITTED"
+        self.active_tx_id: str | None = None
+        self.camera_tx_id: str | None = None
+        self.camera_committed_tx_id: str | None = None
+        self._staged_cam_tx: dict | None = None
+        self._prev_cam_gen: dict | None = None
+        self._legacy_prev_cam: dict | None = None
         self.model, self.data, self.scene, self.labels = self._build_camera_world(
             scene_ref=cfg.get("scene"),
             tool_ref=cfg.get("tool"),
@@ -1121,20 +1195,45 @@ class CameraRig:
         self.frame_depth: dict | None = None  # depth_result of the newest detect(want_depth=True)
         self.backend = os.environ.get("MUJOCO_GL", "default")
 
-    def _build_camera_world(self, scene_ref, tool_ref, objects_str: str):
+    def _build_camera_world(
+        self,
+        scene_ref,
+        tool_ref,
+        objects_str: str,
+        *,
+        scene_is_dir: bool = False,
+        tool_is_dir: bool = False,
+        expected_scene_digest: str | None = None,
+        expected_tool_digest: str | None = None,
+        verify_digests: bool = False,
+    ):
         import mujoco
 
         from .model import load_model
-        from .pack import PackScene, load_scene_pack, load_tool_pack
+        from .pack import PackScene, PackValidationError, load_scene_pack, load_tool_pack
         from .scene import Scene, parse_objects
 
-        scene_pack = load_scene_pack(scene_ref)
+        scene_pack = load_scene_pack(scene_ref, prefer_disk=scene_is_dir)
         effective_tool = (
             tool_ref
             if tool_ref is not None
             else (scene_pack.default_tool if scene_pack else "default")
         )
-        tool_pack = load_tool_pack(effective_tool)
+        tool_pack = load_tool_pack(effective_tool, prefer_disk=tool_is_dir and tool_ref is not None)
+
+        if verify_digests:
+            actual_sd = scene_pack.digest if scene_pack is not None else None
+            actual_td = tool_pack.digest if tool_pack is not None else None
+            if actual_sd != expected_scene_digest:
+                raise PackValidationError(
+                    f"Camera scene digest mismatch: expected {expected_scene_digest!r}, got {actual_sd!r}",
+                    code="DIGEST_MISMATCH",
+                )
+            if actual_td != expected_tool_digest:
+                raise PackValidationError(
+                    f"Camera tool digest mismatch: expected {expected_tool_digest!r}, got {actual_td!r}",
+                    code="DIGEST_MISMATCH",
+                )
 
         if scene_pack is not None:
             model = load_model(
@@ -1175,47 +1274,592 @@ class CameraRig:
     def set_io(self, body):
         return self.link.call(("io_set", body))
 
-    def load_scene(self, body):
-        res = self.link.call(("scene_prepare", body), timeout=15.0)
-        if "error" in res:
-            return res
-        shm_info = res.pop("_shm", None)
-        scene_ref = res.pop("_scene_ref", None)
-        tool_ref = res.pop("_tool_ref", None)
-        objects_str = res.pop("_objects_spec", self.cfg.get("objects", "cube"))
-        if shm_info is not None:
-            done = threading.Event()
-            err_box: dict = {}
-            req = {
-                "done": done,
-                "shm_info": shm_info,
-                "scene_ref": scene_ref,
-                "tool_ref": tool_ref,
-                "objects_str": objects_str,
-                "err_box": err_box,
-                "cancelled": False,
-            }
+    def _run_reload_op(self, req: dict, timeout: float = 5.0) -> str | None:
+        done = req["done"]
+        with self._reload_op_lock:
             with self.reload_lock:
                 self._reload_req = req
             self.reload_wake_event.set()
-            if not done.wait(timeout=10.0):
+            if not done.wait(timeout=timeout):
                 with self.reload_lock:
-                    if not done.is_set():
+                    if req.get("committed"):
+                        # Swap already occurred atomically under reload_lock; wait for done without cancelling.
+                        pass
+                    elif not done.is_set():
                         req["cancelled"] = True
                         if self._reload_req is req:
                             self._reload_req = None
-                        err_box["error"] = "camera reload timed out"
-            if "error" in err_box:
+                        req["err_box"]["error"] = "camera reload timed out"
+                if req.get("committed") and not done.is_set():
+                    done.wait()
+            return req["err_box"].get("error")
+
+    def _close_staged_cam(self, staged: dict | None) -> None:
+        if not staged:
+            return
+        for k in ("renderer", "seg_renderer", "state"):
+            obj = staged.get(k)
+            if obj is not None:
                 try:
-                    self.link.call(("scene_abort",), timeout=5.0)
+                    obj.close()
                 except Exception:
                     pass
-                return {"error": err_box["error"]}
+
+    def _stage_camera_tx(self, req: dict) -> None:
+        import mujoco
+
+        err_box = req["err_box"]
+        shm_info = req["shm_info"]
+        scene_ref = req["scene_ref"]
+        tool_ref = req["tool_ref"]
+        objects_str = req["objects_str"]
+        scene_is_dir = bool(req.get("scene_is_dir", False))
+        tool_is_dir = bool(req.get("tool_is_dir", False))
+        tx_id = req["tx_id"]
+        exp_sd = req.get("expected_scene_digest")
+        exp_td = req.get("expected_tool_digest")
+        verify_digests = bool(req.get("verify_digests", False))
+
+        with self.reload_lock:
+            if req.get("cancelled"):
+                return
+
+        new_renderer = None
+        new_seg = None
+        new_state = None
         try:
-            commit_res = self.link.call(("scene_commit",), timeout=10.0)
-            return commit_res
+            new_model, new_data, new_scene, new_labels = self._build_camera_world(
+                scene_ref,
+                tool_ref,
+                objects_str,
+                scene_is_dir=scene_is_dir,
+                tool_is_dir=tool_is_dir,
+                expected_scene_digest=exp_sd,
+                expected_tool_digest=exp_td,
+                verify_digests=verify_digests,
+            )
+            w, h = self.size
+            new_model.vis.global_.offwidth = max(new_model.vis.global_.offwidth, w)
+            new_model.vis.global_.offheight = max(
+                new_model.vis.global_.offheight, h, self._cam.DETECTION_SIZE[1] + 1
+            )
+            new_renderer = mujoco.Renderer(new_model, h, w)
+            new_seg = mujoco.Renderer(
+                new_model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0]
+            )
+            self._cam.check_renderer_internals(new_seg)
+            new_state = SharedState(
+                shm_info["nq"], shm_info["nv"], shm_info["name"], lock=self.state.lock
+            )
+            with self.reload_lock:
+                if req.get("cancelled"):
+                    self._close_staged_cam(
+                        {"renderer": new_renderer, "seg_renderer": new_seg, "state": new_state}
+                    )
+                    return
+                if self._staged_cam_tx is not None:
+                    self._close_staged_cam(self._staged_cam_tx)
+                self._staged_cam_tx = {
+                    "tx_id": tx_id,
+                    "model": new_model,
+                    "data": new_data,
+                    "scene": new_scene,
+                    "labels": new_labels,
+                    "renderer": new_renderer,
+                    "seg_renderer": new_seg,
+                    "state": new_state,
+                    "scene_ref": scene_ref,
+                    "tool_ref": tool_ref,
+                    "objects_str": objects_str,
+                }
         except Exception as exc:
-            return {"error": f"scene commit failed: {exc}"}
+            self._close_staged_cam(
+                {"renderer": new_renderer, "seg_renderer": new_seg, "state": new_state}
+            )
+            err_box["error"] = f"camera stage failed: {exc}"
+            if hasattr(exc, "code"):
+                err_box["code"] = exc.code
+
+    def _commit_staged_camera_tx(self, req: dict) -> None:
+        err_box = req["err_box"]
+        tx_id = req["tx_id"]
+        with self.reload_lock:
+            if req.get("cancelled"):
+                err_box["error"] = "camera commit cancelled"
+                return
+            staged = self._staged_cam_tx
+            if staged is None or staged.get("tx_id") != tx_id:
+                err_box["error"] = f"camera tx {tx_id!r} not staged"
+                return
+            try:
+                hook = getattr(self, "_before_camera_commit_hook", None)
+                if hook is not None:
+                    hook(staged)
+                prev_gen = {
+                    "tx_id": self.camera_tx_id,
+                    "state": self.state,
+                    "model": self.model,
+                    "data": self.data,
+                    "scene": self.scene,
+                    "labels": self.labels,
+                    "renderer": getattr(self, "renderer", None),
+                    "seg_renderer": getattr(self, "seg_renderer", None),
+                    "scene_ref": self.cfg.get("scene"),
+                    "tool_ref": self.cfg.get("tool"),
+                    "objects_str": self.cfg.get("objects"),
+                }
+
+                self.state = staged["state"]
+                self.model = staged["model"]
+                self.data = staged["data"]
+                self.scene = staged["scene"]
+                self.labels = staged["labels"]
+                self.renderer = staged["renderer"]
+                self.seg_renderer = staged["seg_renderer"]
+                self.cfg["scene"] = staged["scene_ref"]
+                self.cfg["tool"] = staged["tool_ref"]
+                self.cfg["objects"] = staged["objects_str"]
+                self.physics_step = None
+                self.delayed.clear()
+                self.perception.clear_latest()
+                for stream in self.streams.values():
+                    with stream.lock:
+                        stream.want_idr = True
+                self._prev_cam_gen = prev_gen
+                self.camera_committed_tx_id = tx_id
+                self._staged_cam_tx = None
+                # Mark committed and done atomically under reload_lock before any teardown
+                req["committed"] = True
+                req["done"].set()
+            except Exception as exc:
+                err_box["error"] = f"camera commit failed: {exc}"
+                return
+
+    def _finalize_camera_tx(self, req: dict) -> None:
+        prev = None
+        with self.reload_lock:
+            prev = self._prev_cam_gen
+            self._prev_cam_gen = None
+            self.camera_committed_tx_id = None
+            req["done"].set()
+        if prev is not None:
+            self._close_staged_cam(prev)
+
+    def _restore_prev_camera_tx(self, req: dict) -> None:
+        err_box = req["err_box"]
+        to_close = None
+        with self.reload_lock:
+            prev = self._prev_cam_gen
+            if prev is None:
+                err_box["error"] = "no previous camera generation to restore"
+                return
+            try:
+                hook = getattr(self, "_before_camera_abort_hook", None)
+                if hook is not None:
+                    hook(prev)
+                to_close = {
+                    "state": self.state,
+                    "renderer": getattr(self, "renderer", None),
+                    "seg_renderer": getattr(self, "seg_renderer", None),
+                }
+                self.state = prev["state"]
+                self.model = prev["model"]
+                self.data = prev["data"]
+                self.scene = prev["scene"]
+                self.labels = prev["labels"]
+                self.renderer = prev["renderer"]
+                self.seg_renderer = prev["seg_renderer"]
+                self.cfg["scene"] = prev["scene_ref"]
+                self.cfg["tool"] = prev["tool_ref"]
+                self.cfg["objects"] = prev["objects_str"]
+                self.physics_step = None
+                self.delayed.clear()
+                self.perception.clear_latest()
+                for stream in self.streams.values():
+                    with stream.lock:
+                        stream.want_idr = True
+                self._prev_cam_gen = None
+                self.camera_committed_tx_id = None
+                req["done"].set()
+            except Exception as exc:
+                err_box["error"] = f"camera restore failed: {exc}"
+                return
+        if to_close is not None:
+            self._close_staged_cam(to_close)
+
+    def _abort_staged_camera_tx(self, req: dict) -> None:
+        tx_id = req.get("tx_id")
+        err_box = req["err_box"]
+        to_close = None
+        with self.reload_lock:
+            if self._staged_cam_tx is not None and (
+                tx_id is None or self._staged_cam_tx.get("tx_id") == tx_id
+            ):
+                try:
+                    hook = getattr(self, "_before_camera_abort_hook", None)
+                    if hook is not None:
+                        hook(self._staged_cam_tx)
+                except Exception as exc:
+                    err_box["error"] = f"camera abort failed: {exc}"
+                    return
+                to_close = self._staged_cam_tx
+                self._staged_cam_tx = None
+            req["done"].set()
+        if to_close is not None:
+            self._close_staged_cam(to_close)
+
+    def _close_legacy_prev_cam(self, req: dict) -> None:
+        with self.reload_lock:
+            prev = self._legacy_prev_cam
+            self._legacy_prev_cam = None
+            req["done"].set()
+        if prev is not None:
+            self._close_staged_cam(prev)
+
+    def _restore_legacy_prev_cam(self, req: dict) -> None:
+        to_close = None
+        with self.reload_lock:
+            prev = self._legacy_prev_cam
+            self._legacy_prev_cam = None
+            if prev is not None:
+                to_close = {
+                    "state": self.state,
+                    "renderer": getattr(self, "renderer", None),
+                    "seg_renderer": getattr(self, "seg_renderer", None),
+                }
+                self.state = prev["state"]
+                self.model = prev["model"]
+                self.data = prev["data"]
+                self.scene = prev["scene"]
+                self.labels = prev["labels"]
+                self.renderer = prev["renderer"]
+                self.seg_renderer = prev["seg_renderer"]
+                self.cfg["scene"] = prev["scene_ref"]
+                self.cfg["tool"] = prev["tool_ref"]
+                self.cfg["objects"] = prev["objects_str"]
+                self.physics_step = None
+                self.delayed.clear()
+                self.perception.clear_latest()
+                for stream in self.streams.values():
+                    with stream.lock:
+                        stream.want_idr = True
+            req["done"].set()
+        if to_close is not None:
+            self._close_staged_cam(to_close)
+
+    @staticmethod
+    def _strip_internal(res: dict) -> dict:
+        return {k: v for k, v in res.items() if not k.startswith("_")}
+
+    def prepare_scene(self, body: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY", "state": "ABORTED"}
+        try:
+            if self.activation_state == "DEGRADED_SPLIT":
+                return 503, {
+                    "error": "SIM_ACTIVATION_DEGRADED",
+                    "code": "SIM_ACTIVATION_DEGRADED",
+                    "state": "DEGRADED_SPLIT",
+                    "tx_id": self.active_tx_id,
+                    "camera_tx_id": self.camera_tx_id,
+                }
+            res = self.link.call(("tx_prepare", body), timeout=8.0)
+            status = int(res.get("_http_status", 200))
+            if status != 200:
+                return status, self._strip_internal(res)
+            shm_info = res.get("_shm")
+            if shm_info is not None:
+                err_box: dict = {}
+                err = self._run_reload_op(
+                    {
+                        "op": "stage",
+                        "done": threading.Event(),
+                        "tx_id": res["tx_id"],
+                        "shm_info": shm_info,
+                        "scene_ref": res.get("_scene_ref"),
+                        "tool_ref": res.get("_tool_ref"),
+                        "scene_is_dir": res.get("_scene_is_dir", False),
+                        "tool_is_dir": res.get("_tool_is_dir", False),
+                        "objects_str": res.get("_objects_spec", self.cfg.get("objects", "cube")),
+                        "expected_scene_digest": res.get("_scene_digest"),
+                        "expected_tool_digest": res.get("_tool_digest"),
+                        "verify_digests": True,
+                        "err_box": err_box,
+                        "cancelled": False,
+                    },
+                    timeout=5.0,
+                )
+                if err:
+                    try:
+                        self.link.call(("tx_abort", {"tx_id": res["tx_id"]}), timeout=2.0)
+                    except Exception:
+                        pass
+                    code = err_box.get("code", "CAMERA_PREPARE_FAILED")
+                    ret_status = 400 if code == "DIGEST_MISMATCH" else 422
+                    return ret_status, {"error": err, "code": code, "state": "ABORTED"}
+            return 200, self._strip_internal(res)
+        finally:
+            self._tx_lock.release()
+
+    def _finish_finalize(self, tx_id: str) -> tuple[int, dict]:
+        try:
+            fin = self.link.call(("tx_finalize", {"tx_id": tx_id}), timeout=1.0)
+        except Exception as exc:
+            self.activation_state = "DEGRADED_SPLIT"
+            self.active_tx_id = tx_id
+            try:
+                self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": str(exc)}), timeout=1.0)
+            except Exception:
+                pass
+            return 503, {
+                "error": str(exc),
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": tx_id,
+                "physics_tx_id": tx_id,
+                "camera_tx_id": self.camera_tx_id,
+            }
+        fin_status = int(fin.get("_http_status", 200))
+        if fin_status != 200 or "error" in fin:
+            self.activation_state = "DEGRADED_SPLIT"
+            self.active_tx_id = tx_id
+            try:
+                self.link.call(
+                    ("tx_mark_degraded", {"tx_id": tx_id, "error": str(fin.get("error", "finalize failed"))}),
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
+            return 503, {
+                "error": str(fin.get("error", "finalize failed")),
+                "code": "SIM_ACTIVATION_DEGRADED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": tx_id,
+                "physics_tx_id": tx_id,
+                "camera_tx_id": self.camera_tx_id,
+            }
+        self.active_tx_id = tx_id
+        self.camera_tx_id = tx_id
+        self.activation_state = "COMMITTED"
+        self._run_reload_op(
+            {"op": "finalize_cam", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+            timeout=2.0,
+        )
+        return 200, self._strip_internal(fin)
+
+    def commit_scene(self, body: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
+        try:
+            if not isinstance(body, dict):
+                return 400, {"error": "request body must be a JSON object", "code": "INVALID_REQUEST"}
+            tx_id = body.get("tx_id")
+            if not isinstance(tx_id, str) or not tx_id.strip():
+                return 400, {"error": "tx_id must be a non-empty string", "code": "INVALID_TX_ID"}
+            tx_id = tx_id.strip()
+            phase = body.get("phase", "all")
+            if not isinstance(phase, str) or phase not in {"all", "camera_only", "rollback_physics"}:
+                return 400, {"error": f"invalid commit phase: {phase!r}", "code": "INVALID_PHASE"}
+
+            if (
+                phase in {"all", "camera_only"}
+                and tx_id == self.active_tx_id
+                and self.camera_tx_id == tx_id
+                and self.activation_state == "COMMITTED"
+            ):
+                res = self.link.call(("tx_commit", body), timeout=3.0)
+                return int(res.get("_http_status", 200)), self._strip_internal(res)
+
+            if phase == "rollback_physics":
+                if self.activation_state != "DEGRADED_SPLIT" or self.active_tx_id != tx_id:
+                    return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
+                cam_op = (
+                    "restore_prev_cam"
+                    if self.camera_committed_tx_id == tx_id and self._prev_cam_gen is not None
+                    else "abort_staged"
+                )
+                abort_err = self._run_reload_op(
+                    {"op": cam_op, "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                    timeout=3.0,
+                )
+                if abort_err:
+                    # M04: Keep physics rollback snapshot intact so retry succeeds cleanly
+                    return 503, {
+                        "error": abort_err,
+                        "code": "CAMERA_ABORT_FAILED",
+                        "state": "DEGRADED_SPLIT",
+                        "tx_id": self.active_tx_id,
+                        "camera_tx_id": self.camera_tx_id,
+                    }
+                res = self.link.call(("tx_rollback_physics", {"tx_id": tx_id}), timeout=3.0)
+                status = int(res.get("_http_status", 200))
+                if status != 200 or "error" in res:
+                    return (status if status != 200 else 500), self._strip_internal(res)
+                self.active_tx_id = res.get("restored_tx_id")
+                self.camera_tx_id = res.get("camera_tx_id")
+                self.camera_committed_tx_id = None
+                self.activation_state = "COMMITTED"
+                self.perception.clear_latest()
+                return 200, self._strip_internal(res)
+
+            if phase == "camera_only":
+                if self.activation_state != "DEGRADED_SPLIT" or self.active_tx_id != tx_id:
+                    return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
+                if self.camera_committed_tx_id != tx_id:
+                    err = self._run_reload_op(
+                        {"op": "commit_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                        timeout=5.0,
+                    )
+                    if err:
+                        return 503, {
+                            "error": err,
+                            "code": "SIM_ACTIVATION_DEGRADED",
+                            "state": "DEGRADED_SPLIT",
+                            "tx_id": tx_id,
+                            "physics_tx_id": tx_id,
+                            "camera_tx_id": self.camera_tx_id,
+                        }
+                return self._finish_finalize(tx_id)
+
+            # phase == "all"
+            if self.activation_state == "DEGRADED_SPLIT":
+                return 503, {
+                    "error": "SIM_ACTIVATION_DEGRADED",
+                    "code": "SIM_ACTIVATION_DEGRADED",
+                    "state": "DEGRADED_SPLIT",
+                    "tx_id": self.active_tx_id,
+                    "camera_tx_id": self.camera_tx_id,
+                }
+            # M03: Gate frame/video publication BEFORE physics commit
+            prev_state = self.activation_state
+            self.activation_state = "COMMITTING"
+            try:
+                phys = self.link.call(("tx_commit_physics", {"tx_id": tx_id}), timeout=3.0)
+            except Exception:
+                # Reply lost/ambiguous: keep COMMITTING/DEGRADED_SPLIT so old frames don't leak
+                self.activation_state = "DEGRADED_SPLIT"
+                raise
+            p_status = int(phys.get("_http_status", 200))
+            if p_status != 200:
+                self.activation_state = prev_state
+                if p_status == 500:
+                    self._run_reload_op(
+                        {"op": "abort_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                        timeout=3.0,
+                    )
+                return p_status, self._strip_internal(phys)
+
+            err = self._run_reload_op(
+                {"op": "commit_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                timeout=5.0,
+            )
+            if err:
+                self.activation_state = "DEGRADED_SPLIT"
+                self.active_tx_id = tx_id
+                deg = self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": err}), timeout=1.0)
+                return 503, self._strip_internal(deg)
+
+            return self._finish_finalize(tx_id)
+        finally:
+            self._tx_lock.release()
+
+    def abort_scene(self, body: dict) -> tuple[int, dict]:
+        if not self._tx_lock.acquire(blocking=False):
+            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
+        try:
+            if not isinstance(body, dict):
+                return 400, {"error": "request body must be a JSON object", "code": "INVALID_REQUEST"}
+            tx_id = body.get("tx_id")
+            if not isinstance(tx_id, str) or not tx_id.strip():
+                return 400, {"error": "tx_id must be a non-empty string", "code": "MISSING_TX_ID"}
+            tx_id = tx_id.strip()
+            if self.activation_state == "DEGRADED_SPLIT":
+                return 503, {
+                    "error": "SIM_ACTIVATION_DEGRADED",
+                    "code": "SIM_ACTIVATION_DEGRADED",
+                    "state": "DEGRADED_SPLIT",
+                    "tx_id": self.active_tx_id,
+                    "camera_tx_id": self.camera_tx_id,
+                }
+            res = self.link.call(("tx_abort", {"tx_id": tx_id}), timeout=3.0)
+            status = int(res.get("_http_status", 200))
+            if status == 200:
+                self._run_reload_op(
+                    {"op": "abort_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                    timeout=3.0,
+                )
+            return status, self._strip_internal(res)
+        finally:
+            self._tx_lock.release()
+
+    def load_scene(self, body):
+        if not self._tx_lock.acquire(blocking=False):
+            return {"_http_status": 409, "error": "transaction in progress", "code": "TX_BUSY"}
+        try:
+            res = self.link.call(("scene_prepare", body), timeout=8.0)
+            if "error" in res:
+                return res
+            shm_info = res.pop("_shm", None)
+            scene_ref = res.pop("_scene_ref", None)
+            tool_ref = res.pop("_tool_ref", None)
+            objects_str = res.pop("_objects_spec", self.cfg.get("objects", "cube"))
+            swapped_cam = False
+            if shm_info is not None:
+                err = self._run_reload_op(
+                    {
+                        "done": threading.Event(),
+                        "shm_info": shm_info,
+                        "scene_ref": scene_ref,
+                        "tool_ref": tool_ref,
+                        "objects_str": objects_str,
+                        "defer_close": True,
+                        "err_box": {},
+                        "cancelled": False,
+                    },
+                    timeout=5.0,
+                )
+                if err:
+                    try:
+                        self.link.call(("scene_abort",), timeout=2.0)
+                    except Exception:
+                        pass
+                    return {"error": err}
+                swapped_cam = True
+            try:
+                commit_res = self.link.call(("scene_commit",), timeout=3.0)
+            except Exception as exc:
+                if swapped_cam:
+                    self._run_reload_op(
+                        {"op": "restore_legacy_prev", "done": threading.Event(), "err_box": {}, "cancelled": False},
+                        timeout=3.0,
+                    )
+                    try:
+                        self.link.call(("scene_abort",), timeout=2.0)
+                    except Exception:
+                        pass
+                return {"error": f"scene commit failed: {exc}"}
+            if "error" in commit_res:
+                if swapped_cam:
+                    self._run_reload_op(
+                        {"op": "restore_legacy_prev", "done": threading.Event(), "err_box": {}, "cancelled": False},
+                        timeout=3.0,
+                    )
+                    try:
+                        self.link.call(("scene_abort",), timeout=2.0)
+                    except Exception:
+                        pass
+                return commit_res
+            if swapped_cam:
+                self._run_reload_op(
+                    {"op": "close_legacy_prev", "done": threading.Event(), "err_box": {}, "cancelled": False},
+                    timeout=2.0,
+                )
+            self.active_tx_id = commit_res.get("tx_id")
+            self.camera_tx_id = commit_res.get("camera_tx_id")
+            self.activation_state = "COMMITTED"
+            return commit_res
+        finally:
+            self._tx_lock.release()
 
     def _apply_reload(self, req: dict | tuple) -> None:
         import mujoco
@@ -1226,13 +1870,16 @@ class CameraRig:
             tool_ref = req["tool_ref"]
             objects_str = req["objects_str"]
             err_box = req["err_box"]
+            defer_close = bool(req.get("defer_close", False))
         else:
             shm_info, scene_ref, tool_ref, objects_str, err_box = req
             req = {"cancelled": False}
+            defer_close = False
 
         new_renderer = None
         new_seg = None
         new_state = None
+        old_to_close = None
         try:
             new_model, new_data, new_scene, new_labels = self._build_camera_world(
                 scene_ref, tool_ref, objects_str
@@ -1256,28 +1903,23 @@ class CameraRig:
 
             with self.reload_lock:
                 if req.get("cancelled"):
-                    if new_renderer is not None:
-                        try:
-                            new_renderer.close()
-                        except Exception:
-                            pass
-                    if new_seg is not None:
-                        try:
-                            new_seg.close()
-                        except Exception:
-                            pass
-                    if new_state is not None:
-                        try:
-                            new_state.close()
-                        except Exception:
-                            pass
+                    self._close_staged_cam(
+                        {"renderer": new_renderer, "seg_renderer": new_seg, "state": new_state}
+                    )
                     return
 
-                if hasattr(self, "renderer") and self.renderer is not None:
-                    self.renderer.close()
-                if hasattr(self, "seg_renderer") and self.seg_renderer is not None:
-                    self.seg_renderer.close()
-                old_state.close()
+                prev_cam = {
+                    "state": old_state,
+                    "model": self.model,
+                    "data": self.data,
+                    "scene": self.scene,
+                    "labels": self.labels,
+                    "renderer": getattr(self, "renderer", None),
+                    "seg_renderer": getattr(self, "seg_renderer", None),
+                    "scene_ref": self.cfg.get("scene"),
+                    "tool_ref": self.cfg.get("tool"),
+                    "objects_str": self.cfg.get("objects"),
+                }
 
                 self.state = new_state
                 self.model, self.data, self.scene, self.labels = (
@@ -1294,25 +1936,24 @@ class CameraRig:
                 )
                 self.physics_step = None
                 self.delayed.clear()
+                self.perception.clear_latest()
                 for stream in self.streams.values():
                     with stream.lock:
                         stream.want_idr = True
+                if defer_close:
+                    self._legacy_prev_cam = prev_cam
+                else:
+                    old_to_close = prev_cam
+                if isinstance(req, dict):
+                    req["committed"] = True
+                    if "done" in req:
+                        req["done"].set()
+            if old_to_close is not None:
+                self._close_staged_cam(old_to_close)
         except Exception as exc:
-            if new_renderer is not None:
-                try:
-                    new_renderer.close()
-                except Exception:
-                    pass
-            if new_seg is not None:
-                try:
-                    new_seg.close()
-                except Exception:
-                    pass
-            if new_state is not None:
-                try:
-                    new_state.close()
-                except Exception:
-                    pass
+            self._close_staged_cam(
+                {"renderer": new_renderer, "seg_renderer": new_seg, "state": new_state}
+            )
             err_box["error"] = f"camera reload failed: {exc}"
 
     def sim_state(self):
@@ -1498,7 +2139,25 @@ class CameraRig:
                 if self._reload_req is not None:
                     req, self._reload_req = self._reload_req, None
             if req is not None:
-                if isinstance(req, dict):
+                if isinstance(req, dict) and "op" in req:
+                    if not req.get("cancelled"):
+                        op = req["op"]
+                        if op == "stage":
+                            self._stage_camera_tx(req)
+                        elif op == "commit_staged":
+                            self._commit_staged_camera_tx(req)
+                        elif op == "finalize_cam":
+                            self._finalize_camera_tx(req)
+                        elif op == "restore_prev_cam":
+                            self._restore_prev_camera_tx(req)
+                        elif op == "abort_staged":
+                            self._abort_staged_camera_tx(req)
+                        elif op == "close_legacy_prev":
+                            self._close_legacy_prev_cam(req)
+                        elif op == "restore_legacy_prev":
+                            self._restore_legacy_prev_cam(req)
+                    req["done"].set()
+                elif isinstance(req, dict):
                     self._apply_reload(req)
                     req["done"].set()
                 else:
@@ -1512,6 +2171,9 @@ class CameraRig:
                 step is None or step == self.physics_step
             ):  # no new physics: publish nothing
                 self.skipped += 1
+            elif self.activation_state in {"DEGRADED_SPLIT", "COMMITTING"}:
+                # Never publish mixed-generation detections or video frames while degraded/committing
+                self.physics_step = step
             else:
                 self.physics_step = step
                 captured = time.monotonic()

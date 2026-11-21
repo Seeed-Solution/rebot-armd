@@ -858,7 +858,7 @@ async fn sandbox_b5_declared_assets_must_exist_for_catalog_and_activation() {
 
     // Once the declared asset file is created inside the pack, catalog marks installed and activate succeeds
     std::fs::create_dir_all(custom_dir.join("meshes")).unwrap();
-    std::fs::write(custom_dir.join("meshes/part.stl"), "solid part").unwrap();
+    std::fs::write(custom_dir.join("meshes/part.stl"), "solid part\nendsolid part\n").unwrap();
 
     let (_, cat2) = send_json(&app, "GET", "/api/v1/sandbox/catalog", None).await;
     assert_eq!(
@@ -886,17 +886,22 @@ async fn sandbox_b7_sim_mode_sends_robot_and_rejects_mismatched_upstream_robot()
     let seen_requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_c = seen_requests.clone();
 
-    let mock_sim = axum::Router::new().route(
-        "/sim/scene",
-        post(move |axum::Json(body): axum::Json<Value>| {
-            let seen_c = seen_c.clone();
-            async move {
-                seen_c.lock().unwrap().push(body);
-                // Upstream responds with mismatched b601dm while running_robot is so-arm101
-                axum::Json(json!({"ok": true, "robot": "b601dm"}))
-            }
-        }),
-    );
+    let mock_sim = axum::Router::new()
+        .route(
+            "/sim/state",
+            axum::routing::get(|| async { axum::Json(json!({"robot": "b601dm"})) }),
+        )
+        .route(
+            "/sim/scene",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let seen_c = seen_c.clone();
+                async move {
+                    seen_c.lock().unwrap().push(body);
+                    // Upstream responds with mismatched b601dm while running_robot is so-arm101
+                    axum::Json(json!({"ok": true, "robot": "b601dm"}))
+                }
+            }),
+        );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -929,8 +934,7 @@ async fn sandbox_b7_sim_mode_sends_robot_and_rejects_mismatched_upstream_robot()
 
     {
         let reqs = seen_requests.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0]["robot"], "so-arm101");
+        assert_eq!(reqs.len(), 0, "legacy POST /sim/scene must not be called when /sim/state mismatches robot");
     }
 
     // Active state must NOT have been mutated on upstream mismatch
@@ -1173,7 +1177,7 @@ async fn sandbox_m02_collect_pack_files_terminates_on_ancestor_symlink_cycle() {
     let scene_dir = tmp.path().join("scenes/cycle_scene");
     write_scene_pack(&scene_dir, "cycle_scene", &["b601dm"], "default", "");
     std::fs::create_dir_all(scene_dir.join("sub")).unwrap();
-    std::fs::write(scene_dir.join("sub/mesh.stl"), "solid m").unwrap();
+    std::fs::write(scene_dir.join("sub/mesh.stl"), "solid m\nendsolid m\n").unwrap();
     // Symlink inside sub pointing back to pack root (inside pack boundary -> ancestor cycle!)
     std::os::unix::fs::symlink(&scene_dir, scene_dir.join("sub/loop")).unwrap();
 
@@ -1243,7 +1247,7 @@ async fn sandbox_m04_m05_optional_assets_and_normalized_path_in_bundle() {
     let tmp = tempfile::tempdir().unwrap();
     let scene_dir = tmp.path().join("scenes/asset_norm_scene");
     std::fs::create_dir_all(scene_dir.join("meshes")).unwrap();
-    std::fs::write(scene_dir.join("meshes/present.stl"), "solid present").unwrap();
+    std::fs::write(scene_dir.join("meshes/present.stl"), "solid present\nendsolid present\n").unwrap();
     std::fs::write(scene_dir.join("extra.bin"), "bin").unwrap();
     std::fs::write(
         scene_dir.join("scene.json"),
@@ -1269,7 +1273,7 @@ async fn sandbox_m04_m05_optional_assets_and_normalized_path_in_bundle() {
 
     let tool_dir = tmp.path().join("tools/asset_norm_tool");
     std::fs::create_dir_all(&tool_dir).unwrap();
-    std::fs::write(tool_dir.join("jaw.stl"), "solid jaw").unwrap();
+    std::fs::write(tool_dir.join("jaw.stl"), "solid jaw\nendsolid jaw\n").unwrap();
     std::fs::write(
         tool_dir.join("tool.json"),
         serde_json::to_string_pretty(&json!({
@@ -1469,20 +1473,25 @@ async fn sandbox_m08_m11_activate_and_delete_policy_are_serialized() {
     let release = Arc::new(tokio::sync::Notify::new());
     let release_c = release.clone();
 
-    let mock_sim = axum::Router::new().route(
-        "/sim/scene",
-        post(move || {
-            let entered_tx = entered_tx.clone();
-            let release_c = release_c.clone();
-            async move {
-                if let Some(tx) = entered_tx.lock().unwrap().take() {
-                    let _ = tx.send(());
+    let mock_sim = axum::Router::new()
+        .route(
+            "/sim/state",
+            axum::routing::get(|| async { axum::Json(json!({"robot": "b601dm"})) }),
+        )
+        .route(
+            "/sim/scene",
+            post(move || {
+                let entered_tx = entered_tx.clone();
+                let release_c = release_c.clone();
+                async move {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    release_c.notified().await;
+                    axum::Json(json!({"ok": true, "robot": "b601dm"}))
                 }
-                release_c.notified().await;
-                axum::Json(json!({"ok": true, "robot": "b601dm"}))
-            }
-        }),
-    );
+            }),
+        );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
