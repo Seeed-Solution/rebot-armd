@@ -64,13 +64,16 @@ pub const BASELINE_M: [f64; 2] = [0.03, 0.12];
 pub const DEFAULT_BASELINE_M: f64 = 0.08;
 pub const SPEED_SCALE: [f64; 2] = [0.1, 0.5];
 pub const DEFAULT_SPEED_SCALE: f64 = 0.3;
-/// Wait after a view motion settled, before the first snapshot (s).
-pub const MIN_SETTLE_S: f64 = 1.0;
+/// Wait after a view motion settled, before the first snapshot (s). Real B601-DM, 2026-11-22: J1
+/// trails its POS_VEL command by up to 19 mrad at the end of a view move and the rest decays with
+/// tau ~0.7 s, so after 1 s the trigger-and-snapshot bracket still moved 2.7-5.7 mrad.
+pub const MIN_SETTLE_S: f64 = 2.0;
 /// After the trigger: a snapshot equal to the one before the trigger is polled again every
 /// [`REFRESH_POLL`], for at most [`REFRESH_MAX`] (real B601-DM, 2026-11-22: the snapshot changed
-/// 0.03-0.08 s after the trigger returned).
+/// 0.03-0.08 s after the trigger returned, and up to 1.1 s later when it was not the trigger's frame;
+/// idle frames come 0.7-2.2 s apart).
 pub const REFRESH_POLL: Duration = Duration::from_millis(50);
-pub const REFRESH_MAX: Duration = Duration::from_millis(1500);
+pub const REFRESH_MAX: Duration = Duration::from_millis(3000);
 /// Look-at point: the ray through the target box centre at this height above the table (m).
 pub const LOOK_AT_ABOVE_TABLE_M: f64 = 0.02;
 /// Fallback offsets as fractions of the refused one (after the mirrored offset).

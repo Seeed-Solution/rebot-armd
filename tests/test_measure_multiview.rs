@@ -597,8 +597,9 @@ async fn a_snapshot_that_never_refreshes_fails_detection_unavailable() {
     println!("{} {} after {:?}", a["code"], a["message"], t.elapsed());
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("DETECTION_UNAVAILABLE")), "{a}");
     assert!(a["message"].as_str().unwrap().contains("camera snapshot did not refresh"), "{a}");
-    // the snapshot before the trigger, then polls every 50 ms for 1.5 s
+    // the snapshot before the trigger, then polls every REFRESH_POLL for REFRESH_MAX
     let n = r.vision.snapshots.load(Ordering::SeqCst);
-    assert!((20..=40).contains(&n), "{n} snapshots");
+    let polls = (mm::REFRESH_MAX.as_millis() / mm::REFRESH_POLL.as_millis()) as u64;
+    assert!((polls / 2..=polls + 20).contains(&n), "{n} snapshots, about {polls} polls expected");
     assert!(r.at_start().await);
 }
