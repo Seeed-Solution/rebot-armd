@@ -31,11 +31,15 @@
 //! - Times: `measurement.stats` carries the stage times of the reconstruction and `decode_ms`
 //!   (all views); every view its own `decode_ms`.
 //! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
-//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`); discard [`DISCARD_SNAPSHOTS`]
-//!   snapshots; then a snapshot bracketed by joint samples ([`BRACKET_LEAD`] before the request and
-//!   after the reply). The view's pose is the FK of the bracket's mean joints; a bracket that moved
-//!   more than [`BRACKET_RAD`] is retried, at most [`SNAPSHOT_TRIES`] times, then `MOVED`. Then one
-//!   YOLO trigger (a frame newer than the request) for the target box.
+//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`). Then one snapshot `s0`: with
+//!   inference idle the camera runs at 1 fps, so `/snapshot.jpg` can still hold a frame taken while
+//!   the arm moved (real B601-DM, 2026-11-22: the same frame for 0.7-2.2 s). A joint sample, a YOLO
+//!   trigger (a frame newer than the request; it also refreshes the snapshot), then snapshots every
+//!   [`REFRESH_POLL`] until one differs from `s0` (at most [`REFRESH_MAX`], else
+//!   `DETECTION_UNAVAILABLE`), then a second joint sample. The view's pose is the FK of the two
+//!   samples' mean joints; when they differ by more than [`BRACKET_RAD`] the trigger and snapshot
+//!   are retried (`s0` = the last snapshot), at most [`SNAPSHOT_TRIES`] times, then `MOVED`. The
+//!   target box comes from the trigger frame of the accepted try.
 //! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
 //!   (the supervisor ends it; [`recheck`] between steps). A measurement failure after motion
 //!   ([`RETURN_AFTER`], `TOO_FEW_POINTS`) returns to the start joints first when `return_to_start`.
@@ -62,10 +66,11 @@ pub const SPEED_SCALE: [f64; 2] = [0.1, 0.5];
 pub const DEFAULT_SPEED_SCALE: f64 = 0.3;
 /// Wait after a view motion settled, before the first snapshot (s).
 pub const MIN_SETTLE_S: f64 = 1.0;
-/// Snapshots thrown away after the settle (the snapshot lags 1-2 frames after motion).
-pub const DISCARD_SNAPSHOTS: usize = 2;
-/// Time between the snapshots of one capture.
-const SNAPSHOT_GAP: Duration = Duration::from_millis(150);
+/// After the trigger: a snapshot equal to the one before the trigger is polled again every
+/// [`REFRESH_POLL`], for at most [`REFRESH_MAX`] (real B601-DM, 2026-11-22: the snapshot changed
+/// 0.03-0.08 s after the trigger returned).
+pub const REFRESH_POLL: Duration = Duration::from_millis(50);
+pub const REFRESH_MAX: Duration = Duration::from_millis(1500);
 /// Look-at point: the ray through the target box centre at this height above the table (m).
 pub const LOOK_AT_ABOVE_TABLE_M: f64 = 0.02;
 /// Fallback offsets as fractions of the refused one (after the mirrored offset).
@@ -91,11 +96,10 @@ pub const STILL_SAMPLE: Duration = Duration::from_millis(20);
 pub const STILL_VEL: f32 = 0.03;
 pub const STILL_RANGE_RAD: f32 = 0.003;
 pub const MAX_SETTLE_S: f64 = 4.0;
-/// The snapshot's pose: the joints sampled [`BRACKET_LEAD`] before the snapshot request and right
-/// after its reply, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the
-/// two, the snapshot is retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`] times,
-/// then `MOVED`.
-pub const BRACKET_LEAD: Duration = Duration::from_millis(100);
+/// The snapshot's pose: the joints sampled before the trigger request and right after the fresh
+/// snapshot, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the two,
+/// trigger and snapshot are retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`]
+/// times, then `MOVED`.
 pub const BRACKET_RAD: f32 = 0.002;
 pub const SNAPSHOT_TRIES: usize = 3;
 pub const SNAPSHOT_GAP_RETRY: Duration = Duration::from_millis(500);
@@ -369,8 +373,11 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     // bound: per view one joint move (up to 2 rad at the slowest planning speed), settle, captures
     let vmin = inner.planning_limits().iter().take(inner.config.arm_dof()).map(|l| l.max_velocity).fold(f32::INFINITY, f32::min).max(0.05);
     let move_s = 2.0 / (f64::from(vmin) * request.speed_scale) + crate::motion::SETTLE_MAX_S;
-    let capture_s = MAX_SETTLE_S + DISCARD_SNAPSHOTS as f64 * 3.5 + SNAPSHOT_TRIES as f64 * (3.5 + SNAPSHOT_GAP_RETRY.as_secs_f64())
-        + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
+    // a snapshot takes at most 3 s (3.5 s budgeted); per try: the triggers, the refresh polls
+    // (the last one may start just before REFRESH_MAX) and the retry gap
+    let try_s = SNAPSHOT_GAP_RETRY.as_secs_f64() + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0)
+        + 3.5 + REFRESH_MAX.as_secs_f64() + 3.5;
+    let capture_s = MAX_SETTLE_S + 3.5 + SNAPSHOT_TRIES as f64 * try_s;
     let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
@@ -478,21 +485,25 @@ struct Capture {
     bracket: [Vec<f32>; 2],
     snapshot_tries: Vec<f32>,
     settle_s: f64,
+    /// Accepted try: the trigger's time, the time from its reply to the refreshed snapshot (ms)
+    /// and the snapshots that still returned the frame from before the trigger.
+    trigger_ms: f64,
+    snapshot_wait_ms: f64,
+    snapshot_polls: usize,
     /// The snapshot (debug bundles only).
     jpeg: Option<Vec<u8>>,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
 
-/// Settle, discard snapshots, take a snapshot bracketed by joint samples (retried while the
-/// bracket moved), then a detection. The pose is the FK of the bracket's mean joints.
+/// Settle, then (bracketed by joint samples, retried while the bracket moved) a detection
+/// trigger and the first snapshot that differs from the one before the trigger. The pose is the
+/// FK of the bracket's mean joints.
 async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64) -> Result<Capture, Stop> {
     let settle_s = settle(ctx, plan).await?;
-    for _ in 0..DISCARD_SNAPSHOTS {
-        src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
-        tokio::time::sleep(SNAPSHOT_GAP).await;
-        ctx.check().await?;
-    }
+    let snap = || async { src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}"))) };
+    // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
+    let mut s0 = snap().await?;
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let mut tries = Vec::new();
     let mut got = None;
@@ -500,27 +511,41 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
         recheck(ctx, plan).await?;
         let (a, _) = sample(ctx).await;
-        tokio::time::sleep(BRACKET_LEAD).await;
-        let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+        let t_trigger = Instant::now();
+        let mut frame = None;
+        for _ in 0..TRIGGERS {
+            ctx.check().await?;
+            if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
+        }
+        let frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
+        let t_reply = Instant::now();
+        let trigger_ms = (t_reply - t_trigger).as_secs_f64() * 1000.0;
+        let mut polls = 0;
+        let jpeg = loop {
+            let j = snap().await?;
+            if j != s0 { break j; }
+            polls += 1;
+            if t_reply.elapsed() >= REFRESH_MAX {
+                return Err(fail("DETECTION_UNAVAILABLE", format!("camera snapshot did not refresh within {} ms after a detection trigger ({polls} snapshots returned the frame from before the trigger)", REFRESH_MAX.as_millis())));
+            }
+            tokio::time::sleep(REFRESH_POLL).await;
+            ctx.check().await?;
+        };
+        let wait_ms = t_reply.elapsed().as_secs_f64() * 1000.0;
         let (b, _) = sample(ctx).await;
         let spread = bracket_spread(&a, &b, &arm);
         tries.push(spread);
         if spread <= BRACKET_RAD {
             let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
-            got = Some((jpeg, mean, a, b));
+            got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls));
             break;
         }
+        s0 = jpeg;
     }
-    let Some((jpeg, joints, bracket_a, bracket_b)) = got else {
+    let Some((jpeg, joints, bracket_a, bracket_b, mut frame, trigger_ms, snapshot_wait_ms, snapshot_polls)) = got else {
         let mrad: Vec<String> = tries.iter().map(|t| format!("{:.1}", t * 1000.0)).collect();
-        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
+        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
     };
-    let mut frame = None;
-    for _ in 0..TRIGGERS {
-        ctx.check().await?;
-        if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
-    }
-    let mut frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
     recheck(ctx, plan).await?;
     let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
@@ -531,7 +556,7 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
     Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
-        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, jpeg: keep })
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -611,6 +636,7 @@ fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: 
         "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
         "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
         "settle_s": (c.settle_s * 100.0).round() / 100.0,
+        "trigger_ms": c.trigger_ms.round(), "snapshot_wait_ms": c.snapshot_wait_ms.round(), "snapshot_polls": c.snapshot_polls,
     })).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
@@ -826,6 +852,7 @@ fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_
         json!({
             "file": format!("view_{k}.jpg"), "offset_m": v.offset, "frame_id": v.frame_id,
             "joints_rad": v.joints, "bracket_rad": v.bracket, "snapshot_tries_mrad": v.snapshot_tries.iter().map(|t| t * 1000.0).collect::<Vec<f32>>(),
+            "settle_s": v.settle_s, "trigger_ms": v.trigger_ms, "snapshot_wait_ms": v.snapshot_wait_ms, "snapshot_polls": v.snapshot_polls,
             "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
