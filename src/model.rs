@@ -1696,11 +1696,16 @@ impl ArmConfig {
             // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the
             // final grasp / place descent end from the same side (src/backlash.rs)
             backlash_approach: Some(crate::backlash::BacklashApproach::default()),
-            // rebot-sysid on the real arm (B601-DM, 2026-11-11, ±0.08 rad, one session at two
-            // poses): off until validated at more poses (kits/recamera-b601dm/README.md)
+            // Free-motion residuals on the real arm (B601-DM, 2026-11-21): 2786 samples over
+            // pose-to-pose moves at speed 0.3/0.6, ±0.3 rad on every joint in 1 s and 2 s,
+            // linear moves at 0.04/0.08 m/s and J6 sweeps, outside the folded rest pose. Max
+            // |residual| J1 1.31, J2 1.75, J3 2.61, J4 0.41, J5 0.26, J6 0.29 N·m: the 2026-11-11
+            // values for J2 (1.19) and J6 (0.28) were exceeded by normal motion. Threshold =
+            // max(previous, 1.5 x measured max). Still off by default: contact detection is not
+            // validated with real contacts and faster motions (kits/recamera-b601dm/README.md)
             collision: Some(crate::collision::CollisionPolicy {
                 enabled: false,
-                thresholds_nm: [2.0, 1.19, 2.82, 1.43, 0.87, 0.28],
+                thresholds_nm: [2.0, 2.65, 3.9, 1.43, 0.87, 0.45],
                 // J2 and J3 rest on their supports at the folded pose, and J4 shows ~2.1 N·m
                 // residual there (0.4 N·m once lifted), above its 1.43 N·m threshold
                 // (real arm, 2026-11-12)
