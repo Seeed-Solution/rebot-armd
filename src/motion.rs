@@ -18,10 +18,11 @@ use crate::trajectory::MultiJointQuinticTrajectory;
 
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum MotionError {
-    #[error("IK unreachable at s={s:.3} (position error {ep:.4} m, rotation error {er:.4} rad)")]
-    IkUnreachable { s: f64, ep: f64, er: f64 },
-    #[error("IK branch flip at s={s:.3}: joint {joint} jumps {dq:.3} rad between samples (limit 0.10)")]
-    IkBranchFlip { s: f64, joint: usize, dq: f64 },
+    /// `yaw_off_deg`: largest [`outward_hint`] over the start and the samples up to `s`.
+    #[error("IK unreachable at s={s:.3} (position error {ep:.4} m, rotation error {er:.4} rad){}", yaw_hint(*.yaw_off_deg))]
+    IkUnreachable { s: f64, ep: f64, er: f64, yaw_off_deg: Option<f64> },
+    #[error("IK branch flip at s={s:.3}: joint {joint} jumps {dq:.3} rad between samples (limit 0.10){}", yaw_hint(*.yaw_off_deg))]
+    IkBranchFlip { s: f64, joint: usize, dq: f64, yaw_off_deg: Option<f64> },
     #[error("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation {
         s: f64,
@@ -59,11 +60,24 @@ impl MotionError {
     }
 }
 
+/// Message suffix of an IK failure whose sample yaw is off the outward direction.
+fn yaw_hint(yaw_off_deg: Option<f64>) -> String {
+    match yaw_off_deg {
+        Some(d) => format!("; yaw differs from the outward direction by {d:.0}°; try yaw: \"outward\""),
+        None => String::new(),
+    }
+}
+
 // ---- outward yaw ----
 
 /// `yaw: "outward"` is refused when the path passes closer than this to the base z axis
 /// (atan2(y, x) is undefined there); same radius as the 5-DOF auto_yaw.
 pub const OUTWARD_MIN_RADIUS_M: f64 = 0.03;
+/// IK failures on arms with 6+ arm joints get the `yaw: "outward"` hint when the yaw of the start
+/// or of a sample up to the failing one differs from atan2(y, x) by more than this (the largest
+/// such difference is reported).
+pub const OUTWARD_HINT_DEG: f64 = 15.0;
+
 /// Orientation options of a Cartesian path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PathOpts {
@@ -100,6 +114,22 @@ fn segment_axis_distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
 /// Signed angle about base z from the xy direction of `a` to that of `b`.
 fn azimuth_delta(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1])
+}
+
+fn wrap_pi(a: f64) -> f64 {
+    let a = (a + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI);
+    a - std::f64::consts::PI
+}
+
+/// |yaw − atan2(y, x)| in degrees when it exceeds [`OUTWARD_HINT_DEG`] at a sample of a path
+/// planned without `yaw: "outward"` on an arm with 6+ arm joints; None otherwise (5-DOF, near the
+/// base axis, tool vertical, or yaw close to outward).
+pub fn outward_hint(arm_dof: usize, opts: PathOpts, p: &[f64; 3], r: &kinematics::Mat3) -> Option<f64> {
+    if arm_dof < 6 || opts.yaw_outward || p[0].hypot(p[1]) < OUTWARD_MIN_RADIUS_M || crate::chain::is_tool_vertical(r) {
+        return None;
+    }
+    let off = wrap_pi(r[1][0].atan2(r[0][0]) - p[1].atan2(p[0])).abs().to_degrees();
+    (off > OUTWARD_HINT_DEG).then_some(off)
 }
 
 // ---- speed ----
@@ -302,6 +332,8 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
     s_samples.push(0.0);
     let mut prev = input.q0;
     let mut prev_q32 = start_q32;
+    // largest yaw offset from outward over the start and the samples so far (IK failure hint)
+    let mut yaw_off_deg = outward_hint(arm_dof, opts, &start.p, &start.r);
     for k in 1..=n {
         let s = k as f64 / n as f64;
         let p = [start.p[0] + dp[0] * s, start.p[1] + dp[1] * s, start.p[2] + dp[2] * s];
@@ -312,13 +344,16 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
                 None => r_s,
             }
         };
+        if let Some(off) = outward_hint(arm_dof, opts, &p, &r) {
+            yaw_off_deg = Some(yaw_off_deg.map_or(off, |m| m.max(off)));
+        }
         let sol = input.arm.solve_dls_ex(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w, yaw_free);
         if !sol.ok {
-            return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er });
+            return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er, yaw_off_deg });
         }
         if let Some((joint, dq)) = (0..arm_dof).map(|i| (i, (sol.q[i] - prev[i]).abs())).max_by(|a, b| a.1.total_cmp(&b.1)) {
             if dq > MAX_SAMPLE_JUMP_RAD {
-                return Err(MotionError::IkBranchFlip { s, joint: joint + 1, dq });
+                return Err(MotionError::IkBranchFlip { s, joint: joint + 1, dq, yaw_off_deg });
             }
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });

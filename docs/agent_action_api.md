@@ -70,6 +70,7 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 - A path whose xy projection passes within 0.03 m of the base z axis (atan2 undefined) is refused before planning: `INVALID_COMMAND` `yaw "outward" is undefined near the base z axis: the path passes 0.006 m from it (minimum 0.03 m)`.
 - `place`: the place orientation gets the outward yaw of the target; `approach` and `descend` are planned with the outward path, `lift` and `retreat` (straight up, orientation kept) are not.
 - 5-DOF arms: `auto_yaw` keeps its behaviour (the IK leaves yaw free, as without `yaw`); `yaw: "outward"` sets the targets as above in addition.
+- Hint: on arms with 6 or more arm joints, an `IK_UNREACHABLE` or `IK_BRANCH_FLIP` of a path planned without `yaw: "outward"` ends its message with `; yaw differs from the outward direction by N°; try yaw: "outward"` when the yaw of the start or of a sample up to the failing one differs from atan2(y, x) by more than 15° (N = the largest such difference; samples within 0.03 m of the base axis or with a vertical tool are not counted). Example (B601-DM, mock): from `move_to` (0.18, 0.10, 0.30) rpy (0, 40°, 0), which ends at J1 1.194 rad (atan2 0.507), a straight move to (0.18, −0.10, 0.30) gives `IK branch flip at s=0.425: joint 1 jumps 0.105 rad between samples (limit 0.10); yaw differs from the outward direction by 29°; try yaw: "outward"`. With `yaw: "outward"` both moves succeed, J1 within 0.005 rad of atan2(y, x) on every sample (`tests/test_yaw_outward.rs`).
 
 `move_to`、`move_relative`、`place` 的 `"yaw": "outward"`（能力 `yaw_outward`，与 `cartesian` 取值相同；旧版 armd 无此字段）把偏航设为目标位置的 ψ = atan2(y, x)，绕基座 z 轴。`"outward"` 与 null 以外的值返回 `INVALID_COMMAND`。
 
@@ -79,6 +80,7 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 - 路径在 xy 平面上的投影离基座 z 轴不到 0.03 m（atan2 无定义）时，规划前拒绝：`INVALID_COMMAND` `yaw "outward" is undefined near the base z axis: the path passes 0.006 m from it (minimum 0.03 m)`。
 - `place`：放置姿态取目标点的朝外偏航；`approach` 与 `descend` 按朝外路径规划，`lift` 与 `retreat`（竖直移动，保持姿态）不按朝外路径规划。
 - 5 轴机械臂：`auto_yaw` 行为不变（与不带 `yaw` 时一样，IK 放开偏航）；`yaw: "outward"` 另外按上述规则设定目标姿态。
+- 提示：机械臂关节数 ≥ 6 时，不带 `yaw: "outward"` 规划的路径若报 `IK_UNREACHABLE` 或 `IK_BRANCH_FLIP`，且起点或失败点之前（含失败点）任一采样点的偏航与 atan2(y, x) 相差超过 15°，消息末尾加 `; yaw differs from the outward direction by N°; try yaw: "outward"`（N 为其中最大的差值；离基座轴 0.03 m 以内或工具竖直的采样点不计）。示例（B601-DM，mock）：`move_to` (0.18, 0.10, 0.30) rpy (0, 40°, 0) 结束时 J1 为 1.194 rad（atan2 为 0.507），再直线移动到 (0.18, −0.10, 0.30) 返回 `IK branch flip at s=0.425: joint 1 jumps 0.105 rad between samples (limit 0.10); yaw differs from the outward direction by 29°; try yaw: "outward"`。带 `yaw: "outward"` 时两次移动都成功，每个采样点 J1 与 atan2(y, x) 相差不超过 0.005 rad（`tests/test_yaw_outward.rs`）。
 
 ### Speed / 速度
 
@@ -945,7 +947,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 
 | code | status |
 |---|---|
-| `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION`, `POWER_BUDGET` | 422 |
+| `IK_UNREACHABLE`, `IK_BRANCH_FLIP` (message may end with the `yaw: "outward"` hint, see [Outward yaw](#outward-yaw--朝外偏航)), `WORKSPACE_VIOLATION`, `POWER_BUDGET` | 422 |
 | `TASK_UNSUPPORTED` (grasp task requirements not met by the vision provider, or its model switch refused; command rejection, not a fault) | 422 |
 | `REPLAY_EMPTY`, `REPLAY_JOINT_COUNT`, `REPLAY_INVALID_EPISODE`, `REPLAY_TOO_LONG`, `REPLAY_TOO_FAST` | 422 |
 | `SOFT_LIMIT_EXCEEDED`, `INVALID_EPISODE_ID`, `INVALID_OUTPUT_PATH` | 400 |
