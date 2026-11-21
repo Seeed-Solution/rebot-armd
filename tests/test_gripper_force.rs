@@ -125,6 +125,13 @@ fn run(inner: &mut SupervisorInner, id: u64, max_s: f64) -> armd::motion::Action
 
 fn cap() -> f32 { GripperPolicy::rebot_dm().max_close_torque_nm.unwrap() }
 
+/// rebot_dm with the stream contact regulator off (stream_contact_speed_rad_s None).
+fn without_regulator() -> ArmConfig {
+    let mut config = ArmConfig::rebot_dm();
+    config.gripper_policy.as_mut().unwrap().stream_contact_speed_rad_s = None;
+    config
+}
+
 /// Margin above the cap: the latch needs GRIPPER_FORCE_CAP_TICKS ticks and the rig's torque
 /// rises 0.07 N·m per tick at 1.05 rad/s, plus one tick of feedback delay.
 const CAP_MARGIN_NM: f32 = 0.25;
@@ -181,10 +188,12 @@ fn incident_close_without_grasp_detection_stops_at_the_cap() {
     assert_eq!(obs.motion_limit.map(|l| (l.reason, l.joint)), Some((MotionLimitReason::GripperForce, Some(6))));
 }
 
-/// Teleop / policy stream: servo targets at closed through the incident profile.
+/// Teleop / policy stream: servo targets at closed through the incident profile. With the
+/// stream contact regulator the grip stays under the cap (no trip); without it the cap latches.
 #[test]
 fn incident_servo_stream_is_capped() {
-    let (mut inner, rig) = rig(Load::Incident);
+    for regulated in [true, false] {
+    let (mut inner, rig) = rig_with(if regulated { ArmConfig::rebot_dm() } else { without_regulator() }, Load::Incident);
     let epoch = inner.safety.epoch_id();
     let mut target = INSPECT.to_vec();
     // leader arm ramp toward closed, 1 rad/s, then held at closed
@@ -196,11 +205,17 @@ fn incident_servo_stream_is_capped() {
         inner.tick(DT);
     }
     let r = rig.lock().unwrap();
-    eprintln!("incident servo: peak {:.3} N·m, J7 {:.3} rad, trips {}", r.peak_tau, r.q[6], inner.gripper_force_trips);
+    eprintln!("incident servo (regulated {regulated}): peak {:.3} N·m, J7 {:.3} rad, trips {}", r.peak_tau, r.q[6], inner.gripper_force_trips);
     assert!(!r.broke, "finger broke");
     assert!(r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3} N·m", r.peak_tau);
-    assert!(inner.gripper_force_trips >= 1);
+    if regulated {
+        assert!(r.peak_tau < cap(), "peak {:.3} N·m", r.peak_tau);
+        assert_eq!(inner.gripper_force_trips, 0);
+    } else {
+        assert!(inner.gripper_force_trips >= 1);
+    }
     assert!(r.q[6] < CONTACT_RAD + 0.25, "J7 {}", r.q[6]);
+    }
 }
 
 /// A gripper target inside a whole-arm joint move (presets, sequences, replay use the same
@@ -407,11 +422,13 @@ mod policy_stream {
         }).unwrap()
     }
 
-    /// The incident profile through policy targets: the cap latches, the jaw command stays at
-    /// the latch position while the policy keeps asking for closed, the finger survives.
+    /// The incident profile through policy targets (stream contact regulator off): the cap
+    /// latches, the jaw command stays at the latch position while the policy keeps asking for
+    /// closed, the finger survives. With the regulator: tests/test_gripper_force.rs
+    /// rigid_policy_stream_is_regulated.
     #[test]
     fn incident_policy_stream_is_capped() {
-        let (mut inner, rig) = rig(Load::Incident);
+        let (mut inner, rig) = rig_with(without_regulator(), Load::Incident);
         let id = begin(&mut inner);
         let mut target = INSPECT.to_vec();
         let mut g = INSPECT[6];

@@ -179,6 +179,19 @@ impl SupervisorInner {
                 "observation": "gripper.force_limited, gripper.force_limit_trips",
                 "while_held": "gripper targets that close further are held; arm joints keep moving",
                 "release_below_nm": GRIPPER_STALL_RELEASE_NM,
+                "stream_release": "under a servo stream or live policy: only a gripper target at least stream_release_margin_rad more open than the hold, the end of the stream or an action releases it; low torque does not",
+                "stream_release_margin_rad": crate::supervisor::GRIPPER_FORCE_RELEASE_MARGIN_RAD,
+                "stream_contact_regulator": g.contact_torque_nm.zip(g.stream_contact_speed_rad_s).map(|(nm, speed)| json!({
+                    "applies_to": ["servo_stream", "live_policy"],
+                    "trigger": "|gripper torque| at or above contact_torque_nm (or at or above the stall threshold with the jaw still) on fresh feedback while the stream closes",
+                    "target_torque_nm": nm,
+                    "contact_speed_rad_s": speed,
+                    "effect": "closing command advances at most contact_speed_rad_s past the last command while |torque| is below target_torque_nm; above it the lead over the jaw is scaled by target_torque_nm / |torque|",
+                    "ends": "jaw opens stream_release_margin_rad past the contact point, closes contact_lost_rad on with |torque| below half the target, or the stream ends",
+                    "contact_lost_rad": crate::supervisor::GRIPPER_STREAM_CONTACT_LOST_RAD,
+                    "not_bounded": "the first torque sample at contact (stiffness x POS_VEL lag); bounded only by max_lead_rad",
+                    "calibrated": false,
+                })),
                 "invalidates_commands": false,
                 "clear": ["open_gripper", "torque_below_release"],
             }));
@@ -362,6 +375,7 @@ impl SupervisorInner {
                     "max_lead_rad": g.max_lead_rad,
                     "squeeze_rad": g.squeeze_rad,
                     "contact_speed_rad_s": crate::motion::GRIPPER_CONTACT_SPEED,
+                    "stream_contact_speed_rad_s": g.stream_contact_speed_rad_s,
                 })),
                 "action_speed_max": {
                     "linear_mps": cap.and_then(|s| s.linear_mps).map_or(MAX_LINEAR_MPS, |v| MAX_LINEAR_MPS.min(f64::from(v))),

@@ -649,6 +649,17 @@ pub struct GripperPolicy {
     /// position error. Absent: no bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_lead_rad: Option<f32>,
+    /// Contact regulator of servo streams and live policies (rad/s; needs `contact_torque_nm`
+    /// and torque feedback). From the contact (|τ| at or above `contact_torque_nm`, or at or
+    /// above the stall threshold with the jaw still, while the stream closes) the J7 command
+    /// may run ahead of the last written command by at most this speed while |τ| is below
+    /// `contact_torque_nm`; at or above it the lead over the measured jaw is scaled by
+    /// `contact_torque_nm / |τ|`, which holds the grip near `contact_torque_nm` whatever the
+    /// object stiffness. Ends when the jaw opens 0.05 rad past the contact point, when the jaw
+    /// closes on 0.1 rad with |τ| below half of `contact_torque_nm` (the object gave way), or
+    /// when the stream ends. Gripper actions (grasp) keep their own contact handling. Absent: off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_contact_speed_rad_s: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -676,6 +687,9 @@ impl GripperPolicy {
             contact_torque_nm: Some(0.6),
             // free close at 1 rad/s lags 0.21-0.23 rad behind the command (same log)
             max_lead_rad: Some(0.35),
+            // the grasp contact speed (motion::GRIPPER_CONTACT_SPEED): one 20 ms tick adds
+            // 0.006 rad of lead, 0.18 N·m on a 30 N·m/rad contact
+            stream_contact_speed_rad_s: Some(0.3),
         }
     }
 
@@ -1474,8 +1488,9 @@ impl ArmConfig {
                 }
             }
             let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
-            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) || !positive(g.max_lead_rad) {
-                return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm and max_lead_rad must be positive".into());
+            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) || !positive(g.max_lead_rad)
+                || !positive(g.stream_contact_speed_rad_s) {
+                return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
             }
             if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
                 if contact >= cap {

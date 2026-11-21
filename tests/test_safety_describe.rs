@@ -368,6 +368,11 @@ async fn gripper_force_limit_is_described_from_the_policy() {
     assert_eq!(lim["max_close_torque_nm"], json!(g.max_close_torque_nm));
     assert_eq!(lim["contact_torque_nm"], json!(g.contact_torque_nm));
     assert_eq!(lim["max_lead_rad"], json!(g.max_lead_rad));
+    assert_eq!(lim["stream_contact_speed_rad_s"], json!(g.stream_contact_speed_rad_s));
+    assert_eq!(s["stream_release_margin_rad"], json!(armd::supervisor::GRIPPER_FORCE_RELEASE_MARGIN_RAD));
+    let reg = &s["stream_contact_regulator"];
+    assert_eq!(reg["target_torque_nm"], json!(g.contact_torque_nm));
+    assert_eq!(reg["contact_speed_rad_s"], json!(g.stream_contact_speed_rad_s));
     // a policy without the cap has no stop entry
     let mut config = ArmConfig::rebot_dm();
     config.gripper_policy.as_mut().unwrap().max_close_torque_nm = None;
