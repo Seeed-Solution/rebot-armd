@@ -683,6 +683,8 @@ body.offline .banner { display: block; }
 
 /* ---------- safety card (both modes) ---------- */
 .safety { padding: 14px; display: grid; gap: 12px; }
+/* desktop expert: the side column scrolls; the safety card (E-stop) stays at its top (phones: sticky under the header, below) */
+@media (min-width: 1024px) { .side > .safety { position: sticky; top: 0; z-index: 150; } }
 .safety-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
 .sw {
   display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 0 14px; text-align: left;
@@ -729,6 +731,9 @@ body.offline .banner { display: block; }
 .ext-banner { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-lg); border: 1px solid var(--sc-color-border-neutral); border-left: 4px solid var(--sc-color-primary);
   background: rgba(255,255,255,0.82); backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: var(--sc-shadow); }
 .ext-banner[hidden] { display: none; }
+/* scrolled to (scrollIntoView, anchors), the banner lands below the sticky safety card (--safety-h) and, on phones, the header */
+.ext-banner { scroll-margin-top: calc(var(--safety-h, 0px) + 12px); }
+@media (max-width: 1023px) { .ext-banner { scroll-margin-top: calc(var(--head-h, 56px) + 8px + var(--safety-h, 0px) + 12px); } }
 .ext-banner.warn { border-left-color: #d48806; }
 .ext-banner.bad { border-left-color: var(--sc-status-danger-fg); background: rgba(255,241,240,0.9); }
 .ext-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
