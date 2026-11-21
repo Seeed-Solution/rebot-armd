@@ -900,7 +900,7 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
     })
 }
 
-/// Re-run the reconstruction of a bundle (host replay; `cargo run --release --example mview_replay -- <dir>`).
+/// Re-run the reconstruction of a bundle (host replay; `cargo run --release --features mview-replay --bin mview-replay -- <dir>`).
 pub fn replay_bundle(dir: &std::path::Path) -> Result<(Bundle, Computed), String> {
     let b = read_bundle(dir)?;
     let c = compute(&b.views, b.reference, b.ref_box_px, b.table_z_m);

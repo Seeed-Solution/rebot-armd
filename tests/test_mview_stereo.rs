@@ -289,7 +289,7 @@ fn plain_boxes_are_measured_from_their_edges() {
 
 /// A scene like the real-arm run of 2026-11-22 (an elongated object filling ~80 % of the image
 /// height at Z ~0.47 m, fx 804, 3 views orbit x and 5 views orbit xy, JPEG q85), written as replay
-/// bundles to `$MVIEW_BUNDLE_OUT/{x3,xy5}` for `examples/mview_replay` (host and riscv / qemu).
+/// bundles to `$MVIEW_BUNDLE_OUT/{x3,xy5}` for `src/bin/mview_replay.rs` (host and riscv / qemu).
 #[test]
 #[ignore]
 fn write_realistic_bundles() {

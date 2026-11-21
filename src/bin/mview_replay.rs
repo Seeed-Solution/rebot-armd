@@ -1,5 +1,5 @@
 //! Re-run the multi-view reconstruction of a `measure_multiview` debug bundle on the host:
-//! `cargo run --release --example mview_replay -- <bundle dir> [--points]`.
+//! `cargo run --release --features mview-replay --bin mview-replay -- <bundle dir> [--points]`.
 //! Prints the stage counts and times, the triangulated points in the target box with their
 //! heights above the table, the measurement, and the run's own stats from the bundle.
 fn main() {

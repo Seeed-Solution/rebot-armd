@@ -17,6 +17,14 @@ publish = false
 default = ["policy-tract"]
 policy-runtime = []
 policy-tract = ["policy-runtime", "dep:tract-onnx"]
+# host / riscv replay of measure_multiview debug bundles (src/bin/mview_replay.rs); not in the
+# device package (scripts/build_deb.sh builds the default features)
+mview-replay = []
+
+[[bin]]
+name = "mview-replay"
+path = "src/bin/mview_replay.rs"
+required-features = ["mview-replay"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
