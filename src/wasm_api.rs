@@ -656,6 +656,8 @@ impl WasmEngine {
                 operational && !self.collision_fault,
                 operational && !self.collision_fault,
                 q_meas,
+                q_cmd,
+                Some(q_cmd),
             );
             if let Some(hold) = self.torque_guard.hold.as_mut() {
                 let limit = &self.config.limits[hold.joint];

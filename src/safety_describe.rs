@@ -223,8 +223,14 @@ impl SupervisorInner {
                     "effect": "cancel_motion_hold_torque_on",
                     "action_code": "TORQUE_LIMIT",
                     "motion_limit_reason": "torque",
-                    "while_held": "servo and jog targets that move the held joint further in the push direction (sign of the torque at the trip) are clamped to the hold position; targets that keep it or move it the other way pass",
+                    "while_held": "servo and jog targets that move the held joint further in the push direction (sign of the torque at the trip) are clamped to the hold position; targets that keep it or move it the other way pass; any motion that commands the held joint more than push_in_rad past the trip position trips at once; a motion that moves the held joint away from the load (park, home, watchdog park, jog, Cartesian) is not tripped on that joint for up to retreat.window_s while its torque does not rise and the joint follows",
                     "release_rad": crate::torque_guard::TORQUE_HOLD_RELEASE_RAD,
+                    "push_in_rad": crate::torque_guard::TORQUE_PUSH_IN_RAD,
+                    "retreat": {
+                        "window_s": crate::torque_guard::TORQUE_RETREAT_WINDOW_S,
+                        "torque_margin_ratio": crate::torque_guard::TORQUE_RETREAT_MARGIN_RATIO,
+                        "lag_rad": crate::torque_guard::TORQUE_RETREAT_LAG_RAD,
+                    },
                     "invalidates_commands": false,
                     "clear": ["move_joint_away_from_push_direction"],
                 }));
