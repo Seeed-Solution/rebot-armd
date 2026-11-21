@@ -11544,9 +11544,9 @@ function teachBarRender() {
    ================================================================= */
 const TK_OWN_TAGS = new Set(['cockpit', 'calib-wizard']);
 const TK = {
-  log: [], max: 40, tracked: new Map(), epoch: null, seq: 0, ver: 0, // ring buffer of action / lease entries; ver bumps on any change
+  log: [], max: 40, tracked: new Map(), lastTs: null, seq: 0, ver: 0, // ring buffer of action / lease entries; ver bumps on any change
   holder: undefined, lastExtHolder: null,  // last observed lease_holder; last external one
-  lastExt: null, dismissed: false,         // newest external action entry; banner dismissed by the user
+  lastExt: null, dismissed: new Set(),     // newest external action entry; action ids whose banner the user dismissed
   k: null, key: '', listKey: '', envKey: '',
   filterExt: store('rebot.task.f') === 'ext', tab: 'act', opener: null,
   timer: 0, inflight: false, env: null, envAt: 0,
@@ -11595,7 +11595,6 @@ function tkAction(a, o, now) {
       }
     }
     tkPush(e);
-    if (!own) TK.dismissed = false;
   }
   e.seen = o.timestamp;
   const dur = Number.isFinite(a.started_at) ? Math.max(0, (a.finished_at ?? o.timestamp) - a.started_at) : null;
@@ -11618,18 +11617,19 @@ function tkPill() {
   return sb.mode && sb.mode !== 'none' ? t('ext.mode', { m: String(sb.mode) }) : '';
 }
 function tkOnObs(o) {
-  if (o.epoch_id != null && TK.epoch != null && o.epoch_id !== TK.epoch) {
-    TK.tracked.clear();
-    TK.lastExt = null;
+  // Action ids are unique for one armd run; an E-stop, fault or fault clear changes the epoch but keeps them, and the
+  // observation keeps reporting the last action. Only an armd restart (its clock going backwards) starts the ids again.
+  if (Number.isFinite(o.timestamp)) {
+    if (TK.lastTs != null && o.timestamp < TK.lastTs) { TK.tracked.clear(); TK.lastExt = null; TK.dismissed.clear(); }
+    TK.lastTs = o.timestamp;
   }
-  if (o.epoch_id != null) TK.epoch = o.epoch_id;
   const now = Date.now();
   const h = o.lease_holder ?? null;
   if (h !== TK.holder) {
     if (TK.holder != null) tkPush({ id: 'l' + (++TK.seq), type: 'lease', ev: 'release', src: TK.holder, own: TK.holder === CLIENT_ID, at: now });
     if (h != null) {
       tkPush({ id: 'l' + (++TK.seq), type: 'lease', ev: 'acquire', src: h, own: h === CLIENT_ID, at: now });
-      if (h !== CLIENT_ID) { TK.lastExtHolder = h; TK.dismissed = false; }
+      if (h !== CLIENT_ID) TK.lastExtHolder = h;
     }
     TK.holder = h;
   }
@@ -11638,7 +11638,7 @@ function tkOnObs(o) {
   const e = TK.lastExt;
   const other = leaseOther();
   const running = !!e && e.state === 'running' && e.seen === o.timestamp; // a running entry no longer reported is stale
-  const fin = !!e && e.state !== 'running' && !TK.dismissed;
+  const fin = !!e && e.state !== 'running' && !TK.dismissed.has(e.aid);
   const recent = fin && o.timestamp - (e.finished_at ?? o.timestamp) <= 10;
   const sticky = fin && (e.state === 'failed' || e.state === 'cancelled');
   const k = TK.k = { e, other, running, recent, sticky, show: other != null || running || recent || sticky,
@@ -11647,7 +11647,7 @@ function tkOnObs(o) {
   const ml = $('ml-chip');
   k.ml = ml && !ml.hidden ? ml.textContent : '';
   k.pill = tkPill();
-  const key = [k.show, k.mode, TK.ver, other, running, recent, sticky, TK.dismissed, k.ml, k.pill, LANG].join('|');
+  const key = [k.show, k.mode, TK.ver, other, running, recent, sticky, k.ml, k.pill, LANG].join('|');
   if (key !== TK.key) {
     TK.key = key;
     tkRenderBanner(k);
@@ -11921,7 +11921,12 @@ $('ext-open-task').addEventListener('click', () => taskOpen(true));
 $('act-chip').addEventListener('click', () => taskOpen(true));
 // Enter only: Space and Escape are the page-wide E-STOP keys (window keydown handler)
 $('act-chip').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); taskOpen(true); } });
-$('ext-dismiss').addEventListener('click', () => { TK.dismissed = true; tkRerender(); });
+$('ext-dismiss').addEventListener('click', () => {
+  if (!TK.lastExt) return;
+  TK.dismissed.add(TK.lastExt.aid);
+  if (TK.dismissed.size > 64) TK.dismissed.delete(TK.dismissed.values().next().value);
+  tkRerender();
+});
 $('task-close').addEventListener('click', () => taskOpen(false));
 $('task').addEventListener('click', (e) => { if (e.target === e.currentTarget) taskOpen(false); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('task').hidden) taskOpen(false); });
