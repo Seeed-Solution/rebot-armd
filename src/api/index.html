@@ -11911,14 +11911,19 @@ function tkTab(tab, focus) {
   TK.listKey = ''; TK.envKey = '';
   tkRenderList(); tkRenderEnv();
 }
+// the 2 s refresh runs only while #task is open and the browser tab is visible
+function tkTimer() {
+  clearInterval(TK.timer);
+  TK.timer = !$('task').hidden && !document.hidden ? setInterval(tkEnvLoad, 2000) : 0;
+}
+document.addEventListener('visibilitychange', () => { tkTimer(); if (TK.timer) tkEnvLoad(); });
 function taskOpen(open, keepFocus) {
-  clearInterval(TK.timer); TK.timer = 0;
   if (open && $('task').hidden) TK.opener = document.activeElement;
   $('task').hidden = !open;
+  tkTimer();
   if (open) {
     tkTab(TK.tab);
     tkEnvLoad();
-    TK.timer = setInterval(tkEnvLoad, 2000); // only while #task is open
     $('task-close').focus({ preventScroll: true });
     return;
   }
