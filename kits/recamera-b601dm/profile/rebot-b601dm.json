@@ -526,11 +526,11 @@
     "enabled": false,
     "thresholds_nm": [
       2.0,
-      1.19,
-      2.82,
+      2.65,
+      3.9,
       1.43,
       0.87,
-      0.28
+      0.45
     ],
     "persist_ticks": 4,
     "clear_ratio": 0.5,
