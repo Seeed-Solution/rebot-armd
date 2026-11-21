@@ -304,6 +304,7 @@ armd 以 50 Hz 运行：每个周期先读电机反馈，再发送下一个位�
 2. **`armd` Sandbox 管理接口**：
    - `GET /api/v1/sandbox/catalog`、`GET /api/v1/sandbox/bundle`、`GET /api/v1/sandbox/state`
    - `POST /api/v1/sandbox/scenes`、`POST /api/v1/sandbox/tools`、`POST /api/v1/sandbox/policies`（校验并存储 `scene.json`+`world.xml`、`tool.json`+`tool.xml` 与 `rebot-onnx-policy/v1` 格式的 `policy.json`+`model.onnx`）。请求体上限 16 MiB（`ARMD_SANDBOX_MAX_BODY_MB` 覆盖，取 1–1024 的整数 MiB）；base64 解码时内存峰值约为请求体的 3 倍。`Content-Length` 超过上限时在读取请求体之前返回 413；没有 `Content-Length` 的请求体读到上限即返回 413。base64 使体积增加三分之一，16 MiB 请求体最多携带约 12 MiB 文件。
+   - `DELETE /api/v1/sandbox/policies/{id}`（仅操作员）删除一个策略包。该包是当前沙盒策略、正被策略运行使用，或有策略正在为运行加载时返回 409 `POLICY_IN_USE`；id 不存在时返回 404 `POLICY_NOT_FOUND`。
    - `POST /api/v1/sandbox/activate`（切换 `mode: "none" | "wasm" | "sim"`，组合生成浏览器可用的完整 MJCF XML；`"sim"` 模式下自动同步到 `rebot-sim` 的 `/sim/scene`）。`"sim"` 模式需要设置 `ARMD_SIM_URL`（`rebot-sim` 服务地址）；未设置时，`activate`，以及 sim 模式下的 `reset`、`io` 返回 503 `SIM_NOT_CONFIGURED`。不再回退到 `ARMD_DETECTOR_URL`（设备上它指向 rebot-vision）。
    - `POST /api/v1/sandbox/reset`、`POST /api/v1/sandbox/io`、`POST /api/v1/sandbox/telemetry`
    - `POST /api/v1/sandbox/io` 把请求中的键合并进 `desired_io`（每次调用都写入 `state.json`）：键须匹配 `^[A-Za-z0-9_.-]{1,64}$`，每个值序列化为 JSON 后不超过 4 KiB，`desired_io` 最多 64 个键；不满足时返回 400，状态不变。

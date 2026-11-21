@@ -7352,3 +7352,74 @@ mod policy_stats_tests {
     }
 }
 
+/// `DELETE /api/v1/sandbox/policies/{id}` against the full router.
+mod policy_delete_tests {
+    use super::speed_gate_tests::{rig, ws_cmd};
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_is_refused_while_a_run_uses_the_pack() {
+        let (_sup, sandbox, addr, mut ws, gen, _dir) = rig("busy_pol").await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/v1/sandbox/policies/busy_pol");
+        let ack = ws_cmd(&mut ws, 2, gen, "/api/v1/action/policy/start", serde_json::json!({"policy_id": "busy_pol", "mode": "shadow", "fps": 20.0, "max_seconds": 10.0})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+
+        let r = client.delete(&url).send().await.unwrap();
+        assert_eq!(r.status(), 409);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["code"], "POLICY_IN_USE", "{v}");
+        assert!(sandbox.policy_dir("busy_pol").is_some());
+
+        let stop = ws_cmd(&mut ws, 3, gen, "/api/v1/action/policy/stop", serde_json::json!({})).await;
+        assert_eq!(stop["stopped"], true, "{stop}");
+        let r = client.delete(&url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(sandbox.policy_dir("busy_pol").is_none());
+
+        // a start on the deleted pack fails cleanly
+        let rej = ws_cmd(&mut ws, 4, gen, "/api/v1/action/policy/start", serde_json::json!({"policy_id": "busy_pol", "mode": "shadow", "fps": 20.0})).await;
+        assert_eq!(rej["code"], "POLICY_NOT_FOUND", "{rej}");
+    }
+
+    #[tokio::test]
+    async fn delete_needs_an_operator_session() {
+        let sandbox_dir = tempdir().unwrap();
+        let pack = sandbox_dir.path().join("policies").join("op_pol");
+        fs::create_dir_all(&pack).unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        write_rmlp_pack(&pack, &["j1", "j2", "j3", "j4", "j5", "j6"], "rad", &layers, serde_json::json!({}));
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let sup = Arc::new(ArmSupervisor::new(make_6dof_config()));
+        let auth = OperatorAuth::enforced("123456", 1800);
+        sup.set_operator_auth_enforced(true).await;
+        let router = create_router_with_sandbox(sup.clone(), auth, sandbox.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/v1/sandbox/policies/op_pol");
+
+        // reads stay open
+        assert_ne!(client.get(&url).send().await.unwrap().status(), 403);
+        let r = client.delete(&url).send().await.unwrap();
+        assert_eq!(r.status(), 403);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["code"], "OPERATOR_REQUIRED", "{v}");
+        assert!(sandbox.policy_dir("op_pol").is_some());
+
+        let unlock: serde_json::Value = client
+            .post(format!("http://{addr}/api/v1/auth/unlock"))
+            .json(&serde_json::json!({"pin": "123456"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let token = unlock["token"].as_str().unwrap();
+        let r = client.delete(&url).bearer_auth(token).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(sandbox.policy_dir("op_pol").is_none());
+    }
+}

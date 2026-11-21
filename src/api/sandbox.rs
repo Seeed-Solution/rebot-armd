@@ -1188,6 +1188,85 @@ pub async fn upload_policy(
     }
 }
 
+fn policy_delete_error(status: StatusCode, code: &str, message: String) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({"error": message, "code": code, "message": message})))
+}
+
+/// Move `policies/<id>` to a hidden `.deleted.*` name (one rename: the catalog lists either the
+/// whole pack or nothing), then remove it. Leftovers of an interrupted delete are removed too.
+fn remove_policy_pack(root: &Path, id: &str) -> std::io::Result<()> {
+    let kind_dir = root.join("policies");
+    let target_dir = kind_dir.join(id);
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let trash = kind_dir.join(format!(".deleted.{id}.{}.{ts}.{counter}", std::process::id()));
+    {
+        let _lock = TARGET_REPLACE_MUTEX
+            .lock()
+            .map_err(|_| std::io::Error::other("target replacement lock poisoned"))?;
+        std::fs::rename(&target_dir, &trash)?;
+    }
+    if let Ok(entries) = std::fs::read_dir(&kind_dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(".deleted.") {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// DELETE /api/v1/sandbox/policies/{id} (operator-only). 409 `POLICY_IN_USE` while the pack is
+/// the active sandbox policy, a policy run uses it, or a policy is being loaded for a run.
+pub async fn delete_policy(
+    axum::extract::State(supervisor): axum::extract::State<Arc<crate::supervisor::ArmSupervisor>>,
+    Extension(state): Extension<Arc<SandboxState>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !validate_pack_id(&id) {
+        return Err(policy_delete_error(StatusCode::BAD_REQUEST, "INVALID_ID", format!("Invalid policy pack id '{id}'")));
+    }
+    // Lock order as in the policy runner: supervisor, then the sandbox state. Both are held
+    // across the rename, so no run can start on the pack and no activation can select it.
+    let inner = supervisor.inner().read().await;
+    #[cfg(feature = "policy-runtime")]
+    {
+        if let Some(run) = inner.policy_run.as_ref().filter(|r| r.policy_id == id) {
+            return Err(policy_delete_error(
+                StatusCode::CONFLICT,
+                "POLICY_IN_USE",
+                format!("Policy pack '{id}' is used by the running policy action {}", run.action_id),
+            ));
+        }
+        if inner.policy_loading {
+            return Err(policy_delete_error(
+                StatusCode::CONFLICT,
+                "POLICY_IN_USE",
+                "A policy pack is being loaded for a run; delete it after the start finishes".into(),
+            ));
+        }
+    }
+    #[cfg(not(feature = "policy-runtime"))]
+    let _ = &inner;
+    let active = state.active.read().await;
+    if active.active_policy.as_deref() == Some(id.as_str()) {
+        return Err(policy_delete_error(
+            StatusCode::CONFLICT,
+            "POLICY_IN_USE",
+            format!("Policy pack '{id}' is the active sandbox policy; activate another policy or none first"),
+        ));
+    }
+    if state.policy_dir(&id).is_none() {
+        return Err(policy_delete_error(StatusCode::NOT_FOUND, "POLICY_NOT_FOUND", format!("Policy pack '{id}' not found")));
+    }
+    remove_policy_pack(&state.root, &id).map_err(|e| {
+        policy_delete_error(StatusCode::INTERNAL_SERVER_ERROR, "DELETE_FAILED", format!("Cannot delete policy pack '{id}': {e}"))
+    })?;
+    drop(active);
+    drop(inner);
+    Ok(Json(serde_json::json!({"id": id, "deleted": true})))
+}
+
 // ---------------------------------------------------------------------------
 // Pack metadata & raw file serving
 // ---------------------------------------------------------------------------
@@ -2053,6 +2132,10 @@ mod tests {
     }
 
     fn test_router(state: Arc<SandboxState>) -> axum::Router {
+        test_router_with(state, Arc::new(crate::supervisor::ArmSupervisor::new(crate::model::ArmConfig::default())))
+    }
+
+    fn test_router_with(state: Arc<SandboxState>, supervisor: Arc<crate::supervisor::ArmSupervisor>) -> axum::Router {
         use axum::extract::DefaultBodyLimit;
         use axum::routing::{get, post};
         axum::Router::new()
@@ -2079,7 +2162,7 @@ mod tests {
                     .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
                     .layer(axum::middleware::from_fn(upload_concurrency_middleware)),
             )
-            .route("/api/v1/sandbox/policies/{id}", get(get_policy))
+            .route("/api/v1/sandbox/policies/{id}", get(get_policy).delete(delete_policy).with_state(supervisor))
             .route("/api/v1/sandbox/policies/{id}/files/{*path}", get(serve_policy_file))
             .route("/api/v1/sandbox/activate", post(activate))
             .route("/api/v1/sandbox/bundle", get(get_bundle))
@@ -2303,6 +2386,73 @@ mod tests {
         assert_eq!(bundle["policy_manifest"]["id"], "norm_pol");
         assert_eq!(bundle["policy_manifest"]["unit_mode"], "rad");
         assert_eq!(bundle["policy_manifest"]["normalization"]["state_mean"][0], 0.1);
+    }
+
+    #[tokio::test]
+    async fn delete_policy_removes_pack_and_refuses_the_active_policy() {
+        let _guard = TEST_UPLOAD_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxState::new(tmp.path().to_path_buf()));
+        let app = test_router(state.clone());
+        let send = |method: &str, uri: &str, body: Option<serde_json::Value>| {
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                b = b.header("Content-Type", "application/json");
+            }
+            b.body(body.map_or_else(Body::empty, |v| Body::from(serde_json::to_vec(&v).unwrap()))).unwrap()
+        };
+        async fn json_of(res: Response) -> (StatusCode, serde_json::Value) {
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+        }
+        let upload = serde_json::json!({
+            "id": "del_pol",
+            "policy_json": {
+                "format": "rebot-onnx-policy/v1", "name": "del_pol", "robot": "b601dm", "fps": 30, "action_dim": 7,
+                "unit_mode": "rad", "model_file": "model.onnx",
+                "inputs": {"state": {"name": "observation.state", "shape": [1, 7]}},
+                "outputs": {"action": {"name": "action", "shape": [1, 7]}}
+            },
+            "model_onnx_base64": "AQID"
+        });
+        let (st, v) = json_of(app.clone().oneshot(send("POST", "/api/v1/sandbox/policies", Some(upload.clone()))).await.unwrap()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+
+        // active sandbox policy: 409 and the pack stays
+        state.active.write().await.active_policy = Some("del_pol".into());
+        let (st, v) = json_of(app.clone().oneshot(send("DELETE", "/api/v1/sandbox/policies/del_pol", None)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "POLICY_IN_USE");
+        assert!(state.policy_dir("del_pol").is_some());
+
+        state.active.write().await.active_policy = None;
+        let (st, v) = json_of(app.clone().oneshot(send("DELETE", "/api/v1/sandbox/policies/del_pol", None)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v, serde_json::json!({"id": "del_pol", "deleted": true}));
+        assert!(state.policy_dir("del_pol").is_none());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join("policies")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let (_, cat) = json_of(app.clone().oneshot(send("GET", "/api/v1/sandbox/catalog", None)).await.unwrap()).await;
+        assert_eq!(cat["policies"], serde_json::json!([]));
+        let (st, _) = json_of(app.clone().oneshot(send("GET", "/api/v1/sandbox/policies/del_pol", None)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        // again: 404; a bad id: 400
+        let (st, v) = json_of(app.clone().oneshot(send("DELETE", "/api/v1/sandbox/policies/del_pol", None)).await.unwrap()).await;
+        assert_eq!((st, v["code"].as_str()), (StatusCode::NOT_FOUND, Some("POLICY_NOT_FOUND")));
+        let (st, _) = json_of(app.clone().oneshot(send("DELETE", "/api/v1/sandbox/policies/.hidden", None)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // an interrupted delete (hidden trash dir) is not listed and is swept by the next delete
+        let (st, _) = json_of(app.clone().oneshot(send("POST", "/api/v1/sandbox/policies", Some(upload))).await.unwrap()).await;
+        assert_eq!(st, StatusCode::OK);
+        std::fs::create_dir_all(tmp.path().join("policies/.deleted.old_pol.1.2.3")).unwrap();
+        let (_, cat) = json_of(app.clone().oneshot(send("GET", "/api/v1/sandbox/catalog", None)).await.unwrap()).await;
+        assert_eq!(cat["policies"].as_array().unwrap().len(), 1, "{cat}");
+        let (st, _) = json_of(app.clone().oneshot(send("DELETE", "/api/v1/sandbox/policies/del_pol", None)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(std::fs::read_dir(tmp.path().join("policies")).unwrap().count(), 0);
     }
 
     #[tokio::test]
