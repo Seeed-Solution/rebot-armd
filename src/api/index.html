@@ -3626,7 +3626,7 @@ function connectWS() {
       const pending = pendingCommands.get(o.request_id);
       if (!pending || pending.ws !== ws) return;
       clearTimeout(pending.timer); pendingCommands.delete(o.request_id);
-      if (o.type === 'command_ack') pending.resolve(o);
+      if (o.type === 'command_ack') { if (o.action_id != null) tkOwnAction(o.action_id); pending.resolve(o); }
       else pending.reject(rpcError(o));
       syncEpoch(o.epoch_id);
       return;
@@ -3679,6 +3679,7 @@ function connectWS() {
     }
     if (o.type === 'preset_ack') {
       syncEpoch(o.epoch_id);
+      if (o.action_id != null) tkOwnAction(o.action_id);
       toast(t('toast.goto', { name: presetName(o.name) || o.name || t('pn.default') }), 'ok');
       return;
     }
@@ -11542,12 +11543,12 @@ function teachBarRender() {
    Every server-supplied string (lease_holder, tag, kind, phase, code, message, ids, names)
    is written with textContent only.
    ================================================================= */
-const TK_OWN_TAGS = new Set(['cockpit', 'calib-wizard']);
 const TK = {
   log: [], max: 40, tracked: new Map(), lastTs: null, seq: 0, ver: 0, // ring buffer of action / lease entries; ver bumps on any change
   holder: undefined, lastExtHolder: null,  // last observed lease_holder; last external one
   cmdRef: null, cmdAt: -Infinity,          // commanded positions at their last change; observation time of that change
   lastExt: null, dismissed: new Set(),     // newest external action entry; action ids whose banner the user dismissed
+  ownIds: new Set(),                       // action ids from this page's own command / preset acks (every page tags 'cockpit')
   k: null, key: '', listKey: '', envKey: '',
   filterExt: store('rebot.task.f') === 'ext', tab: 'act', opener: null,
   timer: 0, inflight: false, env: null, envAt: 0,
@@ -11580,8 +11581,8 @@ function tkAction(a, o, now) {
   const id = 'a' + a.id;
   let e = TK.tracked.get(id);
   if (!e) {
-    // own: tagged by this page, or started while this page held the (exclusive) lease
-    const own = TK_OWN_TAGS.has(a.tag) || (!a.tag && S.leaseGeneration != null);
+    // own: acked to this page, or untagged and started while this page held the (exclusive) lease
+    const own = TK.ownIds.has(a.id) || (!a.tag && S.leaseGeneration != null);
     const h = o.lease_holder;
     e = { id, aid: a.id, type: 'action', own, sig: '',
       src: own ? CLIENT_ID : (h != null && h !== CLIENT_ID ? h : TK.lastExtHolder),
@@ -11610,6 +11611,18 @@ function tkAction(a, o, now) {
   if (!e.own && (!TK.lastExt || Number(e.aid) >= Number(TK.lastExt.aid))) TK.lastExt = e;
   return e;
 }
+// An ack names an action this page started. It can arrive after the first observation of that action.
+function tkOwnAction(aid) {
+  TK.ownIds.add(aid);
+  if (TK.ownIds.size > 64) TK.ownIds.delete(TK.ownIds.values().next().value);
+  const e = TK.tracked.get('a' + aid);
+  if (!e || e.own) return;
+  e.own = true; e.src = CLIENT_ID; TK.ver++;
+  if (TK.lastExt === e) {
+    TK.lastExt = null;
+    for (const x of TK.tracked.values()) if (!x.own && x.type === 'action' && (!TK.lastExt || Number(x.aid) >= Number(TK.lastExt.aid))) TK.lastExt = x;
+  }
+}
 function tkPill() {
   const E = TK.env;
   const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
@@ -11621,7 +11634,7 @@ function tkOnObs(o) {
   // Action ids are unique for one armd run; an E-stop, fault or fault clear changes the epoch but keeps them, and the
   // observation keeps reporting the last action. Only an armd restart (its clock going backwards) starts the ids again.
   if (Number.isFinite(o.timestamp)) {
-    if (TK.lastTs != null && o.timestamp < TK.lastTs) { TK.tracked.clear(); TK.lastExt = null; TK.dismissed.clear(); }
+    if (TK.lastTs != null && o.timestamp < TK.lastTs) { TK.tracked.clear(); TK.lastExt = null; TK.dismissed.clear(); TK.ownIds.clear(); }
     TK.lastTs = o.timestamp;
   }
   const now = Date.now();

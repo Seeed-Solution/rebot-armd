@@ -217,6 +217,16 @@ try {
     ok(a && a.own === true && a.src === aId, `page A: its own move ${aAid} is own ${JSON.stringify(a)}`);
     ok(b && b.own === false && b.src === aId, `page B: page A's move ${aAid} is external, from ${aId} ${JSON.stringify(b)}`);
     await A.page.evaluate(() => commandRPC('/api/v1/arm', { enable: false }));
+    // the observation of an action can arrive before this page's ack of it: the ack makes the entry own
+    const race = await A.page.evaluate(() => {
+      const id = 900001, o = { ...S.obs, action: { id, kind: 'move_to', tag: 'cockpit', state: 'running', progress: 0.1, started_at: S.obs.timestamp, finished_at: null } };
+      tkOnObs(o);
+      const before = TK.tracked.get('a' + id).own;
+      tkOwnAction(id);
+      const e = TK.tracked.get('a' + id);
+      return { before, after: e.own, src: e.src === CLIENT_ID, lastExt: TK.lastExt === e };
+    }).catch((err) => ({ err: String(err) }));
+    ok(race.before === false && race.after === true && race.src && !race.lastExt, `page A: ack after the first observation makes the entry own ${JSON.stringify(race)}`);
     await A.ctx.close(); await B.ctx.close();
   }
 
