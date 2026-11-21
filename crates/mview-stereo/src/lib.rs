@@ -1,4 +1,5 @@
-//! Motion-stereo geometry of the action `measure_multiview` (src/measure_multiview.rs): object
+//! Motion-stereo geometry of armd's action `measure_multiview` (src/measure_multiview.rs, re-exported
+//! there as `armd::mview_stereo`; a crate of its own so that it builds at opt-level 3): object
 //! points triangulated from grayscale images taken at known camera poses. Pure computation, no
 //! I/O; the action runs it in `spawn_blocking`.
 //!
@@ -39,7 +40,9 @@
 //!   [-0.05, `object_min_h_m`] m of the plane are table points (`table_check`).
 use std::time::Instant;
 
-use crate::kinematics::{self, Mat3, Vec3};
+pub mod kinematics;
+
+use kinematics::{Mat3, Vec3};
 
 /// Patch radius at full resolution (9x9 patches).
 pub const PATCH_R: usize = 4;
@@ -85,18 +88,6 @@ impl Gray {
 
     #[inline]
     fn at(&self, x: usize, y: usize) -> f32 { f32::from(self.px[y * self.w + x]) }
-
-    #[inline]
-    fn bilinear(&self, x: f64, y: f64) -> f32 {
-        let (x0, y0) = (x.floor(), y.floor());
-        let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
-        let (x0, y0) = (x0 as usize, y0 as usize);
-        let i = y0 * self.w + x0;
-        let p = &self.px;
-        let a = f32::from(p[i]) * (1.0 - fx) + f32::from(p[i + 1]) * fx;
-        let b = f32::from(p[i + self.w]) * (1.0 - fx) + f32::from(p[i + self.w + 1]) * fx;
-        a * (1.0 - fy) + b * fy
-    }
 
     /// A patch of radius `r` centred at `(x, y)` fits with a margin of `m` pixels.
     #[inline]
@@ -266,12 +257,27 @@ struct Tmpl {
     sw: f32,
 }
 
+/// The 2x2 neighbourhood of a patch centred at (x, y): index of the top-left pixel of its first
+/// row and the four bilinear weights, shared by every pixel of the patch (same sub-pixel phase).
+#[inline]
+fn patch_phase(img: &Gray, x: f64, y: f64, r: usize) -> (usize, [f32; 4]) {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
+    let base = (y0 as usize - r) * img.w + x0 as usize - r;
+    (base, [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy])
+}
+
 fn sample_bilinear(img: &Gray, x: f64, y: f64, r: usize) -> Option<Vec<f32>> {
     if !img.inside(x, y, r, 1.0) { return None; }
-    let rf = r as f64;
     let n = 2 * r + 1;
+    let (base, [w00, w10, w01, w11]) = patch_phase(img, x, y, r);
     let mut v = Vec::with_capacity(n * n);
-    for j in 0..n { for i in 0..n { v.push(img.bilinear(x - rf + i as f64, y - rf + j as f64)); } }
+    for j in 0..n {
+        let (r0, r1) = (&img.px[base + j * img.w..][..n + 1], &img.px[base + (j + 1) * img.w..][..n + 1]);
+        for i in 0..n {
+            v.push(w00 * f32::from(r0[i]) + w10 * f32::from(r0[i + 1]) + w01 * f32::from(r1[i]) + w11 * f32::from(r1[i + 1]));
+        }
+    }
     Some(v)
 }
 
@@ -326,13 +332,14 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
     let n = 2 * r + 1;
     let (mut s1, mut s2, mut dot) = (0.0f32, 0.0f32, 0.0f32);
     if bilinear {
-        let rf = r as f64;
+        let (base, [w00, w10, w01, w11]) = patch_phase(img, x, y, r);
         for j in 0..n {
+            let (r0, r1) = (&img.px[base + j * img.w..][..n + 1], &img.px[base + (j + 1) * img.w..][..n + 1]);
+            let a = &t.a[j * n..(j + 1) * n];
             for i in 0..n {
-                let k = j * n + i;
-                let v = img.bilinear(x - rf + i as f64, y - rf + j as f64);
-                let wv = t.w.as_ref().map_or(v, |w| w[k] * v);
-                s1 += wv; s2 += wv * v; dot += t.a[k] * v;
+                let v = w00 * f32::from(r0[i]) + w10 * f32::from(r0[i + 1]) + w01 * f32::from(r1[i]) + w11 * f32::from(r1[i + 1]);
+                let wv = t.w.as_ref().map_or(v, |w| w[j * n + i] * v);
+                s1 += wv; s2 += wv * v; dot += a[i] * v;
             }
         }
     } else {
@@ -456,23 +463,27 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     let quota_tex = (p.max_edge_features / 3).saturating_sub(n_in / 5);
     if quota_plain == 0 { return out; }
     let g = |i: usize, j: usize| -> (f32, f32) { let k = (j + 2) * gw + i + 2; (gxv[k], gyv[k]) };
-    let mut max_m = 0.0f32;
-    for j in 0..rh { for i in 0..rw { let (a, b) = g(i, j); max_m = max_m.max(a.hypot(b)); } }
-    let thr = p.edge_min_grad.max(0.1 * max_m);
+    // squared gradient magnitudes over the region (no hypot: it is slow on the device's libm)
+    let mag2: Vec<f32> = (0..rw * rh).map(|k| { let (a, b) = g(k % rw, k / rw); a * a + b * b }).collect();
+    let max_m2 = mag2.iter().copied().fold(0.0f32, f32::max);
+    let thr = p.edge_min_grad.max(0.1 * max_m2.sqrt());
+    let thr2 = thr * thr;
+    let (ex0, ey0) = ((edge_region[0].max(0.0) as usize).max(x0 + 1), (edge_region[1].max(0.0) as usize).max(y0 + 1));
+    let (ex1, ey1) = ((edge_region[2].max(0.0) as usize).min(x1.saturating_sub(1)), (edge_region[3].max(0.0) as usize).min(y1.saturating_sub(1)));
     let mut ecand: Vec<(f32, usize, usize, [f64; 2])> = Vec::new();
-    for j in 1..rh.saturating_sub(1) {
-        for i in 1..rw.saturating_sub(1) {
-            let (x, y) = (x0 + i, y0 + j);
-            if !in_rect(x as f64, y as f64, &edge_region) { continue; }
+    for y in ey0..=ey1 {
+        let j = y - y0;
+        for x in ex0..=ex1 {
+            let i = x - x0;
+            let m2 = mag2[j * rw + i];
+            if m2 < thr2 { continue; }
             let (a, b) = g(i, j);
-            let mg = a.hypot(b);
-            if mg < thr { continue; }
             // neighbours across the edge (gradient direction quantised to 45 deg)
             let (ax, ay) = (a.abs(), b.abs());
             let (di, dj): (isize, isize) = if ax > 2.414 * ay { (1, 0) } else if ay > 2.414 * ax { (0, 1) } else if (a > 0.0) == (b > 0.0) { (1, 1) } else { (1, -1) };
-            let m1 = { let (a, b) = g((i as isize + di) as usize, (j as isize + dj) as usize); a.hypot(b) };
-            let m2 = { let (a, b) = g((i as isize - di) as usize, (j as isize - dj) as usize); a.hypot(b) };
-            if mg < m1 || mg < m2 { continue; }
+            let at = |ii: isize, jj: isize| mag2[(jj as usize) * rw + ii as usize];
+            if m2 < at(i as isize + di, j as isize + dj) || m2 < at(i as isize - di, j as isize - dj) { continue; }
+            let mg = m2.sqrt();
             ecand.push((mg, x, y, [f64::from(a / mg), f64::from(b / mg)]));
         }
     }
@@ -567,6 +578,26 @@ struct PView<'a> {
 
 enum SweepEnd { NoPeak, Ambiguous }
 
+/// The projection into a target camera of the point at inverse optical depth w on a source ray:
+/// w X_cam(w) = w a + b (a = R_t^T (c_s - c_t), b = R_t^T d), so a pixel costs a few
+/// multiply-adds and one division per depth sample.
+struct RayProj { a: Vec3, b: Vec3, fx: f64, fy: f64, cx: f64, cy: f64 }
+
+impl RayProj {
+    fn new(src: &Camera, d: &Vec3, t: &Camera) -> Self {
+        let rt = kinematics::transpose(&t.r);
+        Self { a: kinematics::mat_vec(&rt, &kinematics::sub(&src.c, &t.c)), b: kinematics::mat_vec(&rt, d), fx: t.fx, fy: t.fy, cx: t.cx, cy: t.cy }
+    }
+    /// As [`Camera::project`] of the point at inverse depth `w` (> 0).
+    #[inline]
+    fn at(&self, w: f64) -> Option<[f64; 2]> {
+        let z = self.a[2] * w + self.b[2];
+        if z <= 0.01 * w { return None; }
+        let inv = 1.0 / z;
+        Some([self.fx * (self.a[0] * w + self.b[0]) * inv + self.cx, self.fy * (self.a[1] * w + self.b[1]) * inv + self.cy])
+    }
+}
+
 /// Sweep the ray of `px` in `src` (inverse depth, world z between `z_lo` and `z_hi`) against
 /// `targets`: coarse on the half-resolution images with `tc`, then (with `tf`) refined at full
 /// resolution. Returns the inverse optical depth (1/m).
@@ -588,13 +619,14 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
     let step = 2.0 * p.sweep_step_px;
     let n = ((span / step).ceil() as usize).clamp(2, 600);
     let dw = (w1 - w0) / n as f64;
+    let proj: Vec<RayProj> = targets.iter().map(|v| RayProj::new(src, &d, &v.cam)).collect();
     let mut scores = vec![f32::NEG_INFINITY; n + 1];
     for (i, s) in scores.iter_mut().enumerate() {
-        let x = src.at_inv_depth(&d, w0 + i as f64 * dw);
+        let w = w0 + i as f64 * dw;
         let mut sum = 0.0f32;
         let mut ok = true;
-        for v in targets {
-            match v.cam.project(&x).and_then(|q| { let h = to_half(q); ncc(&v.half, tc, h[0], h[1], false) }) {
+        for (v, pr) in targets.iter().zip(&proj) {
+            match pr.at(w).and_then(|q| { let h = to_half(q); ncc(&v.half, tc, h[0], h[1], false) }) {
                 Some(c) => sum += c,
                 None => { ok = false; break; }
             }

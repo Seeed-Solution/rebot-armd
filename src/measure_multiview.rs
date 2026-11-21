@@ -30,9 +30,12 @@
 //!   0.5 of the offset on either side; when all are refused the action fails with the refusal code.
 //! - Times: `measurement.stats` carries the stage times of the reconstruction and `decode_ms`
 //!   (all views); every view its own `decode_ms`.
-//! - Capture: settle >= [`MIN_SETTLE_S`] after the motion settled, joints still, discard
-//!   [`DISCARD_SNAPSHOTS`] snapshots, then one snapshot and one YOLO trigger (a frame newer than
-//!   the request); the joints must not move during the capture (`MOVED`).
+//! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
+//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`); discard [`DISCARD_SNAPSHOTS`]
+//!   snapshots; then a snapshot bracketed by joint samples ([`BRACKET_LEAD`] before the request and
+//!   after the reply). The view's pose is the FK of the bracket's mean joints; a bracket that moved
+//!   more than [`BRACKET_RAD`] is retried, at most [`SNAPSHOT_TRIES`] times, then `MOVED`. Then one
+//!   YOLO trigger (a frame newer than the request) for the target box.
 //! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
 //!   (the supervisor ends it; [`recheck`] between steps). A measurement failure after motion
 //!   ([`RETURN_AFTER`], `TOO_FEW_POINTS`) returns to the start joints first when `return_to_start`.
@@ -77,8 +80,25 @@ pub const RETURN_AFTER: [&str; 8] = ["TARGET_LOST", "DETECTION_UNAVAILABLE", "UN
 pub const MIN_FRAME_MARGIN_PX: f64 = 8.0;
 /// The two farthest view offsets must stay at least this far apart (m) after fallbacks.
 pub const MIN_EFFECTIVE_BASELINE_M: f64 = 0.02;
-/// Every arm joint within this of the settled position during a capture (rad).
-pub const STILL_RAD: f32 = 0.003;
+/// Settle check after [`MIN_SETTLE_S`]: a window of [`STILL_WINDOW`] joint samples
+/// [`STILL_SAMPLE`] apart is still when, for every arm joint, the median |velocity| is at most
+/// [`STILL_VEL`] and the position range at most [`STILL_RANGE_RAD`]. Windows slide until
+/// [`MAX_SETTLE_S`] after the motion, then `NOT_SETTLED`. (Real B601-DM, 2026-11-22: after a
+/// joint move at speed_scale 0.3 the joints creep 2-4 mrad over seconds and J4 / J5 can hold a
+/// limit cycle of a few mrad; single |velocity| samples reach 0.037 rad/s.)
+pub const STILL_WINDOW: usize = 10;
+pub const STILL_SAMPLE: Duration = Duration::from_millis(20);
+pub const STILL_VEL: f32 = 0.03;
+pub const STILL_RANGE_RAD: f32 = 0.003;
+pub const MAX_SETTLE_S: f64 = 4.0;
+/// The snapshot's pose: the joints sampled [`BRACKET_LEAD`] before the snapshot request and right
+/// after its reply, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the
+/// two, the snapshot is retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`] times,
+/// then `MOVED`.
+pub const BRACKET_LEAD: Duration = Duration::from_millis(100);
+pub const BRACKET_RAD: f32 = 0.002;
+pub const SNAPSHOT_TRIES: usize = 3;
+pub const SNAPSHOT_GAP_RETRY: Duration = Duration::from_millis(500);
 pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
 /// A view's target detection: centre at most this far (normalised image units) from where the
 /// start view saw it, moved by the shift of the look-at point in that view.
@@ -130,6 +150,8 @@ pub struct Request {
     pub baseline_m: f64,
     pub speed_scale: f64,
     pub return_to_start: bool,
+    /// Write a debug bundle ([`debug_dir`]).
+    pub debug: bool,
 }
 
 fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, ArmError> {
@@ -143,7 +165,7 @@ fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Res
 pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
     let empty = Map::new();
     let o = match body { Value::Null => &empty, Value::Object(o) => o, _ => return Err(invalid("Command body must be an object")) };
-    const KEYS: [&str; 9] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start"];
+    const KEYS: [&str; 10] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start", "debug"];
     if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) { return Err(invalid(format!("unknown field {k} ({})", KEYS.join(", ")))); }
     let label = match o.get("label") {
         None | Some(Value::Null) => None,
@@ -189,13 +211,19 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(invalid("return_to_start must be a boolean")),
     };
+    let debug = match o.get("debug") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(invalid("debug must be a boolean")),
+    };
+
     Ok(Request {
         label,
         min_score: num(o, "min_score", 0.3, 0.0, 1.0)?,
         target_box, target_frame_id, motion, axes, views,
         baseline_m: num(o, "baseline_m", DEFAULT_BASELINE_M, BASELINE_M[0], BASELINE_M[1])?,
         speed_scale: num(o, "speed_scale", DEFAULT_SPEED_SCALE, SPEED_SCALE[0], SPEED_SCALE[1])?,
-        return_to_start,
+        return_to_start, debug,
     })
 }
 
@@ -341,7 +369,8 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     // bound: per view one joint move (up to 2 rad at the slowest planning speed), settle, captures
     let vmin = inner.planning_limits().iter().take(inner.config.arm_dof()).map(|l| l.max_velocity).fold(f32::INFINITY, f32::min).max(0.05);
     let move_s = 2.0 / (f64::from(vmin) * request.speed_scale) + crate::motion::SETTLE_MAX_S;
-    let capture_s = MIN_SETTLE_S + (DISCARD_SNAPSHOTS + 1) as f64 * 3.5 + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
+    let capture_s = MAX_SETTLE_S + DISCARD_SNAPSHOTS as f64 * 3.5 + SNAPSHOT_TRIES as f64 * (3.5 + SNAPSHOT_GAP_RETRY.as_secs_f64())
+        + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
     let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
@@ -385,11 +414,50 @@ async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     Ok(())
 }
 
-/// Measured joints and whether every arm joint is still.
-async fn measured(ctx: &MacroCtx) -> (Vec<f32>, bool) {
+/// Measured joints (all) and velocities (arm joints).
+async fn sample(ctx: &MacroCtx) -> (Vec<f32>, Vec<f32>) {
     let inner = ctx.sup.inner().read().await;
-    let still = inner.config.arm_joint_indices().iter().all(|&i| inner.measured_velocities.get(i).is_none_or(|v| v.abs() <= 0.02));
-    (inner.measured_positions.clone(), still)
+    let arm = inner.config.arm_joint_indices();
+    (inner.measured_positions.clone(), arm.iter().map(|&i| inner.measured_velocities.get(i).copied().unwrap_or(0.0)).collect())
+}
+
+/// Wait until the arm is still (see [`STILL_WINDOW`]): `MIN_SETTLE_S`, then sliding windows until
+/// `MAX_SETTLE_S`. Returns the seconds it took.
+async fn settle(ctx: &MacroCtx, plan: &Plan) -> Result<f64, Stop> {
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs_f64(MIN_SETTLE_S);
+    while Instant::now() < until {
+        ctx.check().await?;
+        tokio::time::sleep(POLL).await;
+    }
+    recheck(ctx, plan).await?;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let mut win: std::collections::VecDeque<(Vec<f32>, Vec<f32>)> = std::collections::VecDeque::new();
+    loop {
+        ctx.check().await?;
+        win.push_back(sample(ctx).await);
+        if win.len() > STILL_WINDOW { win.pop_front(); }
+        if win.len() == STILL_WINDOW && is_still(&win, &arm) { return Ok(t0.elapsed().as_secs_f64()); }
+        if t0.elapsed().as_secs_f64() > MAX_SETTLE_S {
+            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {MAX_SETTLE_S} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples)")));
+        }
+        tokio::time::sleep(STILL_SAMPLE).await;
+    }
+}
+
+/// The settle rule over a window of (positions, arm velocities) samples.
+pub fn is_still(win: &std::collections::VecDeque<(Vec<f32>, Vec<f32>)>, arm: &[usize]) -> bool {
+    arm.iter().enumerate().all(|(k, &j)| {
+        let mut v: Vec<f32> = win.iter().map(|s| s.1.get(k).copied().unwrap_or(0.0).abs()).collect();
+        v.sort_by(f32::total_cmp);
+        let (lo, hi) = win.iter().filter_map(|s| s.0.get(j)).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        v[v.len() / 2] <= STILL_VEL && hi - lo <= STILL_RANGE_RAD
+    })
+}
+
+/// Largest difference of the arm joints between two samples (rad).
+pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> f32 {
+    arm.iter().map(|&i| (a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs()).fold(0.0, f32::max)
 }
 
 /// One view's capture.
@@ -404,44 +472,66 @@ struct Capture {
     /// the predicted target box to the image border (px).
     shift_px: [f64; 2],
     margin_px: f64,
+    /// Joints of the pose (bracket mean), the bracket samples, the bracket spread of every
+    /// snapshot try (rad) and the settle time (s).
+    joints: Vec<f32>,
+    bracket: [Vec<f32>; 2],
+    snapshot_tries: Vec<f32>,
+    settle_s: f64,
+    /// The snapshot (debug bundles only).
+    jpeg: Option<Vec<u8>>,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
 
-/// Settle, discard snapshots, take a snapshot and a detection at still joints.
+/// Settle, discard snapshots, take a snapshot bracketed by joint samples (retried while the
+/// bracket moved), then a detection. The pose is the FK of the bracket's mean joints.
 async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64) -> Result<Capture, Stop> {
-    let until = Instant::now() + Duration::from_secs_f64(MIN_SETTLE_S);
-    while Instant::now() < until {
-        ctx.check().await?;
-        tokio::time::sleep(POLL).await;
-    }
-    recheck(ctx, plan).await?;
-    let (settled, still) = measured(ctx).await;
-    if !still { return Err(fail("NOT_SETTLED", "the arm is still moving after the settle time")); }
+    let settle_s = settle(ctx, plan).await?;
     for _ in 0..DISCARD_SNAPSHOTS {
         src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
         tokio::time::sleep(SNAPSHOT_GAP).await;
         ctx.check().await?;
     }
-    let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let mut tries = Vec::new();
+    let mut got = None;
+    for k in 0..SNAPSHOT_TRIES {
+        if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
+        recheck(ctx, plan).await?;
+        let (a, _) = sample(ctx).await;
+        tokio::time::sleep(BRACKET_LEAD).await;
+        let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+        let (b, _) = sample(ctx).await;
+        let spread = bracket_spread(&a, &b, &arm);
+        tries.push(spread);
+        if spread <= BRACKET_RAD {
+            let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
+            got = Some((jpeg, mean, a, b));
+            break;
+        }
+    }
+    let Some((jpeg, joints, bracket_a, bracket_b)) = got else {
+        let mrad: Vec<String> = tries.iter().map(|t| format!("{:.1}", t * 1000.0)).collect();
+        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
+    };
     let mut frame = None;
     for _ in 0..TRIGGERS {
         ctx.check().await?;
         if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
     }
     let mut frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
-    let (joints, still) = measured(ctx).await;
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
-    if !still || arm.iter().any(|&i| (joints[i] - settled[i]).abs() > STILL_RAD) { return Err(fail("MOVED", "the arm moved during the capture")); }
     recheck(ctx, plan).await?;
-    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&settled) }
+    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
     let size = plan.cam.size;
+    let keep = plan.request.debug.then(|| jpeg.clone());
     let (img, decode_ms) = tokio::task::spawn_blocking(move || { let t0 = Instant::now(); let r = decode_frame(&jpeg, size); (r, t0.elapsed().as_secs_f64() * 1000.0) }).await
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
-    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px })
+    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, jpeg: keep })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -517,6 +607,10 @@ fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: 
         "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
         "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
         "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
+        "joints_rad": c.joints.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>(),
+        "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
+        "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
+        "settle_s": (c.settle_s * 100.0).round() / 100.0,
     })).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
@@ -643,17 +737,174 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
     Ok(())
 }
 
+/// What [`compute`] returns.
+pub struct Computed {
+    pub measure: Result<mview_stereo::ObjectMeasure, &'static str>,
+    pub table: mview_stereo::TableCheck,
+    pub rec: mview_stereo::Reconstruction,
+    pub region_px: [f64; 4],
+    pub ms: f64,
+}
+
+/// The feature region: the reference box grown by [`REGION_GROW`] + [`REGION_PAD_PX`].
+pub fn feature_region(b: [f64; 4]) -> [f64; 4] {
+    let (w, h) = (b[2] - b[0], b[3] - b[1]);
+    [b[0] - REGION_GROW * w - REGION_PAD_PX, b[1] - REGION_GROW * h - REGION_PAD_PX, b[2] + REGION_GROW * w + REGION_PAD_PX, b[3] + REGION_GROW * h + REGION_PAD_PX]
+}
+
 /// The reconstruction of the captures (blocking; spawn_blocking).
-fn compute(views: Vec<View>, reference: usize, ref_box_px: [f64; 4], table_z: f64) -> (Result<mview_stereo::ObjectMeasure, &'static str>, mview_stereo::TableCheck, mview_stereo::Stats, f64) {
+pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64) -> Computed {
     let t0 = Instant::now();
-    let (w, h) = (ref_box_px[2] - ref_box_px[0], ref_box_px[3] - ref_box_px[1]);
-    let region = [ref_box_px[0] - REGION_GROW * w - REGION_PAD_PX, ref_box_px[1] - REGION_GROW * h - REGION_PAD_PX,
-        ref_box_px[2] + REGION_GROW * w + REGION_PAD_PX, ref_box_px[3] + REGION_GROW * h + REGION_PAD_PX];
+    let region_px = feature_region(ref_box_px);
     let p = Params::new(table_z);
-    let rec = mview_stereo::reconstruct(&views, reference, region, ref_box_px, &p);
-    let m = mview_stereo::measure(&rec.points, &p);
-    let t = mview_stereo::table_check(&rec.points, &p);
-    (m, t, rec.stats, t0.elapsed().as_secs_f64() * 1000.0)
+    let rec = mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p);
+    let measure = mview_stereo::measure(&rec.points, &p);
+    let table = mview_stereo::table_check(&rec.points, &p);
+    Computed { measure, table, rec, region_px, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+}
+
+/// Triangulated points in the target box: count and height above the table (mm: min, median,
+/// max), and how many lie above the object cut (5 mm).
+pub fn box_heights(points: &[mview_stereo::Point], table_z: f64) -> Value {
+    let p = Params::new(table_z);
+    let mut h: Vec<f64> = points.iter().filter(|q| q.in_box).map(|q| (q.x[2] - table_z) * 1000.0).collect();
+    h.sort_by(f64::total_cmp);
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    if h.is_empty() { return json!({"n": 0, "n_above": 0, "min_mm": null, "median_mm": null, "max_mm": null}); }
+    json!({"n": h.len(), "n_above": h.iter().filter(|x| **x > p.object_min_h_m * 1000.0).count(),
+        "min_mm": r1(h[0]), "median_mm": r1(mview_stereo::quantile(&h, 0.5)), "max_mm": r1(h[h.len() - 1])})
+}
+
+/// Feature outcomes counted by kind (`corner` / `edge`), place (`box` / `out`) and outcome.
+pub fn outcome_counts(rec: &mview_stereo::Reconstruction, object_box: [f64; 4]) -> Value {
+    let mut m: std::collections::BTreeMap<String, std::collections::BTreeMap<&str, usize>> = Default::default();
+    for (f, o) in &rec.outcomes {
+        let inside = (f.x as f64) >= object_box[0] && (f.x as f64) <= object_box[2] && (f.y as f64) >= object_box[1] && (f.y as f64) <= object_box[3];
+        let key = format!("{}_{}", if f.normal.is_some() { "edge" } else { "corner" }, if inside { "box" } else { "out" });
+        *m.entry(key).or_default().entry(o).or_default() += 1;
+    }
+    json!(m)
+}
+
+// ---- debug bundles ----
+
+/// Where `debug: true` writes its bundles: `$ARMD_MVIEW_DEBUG_DIR`, else
+/// `/userdata/rebot-teleop/mview-debug`. One directory per action id; the newest
+/// [`MAX_DEBUG_BUNDLES`] are kept.
+pub fn debug_dir() -> std::path::PathBuf {
+    std::env::var_os("ARMD_MVIEW_DEBUG_DIR").map_or_else(|| std::path::PathBuf::from("/userdata/rebot-teleop/mview-debug"), std::path::PathBuf::from)
+}
+
+pub const MAX_DEBUG_BUNDLES: usize = 5;
+pub const BUNDLE_VERSION: u32 = 1;
+
+fn mat_json(m: &kinematics::Mat3) -> Value { json!(m) }
+
+/// Write the bundle of one run (blocking): `view_<k>.jpg` and `bundle.json`.
+fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, jpegs: &[(usize, Vec<u8>)]) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let dir = root.join(id.to_string());
+    if dir.exists() { std::fs::remove_dir_all(&dir)?; }
+    std::fs::create_dir_all(&dir)?;
+    for (k, j) in jpegs { std::fs::write(dir.join(format!("view_{k}.jpg")), j)?; }
+    let tmp = dir.join(".bundle.json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(json_doc).unwrap_or_default())?;
+    std::fs::rename(tmp, dir.join("bundle.json"))?;
+    // keep the newest MAX_DEBUG_BUNDLES directories
+    let mut dirs: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(root)?.flatten()
+        .filter(|e| e.path().join("bundle.json").exists())
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    for (_, d) in dirs.into_iter().skip(MAX_DEBUG_BUNDLES) { let _ = std::fs::remove_dir_all(d); }
+    Ok(dir)
+}
+
+/// The bundle document (see docs/agent_action_api.md, "Debug bundle").
+fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_px: [f64; 4], c: &Computed, measurement: &Value) -> Value {
+    let views: Vec<Value> = caps.iter().enumerate().map(|(k, v)| {
+        let cam = camera_at(&plan.cam, &v.pose);
+        json!({
+            "file": format!("view_{k}.jpg"), "offset_m": v.offset, "frame_id": v.frame_id,
+            "joints_rad": v.joints, "bracket_rad": v.bracket, "snapshot_tries_mrad": v.snapshot_tries.iter().map(|t| t * 1000.0).collect::<Vec<f32>>(),
+            "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
+            "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
+            "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
+        })
+    }).collect();
+    let tz = plan.setup.table_z_m;
+    let points: Vec<Value> = c.rec.points.iter().map(|q| json!({
+        "x_m": q.x, "h_mm": (q.x[2] - tz) * 1000.0, "ref_px": q.ref_px, "in_box": q.in_box, "edge": q.edge,
+        "consistent": q.consistent, "reproj_rms_px": q.reproj_rms_px, "views": q.views,
+    })).collect();
+    let outcomes: Vec<Value> = c.rec.outcomes.iter().map(|(f, o)| json!({"x": f.x, "y": f.y, "edge": f.normal.is_some(), "outcome": o})).collect();
+    json!({
+        "version": BUNDLE_VERSION, "action_id": id, "armd_version": env!("CARGO_PKG_VERSION"),
+        "created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "request": {"motion": plan.request.motion.name(), "axes": plan.request.axes.name(), "views": plan.request.views,
+            "baseline_m": plan.request.baseline_m, "speed_scale": plan.request.speed_scale, "label": plan.request.label, "min_score": plan.request.min_score},
+        "intrinsics": {"fx": plan.cam.fx, "fy": plan.cam.fy, "cx": plan.cam.cx, "cy": plan.cam.cy, "size": plan.cam.size},
+        "cam_mount": {"r_end_cam": mat_json(&plan.cam.rec), "offset_m": plan.cam.offset},
+        "table_z_m": tz, "reference": reference, "ref_box_px": ref_box_px, "region_px": c.region_px,
+        "views": views, "stats": c.rec.stats, "points": points, "outcomes": outcomes, "measurement": measurement,
+    })
+}
+
+/// A bundle with only what a replay needs (for synthetic or converted captures): the JPEGs, the
+/// cameras (shared intrinsics), the reference view, its box and the table height.
+pub fn write_replay_bundle(dir: &std::path::Path, jpegs: &[Vec<u8>], cams: &[Camera], size: [f64; 2], reference: usize, ref_box_px: [f64; 4], table_z_m: f64) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let c0 = cams.first().copied().ok_or_else(|| std::io::Error::other("no camera"))?;
+    let views: Vec<Value> = jpegs.iter().zip(cams).enumerate().map(|(k, (j, c))| {
+        let _ = std::fs::write(dir.join(format!("view_{k}.jpg")), j);
+        json!({"file": format!("view_{k}.jpg"), "camera": {"r_base_cam": mat_json(&c.r), "c_m": c.c}})
+    }).collect();
+    let doc = json!({"version": BUNDLE_VERSION, "intrinsics": {"fx": c0.fx, "fy": c0.fy, "cx": c0.cx, "cy": c0.cy, "size": size},
+        "table_z_m": table_z_m, "reference": reference, "ref_box_px": ref_box_px, "views": views});
+    std::fs::write(dir.join("bundle.json"), serde_json::to_vec_pretty(&doc).unwrap_or_default())
+}
+
+/// A bundle read back for a replay ([`replay_bundle`]).
+pub struct Bundle {
+    pub views: Vec<View>,
+    pub reference: usize,
+    pub ref_box_px: [f64; 4],
+    pub table_z_m: f64,
+    pub doc: Value,
+}
+
+/// Read a bundle directory: decode each view's JPEG to the camera frame and rebuild its camera
+/// from the stored pose.
+pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
+    let doc: Value = serde_json::from_slice(&std::fs::read(dir.join("bundle.json")).map_err(|e| format!("bundle.json: {e}"))?)
+        .map_err(|e| format!("bundle.json: {e}"))?;
+    let f = |v: &Value, what: &str| v.as_f64().ok_or_else(|| format!("bundle: {what} missing"));
+    let mat = |v: &Value, what: &str| -> Result<kinematics::Mat3, String> { serde_json::from_value(v.clone()).map_err(|e| format!("bundle: {what}: {e}")) };
+    let vec3 = |v: &Value, what: &str| -> Result<Vec3, String> { serde_json::from_value(v.clone()).map_err(|e| format!("bundle: {what}: {e}")) };
+    let i = &doc["intrinsics"];
+    let (fx, fy, cx, cy) = (f(&i["fx"], "fx")?, f(&i["fy"], "fy")?, f(&i["cx"], "cx")?, f(&i["cy"], "cy")?);
+    let size = [f(&i["size"][0], "size")?, f(&i["size"][1], "size")?];
+    let mut views = Vec::new();
+    for (k, v) in doc["views"].as_array().ok_or("bundle: views missing")?.iter().enumerate() {
+        let file = v["file"].as_str().ok_or("bundle: view file missing")?;
+        let jpeg = std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
+        let img = decode_frame(&jpeg, size)?;
+        let cam = Camera { r: mat(&v["camera"]["r_base_cam"], &format!("views[{k}].camera"))?, c: vec3(&v["camera"]["c_m"], &format!("views[{k}].camera"))?, fx, fy, cx, cy };
+        views.push(View { cam, img });
+    }
+    let b = &doc["ref_box_px"];
+    Ok(Bundle {
+        reference: doc["reference"].as_u64().ok_or("bundle: reference missing")? as usize,
+        ref_box_px: [f(&b[0], "ref_box_px")?, f(&b[1], "ref_box_px")?, f(&b[2], "ref_box_px")?, f(&b[3], "ref_box_px")?],
+        table_z_m: f(&doc["table_z_m"], "table_z_m")?,
+        views, doc,
+    })
+}
+
+/// Re-run the reconstruction of a bundle (host replay; `cargo run --release --features mview-replay --bin mview-replay -- <dir>`).
+pub fn replay_bundle(dir: &std::path::Path) -> Result<(Bundle, Computed), String> {
+    let b = read_bundle(dir)?;
+    let c = compute(&b.views, b.reference, b.ref_box_px, b.table_z_m);
+    Ok((b, c))
 }
 
 async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn DetectionSource>) {
@@ -733,16 +984,33 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
     let table_z = plan.setup.table_z_m;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
-    let task = tokio::task::spawn_blocking(move || compute(views, reference, ref_box_px, table_z));
+    let task = tokio::task::spawn_blocking(move || compute(&views, reference, ref_box_px, table_z));
     let back = back_to_start(ctx, plan).await;
-    let (m, t, stats, ms) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
-    tracing::info!("measure_multiview {}: {} views, {stats:?}, {ms:.0} ms, {:?}", ctx.id, caps.len(), m.as_ref().map(|m| m.height_m));
-    let value = measurement_value(plan, &caps, &ref_det, &m, &t, &stats, &fallbacks, ms);
+    let c = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
+    let stats = c.rec.stats;
+    tracing::info!("measure_multiview {}: {} views, {stats:?}, {:.0} ms, {:?}", ctx.id, caps.len(), c.ms, c.measure.as_ref().map(|m| m.height_m));
+    let in_box = box_heights(&c.rec.points, table_z);
+    let mut value = measurement_value(plan, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
+    value["in_box"] = in_box.clone();
+    value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
+    if plan.request.debug {
+        let doc = bundle_doc(ctx.id, plan, &caps, reference, ref_box_px, &c, &value);
+        let jpegs: Vec<(usize, Vec<u8>)> = caps.iter_mut().enumerate().filter_map(|(k, v)| v.jpeg.take().map(|j| (k, j))).collect();
+        let (root, id) = (debug_dir(), ctx.id);
+        let written = tokio::task::spawn_blocking(move || write_bundle(&root, id, &doc, &jpegs)).await;
+        value["debug"] = match written {
+            Ok(Ok(dir)) => json!({"dir": dir.to_string_lossy(), "written": true}),
+            Ok(Err(e)) => { tracing::warn!("measure_multiview {}: debug bundle not written: {e}", ctx.id); json!({"dir": debug_dir().to_string_lossy(), "written": false, "error": e.to_string()}) }
+            Err(e) => json!({"written": false, "error": e.to_string()}),
+        };
+    }
     ctx.sup.inner().write().await.update_action(ctx.id, |a| a.measurement = Some(value));
     back?;
-    Ok(m.err().map(|_| ("TOO_FEW_POINTS".to_string(),
-        format!("fewer than {} object points above the table in the target box ({} points triangulated; features {}, no peak {}, ambiguous {}, left-right {}, reprojection {})",
-            Params::new(table_z).min_object_points, stats.points, stats.features, stats.no_peak, stats.ambiguous, stats.lr_rejected, stats.reproj_rejected))))
+    let p = Params::new(table_z);
+    Ok(c.measure.err().map(|_| ("TOO_FEW_POINTS".to_string(),
+        format!("fewer than {} object points more than {:.0} mm above the table in the target box: {} triangulated points in the box (height above table min {} / median {} / max {} mm, {} above {:.0} mm); {} points in all; features {}, no peak {}, ambiguous {}, refine {}, left-right {}, reprojection {}",
+            p.min_object_points, p.object_min_h_m * 1000.0, in_box["n"], in_box["min_mm"], in_box["median_mm"], in_box["max_mm"], in_box["n_above"], p.object_min_h_m * 1000.0,
+            stats.points, stats.features, stats.no_peak, stats.ambiguous, stats.refine_rejected, stats.lr_rejected, stats.reproj_rejected))))
 }
 
 #[cfg(test)]
@@ -856,6 +1124,47 @@ mod tests {
             let expect = (cam.size[0] / 2.0 - 50.0 - sh[0].abs()).min(cam.size[1] / 2.0 - 30.0 - sh[1].abs());
             assert!((m - expect).abs() < 1e-6 && (sh[0].hypot(sh[1]) - cam.fx * o[0].hypot(o[1]) / z).abs() < 0.5, "{sh:?} {m}");
         }
+    }
+
+    /// How far a joint error moves the image (fx 804, a point 0.45 m in front of the camera on
+    /// the optical axis) and the depth error that shift means at baseline 0.08 m.
+    #[test]
+    fn joint_errors_in_pixels() {
+        let arm = crate::chain::ArmModel::default();
+        let setup = GraspSetup { fx_px: 804.0, fy_px: 804.0, ..GraspSetup::default() };
+        let cam = CamModel::assumed(&arm, &setup, &crate::model::CameraMount::default());
+        let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
+        let c0 = camera_at(&cam, &arm.fk(&q0));
+        let z = 0.45;
+        let x = kinematics::add(&c0.c, &kinematics::mat_vec(&c0.r, &[0.0, 0.0, z]));
+        let p0 = c0.project(&x).unwrap();
+        let mut shifts = [0.0; 6];
+        for (j, s) in shifts.iter_mut().enumerate() {
+            let mut q = q0;
+            q[j] += 0.0035;
+            let p = camera_at(&cam, &arm.fk(&q)).project(&x).unwrap();
+            *s = (p[0] - p0[0]).hypot(p[1] - p0[1]);
+            println!("J{} +3.5 mrad: {:.2} px, depth error at B 0.08 m {:.1} mm", j + 1, *s, z * z * *s / (804.0 * 0.08) * 1000.0);
+        }
+        // a few mrad on a wrist joint is several px: the pose must be the one of the snapshot
+        assert!(shifts[3] > 2.0 && shifts[3] < 6.0, "{shifts:?}");
+    }
+
+    #[test]
+    fn settle_rule_and_bracket() {
+        let arm = [0usize, 1, 2, 3, 4, 5];
+        let win = |f: &dyn Fn(usize) -> (Vec<f32>, Vec<f32>)| -> std::collections::VecDeque<(Vec<f32>, Vec<f32>)> { (0..STILL_WINDOW).map(f).collect() };
+        // creep of 2.7 mrad over 2 s (0.27 mrad per 200 ms window) and one velocity spike of 0.037: still
+        let w = win(&|k| (vec![0.00027 * k as f32 / 10.0; 7], vec![if k == 3 { 0.037 } else { 0.005 }; 6]));
+        assert!(is_still(&w, &arm));
+        // a joint moving 4 mrad within the window, or a median |velocity| of 0.05: not still
+        assert!(!is_still(&win(&|k| { let mut p = vec![0.0; 7]; p[3] = 0.0004 * k as f32; (p, vec![0.0; 6]) }), &arm));
+        assert!(!is_still(&win(&|_| (vec![0.0; 7], vec![0.05; 6])), &arm));
+        let a = vec![0.0f32; 7];
+        let mut b = a.clone();
+        b[4] = 0.0025;
+        b[6] = 0.5; // the gripper is not an arm joint
+        assert!((bracket_spread(&a, &b, &arm) - 0.0025).abs() < 1e-7);
     }
 
     #[test]

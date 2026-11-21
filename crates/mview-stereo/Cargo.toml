@@ -1,0 +1,15 @@
+[package]
+name = "mview-stereo"
+version = "0.1.0"
+edition = "2021"
+description = "Motion-stereo geometry of armd's measure_multiview action (built at opt-level 3, see the root Cargo.toml)"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

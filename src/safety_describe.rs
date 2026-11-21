@@ -330,6 +330,28 @@ impl SupervisorInner {
             "notes": notes,
         });
 
+        let measure_multiview = json!({
+                    "available": capabilities.measure_multiview,
+                    "lease_required": true,
+                    "operator_required": self.operator_auth_enforced,
+                    "speed_scale": crate::measure_multiview::SPEED_SCALE,
+                    "baseline_m": crate::measure_multiview::BASELINE_M,
+                    "views": [crate::measure_multiview::MIN_VIEWS, crate::measure_multiview::MAX_VIEWS],
+                    "motions": ["orbit", "translate"],
+                    "default_motion": "orbit",
+                    "axes": {"x": crate::measure_multiview::Axes::X.views().0, "xy": crate::measure_multiview::Axes::Xy.views().0},
+                    "min_frame_margin_px": crate::measure_multiview::MIN_FRAME_MARGIN_PX,
+                    "min_settle_s": crate::measure_multiview::MIN_SETTLE_S,
+                    "max_settle_s": crate::measure_multiview::MAX_SETTLE_S,
+                    "still": {"window": crate::measure_multiview::STILL_WINDOW, "median_vel_rad_s": crate::measure_multiview::STILL_VEL, "range_rad": crate::measure_multiview::STILL_RANGE_RAD},
+                    "snapshot_bracket_rad": crate::measure_multiview::BRACKET_RAD,
+                    "snapshot_tries": crate::measure_multiview::SNAPSHOT_TRIES,
+                    "debug_dir": crate::measure_multiview::debug_dir().to_string_lossy(),
+                    "motion": "joint-space quintic to each view pose, with the checks of every joint move (swept workspace, keep-out boxes, link capsules, power budget, torque and collision holds); a refused view (or one whose target would leave the image, OUT_OF_FRAME) is retried at the mirrored or a smaller offset, else the action fails with the refusal code",
+                    "ends_on": ["stop", "e_stop", "fault", "collision", "torque_limit", "lease_loss", "watchdog"],
+                    "return_to_start": "default true: joint-space move back to the start joints after the captures or a measurement failure; not after a stop, fault, collision, torque limit or lease loss",
+                    "return_after": crate::measure_multiview::RETURN_AFTER,
+                });
         json!({
             "describe_version": DESCRIBE_VERSION,
             "device": {
@@ -382,23 +404,7 @@ impl SupervisorInner {
                     "angular_rps": cap.and_then(|s| s.angular_rps).map_or(MAX_ANGULAR_RPS, |v| MAX_ANGULAR_RPS.min(f64::from(v))),
                 },
                 // action measure_multiview (src/measure_multiview.rs)
-                "measure_multiview": {
-                    "available": capabilities.measure_multiview,
-                    "lease_required": true,
-                    "operator_required": self.operator_auth_enforced,
-                    "speed_scale": crate::measure_multiview::SPEED_SCALE,
-                    "baseline_m": crate::measure_multiview::BASELINE_M,
-                    "views": [crate::measure_multiview::MIN_VIEWS, crate::measure_multiview::MAX_VIEWS],
-                    "motions": ["orbit", "translate"],
-                    "default_motion": "orbit",
-                    "axes": {"x": crate::measure_multiview::Axes::X.views().0, "xy": crate::measure_multiview::Axes::Xy.views().0},
-                    "min_frame_margin_px": crate::measure_multiview::MIN_FRAME_MARGIN_PX,
-                    "min_settle_s": crate::measure_multiview::MIN_SETTLE_S,
-                    "motion": "joint-space quintic to each view pose, with the checks of every joint move (swept workspace, keep-out boxes, link capsules, power budget, torque and collision holds); a refused view (or one whose target would leave the image, OUT_OF_FRAME) is retried at the mirrored or a smaller offset, else the action fails with the refusal code",
-                    "ends_on": ["stop", "e_stop", "fault", "collision", "torque_limit", "lease_loss", "watchdog"],
-                    "return_to_start": "default true: joint-space move back to the start joints after the captures or a measurement failure; not after a stop, fault, collision, torque limit or lease loss",
-                    "return_after": crate::measure_multiview::RETURN_AFTER,
-                },
+                "measure_multiview": measure_multiview,
             },
             "stops": stops,
             "faults": faults(),

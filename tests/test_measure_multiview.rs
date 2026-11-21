@@ -14,6 +14,8 @@ use armd::grasp::{BoxFuture, CamModel, Detection, DetectionFrame, DetectionSourc
 use armd::kinematics::{self, Pose};
 use armd::measure_multiview as mm;
 use armd::model::KeepoutBox;
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
+use armd::model::JointState;
 use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
 use render::{BoxObj, Noise, Scene};
 use serde_json::{json, Value};
@@ -29,6 +31,12 @@ struct FakeVision {
     hide_after_start: AtomicBool,
     frame: AtomicU64,
     snapshots: AtomicU64,
+    /// Each snapshot takes this long (ms).
+    snapshot_delay_ms: AtomicU64,
+    /// Set on the first snapshot (the arm settled): the creep driver starts shaking.
+    shake_on_snapshot: Mutex<Option<Arc<Mutex<Creep>>>>,
+    /// The creep driver's clock (stopped while rendering).
+    clock: Mutex<Option<Arc<Mutex<Creep>>>>,
     /// (joints, jpeg, box_norm) of the last render.
     cache: Mutex<Option<(Vec<f32>, Vec<u8>, Option<[f64; 4]>)>>,
 }
@@ -42,9 +50,11 @@ impl FakeVision {
             let pose = inner.config.arm_model.fk_f32(&q).unwrap();
             (q, pose)
         };
-        if let Some(c) = self.cache.lock().unwrap().as_ref().filter(|c| c.0.iter().zip(&q).all(|(a, b)| (a - b).abs() < 1e-5)) {
+        if let Some(c) = self.cache.lock().unwrap().as_ref().filter(|c| c.0.iter().zip(&q).all(|(a, b)| (a - b).abs() < 2e-4)) {
             return c.clone();
         }
+        // rendering takes the camera no time: the creep clock stops meanwhile
+        let paused = Instant::now();
         let cam = mm::camera_at(&self.cam, &pose);
         let (w, h) = (self.cam.size[0] as usize, self.cam.size[1] as usize);
         let seed = self.frame.load(Ordering::SeqCst) + 1;
@@ -60,6 +70,7 @@ impl FakeVision {
         let bn = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
         let v = (q, jpeg, bn);
         *self.cache.lock().unwrap() = Some(v.clone());
+        if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref().or(self.clock.lock().unwrap().as_ref()) { c.lock().unwrap().paused += paused.elapsed(); }
         v
     }
 
@@ -96,7 +107,11 @@ impl DetectionSource for FakeVision {
     fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
         Box::pin(async move {
             self.snapshots.fetch_add(1, Ordering::SeqCst);
-            Ok(self.view().await.1)
+            if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref() { c.lock().unwrap().shake = true; }
+            let v = self.view().await.1;
+            let d = self.snapshot_delay_ms.load(Ordering::SeqCst);
+            if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
+            Ok(v)
         })
     }
 }
@@ -118,16 +133,22 @@ fn geometry(config: &ArmConfig) -> (CamModel, Pose, [f64; 3]) {
     (cam, pose, look)
 }
 
-async fn rig(config: ArmConfig) -> Rig { rig_plain(config, false).await }
+async fn rig(config: ArmConfig) -> Rig { rig_driven(config, false, None).await }
 
-/// [`rig`] with a plain (uniform grey) box when `plain`.
-async fn rig_plain(config: ArmConfig, plain: bool) -> Rig {
+async fn rig_plain(config: ArmConfig, plain: bool) -> Rig { rig_driven(config, plain, None).await }
+
+/// [`rig`] with a plain (uniform grey) box when `plain`, and the creep driver when given.
+async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) -> Rig {
     let (cam, _, look) = geometry(&config);
     let sup = Arc::new(ArmSupervisor::new(config));
+    if let Some(d) = driver {
+        d.inner.0.lock().unwrap().q = START;
+        sup.inner().write().await.driver = Some(std::sync::Mutex::new(Box::new(d)));
+    }
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
-        snapshots: AtomicU64::new(0), cache: Mutex::new(None) });
+        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), cache: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -359,4 +380,142 @@ async fn translate_on_two_axes_measures_a_plain_box_from_its_outline() {
     assert!(o["n_edge_points"].as_u64().unwrap() > 0, "{o}");
     for k in ["features_ms", "sweep_ms", "refine_ms", "triangulate_ms", "decode_ms", "total_ms"] { assert!(m["stats"][k].is_number(), "{k}"); }
     assert!(r.at_start().await);
+}
+
+/// Joint offsets the creep driver adds to an ideal position servo (rad, seconds since the start).
+#[derive(Default)]
+struct Creep {
+    t0: Option<Instant>,
+    /// J1 creep (rad/s) and the J4 limit cycle (amplitude rad, period s), always.
+    creep: f32,
+    cycle: (f32, f32),
+    /// After `shake` is set: J4 drifts at `shake_rate` (rad/s).
+    shake: bool,
+    shake_rate: f32,
+    shake_t0: Option<f32>,
+    /// Time the clock stood still.
+    paused: Duration,
+}
+
+/// common::TestArm reporting positions with creep and limit cycles (real B601-DM, 2026-11-22).
+struct CreepArm { inner: common::TestArm, creep: Arc<Mutex<Creep>> }
+
+impl CreepArm {
+    fn offsets(&self) -> ([f32; 7], [f32; 7]) {
+        let mut c = self.creep.lock().unwrap();
+        let t = c.t0.get_or_insert_with(Instant::now).elapsed().saturating_sub(c.paused).as_secs_f32();
+        let (mut p, mut v) = ([0.0f32; 7], [0.0f32; 7]);
+        let tau = std::f32::consts::TAU;
+        p[0] = (c.creep * t).min(0.004);
+        v[0] = if c.creep * t < 0.004 { c.creep } else { 0.0 };
+        let (a, per) = c.cycle;
+        if a > 0.0 {
+            p[3] = a * (tau * t / per).sin();
+            v[3] = a * tau / per * (tau * t / per).cos();
+        }
+        if c.shake {
+            let ts = *c.shake_t0.get_or_insert(t);
+            p[3] += c.shake_rate * (t - ts);
+            v[3] += c.shake_rate;
+        }
+        (p, v)
+    }
+}
+
+impl ArmDriver for CreepArm {
+    fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+    fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let (p, v) = self.offsets();
+        let mut s = self.inner.read_joint_states()?;
+        for (i, js) in s.iter_mut().enumerate().take(7) { js.position += p[i]; js.velocity += v[i]; }
+        Ok(s)
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn supports_mit_mode_switch(&self) -> bool { false }
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creep_and_a_slow_limit_cycle_do_not_stop_the_captures() {
+    // J1 creeps 1.4 mrad/s (up to 4 mrad), J4 cycles +-2 mrad every 1.5 s; each snapshot takes 60 ms
+    let creep = Arc::new(Mutex::new(Creep { creep: 0.0014, cycle: (0.002, 1.5), ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    *r.vision.clock.lock().unwrap() = Some(creep.clone());
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    let m = &a["measurement"];
+    let tries: Vec<Value> = m["views"].as_array().map(|v| v.iter().map(|x| x["snapshot_tries_mrad"].clone()).collect()).unwrap_or_default();
+    println!("state {} code {} message {}; snapshot tries (mrad) {tries:?}; settle_s {:?}", a["state"], a["code"], a["message"],
+        m["views"].as_array().map(|v| v.iter().map(|x| x["settle_s"].clone()).collect::<Vec<_>>()));
+    assert_eq!(a["state"], "done", "{a}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.004, "{m}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shaking_during_the_snapshots_retries_then_fails_moved() {
+    // still while settling; from the first snapshot on J4 drifts 30 mrad/s and each snapshot takes
+    // 60 ms: every bracket (100 ms lead + 60 ms) moves about 4.8 mrad
+    let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.03, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
+    let ack = r.start(json!({})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 60.0).await;
+    println!("{} {}", a["code"], a["message"]);
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
+    let msg = a["message"].as_str().unwrap();
+    assert!(msg.contains("3 snapshots") && msg.contains("mrad"), "{msg}");
+    // 2 discarded + 3 tries at the start view
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
+    let dir = tempfile::tempdir().unwrap();
+    // the only test of this binary that requests debug bundles
+    std::env::set_var("ARMD_MVIEW_DEBUG_DIR", dir.path());
+    // six stale bundles: the newest five are kept
+    for k in 0..6 {
+        let d = dir.path().join(format!("old{k}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("bundle.json"), "{}").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "debug": true})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    let m = &a["measurement"];
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(m["debug"]["written"], true, "{}", m["debug"]);
+    let b = dir.path().join(id.to_string());
+    for k in 0..3 { assert!(b.join(format!("view_{k}.jpg")).exists()); }
+    let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left.len(), mm::MAX_DEBUG_BUNDLES, "{left:?}");
+    assert_eq!(left, vec![id.to_string(), "old3".into(), "old4".into(), "old5".into(), "old2".into()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(), "the newest 5");
+    // the measurement carries the in-box height distribution and the outcome counts
+    assert!(m["in_box"]["n"].as_u64().unwrap() >= m["objects"][0]["n_points"].as_u64().unwrap(), "{}", m["in_box"]);
+    assert!(m["in_box"]["max_mm"].as_f64().unwrap() > 30.0, "{}", m["in_box"]);
+    assert!(m["outcomes"]["corner_box"]["point"].as_u64().unwrap() > 0, "{}", m["outcomes"]);
+    // replay: the same points from the stored JPEGs and poses
+    let (bundle, c) = mm::replay_bundle(&b).unwrap();
+    assert_eq!(bundle.views.len(), 3);
+    assert_eq!(c.rec.stats.points as u64, m["stats"]["points"].as_u64().unwrap());
+    let h = c.measure.unwrap().height_m;
+    assert!((h - m["objects"][0]["height_m"].as_f64().unwrap()).abs() < 1e-4, "{h}");
+    let doc = &bundle.doc;
+    assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
+    assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
 }

@@ -286,3 +286,79 @@ fn plain_boxes_are_measured_from_their_edges() {
         println!("worst |height error| {:.2} mm", worst * 1000.0);
     }
 }
+
+/// A scene like the real-arm run of 2026-11-22 (an elongated object filling ~80 % of the image
+/// height at Z ~0.47 m, fx 804, 3 views orbit x and 5 views orbit xy, JPEG q85), written as replay
+/// bundles to `$MVIEW_BUNDLE_OUT/{x3,xy5}` for `src/bin/mview_replay.rs` (host and riscv / qemu).
+#[test]
+#[ignore]
+fn write_realistic_bundles() {
+    let Some(out) = std::env::var_os("MVIEW_BUNDLE_OUT") else { return };
+    // long side along base x (away from the arm): it spans the image height, foreshortened
+    let b = BoxObj { xy: [0.62, 0.08], yaw: 0.0, size: [0.22, 0.05, 0.035] };
+    let scene = Scene::new(0.0098, vec![b]);
+    let pivot = [b.xy[0], b.xy[1], 0.0098 + 0.02];
+    let el = 41f64.to_radians();
+    let cam0 = render::look_at([pivot[0] - 0.47 * el.cos(), pivot[1], pivot[2] + 0.47 * el.sin()], pivot, FX, SIZE);
+    use armd::measure_multiview::{view_offsets, write_replay_bundle, Axes};
+    for (name, n, axes) in [("x3", 3usize, Axes::X), ("xy5", 5, Axes::Xy)] {
+        let offsets = view_offsets(n, 0.08, axes);
+        let cams: Vec<mview_stereo::Camera> = offsets.iter().map(|o| render::orbit_xy(&cam0, pivot, *o)).collect();
+        let jpegs: Vec<Vec<u8>> = cams.iter().enumerate().map(|(i, c)| {
+            let img = render::render(&scene, c, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 300 + i as u64);
+            let mut sq = vec![0u8; 640 * 640];
+            sq[140 * 640..500 * 640].copy_from_slice(&img.px);
+            let mut j = Vec::new();
+            jpeg_encoder::Encoder::new(&mut j, 85).encode(&sq, 640, 640, jpeg_encoder::ColorType::Luma).unwrap();
+            j
+        }).collect();
+        let reference = offsets.iter().position(|o| o[0] == 0.0 && o[1] == 0.0).unwrap();
+        let bx = render::box_px(&scene, &b, &cams[reference]);
+        println!("{name}: box {bx:?} ({:.0} % of the height)", (bx[3] - bx[1]) / 3.6);
+        write_replay_bundle(&std::path::Path::new(&out).join(name), &jpegs, &cams, SIZE, reference, bx, 0.0098).unwrap();
+    }
+}
+
+/// Thresholds against a scene like the real-arm run (2026-11-22): the object fills ~80 % of the
+/// image height at Z ~0.47 m, dim light (grey levels compressed to 20 + 0.35 x), a per-view gain
+/// change of up to 8 % (gloss), JPEG q75, 3 views orbit x; a plain or weakly textured object on a
+/// noise-textured or periodic (board-like) table. Prints the stage counts for `ncc_min` 0.8 / 0.7.
+#[test]
+#[ignore]
+fn thresholds_on_a_dim_glossy_scene() {
+    use armd::measure_multiview::{decode_frame, view_offsets, Axes};
+    println!("| table | object | ncc_min | height err mm | n_points | in box n / above 5 mm | no_peak | ambiguous | refine | lr | reproj |");
+    for (periodic, plain) in [(false, false), (false, true), (true, false), (true, true)] {
+        let b = BoxObj { xy: [0.62, 0.08], yaw: 0.0, size: [0.22, 0.05, 0.035] };
+        let mut scene = Scene::new(0.0098, vec![b]);
+        scene.periodic = periodic;
+        scene.plain_boxes = plain;
+        let pivot = [b.xy[0], b.xy[1], 0.0098 + 0.02];
+        let el = 41f64.to_radians();
+        let cam0 = render::look_at([pivot[0] - 0.47 * el.cos(), pivot[1], pivot[2] + 0.47 * el.sin()], pivot, FX, SIZE);
+        let offsets = view_offsets(3, 0.08, Axes::X);
+        let views: Vec<View> = offsets.iter().enumerate().map(|(i, o)| {
+            let cam = render::orbit_xy(&cam0, pivot, *o);
+            let img = render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 400 + i as u64);
+            let gain = [1.0, 1.08, 0.94][i];
+            let px: Vec<u8> = img.px.iter().map(|&v| (20.0 + 0.35 * gain * f64::from(v)).round().clamp(0.0, 255.0) as u8).collect();
+            let mut j = Vec::new();
+            jpeg_encoder::Encoder::new(&mut j, 75).encode(&px, 640, 360, jpeg_encoder::ColorType::Luma).unwrap();
+            View { img: decode_frame(&j, SIZE).unwrap(), cam }
+        }).collect();
+        let bx = render::box_px(&scene, &b, &views[1].cam);
+        let region = armd::measure_multiview::feature_region(bx);
+        for ncc_min in [0.8, 0.7] {
+            let mut p = Params::new(0.0098);
+            p.ncc_min = ncc_min;
+            let rec = mview_stereo::reconstruct(&views, 1, region, bx, &p);
+            let st = rec.stats;
+            let ib = armd::measure_multiview::box_heights(&rec.points, 0.0098);
+            let m = mview_stereo::measure(&rec.points, &p);
+            println!("| {} | {} | {ncc_min} | {} | {} | {} / {} | {} | {} | {} | {} | {} |", if periodic { "periodic" } else { "noise" }, if plain { "plain" } else { "textured" },
+                m.as_ref().map_or_else(|w| w.to_string(), |m| format!("{:+.2}", (m.height_m - 0.035) * 1000.0)), m.as_ref().map_or(0, |m| m.n_points),
+                ib["n"], ib["n_above"], st.no_peak, st.ambiguous, st.refine_rejected, st.lr_rejected, st.reproj_rejected);
+            if std::env::var("MV_DEBUG").is_ok() { println!("  {}", armd::measure_multiview::outcome_counts(&rec, bx)); }
+        }
+    }
+}
