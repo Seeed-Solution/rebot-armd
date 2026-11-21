@@ -765,6 +765,7 @@ body.offline .banner { display: block; }
 .st-failed, .st-cancelled { color: var(--sc-status-danger-fg); } .st-lease { color: var(--sc-color-text-tertiary); }
 .ext-open { justify-content: center; min-height: 40px; }
 #act-chip.ext { pointer-events: auto; cursor: pointer; }
+.vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 #act-chip.ext:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 body.is-fs.ui-simple .ext-banner, body.is-hud.ui-simple .ext-banner { display: none; }
 #btn-task { position: relative; }
@@ -2260,6 +2261,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <button class="cal-stale-txt" id="cal-stale-open" type="button"></button>
   <button class="btn calib-x" id="cal-stale-x" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
 </div>
+<span class="vh" id="act-live" role="status" aria-live="polite" data-for="act-chip"></span>
 <div class="calib-mask" id="task" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="task-h">
     <div class="calib-head">
@@ -11752,7 +11754,9 @@ function renderActionChip(k) {
   if (!el) return;
   el.hidden = !k.show;
   el.classList.toggle('ext', k.show);
-  if (!k.show) return;
+  // #act-chip is a button (opens #task); #act-live announces its summary without the progress percentage
+  const live = $('act-live');
+  if (!k.show) { setText(live, ''); return; }
   const e = k.e;
   const who = tkWhoShort(k.other != null ? k.other : e && e.src);
   let text, cls;
@@ -11765,6 +11769,7 @@ function renderActionChip(k) {
   else { text = who + ' · ' + t('ext.idle.s'); cls = ''; }
   setText(el, text);
   el.setAttribute('aria-label', t('ext.chip.aria', { s: text }));
+  setText(live, k.mode === 'act' && e && e.state === 'running' ? who + ' · ' + tkLabel(e) + ' · ' + tkSt(e.state) : text);
   el.classList.toggle('is-warn', cls === 'is-warn');
   el.classList.toggle('is-ok', cls === 'is-ok');
   el.classList.toggle('is-danger', cls === 'is-danger');
