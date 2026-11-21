@@ -803,6 +803,14 @@ body.is-fs.ui-simple .ext-banner, body.is-hud.ui-simple .ext-banner { display: n
    in expert mode the points and settings buttons leave no room, and #ext-banner (shown whenever the button would
    be live) opens the drawer instead; on tablets the mode switch gives up some width so the header does not scroll sideways */
 @media (max-width: 479px) { #btn-task:not(.is-live), body.ui-expert #btn-task { display: none; } }
+/* phones (360-479 px): with operator auth enforced the expert header (state badge + points, settings, operator chip,
+   language) was up to 70 px wider than the screen, pushing the operator chip and EN off it. The expert header drops the
+   state badge, as simple mode does (the safety card shows the enable state); a live task button in simple mode
+   drops the operator chip's label (icon only; the title and aria-label keep the full text). */
+@media (max-width: 479px) {
+  body.ui-expert #state-badge { display: none; }
+  .topbar:has(#btn-task.is-live:not([hidden])) .op-btn .op-lbl { display: none; }
+}
 @media (min-width: 640px) and (max-width: 999px) { .ui-switch button { min-width: 88px; } }
 .task-tabs { display: flex; }
 .task-tabs button { flex: 1 1 0; }

@@ -10,7 +10,9 @@
 // (no reconnect); then "Park and turn torque off" is offered and parks to torque off. A short viewport stands in
 // for the on-screen keyboard (the dialog stays inside it). Detection trigger and gravity mode: refused, dialog
 // with their reason, retried after unlock (detector stubbed behind armd's operator check). Lock goes back to
-// program on the same socket. PNGs to OUT (default .cache/operator-shots/). Exits non-zero if a check fails.
+// program on the same socket. First, the header at 360 / 375 / 390 / 414 / 430 px, expert and simple, zh and en, with
+// the operator chip, with a live task button, and with auth off: no horizontal scroll, every header control and the
+// E-stop is the element at its centre. PNGs to OUT (default .cache/operator-shots/). Exits non-zero if a check fails.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,6 +43,46 @@ async function dialogInside(page) {
     const H = vv ? vv.height : innerHeight;
     return r.left >= 0 && r.right <= innerWidth + 0.5 && r.top >= -0.5 && r.bottom <= H + 0.5 && r.width > 200;
   });
+}
+
+// 0. header on phones (360-430 px), expert and simple, zh and en, with auth enforced (operator chip shown), auth
+// enforced with a live task button, and auth off (chip hidden in the page): no horizontal scroll, and every header
+// control and the E-stop is the element at its own centre
+const headerFit = (page) => page.evaluate(() => {
+  const ctl = [...document.querySelectorAll('.topbar button')].filter((b) => {
+    const r = b.getBoundingClientRect(), cs = getComputedStyle(b);
+    return !b.closest('[hidden]') && r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  });
+  const es = document.getElementById('btn-estop'); es.scrollIntoView({ block: 'center' });
+  const covered = [...ctl, es].map((b) => {
+    const r = b.getBoundingClientRect(), h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return { id: b.id || b.dataset.ui, ok: !!h && (h === b || b.contains(h)) && r.left >= 0 && r.right <= innerWidth + 0.5, hit: h ? (h.id || h.className || h.tagName) : null };
+  }).filter((x) => !x.ok);
+  window.scrollTo(0, 0);
+  return { sw: document.scrollingElement.scrollWidth, iw: innerWidth, ids: ctl.map((b) => b.id || b.dataset.ui), covered };
+});
+await lockServer();
+for (const ui of ['expert', 'simple']) for (const lang of ['zh', 'en']) for (const w of [360, 375, 390, 414, 430]) {
+  const name = `header_${ui}_${lang}_${w}`;
+  const ctx = await browser.newContext({ viewport: { width: w, height: 812 }, deviceScaleFactor: 1, hasTouch: true });
+  await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang);
+  const page = await ctx.newPage();
+  page.on('pageerror', (e) => { console.log('  pageerror ' + e.message); ok(false, name + ' pageerror'); });
+  await page.goto(base + '?ui=' + ui, { waitUntil: 'domcontentloaded' });
+  ok(await waitFor(page, () => S.obs && S.dof > 0 && S.auth.enforced && !$('btn-op').hidden, null, 15000), name + ' auth enforced, operator chip shown');
+  await page.waitForTimeout(300);
+  for (const variant of ['auth', 'auth_task', 'noauth']) {
+    if (variant === 'auth_task') await page.evaluate(() => { const b = $('btn-task'); b.hidden = false; b.classList.add('is-live'); });
+    if (variant === 'noauth') await page.evaluate(() => { const b = $('btn-task'); b.classList.remove('is-live'); S.auth.enforced = false; renderOpBadge(); });
+    await page.waitForTimeout(150);
+    const h = await headerFit(page);
+    const need = ['btn-lang', ...(variant === 'noauth' ? [] : ['btn-op'])];
+    ok(h.sw <= h.iw, `${name} ${variant} no horizontal scroll (${h.sw} > ${h.iw})`);
+    ok(need.every((id) => h.ids.includes(id)) && !h.covered.length, `${name} ${variant} header controls and E-stop reachable ${JSON.stringify(h)}`);
+    if (variant === 'auth' && (w === 375 || w === 360)) await page.screenshot({ path: path.join(out, `${name}.png`), clip: { x: 0, y: 0, width: w, height: 160 } });
+  }
+  console.log(`${name}: header ok`);
+  await ctx.close();
 }
 
 for (const lang of ['zh', 'en']) {
