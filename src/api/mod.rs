@@ -221,6 +221,7 @@ pub fn create_router_full_with_sandbox(
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/api/v1/sandbox/policies/{id}/files/{*path}", get(sandbox::serve_policy_file))
+        .route("/api/v1/sandbox/base-assets/{*path}", get(sandbox::serve_base_asset))
         .route("/api/v1/sandbox/activate", post(sandbox::activate).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/sandbox/bundle", get(sandbox::get_bundle))
         .route("/api/v1/sandbox/state", get(sandbox::get_state))

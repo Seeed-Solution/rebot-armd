@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Extension, Path as UrlPath},
+    extract::{Extension, Path as UrlPath, Query, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -187,21 +187,400 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 
+pub const SO_ARM101_BASE_XML: &str = include_str!("../../sim/mujoco/models/so_arm101_scene.xml");
+
+struct BuiltinSceneSpec {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    robots: &'static [&'static str],
+    default_tool: &'static str,
+    recommended_tools: &'static [&'static str],
+    is_virtual: bool,
+}
+
+const BUILTIN_SCENE_SPECS: &[BuiltinSceneSpec] = &[
+    BuiltinSceneSpec {
+        id: "default",
+        name: "Default Worktable Scene",
+        description: "Standard worktable with interactive red cube.",
+        robots: &["b601dm", "so-arm101"],
+        default_tool: "default",
+        recommended_tools: &["default"],
+        is_virtual: true,
+    },
+    BuiltinSceneSpec {
+        id: "coffee_kiosk",
+        name: "Mobile Coffee Kiosk",
+        description: "4-stage coffee workflow: detect/grasp cup, place under spout avoiding espresso column, press spring brew button, serve at pickup counter.",
+        robots: &["b601dm"],
+        default_tool: "default",
+        recommended_tools: &["default", "wide_cup_gripper"],
+        is_virtual: false,
+    },
+    BuiltinSceneSpec {
+        id: "pcb_suction",
+        name: "PCB Pick-and-Place & Test Cell",
+        description: "3-stage PCB workflow with suction end-effector: vacuum-pick PCB from infeed tray over divider wall, place on test fixture, then transfer to outfeed bin.",
+        robots: &["b601dm"],
+        default_tool: "suction",
+        recommended_tools: &["suction", "default"],
+        is_virtual: false,
+    },
+    BuiltinSceneSpec {
+        id: "pcb_inspection",
+        name: "PCB AOI & Sorting Cell",
+        description: "4-stage AOI continuity test fixture and Pass/NG sorting cell with dual bins and divider keepouts.",
+        robots: &["b601dm"],
+        default_tool: "suction",
+        recommended_tools: &["suction", "screwdriver", "default"],
+        is_virtual: false,
+    },
+    BuiltinSceneSpec {
+        id: "screw_fastening",
+        name: "Aluminum Assembly & Screw Fastening Cell",
+        description: "2-point automated M3 screw fastening workflow with electric screwdriver: align bit with M3 screw targets on aluminum assembly carrier and fasten with torque feedback.",
+        robots: &["b601dm"],
+        default_tool: "screwdriver",
+        recommended_tools: &["screwdriver", "default"],
+        is_virtual: false,
+    },
+    BuiltinSceneSpec {
+        id: "lab_desktop",
+        name: "Laboratory Desktop Pick & Place",
+        description: "SO-ARM101 table sorting cell: pick cube from feeder tray and place into sorting bin with obstacle avoidance.",
+        robots: &["so-arm101"],
+        default_tool: "default",
+        recommended_tools: &["default"],
+        is_virtual: false,
+    },
+];
+
+fn builtin_scene_spec(id: &str) -> Option<&'static BuiltinSceneSpec> {
+    BUILTIN_SCENE_SPECS.iter().find(|s| s.id == id)
+}
+
+/// Normalize a robot/profile identifier to its canonical sandbox robot ID
+/// (`"b601dm"`, `"so-arm101"`, etc.).
+pub fn normalize_robot_id(raw: &str) -> Option<String> {
+    let norm = raw.trim().to_ascii_lowercase();
+    if norm.is_empty() {
+        return None;
+    }
+    let collapsed = norm.replace('_', "-");
+    match collapsed.as_str() {
+        "b601dm" | "b601-dm" | "rebot-dm" | "rebot-b601dm" | "rebot-b601-dm" => {
+            Some("b601dm".to_string())
+        }
+        "so-arm101" | "soarm101" | "so101" | "so-101" => Some("so-arm101".to_string()),
+        _ => Some(collapsed),
+    }
+}
+
 pub fn is_reserved_builtin_id(kind: &str, id: &str) -> bool {
     if id == "default" {
         return true;
     }
     match kind {
-        "scene" => matches!(id, "coffee_kiosk" | "pcb_suction"),
-        "tool" => matches!(id, "wide_cup_gripper" | "suction" | "screwdriver"),
+        "scene" => BUILTIN_SCENE_SPECS.iter().any(|s| s.id == id),
+        "tool" => BUILTIN_TOOL_SPECS.iter().any(|t| t.id == id),
         _ => false,
     }
+}
+
+struct BuiltinToolSpec {
+    id: &'static str,
+    name: &'static str,
+    kind: &'static str,
+    description: &'static str,
+    robots: &'static [&'static str],
+    is_virtual: bool,
+}
+
+const BUILTIN_TOOL_SPECS: &[BuiltinToolSpec] = &[
+    BuiltinToolSpec {
+        id: "default",
+        name: "Stock Parallel Jaw Gripper",
+        kind: "gripper",
+        description: "Factory parallel gripper shipped with B601-DM or SO-ARM101.",
+        robots: &["b601dm", "so-arm101"],
+        is_virtual: true,
+    },
+    BuiltinToolSpec {
+        id: "wide_cup_gripper",
+        name: "Wide Silicone Cup Gripper",
+        kind: "gripper",
+        description: "Tall high-friction silicone parallel jaws tuned for 48 mm paper coffee cups.",
+        robots: &["b601dm"],
+        is_virtual: false,
+    },
+    BuiltinToolSpec {
+        id: "suction",
+        name: "Vacuum Suction End-Effector",
+        kind: "suction",
+        description: "Flat vacuum cup with runtime mjEQ_WELD suction controlled via /sim/io {vacuum: true|false}.",
+        robots: &["b601dm"],
+        is_virtual: false,
+    },
+    BuiltinToolSpec {
+        id: "screwdriver",
+        name: "Spindle Electric Screwdriver",
+        kind: "screwdriver",
+        description: "Rotating electric screwdriver spindle controlled via /sim/io {spindle_rpm: ...}.",
+        robots: &["b601dm"],
+        is_virtual: false,
+    },
+];
+
+fn builtin_tool_spec(id: &str) -> Option<&'static BuiltinToolSpec> {
+    BUILTIN_TOOL_SPECS.iter().find(|t| t.id == id)
+}
+
+#[derive(Debug)]
+enum PackFileError {
+    UnsafePath(String),
+    SymlinkEscape(String),
+    Missing(String),
+    InvalidFormat(String),
+}
+
+impl PackFileError {
+    fn into_http_error(self, missing_code: &str, context: &str) -> (StatusCode, Json<serde_json::Value>) {
+        match self {
+            PackFileError::UnsafePath(msg) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("{context}: {msg}"),
+                    "code": "INVALID_PATH",
+                })),
+            ),
+            PackFileError::SymlinkEscape(msg) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("{context}: {msg}"),
+                    "code": "PATH_ESCAPE",
+                })),
+            ),
+            PackFileError::InvalidFormat(msg) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("{context}: {msg}"),
+                    "code": "INVALID_MANIFEST",
+                })),
+            ),
+            PackFileError::Missing(msg) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("{context}: {msg}"),
+                    "code": missing_code,
+                })),
+            ),
+        }
+    }
+}
+
+fn check_safe_pack_dir(allowed_root: &Path, pack_dir: &Path) -> Result<PathBuf, PackFileError> {
+    let canon_allowed = allowed_root
+        .canonicalize()
+        .map_err(|_| PackFileError::Missing(format!("root '{}' not found", allowed_root.display())))?;
+    if std::fs::symlink_metadata(pack_dir).is_err() {
+        return Err(PackFileError::Missing(format!(
+            "pack directory '{}' not found",
+            pack_dir.display()
+        )));
+    }
+    let canon_dir = pack_dir.canonicalize().map_err(|_| {
+        PackFileError::SymlinkEscape(format!(
+            "pack directory '{}' cannot be resolved safely",
+            pack_dir.display()
+        ))
+    })?;
+    if !canon_dir.starts_with(&canon_allowed) {
+        return Err(PackFileError::SymlinkEscape(format!(
+            "pack directory '{}' escapes allowed root '{}'",
+            pack_dir.display(),
+            allowed_root.display()
+        )));
+    }
+    if !canon_dir.is_dir() {
+        return Err(PackFileError::Missing(format!(
+            "pack path '{}' is not a directory",
+            pack_dir.display()
+        )));
+    }
+    Ok(canon_dir)
+}
+
+fn check_safe_pack_file(canon_pack_dir: &Path, rel: &str) -> Result<PathBuf, PackFileError> {
+    if !is_safe_relative_path(rel) {
+        return Err(PackFileError::UnsafePath(format!(
+            "unsafe relative path '{rel}'"
+        )));
+    }
+    let candidate = canon_pack_dir.join(rel);
+    if std::fs::symlink_metadata(&candidate).is_err() {
+        return Err(PackFileError::Missing(format!("missing file '{rel}'")));
+    }
+    let canon_file = candidate.canonicalize().map_err(|_| {
+        PackFileError::SymlinkEscape(format!("file '{rel}' resolves to an invalid or broken target"))
+    })?;
+    if !canon_file.starts_with(canon_pack_dir) {
+        return Err(PackFileError::SymlinkEscape(format!(
+            "file '{rel}' escapes pack directory via symlink"
+        )));
+    }
+    if !canon_file.is_file() {
+        return Err(PackFileError::Missing(format!("'{rel}' is not a regular file")));
+    }
+    Ok(canon_file)
+}
+
+fn read_safe_pack_file(canon_pack_dir: &Path, rel: &str) -> Result<String, PackFileError> {
+    let path = check_safe_pack_file(canon_pack_dir, rel)?;
+    std::fs::read_to_string(&path)
+        .map_err(|e| PackFileError::Missing(format!("cannot read '{rel}': {e}")))
+}
+
+fn asset_entry_rel_path(entry: &serde_json::Value) -> Result<&str, PackFileError> {
+    match entry {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Err(PackFileError::InvalidFormat("empty asset path string".into()))
+            } else {
+                Ok(trimmed)
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["path", "target", "filename"] {
+                if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(trimmed);
+                    }
+                }
+            }
+            Err(PackFileError::InvalidFormat(
+                "asset entry object missing non-empty 'path', 'target', or 'filename'".into(),
+            ))
+        }
+        _ => Err(PackFileError::InvalidFormat(
+            "asset entry must be a relative path string or object".into(),
+        )),
+    }
+}
+
+fn is_optional_asset(entry: &serde_json::Value) -> bool {
+    entry.get("required").and_then(|v| v.as_bool()) == Some(false)
+}
+
+fn verify_pack_assets(canon_pack_dir: &Path, assets: &[serde_json::Value]) -> Result<(), PackFileError> {
+    for entry in assets {
+        let rel = asset_entry_rel_path(entry)?;
+        match check_safe_pack_file(canon_pack_dir, rel) {
+            Ok(_) => {}
+            Err(PackFileError::Missing(_)) if is_optional_asset(entry) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn normalize_manifest_assets(
+    canon_pack_dir: Option<&Path>,
+    assets: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(assets.len());
+    for entry in assets {
+        let Ok(rel) = asset_entry_rel_path(&entry).map(|s| s.to_string()) else {
+            continue;
+        };
+        if let Some(dir) = canon_pack_dir {
+            if check_safe_pack_file(dir, &rel).is_err() {
+                // Skip absent optional assets (and anything unsafe/missing on disk).
+                continue;
+            }
+        }
+        match entry {
+            serde_json::Value::Object(mut map) => {
+                map.insert("path".to_string(), serde_json::Value::String(rel));
+                out.push(serde_json::Value::Object(map));
+            }
+            serde_json::Value::String(_) => {
+                out.push(serde_json::json!({ "path": rel }));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn clamp_builtin_robots(manifest_robots: &[String], authoritative: &[&str]) -> Vec<String> {
+    let allowed: Vec<String> = authoritative.iter().map(|r| (*r).to_string()).collect();
+    if manifest_robots.is_empty() {
+        return allowed;
+    }
+    let mut filtered = Vec::new();
+    for r in manifest_robots {
+        if let Some(norm) = normalize_robot_id(r) {
+            if allowed.iter().any(|a| a == &norm) && !filtered.contains(&norm) {
+                filtered.push(norm);
+            }
+        }
+    }
+    filtered
+}
+
+fn collect_pack_files(canon_pack_dir: &Path) -> Vec<String> {
+    fn walk(
+        base: &Path,
+        cur: &Path,
+        visited: &mut std::collections::HashSet<PathBuf>,
+        out: &mut Vec<String>,
+    ) {
+        if !visited.insert(cur.to_path_buf()) {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(cur) {
+            for e in entries.flatten() {
+                let path = e.path();
+                let name = e.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                if let Ok(canon) = path.canonicalize() {
+                    if !canon.starts_with(base) {
+                        continue;
+                    }
+                    if canon.is_dir() {
+                        walk(base, &canon, visited, out);
+                    } else if canon.is_file() {
+                        if let Ok(rel) = canon.strip_prefix(base) {
+                            let rel_str = rel.to_string_lossy().replace('\\', "/");
+                            if is_safe_relative_path(&rel_str) {
+                                out.push(rel_str);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    walk(canon_pack_dir, canon_pack_dir, &mut visited, &mut files);
+    files.sort();
+    files.dedup();
+    files
 }
 
 pub fn search_builtin_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(p) = std::env::var("ARMD_BUILTIN_SCENES_DIR") {
-        roots.push(PathBuf::from(p));
+        if !p.trim().is_empty() {
+            roots.push(PathBuf::from(p));
+        }
     }
     roots.push(PathBuf::from("../rebot-companion/rebot_companion/scenes/builtin"));
     roots.push(PathBuf::from("rebot_companion/scenes/builtin"));
@@ -209,7 +588,48 @@ pub fn search_builtin_roots() -> Vec<PathBuf> {
     roots
 }
 
-pub fn load_builtin_scene(id: &str) -> Option<(SceneManifest, String)> {
+fn find_valid_builtin_scene_dir(
+    id: &str,
+    roots: &[PathBuf],
+) -> (bool, Option<(PathBuf, PathBuf, SceneManifest, String)>) {
+    let spec = builtin_scene_spec(id);
+    let mut saw_disk_manifest = false;
+
+    for root in roots {
+        let scene_dir = root.join("scenes").join(id);
+        if scene_dir.join("scene.json").exists() {
+            saw_disk_manifest = true;
+        }
+        let Ok(canon_dir) = check_safe_pack_dir(root, &scene_dir) else {
+            continue;
+        };
+        let Ok(raw_json) = read_safe_pack_file(&canon_dir, "scene.json") else {
+            continue;
+        };
+        let Ok(mut manifest) = serde_json::from_str::<SceneManifest>(&raw_json) else {
+            continue;
+        };
+        let Ok(world_xml) = read_safe_pack_file(&canon_dir, &manifest.world_xml) else {
+            continue;
+        };
+        if validate_xml_security(&world_xml, Some("worldbody")).is_err() {
+            continue;
+        }
+        if verify_pack_assets(&canon_dir, &manifest.assets).is_err() {
+            continue;
+        }
+        if let Some(s) = spec {
+            manifest.id = s.id.to_string();
+            manifest.robots = clamp_builtin_robots(&manifest.robots, s.robots);
+        } else if manifest.id.is_empty() {
+            manifest.id = id.to_string();
+        }
+        return (saw_disk_manifest, Some((root.clone(), canon_dir, manifest, world_xml)));
+    }
+    (saw_disk_manifest, None)
+}
+
+pub fn load_builtin_scene_in_roots(id: &str, roots: &[PathBuf]) -> Option<(SceneManifest, String)> {
     if !validate_pack_id(id) {
         return None;
     }
@@ -242,23 +662,13 @@ pub fn load_builtin_scene(id: &str) -> Option<(SceneManifest, String)> {
         return Some((manifest, "".into()));
     }
 
-    // Check on-disk builtin scenes directory first so full scene manifests (e.g., coffee_kiosk, pcb_suction) stay authoritative.
-    for root in search_builtin_roots() {
-        let scene_dir = root.join("scenes").join(id);
-        let scene_json_path = scene_dir.join("scene.json");
-        if scene_json_path.is_file() {
-            if let Ok(raw_json) = std::fs::read_to_string(&scene_json_path) {
-                if let Ok(manifest) = serde_json::from_str::<SceneManifest>(&raw_json) {
-                    let world_path = scene_dir.join(&manifest.world_xml);
-                    if let Ok(world_xml) = std::fs::read_to_string(&world_path) {
-                        return Some((manifest, world_xml));
-                    }
-                }
-            }
-        }
+    // Check on-disk builtin scenes directory first so full scene manifests stay authoritative.
+    let (saw_disk_manifest, found) = find_valid_builtin_scene_dir(id, roots);
+    if let Some((_, _, manifest, world_xml)) = found {
+        return Some((manifest, world_xml));
     }
 
-    if id == "pcb_suction" {
+    if id == "pcb_suction" && !saw_disk_manifest {
         let manifest = SceneManifest {
             id: "pcb_suction".into(),
             name: "PCB Pick-and-Place & Test Cell".into(),
@@ -321,29 +731,75 @@ pub fn load_builtin_scene(id: &str) -> Option<(SceneManifest, String)> {
     None
 }
 
-pub fn load_builtin_tool(id: &str) -> Option<(ToolManifest, String)> {
-    if !validate_pack_id(id) { return None; }
-    if let Some((manifest, xml)) = builtin_tool_preset(id) {
-        return Some((manifest, xml.into()));
+pub fn load_builtin_scene(id: &str) -> Option<(SceneManifest, String)> {
+    load_builtin_scene_in_roots(id, &search_builtin_roots())
+}
+
+fn find_valid_builtin_tool_dir(
+    id: &str,
+    roots: &[PathBuf],
+) -> (bool, Option<(PathBuf, PathBuf, ToolManifest, String)>) {
+    let spec = builtin_tool_spec(id);
+    let mut saw_disk_manifest = false;
+
+    for root in roots {
+        let tool_dir = root.join("tools").join(id);
+        if tool_dir.join("tool.json").exists() {
+            saw_disk_manifest = true;
+        }
+        let Ok(canon_dir) = check_safe_pack_dir(root, &tool_dir) else {
+            continue;
+        };
+        let Ok(raw_json) = read_safe_pack_file(&canon_dir, "tool.json") else {
+            continue;
+        };
+        let Ok(mut manifest) = serde_json::from_str::<ToolManifest>(&raw_json) else {
+            continue;
+        };
+        let Ok(tool_xml) = read_safe_pack_file(&canon_dir, &manifest.tool_xml) else {
+            continue;
+        };
+        if validate_xml_security(&tool_xml, None).is_err() {
+            continue;
+        }
+        if verify_pack_assets(&canon_dir, &manifest.assets).is_err() {
+            continue;
+        }
+        if let Some(s) = spec {
+            manifest.id = s.id.to_string();
+            manifest.robots = clamp_builtin_robots(&manifest.robots, s.robots);
+        } else if manifest.id.is_empty() {
+            manifest.id = id.to_string();
+        }
+        return (saw_disk_manifest, Some((root.clone(), canon_dir, manifest, tool_xml)));
+    }
+    (saw_disk_manifest, None)
+}
+
+pub fn load_builtin_tool_in_roots(id: &str, roots: &[PathBuf]) -> Option<(ToolManifest, String)> {
+    if !validate_pack_id(id) || !is_reserved_builtin_id("tool", id) {
+        return None;
+    }
+    if id == "default" {
+        return builtin_tool_preset("default").map(|(m, xml)| (m, xml.into()));
     }
 
-    // Try finding directory under search roots
-    for root in search_builtin_roots() {
-        let tool_dir = root.join("tools").join(id);
-        let tool_json_path = tool_dir.join("tool.json");
-        if tool_json_path.is_file() {
-            if let Ok(raw_json) = std::fs::read_to_string(&tool_json_path) {
-                if let Ok(manifest) = serde_json::from_str::<ToolManifest>(&raw_json) {
-                    let tool_path = tool_dir.join(&manifest.tool_xml);
-                    if let Ok(tool_xml) = std::fs::read_to_string(&tool_path) {
-                        return Some((manifest, tool_xml));
-                    }
-                }
-            }
+    let (saw_disk_manifest, found) = find_valid_builtin_tool_dir(id, roots);
+    if let Some((_, _, manifest, tool_xml)) = found {
+        return Some((manifest, tool_xml));
+    }
+
+    if !saw_disk_manifest {
+        if let Some((manifest, xml)) = builtin_tool_preset(id) {
+            return Some((manifest, xml.into()));
         }
     }
 
     None
+}
+
+pub fn load_builtin_tool(id: &str) -> Option<(ToolManifest, String)> {
+    load_builtin_tool_in_roots(id, &search_builtin_roots())
 }
 
 pub fn get_base_robot_xml() -> String {
@@ -356,6 +812,33 @@ pub fn get_base_robot_xml() -> String {
         return content;
     }
     FALLBACK_BASE_XML.to_string()
+}
+
+/// Select the base MuJoCo robot XML for the specified canonical robot ID.
+/// Refuses to silently fall back to B601 XML for any non-B601 robot.
+pub fn get_base_robot_xml_for_robot(robot: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    match normalize_robot_id(robot).as_deref() {
+        Some("b601dm") => Ok(get_base_robot_xml()),
+        Some("so-arm101") => {
+            if let Ok(path) = std::env::var("ARMD_SANDBOX_SO_ARM101_BASE_XML") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    return Ok(content);
+                }
+            }
+            if let Ok(content) = std::fs::read_to_string("./sim/mujoco/models/so_arm101_scene.xml") {
+                return Ok(content);
+            }
+            Ok(SO_ARM101_BASE_XML.to_string())
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("No base robot MJCF model for robot '{robot}'; refusing to fall back to B601"),
+                "code": "ROBOT_INCOMPATIBLE",
+                "robot": robot,
+            })),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +870,8 @@ pub struct ActiveState {
     #[serde(default)]
     pub telemetry: Option<serde_json::Value>,
     pub updated_at_ms: u64,
+    #[serde(skip)]
+    pub cached_mjcf: String,
 }
 
 impl Default for ActiveState {
@@ -406,6 +891,7 @@ impl Default for ActiveState {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            cached_mjcf: String::new(),
         }
     }
 }
@@ -413,7 +899,8 @@ impl Default for ActiveState {
 pub struct SandboxState {
     pub root: PathBuf,
     pub active: RwLock<ActiveState>,
-    pub cached_mjcf: RwLock<String>,
+    pub activate_lock: tokio::sync::Mutex<()>,
+    builtin_roots: Option<Vec<PathBuf>>,
     #[cfg(feature = "policy-runtime")]
     policy_load_delay_ms: AtomicU64,
     #[cfg(feature = "policy-runtime")]
@@ -436,12 +923,41 @@ impl SandboxState {
         Self {
             root,
             active: RwLock::new(active),
-            cached_mjcf: RwLock::new(String::new()),
+            activate_lock: tokio::sync::Mutex::new(()),
+            builtin_roots: None,
             #[cfg(feature = "policy-runtime")]
             policy_load_delay_ms: AtomicU64::new(0),
             #[cfg(feature = "policy-runtime")]
             policy_infer_delay_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Override builtin scene/tool search roots (useful in tests without mutating env vars).
+    pub fn with_builtin_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.builtin_roots = Some(roots);
+        self
+    }
+
+    fn effective_builtin_roots(&self) -> Vec<PathBuf> {
+        self.builtin_roots.clone().unwrap_or_else(search_builtin_roots)
+    }
+
+    /// Returns the user scene directory path if a directory on disk collides with a reserved builtin scene ID.
+    pub fn user_scene_conflict(&self, id: &str) -> Option<PathBuf> {
+        if !is_reserved_builtin_id("scene", id) {
+            return None;
+        }
+        let dir = self.root.join("scenes").join(id);
+        std::fs::symlink_metadata(&dir).is_ok().then_some(dir)
+    }
+
+    /// Returns the user tool directory path if a directory on disk collides with a reserved builtin tool ID.
+    pub fn user_tool_conflict(&self, id: &str) -> Option<PathBuf> {
+        if !is_reserved_builtin_id("tool", id) {
+            return None;
+        }
+        let dir = self.root.join("tools").join(id);
+        std::fs::symlink_metadata(&dir).is_ok().then_some(dir)
     }
 
     #[cfg(feature = "policy-runtime")]
@@ -497,53 +1013,286 @@ impl SandboxState {
         }
     }
 
+    fn load_user_scene_checked(
+        &self,
+        id: &str,
+        check_assets: bool,
+    ) -> Result<(PathBuf, SceneManifest, String), PackFileError> {
+        let scenes_root = self.root.join("scenes");
+        let dir = scenes_root.join(id);
+        let canon_dir = check_safe_pack_dir(&scenes_root, &dir)?;
+        let manifest_str = read_safe_pack_file(&canon_dir, "scene.json")?;
+        let mut manifest: SceneManifest = serde_json::from_str(&manifest_str)
+            .map_err(|e| PackFileError::InvalidFormat(format!("invalid scene.json: {e}")))?;
+        manifest.id = id.to_string();
+        let world_xml = read_safe_pack_file(&canon_dir, &manifest.world_xml)?;
+        validate_xml_security(&world_xml, Some("worldbody"))
+            .map_err(PackFileError::InvalidFormat)?;
+        if check_assets {
+            verify_pack_assets(&canon_dir, &manifest.assets)?;
+        }
+        Ok((canon_dir, manifest, world_xml))
+    }
+
+    fn load_user_tool_checked(
+        &self,
+        id: &str,
+        check_assets: bool,
+    ) -> Result<(PathBuf, ToolManifest, String), PackFileError> {
+        let tools_root = self.root.join("tools");
+        let dir = tools_root.join(id);
+        let canon_dir = check_safe_pack_dir(&tools_root, &dir)?;
+        let manifest_str = read_safe_pack_file(&canon_dir, "tool.json")?;
+        let mut manifest: ToolManifest = serde_json::from_str(&manifest_str)
+            .map_err(|e| PackFileError::InvalidFormat(format!("invalid tool.json: {e}")))?;
+        manifest.id = id.to_string();
+        let tool_xml = read_safe_pack_file(&canon_dir, &manifest.tool_xml)?;
+        validate_xml_security(&tool_xml, None)
+            .map_err(PackFileError::InvalidFormat)?;
+        if check_assets {
+            verify_pack_assets(&canon_dir, &manifest.assets)?;
+        }
+        Ok((canon_dir, manifest, tool_xml))
+    }
+
     pub fn resolve_scene(&self, id: &str) -> Option<(SceneManifest, String)> {
         if !validate_pack_id(id) {
             return None;
         }
-        if let Some(builtin) = load_builtin_scene(id) {
-            return Some(builtin);
+        if let Some(conflict_dir) = self.user_scene_conflict(id) {
+            tracing::error!(
+                "User scene directory '{}' conflicts with reserved builtin scene '{}'; refusing to load or override",
+                conflict_dir.display(),
+                id
+            );
+            return None;
         }
-        let dir = self.root.join("scenes").join(id);
-        let manifest_path = dir.join("scene.json");
-        let manifest_str = std::fs::read_to_string(&manifest_path).ok()?;
-        let manifest: SceneManifest = serde_json::from_str(&manifest_str).ok()?;
-        let world_path = dir.join(&manifest.world_xml);
-        let world_xml = std::fs::read_to_string(&world_path).ok()?;
+        if is_reserved_builtin_id("scene", id) {
+            return load_builtin_scene_in_roots(id, &self.effective_builtin_roots());
+        }
+        let (_, manifest, world_xml) = self.load_user_scene_checked(id, true).ok()?;
         Some((manifest, world_xml))
+    }
+
+    fn resolve_scene_checked_with_dir(
+        &self,
+        id: &str,
+    ) -> Result<(Option<PathBuf>, SceneManifest, String), (StatusCode, Json<serde_json::Value>)> {
+        if !validate_pack_id(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid scene pack id '{id}'"),
+                    "code": "INVALID_ID",
+                })),
+            ));
+        }
+        if let Some(conflict_dir) = self.user_scene_conflict(id) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "User scene directory '{}' conflicts with reserved builtin scene '{}'; remove or rename the user directory",
+                        conflict_dir.display(),
+                        id
+                    ),
+                    "code": "BUILTIN_ID_CONFLICT",
+                    "scene_id": id,
+                    "conflict_path": conflict_dir.to_string_lossy(),
+                })),
+            ));
+        }
+        if is_reserved_builtin_id("scene", id) {
+            let roots = self.effective_builtin_roots();
+            if id != "default" {
+                if let (_, Some((_, canon_dir, manifest, world_xml))) =
+                    find_valid_builtin_scene_dir(id, &roots)
+                {
+                    return Ok((Some(canon_dir), manifest, world_xml));
+                }
+            }
+            return load_builtin_scene_in_roots(id, &roots)
+                .map(|(m, w)| (None, m, w))
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": format!("Builtin scene '{id}' has no installed valid assets"),
+                            "code": "SCENE_NOT_INSTALLED",
+                            "scene_id": id,
+                        })),
+                    )
+                });
+        }
+        let (canon_dir, manifest, world_xml) = self
+            .load_user_scene_checked(id, true)
+            .map_err(|e| e.into_http_error("SCENE_NOT_FOUND", &format!("Scene pack '{id}'")))?;
+        Ok((Some(canon_dir), manifest, world_xml))
+    }
+
+    pub fn resolve_scene_checked(
+        &self,
+        id: &str,
+    ) -> Result<(SceneManifest, String), (StatusCode, Json<serde_json::Value>)> {
+        let (_, manifest, world_xml) = self.resolve_scene_checked_with_dir(id)?;
+        Ok((manifest, world_xml))
     }
 
     pub fn resolve_tool(&self, id: &str) -> Option<(ToolManifest, String)> {
         if !validate_pack_id(id) {
             return None;
         }
-        if let Some(builtin) = load_builtin_tool(id) {
-            return Some(builtin);
+        if let Some(conflict_dir) = self.user_tool_conflict(id) {
+            tracing::error!(
+                "User tool directory '{}' conflicts with reserved builtin tool '{}'; refusing to load or override",
+                conflict_dir.display(),
+                id
+            );
+            return None;
         }
-        let dir = self.root.join("tools").join(id);
-        let manifest_path = dir.join("tool.json");
-        let manifest_str = std::fs::read_to_string(&manifest_path).ok()?;
-        let manifest: ToolManifest = serde_json::from_str(&manifest_str).ok()?;
-        let tool_path = dir.join(&manifest.tool_xml);
-        let tool_xml = std::fs::read_to_string(&tool_path).ok()?;
+        if is_reserved_builtin_id("tool", id) {
+            return load_builtin_tool_in_roots(id, &self.effective_builtin_roots());
+        }
+        let (_, manifest, tool_xml) = self.load_user_tool_checked(id, true).ok()?;
         Some((manifest, tool_xml))
     }
 
-    pub fn resolve_policy(&self, id: &str) -> Option<PolicyManifest> {
+    fn resolve_tool_checked_with_dir(
+        &self,
+        id: &str,
+    ) -> Result<(Option<PathBuf>, ToolManifest, String), (StatusCode, Json<serde_json::Value>)> {
         if !validate_pack_id(id) {
-            return None;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid tool pack id '{id}'"),
+                    "code": "INVALID_ID",
+                })),
+            ));
         }
-        let dir = self.root.join("policies").join(id);
-        let manifest_path = dir.join("policy.json");
-        let manifest_str = std::fs::read_to_string(&manifest_path).ok()?;
-        let mut m: PolicyManifest = serde_json::from_str(&manifest_str).ok()?;
+        if let Some(conflict_dir) = self.user_tool_conflict(id) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "User tool directory '{}' conflicts with reserved builtin tool '{}'; remove or rename the user directory",
+                        conflict_dir.display(),
+                        id
+                    ),
+                    "code": "BUILTIN_ID_CONFLICT",
+                    "tool_id": id,
+                    "conflict_path": conflict_dir.to_string_lossy(),
+                })),
+            ));
+        }
+        if is_reserved_builtin_id("tool", id) {
+            let roots = self.effective_builtin_roots();
+            if id != "default" {
+                if let (_, Some((_, canon_dir, manifest, tool_xml))) =
+                    find_valid_builtin_tool_dir(id, &roots)
+                {
+                    return Ok((Some(canon_dir), manifest, tool_xml));
+                }
+            }
+            return load_builtin_tool_in_roots(id, &roots)
+                .map(|(m, w)| (None, m, w))
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": format!("Builtin tool '{id}' has no installed valid assets"),
+                            "code": "TOOL_NOT_INSTALLED",
+                            "tool_id": id,
+                        })),
+                    )
+                });
+        }
+        let (canon_dir, manifest, tool_xml) = self
+            .load_user_tool_checked(id, true)
+            .map_err(|e| e.into_http_error("TOOL_NOT_FOUND", &format!("Tool pack '{id}'")))?;
+        Ok((Some(canon_dir), manifest, tool_xml))
+    }
+
+    pub fn resolve_tool_checked(
+        &self,
+        id: &str,
+    ) -> Result<(ToolManifest, String), (StatusCode, Json<serde_json::Value>)> {
+        let (_, manifest, tool_xml) = self.resolve_tool_checked_with_dir(id)?;
+        Ok((manifest, tool_xml))
+    }
+
+    fn resolve_policy_checked(
+        &self,
+        id: &str,
+        missing_status: StatusCode,
+        missing_code: &str,
+    ) -> Result<PolicyManifest, (StatusCode, Json<serde_json::Value>)> {
+        if !validate_pack_id(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid policy pack id '{id}'"),
+                    "code": "INVALID_ID",
+                })),
+            ));
+        }
+        let policies_root = self.root.join("policies");
+        let dir = policies_root.join(id);
+        let canon_dir = check_safe_pack_dir(&policies_root, &dir).map_err(|e| match e {
+            PackFileError::Missing(msg) => (
+                missing_status,
+                Json(serde_json::json!({
+                    "error": format!("Policy pack '{id}': {msg}"),
+                    "code": missing_code,
+                    "policy_id": id,
+                })),
+            ),
+            other => other.into_http_error(missing_code, &format!("Policy pack '{id}'")),
+        })?;
+        let manifest_str = read_safe_pack_file(&canon_dir, "policy.json").map_err(|e| match e {
+            PackFileError::Missing(msg) => (
+                missing_status,
+                Json(serde_json::json!({
+                    "error": format!("Policy pack '{id}': {msg}"),
+                    "code": missing_code,
+                    "policy_id": id,
+                })),
+            ),
+            other => other.into_http_error(missing_code, &format!("Policy pack '{id}'")),
+        })?;
+        let mut m: PolicyManifest = serde_json::from_str(&manifest_str).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Policy pack '{id}' has invalid policy.json: {e}"),
+                    "code": "INVALID_POLICY_MANIFEST",
+                    "policy_id": id,
+                })),
+            )
+        })?;
         if m.id.is_empty() {
             m.id = id.to_string();
         }
         if m.name.is_empty() {
             m.name = id.to_string();
         }
-        Some(m)
+        check_safe_pack_file(&canon_dir, &m.model_file).map_err(|e| match e {
+            PackFileError::Missing(msg) => (
+                missing_status,
+                Json(serde_json::json!({
+                    "error": format!("Policy pack '{id}' missing model file: {msg}"),
+                    "code": missing_code,
+                    "policy_id": id,
+                })),
+            ),
+            other => other.into_http_error(missing_code, &format!("Policy pack '{id}'")),
+        })?;
+        Ok(m)
+    }
+
+    pub fn resolve_policy(&self, id: &str) -> Option<PolicyManifest> {
+        self.resolve_policy_checked(id, StatusCode::NOT_FOUND, "POLICY_NOT_FOUND")
+            .ok()
     }
 
     pub fn policy_dir(&self, id: &str) -> Option<PathBuf> {
@@ -573,28 +1322,85 @@ pub fn sim_upstream_url() -> Result<String, (StatusCode, Json<serde_json::Value>
 // HTTP Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /api/v1/sandbox/catalog
-pub async fn get_catalog(Extension(state): Extension<Arc<SandboxState>>) -> Json<serde_json::Value> {
-    let active = state.active.read().await;
+struct ActiveCatalogSnapshot {
+    mode: String,
+    active_scene: String,
+    active_tool: String,
+    active_policy: Option<String>,
+}
 
-    let mut scenes_out = vec![
-        serde_json::json!({"id": "default", "name": "Default Worktable Scene", "builtin": true}),
-        serde_json::json!({"id": "coffee_kiosk", "name": "Mobile Coffee Kiosk", "builtin": true}),
-        serde_json::json!({"id": "pcb_suction", "name": "PCB Suction Handling", "builtin": true}),
-    ];
+fn build_catalog_blocking(
+    state: &SandboxState,
+    active: &ActiveCatalogSnapshot,
+    running_robot: &str,
+) -> serde_json::Value {
+    let roots = state.effective_builtin_roots();
+
+    let mut scenes_out = Vec::new();
+    let mut conflicts_out = Vec::new();
+    for spec in BUILTIN_SCENE_SPECS {
+        let conflict_dir = state.user_scene_conflict(spec.id);
+        let has_conflict = conflict_dir.is_some();
+        let resolved = if !has_conflict {
+            load_builtin_scene_in_roots(spec.id, &roots)
+        } else {
+            None
+        };
+        let installed = if spec.is_virtual {
+            !has_conflict
+        } else {
+            resolved.is_some()
+        };
+        let mut entry = serde_json::json!({
+            "id": spec.id,
+            "name": spec.name,
+            "description": spec.description,
+            "builtin": true,
+            "virtual": spec.is_virtual,
+            "installed": installed,
+            "robots": spec.robots,
+            "default_tool": spec.default_tool,
+            "recommended_tools": spec.recommended_tools,
+        });
+        if let Some(ref cdir) = conflict_dir {
+            let reason = format!(
+                "User scene directory '{}' conflicts with reserved builtin scene '{}'",
+                cdir.display(),
+                spec.id
+            );
+            tracing::warn!("{reason}");
+            entry["conflict"] = serde_json::json!(true);
+            entry["conflict_reason"] = serde_json::json!(reason);
+            conflicts_out.push(serde_json::json!({
+                "kind": "scene",
+                "id": spec.id,
+                "path": cdir.to_string_lossy(),
+                "reason": reason,
+            }));
+        }
+        scenes_out.push(entry);
+    }
 
     if let Ok(entries) = std::fs::read_dir(state.root.join("scenes")) {
         for e in entries.flatten() {
             if let Ok(ft) = e.file_type() {
                 if ft.is_dir() {
                     let id = e.file_name().to_string_lossy().to_string();
+                    if !validate_pack_id(&id) || is_reserved_builtin_id("scene", &id) {
+                        continue;
+                    }
                     if !scenes_out.iter().any(|s| s["id"] == id) {
-                        if let Some((m, _)) = state.resolve_scene(&id) {
+                        if let Ok((canon_dir, m, _)) = state.load_user_scene_checked(&id, false) {
+                            let assets_ok = verify_pack_assets(&canon_dir, &m.assets).is_ok();
                             scenes_out.push(serde_json::json!({
-                                "id": m.id,
+                                "id": id,
                                 "name": m.name,
                                 "version": m.version,
                                 "builtin": false,
+                                "virtual": false,
+                                "installed": assets_ok,
+                                "robots": m.robots,
+                                "default_tool": m.default_tool,
                             }));
                         }
                     }
@@ -603,26 +1409,69 @@ pub async fn get_catalog(Extension(state): Extension<Arc<SandboxState>>) -> Json
         }
     }
 
-    let mut tools_out = vec![
-        serde_json::json!({"id": "default", "name": "Stock Parallel Jaw Gripper", "kind": "gripper", "builtin": true}),
-        serde_json::json!({"id": "wide_cup_gripper", "name": "Wide Silicone Cup Gripper", "kind": "gripper", "builtin": true}),
-        serde_json::json!({"id": "suction", "name": "Vacuum Suction End-Effector", "kind": "suction", "builtin": true}),
-        serde_json::json!({"id": "screwdriver", "name": "Spindle Electric Screwdriver", "kind": "screwdriver", "builtin": true}),
-    ];
+    let mut tools_out = Vec::new();
+    for spec in BUILTIN_TOOL_SPECS {
+        let conflict_dir = state.user_tool_conflict(spec.id);
+        let has_conflict = conflict_dir.is_some();
+        let resolved = if !has_conflict {
+            load_builtin_tool_in_roots(spec.id, &roots)
+        } else {
+            None
+        };
+        let installed = if spec.is_virtual {
+            !has_conflict
+        } else {
+            resolved.is_some()
+        };
+        let mut entry = serde_json::json!({
+            "id": spec.id,
+            "name": spec.name,
+            "kind": spec.kind,
+            "description": spec.description,
+            "builtin": true,
+            "virtual": spec.is_virtual,
+            "installed": installed,
+            "robots": spec.robots,
+        });
+        if let Some(ref cdir) = conflict_dir {
+            let reason = format!(
+                "User tool directory '{}' conflicts with reserved builtin tool '{}'",
+                cdir.display(),
+                spec.id
+            );
+            tracing::warn!("{reason}");
+            entry["conflict"] = serde_json::json!(true);
+            entry["conflict_reason"] = serde_json::json!(reason);
+            conflicts_out.push(serde_json::json!({
+                "kind": "tool",
+                "id": spec.id,
+                "path": cdir.to_string_lossy(),
+                "reason": reason,
+            }));
+        }
+        tools_out.push(entry);
+    }
 
     if let Ok(entries) = std::fs::read_dir(state.root.join("tools")) {
         for e in entries.flatten() {
             if let Ok(ft) = e.file_type() {
                 if ft.is_dir() {
                     let id = e.file_name().to_string_lossy().to_string();
+                    if !validate_pack_id(&id) || is_reserved_builtin_id("tool", &id) {
+                        continue;
+                    }
                     if !tools_out.iter().any(|t| t["id"] == id) {
-                        if let Some((m, _)) = state.resolve_tool(&id) {
+                        if let Ok((canon_dir, m, _)) = state.load_user_tool_checked(&id, false) {
+                            let assets_ok = verify_pack_assets(&canon_dir, &m.assets).is_ok();
                             tools_out.push(serde_json::json!({
-                                "id": m.id,
+                                "id": id,
                                 "name": m.name,
                                 "kind": m.kind,
                                 "version": m.version,
                                 "builtin": false,
+                                "virtual": false,
+                                "installed": assets_ok,
+                                "robots": m.robots,
                             }));
                         }
                     }
@@ -642,6 +1491,7 @@ pub async fn get_catalog(Extension(state): Extension<Arc<SandboxState>>) -> Json
                             "id": m.id,
                             "name": m.name,
                             "format": m.format,
+                            "robot": m.robot,
                             "action_dim": m.action_dim,
                         }));
                     }
@@ -650,18 +1500,51 @@ pub async fn get_catalog(Extension(state): Extension<Arc<SandboxState>>) -> Json
         }
     }
 
-    Json(serde_json::json!({
+    let builtin_scene_ids: Vec<&'static str> = BUILTIN_SCENE_SPECS.iter().map(|s| s.id).collect();
+    let builtin_tool_ids: Vec<&'static str> = BUILTIN_TOOL_SPECS.iter().map(|t| t.id).collect();
+    serde_json::json!({
         "mode": active.mode,
+        "robot": running_robot,
         "active_scene": active.active_scene,
         "active_tool": active.active_tool,
         "active_policy": active.active_policy,
         "wasm_runtime_ready": assets::wasm_runtime_ready(),
-        "builtin_scenes": ["default", "coffee_kiosk", "pcb_suction"],
-        "builtin_tools": ["default", "wide_cup_gripper", "suction", "screwdriver"],
+        "builtin_scenes": builtin_scene_ids,
+        "builtin_tools": builtin_tool_ids,
         "scenes": scenes_out,
         "tools": tools_out,
         "policies": policies_out,
-    }))
+        "conflicts": conflicts_out,
+    })
+}
+
+/// GET /api/v1/sandbox/catalog
+pub async fn get_catalog(
+    State(supervisor): State<Arc<crate::supervisor::ArmSupervisor>>,
+    Extension(state): Extension<Arc<SandboxState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let active_snapshot = {
+        let active = state.active.read().await;
+        ActiveCatalogSnapshot {
+            mode: active.mode.clone(),
+            active_scene: active.active_scene.clone(),
+            active_tool: active.active_tool.clone(),
+            active_policy: active.active_policy.clone(),
+        }
+    };
+    let running_robot = running_robot_id(&supervisor).await;
+    let state_scan = state.clone();
+    let catalog = tokio::task::spawn_blocking(move || {
+        build_catalog_blocking(&state_scan, &active_snapshot, &running_robot)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Catalog scan failed: {e}")})),
+        )
+    })?;
+    Ok(Json(catalog))
 }
 
 // ---------------------------------------------------------------------------
@@ -919,9 +1802,16 @@ pub async fn upload_scene(
     permit_slot: Option<Extension<UploadPermitSlot>>,
     Json(payload): Json<UploadSceneRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _act_guard = state.activate_lock.lock().await;
+    {
+        let mut st = state.active.write().await;
+        if payload.id.as_ref().is_none_or(|id| id == &st.active_scene) {
+            st.cached_mjcf.clear();
+        }
+    }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
-    let res = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+    let res = tokio::task::spawn_blocking(move || -> Result<(String, serde_json::Value), (StatusCode, String)> {
         let _permit = permit;
         let primary_json = payload.scene_json.as_ref().map(|v| ("scene.json", v));
         let primary_xml = payload.world_xml.as_deref().map(|v| ("world.xml", v));
@@ -970,19 +1860,28 @@ pub async fn upload_scene(
         let mut file_names: Vec<String> = file_map.keys().cloned().collect();
         file_names.sort();
 
-        Ok(serde_json::json!({
-            "id": pack_id,
-            "sha256": digest,
-            "path": target_dir.to_string_lossy(),
-            "manifest": manifest,
-            "files": file_names,
-        }))
+        Ok((
+            pack_id.clone(),
+            serde_json::json!({
+                "id": pack_id,
+                "sha256": digest,
+                "path": target_dir.to_string_lossy(),
+                "manifest": manifest,
+                "files": file_names,
+            }),
+        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Blocking task failed: {e}")}))))?;
 
     match res {
-        Ok(val) => Ok(Json(val)),
+        Ok((pack_id, val)) => {
+            let mut st = state.active.write().await;
+            if st.active_scene == pack_id {
+                st.cached_mjcf.clear();
+            }
+            Ok(Json(val))
+        }
         Err((sc, msg)) => Err((sc, Json(serde_json::json!({"error": msg})))),
     }
 }
@@ -1002,9 +1901,16 @@ pub async fn upload_tool(
     permit_slot: Option<Extension<UploadPermitSlot>>,
     Json(payload): Json<UploadToolRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _act_guard = state.activate_lock.lock().await;
+    {
+        let mut st = state.active.write().await;
+        if payload.id.as_ref().is_none_or(|id| id == &st.active_tool) {
+            st.cached_mjcf.clear();
+        }
+    }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
-    let res = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
+    let res = tokio::task::spawn_blocking(move || -> Result<(String, serde_json::Value), (StatusCode, String)> {
         let _permit = permit;
         let primary_json = payload.tool_json.as_ref().map(|v| ("tool.json", v));
         let primary_xml = payload.tool_xml.as_deref().map(|v| ("tool.xml", v));
@@ -1053,19 +1959,28 @@ pub async fn upload_tool(
         let mut file_names: Vec<String> = file_map.keys().cloned().collect();
         file_names.sort();
 
-        Ok(serde_json::json!({
-            "id": pack_id,
-            "sha256": digest,
-            "path": target_dir.to_string_lossy(),
-            "manifest": manifest,
-            "files": file_names,
-        }))
+        Ok((
+            pack_id.clone(),
+            serde_json::json!({
+                "id": pack_id,
+                "sha256": digest,
+                "path": target_dir.to_string_lossy(),
+                "manifest": manifest,
+                "files": file_names,
+            }),
+        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Blocking task failed: {e}")}))))?;
 
     match res {
-        Ok(val) => Ok(Json(val)),
+        Ok((pack_id, val)) => {
+            let mut st = state.active.write().await;
+            if st.active_tool == pack_id {
+                st.cached_mjcf.clear();
+            }
+            Ok(Json(val))
+        }
         Err((sc, msg)) => Err((sc, Json(serde_json::json!({"error": msg})))),
     }
 }
@@ -1085,6 +2000,7 @@ pub async fn upload_policy(
     permit_slot: Option<Extension<UploadPermitSlot>>,
     Json(payload): Json<UploadPolicyRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _act_guard = state.activate_lock.lock().await;
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
     let res = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, (StatusCode, String)> {
@@ -1226,8 +2142,10 @@ pub async fn delete_policy(
     if !validate_pack_id(&id) {
         return Err(policy_delete_error(StatusCode::BAD_REQUEST, "INVALID_ID", format!("Invalid policy pack id '{id}'")));
     }
-    // Lock order as in the policy runner: supervisor, then the sandbox state. Both are held
-    // across the rename, so no run can start on the pack and no activation can select it.
+    // Global lock order: activate_lock -> supervisor -> state.active.
+    // Holding activate_lock across the check + rename ensures concurrent activate() calls
+    // (including mode="sim" upstream round-trips) cannot select a policy being deleted.
+    let _act_guard = state.activate_lock.lock().await;
     let inner = supervisor.inner().read().await;
     #[cfg(feature = "policy-runtime")]
     {
@@ -1276,32 +2194,37 @@ pub async fn get_scene(
     Extension(state): Extension<Arc<SandboxState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !validate_pack_id(&id) {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid scene pack id '{id}'")}))));
-    }
-    if let Some((manifest, _)) = state.resolve_scene(&id) {
-        let dir = state.root.join("scenes").join(&id);
-        let mut files = Vec::new();
-        if dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
-                    files.push(e.file_name().to_string_lossy().to_string());
-                }
-            }
-        } else {
-            files.push("scene.json".into());
-            files.push(manifest.world_xml.clone());
-        }
-        files.sort();
-        Ok(Json(serde_json::json!({
-            "id": manifest.id,
-            "manifest": manifest,
-            "path": dir.to_string_lossy(),
-            "files": files,
-        })))
+    let (manifest, _) = state.resolve_scene_checked(&id)?;
+    let is_virtual = id == "default";
+    let disk_dir = if !is_reserved_builtin_id("scene", &id) {
+        Some(state.root.join("scenes").join(&id))
+    } else if !is_virtual {
+        find_valid_builtin_scene_dir(&id, &state.effective_builtin_roots())
+            .1
+            .map(|(_, canon_dir, _, _)| canon_dir)
     } else {
-        Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Scene pack '{id}' not found")}))))
-    }
+        None
+    };
+
+    let (files, path_val, compiled_preset) = if let Some(ref dir) = disk_dir {
+        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        (
+            collect_pack_files(&canon),
+            serde_json::json!(dir.to_string_lossy()),
+            false,
+        )
+    } else {
+        (Vec::new(), serde_json::Value::Null, !is_virtual)
+    };
+
+    Ok(Json(serde_json::json!({
+        "id": manifest.id,
+        "manifest": manifest,
+        "path": path_val,
+        "files": files,
+        "virtual": is_virtual,
+        "compiled_preset": compiled_preset,
+    })))
 }
 
 /// GET /api/v1/sandbox/tools/{id}
@@ -1309,32 +2232,37 @@ pub async fn get_tool(
     Extension(state): Extension<Arc<SandboxState>>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    if !validate_pack_id(&id) {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid tool pack id '{id}'")}))));
-    }
-    if let Some((manifest, _)) = state.resolve_tool(&id) {
-        let dir = state.root.join("tools").join(&id);
-        let mut files = Vec::new();
-        if dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
-                    files.push(e.file_name().to_string_lossy().to_string());
-                }
-            }
-        } else {
-            files.push("tool.json".into());
-            files.push(manifest.tool_xml.clone());
-        }
-        files.sort();
-        Ok(Json(serde_json::json!({
-            "id": manifest.id,
-            "manifest": manifest,
-            "path": dir.to_string_lossy(),
-            "files": files,
-        })))
+    let (manifest, _) = state.resolve_tool_checked(&id)?;
+    let is_virtual = id == "default";
+    let disk_dir = if !is_reserved_builtin_id("tool", &id) {
+        Some(state.root.join("tools").join(&id))
+    } else if !is_virtual {
+        find_valid_builtin_tool_dir(&id, &state.effective_builtin_roots())
+            .1
+            .map(|(_, canon_dir, _, _)| canon_dir)
     } else {
-        Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Tool pack '{id}' not found")}))))
-    }
+        None
+    };
+
+    let (files, path_val, compiled_preset) = if let Some(ref dir) = disk_dir {
+        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        (
+            collect_pack_files(&canon),
+            serde_json::json!(dir.to_string_lossy()),
+            false,
+        )
+    } else {
+        (Vec::new(), serde_json::Value::Null, !is_virtual)
+    };
+
+    Ok(Json(serde_json::json!({
+        "id": manifest.id,
+        "manifest": manifest,
+        "path": path_val,
+        "files": files,
+        "virtual": is_virtual,
+        "compiled_preset": compiled_preset,
+    })))
 }
 
 /// GET /api/v1/sandbox/policies/{id}
@@ -1421,14 +2349,28 @@ pub async fn serve_scene_file(
     if !validate_pack_id(&id) {
         return (StatusCode::NOT_FOUND, "scene pack or file not found").into_response();
     }
-    let dir = state.root.join("scenes").join(&id);
-    if dir.is_dir() {
-        return serve_file_from_dir(&state.root, &dir, &rel).await;
+    if let Some(conflict_dir) = state.user_scene_conflict(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("User scene directory '{}' conflicts with reserved builtin scene '{}'", conflict_dir.display(), id),
+                "code": "BUILTIN_ID_CONFLICT",
+            })),
+        )
+            .into_response();
     }
-    // Search built-in roots if not found in custom storage
-    for root in search_builtin_roots() {
-        let bdir = root.join("scenes").join(&id);
-        if bdir.is_dir() {
+    if !is_reserved_builtin_id("scene", &id) {
+        let scenes_root = state.root.join("scenes");
+        let dir = scenes_root.join(&id);
+        if dir.is_dir() {
+            return serve_file_from_dir(&scenes_root, &dir, &rel).await;
+        }
+        return (StatusCode::NOT_FOUND, "scene pack or file not found").into_response();
+    }
+    if id != "default" {
+        if let (_, Some((root, bdir, _, _))) =
+            find_valid_builtin_scene_dir(&id, &state.effective_builtin_roots())
+        {
             return serve_file_from_dir(&root, &bdir, &rel).await;
         }
     }
@@ -1443,13 +2385,28 @@ pub async fn serve_tool_file(
     if !validate_pack_id(&id) {
         return (StatusCode::NOT_FOUND, "tool pack or file not found").into_response();
     }
-    let dir = state.root.join("tools").join(&id);
-    if dir.is_dir() {
-        return serve_file_from_dir(&state.root, &dir, &rel).await;
+    if let Some(conflict_dir) = state.user_tool_conflict(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("User tool directory '{}' conflicts with reserved builtin tool '{}'", conflict_dir.display(), id),
+                "code": "BUILTIN_ID_CONFLICT",
+            })),
+        )
+            .into_response();
     }
-    for root in search_builtin_roots() {
-        let bdir = root.join("tools").join(&id);
-        if bdir.is_dir() {
+    if !is_reserved_builtin_id("tool", &id) {
+        let tools_root = state.root.join("tools");
+        let dir = tools_root.join(&id);
+        if dir.is_dir() {
+            return serve_file_from_dir(&tools_root, &dir, &rel).await;
+        }
+        return (StatusCode::NOT_FOUND, "tool pack or file not found").into_response();
+    }
+    if id != "default" {
+        if let (_, Some((root, bdir, _, _))) =
+            find_valid_builtin_tool_dir(&id, &state.effective_builtin_roots())
+        {
             return serve_file_from_dir(&root, &bdir, &rel).await;
         }
     }
@@ -1464,13 +2421,343 @@ pub async fn serve_policy_file(
     if !validate_pack_id(&id) {
         return (StatusCode::NOT_FOUND, "policy pack or file not found").into_response();
     }
-    let dir = state.root.join("policies").join(&id);
-    serve_file_from_dir(&state.root, &dir, &rel).await
+    let policies_root = state.root.join("policies");
+    let dir = policies_root.join(&id);
+    serve_file_from_dir(&policies_root, &dir, &rel).await
+}
+
+fn base_assets_dir() -> Option<PathBuf> {
+    assets::asset_dir()
+        .or_else(|| Path::new("assets").is_dir().then(|| PathBuf::from("assets")))
+        .or_else(|| {
+            Path::new("/usr/share/rebot-teleop/assets")
+                .is_dir()
+                .then(|| PathBuf::from("/usr/share/rebot-teleop/assets"))
+        })
+}
+
+fn is_safe_base_asset_ext(rel: &str) -> bool {
+    let ext = rel.rsplit_once('.').map(|x| x.1.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("stl" | "obj" | "ply" | "dae" | "png" | "jpg" | "jpeg" | "bin")
+    )
+}
+
+/// GET /api/v1/sandbox/base-assets/{*path}
+pub async fn serve_base_asset(UrlPath(rel): UrlPath<String>) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
+    if !is_safe_relative_path(&rel) || !is_safe_base_asset_ext(&rel) {
+        return not_found();
+    }
+    let Some(dir) = base_assets_dir() else {
+        return not_found();
+    };
+    let Ok(canon_root) = dir.canonicalize() else {
+        return not_found();
+    };
+    let Ok(canon_file) = canon_root.join(&rel).canonicalize() else {
+        return not_found();
+    };
+    if !canon_file.starts_with(&canon_root) || !canon_file.is_file() {
+        return not_found();
+    }
+    match tokio::fs::metadata(&canon_file).await {
+        Ok(m) if m.len() <= MAX_PACK_FILE_BYTES => {}
+        _ => return not_found(),
+    }
+    let ct = pack_content_type(&rel);
+    match tokio::fs::read(&canon_file).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-cache")],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(_) => not_found(),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Activation, State, Reset, IO, Telemetry
 // ---------------------------------------------------------------------------
+
+async fn running_robot_id(supervisor: &crate::supervisor::ArmSupervisor) -> String {
+    let inner = supervisor.inner().read().await;
+    if let Some(ref pid) = inner.config.profile_id {
+        if let Some(norm) = normalize_robot_id(pid) {
+            return norm;
+        }
+    }
+    if let Some(ref follower) = inner.follower {
+        if !matches!(follower.as_str(), "mock" | "sim") {
+            if let Some(norm) = normalize_robot_id(follower) {
+                return norm;
+            }
+        }
+    }
+    "b601dm".to_string()
+}
+
+fn robot_incompatible_error(
+    message: String,
+    running_robot: &str,
+    requested_robot: Option<&str>,
+    allowed_robots: &[String],
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": message,
+            "code": "ROBOT_INCOMPATIBLE",
+            "running_robot": running_robot,
+            "requested_robot": requested_robot,
+            "allowed_robots": allowed_robots,
+        })),
+    )
+}
+
+fn resolve_requested_robot(
+    robot: Option<&str>,
+    profile: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    let mut resolved: Option<String> = None;
+    for raw in [robot, profile, profile_id].into_iter().flatten() {
+        let norm = normalize_robot_id(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("Invalid or empty robot/profile '{raw}'"),
+                    "code": "ROBOT_INCOMPATIBLE",
+                })),
+            )
+        })?;
+        if let Some(ref prev) = resolved {
+            if prev != &norm {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("Conflicting robot/profile parameters '{prev}' and '{norm}'"),
+                        "code": "ROBOT_INCOMPATIBLE",
+                    })),
+                ));
+            }
+        } else {
+            resolved = Some(norm);
+        }
+    }
+    Ok(resolved)
+}
+
+fn ensure_requested_robot_matches(
+    running_robot: &str,
+    requested_robot: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(req) = requested_robot {
+        if req != running_robot {
+            return Err(robot_incompatible_error(
+                format!(
+                    "Requested robot/profile '{req}' does not match running armd robot '{running_robot}'"
+                ),
+                running_robot,
+                Some(req),
+                &[],
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_policy_robot_compatibility(
+    running_robot: &str,
+    policy_manifest: &PolicyManifest,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let raw = policy_manifest.robot.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let pol_robot = normalize_robot_id(raw);
+    if pol_robot.as_deref() != Some(running_robot) {
+        return Err(robot_incompatible_error(
+            format!(
+                "Policy '{}' is for robot '{}', which is incompatible with running robot '{}'",
+                policy_manifest.id, policy_manifest.robot, running_robot
+            ),
+            running_robot,
+            None,
+            std::slice::from_ref(&policy_manifest.robot),
+        ));
+    }
+    Ok(())
+}
+
+struct BaseMeshInspection {
+    meshdir: Option<String>,
+    base_assets: Vec<serde_json::Value>,
+    missing_base_assets: Vec<String>,
+    note: Option<String>,
+}
+
+fn is_safe_base_mesh_file(file: &str) -> bool {
+    if !is_safe_relative_path(file) {
+        return false;
+    }
+    Path::new(file)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
+    let Ok(doc) = roxmltree::Document::parse(base_mjcf_xml) else {
+        return BaseMeshInspection {
+            meshdir: None,
+            base_assets: Vec::new(),
+            missing_base_assets: Vec::new(),
+            note: None,
+        };
+    };
+
+    let meshdir = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "compiler")
+        .and_then(|n| n.attribute("meshdir"))
+        .map(|s| s.to_string());
+
+    let canon_asset_root = base_assets_dir().and_then(|d| d.canonicalize().ok());
+    let meshdir_leaf = meshdir
+        .as_deref()
+        .and_then(|m| Path::new(m).file_name())
+        .and_then(|n| n.to_str())
+        .filter(|leaf| is_safe_relative_path(leaf))
+        .map(|s| s.to_string());
+
+    let mut base_assets = Vec::new();
+    let mut missing_base_assets = Vec::new();
+
+    for node in doc.descendants() {
+        if node.is_element() && node.tag_name().name() == "mesh" {
+            if let Some(file) = node.attribute("file").map(str::trim).filter(|s| !s.is_empty()) {
+                let mjcf_path = match meshdir.as_deref() {
+                    Some(md) if !md.is_empty() => {
+                        format!("{}/{}", md.trim_end_matches('/'), file)
+                    }
+                    _ => file.to_string(),
+                };
+
+                let (local_exists, candidate_rel) = if is_safe_base_mesh_file(file) {
+                    let rel = match meshdir_leaf.as_deref() {
+                        Some(leaf) => format!("{leaf}/{file}"),
+                        None => file.to_string(),
+                    };
+                    let exists = is_safe_relative_path(&rel)
+                        && is_safe_base_asset_ext(&rel)
+                        && canon_asset_root.as_ref().is_some_and(|root| {
+                            root.join(&rel)
+                                .canonicalize()
+                                .is_ok_and(|f| f.starts_with(root) && f.is_file())
+                        });
+                    (exists, Some(rel))
+                } else {
+                    (false, None)
+                };
+
+                let resolved_url = if local_exists {
+                    candidate_rel
+                        .as_ref()
+                        .map(|rel| format!("/api/v1/sandbox/base-assets/{rel}"))
+                } else {
+                    None
+                };
+
+                let http_accessible = resolved_url.is_some();
+                if !http_accessible || !local_exists {
+                    missing_base_assets.push(mjcf_path.clone());
+                }
+
+                base_assets.push(serde_json::json!({
+                    "file": file,
+                    "meshdir": meshdir,
+                    "mjcf_path": mjcf_path,
+                    "memfs_path": mjcf_path,
+                    "path": candidate_rel,
+                    "local_exists": local_exists,
+                    "http_accessible": http_accessible,
+                    "url": resolved_url,
+                }));
+            }
+        }
+    }
+
+    let note = if !missing_base_assets.is_empty() {
+        Some(
+            "Base MJCF references mesh files that are missing or unsafe inside the base assets directory; browser MuJoCo WASM cannot fetch missing base meshes."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    BaseMeshInspection {
+        meshdir,
+        base_assets,
+        missing_base_assets,
+        note,
+    }
+}
+
+fn validate_robot_compatibility(
+    running_robot: &str,
+    requested_robot: Option<&str>,
+    scene_manifest: &SceneManifest,
+    tool_manifest: &ToolManifest,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    ensure_requested_robot_matches(running_robot, requested_robot)?;
+    if !scene_manifest.robots.is_empty() || builtin_scene_spec(&scene_manifest.id).is_some() {
+        let scene_ok = scene_manifest
+            .robots
+            .iter()
+            .filter_map(|r| normalize_robot_id(r))
+            .any(|r| r == running_robot);
+        if !scene_ok {
+            return Err(robot_incompatible_error(
+                format!(
+                    "Scene '{}' only supports robots {:?}, which is incompatible with running robot '{}'",
+                    scene_manifest.id, scene_manifest.robots, running_robot
+                ),
+                running_robot,
+                requested_robot,
+                &scene_manifest.robots,
+            ));
+        }
+    }
+    if !tool_manifest.robots.is_empty() || builtin_tool_spec(&tool_manifest.id).is_some() {
+        let tool_ok = tool_manifest
+            .robots
+            .iter()
+            .filter_map(|r| normalize_robot_id(r))
+            .any(|r| r == running_robot);
+        if !tool_ok {
+            return Err(robot_incompatible_error(
+                format!(
+                    "Tool '{}' only supports robots {:?}, which is incompatible with running robot '{}'",
+                    tool_manifest.id, tool_manifest.robots, running_robot
+                ),
+                running_robot,
+                requested_robot,
+                &tool_manifest.robots,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ActivateRequest {
@@ -1479,16 +2766,23 @@ pub struct ActivateRequest {
     pub scene: Option<String>,
     #[serde(default)]
     pub tool: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub policy: Option<Option<String>>,
     #[serde(default)]
     pub seed: Option<u64>,
     #[serde(default)]
     pub auto_start_policy: Option<bool>,
+    #[serde(default)]
+    pub robot: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 /// POST /api/v1/sandbox/activate
 pub async fn activate(
+    State(supervisor): State<Arc<crate::supervisor::ArmSupervisor>>,
     Extension(state): Extension<Arc<SandboxState>>,
     Json(payload): Json<ActivateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -1496,6 +2790,17 @@ pub async fn activate(
     if !matches!(mode.as_str(), "none" | "wasm" | "sim") {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid mode '{mode}', must be none, wasm, or sim")}))));
     }
+
+    let _act_guard = state.activate_lock.lock().await;
+
+    // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
+    let running_robot = running_robot_id(&supervisor).await;
+    let requested_robot = resolve_requested_robot(
+        payload.robot.as_deref(),
+        payload.profile.as_deref(),
+        payload.profile_id.as_deref(),
+    )?;
+    ensure_requested_robot_matches(&running_robot, requested_robot.as_deref())?;
 
     let (cur_scene, cur_tool, cur_policy, cur_seed) = {
         let cur = state.active.read().await;
@@ -1517,27 +2822,36 @@ pub async fn activate(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid tool pack id '{tool_id}'")}))));
     }
 
-    let (scene_manifest, scene_world_xml) = state.resolve_scene(&scene_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Scene pack '{scene_id}' not found")}))))?;
+    let (scene_manifest, scene_world_xml) = state.resolve_scene_checked(&scene_id)?;
+    let (tool_manifest, tool_xml) = state.resolve_tool_checked(&tool_id)?;
 
-    let (tool_manifest, tool_xml) = state.resolve_tool(&tool_id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Tool pack '{tool_id}' not found")}))))?;
+    validate_robot_compatibility(
+        &running_robot,
+        requested_robot.as_deref(),
+        &scene_manifest,
+        &tool_manifest,
+    )?;
 
     let policy_id = match payload.policy {
         Some(Some(ref pid)) => {
             if !validate_pack_id(pid) {
                 return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid policy pack id '{pid}'")}))));
             }
-            if state.resolve_policy(pid).is_none() {
-                return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Policy pack '{pid}' not found")}))));
-            }
+            let pm = state.resolve_policy_checked(pid, StatusCode::NOT_FOUND, "POLICY_NOT_FOUND")?;
+            validate_policy_robot_compatibility(&running_robot, &pm)?;
             Some(pid.clone())
         }
         Some(None) => None,
-        None => cur_policy,
+        None => {
+            if let Some(ref pid) = cur_policy {
+                let pm = state.resolve_policy_checked(pid, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
+                validate_policy_robot_compatibility(&running_robot, &pm)?;
+            }
+            cur_policy
+        }
     };
 
-    let base_xml = get_base_robot_xml();
+    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
     let composed = compose_mjcf(
         &base_xml,
         Some(&scene_world_xml),
@@ -1545,7 +2859,7 @@ pub async fn activate(
         Some(&tool_xml),
     ).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("MJCF composition failed: {e}")}))))?;
 
-    // If mode == "sim", send POST /sim/scene to rebot-sim upstream
+    // If mode == "sim", send POST /sim/scene to rebot-sim upstream and verify robot agreement
     if mode == "sim" {
         let sim_url = sim_upstream_url()?;
         let upstream = DetectorUpstream::parse(&sim_url)
@@ -1555,12 +2869,43 @@ pub async fn activate(
             "scene": scene_id,
             "tool": tool_id,
             "seed": payload.seed.unwrap_or(cur_seed),
+            "robot": running_robot,
         })).unwrap();
 
-        sim_post(&upstream, &sim_url, "/sim/scene", &body_bytes).await?;
+        let resp_bytes = sim_post(&upstream, &sim_url, "/sim/scene", &body_bytes).await?;
+        if let Ok(resp_val) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            if let Some(robot_val) = resp_val.get("robot") {
+                if !robot_val.is_null() {
+                    let upstream_raw = robot_val.as_str().ok_or_else(|| {
+                        robot_incompatible_error(
+                            format!("rebot-sim returned non-string robot field {robot_val}"),
+                            &running_robot,
+                            None,
+                            std::slice::from_ref(&running_robot),
+                        )
+                    })?;
+                    if normalize_robot_id(upstream_raw).as_deref() != Some(running_robot.as_str()) {
+                        return Err(robot_incompatible_error(
+                            format!(
+                                "rebot-sim upstream reported robot '{upstream_raw}', incompatible with running armd robot '{running_robot}'"
+                            ),
+                            &running_robot,
+                            Some(upstream_raw),
+                            std::slice::from_ref(&running_robot),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
-    // Success: mutate ONLY mode, active packs, seed, auto_start_policy and updated_at_ms
+    // Re-verify selected policy still exists before committing ActiveState.
+    if let Some(ref pid) = policy_id {
+        let pm = state.resolve_policy_checked(pid, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
+        validate_policy_robot_compatibility(&running_robot, &pm)?;
+    }
+
+    // Success: atomically update mode, active packs, seed, auto_start_policy, updated_at_ms, and cached_mjcf
     let (final_auto_start, final_seed, final_reset_seq, final_io_seq) = {
         let mut st_write = state.active.write().await;
         st_write.mode = mode.clone();
@@ -1577,9 +2922,7 @@ pub async fn activate(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-
-        let mut mjcf_write = state.cached_mjcf.write().await;
-        *mjcf_write = composed;
+        st_write.cached_mjcf = composed;
 
         (
             st_write.auto_start_policy,
@@ -1592,6 +2935,7 @@ pub async fn activate(
 
     Ok(Json(serde_json::json!({
         "mode": mode,
+        "robot": running_robot,
         "active_scene": scene_id,
         "active_tool": tool_id,
         "active_policy": policy_id,
@@ -1610,14 +2954,14 @@ async fn sim_post(
     sim_url: &str,
     path: &str,
     body: &[u8],
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
     let req_fut = proxy::upstream_request(upstream, Method::POST, path, Some(body));
     match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
         Ok(Ok(resp)) if !resp.status.is_success() => {
             let err_msg = String::from_utf8_lossy(&resp.body).to_string();
             Err((resp.status, Json(serde_json::json!({"error": format!("rebot-sim error: {err_msg}"), "sim_url": sim_url}))))
         }
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(resp)) => Ok(resp.body),
         Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
             "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
             "sim_url": sim_url,
@@ -1629,31 +2973,69 @@ async fn sim_post(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct BundleQuery {
+    #[serde(default)]
+    pub robot: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
 /// GET /api/v1/sandbox/bundle
 pub async fn get_bundle(
+    State(supervisor): State<Arc<crate::supervisor::ArmSupervisor>>,
     Extension(state): Extension<Arc<SandboxState>>,
+    Query(query): Query<BundleQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let current = state.active.read().await.clone();
-    let cached_xml = state.cached_mjcf.read().await.clone();
+    // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
+    let running_robot = running_robot_id(&supervisor).await;
+    let requested_robot = resolve_requested_robot(
+        query.robot.as_deref(),
+        query.profile.as_deref(),
+        query.profile_id.as_deref(),
+    )?;
+    ensure_requested_robot_matches(&running_robot, requested_robot.as_deref())?;
 
-    let composed_xml = if !cached_xml.is_empty() {
-        cached_xml
+    let current = state.active.read().await.clone();
+
+    let (scene_dir, mut scene_manifest, sw) = state.resolve_scene_checked_with_dir(&current.active_scene)?;
+    let (tool_dir, mut tool_manifest, tw) = state.resolve_tool_checked_with_dir(&current.active_tool)?;
+
+    validate_robot_compatibility(
+        &running_robot,
+        requested_robot.as_deref(),
+        &scene_manifest,
+        &tool_manifest,
+    )?;
+
+    let policy_manifest = if let Some(ref p) = current.active_policy {
+        let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
+        validate_policy_robot_compatibility(&running_robot, &pm)?;
+        Some(pm)
     } else {
-        let (_sm, sw) = state.resolve_scene(&current.active_scene)
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to resolve active scene"}))))?;
-        let (tm, tw) = state.resolve_tool(&current.active_tool)
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to resolve active tool"}))))?;
-        compose_mjcf(&get_base_robot_xml(), Some(&sw), Some(&tm), Some(&tw))
+        None
+    };
+
+    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
+    let use_cached = !current.cached_mjcf.is_empty() && !state.active.read().await.cached_mjcf.is_empty();
+    let composed_xml = if use_cached {
+        current.cached_mjcf
+    } else {
+        compose_mjcf(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?
     };
 
-    let scene_manifest = state.resolve_scene(&current.active_scene).map(|x| x.0);
-    let tool_manifest = state.resolve_tool(&current.active_tool).map(|x| x.0);
-    let policy_manifest = current.active_policy.as_ref().and_then(|p| state.resolve_policy(p));
+    scene_manifest.assets = normalize_manifest_assets(scene_dir.as_deref(), scene_manifest.assets);
+    tool_manifest.assets = normalize_manifest_assets(tool_dir.as_deref(), tool_manifest.assets);
+
+    let mesh_info = inspect_base_mesh_assets(&base_xml);
     let policy_model_url = policy_manifest.as_ref().map(|pm| format!("/api/v1/sandbox/policies/{}/files/{}", pm.id, pm.model_file));
 
     Ok(Json(serde_json::json!({
         "mode": current.mode,
+        "robot": running_robot,
         "active_scene": current.active_scene,
         "active_tool": current.active_tool,
         "active_policy": current.active_policy,
@@ -1662,6 +3044,10 @@ pub async fn get_bundle(
         "reset_seq": current.reset_seq,
         "io_seq": current.io_seq,
         "composed_xml": composed_xml,
+        "base_meshdir": mesh_info.meshdir,
+        "base_assets": mesh_info.base_assets,
+        "missing_base_assets": mesh_info.missing_base_assets,
+        "base_assets_note": mesh_info.note,
         "scene_manifest": scene_manifest,
         "tool_manifest": tool_manifest,
         "policy_manifest": policy_manifest,
@@ -2162,8 +3548,9 @@ mod tests {
                     .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
                     .layer(axum::middleware::from_fn(upload_concurrency_middleware)),
             )
-            .route("/api/v1/sandbox/policies/{id}", get(get_policy).delete(delete_policy).with_state(supervisor))
+            .route("/api/v1/sandbox/policies/{id}", get(get_policy).delete(delete_policy))
             .route("/api/v1/sandbox/policies/{id}/files/{*path}", get(serve_policy_file))
+            .route("/api/v1/sandbox/base-assets/{*path}", get(serve_base_asset))
             .route("/api/v1/sandbox/activate", post(activate))
             .route("/api/v1/sandbox/bundle", get(get_bundle))
             .route("/api/v1/sandbox/state", get(get_state))
@@ -2171,6 +3558,7 @@ mod tests {
             .route("/api/v1/sandbox/io", post(set_io))
             .route("/api/v1/sandbox/telemetry", post(post_telemetry))
             .layer(Extension(state))
+            .with_state(supervisor)
     }
 
     #[tokio::test]
@@ -2328,11 +3716,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("armd-sandbox-norm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let state = Arc::new(SandboxState::new(dir));
+        let supervisor = Arc::new(crate::supervisor::ArmSupervisor::new(crate::model::ArmConfig::default()));
         let app = axum::Router::new()
             .route("/api/v1/sandbox/policies", axum::routing::post(upload_policy))
             .route("/api/v1/sandbox/activate", axum::routing::post(activate))
             .route("/api/v1/sandbox/bundle", axum::routing::get(get_bundle))
-            .layer(axum::Extension(state));
+            .layer(axum::Extension(state))
+            .with_state(supervisor);
 
         let pol_payload = serde_json::json!({
             "policy_json": {

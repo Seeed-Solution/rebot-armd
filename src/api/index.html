@@ -13527,14 +13527,19 @@ const WASM_SIM = window.WASM_SIM = (() => {
   }
 
   function writeMemfsFile(mj, relPath, bytes) {
-    const clean = relPath.replace(/^\/+/, '');
-    const parts = clean.split('/').filter(Boolean);
-    let cur = '/working';
-    for (let i = 0; i < parts.length - 1; i++) {
-      cur += '/' + parts[i];
+    const stack = relPath.startsWith('/') ? [] : ['working'];
+    for (const seg of relPath.split('/')) {
+      if (!seg || seg === '.') continue;
+      if (seg === '..') { if (stack.length > 0) stack.pop(); }
+      else stack.push(seg);
+    }
+    if (stack.length === 0) return;
+    let cur = '';
+    for (let i = 0; i < stack.length - 1; i++) {
+      cur += '/' + stack[i];
       try { mj.FS.mkdir(cur); } catch (_) {}
     }
-    mj.FS.writeFile('/working/' + clean, bytes);
+    mj.FS.writeFile('/' + stack.join('/'), bytes);
   }
 
   function mulberry32(seed) {
@@ -14248,6 +14253,13 @@ const WASM_SIM = window.WASM_SIM = (() => {
         if (a?.path) {
           const ar = await fetch(`/api/v1/sandbox/tools/${bundle.active_tool}/files/${a.path}`);
           if (ar.ok) writeMemfsFile(mj, a.path, new Uint8Array(await ar.arrayBuffer()));
+        }
+      }
+      for (const a of (bundle.base_assets || [])) {
+        const dst = a?.memfs_path || a?.path;
+        if (a?.url && dst) {
+          const ar = await fetch(a.url);
+          if (ar.ok) writeMemfsFile(mj, dst, new Uint8Array(await ar.arrayBuffer()));
         }
       }
       writeMemfsFile(mj, 'scene.xml', bundle.composed_xml);
