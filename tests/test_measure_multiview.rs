@@ -48,7 +48,7 @@ impl FakeVision {
         let cam = mm::camera_at(&self.cam, &pose);
         let (w, h) = (self.cam.size[0] as usize, self.cam.size[1] as usize);
         let seed = self.frame.load(Ordering::SeqCst) + 1;
-        let img = render::render(&self.scene, &cam, w, h, 1, Noise { sigma: 1.0, ..Noise::default() }, seed);
+        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, seed);
         // letterbox into a w x w square, frame in the centred rows
         let top = (w - h) / 2;
         let mut sq = vec![0u8; w * w];
@@ -118,10 +118,14 @@ fn geometry(config: &ArmConfig) -> (CamModel, Pose, [f64; 3]) {
     (cam, pose, look)
 }
 
-async fn rig(config: ArmConfig) -> Rig {
+async fn rig(config: ArmConfig) -> Rig { rig_plain(config, false).await }
+
+/// [`rig`] with a plain (uniform grey) box when `plain`.
+async fn rig_plain(config: ArmConfig, plain: bool) -> Rig {
     let (cam, _, look) = geometry(&config);
     let sup = Arc::new(ArmSupervisor::new(config));
-    let scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
+    let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
+    scene.plain_boxes = plain;
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
         snapshots: AtomicU64::new(0), cache: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
@@ -180,6 +184,11 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     let mut r = rig(config).await;
     let v: Value = serde_json::to_value(r.sup.inner().read().await.schema().capabilities).unwrap();
     assert_eq!(v["measure_multiview"], true, "{v}");
+    let d = r.sup.inner().read().await.safety_describe();
+    let l = &d["limits"]["measure_multiview"];
+    assert_eq!((l["motions"].clone(), l["default_motion"].as_str()), (json!(["orbit", "translate"]), Some("orbit")), "{l}");
+    assert_eq!((l["axes"]["x"].clone(), l["axes"]["xy"].clone(), l["min_frame_margin_px"].as_f64()), (json!([2, 5]), json!([3, 5]), Some(8.0)), "{l}");
+    assert_eq!(l["speed_scale"], json!([0.1, 0.5]));
     let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
     assert_eq!(ack["type"], "command_ack", "{ack}");
     let id = ack["action_id"].as_u64().unwrap();
@@ -251,10 +260,10 @@ async fn a_refused_view_pose_falls_back_to_a_smaller_offset() {
     let f = m["fallbacks"].as_array().unwrap();
     println!("fallbacks {f:?}, views {}, objects {}", m["views"], m["objects"]);
     assert_eq!(f.len(), 1, "{m}");
-    assert_eq!((f[0]["offset_m"].as_f64(), f[0]["code"].as_str()), (Some(0.04), Some("WORKSPACE_VIOLATION")), "{m}");
-    let used = f[0]["used_offset_m"].as_f64().unwrap();
+    assert_eq!((f[0]["offset_m"][0].as_f64(), f[0]["offset_m"][1].as_f64(), f[0]["code"].as_str()), (Some(0.04), Some(0.0), Some("WORKSPACE_VIOLATION")), "{m}");
+    let used = f[0]["used_offset_m"][0].as_f64().unwrap();
     assert!(used.abs() < 0.04, "{m}");
-    let offs: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["offset_m"].as_f64().unwrap()).collect();
+    let offs: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["offset_m"][0].as_f64().unwrap()).collect();
     assert!(offs.contains(&used) && offs.contains(&-0.04) && offs.contains(&0.0), "{offs:?}");
     assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.004, "{m}");
     assert!(r.at_start().await);
@@ -319,4 +328,35 @@ async fn refused_without_operator_session_and_bad_bodies() {
         let rej = r.start(bad.clone()).await;
         assert_eq!(rej["code"], "INVALID_COMMAND", "{bad}: {rej}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn translate_on_two_axes_measures_a_plain_box_from_its_outline() {
+    let mut r = rig_plain(ArmConfig::rebot_dm(), true).await;
+    let ack = r.start(json!({"label": "box", "motion": "translate", "speed_scale": 0.5})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 150.0).await;
+    let m = &a["measurement"];
+    println!("translate xy5: objects {}, stats {}, views {}", m["objects"], m["stats"], m["views"]);
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!((m["motion"].as_str(), m["axes"].as_str()), (Some("translate"), Some("xy")));
+    let views = m["views"].as_array().unwrap();
+    assert_eq!(views.len(), 5);
+    // the start, then +x, +y, -x, -y at B/2; orientation kept, the look-at point moves
+    for v in &views[1..] {
+        let o = [v["offset_m"][0].as_f64().unwrap(), v["offset_m"][1].as_f64().unwrap()];
+        assert!((o[0].hypot(o[1]) - 0.04).abs() < 1e-9, "{v}");
+        let s = [v["predicted_shift_px"][0].as_f64().unwrap(), v["predicted_shift_px"][1].as_f64().unwrap()];
+        assert!(s[0].hypot(s[1]) > 40.0 && v["frame_margin_px"].as_f64().unwrap() >= 8.0, "{v}");
+        // orientation kept (within the IK tolerance of 0.5 deg)
+        let q: Vec<f64> = (0..4).map(|i| v["tcp"]["quat_wxyz"][i].as_f64().unwrap()).collect();
+        let q0: Vec<f64> = (0..4).map(|i| views[0]["tcp"]["quat_wxyz"][i].as_f64().unwrap()).collect();
+        let dot: f64 = q.iter().zip(&q0).map(|(a, b)| a * b).sum::<f64>().abs();
+        assert!(2.0 * dot.min(1.0).acos() < 0.5f64.to_radians(), "{v}");
+    }
+    let o = &m["objects"][0];
+    assert!((o["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{o}");
+    assert!(o["n_edge_points"].as_u64().unwrap() > 0, "{o}");
+    for k in ["features_ms", "sweep_ms", "refine_ms", "triangulate_ms", "decode_ms", "total_ms"] { assert!(m["stats"][k].is_number(), "{k}"); }
+    assert!(r.at_start().await);
 }

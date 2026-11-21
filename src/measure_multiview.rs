@@ -8,18 +8,28 @@
 //! measured joints at each capture, kinematic correction included); no depth model, no depth
 //! calibration.
 //!
-//! - Body `{label?, min_score? (0..1, 0.3), target? {box_norm, frame_id?}, views? (2..5, 3),
-//!   baseline_m? (0.03..0.12, 0.08), speed_scale? (0.1..0.5, 0.3), return_to_start? (true)}`.
-//! - View poses: the start pose turned about the look-at point X (ray through the target box
-//!   centre at [`LOOK_AT_ABOVE_TABLE_M`] above the table) about the axis perpendicular to that ray
-//!   and to the camera's image x axis, so the camera centre moves by the chord `offset` along the
-//!   image x axis at the same distance from X and X stays at the same pixel. Offsets are spread
-//!   evenly over [-baseline/2, +baseline/2] (`views` 3: -B/2, 0 (the start pose), +B/2).
+//! - Body `{label?, min_score? (0..1, 0.3), target? {box_norm, frame_id?}, motion? ("orbit" |
+//!   "translate", "orbit"), axes? ("x" | "xy"; "x" for orbit, "xy" for translate), views? (x: 2..5,
+//!   3; xy: 3..5, 5), baseline_m? (0.03..0.12, 0.08), speed_scale? (0.1..0.5, 0.3),
+//!   return_to_start? (true)}`.
+//! - View offsets ([`view_offsets`]) in the image plane of the start camera: `axes` "x" spreads
+//!   them evenly over [-baseline/2, +baseline/2] on the image x axis (`views` 3: -B/2, 0 (the start
+//!   pose), +B/2); "xy" puts the start pose and `views - 1` offsets on the circle of radius
+//!   baseline/2 (`views` 5: +x, +y, -x, -y), so edges of every direction cross an epipolar line.
+//! - `motion` "orbit": the start pose turned about the look-at point X (ray through the target box
+//!   centre at [`LOOK_AT_ABOVE_TABLE_M`] above the table) so that the camera centre moves by the
+//!   chord |offset| in the offset's direction at the same distance from X; X stays at the same
+//!   pixel. "translate": the camera keeps its orientation and moves by the offset parallel to the
+//!   image plane; X moves by about fx * |offset| / Z in the image. Before moving, the start box
+//!   shifted by the predicted shift of X must stay [`MIN_FRAME_MARGIN_PX`] inside the image (else
+//!   `OUT_OF_FRAME`, a refusal with fallbacks).
 //! - Motion: IK of the view pose ([`motion::solve_goal_joints`]), then the joint-space quintic of
 //!   `path: "joint"` at `speed_scale` with every check of a joint move (swept workspace, keep-out
 //!   boxes, link capsules, power budget, torque and collision holds). A view refused before it
 //!   moves ([`PLAN_REFUSALS`]) is retried at the mirrored offset (when unused), then at 0.75 and
 //!   0.5 of the offset on either side; when all are refused the action fails with the refusal code.
+//! - Times: `measurement.stats` carries the stage times of the reconstruction and `decode_ms`
+//!   (all views); every view its own `decode_ms`.
 //! - Capture: settle >= [`MIN_SETTLE_S`] after the motion settled, joints still, discard
 //!   [`DISCARD_SNAPSHOTS`] snapshots, then one snapshot and one YOLO trigger (a frame newer than
 //!   the request); the joints must not move during the capture (`MOVED`).
@@ -57,27 +67,56 @@ const SNAPSHOT_GAP: Duration = Duration::from_millis(150);
 pub const LOOK_AT_ABOVE_TABLE_M: f64 = 0.02;
 /// Fallback offsets as fractions of the refused one (after the mirrored offset).
 pub const FALLBACK_SCALES: [f64; 2] = [0.75, 0.5];
-/// Planning refusals before a view's motion: the view is retried at a fallback offset.
-pub const PLAN_REFUSALS: [&str; 4] = ["IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED"];
+/// Refusals before a view's motion (planning, or the target leaving the image): the view is
+/// retried at a fallback offset.
+pub const PLAN_REFUSALS: [&str; 5] = ["IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED", "OUT_OF_FRAME"];
 /// Failures after the arm moved that still return to the start joints (`return_to_start`).
-pub const RETURN_AFTER: [&str; 7] = ["TARGET_LOST", "DETECTION_UNAVAILABLE", "UNSUPPORTED", "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED"];
-/// The views' extreme offsets must stay at least this far apart (m) after fallbacks.
+pub const RETURN_AFTER: [&str; 8] = ["TARGET_LOST", "DETECTION_UNAVAILABLE", "UNSUPPORTED", "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "SOFT_LIMIT_EXCEEDED", "OUT_OF_FRAME"];
+/// A view is refused (`OUT_OF_FRAME`) when the start target box, moved by the predicted shift of
+/// the look-at point, would come closer than this to the image border (px).
+pub const MIN_FRAME_MARGIN_PX: f64 = 8.0;
+/// The two farthest view offsets must stay at least this far apart (m) after fallbacks.
 pub const MIN_EFFECTIVE_BASELINE_M: f64 = 0.02;
 /// Every arm joint within this of the settled position during a capture (rad).
 pub const STILL_RAD: f32 = 0.003;
 pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
 /// A view's target detection: centre at most this far (normalised image units) from where the
-/// start view saw it.
+/// start view saw it, moved by the shift of the look-at point in that view.
 pub const TARGET_MAX_SHIFT_NORM: f64 = 0.2;
 /// The start detection matching `target.box_norm`: IoU at least this.
 pub const TARGET_MIN_IOU: f64 = 0.3;
-/// Feature region: the reference box grown by this fraction of its size on each side plus 16 px.
-const REGION_GROW: f64 = 0.5;
+/// Feature region: the reference box grown by this fraction of its size on each side plus
+/// [`REGION_PAD_PX`].
+const REGION_GROW: f64 = 0.25;
+const REGION_PAD_PX: f64 = 12.0;
 const TRIGGER_WAIT_MS: u64 = 1500;
 const TRIGGERS: usize = 3;
 const YOLO: &[&str] = &["yolo"];
 
 fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.into()).into() }
+
+/// How the camera reaches a view (`motion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    /// Turned about the look-at point X: X stays at the same pixel, the orientation changes.
+    Orbit,
+    /// Moved parallel to the image plane, orientation kept: the object shifts in the image.
+    Translate,
+}
+
+impl Motion {
+    pub fn name(self) -> &'static str { match self { Self::Orbit => "orbit", Self::Translate => "translate" } }
+}
+
+/// Where the view offsets lie (`axes`): along the image x axis, or on a circle in the image plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axes { X, Xy }
+
+impl Axes {
+    pub fn name(self) -> &'static str { match self { Self::X => "x", Self::Xy => "xy" } }
+    /// Allowed `views` and the default.
+    pub fn views(self) -> ([usize; 2], usize) { match self { Self::X => ([MIN_VIEWS, MAX_VIEWS], DEFAULT_VIEWS), Self::Xy => ([3, MAX_VIEWS], MAX_VIEWS) } }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
@@ -85,6 +124,8 @@ pub struct Request {
     pub min_score: f64,
     pub target_box: Option<[f64; 4]>,
     pub target_frame_id: Option<u64>,
+    pub motion: Motion,
+    pub axes: Axes,
     pub views: usize,
     pub baseline_m: f64,
     pub speed_scale: f64,
@@ -102,7 +143,7 @@ fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Res
 pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
     let empty = Map::new();
     let o = match body { Value::Null => &empty, Value::Object(o) => o, _ => return Err(invalid("Command body must be an object")) };
-    const KEYS: [&str; 7] = ["label", "min_score", "target", "views", "baseline_m", "speed_scale", "return_to_start"];
+    const KEYS: [&str; 9] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start"];
     if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) { return Err(invalid(format!("unknown field {k} ({})", KEYS.join(", ")))); }
     let label = match o.get("label") {
         None | Some(Value::Null) => None,
@@ -125,10 +166,23 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         }
         Some(_) => return Err(invalid("target must be an object {box_norm, frame_id?}")),
     };
+    let motion = match o.get("motion") {
+        None | Some(Value::Null) => Motion::Orbit,
+        Some(Value::String(s)) if s == "orbit" => Motion::Orbit,
+        Some(Value::String(s)) if s == "translate" => Motion::Translate,
+        Some(_) => return Err(invalid("motion must be \"orbit\" or \"translate\"")),
+    };
+    let axes = match o.get("axes") {
+        None | Some(Value::Null) => match motion { Motion::Orbit => Axes::X, Motion::Translate => Axes::Xy },
+        Some(Value::String(s)) if s == "x" => Axes::X,
+        Some(Value::String(s)) if s == "xy" => Axes::Xy,
+        Some(_) => return Err(invalid("axes must be \"x\" or \"xy\"")),
+    };
+    let ([lo, hi], default_views) = axes.views();
     let views = match o.get("views") {
-        None | Some(Value::Null) => DEFAULT_VIEWS,
-        Some(v) => v.as_u64().filter(|n| (MIN_VIEWS as u64..=MAX_VIEWS as u64).contains(n))
-            .ok_or_else(|| invalid(format!("views must be an integer in [{MIN_VIEWS}, {MAX_VIEWS}]")))? as usize,
+        None | Some(Value::Null) => default_views,
+        Some(v) => v.as_u64().filter(|n| (lo as u64..=hi as u64).contains(n))
+            .ok_or_else(|| invalid(format!("views must be an integer in [{lo}, {hi}] with axes \"{}\"", axes.name())))? as usize,
     };
     let return_to_start = match o.get("return_to_start") {
         None | Some(Value::Null) => true,
@@ -138,39 +192,87 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
     Ok(Request {
         label,
         min_score: num(o, "min_score", 0.3, 0.0, 1.0)?,
-        target_box, target_frame_id, views,
+        target_box, target_frame_id, motion, axes, views,
         baseline_m: num(o, "baseline_m", DEFAULT_BASELINE_M, BASELINE_M[0], BASELINE_M[1])?,
         speed_scale: num(o, "speed_scale", DEFAULT_SPEED_SCALE, SPEED_SCALE[0], SPEED_SCALE[1])?,
         return_to_start,
     })
 }
 
-/// Chord offsets (m) of `n` views spread evenly over [-baseline/2, +baseline/2].
-pub fn view_offsets(n: usize, baseline_m: f64) -> Vec<f64> {
-    (0..n).map(|i| -baseline_m / 2.0 + baseline_m * i as f64 / (n - 1).max(1) as f64).map(|o| if o.abs() < 1e-9 { 0.0 } else { o }).collect()
+/// View offsets [x, y] (m, image-plane axes of the start camera). `X`: `n` offsets spread evenly
+/// over [-baseline/2, +baseline/2] on x. `Xy`: the start [0, 0] and `n - 1` offsets on the circle
+/// of radius baseline/2 at angles 360 deg * k / (n - 1) from +x (`views` 5: +x, +y, -x, -y).
+pub fn view_offsets(n: usize, baseline_m: f64, axes: Axes) -> Vec<[f64; 2]> {
+    let clean = |v: f64| if v.abs() < 1e-9 { 0.0 } else { v };
+    match axes {
+        Axes::X => (0..n).map(|i| [clean(-baseline_m / 2.0 + baseline_m * i as f64 / (n - 1).max(1) as f64), 0.0]).collect(),
+        Axes::Xy => std::iter::once([0.0, 0.0]).chain((0..n.saturating_sub(1)).map(|k| {
+            let a = 2.0 * std::f64::consts::PI * k as f64 / (n - 1) as f64;
+            [clean(baseline_m / 2.0 * a.cos()), clean(baseline_m / 2.0 * a.sin())]
+        })).collect(),
+    }
 }
 
-/// The order the views are visited from the start pose: the start view (offset 0) first, then
-/// the negative side outward, then the positive side outward.
-pub fn visit_order(offsets: &[f64]) -> Vec<usize> {
+fn is_start(o: &[f64; 2]) -> bool { o[0] == 0.0 && o[1] == 0.0 }
+fn dist2(a: &[f64; 2], b: &[f64; 2]) -> f64 { (a[0] - b[0]).hypot(a[1] - b[1]) }
+
+/// The order the views are visited from the start pose: the start view first; then for offsets on
+/// x the negative side outward and the positive side outward, for offsets on a circle by angle.
+pub fn visit_order(offsets: &[[f64; 2]]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..offsets.len()).collect();
+    let on_x = offsets.iter().all(|o| o[1] == 0.0);
     idx.sort_by(|&a, &b| {
-        let key = |o: f64| (if o == 0.0 { 0 } else if o < 0.0 { 1 } else { 2 }, o.abs());
-        let (ka, kb) = (key(offsets[a]), key(offsets[b]));
+        let key = |o: &[f64; 2]| -> (u8, f64) {
+            if is_start(o) { (0, 0.0) } else if on_x { (if o[0] < 0.0 { 1 } else { 2 }, o[0].abs()) } else { (1, o[1].atan2(o[0]).rem_euclid(2.0 * std::f64::consts::PI)) }
+        };
+        let (ka, kb) = (key(&offsets[a]), key(&offsets[b]));
         ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1))
     });
     idx
 }
 
-/// Offsets to try after `o` was refused, given the offsets already planned or captured.
-pub fn fallback_offsets(o: f64, used: &[f64]) -> Vec<f64> {
-    let mut out = Vec::new();
-    let free = |c: f64, out: &[f64]| c.abs() >= 0.005 && used.iter().chain(out).all(|u| (u - c).abs() > 0.004);
-    if free(-o, &out) { out.push(-o); }
+/// Offsets to try after `o` was refused, given the offsets already planned or captured: the
+/// mirrored one, then 0.75 and 0.5 of it on either side, each when no other view is within 4 mm.
+pub fn fallback_offsets(o: [f64; 2], used: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut out: Vec<[f64; 2]> = Vec::new();
+    let free = |c: [f64; 2], out: &[[f64; 2]]| c[0].hypot(c[1]) >= 0.005 && used.iter().chain(out).all(|u| dist2(u, &c) > 0.004);
+    let m = [-o[0], -o[1]];
+    if free(m, &out) { out.push(m); }
     for s in FALLBACK_SCALES {
-        for c in [o * s, -o * s] { if free(c, &out) { out.push(c); } }
+        for c in [[o[0] * s, o[1] * s], [-o[0] * s, -o[1] * s]] { if free(c, &out) { out.push(c); } }
     }
     out
+}
+
+/// Largest distance between two offsets (the effective baseline).
+pub fn span(offsets: &[[f64; 2]]) -> f64 {
+    offsets.iter().enumerate().flat_map(|(i, a)| offsets[i + 1..].iter().map(move |b| dist2(a, b))).fold(0.0, f64::max)
+}
+
+/// The image-plane axes of the start camera in the base frame: x, y (unit, orthogonal to the ray
+/// from the camera to the pivot for `Orbit`; the camera's own axes for `Translate`).
+pub fn plane_axes(cam: &Camera, pivot: &Vec3, motion: Motion) -> (Vec3, Vec3) {
+    let (xc, yc) = (kinematics::column(&cam.r, 0), kinematics::column(&cam.r, 1));
+    match motion {
+        Motion::Translate => (xc, yc),
+        Motion::Orbit => {
+            let ray = kinematics::unit(&kinematics::sub(pivot, &cam.c));
+            let orth = |v: &Vec3| { let k = kinematics::dot(&ray, v); kinematics::unit(&kinematics::sub(v, &[ray[0] * k, ray[1] * k, ray[2] * k])) };
+            let lx = orth(&xc);
+            (lx, kinematics::cross(&ray, &lx))
+        }
+    }
+}
+
+/// The view pose for `offset` (see [`Motion`]). `axes` from [`plane_axes`].
+pub fn view_pose(pose: &Pose, cam_c: &Vec3, pivot: &Vec3, axes: &(Vec3, Vec3), offset: [f64; 2], motion: Motion) -> Pose {
+    let d = [offset[0] * axes.0[0] + offset[1] * axes.1[0], offset[0] * axes.0[1] + offset[1] * axes.1[1], offset[0] * axes.0[2] + offset[1] * axes.1[2]];
+    let mag = kinematics::norm(&d);
+    if mag == 0.0 { return *pose; }
+    match motion {
+        Motion::Translate => Pose::new(pose.r, kinematics::add(&pose.p, &d)),
+        Motion::Orbit => orbit_pose(pose, cam_c, pivot, &kinematics::unit(&d), mag),
+    }
 }
 
 /// The pose `pose` turned about `pivot` so that the camera centre `cam_c` moves by the chord
@@ -292,17 +394,22 @@ async fn measured(ctx: &MacroCtx) -> (Vec<f32>, bool) {
 
 /// One view's capture.
 struct Capture {
-    offset_m: f64,
+    offset: [f64; 2],
     pose: Pose,
     img: Gray,
     frame_id: u64,
     detections: Vec<Detection>,
+    decode_ms: f64,
+    /// Predicted shift of the look-at point from its start pixel, and the smallest distance of
+    /// the predicted target box to the image border (px).
+    shift_px: [f64; 2],
+    margin_px: f64,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
 
 /// Settle, discard snapshots, take a snapshot and a detection at still joints.
-async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset_m: f64) -> Result<Capture, Stop> {
+async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64) -> Result<Capture, Stop> {
     let until = Instant::now() + Duration::from_secs_f64(MIN_SETTLE_S);
     while Instant::now() < until {
         ctx.check().await?;
@@ -331,10 +438,10 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset_
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
     let size = plan.cam.size;
-    let img = tokio::task::spawn_blocking(move || decode_frame(&jpeg, size)).await
-        .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?
-        .map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
-    Ok(Capture { offset_m, pose, img, frame_id: frame.frame_id, detections: frame.detections })
+    let (img, decode_ms) = tokio::task::spawn_blocking(move || { let t0 = Instant::now(); let r = decode_frame(&jpeg, size); (r, t0.elapsed().as_secs_f64() * 1000.0) }).await
+        .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
+    let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
+    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -348,9 +455,11 @@ fn pick_start(req: &Request, dets: &[Detection]) -> Option<Detection> {
     }
 }
 
-/// The target in another view: same label, nearest to the start view's box centre.
-fn pick_view(target: &Detection, min_score: f64, dets: &[Detection]) -> Option<Detection> {
+/// The target in another view: same label, nearest to the start view's box centre moved by
+/// `shift` (normalised image units).
+fn pick_view(target: &Detection, min_score: f64, dets: &[Detection], shift: [f64; 2]) -> Option<Detection> {
     let c0 = grasp::box_centre(&target.box_norm);
+    let c0 = [c0[0] + shift[0], c0[1] + shift[1]];
     dets.iter().filter(|d| d.score >= min_score && d.label.eq_ignore_ascii_case(&target.label))
         .map(|d| { let c = grasp::box_centre(&d.box_norm); ((c[0] - c0[0]).hypot(c[1] - c0[1]), d) })
         .filter(|(dist, _)| *dist <= TARGET_MAX_SHIFT_NORM)
@@ -401,58 +510,84 @@ fn is_refusal(s: &Stop) -> bool { matches!(s, Stop::Fail(code, _) if PLAN_REFUSA
 fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
 
 /// The `measurement` value of the action (see docs/agent_action_api.md).
-fn measurement_value(caps: &[Capture], target: &Detection, table_z: f64, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
+fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
     table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, fallbacks: &[Value], compute_ms: f64) -> Value {
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let views: Vec<Value> = caps.iter().map(|c| json!({
         "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
-        "frame_id": c.frame_id, "offset_m": r4(c.offset_m),
+        "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
+        "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
     })).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
             "label": target.label, "score": target.score,
             "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
-            "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": (m.yaw_deg * 10.0).round() / 10.0,
-            "n_points": m.n_points, "reproj_rms_px": (m.reproj_rms_px * 100.0).round() / 100.0, "views_used": caps.len(),
+            "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": r1(m.yaw_deg),
+            "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points,
+            "reproj_rms_px": (m.reproj_rms_px * 100.0).round() / 100.0, "views_used": caps.len(),
         })], Value::Null),
         Err(w) => (Vec::new(), json!(w)),
     };
     let mm = |v: Option<f64>| v.map_or(Value::Null, |x| json!((x * 100.0).round() / 100.0));
+    let mut st = serde_json::to_value(stats).unwrap_or(Value::Null);
+    if let Some(o) = st.as_object_mut() {
+        for v in o.values_mut() { if let Some(x) = v.as_f64().filter(|_| !v.is_u64()) { *v = json!((x * 100.0).round() / 100.0); } }
+        o.insert("decode_ms".into(), json!((caps.iter().map(|c| c.decode_ms).sum::<f64>() * 100.0).round() / 100.0));
+    }
+    let offsets: Vec<[f64; 2]> = caps.iter().map(|c| c.offset).collect();
     json!({
         "method": "motion_stereo",
+        "motion": plan.request.motion.name(),
+        "axes": plan.request.axes.name(),
         "objects": objects,
         "table_check": {"n_points": table.n_points, "median_abs_mm": mm(table.median_abs_mm), "p90_abs_mm": mm(table.p90_abs_mm), "median_mm": mm(table.median_mm)},
         "views": views,
         "why": why,
-        "table_z_m": table_z,
-        "baseline_m": r4(caps.iter().map(|c| c.offset_m).fold(f64::NEG_INFINITY, f64::max) - caps.iter().map(|c| c.offset_m).fold(f64::INFINITY, f64::min)),
+        "table_z_m": plan.setup.table_z_m,
+        "baseline_m": r4(span(&offsets)),
         "fallbacks": fallbacks,
-        "stats": stats,
+        "stats": st,
         "compute_ms": compute_ms.round(),
+    })
+}
+
+/// Predicted shift (px) of the look-at point in the view at `goal`, and the smallest distance
+/// (px) of the start target box moved by it to the image border.
+pub fn frame_prediction(cam: &CamModel, goal: &Pose, pivot: &Vec3, start_px: [f64; 2], box_px: [f64; 4]) -> ([f64; 2], f64) {
+    let Some(q) = camera_at(cam, goal).project(pivot) else { return ([f64::NAN; 2], f64::NEG_INFINITY); };
+    let s = [q[0] - start_px[0], q[1] - start_px[1]];
+    let [w, h] = cam.size;
+    let m = (box_px[0] + s[0]).min(box_px[1] + s[1]).min(w - (box_px[2] + s[0])).min(h - (box_px[3] + s[1]));
+    (s, m)
+}
+
+/// The look-at point X: the ray through the target box centre at [`LOOK_AT_ABOVE_TABLE_M`]
+/// above the table (0.35 m along the ray when it does not meet that plane).
+fn look_at(plan: &Plan, pose: &Pose, target: &Detection) -> Vec3 {
+    let centre = plan.cam.to_px(grasp::box_centre(&target.box_norm));
+    plan.cam.plane_point(pose, centre, plan.setup.table_z_m + LOOK_AT_ABOVE_TABLE_M).unwrap_or_else(|| {
+        let c = camera_at(&plan.cam, pose);
+        let d = kinematics::unit(&c.ray(centre));
+        kinematics::add(&c.c, &[0.35 * d[0], 0.35 * d[1], 0.35 * d[2]])
     })
 }
 
 /// Everything after the start capture, until the views are captured.
 async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps: &mut Vec<Capture>, target: &Detection,
-    fallbacks: &mut Vec<Value>) -> Result<(), (Stop, bool)> {
-    let start = &caps[0];
-    let pose0 = start.pose;
+    fallbacks: &mut Vec<Value>, pivot: &Vec3) -> Result<(), (Stop, bool)> {
+    let pose0 = caps[0].pose;
     let cam0 = camera_at(&plan.cam, &pose0);
-    let centre = plan.cam.to_px(grasp::box_centre(&target.box_norm));
-    let table_z = plan.setup.table_z_m;
-    let pivot = plan.cam.plane_point(&pose0, centre, table_z + LOOK_AT_ABOVE_TABLE_M).unwrap_or_else(|| {
-        let d = kinematics::unit(&cam0.ray(centre));
-        kinematics::add(&cam0.c, &[0.35 * d[0], 0.35 * d[1], 0.35 * d[2]])
-    });
-    let ray = kinematics::unit(&kinematics::sub(&pivot, &cam0.c));
-    let xc = kinematics::column(&cam0.r, 0);
-    let lat = kinematics::unit(&kinematics::sub(&xc, &[ray[0] * kinematics::dot(&ray, &xc), ray[1] * kinematics::dot(&ray, &xc), ray[2] * kinematics::dot(&ray, &xc)]));
-    let offsets = view_offsets(plan.request.views, plan.request.baseline_m);
+    let b = target.box_norm;
+    let box_px = [b[0] * plan.cam.size[0], b[1] * plan.cam.size[1], b[2] * plan.cam.size[0], b[3] * plan.cam.size[1]];
+    let start_px = cam0.project(pivot).unwrap_or_else(|| plan.cam.to_px(grasp::box_centre(&b)));
+    let axes = plane_axes(&cam0, pivot, plan.request.motion);
+    let offsets = view_offsets(plan.request.views, plan.request.baseline_m, plan.request.axes);
     let order = visit_order(&offsets);
-    let mut used: Vec<f64> = offsets.clone();
+    let mut used: Vec<[f64; 2]> = offsets.clone();
     let total = order.len() as f32;
     for (k, &i) in order.iter().enumerate() {
         let o = offsets[i];
-        if o == 0.0 { continue; } // the start capture
+        if is_start(&o) { continue; } // the start capture
         ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("view:{k}"), k as f32 / (total + 1.0), None, None);
         let mut candidates = vec![o];
         let mut tried = 0;
@@ -462,25 +597,33 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
             let c = candidates[tried];
             tried += 1;
             recheck(ctx, plan).await.map_err(|s| (s, true))?;
-            let goal = orbit_pose(&pose0, &cam0.c, &pivot, &lat, c);
-            match move_to_goal(ctx, plan, &format!("move:{k}"), goal).await {
+            let goal = view_pose(&pose0, &cam0.c, pivot, &axes, c, plan.request.motion);
+            let (shift, margin) = frame_prediction(&plan.cam, &goal, pivot, start_px, box_px);
+            let moved = if margin < MIN_FRAME_MARGIN_PX {
+                Err((fail("OUT_OF_FRAME", format!("the target would be {margin:.0} px from the image border at offset [{:+.3}, {:+.3}] m (minimum {MIN_FRAME_MARGIN_PX})", c[0], c[1])), false))
+            } else {
+                move_to_goal(ctx, plan, &format!("move:{k}"), goal).await
+            };
+            match moved {
                 Ok(()) => {
                     if c != o {
-                        fallbacks.push(json!({"offset_m": r4(o), "used_offset_m": r4(c), "code": last_refusal.as_ref().map(|s| match s { Stop::Fail(c, _) => c.clone(), Stop::Cancelled => String::new() })}));
-                        used.retain(|u| (u - o).abs() > 1e-9);
+                        fallbacks.push(json!({"offset_m": o.map(r4), "used_offset_m": c.map(r4), "code": last_refusal.as_ref().map(|s| match s { Stop::Fail(c, _) => c.clone(), Stop::Cancelled => String::new() })}));
+                        used.retain(|u| dist2(u, &o) > 1e-9);
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let cap = capture(ctx, plan, src, c).await.map_err(|s| (s, true))?;
-                    if pick_view(target, plan.request.min_score, &cap.detections).is_none() {
-                        return Err((fail("TARGET_LOST", format!("the {} is not detected at the view offset {c:+.3} m", target.label)), true));
+                    let cap = capture(ctx, plan, src, c, shift, margin).await.map_err(|s| (s, true))?;
+                    // where the look-at point is in the captured view (measured joints)
+                    let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
+                    if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
+                        return Err((fail("TARGET_LOST", format!("the {} is not detected at the view offset [{:+.3}, {:+.3}] m", target.label, c[0], c[1])), true));
                     }
                     caps.push(cap);
                     done = true;
                     break;
                 }
                 Err((s, false)) if is_refusal(&s) => {
-                    if let Stop::Fail(code, msg) = &s { tracing::info!("measure_multiview {}: view offset {c:+.3} m refused ({code}: {msg})", ctx.id); }
+                    if let Stop::Fail(code, msg) = &s { tracing::info!("measure_multiview {}: view offset [{:+.3}, {:+.3}] m refused ({code}: {msg})", ctx.id, c[0], c[1]); }
                     if tried == 1 { candidates.extend(fallback_offsets(o, &used)); }
                     last_refusal = Some(s);
                 }
@@ -493,10 +636,9 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
             return Err((s, caps.len() > 1));
         }
     }
-    let lo = caps.iter().map(|c| c.offset_m).fold(f64::INFINITY, f64::min);
-    let hi = caps.iter().map(|c| c.offset_m).fold(f64::NEG_INFINITY, f64::max);
-    if hi - lo < MIN_EFFECTIVE_BASELINE_M {
-        return Err((fail("IK_UNREACHABLE", format!("the reachable view poses span {:.3} m (minimum {MIN_EFFECTIVE_BASELINE_M})", hi - lo)), true));
+    let got: Vec<[f64; 2]> = caps.iter().map(|c| c.offset).collect();
+    if span(&got) < MIN_EFFECTIVE_BASELINE_M {
+        return Err((fail("IK_UNREACHABLE", format!("the reachable view poses span {:.3} m (minimum {MIN_EFFECTIVE_BASELINE_M})", span(&got))), true));
     }
     Ok(())
 }
@@ -505,7 +647,8 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
 fn compute(views: Vec<View>, reference: usize, ref_box_px: [f64; 4], table_z: f64) -> (Result<mview_stereo::ObjectMeasure, &'static str>, mview_stereo::TableCheck, mview_stereo::Stats, f64) {
     let t0 = Instant::now();
     let (w, h) = (ref_box_px[2] - ref_box_px[0], ref_box_px[3] - ref_box_px[1]);
-    let region = [ref_box_px[0] - REGION_GROW * w - 16.0, ref_box_px[1] - REGION_GROW * h - 16.0, ref_box_px[2] + REGION_GROW * w + 16.0, ref_box_px[3] + REGION_GROW * h + 16.0];
+    let region = [ref_box_px[0] - REGION_GROW * w - REGION_PAD_PX, ref_box_px[1] - REGION_GROW * h - REGION_PAD_PX,
+        ref_box_px[2] + REGION_GROW * w + REGION_PAD_PX, ref_box_px[3] + REGION_GROW * h + REGION_PAD_PX];
     let p = Params::new(table_z);
     let rec = mview_stereo::reconstruct(&views, reference, region, ref_box_px, &p);
     let m = mview_stereo::measure(&rec.points, &p);
@@ -552,15 +695,22 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
         Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
     }
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
-    let first = capture(ctx, plan, src, 0.0).await?;
+    let first = capture(ctx, plan, src, [0.0, 0.0], [0.0, 0.0], f64::NAN).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
             if plan.request.target_box.is_some() { " overlapping target.box_norm" } else { "" })));
     };
+    let mut first = first;
+    let pivot = look_at(plan, &first.pose, &target);
+    {
+        let b = target.box_norm;
+        let [w, h] = plan.cam.size;
+        first.margin_px = (b[0] * w).min(b[1] * h).min(w - b[2] * w).min(h - b[3] * h);
+    }
     let mut caps = vec![first];
     let mut fallbacks = Vec::new();
-    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks).await;
+    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks, &pivot).await;
     if let Err((stop, moved)) = views_res {
         // a measurement failure goes back to the start first; a stop, fault, collision, torque
         // limit, lease loss or anything else ends the action where the arm is
@@ -575,9 +725,9 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
         return Err(stop);
     }
     // reference: the view closest to the start pose; its own detection box
-    caps.sort_by(|a, b| a.offset_m.total_cmp(&b.offset_m));
-    let reference = (0..caps.len()).min_by(|&a, &b| caps[a].offset_m.abs().total_cmp(&caps[b].offset_m.abs())).unwrap_or(0);
-    let ref_det = pick_view(&target, plan.request.min_score, &caps[reference].detections).unwrap_or_else(|| target.clone());
+    let reference = (0..caps.len()).min_by(|&a, &b| dist2(&caps[a].offset, &[0.0; 2]).total_cmp(&dist2(&caps[b].offset, &[0.0; 2]))).unwrap_or(0);
+    let shift = plan.cam.to_norm(caps[reference].shift_px);
+    let ref_det = pick_view(&target, plan.request.min_score, &caps[reference].detections, shift).unwrap_or_else(|| target.clone());
     let b = ref_det.box_norm;
     let ref_box_px = [b[0] * plan.cam.size[0], b[1] * plan.cam.size[1], b[2] * plan.cam.size[0], b[3] * plan.cam.size[1]];
     let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
@@ -587,7 +737,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let back = back_to_start(ctx, plan).await;
     let (m, t, stats, ms) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
     tracing::info!("measure_multiview {}: {} views, {stats:?}, {ms:.0} ms, {:?}", ctx.id, caps.len(), m.as_ref().map(|m| m.height_m));
-    let value = measurement_value(&caps, &ref_det, table_z, &m, &t, &stats, &fallbacks, ms);
+    let value = measurement_value(plan, &caps, &ref_det, &m, &t, &stats, &fallbacks, ms);
     ctx.sup.inner().write().await.update_action(ctx.id, |a| a.measurement = Some(value));
     back?;
     Ok(m.err().map(|_| ("TOO_FEW_POINTS".to_string(),
@@ -603,11 +753,19 @@ mod tests {
     fn request_parsing_and_bounds() {
         let r = parse_request(&Value::Null).unwrap();
         assert_eq!((r.views, r.baseline_m, r.speed_scale, r.return_to_start, r.min_score), (3, 0.08, 0.3, true, 0.3));
+        assert_eq!((r.motion, r.axes), (Motion::Orbit, Axes::X));
+        let r = parse_request(&json!({"motion": "translate"})).unwrap();
+        assert_eq!((r.motion, r.axes, r.views), (Motion::Translate, Axes::Xy, 5));
+        let r = parse_request(&json!({"motion": "orbit", "axes": "xy", "views": 3})).unwrap();
+        assert_eq!((r.motion, r.axes, r.views), (Motion::Orbit, Axes::Xy, 3));
+        let r = parse_request(&json!({"motion": "translate", "axes": "x"})).unwrap();
+        assert_eq!((r.axes, r.views), (Axes::X, 3));
         let r = parse_request(&json!({"label": "cup", "target": {"box_norm": [0.1, 0.2, 0.3, 0.4], "frame_id": 7}, "views": 5, "baseline_m": 0.12, "speed_scale": 0.5, "return_to_start": false})).unwrap();
         assert_eq!((r.target_box, r.target_frame_id, r.views, r.return_to_start), (Some([0.1, 0.2, 0.3, 0.4]), Some(7), 5, false));
         for bad in [json!({"views": 1}), json!({"views": 6}), json!({"baseline_m": 0.02}), json!({"baseline_m": 0.13}), json!({"speed_scale": 0.6}),
                     json!({"speed_scale": 0.05}), json!({"target": {"box_norm": [0.3, 0.2, 0.1, 0.4]}}), json!({"target": {"box_norm": [0, 0, 1]}}),
-                    json!({"target": [0, 0, 1, 1]}), json!({"foo": 1}), json!({"return_to_start": 1}), json!({"label": ""}), json!([1])] {
+                    json!({"target": [0, 0, 1, 1]}), json!({"foo": 1}), json!({"return_to_start": 1}), json!({"label": ""}), json!([1]),
+                    json!({"motion": "spin"}), json!({"axes": "z"}), json!({"axes": "xy", "views": 2}), json!({"motion": 1})] {
             let e = crate::api::rest::ApiError::from(parse_request(&bad).unwrap_err());
             assert_eq!(e.code.as_deref(), Some("INVALID_COMMAND"), "{bad}");
         }
@@ -615,19 +773,29 @@ mod tests {
 
     #[test]
     fn offsets_order_and_fallbacks() {
-        assert_eq!(view_offsets(3, 0.08), vec![-0.04, 0.0, 0.04]);
-        assert_eq!(view_offsets(2, 0.08), vec![-0.04, 0.04]);
-        let o5 = view_offsets(5, 0.08);
-        assert!((o5[1] + 0.02).abs() < 1e-12 && o5[2] == 0.0);
+        let x = |v: &[[f64; 2]]| v.iter().map(|o| { assert_eq!(o[1], 0.0); o[0] }).collect::<Vec<f64>>();
+        assert_eq!(x(&view_offsets(3, 0.08, Axes::X)), vec![-0.04, 0.0, 0.04]);
+        assert_eq!(x(&view_offsets(2, 0.08, Axes::X)), vec![-0.04, 0.04]);
+        let o5 = view_offsets(5, 0.08, Axes::X);
+        assert!((o5[1][0] + 0.02).abs() < 1e-12 && o5[2][0] == 0.0);
         assert_eq!(visit_order(&o5), vec![2, 1, 0, 3, 4]);
+        // xy: the start, then +x, +y, -x, -y on the circle of radius B/2, visited by angle
+        let c5 = view_offsets(5, 0.08, Axes::Xy);
+        assert_eq!(c5, vec![[0.0, 0.0], [0.04, 0.0], [0.0, 0.04], [-0.04, 0.0], [0.0, -0.04]]);
+        assert_eq!(visit_order(&c5), vec![0, 1, 2, 3, 4]);
+        assert!((span(&c5) - 0.08).abs() < 1e-12 && (span(&view_offsets(3, 0.08, Axes::X)) - 0.08).abs() < 1e-12);
+        let c4 = view_offsets(4, 0.08, Axes::Xy);
+        assert_eq!(c4.len(), 4);
+        assert!(c4[1..].iter().all(|o| (o[0].hypot(o[1]) - 0.04).abs() < 1e-12));
+        let mm = |f: &[[f64; 2]]| f.iter().map(|o| ((o[0] * 1000.0).round() as i64, (o[1] * 1000.0).round() as i64)).collect::<Vec<_>>();
         // the mirror is in use: the smaller offsets on both sides
-        let f = fallback_offsets(0.04, &[-0.04, 0.0, 0.04]);
-        assert_eq!(f.iter().map(|x| (x * 1000.0).round() as i64).collect::<Vec<_>>(), vec![30, -30, 20, -20]);
+        let used = view_offsets(3, 0.08, Axes::X);
+        assert_eq!(mm(&fallback_offsets([0.04, 0.0], &used)), vec![(30, 0), (-30, 0), (20, 0), (-20, 0)]);
         // views 2 with the mirror free (refused first)
-        let f = fallback_offsets(-0.04, &[0.04]);
-        assert_eq!(f.iter().map(|x| (x * 1000.0).round() as i64).collect::<Vec<_>>(), vec![-30, 30, -20, 20]);
-        let f = fallback_offsets(-0.04, &[-0.04]);
-        assert_eq!((f[0] * 1000.0).round(), 40.0);
+        assert_eq!(mm(&fallback_offsets([-0.04, 0.0], &[[0.04, 0.0]])), vec![(-30, 0), (30, 0), (-20, 0), (20, 0)]);
+        assert_eq!(mm(&fallback_offsets([-0.04, 0.0], &[[-0.04, 0.0]]))[0], (40, 0));
+        // xy: +y refused, -y in use
+        assert_eq!(mm(&fallback_offsets([0.0, 0.04], &c5)), vec![(0, 30), (0, -30), (0, 20), (0, -20)]);
     }
 
     #[test]
@@ -653,6 +821,40 @@ mod tests {
             let along = kinematics::dot(&kinematics::sub(&c.c, &c0.c), &lat);
             assert!(along * o > 0.0 && (along.abs() - o.abs()).abs() < 0.002, "{along}");
             assert!((kinematics::norm(&kinematics::sub(&c.c, &pivot)) - kinematics::norm(&kinematics::sub(&c0.c, &pivot))).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn view_poses_orbit_on_two_axes_and_translate() {
+        let arm = crate::chain::ArmModel::default();
+        let cam = CamModel::assumed(&arm, &GraspSetup::default(), &crate::model::CameraMount::default());
+        let pose = arm.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 0.0]);
+        let c0 = camera_at(&cam, &pose);
+        let centre = [cam.cx, cam.cy];
+        let pivot = cam.plane_point(&pose, centre, 0.02).unwrap();
+        let z = kinematics::norm(&kinematics::sub(&pivot, &c0.c));
+        for o in view_offsets(5, 0.08, Axes::Xy) {
+            // orbit: the pivot stays on its pixel, the chord is |offset|
+            let ax = plane_axes(&c0, &pivot, Motion::Orbit);
+            let c = camera_at(&cam, &view_pose(&pose, &c0.c, &pivot, &ax, o, Motion::Orbit));
+            let px = c.project(&pivot).unwrap();
+            assert!((px[0] - centre[0]).abs() < 1e-6 && (px[1] - centre[1]).abs() < 1e-6, "{o:?} {px:?}");
+            assert!((kinematics::norm(&kinematics::sub(&c.c, &c0.c)) - o[0].hypot(o[1])).abs() < 1e-9);
+            // translate: same orientation, the camera moves by the offset along its own x, y; the
+            // pivot shifts by about fx * offset / z the other way
+            let ax = plane_axes(&c0, &pivot, Motion::Translate);
+            let p = view_pose(&pose, &c0.c, &pivot, &ax, o, Motion::Translate);
+            assert_eq!(p.r, pose.r);
+            let c = camera_at(&cam, &p);
+            let d = kinematics::mat_vec(&kinematics::transpose(&c0.r), &kinematics::sub(&c.c, &c0.c));
+            assert!((d[0] - o[0]).abs() < 1e-12 && (d[1] - o[1]).abs() < 1e-12 && d[2].abs() < 1e-12, "{d:?}");
+            let px = c.project(&pivot).unwrap();
+            assert!((px[0] - centre[0] + cam.fx * o[0] / z).abs() < 0.5 && (px[1] - centre[1] + cam.fy * o[1] / z).abs() < 0.5, "{o:?} {px:?}");
+            // frame margin of a 100 x 60 px box at the centre: 330 - 50 - |shift x|, 180 - 30 - |shift y|
+            let bx = [centre[0] - 50.0, centre[1] - 30.0, centre[0] + 50.0, centre[1] + 30.0];
+            let (sh, m) = frame_prediction(&cam, &p, &pivot, centre, bx);
+            let expect = (cam.size[0] / 2.0 - 50.0 - sh[0].abs()).min(cam.size[1] / 2.0 - 30.0 - sh[1].abs());
+            assert!((m - expect).abs() < 1e-6 && (sh[0].hypot(sh[1]) - cam.fx * o[0].hypot(o[1]) / z).abs() < 0.5, "{sh:?} {m}");
         }
     }
 

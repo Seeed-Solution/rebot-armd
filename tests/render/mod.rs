@@ -21,10 +21,14 @@ pub struct Scene {
     /// A periodic dot pattern (4 mm period in x and y) on the table instead of noise: every
     /// patch repeats along the epipolar lines.
     pub periodic: bool,
+    /// Uniform table (grey 90) instead of texture.
+    pub plain_table: bool,
+    /// Uniform boxes (grey 175, shaded per face) instead of texture.
+    pub plain_boxes: bool,
 }
 
 impl Scene {
-    pub fn new(table_z: f64, boxes: Vec<BoxObj>) -> Self { Self { table_z, boxes, cell_m: 0.003, periodic: false } }
+    pub fn new(table_z: f64, boxes: Vec<BoxObj>) -> Self { Self { table_z, boxes, cell_m: 0.003, periodic: false, plain_table: false, plain_boxes: false } }
 }
 
 fn hash(ix: i64, iy: i64, seed: u64) -> f64 {
@@ -61,7 +65,7 @@ fn trace(scene: &Scene, o: &Vec3, d: &Vec3) -> Option<(f64, f64)> {
         if t > 0.0 {
             let (x, y) = (o[0] + t * d[0], o[1] + t * d[1]);
             let k = 2.0 * std::f64::consts::PI / 0.004;
-            let g = if scene.periodic { 128.0 + 100.0 * (k * x).sin() * (k * y).sin() } else { texture(x, y, scene.cell_m, 1) };
+            let g = if scene.plain_table { 90.0 } else if scene.periodic { 128.0 + 100.0 * (k * x).sin() * (k * y).sin() } else { texture(x, y, scene.cell_m, 1) };
             best = Some((t, g));
         }
     }
@@ -92,7 +96,8 @@ fn trace(scene: &Scene, o: &Vec3, d: &Vec3) -> Option<(f64, f64)> {
         let (u, v) = match axis { 0 => (p[1], p[2]), 1 => (p[0], p[2]), _ => (p[0], p[1]) };
         // faces slightly brighter / darker than each other
         let shade = [0.92, 0.85, 1.0][axis];
-        best = Some((t0, 20.0 + shade * (texture(u, v, scene.cell_m, face_seed) - 20.0)));
+        let base = if scene.plain_boxes { 175.0 } else { texture(u, v, scene.cell_m, face_seed) };
+        best = Some((t0, 20.0 + shade * (base - 20.0)));
     }
     best
 }
@@ -180,4 +185,33 @@ pub fn box_px(scene: &Scene, b: &BoxObj, cam: &Camera) -> [f64; 4] {
         if let Some(q) = cam.project(&p) { r = [r[0].min(q[0]), r[1].min(q[1]), r[2].max(q[0]), r[3].max(q[1])]; }
     }
     r
+}
+
+/// `cam` moved by `offset` = [x, y] (m) along its own image x and y axes, orientation kept.
+pub fn translate(cam: &Camera, offset: [f64; 2]) -> Camera {
+    let (x, y) = (kinematics::column(&cam.r, 0), kinematics::column(&cam.r, 1));
+    Camera { c: [cam.c[0] + offset[0] * x[0] + offset[1] * y[0], cam.c[1] + offset[0] * x[1] + offset[1] * y[1], cam.c[2] + offset[0] * x[2] + offset[1] * y[2]], ..*cam }
+}
+
+/// `cam` turned about `pivot` so that its centre moves by the chord |offset| along offset = [x, y]
+/// in its image plane (the pivot stays at the same pixel).
+pub fn orbit_xy(cam: &Camera, pivot: Vec3, offset: [f64; 2]) -> Camera {
+    let mag = offset[0].hypot(offset[1]);
+    if mag == 0.0 { return *cam; }
+    let rel = kinematics::sub(&cam.c, &pivot);
+    let d = kinematics::norm(&rel);
+    let ray = kinematics::unit(&kinematics::sub(&pivot, &cam.c));
+    let (xc, yc) = (kinematics::column(&cam.r, 0), kinematics::column(&cam.r, 1));
+    let dir = [offset[0] * xc[0] + offset[1] * yc[0], offset[0] * xc[1] + offset[1] * yc[1], offset[0] * xc[2] + offset[1] * yc[2]];
+    let k = kinematics::dot(&ray, &dir);
+    let lat = kinematics::unit(&kinematics::sub(&dir, &[ray[0] * k, ray[1] * k, ray[2] * k]));
+    let axis = kinematics::unit(&kinematics::cross(&lat, &ray));
+    let r = kinematics::axis_r(&axis, 2.0 * (mag / (2.0 * d)).asin());
+    Camera { r: kinematics::mat_mul(&r, &cam.r), c: kinematics::add(&pivot, &kinematics::mat_vec(&r, &rel)), ..*cam }
+}
+
+/// First surface point the ray through pixel `px` of `cam` hits.
+pub fn hit(scene: &Scene, cam: &Camera, px: [f64; 2]) -> Option<Vec3> {
+    let d = cam.ray(px);
+    trace(scene, &cam.c, &d).map(|(t, _)| [cam.c[0] + t * d[0], cam.c[1] + t * d[1], cam.c[2] + t * d[2]])
 }
