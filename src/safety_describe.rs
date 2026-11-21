@@ -231,6 +231,7 @@ impl SupervisorInner {
                         "torque_margin_ratio": crate::torque_guard::TORQUE_RETREAT_MARGIN_RATIO,
                         "lag_rad": crate::torque_guard::TORQUE_RETREAT_LAG_RAD,
                     },
+                    "backoff_rad": crate::torque_guard::TORQUE_HOLD_BACKOFF_RAD,
                     "invalidates_commands": false,
                     "clear": ["move_joint_away_from_push_direction"],
                 }));

@@ -16,7 +16,7 @@ use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, J
 use armd::model::{ArmConfig, JointState, MotionLimitReason};
 use armd::recording::{write_frames_to_parquet, RecordFrame};
 use armd::replay::ReplayRequest;
-use armd::torque_guard::{TorqueGuardInfo, TorqueGuardPolicy, TORQUE_HOLD_RELEASE_RAD};
+use armd::torque_guard::{TorqueGuardInfo, TorqueGuardPolicy, TORQUE_HOLD_BACKOFF_RAD, TORQUE_HOLD_RELEASE_RAD};
 use armd::{ArmObservation, FaultCode, SafetyState, SupervisorInner};
 use common::INSPECT;
 
@@ -210,7 +210,7 @@ fn servo_push_into_a_stop_holds_within_persist_plus_one_tick() {
     assert!(inner.servo_target.is_none() && inner.active_trajectory.is_none(), "stream ended");
     let obs = ticks(&mut inner, 2);
     assert!(obs.torques[J4].abs() < THR_WRIST * 0.5, "torque after the hold {}", obs.torques[J4]);
-    assert!((obs.commanded_positions[J4] - stop).abs() < 1e-4, "held at the measured position {}", obs.commanded_positions[J4]);
+    assert!((obs.commanded_positions[J4] - (stop - TORQUE_HOLD_BACKOFF_RAD)).abs() < 1e-4, "held backed off from the measured position {}", obs.commanded_positions[J4]);
     assert!(obs.safety_state.is_operational() && obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
     assert_eq!(torque_limit(&obs), Some(J4));
     let json = serde_json::to_value(&obs.motion_limit).unwrap();
@@ -271,7 +271,7 @@ fn backing_out_is_allowed_pushing_in_stays_held() {
     t[J4] -= 0.3;
     inner.jog_action(t, None, None, "joint_move").unwrap();
     let obs = ticks(&mut inner, 100);
-    assert!((obs.commanded_positions[J4] - (stop - 0.3)).abs() < 1e-3, "jogged out to {}", obs.commanded_positions[J4]);
+    assert!((obs.commanded_positions[J4] - (stop - TORQUE_HOLD_BACKOFF_RAD - 0.3)).abs() < 1e-3, "jogged out to {}", obs.commanded_positions[J4]);
     assert!(inner.torque_guard.hold.is_none());
 }
 
@@ -414,7 +414,7 @@ fn j4_incident_ramp_trips_before_9_5_is_held_100_ms() {
         if t_trip.is_none() && torque_limit(&obs) == Some(J4) {
             t_trip = Some(t_ms);
             assert!(obs.safety_state.is_operational() && obs.is_torqued);
-            assert!((obs.commanded_positions[J4] - INSPECT[J4]).abs() < 1e-4);
+            assert!((obs.commanded_positions[J4] - (INSPECT[J4] - TORQUE_HOLD_BACKOFF_RAD)).abs() < 1e-4);
         }
     }
     let (t_over, t_peak, t_trip) = (t_over.unwrap(), t_peak.unwrap(), t_trip.expect("tripped"));
@@ -463,3 +463,4 @@ fn bus_loss_then_motors_back_enabled_is_unchanged() {
     inner.clear_fault().unwrap();
     assert!(ticks(&mut inner, 2).is_torqued);
 }
+

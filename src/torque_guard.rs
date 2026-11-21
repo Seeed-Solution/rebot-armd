@@ -50,6 +50,14 @@ pub const TORQUE_RETREAT_TURN_RAD: f32 = 0.001;
 /// or Cartesian move that pushes into the load again). At the 650 N·m/rad contact of the
 /// reproduction 2 mrad is 1.2 N·m.
 pub const TORQUE_PUSH_IN_RAD: f32 = 0.002;
+/// After a trip the held joint is commanded this far (rad) back from the measured trip
+/// position, in the relieving direction, so that it does not keep pressing at the trip
+/// torque. Bounded: a repeated trip on the same joint and sign never backs off further than
+/// this from the first trip position, and never moves a joint that was pushed back further
+/// than this toward the load. 5 mrad is 1.5 mm at 0.3 m from J2; position control stays
+/// on, so it is a bounded position step, not a release (the trip itself steps the command
+/// back by the tracking lag, 65 mrad in the 2026-11-21 incident).
+pub const TORQUE_HOLD_BACKOFF_RAD: f32 = 0.005;
 
 /// Accepted range of `torque_guard.ratio`.
 pub const MIN_RATIO: f32 = 0.3;
@@ -135,7 +143,7 @@ pub struct TorqueHold {
     /// Observation-clock time of the trip.
     pub since_s: f64,
     /// Measured position of the joint at the first trip of this hold (same joint and sign);
-    /// reference for the push-in check.
+    /// reference for the push-in check and the back-off bound.
     pub anchor_q: f32,
     /// This hold was entered because a motion pushed past the trip position.
     pub push_in: bool,
@@ -160,6 +168,15 @@ pub enum Retreat {
 impl TorqueHold {
     /// Relief coordinate of `q`: (q - hold_q) x sign; negative = away from the load.
     pub fn relief(&self, q: f32) -> f32 { (q - self.hold_q) * self.sign }
+
+    /// Hold command of the held joint after a trip at measured position `q_meas`:
+    /// [`TORQUE_HOLD_BACKOFF_RAD`] back from it in the relieving direction, never further
+    /// than that from `anchor_q`, and never toward the load from `q_meas`.
+    pub fn backed_off(&self, q_meas: f32) -> f32 {
+        let r = (q_meas - self.anchor_q) * self.sign;
+        let r_hold = (r - TORQUE_HOLD_BACKOFF_RAD).max(-TORQUE_HOLD_BACKOFF_RAD).min(r);
+        self.anchor_q + r_hold * self.sign
+    }
 }
 
 /// Runtime guard state kept in the supervisor.
@@ -302,7 +319,8 @@ impl SupervisorInner {
     }
 
     /// Trip on joint `j`: fail the running action with `TORQUE_LIMIT`, end every motion and
-    /// hold the measured pose with torque on (gripper keeps its command).
+    /// hold the measured pose with torque on (gripper keeps its command), the held joint
+    /// backed off by [`TORQUE_HOLD_BACKOFF_RAD`] in the relieving direction.
     fn torque_trip(&mut self, j: usize, torque: f32, threshold: f32, p: &TorqueGuardPolicy, again: bool) {
         let tmax = threshold / p.ratio;
         let push_in = self.torque_guard.hold.is_some_and(|h| h.push_in);
@@ -327,6 +345,12 @@ impl SupervisorInner {
         self.hold_measured_pose();
         self.note_motion_limit(MotionLimitReason::Torque, Some(j));
         if let Some(h) = self.torque_guard.hold.as_mut() {
+            let l = &self.config.limits[j];
+            let q = self.measured_positions[j];
+            if q.is_finite() {
+                self.commanded_positions[j] = h.backed_off(q).clamp(l.min_position, l.max_position);
+                self.target_positions[j] = self.commanded_positions[j];
+            }
             h.hold_q = self.commanded_positions[j];
         }
     }
