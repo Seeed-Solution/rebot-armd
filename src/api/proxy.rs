@@ -521,9 +521,23 @@ pub const DEFAULT_SNAPSHOT_PORT: u16 = 8001;
 /// port [`DEFAULT_SNAPSHOT_PORT`]: the current camera JPEG from armd's origin, so the cockpit can
 /// read its pixels (the fingertip sticker measurement of the calibration wizard).
 pub async fn get_camera_snapshot(Extension(up): Extension<DetectorUpstream>) -> Response {
+    forward(&snapshot_upstream(&up), Method::GET, "/snapshot.jpg".into(), None, Duration::from_secs(3)).await
+}
+
+/// rebot-vision's video server: the detector's host, port [`DEFAULT_SNAPSHOT_PORT`] or `ARMD_SNAPSHOT_PORT`.
+pub(crate) fn snapshot_upstream(up: &DetectorUpstream) -> DetectorUpstream {
     let port = std::env::var("ARMD_SNAPSHOT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_SNAPSHOT_PORT);
-    let snap = DetectorUpstream { host: up.host.clone(), port, base_path: String::new() };
-    forward(&snap, Method::GET, "/snapshot.jpg".into(), None, Duration::from_secs(3)).await
+    DetectorUpstream { host: up.host.clone(), port, base_path: String::new() }
+}
+
+/// One `GET /snapshot.jpg` for armd's own use (the multi-view measurement): the JPEG bytes of a
+/// 2xx reply; non-2xx, unreachable or timed out is an error.
+pub(crate) async fn fetch_snapshot(up: &DetectorUpstream, timeout: Duration) -> Result<Vec<u8>, String> {
+    let r = tokio::time::timeout(timeout, upstream_request(&snapshot_upstream(up), Method::GET, "/snapshot.jpg", None))
+        .await
+        .map_err(|_| "snapshot timed out".to_string())??;
+    if !r.status.is_success() { return Err(format!("snapshot returned {}", r.status)); }
+    Ok(r.body)
 }
 
 /// GET /api/v1/detection/mask_focus -> upstream GET /api/mask_focus
