@@ -317,5 +317,11 @@ const solveViews = views;
   const bd = CW.makeBoard(), svg = CW.boardSvg(bd);
   check('board SVG', svg.startsWith('<svg') && (svg.match(/fill="#000"/g) || []).length >= 12 && svg.includes('100 mm') && Math.abs(bd.width - 0.115) < 1e-9 && Math.abs(bd.height - 0.085) < 1e-9 && bd.byId.get(3).row === 0 && bd.byId.get(3).col === 3, `${svg.length} bytes, ${bd.cols} x ${bd.rows}, ${(bd.width * 1000).toFixed(0)} x ${(bd.height * 1000).toFixed(0)} mm board, id 3 at row 0 col 3: ${bd.byId.get(3).row},${bd.byId.get(3).col}`);
 }
+// ---- the cockpit ArUco overlay's expected ids (ARU_BOARD_IDS in index.html) are the default board's ids 0..n-1
+{
+  const bd = CW.makeBoard(), m = html.match(/const ARU_BOARD_IDS = (\d+);/), n = m ? Number(m[1]) : NaN;
+  const ids = bd.markers.map((x) => x.id).sort((a, b) => a - b);
+  check('overlay board ids', n === bd.cols * bd.rows && ids.every((id, i) => id === i) && ids.length === n, `ARU_BOARD_IDS ${n}, board ${bd.cols} x ${bd.rows}, ids ${ids[0]}..${ids.at(-1)}`);
+}
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);
