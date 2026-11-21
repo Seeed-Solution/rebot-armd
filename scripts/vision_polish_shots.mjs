@@ -8,6 +8,8 @@
 //   - grasp setup drawer: the tilt field shows 1 decimal; Save without an edit sends no camera_tilt_deg
 //   - camera_down true: the grip point reads "not used: camera-down acquisition", the pick button is
 //     hidden and no grip ring is drawn; camera_down false: the value, the pick button and the ring
+//   - vision mode selector: with the provider's global mode "yolo" and this page's overlay off, the
+//     selector reads "Show: Off" (it is this page's overlay, not the device mode)
 // Writes PNGs (default .cache/vision-polish-shots/).
 import fs from 'node:fs';
 import http from 'node:http';
@@ -110,8 +112,8 @@ const shots = [];
 let bad = 0, checks = 0;
 const check = (name, ok, d = '') => { checks++; if (!ok) { bad++; console.log(`  FAIL ${name} ${d}`); } };
 const T = {
-  zh: { cd: '未使用：相机朝下对准', gset: '抓取设置' },
-  en: { cd: 'Not used: camera-down acquisition', gset: 'Grasp setup' },
+  zh: { cd: '未使用：相机朝下对准', gset: '抓取设置', show: '显示', off: '关', aria: '本页画面显示' },
+  en: { cd: 'Not used: camera-down acquisition', gset: 'Grasp setup', show: 'Show', off: 'Off', aria: 'Shown on this page' },
 };
 const noHScroll = (page) => page.evaluate(() => ({ sw: document.scrollingElement.scrollWidth, iw: window.innerWidth }));
 const sent = (page, p) => page.evaluate((p) => window.__sent.filter((m) => m.type === 'command' && m.path === p), p);
@@ -146,6 +148,15 @@ for (const [ui, lang, vp] of combos) {
   await page.goto(base + (ui === 'expert' ? '?ui=expert' : ''), { waitUntil: 'domcontentloaded' });
   await page.evaluate(feed, [SETUP, true]);
   await page.waitForTimeout(700);
+
+  // 3. vision mode selector: global mode yolo, overlay off -> "Show" + Off
+  await openVis(page);
+  const vm = await page.evaluate(() => {
+    const w = document.getElementById('vmode'), k = document.getElementById('vm-k'), r = k.getBoundingClientRect();
+    return { prefix: !k.hidden && r.width > 0 ? k.textContent : null, aria: w.getAttribute('aria-label'), on: [...w.querySelectorAll('button.on')].map((b) => b.textContent), mode: VM.mode };
+  });
+  check(`${tag} selector reads as this page's overlay`, vm.mode === 'yolo' && vm.prefix === L.show && vm.aria === L.aria && vm.on.join() === L.off, JSON.stringify(vm));
+  await closeVis(page);
 
   // 1 + 2. grasp setup drawer, camera-down acquisition (calibrated 38 deg mount)
   await page.evaluate(() => graspLoadSetup(true));

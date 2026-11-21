@@ -4,7 +4,7 @@
 // Serves src/api/index.html with a stateful mock of rebot-vision 1.3 (perception API 2:
 // /api/v1/vision/mode, /subscribe, /subscribe/<id>/keepalive, DELETE /subscribe/<id>, /detection/trigger)
 // and /api/v1/detection/inference. For simple / expert x zh / en x 1280x800 / 375x812 it checks the
-// selector (Off / YOLO / ArUco / Both): choosing a set creates this page's overlay subscription
+// selector (Off / YOLO / ArUco / Both, prefixed "Show" under API 2): choosing a set creates this page's overlay subscription
 // (kept alive, updated in place on a new choice, deleted on Off, on Detect off and while the page is
 // hidden) and never POSTs the global mode; single shot sends the selected pipelines; a "both" payload
 // draws YOLO boxes and ArUco markers together; YOLO choices are disabled without a model; an API 1
@@ -107,9 +107,12 @@ const shots = [];
 let bad = 0, checks = 0;
 const check = (name, ok, d = '') => { checks++; if (!ok) { bad++; console.log(`  FAIL ${name} ${d}`); } };
 const T = { zh: ['关', 'YOLO', 'ArUco', '两者'], en: ['Off', 'YOLO', 'ArUco', 'Both'] };
+// perception API 2: the selector is this page's overlay ("Show" prefix); API 1: the device mode (no prefix)
+const P = { zh: ['显示', '本页画面显示', '视觉模式'], en: ['Show', 'Shown on this page', 'Vision mode'] };
 const hud = (page) => page.evaluate(() => {
   const w = document.getElementById('vmode'), r = w.getBoundingClientRect(), vb = document.getElementById('video-box').getBoundingClientRect();
-  return { shown: !w.closest('[hidden]') && r.width > 0, labels: [...w.querySelectorAll('button')].map((b) => b.textContent),
+  const k = document.getElementById('vm-k'), kr = k.getBoundingClientRect();
+  return { shown: !w.closest('[hidden]') && r.width > 0, prefix: !k.hidden && kr.width > 0 ? k.textContent : null, aria: w.getAttribute('aria-label'), labels: [...w.querySelectorAll('button')].map((b) => b.textContent),
     on: [...w.querySelectorAll('button.on')].map((b) => b.dataset.vm), disabled: [...w.querySelectorAll('button:disabled')].map((b) => b.dataset.vm),
     inside: r.left >= vb.left - 1 && r.right <= vb.right + 1, det: document.getElementById('btn-det').textContent,
     sw: document.scrollingElement.scrollWidth, iw: window.innerWidth };
@@ -143,6 +146,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await openVis(page);
   let h = await hud(page);
   check(`${tag} selector`, h.shown && JSON.stringify(h.labels) === JSON.stringify(T[lang]) && h.on.join() === 'off' && h.inside, JSON.stringify(h));
+  check(`${tag} show prefix`, h.prefix === P[lang][0] && h.aria === P[lang][1], JSON.stringify(h));
   check(`${tag} standby`, SUBS.size === 0 && subCalls().length === 0, JSON.stringify(CALLS));
   let file = path.join(out, `vision_standby_${tag}.png`); await page.screenshot({ path: file }); shots.push(file);
 
@@ -207,6 +211,9 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.evaluate(() => window.__vision.vmRefresh()); await page.waitForTimeout(150);
   await openVis(page); await page.click('#vmode button[data-vm="both"]'); await page.waitForTimeout(300);
   check(`${tag} api1 mode post`, JSON.stringify(POSTS.at(-1)) === JSON.stringify({ mode: 'both', enabled: true }) && V.enabled, JSON.stringify(POSTS));
+  await openVis(page);
+  h = await hud(page);
+  check(`${tag} api1 no prefix`, h.prefix === null && h.aria === P[lang][2] && h.on.join() === 'both', JSON.stringify(h));
 
   // 8. provider without /api/mode: selector hidden, Detect stays
   V.route = false;
