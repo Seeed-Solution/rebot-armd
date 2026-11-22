@@ -1123,3 +1123,16 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
     for _ in 0..5 { inner.tick(DT); }
     assert!(!inner.mit_active(), "re-activated without a passed gate");
 }
+
+/// Review round 3, #9: a deadline trip during a hand back (rollback then unconfirmed) is a loss:
+/// BUS_LOSS is latched, not a hardware fault; a trip seen after the group was already cancelled
+/// for another reason still latches BUS_LOSS.
+#[test]
+fn mit_trip_during_hand_back_latches_bus_loss() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    bus.with(|s| s.motors[3].silent_after_mode_ack = true); // ACK, then nothing: J4 goes stale
+    inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
+    inner.tick(DT);
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::BusLoss), "{:?}", inner.safety.fault());
+}

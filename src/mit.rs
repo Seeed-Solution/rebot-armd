@@ -709,7 +709,26 @@ impl crate::supervisor::SupervisorInner {
 
     /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
     /// and the gap since the last flushed dynamic batch, each against [`MIT_DEADLINE`].
+    /// Fault code of a cancelled group: BUS_LOSS when the driver's deadline fence tripped (a
+    /// transport loss, wherever it was detected), otherwise a hardware fault (mode uncertain).
+    fn mit_loss_code(&self) -> crate::safety::FaultCode {
+        let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).is_some_and(|drv| drv.mit_fence_trip().is_some());
+        if tripped { crate::safety::FaultCode::BusLoss } else { crate::safety::FaultCode::HardwareFault }
+    }
+
     pub(crate) fn mit_supervise(&mut self) {
+        if self.mit.owner == MitOwner::Lost {
+            // a trip seen after the group was cancelled for another reason is still a loss
+            let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.mit_fence_trip());
+            let code = self.safety.fault().map(|f| f.code);
+            if let Some(t) = tripped {
+                if code != Some(crate::safety::FaultCode::BusLoss) && code != Some(crate::safety::FaultCode::Estop) {
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::BusLoss,
+                        crate::safety::FaultReason::Other(format!("MIT_LOST: driver deadline fence: {t}")));
+                }
+            }
+            return;
+        }
         if self.mit.owner != MitOwner::Active { return; }
         let (trip, ages) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
             Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
@@ -815,7 +834,8 @@ impl crate::supervisor::SupervisorInner {
                 self.tracking.invalidate();
                 if uncertain {
                     self.mit.joints = joints;
-                    self.mit_lose(format!("MIT handover failed and the switch back is not confirmed: {e}"), crate::safety::FaultCode::HardwareFault);
+                    let code = self.mit_loss_code();
+                    self.mit_lose(format!("MIT handover failed and the switch back is not confirmed: {e}"), code);
                 }
             }
         }
@@ -854,7 +874,8 @@ impl crate::supervisor::SupervisorInner {
             Err(e) => {
                 let msg = format!("MIT hand back ({why}) failed: {e}");
                 if uncertain {
-                    self.mit_lose(msg.clone(), crate::safety::FaultCode::HardwareFault);
+                    let code = self.mit_loss_code();
+                    self.mit_lose(msg.clone(), code);
                 } else {
                     // switched back to MIT with the hold: still the owner
                     self.mit.last_output = Some(std::time::Instant::now());
