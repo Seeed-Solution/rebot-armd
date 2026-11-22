@@ -3658,3 +3658,54 @@ fn tracking_rejection_fallback_brakes_over_ticks_within_acceleration() {
         }
     }
 }
+
+/// Review 3 M3: during park (`NormalUnload`) the rejection fallback is validated against
+/// the park keep-out-only workspace with the park escape depths (evaluated before
+/// `hold_measured_pose` clears the park state) and commits into the park depths without
+/// overwriting the full-workspace depths.
+#[test]
+fn tracking_park_rejection_fallback_keeps_park_workspace_and_depths() {
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    jt.joints[0].lag_s = 0.68;
+    let mut cfg = ArmConfig { lease_timeout_ms: 600_000, joint_tracking: Some(jt), ..ArmConfig::rebot_dm() };
+    cfg.torque_guard = None;
+    let q0 = INSPECT;
+    let mut q_box = q0;
+    q_box[0] += 0.004;
+    let p_box = cfg.arm_model.fk_f32(&q_box).unwrap().p;
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+
+    // Issued J1 0.008 rad ahead of measured q0, nominal park reference 0.012 ahead; a small
+    // keep-out box sits between measured and issued, so the ramp-out's measured segment fails.
+    let mut pq = q0.to_vec();
+    pq[0] += 0.008;
+    inner.tracking.record_issued(pq.clone(), vec![0.0; 7]);
+    let half = 0.0008_f32;
+    let ws = inner.config.workspace.as_mut().unwrap();
+    ws.keepout_boxes.push(KeepoutBox {
+        name: "between".into(),
+        min_m: [p_box[0] as f32 - half, p_box[1] as f32 - half, p_box[2] as f32 - half],
+        max_m: [p_box[0] as f32 + half, p_box[1] as f32 + half, p_box[2] as f32 + half],
+    });
+    inner.workspace_revision += 1;
+    inner.pending_normal_unload = true;
+    inner.commanded_positions[0] = q0[0] + 0.012;
+    inner.target_positions = inner.commanded_positions.clone();
+    let full_depths_before = inner.tracking.ws_min_depths.clone().map(|(rev, d)| (rev, d.as_slice().to_vec()));
+
+    let idx0 = drv.with(|s| s.written.len());
+    inner.tick(DT);
+    let frames = drv.with(|s| s.written[idx0..].to_vec());
+    assert_eq!(frames.len(), 1, "the park fallback step must be sent");
+    assert_eq!(frames[0][0].position.to_bits(), pq[0].to_bits(), "fallback brakes at the last issued J1 output");
+    assert!(
+        inner.tracking.ws_keepout_min_depths.is_some(),
+        "the park fallback must commit the park keep-out escape depths"
+    );
+    assert_eq!(
+        inner.tracking.ws_min_depths.clone().map(|(rev, d)| (rev, d.as_slice().to_vec())),
+        full_depths_before,
+        "the park fallback must not overwrite the full-workspace escape depths"
+    );
+}

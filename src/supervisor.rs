@@ -1283,21 +1283,31 @@ impl SupervisorInner {
         self.servo_blocked_hold = true;
     }
 
-    /// End every motion and hold the measured pose (clamped to the limits) with torque on;
-    /// the gripper keeps its command so that a held object stays held.
-    pub(crate) fn hold_measured_pose(&mut self) {
-        let gripper_idx = self.config.gripper_index();
-        let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
-        self.stop_motion();
-        self.servo_stream_active = false;
-        self.tracking.invalidate();
+    /// The command `hold_measured_pose` holds: the measured pose clamped to the limits
+    /// (the current command when a measurement is not finite), the gripper keeping its command.
+    pub(crate) fn measured_hold_pose(&self) -> Vec<f32> {
+        let mut hold = self.commanded_positions.clone();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
+            for (i, (c, m)) in hold.iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
                 *c = m.clamp(l.min_position, l.max_position);
             }
         }
-        if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) { self.commanded_positions[g] = c; }
+        if let Some(g) = self.config.gripper_index() {
+            if let (Some(c), Some(&cmd)) = (hold.get_mut(g), self.commanded_positions.get(g)) {
+                *c = cmd;
+            }
+        }
+        hold
+    }
+
+    /// End every motion and hold the measured pose (clamped to the limits) with torque on;
+    /// the gripper keeps its command so that a held object stays held.
+    pub(crate) fn hold_measured_pose(&mut self) {
+        self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        self.commanded_positions = self.measured_hold_pose();
         self.target_positions = self.commanded_positions.clone();
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
@@ -4183,18 +4193,17 @@ impl SupervisorInner {
         Some((q_next64 as f32, v_final64 as f32, reached))
     }
 
-    /// Write one rejection-fallback step (`tracking_fallback_step`) and keep the braking
-    /// ramp toward `hold` going while the output is not at rest. When no step is feasible,
+    /// Write one rejection-fallback step (`tracking_fallback_compute`) and keep the braking
+    /// ramp going while the output is not at rest. When no step is feasible,
     /// latch a fault and send no frame this tick; the command stays on the last issued
     /// output so the following fault-hold frames repeat what the motors already hold.
     /// Returns a driver write error.
     fn apply_tracking_fallback_step(
         &mut self,
-        step: Result<crate::tracking::ValidatedFallback, String>,
-        hold: Vec<f32>,
-        prev_confirmed: Option<&[f32]>,
+        pending: crate::tracking::PendingFallback,
         gravity_output_enabled: bool,
     ) -> Option<String> {
+        let crate::tracking::PendingFallback { step, ramp, prev_confirmed, other_depths } = pending;
         match step {
             Ok(fb) => {
                 self.commanded_positions = fb.positions.clone();
@@ -4229,8 +4238,15 @@ impl SupervisorInner {
                         if done {
                             self.commanded_velocities.fill(0.0);
                         }
-                        self.tracking.record_issued_with_ws(fb.positions, fb.velocities, fb.ws_min_depths);
-                        self.tracking.fallback_ramp = (!done).then_some(hold);
+                        // Commit the step's escape depths to the workspace it was checked
+                        // against; the other workspace's depths stay as they were.
+                        let (full, park) = if ramp.keepout_only {
+                            (other_depths, fb.ws_min_depths)
+                        } else {
+                            (fb.ws_min_depths, other_depths)
+                        };
+                        self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
+                        self.tracking.fallback_ramp = (!done).then_some(ramp);
                         None
                     }
                     Some(Err(e)) => {
@@ -4245,7 +4261,7 @@ impl SupervisorInner {
             }
             Err(why) => {
                 tracing::error!("Joint tracking fallback cannot brake within the limits ({why}): no frame sent");
-                if let Some(pq) = prev_confirmed.filter(|p| p.len() == self.commanded_positions.len()) {
+                if let Some(pq) = prev_confirmed.as_deref().filter(|p| p.len() == self.commanded_positions.len()) {
                     let gripper_idx = self.config.gripper_index();
                     for (i, (c, &p)) in self.commanded_positions.iter_mut().zip(pq).enumerate() {
                         if Some(i) != gripper_idx {
@@ -5481,27 +5497,11 @@ impl SupervisorInner {
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
                 } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
-                    let hold = self.tracking.fallback_ramp.clone().unwrap_or_default();
+                    let ramp = self.tracking.fallback_ramp.clone().expect("checked above");
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let prev_confirmed = self.tracking.last_issued_positions.clone();
-                    let prev_velocities = self.tracking.last_issued_velocities.clone();
-                    let prev_ws_min_depths = self.tracking.ws_min_depths.clone();
-                    let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
-                        && self.measured_positions.len() == self.config.dof
-                        && self.measured_positions.iter().all(|q| q.is_finite());
-                    let step = self.tracking_fallback_step(
-                        prev_confirmed.as_deref(),
-                        prev_velocities.as_deref(),
-                        prev_ws_min_depths.as_ref(),
-                        &hold,
-                        servo_dt,
-                        &active_limits,
-                        fresh_meas,
-                        &mut tick_sweep_budget,
-                    );
-                    output_error =
-                        self.apply_tracking_fallback_step(step, hold, prev_confirmed.as_deref(), gravity_output_enabled);
+                    let pending = self.tracking_fallback_compute(ramp, servo_dt, &active_limits, &mut tick_sweep_budget);
+                    output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else if ramp_out_handover || tracking_owned {
@@ -5579,12 +5579,17 @@ impl SupervisorInner {
                         }
                         Err(reject) => {
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
-                            let prev_confirmed = self.tracking.last_issued_positions.clone();
-                            let prev_velocities = self.tracking.last_issued_velocities.clone();
-                            let prev_ws_min_depths = self.tracking.ws_min_depths.clone();
-                            let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
-                                && self.measured_positions.len() == self.config.dof
-                                && self.measured_positions.iter().all(|q| q.is_finite());
+                            // Rejection fallback: evaluated from the intact history and park
+                            // state BEFORE the hold below invalidates them. It brakes the issued
+                            // output toward the measured hold within the active limits (continued
+                            // on later ticks by `fallback_ramp`), or latches a fault without
+                            // sending a frame when no step is feasible.
+                            let ramp = crate::tracking::FallbackRamp {
+                                hold: self.measured_hold_pose(),
+                                keepout_only: self.pending_normal_unload,
+                            };
+                            let pending =
+                                self.tracking_fallback_compute(ramp, servo_dt, &active_limits, &mut tick_sweep_budget);
                             match reject {
                                 crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
                                     self.enter_servo_keepout_hold(&ws_err);
@@ -5608,27 +5613,7 @@ impl SupervisorInner {
                                     );
                                 }
                             }
-
-                            // Rejection fallback: brake the issued output toward the hold within
-                            // the active limits (continued on later ticks by `fallback_ramp`), or
-                            // latch a fault without sending a frame when no step is feasible.
-                            let candidate_hold = self.commanded_positions.clone();
-                            let step = self.tracking_fallback_step(
-                                prev_confirmed.as_deref(),
-                                prev_velocities.as_deref(),
-                                prev_ws_min_depths.as_ref(),
-                                &candidate_hold,
-                                servo_dt,
-                                &active_limits,
-                                fresh_meas,
-                                &mut tick_sweep_budget,
-                            );
-                            output_error = self.apply_tracking_fallback_step(
-                                step,
-                                candidate_hold,
-                                prev_confirmed.as_deref(),
-                                gravity_output_enabled,
-                            );
+                            output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                         }
                     }
                     self.tracking.last_tick_sweep_evals =

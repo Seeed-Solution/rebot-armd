@@ -192,7 +192,31 @@ pub struct TrackingRuntime {
     /// Rejection-fallback braking ramp in progress: the issued output keeps stepping
     /// toward this hold pose within the active limits, one tick at a time, until it
     /// is at rest (also while the rejection fault is latched).
-    pub fallback_ramp: Option<Vec<f32>>,
+    pub fallback_ramp: Option<FallbackRamp>,
+}
+
+/// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct FallbackRamp {
+    /// Hold pose the ramp brakes toward (measured pose at the rejection, jaw command kept).
+    pub hold: Vec<f32>,
+    /// The rejection happened during park (`NormalUnload`): validate against the park
+    /// keep-out-only workspace and its escape depths.
+    pub keepout_only: bool,
+}
+
+/// A fallback step evaluated before any hold or fault changes the tracking state, with the
+/// state it was evaluated from.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct PendingFallback {
+    pub step: Result<ValidatedFallback, String>,
+    pub ramp: FallbackRamp,
+    pub prev_confirmed: Option<Vec<f32>>,
+    /// Escape depths of the other workspace (full when `keepout_only`, park otherwise),
+    /// kept unchanged when the step is recorded.
+    pub other_depths: Option<(u64, crate::kinematics::SlotBuf)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1017,6 +1041,7 @@ impl crate::supervisor::SupervisorInner {
         prev_velocities: Option<&[f32]>,
         prev_ws_min_depths: Option<&(u64, crate::kinematics::SlotBuf)>,
         q_hold: &[f32],
+        keepout_only: bool,
         dt: f64,
         active_limits: &[crate::model::JointLimit],
         fresh_meas: bool,
@@ -1045,7 +1070,7 @@ impl crate::supervisor::SupervisorInner {
                     return Err(format!("joint {} fallback hold outside its limits", j + 1));
                 }
             }
-            let ws = self.fallback_workspace_check(None, prev_ws_min_depths, q_hold, true, budget)?;
+            let ws = self.fallback_workspace_check(None, prev_ws_min_depths, q_hold, keepout_only, true, budget)?;
             return Ok(ValidatedFallback { positions: q_hold.to_vec(), velocities: zeros, ws_min_depths: ws, done: true });
         };
 
@@ -1100,7 +1125,7 @@ impl crate::supervisor::SupervisorInner {
             // so it is swept from `prev_confirmed` only; a step toward the hold changes
             // direction and is also swept from the measurement.
             let check_meas = fresh_meas && !brake_only;
-            match self.fallback_workspace_check(Some(pq), prev_ws_min_depths, &q_c, check_meas, budget) {
+            match self.fallback_workspace_check(Some(pq), prev_ws_min_depths, &q_c, keepout_only, check_meas, budget) {
                 Ok(ws) => {
                     let velocities: Vec<f32> =
                         (0..dof).map(|i| ((f64::from(q_c[i]) - f64::from(pq[i])) / dt) as f32).collect();
@@ -1115,6 +1140,43 @@ impl crate::supervisor::SupervisorInner {
             }
         }
         Err(last_err)
+    }
+
+    /// Evaluate the rejection fallback toward `ramp.hold` from the current tracking state,
+    /// using the escape depths of the workspace `ramp.keepout_only` selects. Read-only:
+    /// call it before any hold or fault invalidates the history.
+    pub fn tracking_fallback_compute(
+        &self,
+        ramp: FallbackRamp,
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+        budget: &mut usize,
+    ) -> PendingFallback {
+        let fresh_meas = self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
+            && self.measured_positions.len() == self.config.dof
+            && self.measured_positions.iter().all(|q| q.is_finite());
+        let (depths, other_depths) = if ramp.keepout_only {
+            (&self.tracking.ws_keepout_min_depths, &self.tracking.ws_min_depths)
+        } else {
+            (&self.tracking.ws_min_depths, &self.tracking.ws_keepout_min_depths)
+        };
+        let step = self.tracking_fallback_step(
+            self.tracking.last_issued_positions.as_deref(),
+            self.tracking.last_issued_velocities.as_deref(),
+            depths.as_ref(),
+            &ramp.hold,
+            ramp.keepout_only,
+            dt,
+            active_limits,
+            fresh_meas,
+            budget,
+        );
+        PendingFallback {
+            step,
+            ramp,
+            prev_confirmed: self.tracking.last_issued_positions.clone(),
+            other_depths: other_depths.clone(),
+        }
     }
 
     /// Joint limits, velocity and acceleration of `q` issued after `pq` at `pv`.
@@ -1148,18 +1210,26 @@ impl crate::supervisor::SupervisorInner {
     }
 
     /// Swept workspace check of a fallback step from `prev` (persistent escape depths
-    /// `prev_depths`) and, when `fresh_meas`, from the measurement. Returns the depths to commit.
+    /// `prev_depths`) and, when `fresh_meas`, from the measurement. With `keepout_only`
+    /// (park) only the keep-out boxes and link checks apply, as in `compute_lead_ramp_out`.
+    /// Returns the depths to commit.
     fn fallback_workspace_check(
         &self,
         prev: Option<&[f32]>,
         prev_depths: Option<&(u64, crate::kinematics::SlotBuf)>,
         q: &[f32],
+        keepout_only: bool,
         fresh_meas: bool,
         budget: &mut usize,
     ) -> Result<Option<(u64, crate::kinematics::SlotBuf)>, String> {
         use crate::chain::WorkspaceEvaluator;
         use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
-        let Some((ws, cam)) = self.workspace_policy() else { return Ok(None) };
+        let Some((ws_full, cam)) = self.workspace_policy() else { return Ok(None) };
+        let keepout_ws = keepout_only.then(|| ws_full.keepout_only());
+        let ws = keepout_ws.as_ref().unwrap_or(ws_full);
+        if keepout_only && ws.keepout_boxes.is_empty() {
+            return Ok(prev_depths.cloned());
+        }
         let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
         let mut committed = None;
         if let Some(pq) = prev {
