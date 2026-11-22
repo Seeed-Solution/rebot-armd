@@ -30,7 +30,17 @@ enum Load {
     Incident,
     /// A rigid object at `.0`: the jaw stops there; torque `stiffness x (command - block)`.
     Rigid(f32, f32),
+    /// An object that gives way from `.0` to `.1` (a box closed on across its corners turns
+    /// square in the jaws): up to `YIELD_NM` while the jaw pushes it on (scaled by the jaw speed
+    /// up to YIELD_SPEED), nothing once the jaw stops; rigid at `.1` with stiffness `.2`.
+    Yielding(f32, f32, f32),
 }
+
+/// Yielding: torque while the jaw turns the object (sim block, 2026-11-22: 0.90 N·m from
+/// contact at -2.37 rad until the jaw stopped).
+const YIELD_NM: f32 = 0.9;
+/// ... at the grasp contact speed (0.3 rad/s); it fell to 0.28 N·m as the jaw slowed to a stop.
+const YIELD_SPEED: f32 = 0.3;
 
 struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], enabled: EnableState, load: Load, broke: bool, peak_tau: f32, max_lead: f32, max_cmd: f32,
     /// J7 per write: (command, position, torque)
@@ -64,6 +74,11 @@ impl ArmDriver for RigDriver {
                 Load::Incident => if v.abs() > 0.05 { FREE_NM * v.signum() } else { 0.0 },
                 Load::Rigid(block, stiffness) => {
                     if q >= block { q = block; v = 0.0; (stiffness * (t.position - block)).max(0.0) }
+                    else if v.abs() > 0.05 { FREE_NM * v.signum() } else { 0.0 }
+                }
+                Load::Yielding(from, to, stiffness) => {
+                    if q >= to { q = to; v = 0.0; (stiffness * (t.position - to)).max(0.0) }
+                    else if q >= from { YIELD_NM * (v / YIELD_SPEED).clamp(0.0, 1.0) }
                     else if v.abs() > 0.05 { FREE_NM * v.signum() } else { 0.0 }
                 }
             };
@@ -330,6 +345,31 @@ fn incident_grasp_stops_at_contact_plus_squeeze() {
     assert!(inner.commanded_positions[6] <= stop.unwrap() + 1e-4);
     let r = rig.lock().unwrap();
     assert!(!r.broke && r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3}", r.peak_tau);
+}
+
+/// An object that gives way after the contact (turns square in the jaws): the jaw reaches the
+/// contact stop with no torque. The contact is dropped there and the close goes on to the
+/// object's rigid face, where the grasp holds with torque (it stopped at the first stop with
+/// about 0 N·m before and the object fell out on the lift: sim axis_block_detect_depth_record).
+#[test]
+fn yielding_object_closes_on_to_a_firm_grip() {
+    let (from, to) = (-2.37_f32, -2.0_f32);
+    let (mut inner, rig) = rig(Load::Yielding(from, to, 10.0));
+    let (a, contact, stop, _) = grasp_tracking_contact(&mut inner, &rig);
+    let contact = contact.expect("contact detected");
+    eprintln!("yielding: first contact {contact:.3}, first stop {stop:?}, J7 {:.3}, command {:.3}, holding {:?}",
+        inner.measured_positions[6], inner.commanded_positions[6], a.holding);
+    assert!((contact - from).abs() < 0.08, "contact at {contact}");
+    assert!(stop.unwrap() < to - 0.1, "first stop {stop:?} short of the rigid face");
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert!((inner.measured_positions[6] - to).abs() < 1e-3, "J7 {} not on the rigid face", inner.measured_positions[6]);
+    // the hold presses on the face: torque above holding_torque_nm, under the cap
+    reset_stats(&rig);
+    for _ in 0..50 { inner.tick(DT); }
+    let tau = rig.lock().unwrap().tau[6];
+    assert!(tau >= GripperPolicy::rebot_dm().holding_torque_nm && tau <= cap() + 1e-3, "hold torque {tau:.3} N·m");
+    // never past the squeeze from the last contact
+    assert!(inner.commanded_positions[6] <= to + GripperPolicy::rebot_dm().squeeze_rad + 1e-4, "command {}", inner.commanded_positions[6]);
 }
 
 /// Without torque contact detection and without the cap, the following error (command ahead,
