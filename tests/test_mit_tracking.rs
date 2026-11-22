@@ -596,12 +596,11 @@ fn mit_collision_and_guarded_retreat_hold_without_dynamic_terms() {
 
 #[test]
 fn mit_bus_loss_cancels_the_group() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
     bus.with(|s| s.motors[3].silent = true);
     bus.clear_log();
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_millis(60) {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    for _ in 0..12 {
+        clock.advance(std::time::Duration::from_millis(5));
         inner.tick(DT);
         if inner.safety.state().is_stopped() { break; }
     }
@@ -610,7 +609,7 @@ fn mit_bus_loss_cancels_the_group() {
     assert!(!fault.recoverable);
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     bus.clear_log();
-    for _ in 0..10 { std::thread::sleep(std::time::Duration::from_millis(5)); inner.tick(DT); }
+    for _ in 0..10 { clock.advance(std::time::Duration::from_millis(5)); inner.tick(DT); }
     assert!(bus.tx_log().iter().all(|f| f.id == 0x7FF), "output after the loss: {:?}", bus.tx_log());
     assert!(command_frames(&bus.tx_log()).is_empty());
 }
@@ -621,7 +620,11 @@ fn command_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::Can
 
 #[test]
 fn mit_partial_send_reconnect_through_the_supervisor() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
+    // a 1 s motor TIMEOUT (recorded): the fake motor's own watchdog does not expire within this
+    // reconnect sequence (an expired motor reports a fault; that recovery is not under test here)
+    bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 20_000));
+    with_record(&mut inner, record_j4(20_000));
     bus.with(|s| s.fail_tx_after = Some(3));
     inner.tick(DT);
     let fault = inner.safety.fault().expect("partial write latches");
@@ -633,7 +636,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     for _ in 0..5 { inner.tick(DT); }
     assert!(command_frames(&bus.tx_log()).is_empty(), "{:?}", bus.tx_log());
     // time alone resumes nothing
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    clock.advance(std::time::Duration::from_millis(400));
     bus.clear_log();
     for _ in 0..5 { inner.tick(DT); }
     assert!(bus.tx_log().is_empty(), "polls resumed without clearance: {:?}", bus.tx_log());
@@ -642,7 +645,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     let mut cleared = false;
     for _ in 0..20 {
         if inner.clear_fault().is_ok() { cleared = true; break; }
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        clock.advance(std::time::Duration::from_millis(40));
         inner.tick(DT);
     }
     assert!(cleared, "clearance");
@@ -719,7 +722,7 @@ fn mit_failed_readback_on_rearm_revokes_authorization() {
 /// replay and no invented hold.
 #[test]
 fn mit_failed_disable_never_replays_the_cached_mit_frame() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
     for _ in 0..3 { inner.tick(DT); }
     bus.with(|s| s.fail_tx_ids = (1..=7).collect());
     inner.apply_stop_policy(armd::StopPolicy::ThermalTrip);
@@ -727,7 +730,7 @@ fn mit_failed_disable_never_replays_the_cached_mit_frame() {
     bus.with(|s| { s.fail_tx_ids.clear(); s.motors[3].silent = true; });
     bus.clear_log();
     for _ in 0..12 {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        clock.advance(std::time::Duration::from_millis(10));
         inner.tick(DT);
     }
     let replays: Vec<_> = bus.tx_log().into_iter().filter(|f| f.id == 4 && f.data != damiao::CMD_DISABLE).collect();
@@ -781,12 +784,12 @@ fn mit_effort_bound_holds_on_decoded_wire_fields() {
 /// Review #9: a loss latches BUS_LOSS also when the arm is already stopped by another fault.
 #[test]
 fn mit_loss_latches_bus_loss_even_when_already_stopped() {
-    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
     inner.safety.trigger_fault_coded(armd::FaultCode::FollowingError, armd::FaultReason::Other("test".into()));
     bus.with(|s| s.motors[3].silent = true);
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_millis(80) && inner.mit.owner != mit::MitOwner::Lost {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    for _ in 0..16 {
+        if inner.mit.owner == mit::MitOwner::Lost { break; }
+        clock.advance(std::time::Duration::from_millis(5));
         inner.tick(DT);
     }
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
