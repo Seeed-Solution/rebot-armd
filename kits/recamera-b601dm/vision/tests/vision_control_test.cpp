@@ -656,6 +656,37 @@ static void test_camera_hold() {
     CHECK(c.default_trigger_pipelines() == (Pipelines{true, false}));
 }
 
+static void test_owned_delete() {
+    // DELETE ?client=&instance_id=: only the owner's subscription of this process is deleted
+    VisionControl::Options o = opts(Mode::Yolo, false, 5);
+    o.instance_id = "rv-a";
+    VisionControl c(o, nullptr);
+    int st = 0;
+    json h = req(c, "POST", "/api/subscribe", R"({"client":"armd-mview-7","pipelines":[],"ttl_ms":5000})", &st);
+    CHECK(st == 200 && h["instance_id"] == "rv-a" && h["hold"] == true);
+    const std::string id = h["id"].get<std::string>();
+    json e = req(c, "DELETE", "/api/subscribe/" + id + "?client=armd-mview-8&instance_id=rv-a", "", &st);
+    CHECK(st == 409 && e["error"] == "NOT_OWNER" && c.continuous().holds == 1);
+    // the id of another process (a restart starts again at s1): refused, kept
+    e = req(c, "DELETE", "/api/subscribe/" + id + "?client=armd-mview-7&instance_id=rv-b", "", &st);
+    CHECK(st == 409 && e["error"] == "INSTANCE_CHANGED" && c.continuous().holds == 1);
+    req(c, "DELETE", "/api/subscribe/s99?client=armd-mview-7&instance_id=rv-a", "", &st);
+    CHECK(st == 404);
+    json d = req(c, "DELETE", "/api/subscribe/" + id + "?client=armd-mview-7&instance_id=rv-a", "", &st);
+    CHECK(st == 200 && d["deleted"] == id && c.continuous().holds == 0);
+    req(c, "DELETE", "/api/subscribe/" + id + "?client=armd-mview-7&instance_id=rv-a", "", &st);
+    CHECK(st == 404);
+    // without the query (the cockpit overlay): by id, as before
+    json s = req(c, "POST", "/api/subscribe", sub_body("overlay", R"(["aruco"])"), &st);
+    CHECK(st == 200 && s["instance_id"] == "rv-a");
+    req(c, "DELETE", "/api/subscribe/" + s["id"].get<std::string>(), "", &st);
+    CHECK(st == 200 && c.continuous().subscriptions == 0);
+    // keep-alive bodies carry the instance too
+    json k = req(c, "POST", "/api/subscribe", R"({"client":"armd-mview-9","pipelines":[],"ttl_ms":5000})", &st);
+    json ka = req(c, "POST", "/api/subscribe/" + k["id"].get<std::string>() + "/keepalive", "{}", &st);
+    CHECK(st == 200 && ka["instance_id"] == "rv-a");
+}
+
 static void test_trigger_pipelines() {
     // standby in base mode yolo: each requested set runs exactly, on a fresh frame
     VisionControl c(opts(Mode::Yolo, false, 5), nullptr);
@@ -1264,6 +1295,7 @@ int main() {
     test_subscription_union();
     test_subscription_expiry();
     test_camera_hold();
+    test_owned_delete();
     test_trigger_pipelines();
     test_mode_endpoint_compat();
     test_mask_focus_control();

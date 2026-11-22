@@ -63,7 +63,9 @@
 //! - The image computation runs in `spawn_blocking`, while the arm returns to the start pose.
 //! - Camera hold ([`CameraHold`], gray frames only): for the run armd holds the provider's camera
 //!   gate open (rebot-vision `POST /api/subscribe` without pipelines, refreshed every
-//!   [`CAMERA_HOLD_REFRESH`], deleted at the end of every outcome), so a trigger does not wait for
+//!   [`CAMERA_HOLD_REFRESH`], deleted at the end of every outcome by the latest id the provider
+//!   returned, with the client and provider instance so a restarted provider's or another
+//!   client's subscription is not deleted), so a trigger does not wait for
 //!   the 1 fps idle gate. A provider without it (`measurement.camera_hold` "unsupported") runs as before.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -178,7 +180,10 @@ const CAMERA_RELEASE_WAIT: Duration = Duration::from_secs(1);
 /// refresh and the hold expires after [`CAMERA_HOLD_TTL_MS`].
 pub struct CameraHold {
     src: Arc<dyn DetectionSource>,
-    id: Option<String>,
+    client: String,
+    /// The latest ticket: the refresh replaces it when the provider answers with another id
+    /// (a restarted provider makes a new subscription), and drops it when the hold is gone.
+    ticket: Arc<std::sync::Mutex<Option<grasp::CameraHoldTicket>>>,
     refresh: Option<tokio::task::JoinHandle<()>>,
     /// `measurement.camera_hold`: "held", "unsupported" (the provider has none), "failed" (the
     /// request failed; the run goes on without), "off" (snapshot source).
@@ -187,20 +192,26 @@ pub struct CameraHold {
 
 impl CameraHold {
     pub async fn start(src: Arc<dyn DetectionSource>, wanted: bool) -> Self {
-        let mut h = Self { src, id: None, refresh: None, status: "off" };
+        let client = CAMERA_HOLD_CLIENT.to_string();
+        let mut h = Self { src, client, ticket: Arc::new(std::sync::Mutex::new(None)), refresh: None, status: "off" };
         if !wanted { return h; }
-        match h.src.camera_hold(CAMERA_HOLD_CLIENT, CAMERA_HOLD_TTL_MS).await {
-            Ok(Some(id)) => {
-                let src = h.src.clone();
+        match h.src.camera_hold(&h.client, CAMERA_HOLD_TTL_MS).await {
+            Ok(Some(t)) => {
+                *h.ticket.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+                let (src, client, ticket) = (h.src.clone(), h.client.clone(), h.ticket.clone());
                 h.refresh = Some(tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(CAMERA_HOLD_REFRESH).await;
-                        if let Err(e) = src.camera_hold(CAMERA_HOLD_CLIENT, CAMERA_HOLD_TTL_MS).await {
-                            tracing::warn!("measure_multiview: camera hold refresh failed: {e}");
+                        match src.camera_hold(&client, CAMERA_HOLD_TTL_MS).await {
+                            Ok(t) => {
+                                let mut cur = ticket.lock().unwrap_or_else(|e| e.into_inner());
+                                if *cur != t { tracing::info!("measure_multiview: camera hold now {t:?} (was {cur:?})"); }
+                                *cur = t;
+                            }
+                            Err(e) => tracing::warn!("measure_multiview: camera hold refresh failed: {e}"),
                         }
                     }
                 }));
-                h.id = Some(id);
                 h.status = "held";
             }
             Ok(None) => h.status = "unsupported",
@@ -218,8 +229,10 @@ impl CameraHold {
             r.abort();
             let _ = r.await;
         }
-        if let Some(id) = self.id.take() {
-            match tokio::time::timeout(CAMERA_RELEASE_WAIT, self.src.camera_release(&id)).await {
+        let ticket = self.ticket.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(t) = ticket {
+            let id = &t.id;
+            match tokio::time::timeout(CAMERA_RELEASE_WAIT, self.src.camera_release(&t, &self.client)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => tracing::warn!("measure_multiview: camera hold {id} not released ({e}); it expires in {CAMERA_HOLD_TTL_MS} ms"),
                 Err(_) => tracing::warn!("measure_multiview: camera hold {id} release timed out; it expires in {CAMERA_HOLD_TTL_MS} ms"),

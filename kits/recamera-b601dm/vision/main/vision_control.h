@@ -234,7 +234,7 @@ public:
     enum class IntrinsicsStatus { Ok, CliOverride, RevisionMismatch, PersistFailed };
     static constexpr int kIntrinsicsApplyWaitMs = 2000;
 
-    enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound, SwapBusy, IonBudget };
+    enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound, SwapBusy, IonBudget, NotOwner, InstanceChanged };
 
     class TriggerScope {
     public:
@@ -364,6 +364,13 @@ public:
                      uint64_t now_ms, Subscription& out);
     Status keepalive(const std::string& id, uint64_t now_ms, Subscription& out);
     bool unsubscribe(const std::string& id);
+    /**
+     * Remove subscription `id` only when it belongs to `client` (NotOwner otherwise) and, when
+     * `instance` is not empty, this process is that instance (InstanceChanged otherwise: after a
+     * restart ids start again at s1 and may name another client's subscription). Empty `client`
+     * skips the owner check. NotFound when unknown or expired.
+     */
+    Status unsubscribe_owned(const std::string& id, const std::string& client, const std::string& instance);
     /** Active subscriptions (expired ones are dropped first). */
     std::vector<Subscription> subscriptions(uint64_t now_ms);
     /** Drop subscriptions expired at now_ms. */

@@ -1502,15 +1502,27 @@ pub trait DetectionSource: Send + Sync {
     /// Keep the camera gate open without inference for `ttl_ms` (rebot-vision camera hold:
     /// `POST /api/subscribe {"client", "pipelines": [], "ttl_ms"}`), so a trigger is served by the
     /// next camera frame. Calling it again with the same `client` refreshes the same hold.
-    /// `Ok(Some(id))` = held; `Ok(None)` = the provider has no camera hold (older rebot-vision
-    /// answers 400, a provider without subscriptions 404). Default: no camera hold.
-    fn camera_hold(&self, _client: &str, _ttl_ms: u64) -> BoxFuture<'_, Result<Option<String>, String>> {
+    /// `Ok(Some(ticket))` = held (the id may change when the provider restarted: keep the
+    /// latest); `Ok(None)` = the provider has no camera hold (older rebot-vision answers 400, a
+    /// provider without subscriptions 404). Default: no camera hold.
+    fn camera_hold(&self, _client: &str, _ttl_ms: u64) -> BoxFuture<'_, Result<Option<CameraHoldTicket>, String>> {
         Box::pin(async { Ok(None) })
     }
-    /// End the camera hold `id` (`DELETE /api/subscribe/<id>`).
-    fn camera_release(&self, _id: &str) -> BoxFuture<'_, Result<(), String>> {
+    /// End `client`'s camera hold `ticket` (`DELETE /api/subscribe/<id>?client=&instance_id=`):
+    /// a rebot-vision with owner checks deletes it only when it is still this client's
+    /// subscription of the same provider instance (after a restart the ids start again at s1).
+    fn camera_release(&self, _ticket: &CameraHoldTicket, _client: &str) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+/// A camera hold taken by [`DetectionSource::camera_hold`]: the subscription id and the
+/// provider instance that issued it (rebot-vision subscription bodies' `instance_id`; None from
+/// a provider that does not report it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraHoldTicket {
+    pub id: String,
+    pub instance_id: Option<String>,
 }
 
 /// The camera app's detection API (the same upstream armd proxies under /api/v1/detection).
@@ -1639,8 +1651,13 @@ pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
     frame.image_size_px = cam.size;
 }
 
+/// A subscription id, instance id or client name armd puts into a query: 1..64 of [A-Za-z0-9_-].
+fn hold_token_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 impl DetectionSource for HttpDetectionSource {
-    fn camera_hold(&self, client: &str, ttl_ms: u64) -> BoxFuture<'_, Result<Option<String>, String>> {
+    fn camera_hold(&self, client: &str, ttl_ms: u64) -> BoxFuture<'_, Result<Option<CameraHoldTicket>, String>> {
         let body = serde_json::json!({"client": client, "pipelines": [], "ttl_ms": ttl_ms}).to_string();
         Box::pin(async move {
             let (status, v) = crate::api::proxy::request_status_json(&self.upstream, "POST", "/api/subscribe", Some(body.as_bytes()), Duration::from_secs(2)).await?;
@@ -1648,15 +1665,26 @@ impl DetectionSource for HttpDetectionSource {
             if !status.is_success() { return Err(format!("camera hold: detector returned {status}")); }
             // an older provider that took [] as an ordinary subscription does not report a hold
             if v.get("hold").and_then(Value::as_bool) != Some(true) { return Ok(None); }
-            v.get("id").and_then(Value::as_str).map(|id| Some(id.to_string())).ok_or_else(|| "camera hold: reply without id".to_string())
+            let id = v.get("id").and_then(Value::as_str).filter(|id| hold_token_ok(id)).ok_or_else(|| "camera hold: reply without a valid id".to_string())?;
+            let instance_id = v.get("instance_id").and_then(Value::as_str).filter(|i| hold_token_ok(i)).map(str::to_string);
+            Ok(Some(CameraHoldTicket { id: id.to_string(), instance_id }))
         })
     }
-    fn camera_release(&self, id: &str) -> BoxFuture<'_, Result<(), String>> {
-        let path = format!("/api/subscribe/{id}");
+    fn camera_release(&self, ticket: &CameraHoldTicket, client: &str) -> BoxFuture<'_, Result<(), String>> {
+        // an older rebot-vision ignores the query and deletes by id
+        let mut path = format!("/api/subscribe/{}?client={client}", ticket.id);
+        if let Some(i) = &ticket.instance_id { path.push_str("&instance_id="); path.push_str(i); }
+        let (ok_client, id, client) = (hold_token_ok(client), ticket.id.clone(), client.to_string());
         Box::pin(async move {
-            let (status, _) = crate::api::proxy::request_status_json(&self.upstream, "DELETE", &path, None, Duration::from_secs(2)).await?;
-            // 404: already expired
-            if status.is_success() || status == axum::http::StatusCode::NOT_FOUND { Ok(()) } else { Err(format!("camera release: detector returned {status}")) }
+            if !ok_client { return Err(format!("camera release: client {client:?} is not [A-Za-z0-9_-]{{1,64}}")); }
+            let (status, v) = crate::api::proxy::request_status_json(&self.upstream, "DELETE", &path, None, Duration::from_secs(2)).await?;
+            // 404: already expired; 409: no longer ours (another client's id, or a restarted
+            // provider whose ids started again): nothing of this hold is left to end
+            if status == axum::http::StatusCode::CONFLICT {
+                let why = v.get("error").and_then(serde_json::Value::as_str).unwrap_or("409");
+                tracing::info!("camera release {id}: not deleted ({why})");
+            }
+            if status.is_success() || status == axum::http::StatusCode::NOT_FOUND || status == axum::http::StatusCode::CONFLICT { Ok(()) } else { Err(format!("camera release: detector returned {status}")) }
         })
     }
     fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {

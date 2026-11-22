@@ -407,6 +407,21 @@ bool VisionControl::unsubscribe(const std::string& id) {
     return found;
 }
 
+VisionControl::Status VisionControl::unsubscribe_owned(const std::string& id, const std::string& client,
+                                                       const std::string& instance) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!instance.empty() && instance != instance_id_) return Status::InstanceChanged;
+        const auto it = std::find_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.id == id; });
+        if (it == subs_.end()) return Status::NotFound;
+        if (!client.empty() && it->client != client) return Status::NotOwner;
+        subs_.erase(it);
+        notify_locked();
+    }
+    cv_.notify_all();
+    return Status::Ok;
+}
+
 std::vector<Subscription> VisionControl::subscriptions(uint64_t now_ms) {
     expire(now_ms);
     std::lock_guard<std::mutex> lk(mu_);
@@ -1500,6 +1515,8 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
         case VisionControl::Status::Full: return {503, error_body("too many subscriptions")};
         case VisionControl::Status::NotFound: return {404, error_body("no such subscription")};
         case VisionControl::Status::SwapBusy: return {409, error_body("SWAP_BUSY")};
+        case VisionControl::Status::NotOwner: return {409, error_body("NOT_OWNER")};
+        case VisionControl::Status::InstanceChanged: return {409, error_body("INSTANCE_CHANGED")};
         default: return {200, ok_body};
     }
 }
@@ -1552,6 +1569,8 @@ static HttpReply post_models(VisionControl& ctl, const std::string& body) {
 static std::string subscription_body(VisionControl& ctl, const Subscription& s, uint64_t mono) {
     nlohmann::json j = subscription_json(s, mono, ctl.active_fps());
     j["api_version"] = kApiVersion;
+    // the process the id belongs to: DELETE ?instance_id= refuses after a restart
+    j["instance_id"] = ctl.instance_id();
     j["continuous"] = continuous_json(ctl.continuous());
     return j.dump();
 }
@@ -1662,7 +1681,13 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             return status_reply(st, st == VisionControl::Status::Ok ? subscription_body(ctl, s, mono) : "");
         }
         if (!keep && method == "DELETE") {
-            if (!ctl.unsubscribe(id)) return {404, error_body("no such subscription")};
+            // ?client=<owner>&instance_id=<instance>: delete only the caller's own subscription
+            // of this process (409 NOT_OWNER / INSTANCE_CHANGED); without them, by id alone
+            std::string client, instance;
+            query_param(query, "client", client);
+            query_param(query, "instance_id", instance);
+            const VisionControl::Status st = ctl.unsubscribe_owned(id, client, instance);
+            if (st != VisionControl::Status::Ok) return status_reply(st, "");
             nlohmann::json j = {{"api_version", kApiVersion}, {"deleted", id},
                                 {"continuous", continuous_json(ctl.continuous())}};
             return {200, j.dump()};
