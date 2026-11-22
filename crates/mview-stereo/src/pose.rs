@@ -167,10 +167,64 @@ impl PosePassProfile {
     }
 }
 
+/// One Levenberg-Marquardt call of a `refine_poses` (`mview-profile`).
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LmCallProfile {
+    /// `round` (free cameras, outlier/cap rounds), `cap_resolve` (after the last cap round) or
+    /// `before` (fixed cameras, the kinematic rms diagnostic).
+    pub role: &'static str,
+    pub round: usize,
+    pub n_free: usize,
+    pub n_points: usize,
+    pub iters: u32,
+    pub accepted: u32,
+    pub rejected: u32,
+    /// `gain` (relative gain below 1e-7), `lambda` (damping above 1e6), `singular`, `iters`.
+    pub exit: &'static str,
+    pub ms: f64,
+}
+
+/// The solves of one `refine_poses` call: per LM call, and the stage times / counters
+/// (`lm.*`: init, assembly, schur, dense, backsub, trial_cost, rms; allocations).
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LmProfile {
+    pub calls: Vec<LmCallProfile>,
+    pub stages: std::collections::BTreeMap<String, f64>,
+}
+
+#[cfg(feature = "mview-profile")]
+mod lm_prof {
+    use super::{LmCallProfile, LmProfile};
+    use std::cell::RefCell;
+    thread_local! {
+        static CALLS: RefCell<Vec<LmCallProfile>> = const { RefCell::new(Vec::new()) };
+        static ROLE: RefCell<(&'static str, usize)> = const { RefCell::new(("round", 0)) };
+    }
+    pub(super) fn set_role(role: &'static str, round: usize) { ROLE.with(|r| *r.borrow_mut() = (role, round)); }
+    pub(super) fn role() -> (&'static str, usize) { ROLE.with(|r| *r.borrow()) }
+    pub(super) fn push(c: LmCallProfile) { CALLS.with(|v| v.borrow_mut().push(c)); }
+    pub(super) fn take() -> LmProfile {
+        LmProfile { calls: CALLS.with(|v| std::mem::take(&mut *v.borrow_mut())), stages: crate::stage_prof::take() }
+    }
+}
+
+#[inline(always)]
+#[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+fn lm_role(role: &'static str, round: usize) {
+    #[cfg(feature = "mview-profile")]
+    lm_prof::set_role(role, round);
+}
+
 /// Top-level pose refinement profile collected under `mview-profile`.
 #[cfg(feature = "mview-profile")]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PoseProfile {
+    /// Preparation sub-stages (`prep.features_ms`, `prep.halves_ms`, `prep.templates_ms`, ...).
+    pub prep_stages: std::collections::BTreeMap<String, f64>,
+    pub pass1_lm: LmProfile,
+    pub pass2_lm: LmProfile,
     pub prep_ms: f64,
     pub pass1_match_ms: f64,
     pub pass1_solve_ms: f64,
@@ -1163,9 +1217,14 @@ impl TexturePrep {
         // the box quota is 0: corners in it are left out; corners in an excluded region are dropped
         // afterwards, so the quota is taken twice
         p.max_table_features *= 2;
+        let t = ProfT::start();
         let raw_feats: Vec<Feature> = features(&rv.img, full, grown, [0.0; 4], &p).into_iter()
             .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
+        t.stop("prep.features_ms");
+        let t = ProfT::start();
         let halves: Vec<Gray> = views.iter().map(|v| v.img.half()).collect();
+        t.stop("prep.halves_ms");
+        let t = ProfT::start();
         let mut feats = Vec::new();
         for f in raw_feats {
             let px = [f.x as f64, f.y as f64];
@@ -1181,6 +1240,8 @@ impl TexturePrep {
             ) else { continue; };
             feats.push(PreparedFeat { px, x0, tc, tf });
         }
+        t.stop("prep.templates_ms");
+        prof_count("prep.n_features", feats.len() as u64);
         Self { reference, halves, feats }
     }
 
@@ -1535,16 +1596,31 @@ impl Problem<'_> {
     /// Levenberg-Marquardt on the rotations of the `free` views (index into the parameter
     /// blocks) and the points.
     fn solve(&self, s: &mut State, free: &[Option<usize>]) {
+        #[cfg(feature = "mview-profile")]
+        let t_call = Instant::now();
+        #[cfg(feature = "mview-profile")]
+        let mut cp = {
+            let (role, round) = lm_prof::role();
+            LmCallProfile { role, round, n_free: free.iter().filter(|f| f.is_some()).count(), n_points: self.corrs.len(), exit: "iters", ..Default::default() }
+        };
         let nf = free.iter().filter(|f| f.is_some()).count();
         let nc = 3 * nf;
         let mut lambda = 1e-3;
+        let t = ProfT::start();
         let mut cost = self.cost(s, free);
+        t.stop("lm.trial_cost_ms");
         for _ in 0..LM_ITERS {
+            #[cfg(feature = "mview-profile")]
+            {
+                cp.iters += 1;
+            }
             let mut sm = vec![0.0; nc * nc];
             let mut bc = vec![0.0; nc];
             // per point: Hpp^-1, gp, and its blocks with the free views
             let mut per: Vec<Option<(Mat3, Vec3, Vec<(usize, Mat3)>)>> = Vec::with_capacity(self.corrs.len());
+            prof_count("lm.alloc", 3);
             for (i, c) in self.corrs.iter().enumerate() {
+                let t_asm = ProfT::start();
                 let wt = self.weight(c);
                 let mut hpp = [[0.0; 3]; 3];
                 let mut gp = [0.0; 3];
@@ -1586,6 +1662,8 @@ impl Problem<'_> {
                     gp[2] += hw * self.plane_w * r;
                 }
                 for u in 0..3 { hpp[u][u] = hpp[u][u] * (1.0 + lambda) + 1e-9; }
+                t_asm.stop("lm.assembly_ms");
+                let t_schur = ProfT::start();
                 let Some(inv) = inv3(&hpp) else { per.push(None); continue; };
                 // Schur complement: S -= B1^T inv B2, b -= B1^T inv gp
                 for (f1, b1) in &hpc {
@@ -1598,6 +1676,7 @@ impl Problem<'_> {
                     }
                 }
                 per.push(Some((inv, gp, hpc)));
+                t_schur.stop("lm.schur_ms");
             }
             for (a, f) in free.iter().enumerate() {
                 let Some(fi) = f else { continue; };
@@ -1608,8 +1687,22 @@ impl Problem<'_> {
                 }
             }
             for u in 0..nc { sm[u * nc + u] *= 1.0 + lambda; }
-            let dc = if nc > 0 { match solve_dense(sm, bc.iter().map(|v| -v).collect(), nc) { Some(d) => d, None => break } } else { Vec::new() };
+            let t = ProfT::start();
+            let dc = if nc > 0 {
+                match solve_dense(sm, bc.iter().map(|v| -v).collect(), nc) {
+                    Some(d) => d,
+                    None => {
+                        #[cfg(feature = "mview-profile")]
+                        {
+                            cp.exit = "singular";
+                        }
+                        break;
+                    }
+                }
+            } else { Vec::new() };
+            t.stop("lm.dense_ms");
             // back-substitution and the trial state
+            let t = ProfT::start();
             let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
             for (i, e) in per.iter().enumerate() {
                 let Some((inv, gp, hpc)) = e else { continue; };
@@ -1627,22 +1720,51 @@ impl Problem<'_> {
                 trial.cams[a].r = mat_mul(&rodrigues(&d), &trial.cams[a].r);
                 for u in 0..3 { trial.w[a][u] += d[u]; }
             }
+            t.stop("lm.backsub_ms");
+            let t = ProfT::start();
             let tc = self.cost(&trial, free);
+            t.stop("lm.trial_cost_ms");
             if tc < cost {
+                #[cfg(feature = "mview-profile")]
+                {
+                    cp.accepted += 1;
+                }
                 let gain = (cost - tc) / cost.max(1e-12);
                 *s = trial;
                 cost = tc;
                 lambda = (lambda * 0.3).max(1e-7);
-                if gain < 1e-7 { break; }
+                if gain < 1e-7 {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "gain";
+                    }
+                    break;
+                }
             } else {
+                #[cfg(feature = "mview-profile")]
+                {
+                    cp.rejected += 1;
+                }
                 lambda *= 10.0;
-                if lambda > 1e6 { break; }
+                if lambda > 1e6 {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "lambda";
+                    }
+                    break;
+                }
             }
+        }
+        #[cfg(feature = "mview-profile")]
+        {
+            cp.ms = ms(t_call);
+            lm_prof::push(cp);
         }
     }
 
     /// Reprojection rms (px) per view over the active observations.
     fn rms(&self, s: &State, nv: usize) -> Vec<Option<f64>> {
+        let _t = RmsTimer(ProfT::start());
         let mut acc = vec![(0.0, 0usize); nv];
         for (i, c) in self.corrs.iter().enumerate() {
             for (k, (a, q)) in c.obs.iter().enumerate() {
@@ -1654,9 +1776,16 @@ impl Problem<'_> {
     }
 }
 
+struct RmsTimer(ProfT);
+impl Drop for RmsTimer { fn drop(&mut self) { std::mem::replace(&mut self.0, ProfT::start()).stop("lm.rms_ms"); } }
+struct InitTimer(ProfT);
+impl Drop for InitTimer { fn drop(&mut self) { std::mem::replace(&mut self.0, ProfT::start()).stop("lm.init_ms"); } }
+
 /// Initial points: the triangulation of the observations (the table plane for a point that
 /// does not triangulate).
 fn init_points(cams: &[Camera], corrs: &[Corr], table_z: f64) -> Vec<Vec3> {
+    let _t = InitTimer(ProfT::start());
+    prof_count("lm.init_calls", 1);
     corrs.iter().map(|c| {
         let cs: Vec<Camera> = c.obs.iter().map(|o| cams[o.0]).collect();
         let ps: Vec<[f64; 2]> = c.obs.iter().map(|o| o.1).collect();
@@ -1678,6 +1807,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
     #[cfg(feature = "mview-profile")]
+    let _ = (crate::stage_prof::take(), lm_prof::take());
+    #[cfg(feature = "mview-profile")]
     let t_prep = Instant::now();
     let prep = texture.then(|| match cams.get(reference) {
         Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
@@ -1685,6 +1816,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     });
     #[cfg(feature = "mview-profile")]
     let prep_ms = if texture { ms(t_prep) } else { 0.0 };
+    #[cfg(feature = "mview-profile")]
+    let prep_stages = crate::stage_prof::take();
     let mut cache = prep.as_ref().map(|p| MatchCache::new(p.feats.len(), views.len()));
     #[cfg(feature = "mview-profile")]
     let mut pass1_prof = PosePassProfile::new_seeded();
@@ -1709,6 +1842,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     #[cfg(feature = "mview-profile")]
     let pass1_solve_ms = ms(t_p1_solve);
     #[cfg(feature = "mview-profile")]
+    let pass1_lm = lm_prof::take();
+    #[cfg(feature = "mview-profile")]
     let mut pass2_prof = PosePassProfile::new_seeded();
     #[cfg(feature = "mview-profile")]
     let (mut pass2_match_ms, mut pass2_solve_ms) = (0.0, 0.0);
@@ -1717,6 +1852,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
             let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
             #[cfg(feature = "mview-profile")]
             let t_p2_match = Instant::now();
+            #[cfg(feature = "mview-profile")]
+            let _ = crate::stage_prof::take();
             let second = with(p.corrs_with_cache_profiled(
                 views,
                 &r1.cams,
@@ -1744,6 +1881,9 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     #[cfg(feature = "mview-profile")]
     {
         out.profile = Some(PoseProfile {
+            prep_stages,
+            pass1_lm,
+            pass2_lm: if prep.is_some() { lm_prof::take() } else { LmProfile::default() },
             prep_ms,
             pass1_match_ms,
             pass1_solve_ms,
@@ -1787,6 +1927,7 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
         st = fresh();
         let free = free_of(&fixed);
         if free.iter().all(Option::is_none) { break; }
+        lm_role("round", round);
         prob.solve(&mut st, &free);
         if round == 0 {
             for (i, c) in corrs.iter().enumerate() {
@@ -1807,13 +1948,14 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
             }
         }
         if !changed { break; }
-        if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { prob.solve(&mut st, &free); } }
+        if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { lm_role("cap_resolve", round); prob.solve(&mut st, &free); } }
     }
     if free_of(&fixed).iter().all(Option::is_none) { st = fresh(); }
     // before: the same observations triangulated with the kinematic cameras (no coplanarity)
     let before = {
         let pb = Problem { corrs, active: prob.active.clone(), table_z, plane_w: 0.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
         let mut s0 = State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+        lm_role("before", 0);
         pb.solve(&mut s0, &vec![None; nv]);
         pb.rms(&s0, nv)
     };

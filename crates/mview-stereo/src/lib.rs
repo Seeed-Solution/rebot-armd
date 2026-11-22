@@ -378,6 +378,8 @@ pub struct Stats {
 pub struct RecProfile {
     pub ncc_calls: std::collections::BTreeMap<String, u64>,
     pub total_ncc_calls: u64,
+    /// Sub-stage times (ms) and counters (`features.*`, `sweep.*`, `refine.*`).
+    pub stages: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -467,6 +469,7 @@ mod profile_tls {
             RecProfile {
                 ncc_calls,
                 total_ncc_calls,
+                stages: Default::default(),
             }
         }
     }
@@ -488,6 +491,57 @@ mod profile_tls {
 
 #[cfg(feature = "mview-profile")]
 pub(crate) use profile_tls::half_grid_counts as half_grid_profile_counts;
+
+/// Stage timers and counters (thread-local, `mview-profile`): [`ProfT::stop`] adds the elapsed ms
+/// under a key, [`prof_count`] adds a count; the callers take the map at stage boundaries. Without
+/// the feature both are no-ops (a zero-sized timer).
+pub(crate) mod stage_prof {
+    #[cfg(feature = "mview-profile")]
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    #[cfg(feature = "mview-profile")]
+    thread_local! {
+        static ACC: RefCell<BTreeMap<&'static str, f64>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    pub(crate) struct ProfT(#[cfg(feature = "mview-profile")] std::time::Instant);
+
+    impl ProfT {
+        #[inline(always)]
+        pub(crate) fn start() -> Self {
+            Self(
+                #[cfg(feature = "mview-profile")]
+                std::time::Instant::now(),
+            )
+        }
+
+        #[inline(always)]
+        #[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+        pub(crate) fn stop(self, key: &'static str) {
+            #[cfg(feature = "mview-profile")]
+            add(key, self.0.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    #[cfg(feature = "mview-profile")]
+    pub(crate) fn add(key: &'static str, v: f64) {
+        ACC.with(|a| *a.borrow_mut().entry(key).or_insert(0.0) += v);
+    }
+
+    #[inline(always)]
+    #[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+    pub(crate) fn prof_count(key: &'static str, n: u64) {
+        #[cfg(feature = "mview-profile")]
+        add(key, n as f64);
+    }
+
+    /// The accumulated stages since the last take (and reset).
+    #[cfg(feature = "mview-profile")]
+    pub(crate) fn take() -> BTreeMap<String, f64> {
+        ACC.with(|a| std::mem::take(&mut *a.borrow_mut()).into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+}
+pub(crate) use stage_prof::{prof_count, ProfT};
 
 // ---- patches ----
 
@@ -735,6 +789,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     let x1 = (region[2].ceil().max(0.0) as usize).min(img.w.saturating_sub(m + 1));
     let y1 = (region[3].ceil().max(0.0) as usize).min(img.h.saturating_sub(m + 1));
     if x1 <= x0 + 2 || y1 <= y0 + 2 { return Vec::new(); }
+    let t_map = ProfT::start();
     // gradients over the region plus a 2 px border (structure tensor window 5x5)
     let (gx0, gy0) = (x0 - 2, y0 - 2);
     let (gw, gh) = (x1 - x0 + 5, y1 - y0 + 5);
@@ -781,6 +836,8 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
             stream_corner_row::<true, true>(gx_slice, gy_slice, ring_row, &mut vacc, lam_row, &mut max_l);
         }
     }
+    t_map.stop("features.map_ms");
+    let t_sel = ProfT::start();
     // corners: relative and absolute floors (a 5x5 window of 2-grey-level gradients is no corner)
     let floor = (p.corner_rel_floor * max_l).max(100.0);
     let mut cand: Vec<(f32, usize, usize)> = Vec::new();
@@ -827,7 +884,10 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     // of the corners in the box
     let quota_plain = p.max_edge_features;
     let quota_tex = (p.max_edge_features / 3).saturating_sub(n_in / 5);
+    t_sel.stop("features.corner_select_ms");
+    prof_count("features.calls", 1);
     if quota_plain == 0 { return out; }
+    let t_edge = ProfT::start();
     let g = |i: usize, j: usize| -> (f32, f32) { let k = (j + 2) * gw + i + 2; (gxv[k], gyv[k]) };
     // squared gradient magnitudes over the region (no hypot: it is slow on the device's libm)
     let mag2: Vec<f32> = (0..rw * rh).map(|k| { let (a, b) = g(k % rw, k / rw); a * a + b * b }).collect();
@@ -903,6 +963,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
         if plain { n_plain += 1 } else { n_tex += 1 }
         if n_plain >= quota_plain && n_tex >= quota_tex { break; }
     }
+    t_edge.stop("features.edge_ms");
     out
 }
 
@@ -986,6 +1047,9 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
     let step = 2.0 * p.sweep_step_px;
     let n = ((span / step).ceil() as usize).clamp(2, 600);
     let dw = (w1 - w0) / n as f64;
+    let t_coarse = ProfT::start();
+    prof_count(if tf.is_some() { "sweep.fwd_calls" } else { "sweep.back_calls" }, 1);
+    prof_count("sweep.coarse_samples", (n + 1) as u64);
     let proj: Vec<RayProj> = targets.iter().map(|v| RayProj::new(src, &d, &v.cam)).collect();
     let mut scores = vec![f32::NEG_INFINITY; n + 1];
     for (i, s) in scores.iter_mut().enumerate() {
@@ -1000,6 +1064,7 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
         }
         if ok { *s = sum / targets.len() as f32; }
     }
+    t_coarse.stop(if tf.is_some() { "sweep.coarse_ms" } else { "sweep.back_coarse_ms" });
     let (ib, &best) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).ok_or(SweepEnd::NoPeak)?;
     if f64::from(best) < p.sweep_min { return Err(SweepEnd::NoPeak); }
     // best separate peak: local maxima at least 2 px of image motion from the best
@@ -1027,7 +1092,9 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
         sum / targets.len() as f32
     };
     let q = dw / 2.0;
+    let t_fine = ProfT::start();
     let fine: Vec<(f64, f32)> = (-4..=4).map(|k| { let w = wb + f64::from(k) * q; (w, score_at(w)) }).collect();
+    t_fine.stop("sweep.fine_ms");
     let (k, _) = fine.iter().enumerate().max_by(|a, b| a.1.1.total_cmp(&b.1.1)).ok_or(SweepEnd::NoPeak)?;
     let mut w = fine[k].0;
     if k > 0 && k + 1 < fine.len() {
@@ -1214,6 +1281,8 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     }
     #[cfg(feature = "mview-profile")]
     let rec_guard = profile_tls::RecProfileGuard::enter();
+    #[cfg(feature = "mview-profile")]
+    let _ = stage_prof::take();
     let t0 = Instant::now();
     let pv: Vec<PView> = views.iter().map(|v| PView { cam: v.cam, full: &v.img, half: v.img.half() }).collect();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
@@ -1273,6 +1342,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         for &vi in &valid {
             let v = &pv[vi];
             let t0 = Instant::now();
+            let t_ref = ProfT::start();
             let m = v.cam.project(&x0).and_then(|q0| match f.normal {
                 None => refine_2d(v.full, &tf, q0),
                 Some(_) => {
@@ -1283,6 +1353,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
                     e.and_then(|e| refine_1d(v.full, &tf, q0, e))
                 }
             });
+            t_ref.stop(if f.normal.is_none() { "refine.corner_2d_ms" } else { "refine.edge_1d_ms" });
             rec.stats.refine_ms += ms(t0);
             let Some((q, _)) = m.filter(|(_, s)| *s >= p.ncc_min) else { fail = true; rec.stats.refine_rejected += 1; rec.outcomes.push((f, "refine")); break; };
             if swept.contains(&vi) {
@@ -1320,7 +1391,9 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     rec.stats.total_ms = ms(t_all);
     #[cfg(feature = "mview-profile")]
     {
-        rec.profile = Some(rec_guard.finish());
+        let mut prof = rec_guard.finish();
+        prof.stages = stage_prof::take();
+        rec.profile = Some(prof);
     }
     rec
 }

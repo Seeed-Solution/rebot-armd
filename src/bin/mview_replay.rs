@@ -6,6 +6,27 @@
 //! and the refined cameras for offline analysis.
 use serde_json::{json, Value};
 
+/// FNV-1a 64 of `bytes` (hex): the input check of the accuracy gate (same decoded pixels).
+fn fnv64(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The replay's inputs as decoded: per view the image size and pixel digest and the camera,
+/// the markers, the box, the reference, table_z and the pose mode.
+fn input_value(b: &armd::measure_multiview::Bundle, mode: armd::measure_multiview::PoseRefine) -> Value {
+    let views: Vec<Value> = b.views.iter().map(|v| json!({
+        "w": v.img.w, "h": v.img.h, "px_fnv64": fnv64(&v.img.px),
+        "cam": {"r": v.cam.r, "c": v.cam.c, "fx": v.cam.fx, "fy": v.cam.fy, "cx": v.cam.cx, "cy": v.cam.cy},
+    })).collect();
+    let markers: Vec<Value> = b.markers.iter().map(|ms| ms.iter().map(|m| json!({"id": m.id, "corners": m.corners})).collect()).collect();
+    json!({"views": views, "markers": markers, "box": b.ref_box_px, "reference": b.reference, "table_z": b.table_z_m, "mode": mode.name()})
+}
+
 fn pose_raw_value(
     mode: armd::measure_multiview::PoseRefine,
     pose: &Option<armd::mview_stereo::PoseRefinement>,
@@ -65,6 +86,9 @@ fn build_profile_doc(
                 "total_ms": pp.total_ms,
                 "pass1": pp.pass1,
                 "pass2": pp.pass2,
+                "prep_stages": pp.prep_stages,
+                "pass1_lm": pp.pass1_lm,
+                "pass2_lm": pp.pass2_lm,
                 "shares": {
                     "prep": share(pp.prep_ms),
                     "pass1_match": share(pp.pass1_match_ms),
@@ -140,8 +164,26 @@ fn main() {
             "n": m.n_points, "n_top": m.n_top_points, "rms": m.reproj_rms_px, "top_method": m.top_method}));
         let cams: Vec<serde_json::Value> = c.pose.as_ref().map(|p| p.cams.clone()).unwrap_or_else(|| b.views.iter().map(|v| v.cam).collect())
             .iter().map(|k| json!({"r": k.r, "c": k.c})).collect();
+        let measure_full = c.measure.as_ref().map_or(Value::Null, |m| json!({
+            "centroid_m": m.centroid_m, "top_z_m": m.top_z_m, "height_m": m.height_m, "width_m": m.width_m, "length_m": m.length_m,
+            "yaw_deg": m.yaw_deg, "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points,
+            "reproj_rms_px": m.reproj_rms_px, "points": m.points, "top_method": m.top_method,
+        }));
+        let outcomes: Vec<Value> = c.rec.outcomes.iter().map(|(f, o)| json!([f.x, f.y, f.normal, f.side, f.strength, o])).collect();
+        let plane = c.plane.as_ref().map_or(Value::Null, |t| json!({
+            "plane": t.plane, "n_points": t.n_points, "n_inliers": t.n_inliers, "offset_mm": t.offset_mm, "tilt_deg": t.tilt_deg,
+            "mad_mm": t.mad_mm, "threshold_mm": t.threshold_mm,
+        }));
         #[cfg_attr(not(feature = "mview-profile"), allow(unused_mut))]
         let mut doc = json!({
+            "input": input_value(&b, mode_eff),
+            "compute_ms": c.ms,
+            "measure_full": measure_full,
+            "outcomes": outcomes,
+            "plane": plane,
+            "object_min_h_m": c.object_min_h_m,
+            "table": {"n_points": c.table.n_points, "median_mm": c.table.median_mm, "median_abs_mm": c.table.median_abs_mm, "p90_abs_mm": c.table.p90_abs_mm},
+            "region_px": c.region_px,
             "table_z": b.table_z_m,
             "box": b.ref_box_px,
             "measure": m,
