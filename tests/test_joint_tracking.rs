@@ -3391,3 +3391,86 @@ fn tracking_failed_gravity_comp_entry_rollback_invalidates_old_baseline() {
         "stale pre-entry issued target must not remain after rollback"
     );
 }
+
+/// Review 2 M6: Output acceptance defaults to `false`; skipping output due to `disable_pending`
+/// or `!is_torqued` must NEVER publish `"done"` for an action finishing on that tick.
+#[test]
+fn tracking_action_done_not_published_when_output_skipped_by_disable_or_torque_off() {
+    let cur_gripper_frac = |inner: &SupervisorInner, q_grip: f32| -> f64 {
+        let policy = inner.config.gripper_policy.as_ref().unwrap();
+        f64::from(((q_grip - policy.closed_rad) / (policy.open_rad - policy.closed_rad)).clamp(0.0, 1.0))
+    };
+    let make_rig = || {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let epoch = inner.safety.epoch_id();
+        let cur_frac = cur_gripper_frac(&inner, q0[6]);
+        let (id, _) = inner
+            .start_gripper(
+                GripperRequest {
+                    command: GripperCommand::Move,
+                    fraction: Some(cur_frac),
+                    grasp: false,
+                    speed: 1.0,
+                    timeout_s: Some(5.0),
+                    tag: None,
+                },
+                epoch,
+            )
+            .unwrap();
+        (inner, drv, id)
+    };
+
+    // Determine exact `done_tick` from control run.
+    let done_tick = {
+        let (mut inner, _drv, _id) = make_rig();
+        let mut n = 0usize;
+        for k in 1..=30 {
+            let obs = inner.tick(DT);
+            if obs.action.as_ref().is_some_and(|a| a.state == "done") {
+                n = k;
+                break;
+            }
+        }
+        assert!(n >= 1);
+        n
+    };
+
+    // 1. `disable_pending == true` on `done_tick`: output skipped -> action must NOT report "done".
+    {
+        let (mut inner, drv, id) = make_rig();
+        for _ in 1..done_tick {
+            let obs = inner.tick(DT);
+            assert_eq!(obs.action.as_ref().unwrap().state, "running");
+        }
+        let idx_before = drv.with(|s| s.written.len());
+        inner.disable_pending = true;
+        let obs = inner.tick(DT);
+        assert_eq!(drv.with(|s| s.written.len()), idx_before, "disable_pending must skip output write");
+        let act = obs.action.expect("action status present");
+        assert_eq!(act.id, id);
+        assert_ne!(act.state, "done", "skipped output on disable_pending must NOT publish done");
+    }
+
+    // 2. `!is_torqued` on `done_tick`: output skipped -> action must NOT report "done".
+    {
+        let (mut inner, drv, id) = make_rig();
+        for _ in 1..done_tick {
+            let obs = inner.tick(DT);
+            assert_eq!(obs.action.as_ref().unwrap().state, "running");
+        }
+        let idx_before = drv.with(|s| s.written.len());
+        inner.is_torqued = false;
+        let obs = inner.tick(DT);
+        assert_eq!(drv.with(|s| s.written.len()), idx_before, "untorqued arm must skip output write");
+        let act = obs.action.expect("action status present");
+        assert_eq!(act.id, id);
+        assert_ne!(act.state, "done", "skipped output while untorqued must NOT publish done");
+    }
+}

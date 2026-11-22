@@ -5340,15 +5340,20 @@ impl SupervisorInner {
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
-        let mut tick_output_rejected = false;
+        let mut tick_output_accepted = false;
         if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
+            if self.driver.is_none() {
+                tick_output_accepted = true;
+            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
                 if let Ok(mut driver) = d.lock() {
                     if driver.enable_state() != EnableState::Disabled {
-                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                        match driver.write_joint_targets(&targets) {
+                            Ok(()) => tick_output_accepted = true,
+                            Err(e) => output_error = Some(e.to_string()),
+                        }
                     }
                 }
             }
@@ -5381,7 +5386,6 @@ impl SupervisorInner {
                 if tracking_active && self.tracking.recovery_suspended {
                     // Driver emitted an autonomous recovery write; suspend supervisor target
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
-                    tick_output_rejected = true;
                 } else if ramp_out_handover || tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
@@ -5439,12 +5443,15 @@ impl SupervisorInner {
                                 .and_then(|d| d.lock().ok())
                                 .map(|mut driver| driver.write_joint_targets(&targets));
                             match write_res {
-                                Some(Ok(())) => self.tracking.record_issued_with_ws_depths(
-                                    out.positions,
-                                    out.velocities,
-                                    out.ws_min_depths,
-                                    out.ws_keepout_min_depths,
-                                ),
+                                Some(Ok(())) => {
+                                    self.tracking.record_issued_with_ws_depths(
+                                        out.positions,
+                                        out.velocities,
+                                        out.ws_min_depths,
+                                        out.ws_keepout_min_depths,
+                                    );
+                                    tick_output_accepted = true;
+                                }
                                 Some(Err(e)) => {
                                     self.tracking.invalidate();
                                     output_error = Some(e.to_string());
@@ -5453,7 +5460,6 @@ impl SupervisorInner {
                             }
                         }
                         Err(reject) => {
-                            tick_output_rejected = true;
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
                             let prev_confirmed = self.tracking.last_issued_positions.clone();
                             let prev_velocities = self.tracking.last_issued_velocities.clone();
@@ -5575,22 +5581,24 @@ impl SupervisorInner {
                                     kd: None,
                                 })
                                 .collect();
-                            if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                            match driver.write_joint_targets(&targets) {
+                                Ok(()) => tick_output_accepted = true,
+                                Err(e) => output_error = Some(e.to_string()),
+                            }
                         }
+                    } else {
+                        tick_output_accepted = true;
                     }
                 }
             } else {
                 self.tracking.invalidate();
-                if self.driver.is_some() {
-                    tick_output_rejected = true;
-                }
             }
         } else {
             self.tracking.invalidate();
         }
 
         if let Some(error) = output_error {
-            tick_output_rejected = true;
+            tick_output_accepted = false;
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
@@ -5616,7 +5624,7 @@ impl SupervisorInner {
             self.servo_stream_active = false;
         }
 
-        let tick_output_accepted = !tick_output_rejected && !self.safety.state().is_stopped();
+        let tick_output_accepted = tick_output_accepted && !self.safety.state().is_stopped();
         if let Some(done) = deferred_done {
             if tick_output_accepted {
                 if done.clear_releasing {
