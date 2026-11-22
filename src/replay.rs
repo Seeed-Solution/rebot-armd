@@ -255,16 +255,23 @@ pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
             input.request.episode, eff_tool_id, eff_tool_digest, input.active_tool.id, input.active_tool.config_digest
         )));
     }
-    let mut plan = plan_frames(input, &frames)?;
+    let mut plan = plan_frames_with_provenance(input, &frames, eff_tool_id, eff_tool_digest)?;
     plan.has_gripper_motion = sidecar_has_gripper;
     plan.tool_provenance_ok = provenance_ok;
-    plan.recorded_tool_id = eff_tool_id;
-    plan.recorded_tool_digest = eff_tool_digest;
     Ok(plan)
 }
 
-/// [`plan`] for frames already in memory.
+/// [`plan`] for frames already in memory (legacy unkeyed provenance `(None, None)`).
 pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayPlan, ArmError> {
+    plan_frames_with_provenance(input, frames, None, None)
+}
+
+fn plan_frames_with_provenance(
+    input: ReplayInput,
+    frames: &[RecordFrame],
+    recorded_tool_id: Option<String>,
+    recorded_tool_digest: Option<String>,
+) -> Result<ReplayPlan, ArmError> {
     if frames.is_empty() {
         return Err(rejected(422, "REPLAY_EMPTY", "episode has no frames".into()));
     }
@@ -346,6 +353,20 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
             .map_err(workspace_reject)?;
     }
     let has_gripper_motion = crate::recording::store::episode_has_gripper_motion(frames, input.gripper_idx);
+    let approach_moves_gripper = input.gripper_idx.is_some_and(|g| {
+        frames.first().and_then(|f| f.observation_state.get(g).copied())
+            .zip(input.start.get(g).copied())
+            .is_some_and(|(first_g, start_g)| (first_g - start_g).abs() > 1e-3)
+    });
+    let tool_provenance_ok = input
+        .active_tool
+        .matches_record(recorded_tool_id.as_deref(), recorded_tool_digest.as_deref());
+    if input.request.gripper && (has_gripper_motion || approach_moves_gripper) && !tool_provenance_ok {
+        return Err(rejected(409, "TOOL_MISMATCH", format!(
+            "Episode '{}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({}); pass gripper: false for arm-only playback",
+            input.request.episode, recorded_tool_id, recorded_tool_digest, input.active_tool.id, input.active_tool.config_digest
+        )));
+    }
     // power budget: the playback (at the chosen speed) is slowed to fit, or refused
     let power_scale = match input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         None => None,
@@ -375,9 +396,9 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
         duration,
         power_scale,
         has_gripper_motion,
-        tool_provenance_ok: true,
-        recorded_tool_id: None,
-        recorded_tool_digest: None,
+        tool_provenance_ok,
+        recorded_tool_id,
+        recorded_tool_digest,
     })
 }
 
@@ -686,5 +707,67 @@ mod tests {
         assert_eq!(code(resample(&[frame(1.0, &[0.0]), frame(0.5, &[0.0])], 0.02).unwrap_err()), "REPLAY_INVALID_EPISODE");
         assert_eq!(code(resample(&[frame(0.0, &[0.0]), frame(f64::NAN, &[0.0])], 0.02).unwrap_err()), "REPLAY_INVALID_EPISODE");
         assert_eq!(code(resample(&[frame(0.0, &[0.0]), frame(601.0, &[0.0])], 0.02).unwrap_err()), "REPLAY_TOO_LONG");
+    }
+
+    #[test]
+    fn r3_m5_plan_frames_enforces_active_tool_provenance_for_gripper_motion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+        let mut cfg = crate::model::ArmConfig::rebot_dm();
+        let finray_pack: crate::tool::ToolPackConfig = serde_json::from_value(serde_json::json!({
+            "id": "soft_finray_gripper",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.0288, 0.0, 0.0]
+        })).unwrap();
+        let non_stock_cfg = crate::tool::apply_tool_overlay(&cfg, &finray_pack).unwrap();
+        cfg.validate().unwrap();
+
+        let q0 = vec![0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -1.0];
+        let mut q1 = q0.clone();
+        q1[6] = -0.2;
+        let frames = vec![
+            frame(0.0, &q0),
+            frame(0.5, &q0),
+            frame(1.0, &q1),
+        ];
+
+        let make_input = |c: &crate::model::ArmConfig, gripper: bool| ReplayInput {
+            request: ReplayRequest { episode: "mem_ep".into(), speed: 1.0, gripper, tag: None, allow_stale: false },
+            path: dir.path().join("unused.parquet"),
+            profile_id: c.profile_id.clone(),
+            dof: c.dof,
+            arm_dof: c.arm_dof(),
+            gripper_idx: c.gripper_index(),
+            joint_names: c.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: c.limits.clone(),
+            speed_limits: c.limits.clone(),
+            ws: None,
+            arm: c.arm_model.clone(),
+            start: q0.clone(),
+            control_hz: 50,
+            epoch: 0,
+            workspace_revision: 0,
+            power: None,
+            store: store.clone(),
+            zero_offsets: vec![0.0; c.dof],
+            tcp_offset: c.tcp_offset,
+            active_tool: c.active_tool.clone(),
+        };
+
+        // 1. Non-stock active tool + gripper: true -> rejected with 409 TOOL_MISMATCH
+        let err = plan_frames(make_input(&non_stock_cfg, true), &frames).unwrap_err();
+        match err {
+            ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
+            other => panic!("expected 409 TOOL_MISMATCH, got {other:?}"),
+        }
+
+        // 2. Non-stock active tool + gripper: false (arm-only) -> allowed
+        let arm_only = plan_frames(make_input(&non_stock_cfg, false), &frames).unwrap();
+        assert!(!arm_only.tool_provenance_ok);
+
+        // 3. Stock active tool + gripper: true -> allowed (legacy provenance)
+        let stock_plan = plan_frames(make_input(&cfg, true), &frames).unwrap();
+        assert!(stock_plan.tool_provenance_ok);
     }
 }

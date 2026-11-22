@@ -70,7 +70,7 @@ fn cli_tool_info_covers_finray_stock_robots_and_rejects_invalid() {
         assert_eq!(v["tcp_offset_m"], serde_json::json!([0.0288, 0.0, 0.0]));
         assert_eq!(
             v["config_digest"],
-            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776"
+            "v1:377d453f74a2016a65bd15dfd2a471fc3c6afe9d3cf9c8f0c494fea024d14360"
         );
         assert!(v["canonical_json"].as_str().unwrap().contains("\"tool_id\":\"soft_finray_gripper\""));
     }
@@ -85,9 +85,9 @@ fn cli_tool_info_covers_finray_stock_robots_and_rejects_invalid() {
     assert!(stderr.contains("--robot"), "{stderr}");
 
     for (robot, expected_digest) in [
-        ("b601dm", "v1:ac4d69ae16085196687d381a4dbfa89a1940a08522dd088f2459645fd91d1064"),
-        ("so101", "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42"),
-        ("so100", "v1:efbb9e76729b3b748959c032a789412e0ef0224d197079d16f688a32f82463d4"),
+        ("b601dm", "v1:4d9ba4f81085d7ee9cbf2b17ce608f0b6b420d6014789ae22cd109163dac993d"),
+        ("so101", "v1:4a99263dd305f5bf7e7f0f6a96dc2802b6be9b4255e26b88fcbd53f3112c0ef0"),
+        ("so100", "v1:a6d6472780495b49ed7b4284271d71afe15d9379804c758565dee1fc24a78f7f"),
         ("b601rs", "v1:940a10d6d0dadaa2c6d2fdf7771cb8e226805c3300233dff9661fc5b8cf89636"),
     ] {
         let (code, stdout, stderr) =

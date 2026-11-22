@@ -205,8 +205,8 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     };
     let check_table = |q: &[[f32; 7]]| -> Result<(), ArmError> {
         if let Some((points, bound)) = table_clearance.as_ref() {
-            crate::backlash::table_clear(&input.arm, points, *bound, q)
-                .map_err(|r| ArmError::from(crate::backlash::table_violation_from_clear(r)))?;
+            crate::backlash::check_table_clear(&input.arm, points, *bound, q.iter().map(|q| q.as_slice()))
+                .map_err(|v| ArmError::from(v.into_motion_error()))?;
         }
         Ok(())
     };

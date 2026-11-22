@@ -1420,3 +1420,87 @@ async fn m6_stream_contact_speed_invalidates_commissioning_and_m8_rejects_non_st
     assert_eq!(legacy_emb.tool_id, None);
     assert_eq!(legacy_emb.tool_config_digest, None);
 }
+
+#[tokio::test]
+async fn r3_m4_settle_ms_changes_digest_and_invalidates_commissioning() {
+    let comm_dir = tempfile::tempdir().unwrap();
+    let comm_file = comm_dir.path().join("tool_commissioning.json");
+    let pack: ToolPackConfig = serde_json::from_str(FINRAY_PACK_JSON).unwrap();
+    let base1 = ArmConfig::rebot_dm();
+    let mut base2 = base1.clone();
+    base2.gripper_policy.as_mut().unwrap().settle_ms = 650;
+    let cfg1 = tool::apply_tool_overlay(&base1, &pack).unwrap();
+    let cfg2 = tool::apply_tool_overlay(&base2, &pack).unwrap();
+    assert_ne!(cfg1.active_tool.config_digest, cfg2.active_tool.config_digest);
+
+    let sup1 = Arc::new(ArmSupervisor::new(cfg1.clone()));
+    {
+        let mut inner = sup1.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_file.clone());
+    }
+    let prep = {
+        let inner = sup1.inner().read().await;
+        tool::prepare_commissioning_confirm(
+            &inner,
+            &json!({
+                "confirm": true,
+                "tool_id": cfg1.active_tool.id,
+                "tool_config_digest": cfg1.active_tool.config_digest
+            }),
+            false,
+        )
+        .unwrap()
+    };
+    prep.write.unwrap().run().await.unwrap();
+
+    // Same settle_ms loads as commissioned; modified settle_ms invalidates commissioning.
+    let sup_same = Arc::new(ArmSupervisor::new(cfg1));
+    tool::load_commissioning_into(&sup_same, &comm_file).await;
+    assert!(!sup_same.inner().read().await.config.active_tool.commissioning_required);
+
+    let sup_changed = Arc::new(ArmSupervisor::new(cfg2));
+    tool::load_commissioning_into(&sup_changed, &comm_file).await;
+    assert!(
+        sup_changed.inner().read().await.config.active_tool.commissioning_required,
+        "changing settle_ms must invalidate old commissioning"
+    );
+}
+
+#[test]
+fn r3_minor1_place_table_violation_preserves_actual_point_value_and_bound() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_rolled = kinematics::rpy_to_r(std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+    let end_goal = cfg.tcp_to_end(&Pose::new(r_rolled, [0.26, 0.0, 0.28]));
+    let sol = cfg.arm_model.solve_dls(&end_goal, &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+
+    let mut inner = common::sim_at(cfg, &q_start);
+    inner.set_grasp_setup(GraspSetup { table_z_m: 0.190, ..GraspSetup::default() });
+    let pending = armd::place::prepare(
+        &inner,
+        &json!({
+            "position": [0.26, 0.0, 0.25],
+            "orientation": {"rpy": [0.0, 0.0, 0.0]},
+            "approach_height_m": 0.04,
+        }),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    let err = armd::place::plan(pending).unwrap_err();
+    match err {
+        ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { s, point, value, bound, .. }) => {
+            let expected_bound = 0.190 + armd::grasp::TABLE_CLEARANCE_M;
+            assert!((bound - expected_bound).abs() < 1e-6, "expected effective table+clearance bound {expected_bound}, got {bound}");
+            assert!(value < bound, "expected measured height {value} < bound {bound}");
+            assert!(value != 0.0 && bound != 0.0, "must not emit placeholder zero metrics: value={value}, bound={bound}");
+            assert!(point > 0, "rolled finray lateral point (not point 0) should trigger violation, got point={point}, s={s}");
+        }
+        other => panic!("expected WorkspaceViolation, got {other:?}"),
+    }
+}

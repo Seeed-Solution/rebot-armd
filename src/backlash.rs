@@ -277,6 +277,83 @@ impl DescentRules {
     pub fn tcp_at(point_end_m: [f64; 3]) -> Self { Self { from_above: vec![point_end_m], table: None } }
 }
 
+/// Detailed diagnostic for a table-clearance violation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableClearViolation {
+    pub sample_index: usize,
+    pub total_samples: usize,
+    pub point: usize,
+    pub value_m: f64,
+    pub bound_m: f64,
+}
+
+impl TableClearViolation {
+    pub fn s(&self) -> f64 {
+        if self.total_samples <= 1 {
+            1.0
+        } else {
+            self.sample_index as f64 / (self.total_samples - 1) as f64
+        }
+    }
+
+    pub fn message(&self) -> String {
+        format!(
+            "table: sample {}/{} tool point {} z={:.4} m below clearance bound {:.4} m",
+            self.sample_index, self.total_samples, self.point, self.value_m, self.bound_m
+        )
+    }
+
+    pub fn into_motion_error(self) -> MotionError {
+        let s = self.s();
+        let reason = self.message();
+        MotionError::WorkspaceViolation {
+            s,
+            point: self.point,
+            limit: "table_z_m + 0.005".into(),
+            value: self.value_m,
+            bound: self.bound_m,
+            detail: Box::new(crate::kinematics::WorkspaceViolationDetail {
+                constraint_id: Some("table_z".into()),
+                geometry_id: None,
+                violation_phase: Some("plan".into()),
+                reason: Some(reason),
+            }),
+        }
+    }
+}
+
+/// Check the table rule of [`DescentRules::table`] along joint-space samples `qs`, returning full
+/// violation diagnostics (sample index, tool point index, measured z, and effective bound).
+pub fn check_table_clear<'a>(
+    arm: &crate::chain::ArmModel,
+    points: &[crate::kinematics::Vec3],
+    bound: f64,
+    qs: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<(), TableClearViolation> {
+    let samples: Vec<&'a [f32]> = qs.into_iter().collect();
+    let total_samples = samples.len();
+    let Some(start) = samples.first().and_then(|q| arm.fk_f32(q)) else {
+        return Ok(());
+    };
+    let floor: Vec<f64> = points.iter().map(|p| start.transform_point(p)[2].min(bound)).collect();
+    for (sample_index, q) in samples.iter().enumerate().skip(1) {
+        let Some(pose) = arm.fk_f32(q) else { continue };
+        for (point, (p, f)) in points.iter().zip(&floor).enumerate() {
+            let z = pose.transform_point(p)[2];
+            if z < f - 1e-6 {
+                return Err(TableClearViolation {
+                    sample_index,
+                    total_samples,
+                    point,
+                    value_m: z,
+                    bound_m: *f,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The table rule of [`DescentRules::table`] along joint-space samples `qs` (the first is the start).
 pub fn table_clear<Q: AsRef<[f32]>>(arm: &crate::chain::ArmModel, points: &[crate::kinematics::Vec3], bound: f64, qs: &[Q]) -> Result<(), String> {
     table_clear_iter(arm, points, bound, qs.iter().map(AsRef::as_ref))
@@ -284,16 +361,7 @@ pub fn table_clear<Q: AsRef<[f32]>>(arm: &crate::chain::ArmModel, points: &[crat
 
 /// Iterator variant of [`table_clear`].
 pub fn table_clear_iter<'a>(arm: &crate::chain::ArmModel, points: &[crate::kinematics::Vec3], bound: f64, qs: impl IntoIterator<Item = &'a [f32]>) -> Result<(), String> {
-    let mut iter = qs.into_iter();
-    let Some(start) = iter.next().and_then(|q| arm.fk_f32(q)) else { return Ok(()) };
-    let floor: Vec<f64> = points.iter().map(|p| start.transform_point(p)[2].min(bound)).collect();
-    for q in iter {
-        let Some(pose) = arm.fk_f32(q) else { continue };
-        if points.iter().zip(&floor).any(|(p, f)| pose.transform_point(p)[2] < f - 1e-6) {
-            return Err(format!("table: a tool point comes closer than the clearance ({bound:.3} m)"));
-        }
-    }
-    Ok(())
+    check_table_clear(arm, points, bound, qs).map_err(|v| v.message())
 }
 
 /// Convert a [`table_clear`] failure into a `WORKSPACE_VIOLATION` [`MotionError`].
@@ -491,7 +559,8 @@ mod runtime {
             rules: Option<&DescentRules>, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
             let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
                 if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
-                    table_clear(&input.arm, points, *bound, &path.q).map_err(|r| ArmError::from(table_violation_from_clear(r)))?;
+                    check_table_clear(&input.arm, points, *bound, path.q.iter().map(|q| q.as_slice()))
+                        .map_err(|v| ArmError::from(v.into_motion_error()))?;
                 }
                 Ok(())
             };
@@ -550,7 +619,8 @@ mod runtime {
             plan: Option<&Plan>, rules: Option<&DescentRules>) -> Result<f64, ArmError> {
             let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
                 if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
-                    table_clear(&input.arm, points, *bound, &path.q).map_err(|r| ArmError::from(table_violation_from_clear(r)))?;
+                    check_table_clear(&input.arm, points, *bound, path.q.iter().map(|q| q.as_slice()))
+                        .map_err(|v| ArmError::from(v.into_motion_error()))?;
                 }
                 Ok(())
             };
@@ -670,5 +740,44 @@ mod tests {
         assert_eq!(p.joint_indices(&names, &arm), vec![1]);
         let parsed: BacklashApproach = serde_json::from_str("{}").unwrap();
         assert_eq!(parsed, BacklashApproach::default());
+    }
+
+    #[test]
+    fn r3_minor1_check_table_clear_reports_actual_sample_point_value_and_bound() {
+        let arm = crate::chain::ArmModel::REBOT_DEV_ARM;
+        // Sample 0 is well above z=0; sample 1 dips below bound at the second envelope point.
+        let q_high = [0.0f32, -0.4, -0.4, 0.2, 0.0, 0.0, 0.0];
+        let q_low = [0.0f32, 0.8, 0.2, 0.8, 0.0, 0.0, 0.0];
+        let end_low = arm.fk_f32(&q_low).unwrap();
+        let bound = 0.05;
+        // Point 0 stays safely above bound; point 1 sits far below end_link (-0.30 in z in base/end frame).
+        let pt_safe = [0.0, 0.0, 0.50];
+        let mut r_inv = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                r_inv[i][j] = end_low.r[j][i];
+            }
+        }
+        let world_low = [0.0, 0.0, -0.10];
+        let pt_violating = crate::kinematics::mat_vec(&r_inv, &crate::kinematics::sub(&world_low, &end_low.p));
+        let points = [pt_safe, pt_violating];
+
+        let qs: [&[f32]; 3] = [&q_high, &q_low, &q_high];
+        let err = check_table_clear(&arm, &points, bound, qs).unwrap_err();
+        assert_eq!(err.sample_index, 1);
+        assert_eq!(err.total_samples, 3);
+        assert_eq!(err.point, 1);
+        assert!((err.value_m - (-0.10)).abs() < 1e-6, "got value_m={}", err.value_m);
+        assert!((err.bound_m - bound).abs() < 1e-9, "got bound_m={}", err.bound_m);
+        let motion_err = err.into_motion_error();
+        match motion_err {
+            crate::motion::MotionError::WorkspaceViolation { s, point, value, bound: b, .. } => {
+                assert!((s - 0.5).abs() < 1e-9, "s={s}");
+                assert_eq!(point, 1);
+                assert!((value - (-0.10)).abs() < 1e-6, "value={value}");
+                assert!((b - bound).abs() < 1e-9, "bound={b}");
+            }
+            other => panic!("expected WorkspaceViolation, got {other:?}"),
+        }
     }
 }

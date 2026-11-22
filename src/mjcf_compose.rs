@@ -1279,6 +1279,51 @@ pub fn validate_tool_manifest(
     Ok(resolved_tcp)
 }
 
+fn parse_mjcf_vec3(raw: &str, label: &str) -> Result<[f64; 3], String> {
+    let vals: Vec<f64> = raw
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().map_err(|e| format!("invalid {label} float '{s}': {e}")))
+        .collect::<Result<_, _>>()?;
+    if vals.len() != 3 || !vals.iter().all(|v| v.is_finite()) {
+        return Err(format!("base MJCF <site name=\"tcp\"> {label} must have 3 finite numbers"));
+    }
+    Ok([vals[0], vals[1], vals[2]])
+}
+
+fn parse_mjcf_site_rotation(node: roxmltree::Node) -> Result<crate::kinematics::Mat3, String> {
+    if let Some(q_raw) = node.attribute("quat") {
+        let vals: Vec<f64> = q_raw
+            .split_whitespace()
+            .map(|s| s.parse::<f64>().map_err(|e| format!("invalid tcp site quat float '{s}': {e}")))
+            .collect::<Result<_, _>>()?;
+        if vals.len() != 4 || !vals.iter().all(|v| v.is_finite()) {
+            return Err("base MJCF <site name=\"tcp\"> quat must have 4 finite numbers".into());
+        }
+        let norm = (vals[0] * vals[0] + vals[1] * vals[1] + vals[2] * vals[2] + vals[3] * vals[3]).sqrt();
+        if norm <= 1e-12 {
+            return Err("base MJCF <site name=\"tcp\"> quat has zero norm".into());
+        }
+        let (w, x, y, z) = (vals[0] / norm, vals[1] / norm, vals[2] / norm, vals[3] / norm);
+        return Ok([
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]);
+    }
+    if let Some(e_raw) = node.attribute("euler") {
+        let r = parse_mjcf_vec3(e_raw, "euler")?;
+        return Ok(crate::kinematics::rpy_to_r(r[0], r[1], r[2]));
+    }
+    for unsupported in ["axisangle", "xyaxes", "zaxis"] {
+        if node.attribute(unsupported).is_some() {
+            return Err(format!(
+                "base MJCF <site name=\"tcp\"> uses unsupported orientation attribute '{unsupported}'"
+            ));
+        }
+    }
+    Ok(crate::kinematics::IDENTITY)
+}
+
 fn find_xml_attr_value_span(tag_xml: &str, attr_name: &str) -> Option<(usize, usize)> {
     let bytes = tag_xml.as_bytes();
     let mut i = 0;
@@ -1536,11 +1581,10 @@ pub fn compose_mjcf(
             None
         };
 
-        // Update base TCP site pos even when tool_xml is empty/omitted:
-        // explicit Some([0,0,0]) forces 0 0 0; None inherits resolved XML site.
+        // Update base TCP site pos relative to the base site's zero-offset pose
+        // (p_tcp = p_base_site + R_base_site * tcp_offset), preserving base pose for [0, 0, 0].
         let should_override_tcp_site = tm.tcp_offset.is_some() || skip_range.is_some();
         if should_override_tcp_site {
-            let pos_val = format!("{} {} {}", resolved_tcp[0], resolved_tcp[1], resolved_tcp[2]);
             let mut tcp_site_updated = false;
             for node in base_doc.descendants() {
                 if node.is_element() && node.tag_name().name() == "site" && node.attribute("name") == Some("tcp") {
@@ -1551,6 +1595,26 @@ pub fn compose_mjcf(
                     if overlaps_delete {
                         continue;
                     }
+                    let base_pos = match node.attribute("pos") {
+                        Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+                        None => [0.0; 3],
+                    };
+                    let composed_pos = if resolved_tcp == [0.0; 3] {
+                        base_pos
+                    } else {
+                        let r_site = parse_mjcf_site_rotation(node)?;
+                        crate::kinematics::add(
+                            &base_pos,
+                            &crate::kinematics::mat_vec(&r_site, &resolved_tcp),
+                        )
+                    };
+                    let fmt = |v: f64| if v == 0.0 { 0.0 } else { v };
+                    let pos_val = format!(
+                        "{} {} {}",
+                        fmt(composed_pos[0]),
+                        fmt(composed_pos[1]),
+                        fmt(composed_pos[2])
+                    );
                     let site_str = &base_xml[range.clone()];
                     if let Some((val_start, val_end)) = find_xml_attr_value_span(site_str, "pos") {
                         edits.push(XmlEdit {
@@ -2093,5 +2157,64 @@ mod tests {
             let missing_err_empty = compose_mjcf(missing_tcp_base, None, Some(&sq_manifest), empty_xml).unwrap_err();
             assert!(missing_err_empty.contains("tcp"), "{missing_err_empty}");
         }
+
+        // 10. R3 M3: SO-101 base MJCF TCP site preserves its non-zero zero-offset pos for [0,0,0]
+        // and rotates non-zero tcp_offset through the site quat matching ArmConfig::end_to_tcp.
+        let so101_base_xml = include_str!("../sim/mujoco/models/so_arm101_scene.xml");
+        let so101_zero_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_zero_offset",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "tcp_offset": [0.0, 0.0, 0.0],
+            "armd": {
+                "gripper_policy": {
+                    "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]]
+                }
+            }
+        })).unwrap();
+        let so101_zero_xml = compose_mjcf(so101_base_xml, None, Some(&so101_zero_manifest), None).unwrap();
+        let so101_zero_doc = roxmltree::Document::parse(&so101_zero_xml).unwrap();
+        let so101_zero_site = so101_zero_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let zero_pos = parse_mjcf_vec3(so101_zero_site.attribute("pos").unwrap(), "pos").unwrap();
+        assert!((zero_pos[0] - (-0.0079)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+        assert!((zero_pos[1] - (-0.000218121)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+        assert!((zero_pos[2] - (-0.0981274)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+
+        let so101_offset_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_offset_tool",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "tcp_offset": [0.025, 0.010, -0.005],
+            "armd": {
+                "gripper_policy": {
+                    "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]]
+                }
+            }
+        })).unwrap();
+        let so101_offset_xml = compose_mjcf(so101_base_xml, None, Some(&so101_offset_manifest), None).unwrap();
+        let so101_offset_doc = roxmltree::Document::parse(&so101_offset_xml).unwrap();
+        let so101_offset_site = so101_offset_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let offset_pos = parse_mjcf_vec3(so101_offset_site.attribute("pos").unwrap(), "pos").unwrap();
+        let r_site = parse_mjcf_site_rotation(so101_zero_site).unwrap();
+        let expected_offset_pos = crate::kinematics::add(
+            &zero_pos,
+            &crate::kinematics::mat_vec(&r_site, &[0.025, 0.010, -0.005]),
+        );
+        for axis in 0..3 {
+            assert!(
+                (offset_pos[axis] - expected_offset_pos[axis]).abs() < 1e-6,
+                "axis={axis} offset_pos={offset_pos:?} expected={expected_offset_pos:?}"
+            );
+        }
+        // Site x-axis in SO-101 gripper body points along -Z (0, 0, -1), y along -X (-1, 0, 0), z along +Y (0, 1, 0).
+        assert!((offset_pos[0] - (-0.0079 - 0.010)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+        assert!((offset_pos[1] - (-0.000218121 - 0.005)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+        assert!((offset_pos[2] - (-0.0981274 - 0.025)).abs() < 1e-5, "offset_pos={offset_pos:?}");
     }
 }

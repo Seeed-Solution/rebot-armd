@@ -2309,15 +2309,15 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     cur.j7 = open_rad;
     cur.goal_frame = if camera_down { GoalFrame::EndLink } else { GoalFrame::Tcp };
     let path = motion::plan_cartesian_ex(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-    crate::backlash::table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, &path.q)
-        .map_err(|r| ArmError::from(crate::backlash::table_violation_from_clear(r)))?;
+    crate::backlash::check_table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, path.q.iter().map(|q| q.as_slice()))
+        .map_err(|v| ArmError::from(v.into_motion_error()))?;
     let last = path.last();
     cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
     cur.goal_frame = GoalFrame::Tcp;
     let transition_duration = if camera_down {
         let trans_path = motion::plan_cartesian_ex(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
-        crate::backlash::table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, &trans_path.q)
-            .map_err(|r| ArmError::from(crate::backlash::table_violation_from_clear(r)))?;
+        crate::backlash::check_table_clear(&input.arm, &pts, setup.table_z_m + TABLE_CLEARANCE_M, trans_path.q.iter().map(|q| q.as_slice()))
+            .map_err(|v| ArmError::from(v.into_motion_error()))?;
         let last = trans_path.last();
         cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
         transition_estimate(&goal, &target, setup)

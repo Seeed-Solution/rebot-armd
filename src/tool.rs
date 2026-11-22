@@ -627,6 +627,7 @@ struct CanonicalGripperPolicy {
     max_close_torque_unm: Option<i64>,
     max_lead_urad: Option<i64>,
     open_urad: i64,
+    settle_ms: u64,
     squeeze_urad: i64,
     stream_contact_speed_urad_s: Option<i64>,
 }
@@ -660,6 +661,7 @@ pub struct CanonicalGripperInput {
     pub holding_torque_nm: f64,
     pub contact_torque_nm: Option<f64>,
     pub max_lead_rad: Option<f64>,
+    pub settle_ms: u64,
     pub squeeze_rad: f64,
     pub max_close_torque_nm: Option<f64>,
     pub stream_contact_speed_rad_s: Option<f64>,
@@ -682,6 +684,7 @@ impl From<&GripperPolicy> for CanonicalGripperInput {
             holding_torque_nm: f64::from(gp.holding_torque_nm),
             contact_torque_nm: gp.contact_torque_nm.map(f64::from),
             max_lead_rad: gp.max_lead_rad.map(f64::from),
+            settle_ms: gp.settle_ms,
             squeeze_rad: f64::from(gp.squeeze_rad),
             max_close_torque_nm: gp.max_close_torque_nm.map(f64::from),
             stream_contact_speed_rad_s: gp.stream_contact_speed_rad_s.map(f64::from),
@@ -738,6 +741,7 @@ pub fn canonical_tool_payload_json_f64(
             max_close_torque_unm: gp.max_close_torque_nm.map(to_micro_f64),
             max_lead_urad: gp.max_lead_rad.map(to_micro_f64),
             open_urad: to_micro_f64(gp.open_rad),
+            settle_ms: gp.settle_ms,
             squeeze_urad: to_micro_f64(gp.squeeze_rad),
             stream_contact_speed_urad_s: gp.stream_contact_speed_rad_s.map(to_micro_f64),
         }
@@ -1553,7 +1557,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[[0,-82000,-22000],[0,-82000,22000],[0,82000,-22000],[0,82000,22000],[32000,-82000,-22000],[32000,-82000,22000],[32000,0,-22000],[32000,0,22000],[32000,82000,-22000],[32000,82000,22000]],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":[[-5700000,88600],[0,3600]],"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":[[-5700000,88600],[0,3600]],"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"settle_ms":300,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":75000,"#,
             r#""physical_contact_um":[28800,0,0],"#,
@@ -1563,7 +1567,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_FINRAY_DIGEST: &str =
-            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776";
+            "v1:377d453f74a2016a65bd15dfd2a471fc3c6afe9d3cf9c8f0c494fea024d14360";
         eprintln!("CANONICAL_FINRAY_JSON={finray_json}");
         eprintln!("CANONICAL_FINRAY_DIGEST={}", applied.active_tool.config_digest);
         assert_eq!(finray_json, expected_finray_json);
@@ -1596,7 +1600,7 @@ mod tests {
             r#""edge_to_low_um":2300,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":null,"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":null,"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"settle_ms":300,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":75000,"#,
             r#""physical_contact_um":[0,0,0],"#,
@@ -1614,7 +1618,7 @@ mod tests {
         assert!(schema.active_tool.config_digest.starts_with("v1:"));
         assert_eq!(schema.active_tool.config_digest.len(), 3 + 64);
         const EXPECTED_DEFAULT_DIGEST: &str =
-            "v1:ac4d69ae16085196687d381a4dbfa89a1940a08522dd088f2459645fd91d1064";
+            "v1:4d9ba4f81085d7ee9cbf2b17ce608f0b6b420d6014789ae22cd109163dac993d";
         eprintln!("CANONICAL_DEFAULT_JSON={default_json}");
         eprintln!("CANONICAL_DEFAULT_DIGEST={}", schema.active_tool.config_digest);
         assert_eq!(schema.active_tool.config_digest, EXPECTED_DEFAULT_DIGEST);
@@ -1641,7 +1645,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,65000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,65000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"settle_ms":300,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":65000,"#,
             r#""physical_contact_um":[0,0,0],"#,
@@ -1651,7 +1655,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_SO101_DIGEST: &str =
-            "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42";
+            "v1:4a99263dd305f5bf7e7f0f6a96dc2802b6be9b4255e26b88fcbd53f3112c0ef0";
         eprintln!("CANONICAL_SO101_JSON={so101_json}");
         eprintln!("CANONICAL_SO101_DIGEST={}", so101_schema.active_tool.config_digest);
         assert_eq!(so101_json, expected_so101_json);
@@ -1676,7 +1680,7 @@ mod tests {
         );
         let expected_so100_json = expected_so101_json.replace(r#""robot_id":"so101""#, r#""robot_id":"so100""#);
         const EXPECTED_SO100_DIGEST: &str =
-            "v1:efbb9e76729b3b748959c032a789412e0ef0224d197079d16f688a32f82463d4";
+            "v1:a6d6472780495b49ed7b4284271d71afe15d9379804c758565dee1fc24a78f7f";
         eprintln!("CANONICAL_SO100_JSON={so100_json}");
         eprintln!("CANONICAL_SO100_DIGEST={}", so100_schema.active_tool.config_digest);
         assert_eq!(so100_json, expected_so100_json);
@@ -1715,7 +1719,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,70000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,70000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"settle_ms":300,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":65000,"#,
             r#""physical_contact_um":null,"#,
@@ -1725,7 +1729,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_SO101_INHERITED_DIGEST: &str =
-            "v1:6f50d92eb5709a880819d6ddcce4e2c78dad34986929319cb444db6265087d39";
+            "v1:c756a002814cbf60a16067c3c9e169e5e59249e9637338fbaac85f1e384d957d";
         eprintln!("CANONICAL_SO101_INHERITED_JSON={so101_inherited_json}");
         eprintln!("CANONICAL_SO101_INHERITED_DIGEST={}", so101_inherited.active_tool.config_digest);
         assert_eq!(so101_inherited_json, expected_so101_inherited_json);
@@ -2089,7 +2093,7 @@ mod tests {
         assert_eq!(fin_sum.tcp_offset_m, [0.0288, 0.0, 0.0]);
         assert_eq!(
             fin_sum.config_digest,
-            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776"
+            "v1:377d453f74a2016a65bd15dfd2a471fc3c6afe9d3cf9c8f0c494fea024d14360"
         );
         assert_eq!(
             format!("v1:{}", crate::gravity::compute_sha256(fin_sum.canonical_json.as_bytes())),
@@ -2106,9 +2110,9 @@ mod tests {
         assert!(err.contains("--robot"), "{err}");
 
         for (robot, expected_digest) in [
-            ("b601dm", "v1:ac4d69ae16085196687d381a4dbfa89a1940a08522dd088f2459645fd91d1064"),
-            ("so101", "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42"),
-            ("so100", "v1:efbb9e76729b3b748959c032a789412e0ef0224d197079d16f688a32f82463d4"),
+            ("b601dm", "v1:4d9ba4f81085d7ee9cbf2b17ce608f0b6b420d6014789ae22cd109163dac993d"),
+            ("so101", "v1:4a99263dd305f5bf7e7f0f6a96dc2802b6be9b4255e26b88fcbd53f3112c0ef0"),
+            ("so100", "v1:a6d6472780495b49ed7b4284271d71afe15d9379804c758565dee1fc24a78f7f"),
             ("b601rs", "v1:940a10d6d0dadaa2c6d2fdf7771cb8e226805c3300233dff9661fc5b8cf89636"),
         ] {
             let s = resolve_tool_config_summary(&stock, Some(robot)).unwrap();
@@ -2138,6 +2142,16 @@ mod tests {
         assert_ne!(
             stock_active_tool_info(&base).config_digest,
             stock_active_tool_info(&base_mod).config_digest
+        );
+
+        // R3 M4: Changing settle_ms on base profile changes canonical digest.
+        let mut base_settle = base.clone();
+        base_settle.gripper_policy.as_mut().unwrap().settle_ms = 600;
+        let d_settle = apply_tool_overlay(&base_settle, &pack).unwrap().active_tool.config_digest;
+        assert_ne!(d1, d_settle, "settle_ms must affect config_digest");
+        assert_ne!(
+            stock_active_tool_info(&base).config_digest,
+            stock_active_tool_info(&base_settle).config_digest
         );
 
         // M7: Dynamics qualification matches micro-unit digest quantization (0.15 == 0.1500004, 0.1500005 fails).

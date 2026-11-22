@@ -3823,6 +3823,32 @@ async fn commit_local_active_state(
     (final_auto_start, final_seed, final_reset_seq, final_io_seq)
 }
 
+fn remote_target_matches_local(
+    sim_val: &serde_json::Value,
+    target_scene: &str,
+    target_tool: &str,
+    target_scene_digest: &Option<String>,
+    target_tool_digest: &Option<String>,
+) -> bool {
+    let scene_ok = match sim_val.get("scene").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str() == Some(target_scene),
+        None => true,
+    };
+    let tool_ok = match sim_val.get("tool").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str() == Some(target_tool),
+        None => true,
+    };
+    let sd_ok = match sim_val.get("scene_digest").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str().is_some_and(|sd| target_scene_digest.as_deref() == Some(sd)),
+        None => true,
+    };
+    let td_ok = match sim_val.get("tool_digest").filter(|v| !v.is_null()) {
+        Some(v) => v.as_str().is_some_and(|td| target_tool_digest.as_deref() == Some(td)),
+        None => true,
+    };
+    scene_ok && tool_ok && sd_ok && td_ok
+}
+
 fn resolve_remote_target_locally(
     state: &SandboxState,
     running_robot: &str,
@@ -3924,9 +3950,9 @@ async fn converge_degraded_split(
     detail: &str,
 ) -> Result<(bool, u64, u64, u64), (StatusCode, Json<serde_json::Value>)> {
     if let Some(remote_tx) = extract_remote_tx_id(detail.as_bytes()) {
+        let sim_val = serde_json::from_str::<serde_json::Value>(detail)
+            .unwrap_or(serde_json::Value::Null);
         if remote_tx != snap.tx_id {
-            let sim_val = serde_json::from_str::<serde_json::Value>(detail)
-                .unwrap_or(serde_json::Value::Null);
             let msg = format!(
                 "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{remote_tx}' (not '{}'); call /api/v1/sandbox/recover-split first",
                 snap.tx_id
@@ -3936,6 +3962,23 @@ async fn converge_degraded_split(
                 *tx_w = foreign_degraded_from_sim_val(&snap, remote_tx.clone(), &sim_val, msg.clone());
             }
             return Err(degraded_split_http_error(&remote_tx, &msg));
+        }
+        if !remote_target_matches_local(
+            &sim_val,
+            &snap.target_scene,
+            &snap.target_tool,
+            &snap.target_scene_digest,
+            &snap.target_tool_digest,
+        ) {
+            let msg = format!(
+                "Sim DEGRADED_SPLIT '{}' reports a different scene/tool/digest than local transaction target '{}/{}'",
+                snap.tx_id, snap.target_scene, snap.target_tool
+            );
+            {
+                let mut tx_w = state.tx_state.write().await;
+                *tx_w = foreign_degraded_from_sim_val(&snap, remote_tx, &sim_val, msg.clone());
+            }
+            return Err(degraded_split_http_error(&snap.tx_id, &msg));
         }
     }
     let split_tx_id = snap.tx_id.clone();
@@ -4118,6 +4161,20 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
             };
             let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
             if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+                if !remote_target_matches_local(
+                    &sim_val,
+                    target_scene,
+                    target_tool,
+                    target_scene_digest,
+                    target_tool_digest,
+                ) {
+                    return Err(tx_json_err(
+                        StatusCode::CONFLICT,
+                        "SIM_RECOVERY_INCOMPATIBLE",
+                        tx_id,
+                        "Remote /sim/state COMMITTED target does not match local Unknown transaction target",
+                    ));
+                }
                 commit_local_active_state(
                     state,
                     "sim",
@@ -4158,8 +4215,19 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
                 };
                 if remote_tx == Some(tx_id.as_str()) {
                     let detail = String::from_utf8_lossy(&resp.body).to_string();
+                    let matches = remote_target_matches_local(
+                        &sim_val,
+                        target_scene,
+                        target_tool,
+                        target_scene_digest,
+                        target_tool_digest,
+                    );
                     let mut tx_w = state.tx_state.write().await;
-                    *tx_w = own_snap.into_degraded(tx_id.clone(), true, detail);
+                    *tx_w = if matches {
+                        own_snap.into_degraded(tx_id.clone(), true, detail)
+                    } else {
+                        foreign_degraded_from_sim_val(&own_snap, tx_id.clone(), &sim_val, detail)
+                    };
                     return Err(degraded_split_http_error(
                         tx_id,
                         "Previous sim activation is in DEGRADED_SPLIT; call /api/v1/sandbox/recover-split first",
@@ -4993,42 +5061,120 @@ pub async fn recover_split(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
 
-            let (resolved_target_matches, target_mjcf, target_sd, target_td) = match cur_tx {
+            let (
+                resolved_target_matches,
+                eff_scene,
+                eff_tool,
+                eff_policy,
+                eff_seed,
+                eff_auto_start,
+                target_mjcf,
+                target_sd,
+                target_td,
+            ) = match cur_tx {
                 ActivationTxState::Unknown {
                     ref tx_id,
+                    ref target_scene,
+                    ref target_tool,
+                    ref target_policy,
+                    target_seed,
+                    target_auto_start_policy,
                     ref target_composed_mjcf,
                     ref target_scene_digest,
                     ref target_tool_digest,
                     ..
-                } if tx_id == adopted_tx => (
-                    true,
-                    target_composed_mjcf.clone(),
-                    target_scene_digest.clone(),
-                    target_tool_digest.clone(),
-                ),
-                _ => resolve_remote_target_locally(
-                    &state,
-                    &running_robot,
-                    &r_scene,
-                    &r_tool,
-                    r_sd,
-                    r_td,
-                ),
+                } if tx_id == adopted_tx => {
+                    if remote_target_matches_local(
+                        &sim_val,
+                        target_scene,
+                        target_tool,
+                        target_scene_digest,
+                        target_tool_digest,
+                    ) {
+                        (
+                            true,
+                            target_scene.clone(),
+                            target_tool.clone(),
+                            target_policy.clone(),
+                            target_seed,
+                            target_auto_start_policy,
+                            target_composed_mjcf.clone(),
+                            target_scene_digest.clone(),
+                            target_tool_digest.clone(),
+                        )
+                    } else {
+                        (
+                            false,
+                            r_scene.clone(),
+                            r_tool.clone(),
+                            prev_active.active_policy.clone(),
+                            prev_active.seed,
+                            prev_active.auto_start_policy,
+                            String::new(),
+                            r_sd.clone(),
+                            r_td.clone(),
+                        )
+                    }
+                }
+                _ => {
+                    let (ok, mjcf, sd, td) = resolve_remote_target_locally(
+                        &state,
+                        &running_robot,
+                        &r_scene,
+                        &r_tool,
+                        r_sd,
+                        r_td,
+                    );
+                    (
+                        ok,
+                        r_scene,
+                        r_tool,
+                        prev_active.active_policy.clone(),
+                        prev_active.seed,
+                        prev_active.auto_start_policy,
+                        mjcf,
+                        sd,
+                        td,
+                    )
+                }
             };
 
+            let (eff_prev_tx, eff_prev_scene, eff_prev_tool, eff_prev_sd, eff_prev_td) = match &cur_tx {
+                ActivationTxState::Unknown {
+                    prev_tx_id,
+                    prev_scene,
+                    prev_tool,
+                    prev_scene_digest,
+                    prev_tool_digest,
+                    ..
+                } => (
+                    prev_tx_id.clone(),
+                    prev_scene.clone(),
+                    prev_tool.clone(),
+                    prev_scene_digest.clone(),
+                    prev_tool_digest.clone(),
+                ),
+                _ => (
+                    None,
+                    prev_active.active_scene.clone(),
+                    prev_active.active_tool.clone(),
+                    None,
+                    None,
+                ),
+            };
             let detail = String::from_utf8_lossy(&sresp.body).to_string();
             (
                 adopted_tx.to_string(),
-                None,
-                prev_active.active_scene,
-                prev_active.active_tool,
-                None,
-                None,
-                r_scene,
-                r_tool,
-                prev_active.active_policy,
-                prev_active.seed,
-                prev_active.auto_start_policy,
+                eff_prev_tx,
+                eff_prev_scene,
+                eff_prev_tool,
+                eff_prev_sd,
+                eff_prev_td,
+                eff_scene,
+                eff_tool,
+                eff_policy,
+                eff_seed,
+                eff_auto_start,
                 target_mjcf,
                 target_sd,
                 target_td,
@@ -5044,6 +5190,48 @@ pub async fn recover_split(
             ));
         }
     };
+
+    if payload.action == "replay_camera" && !target_matches_tx {
+        let mut tx_w = state.tx_state.write().await;
+        if !matches!(*tx_w, ActivationTxState::DegradedSplit { .. }) {
+            let prev = state.active.read().await.clone();
+            *tx_w = ActivationTxState::DegradedSplit {
+                tx_id: tx_id.clone(),
+                prev_tx_id: prev_tx_id.clone(),
+                prev_scene: prev_scene.clone(),
+                prev_tool: prev_tool.clone(),
+                prev_policy: prev.active_policy.clone(),
+                prev_mode: prev.mode,
+                prev_seed: prev.seed,
+                prev_auto_start_policy: prev.auto_start_policy,
+                prev_cached_mjcf: prev.cached_mjcf,
+                prev_scene_digest: prev_scene_digest.clone(),
+                prev_tool_digest: prev_tool_digest.clone(),
+                target_scene: target_scene.clone(),
+                target_tool: target_tool.clone(),
+                target_policy: target_policy.clone(),
+                target_seed,
+                target_auto_start_policy,
+                target_composed_mjcf: String::new(),
+                target_scene_digest: target_scene_digest.clone(),
+                target_tool_digest: target_tool_digest.clone(),
+                target_matches_tx: false,
+                detail: detail.clone(),
+            };
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Cannot replay_camera for DEGRADED_SPLIT '{}': remote target '{}/{}' does not match a locally verified robot-compatible pack; call rollback_physics instead",
+                    tx_id, target_scene, target_tool
+                ),
+                "code": "SIM_SPLIT_RECOVERY_REJECTED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": tx_id,
+            })),
+        ));
+    }
 
     let commit_bytes = serde_json::to_vec(&serde_json::json!({
         "tx_id": tx_id,
@@ -5074,49 +5262,33 @@ pub async fn recover_split(
             target_scene_digest.as_deref(),
             target_tool_digest.as_deref(),
         )?;
-        if target_matches_tx {
-            let (final_auto_start, final_seed, final_reset_seq, final_io_seq) =
-                commit_local_active_state(
-                    &state,
-                    "sim",
-                    &target_scene,
-                    &target_tool,
-                    target_policy.clone(),
-                    Some(target_seed),
-                    Some(target_auto_start_policy),
-                    target_composed_mjcf,
-                    &tx_id,
-                    target_scene_digest,
-                    target_tool_digest,
-                )
-                .await;
-            Ok(Json(serde_json::json!({
-                "ok": true,
-                "state": "COMMITTED",
-                "tx_id": tx_id,
-                "active_scene": target_scene,
-                "active_tool": target_tool,
-                "active_policy": target_policy,
-                "auto_start_policy": final_auto_start,
-                "seed": final_seed,
-                "reset_seq": final_reset_seq,
-                "io_seq": final_io_seq,
-            })))
-        } else {
-            {
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Committed {
-                    tx_id: tx_id.clone(),
-                    scene_digest: target_scene_digest,
-                    tool_digest: target_tool_digest,
-                };
-            }
-            Ok(Json(serde_json::json!({
-                "ok": true,
-                "state": "COMMITTED",
-                "tx_id": tx_id,
-            })))
-        }
+        let (final_auto_start, final_seed, final_reset_seq, final_io_seq) =
+            commit_local_active_state(
+                &state,
+                "sim",
+                &target_scene,
+                &target_tool,
+                target_policy.clone(),
+                Some(target_seed),
+                Some(target_auto_start_policy),
+                target_composed_mjcf,
+                &tx_id,
+                target_scene_digest,
+                target_tool_digest,
+            )
+            .await;
+        Ok(Json(serde_json::json!({
+            "ok": true,
+            "state": "COMMITTED",
+            "tx_id": tx_id,
+            "active_scene": target_scene,
+            "active_tool": target_tool,
+            "active_policy": target_policy,
+            "auto_start_policy": final_auto_start,
+            "seed": final_seed,
+            "reset_seq": final_reset_seq,
+            "io_seq": final_io_seq,
+        })))
     } else {
         let restored_tx_id = verify_rollback_ack(&resp.body, &tx_id, prev_tx_id.as_deref())
             .map_err(|msg| degraded_split_http_error(&tx_id, &msg))?;
