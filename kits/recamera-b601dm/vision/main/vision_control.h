@@ -223,6 +223,7 @@ public:
         int frame_size[2] = {640, 640};
         std::string instance_id;         ///< optional override for tests; empty = auto-generated
         uint32_t initial_frame_id = 0;   ///< optional starting frame counter for rollover tests
+        int max_gray_sends = 2;          ///< maximum concurrent GET /api/frame/gray responses
     };
 
     enum class IntrinsicsStatus { Ok, CliOverride, RevisionMismatch, PersistFailed };
@@ -384,6 +385,10 @@ public:
     /** Look up a retained gray frame by `(instance_id, frame_id)` (immediate, no wait). */
     GrayRing::Lookup get_gray(const std::string& instance_id, uint32_t frame_id,
                               std::shared_ptr<const GrayFrame>& out) const;
+    /** Acquire a concurrent gray-frame send slot; returns nullptr when at capacity (503 GRAY_BUSY). */
+    std::shared_ptr<void> try_acquire_gray_send();
+    int active_gray_sends() const noexcept { return active_gray_sends_->load(std::memory_order_acquire); }
+    int max_gray_sends() const noexcept { return max_gray_sends_; }
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
@@ -460,6 +465,8 @@ private:
     uint64_t intrinsics_applied_ = 1;
     DepthMapGate depth_map_gate_{1000};
     std::atomic<int> depth_map_wanted_{0};
+    const int max_gray_sends_;
+    std::shared_ptr<std::atomic<int>> active_gray_sends_;
 };
 
 /** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
@@ -475,6 +482,22 @@ struct HttpReply {
     std::string body;
     std::string content_type = "application/json";
     std::vector<std::pair<std::string, std::string>> headers;  ///< extra response headers
+    /** Optional immutable binary segment appended directly after `body` without copying. */
+    std::shared_ptr<const std::vector<uint8_t>> binary_segment;
+    /** Optional RAII guard (e.g., concurrent gray send slot) held until reply transmission finishes. */
+    std::shared_ptr<void> send_guard;
+
+    size_t content_length() const noexcept {
+        return body.size() + (binary_segment ? binary_segment->size() : 0u);
+    }
+    std::string full_body() const {
+        if (!binary_segment || binary_segment->empty()) return body;
+        std::string out;
+        out.reserve(body.size() + binary_segment->size());
+        out.append(body);
+        out.append(reinterpret_cast<const char*>(binary_segment->data()), binary_segment->size());
+        return out;
+    }
 };
 
 /** Who sent the request. Loopback = 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104. */
@@ -487,8 +510,12 @@ struct RequestPeer {
  *   GET  /api/inference                 POST /api/inference {"enabled": bool}
  *   GET  /api/mode                      POST /api/mode {"mode"?, "enabled"?, "fps"?}
  *   GET  /api/results/latest[?after=<frame_id>&wait_ms=<0..5000>]
- *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco", ...], "wait_ms"?}
- *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
+ *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco"|"depth"|"gray", ...], "wait_ms"?}
+ *        ("gray" accepted from loopback peers only; 403 otherwise)
+ *   GET  /api/frame/gray?instance_id=<id>&frame_id=<u32>  (loopback peer only; 403 otherwise)
+ *        exact immediate lookup; 200 application/octet-stream (RGF1), 400 invalid/duplicate/overflow
+ *        params, 404 FRAME_NOT_STORED, 410 FRAME_EXPIRED, 503 GRAY_BUSY + Retry-After
+ *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}  ("gray" refused: 400)
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
  *   GET  /api/depth[?wait_ms=<0..5000>]  one depth inference on a fresh frame; 200

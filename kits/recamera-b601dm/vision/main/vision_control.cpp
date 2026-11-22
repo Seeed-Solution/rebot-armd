@@ -113,7 +113,9 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       models_(model_set_of(opt)),
       intrinsics_cli_(opt.intrinsics_cli_override),
       config_path_(opt.config_path),
-      intrinsics_(opt.intrinsics) {
+      intrinsics_(opt.intrinsics),
+      max_gray_sends_(opt.max_gray_sends > 0 ? opt.max_gray_sends : 1),
+      active_gray_sends_(std::make_shared<std::atomic<int>>(0)) {
     for (int i = 0; i < 4; ++i) gray_crop_[i] = opt.gray_crop[i];
     for (int i = 0; i < 2; ++i) frame_size_[i] = opt.frame_size[i];
     Mode m = opt.mode;
@@ -530,6 +532,20 @@ GrayRing::Lookup VisionControl::get_gray(const std::string& instance_id, uint32_
     return gray_ring_.find(instance_id, frame_id, instance_id_, out);
 }
 
+std::shared_ptr<void> VisionControl::try_acquire_gray_send() {
+    std::atomic<int>* counter = active_gray_sends_.get();
+    int cur = counter->load(std::memory_order_acquire);
+    while (cur < max_gray_sends_) {
+        if (counter->compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            std::shared_ptr<std::atomic<int>> keep = active_gray_sends_;
+            return std::shared_ptr<void>(counter, [keep](void*) {
+                keep->fetch_sub(1, std::memory_order_acq_rel);
+            });
+        }
+    }
+    return nullptr;
+}
+
 bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
@@ -713,6 +729,7 @@ static nlohmann::json pipeline_list(Pipelines p) {
     if (p.yolo) a.push_back("yolo");
     if (p.aruco) a.push_back("aruco");
     if (p.depth) a.push_back("depth");
+    if (p.gray) a.push_back("gray");
     return a;
 }
 
@@ -835,14 +852,18 @@ static HttpReply put_intrinsics(VisionControl& ctl, const std::string& body, Req
     return {200, intrinsics_body(ctl)};
 }
 
-static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
+static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0, RequestPeer peer = {}) {
     const uint64_t now = now_ms ? now_ms : mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
     const ModelSet ms = ctl.models();
+    const bool gray_avail = peer.loopback && ctl.gray_available();
+    const int* crop = ctl.gray_crop();
+    const int* fsize = ctl.frame_size();
     MaskFocus mf;
     nlohmann::json j = {
         {"api_version", kApiVersion},
+        {"instance_id", ctl.instance_id()},
         {"mode", mode_name(m)},
         {"modes", {"off", "yolo", "aruco", "both"}},
         {"pipelines", {{"yolo", p.yolo}, {"aruco", p.aruco}, {"depth", p.depth}}},
@@ -860,7 +881,21 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"subscriptions", true},
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
-        {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}}},
+        {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}, {"gray", gray_avail}}},
+        {"gray_frames",
+         gray_avail
+             ? nlohmann::json{{"encoding", "RGF1"},
+                              {"format", "gray8"},
+                              {"width", ctl.gray_width()},
+                              {"height", ctl.gray_height()},
+                              {"stride", ctl.gray_width()},
+                              {"crop", {crop[0], crop[1], crop[2], crop[3]}},
+                              {"frame_size", {fsize[0], fsize[1]}},
+                              {"luma", "(77*R+150*G+29*B)>>8"},
+                              {"luma_range", "full_0_255"},
+                              {"ring", kGrayRingCapacity},
+                              {"exposure_qualified", false}}
+             : nlohmann::json(nullptr)},
         {"model", {{"name", ms.model_name}, {"path", ms.model_path}, {"kind", name_or_null(ms.model_kind)}, {"mask", ms.mask}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
         {"depth_model", ms.depth_available ? nlohmann::json{{"name", ms.depth_model_name}, {"path", ms.depth_model_path}, {"metric", ms.depth_metric}} : nullptr},
         {"family", ctl.family()},
@@ -871,8 +906,8 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
     return j.dump();
 }
 
-static std::string mode_body(const VisionControl& ctl, uint64_t now_ms = 0) {
-    return status_json(ctl, now_ms);
+static std::string mode_body(const VisionControl& ctl, uint64_t now_ms = 0, RequestPeer peer = {}) {
+    return status_json(ctl, now_ms, peer);
 }
 
 static bool query_param(const std::string& query, const std::string& key, std::string& value) {
@@ -914,7 +949,8 @@ static bool wait_ms_param(const std::string& query, int& wait_ms) {
 static void put_result(std::ostringstream& s, const VisionResult& r, const std::string& family, uint64_t now_ms) {
     const uint64_t now = now_ms == 0 ? get_unix_ms() : now_ms;
     const long long age = static_cast<long long>(now) - static_cast<long long>(r.ts_ms);
-    s << std::fixed << ",\"mode\":\"" << mode_name(r.mode) << "\",\"frame_id\":" << r.frame_id
+    s << std::fixed << ",\"instance_id\":" << nlohmann::json(r.instance_id).dump()
+      << ",\"mode\":\"" << mode_name(r.mode) << "\",\"frame_id\":" << r.frame_id
       << ",\"ts_ms\":" << r.ts_ms << ",\"age_ms\":" << (age < 0 ? 0 : age) << ",\"inference_time_ms\":"
       << std::setprecision(1) << r.inference_ms << ",\"width\":" << r.width << ",\"height\":" << r.height
       << ",\"pipelines\":{\"yolo\":{\"ran\":" << (r.ran_yolo ? "true" : "false") << ",\"ms\":" << r.yolo_ms;
@@ -923,7 +959,8 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
     }
     s << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
     if (!r.aruco_stages_json.empty()) s << ",\"stages\":" << r.aruco_stages_json;
-    s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms << "}}"
+    s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms
+      << "},\"gray\":{\"ran\":" << (r.ran_gray ? "true" : "false") << ",\"ms\":" << r.gray_ms << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
       << "\",\"undistorted\":" << (r.undistorted ? "true" : "false") << ",\"rejected\":" << r.rejected
       << ",\"markers\":" << r.markers_json << ",\"model_generation\":" << r.model_generation;
@@ -983,8 +1020,8 @@ static bool body_object(const std::string& body, nlohmann::json& out) {
     return !out.is_discarded() && out.is_object();
 }
 
-/** "pipelines": a non-empty list of "yolo" / "aruco" / "depth" (duplicates allowed). */
-static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
+/** "pipelines": a non-empty list of "yolo" / "aruco" / "depth" (and "gray" when `allow_gray`). */
+static bool parse_pipelines(const nlohmann::json& v, Pipelines& out, bool allow_gray = false) {
     if (!v.is_array() || v.empty()) return false;
     Pipelines p;
     for (const auto& x : v) {
@@ -993,6 +1030,7 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
         if (s == "yolo") p.yolo = true;
         else if (s == "aruco") p.aruco = true;
         else if (s == "depth") p.depth = true;
+        else if (allow_gray && s == "gray") p.gray = true;
         else return false;
     }
     out = p;
@@ -1000,6 +1038,8 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
 }
 
 static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\"";
+static const char* kTriggerPipelinesError =
+    "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\", \"gray\"";
 
 static bool parse_mask_focus(const nlohmann::json& v, MaskFocus& out) {
     if (!v.is_object()) return false;
@@ -1052,7 +1092,7 @@ static HttpReply post_mask_focus(VisionControl& ctl, const std::string& body, ui
 }
 
 static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, const std::string& body,
-                               uint64_t now_ms, const RequestTimes* times) {
+                               uint64_t now_ms, const RequestTimes* times, RequestPeer peer) {
     int wait_ms = 2500;  // aruco-detector default for the single shot
     if (!wait_ms_param(query, wait_ms)) return {400, error_body("wait_ms must be a non-negative integer")};
     nlohmann::json j;
@@ -1063,7 +1103,19 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     }
     Pipelines want = ctl.default_trigger_pipelines();
     if (auto it = j.find("pipelines"); it != j.end()) {
-        if (!parse_pipelines(*it, want)) return {400, error_body(kPipelinesError)};
+        if (!parse_pipelines(*it, want, /*allow_gray=*/true)) return {400, error_body(kTriggerPipelinesError)};
+        if (want.gray && !peer.loopback) {
+            return {403, nlohmann::json{{"api_version", kApiVersion},
+                                        {"error", "FORBIDDEN"},
+                                        {"detail", "gray pipeline is accepted from a loopback peer only"}}
+                             .dump()};
+        }
+        if (want.gray && !ctl.gray_available()) {
+            return {409, nlohmann::json{{"api_version", kApiVersion},
+                                        {"error", "gray unavailable"},
+                                        {"detail", "gray frames are not supported for the configured frame geometry"}}
+                             .dump()};
+        }
         if (want.yolo && !ctl.yolo_available()) return yolo_unavailable_reply();
         if (want.depth && !ctl.depth_available()) return depth_unavailable_reply();
     }
@@ -1194,6 +1246,121 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     return out;
 }
 
+static nlohmann::json gray_error_json(const char* code, const std::string& detail) {
+    return {{"api_version", kApiVersion}, {"error", code}, {"detail", detail}};
+}
+
+static HttpReply gray_error(int status, const char* code, const std::string& detail) {
+    return {status, gray_error_json(code, detail).dump()};
+}
+
+static bool valid_instance_token(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool parse_gray_query(const std::string& query, std::string& instance_id, uint32_t& frame_id,
+                             std::string& detail) {
+    if (query.empty()) {
+        detail = "query requires instance_id and frame_id";
+        return false;
+    }
+    bool seen_inst = false;
+    bool seen_fid = false;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t end = query.find('&', pos);
+        if (end == std::string::npos) end = query.size();
+        const std::string item = query.substr(pos, end - pos);
+        if (item.empty()) {
+            detail = "empty query parameter";
+            return false;
+        }
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            detail = "malformed query parameter";
+            return false;
+        }
+        const std::string k = item.substr(0, eq);
+        const std::string v = item.substr(eq + 1);
+        if (k == "instance_id") {
+            if (seen_inst) {
+                detail = "duplicate instance_id parameter";
+                return false;
+            }
+            if (!valid_instance_token(v)) {
+                detail = "instance_id must be 1..64 [A-Za-z0-9_-] characters";
+                return false;
+            }
+            instance_id = v;
+            seen_inst = true;
+        } else if (k == "frame_id") {
+            if (seen_fid) {
+                detail = "duplicate frame_id parameter";
+                return false;
+            }
+            unsigned long long n = 0;
+            if (!parse_u64(v, n) || n > 0xFFFFFFFFull) {
+                detail = "frame_id must be an unsigned 32-bit integer";
+                return false;
+            }
+            frame_id = static_cast<uint32_t>(n);
+            seen_fid = true;
+        } else {
+            detail = "unknown query parameter \"" + k + "\"";
+            return false;
+        }
+        if (end == query.size()) break;
+        pos = end + 1;
+    }
+    if (!seen_inst || !seen_fid) {
+        detail = "both instance_id and frame_id are required";
+        return false;
+    }
+    return true;
+}
+
+static HttpReply gray_frame_reply(VisionControl& ctl, const std::string& query, RequestPeer peer) {
+    if (!peer.loopback) {
+        return gray_error(403, "FORBIDDEN", "GET /api/frame/gray is accepted from a loopback peer only");
+    }
+    std::string inst;
+    uint32_t fid = 0;
+    std::string detail;
+    if (!parse_gray_query(query, inst, fid, detail)) {
+        return gray_error(400, "INVALID_PARAM", detail);
+    }
+    std::shared_ptr<void> guard = ctl.try_acquire_gray_send();
+    if (!guard) {
+        HttpReply busy = gray_error(503, "GRAY_BUSY", "too many concurrent gray frame transfers");
+        busy.headers.push_back({"Retry-After", "1"});
+        return busy;
+    }
+    std::shared_ptr<const GrayFrame> rec;
+    switch (ctl.get_gray(inst, fid, rec)) {
+        case GrayRing::Lookup::Expired:
+            return gray_error(410, "FRAME_EXPIRED",
+                              "gray frame is from an older instance or has been evicted from the ring");
+        case GrayRing::Lookup::NotStored:
+            return gray_error(404, "FRAME_NOT_STORED", "no gray frame stored for that frame_id");
+        case GrayRing::Lookup::Found: {
+            HttpReply out;
+            out.status = 200;
+            out.content_type = "application/octet-stream";
+            out.body = gray_frame_header(*rec);
+            out.binary_segment = rec->pixels;
+            out.send_guard = std::move(guard);
+            return out;
+        }
+    }
+    return gray_error(404, "FRAME_NOT_STORED", "no gray frame stored for that frame_id");
+}
+
 static HttpReply status_reply(VisionControl::Status st, const std::string& ok_body) {
     switch (st) {
         case VisionControl::Status::BadFps:
@@ -1207,7 +1374,7 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
     }
 }
 
-static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
+static HttpReply post_mode(VisionControl& ctl, const std::string& body, RequestPeer peer) {
     const nlohmann::json j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return {400, error_body("body must be a JSON object")};
     Mode mode;
@@ -1233,7 +1400,7 @@ static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
     }
     if (!pm && !pe && !pf) return {400, error_body("body needs \"mode\", \"enabled\" or \"fps\"")};
     const VisionControl::Status st = ctl.apply(pm, pe, pf);
-    return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl) : "");
+    return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl, 0, peer) : "");
 }
 
 static HttpReply post_models(VisionControl& ctl, const std::string& body) {
@@ -1323,8 +1490,8 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             return {200, inference_body(ctl)};
         }
     } else if (path == "/api/mode" || path == "/api/status") {
-        if (method == "GET") return {200, status_json(ctl, now)};
-        if (method == "POST" && path == "/api/mode") return post_mode(ctl, body);
+        if (method == "GET") return {200, status_json(ctl, now, peer)};
+        if (method == "POST" && path == "/api/mode") return post_mode(ctl, body, peer);
     } else if (path == "/api/mask_focus") {
         if (method == "GET") {
             MaskFocus f;
@@ -1336,7 +1503,9 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
-        return trigger_reply(ctl, query, body, now_ms, times);
+        return trigger_reply(ctl, query, body, now_ms, times, peer);
+    } else if (path == "/api/frame/gray" && method == "GET") {
+        return gray_frame_reply(ctl, query, peer);
     } else if (path == "/api/depth" && method == "GET") {
         return depth_map_reply(ctl, query, now);
     } else if (path == "/api/models" && method == "POST") {

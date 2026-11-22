@@ -47,6 +47,7 @@ static const char* status_text(int code) {
         case 408: return "Request Timeout";
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
+        case 410: return "Gone";
         case 415: return "Unsupported Media Type";
         case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
@@ -86,21 +87,53 @@ bool is_loopback_address(const sockaddr* addr, socklen_t len) {
     return false;
 }
 
-static void send_reply(int fd, const HttpReply& r) {
+static int64_t now_ms_steady() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool send_segment_deadline(int fd, const void* data, size_t len, int64_t deadline_ms,
+                                  const std::atomic<bool>* running) {
+    const char* p = static_cast<const char*>(data);
+    size_t sent = 0;
+    while (sent < len) {
+        if (running && !running->load(std::memory_order_acquire)) return false;
+        const int64_t remaining = deadline_ms - now_ms_steady();
+        if (remaining <= 0) return false;
+        const int wait_ms = static_cast<int>(remaining > 100 ? 100 : remaining);
+        pollfd pfd = {fd, POLLOUT, 0};
+        const int pr = ::poll(&pfd, 1, wait_ms);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) continue;
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+        const ssize_t n = ::send(fd, p + sent, len - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            return false;
+        }
+        if (n == 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static void send_reply(int fd, const HttpReply& r, int deadline_ms, const std::atomic<bool>* running) {
     std::ostringstream ss;
     ss << "HTTP/1.1 " << r.status << " " << status_text(r.status) << "\r\n"
        << "Content-Type: " << r.content_type << "\r\n"
-       << "Content-Length: " << r.body.size() << "\r\n";
+       << "Content-Length: " << r.content_length() << "\r\n";
     for (const auto& h : r.headers) ss << h.first << ": " << h.second << "\r\n";
     ss << "Cache-Control: no-store\r\n"
-       << "Connection: close\r\n\r\n"
-       << r.body;
-    const std::string out = ss.str();
-    size_t sent = 0;
-    while (sent < out.size()) {
-        const ssize_t n = ::send(fd, out.data() + sent, out.size() - sent, MSG_NOSIGNAL);
-        if (n <= 0) break;
-        sent += static_cast<size_t>(n);
+       << "Connection: close\r\n\r\n";
+    const std::string hdr = ss.str();
+    const int64_t deadline = now_ms_steady() + (deadline_ms > 0 ? deadline_ms : HttpControlServer::kDefaultSendDeadlineMs);
+    if (!send_segment_deadline(fd, hdr.data(), hdr.size(), deadline, running)) return;
+    if (!r.body.empty() && !send_segment_deadline(fd, r.body.data(), r.body.size(), deadline, running)) return;
+    if (r.binary_segment && !r.binary_segment->empty()) {
+        send_segment_deadline(fd, r.binary_segment->data(), r.binary_segment->size(), deadline, running);
     }
 }
 
@@ -133,9 +166,17 @@ bool HttpControlServer::start(int port) {
         return false;
     }
 
+    sockaddr_in bound{};
+    socklen_t blen = sizeof(bound);
+    if (::getsockname(server_fd_, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+        bound_port_.store(ntohs(bound.sin_port));
+    } else {
+        bound_port_.store(port);
+    }
+
     running_.store(true);
     thread_ = std::make_unique<std::thread>(&HttpControlServer::accept_loop, this);
-    MA_LOGI(TAG, "Inference control on http://0.0.0.0:%d/api/inference", port);
+    MA_LOGI(TAG, "Inference control on http://0.0.0.0:%d/api/inference", bound_port_.load());
     return true;
 }
 
@@ -225,7 +266,7 @@ void HttpControlServer::accept_loop() {
                 continue;
             }
             if (clients_.size() >= kMaxClients) {
-                send_reply(cfd, {503, "{\"error\":\"too many connections\"}"});
+                send_reply(cfd, {503, "{\"error\":\"too many connections\"}"}, send_deadline_ms_.load(), &running_);
                 ::close(cfd);
                 continue;
             }
@@ -243,11 +284,6 @@ void HttpControlServer::accept_loop() {
             clients_.push_back(ctx);
         }
     }
-}
-
-static int64_t now_ms_steady() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 ReadStatus read_http_request(int fd, int deadline_ms, std::string& buf, size_t& header_end,
@@ -318,15 +354,16 @@ void HttpControlServer::handle_client(int fd, uint64_t accept_ms, bool loopback)
     bool has_content_length = false;
     std::string content_type;
 
+    const int send_dl = send_deadline_ms_.load();
     const ReadStatus rs = read_http_request(fd, kRequestDeadlineMs, buf, header_end, content_type,
                                             content_length, has_content_length);
     if (rs == ReadStatus::Timeout) {
-        send_reply(fd, {408, "{\"error\":\"request timeout\"}"});
+        send_reply(fd, {408, "{\"error\":\"request timeout\"}"}, send_dl, &running_);
         return;
     }
 
     if (header_end == std::string::npos) {
-        send_reply(fd, {400, "{\"error\":\"malformed HTTP request\"}"});
+        send_reply(fd, {400, "{\"error\":\"malformed HTTP request\"}"}, send_dl, &running_);
         return;
     }
 
@@ -334,7 +371,7 @@ void HttpControlServer::handle_client(int fd, uint64_t accept_ms, bool loopback)
     const size_t s1 = line1.find(' ');
     const size_t s2 = s1 == std::string::npos ? std::string::npos : line1.find(' ', s1 + 1);
     if (s1 == std::string::npos || s2 == std::string::npos) {
-        send_reply(fd, {400, "{\"error\":\"malformed request line\"}"});
+        send_reply(fd, {400, "{\"error\":\"malformed request line\"}"}, send_dl, &running_);
         return;
     }
     const std::string method = line1.substr(0, s1);
@@ -342,7 +379,8 @@ void HttpControlServer::handle_client(int fd, uint64_t accept_ms, bool loopback)
 
     if (const int rc = precheck_request(method, content_type)) {
         send_reply(fd, {rc, rc == 415 ? "{\"error\":\"Content-Type must be application/json\"}"
-                                      : "{\"error\":\"method not allowed\"}"});
+                                      : "{\"error\":\"method not allowed\"}"},
+                   send_dl, &running_);
         return;
     }
 
@@ -351,7 +389,7 @@ void HttpControlServer::handle_client(int fd, uint64_t accept_ms, bool loopback)
     RequestPeer peer;
     peer.loopback = loopback;
     const HttpReply r = handle_control_request(ctl_, method, target, body, 0, &times, peer);
-    send_reply(fd, r);
+    send_reply(fd, r, send_dl, &running_);
 }
 
 }  // namespace rv
