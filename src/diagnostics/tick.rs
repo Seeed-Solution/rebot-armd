@@ -15,7 +15,8 @@ pub struct TickSample {
     pub wait: std::time::Duration,
     /// Holding the supervisor write lock.
     pub lock: std::time::Duration,
-    /// After the lock: telemetry broadcast, spawned persist job.
+    /// After the lock: telemetry broadcast, spawned persist job (the observation snapshot is
+    /// published under the lock).
     pub post: std::time::Duration,
     /// `dt` of the tick: start-to-start interval of the control loop.
     pub period: std::time::Duration,
@@ -79,6 +80,14 @@ pub struct ControlThreadSched {
     pub realtime: bool,
 }
 
+/// Observations served by `GET /api/v1/observation` from the tick's snapshot (`hits`) or
+/// computed under the supervisor read lock (`misses`).
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ObservationCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TickSnapshot {
     /// Ticks in the window (at most [`TICK_WINDOW`]).
@@ -110,6 +119,7 @@ pub struct TickSnapshot {
     pub max_tick: Option<TickBreakdown>,
     /// Control thread scheduling; None until the control thread reported it (tests).
     pub control_thread: Option<ControlThreadSched>,
+    pub observation_cache: ObservationCacheStats,
 }
 
 impl Default for TickStats {
@@ -187,6 +197,7 @@ impl TickWindow {
             writer_acquire_us: col(9),
             max_tick,
             control_thread: None,
+            observation_cache: ObservationCacheStats::default(),
         }
     }
 }

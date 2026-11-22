@@ -179,6 +179,7 @@ async fn tick_route_reports_timing_and_late_ticks() {
     assert_eq!(body["period_us"]["max"], 50_000);
     // no control thread in this test
     assert!(body["control_thread"].is_null());
+    assert_eq!(body["observation_cache"]["hits"], 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

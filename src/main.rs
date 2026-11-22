@@ -517,7 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Preserve real elapsed time so the supervisor can detect stalled control ticks.
             let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(control_supervisor.tick(dt));
+                runtime.block_on(control_supervisor.control_tick(dt));
             }));
             if let Err(e) = tick_res {
                 control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
