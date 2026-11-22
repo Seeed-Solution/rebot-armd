@@ -176,6 +176,9 @@ pub fn texture_corrs(views: &[View], cams: &[Camera], reference: usize, object_b
     skip.extend_from_slice(exclude);
     let mut p = Params::new(table_z);
     (p.max_object_features, p.max_table_features, p.max_edge_features, p.min_feature_dist_px) = (0, POSE_MAX_FEATURES, 0, 8.0);
+    // strongest first over the whole image: on the real bundles (2026-11-21/22) the strongest
+    // corners (sheet codes, cable edges) matched more often than a grid of weaker ones
+    (p.corner_rel_floor, p.corner_cell_px) = (0.01, 0);
     let full = [0.0, 0.0, rv.img.w as f64 - 1.0, rv.img.h as f64 - 1.0];
     // the box quota is 0: corners in it are left out; corners in an excluded region are dropped
     // afterwards, so the quota is taken twice

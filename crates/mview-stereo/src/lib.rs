@@ -6,8 +6,10 @@
 //! - Camera rotations ([`pose`]): before the reconstruction the caller may refine the rotation of
 //!   every view but the reference from points on the table ([`refine_views`]).
 //! - Features (reference view): Shi-Tomasi corners (minimum eigenvalue of the 5x5 structure
-//!   tensor) in the feature region, at most `max_object_features` in the object box and
-//!   `max_table_features` outside it, strongest first and `min_feature_dist_px` apart; plus edge
+//!   tensor, at least `corner_rel_floor` of the strongest) in the feature region, at most
+//!   `max_object_features` in the object box and `max_table_features` outside it,
+//!   `min_feature_dist_px` apart, taken over a grid of `corner_cell_px` cells (the strongest of
+//!   every cell first, then the second, ...); plus edge
 //!   points (gradient-magnitude maxima across the edge, at least `edge_min_grad` grey levels per
 //!   pixel) in the box grown by [`EDGE_REGION_GROW`], for objects without texture: up to
 //!   `max_edge_features` edges with a uniform side (a plain face: the outline of a plain object)
@@ -195,6 +197,11 @@ pub struct Params {
     pub min_object_points: usize,
     /// Table plane [n_x, n_y, n_z, d] (unit normal up, height = n . x + d); None: z = `table_z_m`.
     pub plane: Option<[f64; 4]>,
+    /// Corners need a minimum eigenvalue of at least this fraction of the strongest (and 100).
+    pub corner_rel_floor: f32,
+    /// Corner selection over a grid of cells this size (px): the strongest corner of every cell
+    /// first, then the second of every cell, ...; 0 = strongest first over the whole region.
+    pub corner_cell_px: usize,
 }
 
 impl Params {
@@ -203,7 +210,7 @@ impl Params {
             table_z_m, max_height_m: 0.25, max_object_features: 200, max_table_features: 60, max_edge_features: 120,
             min_feature_dist_px: 5.0, min_edge_dist_px: 4.0, edge_min_grad: 6.0,
             sweep_min: 0.6, ncc_min: 0.8, ratio: 0.7, lr_tol_px: 2.0, reproj_max_px: 2.0, sweep_step_px: 0.75, object_min_h_m: 0.005,
-            min_object_points: 8, plane: None,
+            min_object_points: 8, plane: None, corner_rel_floor: 0.002, corner_cell_px: 16,
         }
     }
 
@@ -550,7 +557,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
         }
     }
     // corners: relative and absolute floors (a 5x5 window of 2-grey-level gradients is no corner)
-    let floor = (0.01 * max_l).max(100.0);
+    let floor = (p.corner_rel_floor * max_l).max(100.0);
     let mut cand: Vec<(f32, usize, usize)> = Vec::new();
     for j in 1..rh.saturating_sub(1) {
         for i in 1..rw.saturating_sub(1) {
@@ -561,6 +568,19 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
         }
     }
     cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if p.corner_cell_px > 0 {
+        // by rank within the cell, then strength: a high-contrast pattern (black and white codes)
+        // does not take the whole quota from a weaker texture beside it
+        let c = p.corner_cell_px;
+        let mut rank: std::collections::HashMap<(usize, usize), usize> = Default::default();
+        let mut keyed: Vec<(usize, usize, (f32, usize, usize))> = cand.iter().enumerate().map(|(i, &e)| {
+            let r = rank.entry((e.1 / c, e.2 / c)).or_insert(0);
+            *r += 1;
+            (*r, i, e)
+        }).collect();
+        keyed.sort_by_key(|k| (k.0, k.1));
+        cand = keyed.into_iter().map(|k| k.2).collect();
+    }
     let mut out: Vec<Feature> = Vec::new();
     let (mut n_in, mut n_out) = (0, 0);
     let (qi, qo) = (p.max_object_features, p.max_table_features);
