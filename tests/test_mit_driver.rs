@@ -542,3 +542,18 @@ fn damiao_clear_error_frame_layout() {
     assert_eq!((f.id, f.dlc, f.is_extended, f.is_rtr), (4, 8, false, false));
     assert_eq!(f.data, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB]);
 }
+
+/// Round 6 (prerequisite of #3): a switch whose acknowledgement carries the wrong mode fails at
+/// once instead of waiting out the reply timeout past the 45 ms deadline, so its rollback is still
+/// fenced-in-time and can be confirmed.
+#[test]
+fn mit_wrong_ack_fails_fast_and_the_rollback_is_confirmed() {
+    let (mut d, bus, _clock) = rig(2000);
+    let hold = hold_at(&mut d);
+    d.set_mit_deadline_fence(Some(FENCE), HOLDOFF);
+    bus.with(|s| s.motors[J4].ack_value_override_once = Some(99));
+    assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err());
+    assert!(d.mit_fence_trip().is_none(), "the failure waited past the deadline: {:?}", d.mit_fence_trip());
+    assert!(!d.joint_modes_uncertain(), "rollback not confirmed");
+    assert_eq!(d.joint_control_modes()[J4], Some(DamiaoControlMode::PosVel));
+}

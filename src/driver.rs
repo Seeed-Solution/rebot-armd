@@ -2693,9 +2693,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
         let start = self.now();
         let mut polled = false;
+        // a joint without a matching acknowledgement fails at once (nothing to wait for), so the
+        // rollback starts within the deadline
+        let acks_complete = ack_seq.iter().all(Option::is_some);
         loop {
             let missing = unconfirmed(self);
-            if missing.is_empty() || self.since(start) >= REGISTER_REPLY_TIMEOUT { break; }
+            if missing.is_empty() || !acks_complete || self.since(start) >= REGISTER_REPLY_TIMEOUT { break; }
             if !polled && ack_seq.iter().all(Option::is_some) {
                 for &i in &missing { let _ = self.tx_mit(&damiao::build_refresh_frame(self.motor_ids[i])); }
                 let _ = self.can.flush();

@@ -47,6 +47,8 @@ pub struct FakeMotor {
     pub ack_value_override: Option<u32>,
     /// Register writes get no acknowledgement.
     pub no_write_ack: bool,
+    /// The next register write acknowledgement carries this value instead (then cleared).
+    pub ack_value_override_once: Option<u32>,
     /// After the next CTRL_MODE acknowledgement the motor goes silent (mode accepted, hold,
     /// post-switch feedback and every later reply lost).
     pub silent_after_mode_ack: bool,
@@ -77,7 +79,7 @@ impl FakeMotor {
         regs.insert(damiao::RID_TMAX, limits.t_max.to_le_bytes());
         regs.insert(damiao::RID_TIMEOUT, 0u32.to_le_bytes());
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
-            silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, silent_after_mode_ack: false,
+            silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
             mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0 }
     }
 
@@ -232,7 +234,7 @@ impl FakeBusState {
                 damiao::REG_WRITE => {
                     let value = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
                     if !m.ignore_reg_writes { m.regs.insert(rid, value); }
-                    let ack = m.ack_value_override.map_or(value, u32::to_le_bytes);
+                    let ack = m.ack_value_override_once.take().or(m.ack_value_override).map_or(value, u32::to_le_bytes);
                     let r = (!m.no_write_ack).then(|| m.reg_reply(damiao::REG_WRITE, rid, ack));
                     if rid == damiao::RID_CTRL_MODE {
                         m.mute_feedback = std::mem::take(&mut m.mute_feedback_after_mode_ack);
