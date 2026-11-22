@@ -328,21 +328,8 @@ fn record_j4_zero(timeout_raw: u32, zero: f32) -> MitQualificationFile {
 
 /// Armed supervisor with MIT active on J4 (motor zero offset `zero_j4`, rad).
 fn active_rig(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus) {
-    let bus = FakeBus::new(&b601_limits());
-    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; });
-    let mut d = disabled_driver(&bus);
-    d.check_mapping_ranges();
-    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
-    inner.lease_enabled = false;
-    if zero_j4 != 0.0 { inner.set_joint_zero_offsets(&[0.0, 0.0, 0.0, zero_j4, 0.0, 0.0, 0.0]).unwrap(); }
-    inner.tick(DT);
-    inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
-    with_record(&mut inner, record_j4_zero(2000, zero_j4));
-    inner.set_torque(true).unwrap();
-    assert!(inner.mit_motion_blocker().is_some(), "motion refused before the handover");
-    inner.tick(DT);
-    inner.tick(DT);
-    assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
+    // on the fake clock: the 45 ms deadline never depends on wall-clock load
+    let (inner, bus, _clock) = active_rig_clocked(cfg, zero_j4);
     (inner, bus)
 }
 
@@ -476,7 +463,7 @@ fn mit_effort_saturation_and_empty_interval() {
 #[test]
 fn mit_owner_handover() {
     // activation refused while a joint moves
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
@@ -890,7 +877,7 @@ fn mit_torque_guard_hold_never_pushes_into_the_held_direction() {
 /// MIT is requested but does not own its joints (handover pending or failed).
 #[test]
 fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
@@ -1024,7 +1011,7 @@ fn mit_near_misses_are_counted_without_cancelling() {
 /// the rollback sends no further MIT frame (only the original hold went out).
 #[test]
 fn mit_handover_is_fenced_from_the_first_switch_frame() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
     let mut d = disabled_driver(&bus);
     d.check_mapping_ranges();
@@ -1069,7 +1056,7 @@ fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
         if l >= g.abs() { continue; }
         let mut cfg = mit_config_j4();
         { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.effort_limit_nm = l; j4.hold_kd = Some(hold_kd); }
-        let bus = FakeBus::new(&b601_limits());
+        let bus = clocked_bus();
         bus.with(|s| { s.follow_commands = false; for (i, m) in s.motors.iter_mut().enumerate() { m.q = qh[i]; } s.motors[3].v = v_m; });
         let mut d = disabled_driver(&bus);
         d.check_mapping_ranges();
