@@ -409,8 +409,9 @@ impl crate::supervisor::SupervisorInner {
 
     /// Positive evidence that the arm joints are at rest, from fresh feedback: measured
     /// velocities within [`STATIONARY_VELOCITY_RAD_S`] when the driver reports velocity,
-    /// otherwise two position samples at least one control tick apart (every joint
-    /// re-sampled in between) within [`STATIONARY_POSITION_TOL_RAD`].
+    /// otherwise two position samples within [`STATIONARY_POSITION_TOL_RAD`] whose feedback
+    /// timestamps lie at least one control period (`1 / control_frequency_hz`) apart: the
+    /// oldest joint sample of the second is that much newer than the newest of the first.
     pub fn tracking_stationary_evidence(&self) -> bool {
         let dof = self.config.dof;
         if !self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
@@ -436,7 +437,9 @@ impl crate::supervisor::SupervisorInner {
         else {
             return false;
         };
-        oldest_now > *sampled_newest
+        // At least one control period between the samples by their feedback timestamps.
+        let period = std::time::Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+        oldest_now.checked_duration_since(*sampled_newest).is_some_and(|gap| gap >= period)
             && q_prev.len() == dof
             && arm.iter().all(|&j| (self.measured_positions[j] - q_prev[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
     }

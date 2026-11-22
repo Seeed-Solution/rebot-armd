@@ -3895,8 +3895,12 @@ fn tracking_seeds_only_on_positive_stationarity_evidence() {
             s.pinned[0] = Some(q0[0]);
             s.q[0] = q0[0];
         });
+        // Review 4 #3: the two samples must lie >= one control period apart by their feedback
+        // timestamps (the test ticks run back to back): the first rest sample is 30 ms old.
+        drv.with(|s| s.feedback_age = Duration::from_millis(30));
         inner.tick(DT);
         assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "one sample at rest is not evidence");
+        drv.with(|s| s.feedback_age = Duration::ZERO);
         let obs = inner.tick(DT);
         assert!(obs.safety_state.is_operational(), "{:?}", obs.fault);
         assert_ne!(
@@ -4023,4 +4027,46 @@ fn tracking_braking_fallback_keeps_rejected_motion_caps() {
     for (k, (v, _)) in steps.iter().enumerate() {
         assert!(v.abs() <= scaled_v + 1e-3, "fallback frame {k}: J1 {v:.4} rad/s above the motion's scaled cap {scaled_v:.4}");
     }
+}
+
+/// Review 4 #3: without velocity feedback, two rest samples less than one control period
+/// apart (by their feedback timestamps) are no evidence of rest, however many ticks repeat.
+#[test]
+fn tracking_rest_samples_must_be_one_control_period_apart() {
+    use armd::tracking::TrackingHistoryState;
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let period = Duration::from_secs_f64(1.0 / f64::from(cfg.control_frequency_hz));
+    assert!(period >= Duration::from_millis(5), "test needs a measurable control period");
+    let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+    drv.with(|s| s.velocity_feedback = false);
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+    inner.lease_enabled = false;
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    // Back-to-back ticks, fresh (age 0) feedback each: samples microseconds apart.
+    for k in 0..5 {
+        let started = std::time::Instant::now();
+        inner.tick(DT);
+        assert!(started.elapsed() < period, "tick {k} took a whole control period; the test needs sub-period spacing");
+        assert_eq!(
+            inner.tracking.history_state,
+            TrackingHistoryState::Unknown,
+            "tick {k}: rest samples < one control period apart must not seed"
+        );
+    }
+    // One sample a full period older than the next: evidence.
+    drv.with(|s| s.feedback_age = period + Duration::from_millis(2));
+    inner.tick(DT);
+    drv.with(|s| s.feedback_age = Duration::ZERO);
+    inner.tick(DT);
+    assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
