@@ -250,6 +250,8 @@ fn zero_entry(inner: &SupervisorInner, new: &[f32], method: &str) -> Option<Opti
 
 /// The real run (after [`check`]; the caller holds the busy flags and clears them afterwards).
 pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
+    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, req.method.as_deref().unwrap_or("motor")).await?;
     if req.method.as_deref() == Some("software") { return run_software(sup, deps, req, check).await; }
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. readings, then disable every motor (official sequence), torque stays off
@@ -439,6 +441,8 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
         if let Some(z) = &target { z.validate(Some(n)).map_err(|e| invalid(format!("backup {name}: {e}")))?; }
         Ok((inner.joint_zero_offsets.clone(), new, reference(inner)))
     }).await?;
+    let changed: Vec<usize> = (0..old.len()).filter(|&j| old.get(j) != new.get(j)).map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &changed, "restored").await?;
     let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
     locked_step(sup, check, "apply", |inner| inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))).await?;
     let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();

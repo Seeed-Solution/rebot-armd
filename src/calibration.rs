@@ -1552,3 +1552,23 @@ mod tests {
         }
     }
 }
+
+/// Before a zero of `joints` (1-based) is written: mark an MIT qualification record that holds
+/// one of them invalidated and persist that first (atomic write), then publish it live. A failed
+/// write refuses the zero (nothing changed), so a crash or write error never leaves a valid
+/// record next to a changed physical zero. Nothing to do without such a record.
+pub async fn invalidate_mit_before_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize], method: &str) -> Result<(), CalibError> {
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let file = {
+        let inner = sup.inner().read().await;
+        let Some(mut c) = inner.calibration.clone() else { return Ok(()) };
+        let reason = format!("{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero");
+        if !crate::mit::invalidate_record(&mut c, joints, &reason, &at) { return Ok(()); }
+        c
+    };
+    let text = serde_json::to_string_pretty(&file).map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
+    put_file(deps.path.clone(), Some(text)).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED",
+        format!("the MIT qualification could not be invalidated in {} ({e}); the zero was refused, nothing was changed", deps.path.display())))?;
+    sup.inner().write().await.set_calibration(Some(file));
+    Ok(())
+}

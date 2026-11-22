@@ -301,3 +301,43 @@ async fn unsupported_driver_is_refused_with_the_reason() {
     let rej = cmd(&mut r, PATH, json!({"joints": [1], "dry_run": true})).await;
     assert_eq!(rej["code"], "MOTOR_ZERO_NO_FEEDBACK", "{rej}");
 }
+
+fn mit_record_j2() -> Value {
+    json!({"version": 1, "joints": [{
+        "profile_id": "rebot_b601dm", "joint": 2, "joint_name": "joint2", "zero_fingerprint": armd::mit::zero_fingerprint(0.0),
+        "motor_id": 2, "reply_id": 18, "esc_id": 2, "mst_id": 18, "sw_ver": 942747703, "pmax": 12.5, "vmax": 10.0, "tmax": 28.0,
+        "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": true, "tested_response": "disabled",
+        "measured_expiry_ms": 101.0, "load_envelope": "supported", "max_kp": 30.0, "max_kd": 1.0, "effort_ceiling_nm": 4.0,
+        "date": "2026-11-22T00:00:00Z", "trace_id": "t"}]})
+}
+
+/// Review #4: the MIT qualification of a zeroed joint is invalidated on disk BEFORE the zero is
+/// written; when that write fails, the zero is refused and nothing changes.
+#[tokio::test]
+async fn mit_record_is_invalidated_on_disk_before_the_zero_and_a_failed_write_refuses_it() {
+    let with_record = |dir: &Path| {
+        let mut file = CalibrationFile { joint_zero: Some(armd::joint_zero::JointZero::new(&[0.0; 7], "software", "rest")), ..Default::default() };
+        file.mit_qualification = Some(mit_record_j2());
+        std::fs::write(dir.join("calibration.json"), serde_json::to_string(&file).unwrap()).unwrap();
+    };
+    // the file cannot be written: refused, offsets and record unchanged
+    let mut r = rig(None, with_record).await;
+    set_q(&r, Q).await;
+    let before = r.sup.inner().read().await.joint_zero_offsets.clone();
+    let dir = r.dir.path().to_path_buf();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let rej = cmd(&mut r, PATH, json!({"joints": [2], "force": true})).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(rej["type"], "command_reject", "{rej}");
+    assert!(rej["message"].as_str().unwrap_or("").contains("nothing was changed"), "{rej}");
+    let inner = r.sup.inner().read().await;
+    assert_eq!(inner.joint_zero_offsets, before, "the zero was applied");
+    assert!(inner.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_none());
+    drop(inner);
+    // writable: the invalidation is on disk and the zero is done
+    let ok = cmd(&mut r, PATH, json!({"joints": [2], "force": true})).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.mit_record().unwrap().unwrap().invalidated.is_some());
+}
