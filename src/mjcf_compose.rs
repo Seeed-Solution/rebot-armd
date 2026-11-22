@@ -1388,22 +1388,23 @@ fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
 
 fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<(), String> {
     check_tcp_site_not_in_frame(node)?;
-    if let Some(host_body) = node
+    let host_body = node
         .ancestors()
         .skip(1)
         .find(|a| a.is_element() && a.tag_name().name() == "body")
+        .ok_or_else(|| {
+            "base MJCF <site name=\"tcp\"> has no host <body> ancestor; declare <site name=\"tcp\"> directly inside a named host <body>".to_string()
+        })?;
+    if host_body
+        .attribute("name")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none()
     {
-        if host_body
-            .attribute("name")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .is_none()
-        {
-            return Err(
-                "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
-                    .into(),
-            );
-        }
+        return Err(
+            "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
+                .into(),
+        );
     }
     if node.attribute("fromto").is_some() {
         return Err("base MJCF <site name=\"tcp\"> uses unsupported 'fromto' attribute".into());
@@ -1417,19 +1418,19 @@ fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) ->
             "base MJCF <site name=\"tcp\"> uses unsupported class '{cls}'"
         ));
     }
-    // Explicit class="main" on <site name="tcp"> overrides any ancestor childclass.
+    // Explicit class="main" on <site name="tcp"> overrides any ancestor childclass;
+    // otherwise take the nearest ancestor's childclass (stopping at childclass="main").
     let effective_class = if raw_explicit_class == Some("main") {
         None
     } else {
-        node.ancestors().skip(1).find_map(|a| {
-            a.is_element()
-                .then(|| {
-                    a.attribute("childclass")
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty() && *s != "main")
-                })
-                .flatten()
-        })
+        node.ancestors()
+            .skip(1)
+            .find_map(|a| {
+                a.is_element()
+                    .then(|| a.attribute("childclass").map(str::trim).filter(|s| !s.is_empty()))
+                    .flatten()
+            })
+            .filter(|s| *s != "main")
     };
     const TRANSFORM_ATTRS: [&str; 7] =
         ["pos", "quat", "euler", "axisangle", "xyaxes", "zaxis", "fromto"];
@@ -1489,20 +1490,21 @@ fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> 
         for site in base_doc.descendants() {
             if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
                 check_tcp_site_not_in_frame(site)?;
-                if let Some(direct_body) = site
+                let direct_body = site
                     .ancestors()
                     .skip(1)
                     .find(|anc| anc.is_element() && anc.tag_name().name() == "body")
-                {
-                    let bname = direct_body
-                        .attribute("name")
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| {
-                            "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name".to_string()
-                        })?;
-                    return Ok(bname.to_string());
-                }
+                    .ok_or_else(|| {
+                        "base MJCF <site name=\"tcp\"> has no host <body> ancestor; declare <site name=\"tcp\"> directly inside a named host <body>".to_string()
+                    })?;
+                let bname = direct_body
+                    .attribute("name")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name".to_string()
+                    })?;
+                return Ok(bname.to_string());
             }
         }
         if base_doc
@@ -2682,5 +2684,33 @@ mod tests {
             let err = compose_mjcf(unnamed_body_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
             assert!(err.contains("unnamed <body>"), "expected unnamed <body> rejection, got: {err}");
         }
+
+        // 18. R9 M4: <site name="tcp"> directly under <worldbody> (no host <body>) fails closed
+        // instead of attaching tool geometries onto another <body name="end_link">.
+        let world_tcp_base = r#"<mujoco><worldbody>
+          <site name="tcp" pos="0 0 0"/>
+          <body name="end_link"><geom type="box" size="0.01 0.01 0.01"/></body>
+        </worldbody></mujoco>"#;
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(world_tcp_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("no host <body>"), "expected missing host <body> rejection, got: {err}");
+        }
+
+        // 19. R9 m2: Nearest ancestor childclass="main" stops lookup instead of skipping outward
+        // to an outer childclass="painted".
+        let inner_main_childclass_base = r#"<mujoco>
+          <default><default class="painted"><site pos="0 0 0.05" quat="0 1 0 0"/></default></default>
+          <worldbody childclass="painted">
+            <body name="end_link" childclass="main"><site name="tcp" pos="0 0 0"/></body>
+          </worldbody>
+        </mujoco>"#;
+        let inner_main_ok = compose_mjcf(
+            inner_main_childclass_base,
+            None,
+            Some(&framed_manifest),
+            Some(so101_geom_tool),
+        )
+        .expect("nearest ancestor childclass=\"main\" must stop inheritance from outer childclass");
+        assert!(inner_main_ok.contains("0.02 0 0"), "{inner_main_ok}");
     }
 }
