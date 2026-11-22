@@ -114,6 +114,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
     fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
+    fn feedback_receive_instants(&self) -> Vec<Option<std::time::Instant>> { self.inner.feedback_receive_instants() }
     fn max_command_velocity(&self, joint: usize) -> Option<f32> { self.inner.max_command_velocity(joint) }
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
         let o = self.off(joint);

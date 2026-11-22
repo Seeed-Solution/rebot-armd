@@ -20,6 +20,12 @@ pub struct EpisodeMetadata {
     pub gripper_joint: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_gripper_motion: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -57,6 +63,15 @@ fn metadata_kv(meta: Option<&EpisodeMetadata>) -> std::collections::HashMap<Stri
             if let Ok(s) = serde_json::to_string(jn) {
                 metadata.insert("joint_names".into(), s);
             }
+        }
+        if let Some(ref tid) = m.tool_id {
+            metadata.insert("tool_id".into(), tid.clone());
+        }
+        if let Some(ref tdig) = m.tool_config_digest {
+            metadata.insert("tool_config_digest".into(), tdig.clone());
+        }
+        if let Some(gm) = m.has_gripper_motion {
+            metadata.insert("has_gripper_motion".into(), gm.to_string());
         }
     }
     metadata
@@ -126,6 +141,12 @@ pub fn write_episode_parquet(path: &Path, frames: &[RecordFrame], meta: Option<&
 pub fn read_parquet_kv(path: &Path) -> Result<std::collections::HashMap<String, String>, ParquetRecordingError> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    Ok(builder.schema().metadata().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+/// Key-value metadata of an in-memory parquet payload (footer only; rows are not decoded).
+pub fn read_parquet_kv_from_bytes(bytes: axum::body::Bytes) -> Result<std::collections::HashMap<String, String>, ParquetRecordingError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
     Ok(builder.schema().metadata().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
@@ -245,6 +266,21 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
                         if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
                             m.joint_names = Some(jn);
                         }
+                    }
+                }
+                if m.tool_id.is_none() {
+                    if let Some(tid) = meta_map.get("tool_id") {
+                        m.tool_id = Some(tid.clone());
+                    }
+                }
+                if m.tool_config_digest.is_none() {
+                    if let Some(tdig) = meta_map.get("tool_config_digest") {
+                        m.tool_config_digest = Some(tdig.clone());
+                    }
+                }
+                if m.has_gripper_motion.is_none() {
+                    if let Some(gm) = meta_map.get("has_gripper_motion").and_then(|s| s.parse::<bool>().ok()) {
+                        m.has_gripper_motion = Some(gm);
                     }
                 }
             }

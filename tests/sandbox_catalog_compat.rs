@@ -53,6 +53,7 @@ fn write_tool_pack(dir: &Path, id: &str, kind: &str, robots: &[&str], extra_xml:
         "version": "1.0.0",
         "tool_xml": "tool.xml",
         "robots": robots,
+        "tcp_offset": [0.0, 0.0, 0.0],
         "assets": []
     });
     std::fs::write(
@@ -1282,6 +1283,7 @@ async fn sandbox_m04_m05_optional_assets_and_normalized_path_in_bundle() {
             "kind": "gripper",
             "tool_xml": "tool.xml",
             "robots": ["b601dm"],
+            "tcp_offset": [0.0, 0.0, 0.0],
             "assets": ["jaw.stl", {"path": "opt_missing.stl", "required": false}]
         }))
         .unwrap(),
@@ -1346,7 +1348,7 @@ async fn sandbox_m09_same_id_overwrite_invalidates_cached_mjcf() {
 
     let upload_tool_v1 = json!({
         "id": "live_tool",
-        "tool_json": {"id": "live_tool", "name": "Live Tool v1", "kind": "gripper", "version": "1.0.0", "tool_xml": "tool.xml"},
+        "tool_json": {"id": "live_tool", "name": "Live Tool v1", "kind": "gripper", "version": "1.0.0", "tool_xml": "tool.xml", "tcp_offset": [0.0, 0.0, 0.0]},
         "tool_xml": r#"<mujoco model="tv1"><worldbody><geom name="tool_v1_marker" type="box" size="0.01 0.01 0.01"/></worldbody></mujoco>"#
     });
     let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/tools", Some(upload_tool_v1)).await;
@@ -1379,7 +1381,7 @@ async fn sandbox_m09_same_id_overwrite_invalidates_cached_mjcf() {
 
     let upload_tool_v2 = json!({
         "id": "live_tool",
-        "tool_json": {"id": "live_tool", "name": "Live Tool v2", "kind": "gripper", "version": "2.0.0", "tool_xml": "tool.xml"},
+        "tool_json": {"id": "live_tool", "name": "Live Tool v2", "kind": "gripper", "version": "2.0.0", "tool_xml": "tool.xml", "tcp_offset": [0.0, 0.0, 0.0]},
         "tool_xml": r#"<mujoco model="tv2"><worldbody><geom name="tool_v2_marker" type="box" size="0.01 0.01 0.01"/></worldbody></mujoco>"#
     });
     let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/tools", Some(upload_tool_v2)).await;

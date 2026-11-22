@@ -252,13 +252,13 @@ impl From<ArmError> for ApiError {
                     current_revision: None,
                     retry_after_s: None,
                 },
-                crate::safety::SafetyError::ArmNotAtRestingPose { .. } => ApiError {
+                crate::safety::SafetyError::ArmNotAtRestingPose { ref reason, .. } => ApiError {
                     status: StatusCode::CONFLICT,
                     error: "ArmNotAtRestingPose".to_string(),
                     message: safety_err.to_string(),
                     code: Some("ARM_NOT_AT_RESTING_POSE".to_string()),
                     safety_state: Some("Armed".to_string()),
-                    details: None,
+                    details: reason.as_ref().map(|r| Box::new(serde_json::json!({ "reason": r }))),
                     workspace_violation: None,
                     current_revision: None,
                     retry_after_s: None,
@@ -298,6 +298,9 @@ impl From<ArmError> for ApiError {
                 },
                 crate::safety::SafetyError::CollisionHold(_) => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
+                }
+                crate::safety::SafetyError::CommissioningRequired(_) => {
+                    ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COMMISSIONING_REQUIRED".to_string())
                 }
                 crate::safety::SafetyError::MotionBusy => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "MOTION_BUSY".to_string())
@@ -715,8 +718,11 @@ pub async fn episodes_import(
     };
     if !store.enabled() { return Err(ArmError::from(crate::recording::StoreError::Disabled).into()); }
     let result = tokio::task::spawn_blocking(move || -> Result<(crate::recording::EpisodeSidecar, bool), ApiError> {
+        let parquet_kv = crate::recording::read_parquet_kv_from_bytes(parquet.clone())
+            .map_err(|e| import_invalid("schema", format!("parquet: {e}")))?;
         let frames = crate::recording::read_frames_from_bytes(parquet).map_err(|e| import_invalid("schema", format!("parquet: {e}")))?;
-        let checked = crate::recording::import::check(&ctx, &sidecar, &frames).map_err(|e| import_invalid(e.reason, e.message))?;
+        let checked = crate::recording::import::check_with_provenance(&ctx, &sidecar, &frames, Some(&parquet_kv))
+            .map_err(|e| import_invalid(e.reason, e.message))?;
         let mut sc = checked.sidecar;
         sc.id = crate::recording::new_ulid();
         store.check_capacity().map_err(ArmError::from)?;
@@ -760,21 +766,24 @@ pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Resul
 /// GET /api/v1/grasp/setup: the runtime grasp setup (change it with the WS command
 /// `/api/v1/grasp/setup`). `camera_down` says whether a grasp on the current mount acquires
 /// camera-down (`crate::grasp::camera_down_mode`; then `grip_pixel_norm` is not the centring
-/// aim); null with `camera_down_error` when the setting cannot be served.
+/// aim); null with `camera_down_error` when the setting cannot be served. `width_check` compares
+/// `max_grasp_width_m` with the jaw curve (`crate::grasp::grasp_width_check_json`).
 pub async fn get_grasp_setup(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
 ) -> Response {
-    let (setup, revision, camera_down) = {
+    let (setup, revision, camera_down, width_check) = {
         let inner = supervisor.inner().read().await;
         let setup = inner.grasp_setup();
         let camera_down = setup.as_ref().map(|s| crate::grasp::camera_down_mode(s, &inner.config.camera_mount));
-        (setup, inner.grasp_setup_revision, camera_down)
+        let width_check = setup.as_ref().map(|s| crate::grasp::grasp_width_check_json(&inner, s.max_grasp_width_m));
+        (setup, inner.grasp_setup_revision, camera_down, width_check)
     };
     let path = deps.setup_path.as_ref().map(|p| p.display().to_string());
     match setup {
         Some(s) => {
-            let mut v = serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision});
+            let mut v = serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision,
+                "width_check": width_check});
             match camera_down {
                 Some(Ok(b)) => { v["camera_down"] = serde_json::json!(b); }
                 Some(Err(e)) => { v["camera_down"] = serde_json::Value::Null; v["camera_down_error"] = serde_json::json!(e); }
@@ -861,8 +870,77 @@ pub async fn get_safety_describe(
 }
 
 /// `GET /api/v1/gripper/calibration`: current gripper calibration and effective policy (no lease).
+/// GET /api/v1/gripper/calibration
 pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.gripper_calibration_response()).into_response()
+}
+
+/// GET /api/v1/tool/commissioning
+pub async fn get_tool_commissioning(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.tool_commissioning_response()).into_response()
+}
+
+/// POST /api/v1/tool/commissioning/confirm
+pub async fn post_tool_commissioning_confirm(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    payload: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = payload.map_err(|e| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid commissioning confirm body: {e}"),
+            "INVALID_COMMAND".into(),
+        )
+    })?;
+    let cw_lock = supervisor.config_write_lock();
+    let _cw = cw_lock.lock().await;
+    let mut prepared = {
+        let inner = supervisor.inner().read().await;
+        crate::tool::prepare_commissioning_confirm(&inner, &body, auth.is_enforced())?
+    };
+    let write = prepared.write.take();
+    let (ds, active_tool, revision) = if let Some(w) = write {
+        let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(w.path, w.text))
+            .await
+            .map_err(|e| ApiError::persist_failed(format!("commissioning stage task: {e}")))?
+            .map_err(|e| ApiError::persist_failed(format!("commissioning stage failed: {e}")))?;
+        let mut inner = supervisor.inner().write().await;
+        if let Err(e) = crate::tool::precheck_commissioning_confirm(&inner, &prepared) {
+            staged.abort();
+            return Err(e.into());
+        }
+        let ds = match staged.rename_only() {
+            Ok(ds) => ds,
+            Err(e) => return Err(ApiError::persist_failed(format!("commissioning rename failed: {e}"))),
+        };
+        let (active_tool, revision) = crate::tool::commit_commissioning_confirm(&mut inner, prepared)?;
+        (ds, active_tool, revision)
+    } else {
+        let mut inner = supervisor.inner().write().await;
+        crate::tool::precheck_commissioning_confirm(&inner, &prepared)?;
+        let (active_tool, revision) = crate::tool::commit_commissioning_confirm(&mut inner, prepared)?;
+        return Ok(Json(serde_json::json!({
+            "active_tool": active_tool,
+            "commissioning_required": active_tool.commissioning_required,
+            "revision": revision,
+            "durability_confirmed": true,
+        }))
+        .into_response());
+    };
+    let outcome = tokio::task::spawn_blocking(move || ds.sync_parent_dir())
+        .await
+        .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+    let mut resp = serde_json::json!({
+        "active_tool": active_tool,
+        "commissioning_required": active_tool.commissioning_required,
+        "revision": revision,
+        "durability_confirmed": matches!(outcome, crate::persist::PublishOutcome::Published),
+    });
+    if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+        resp["durability_warning"] = serde_json::json!(w);
+    }
+    Ok(Json(resp).into_response())
 }
 
 #[derive(Debug, Deserialize)]

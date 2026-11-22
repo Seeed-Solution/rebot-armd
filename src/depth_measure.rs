@@ -89,6 +89,7 @@ struct Snapshot {
     setup: GraspSetup,
     cam: CamModel,
     pose: Pose,
+    tcp_offset: [f64; 3],
     commanded: Vec<f32>,
     measured: Vec<f32>,
     lens_known: bool,
@@ -118,6 +119,7 @@ fn snapshot(inner: &SupervisorInner) -> Result<Snapshot, ArmError> {
     let pose = arm.fk_f32(&inner.commanded_positions).ok_or_else(|| ArmError::Internal("no FK pose for the commanded positions".into()))?;
     Ok(Snapshot {
         cam, pose,
+        tcp_offset: inner.config.tcp_offset,
         commanded: inner.commanded_positions.clone(),
         measured: inner.measured_positions.clone(),
         lens_known: inner.config.camera_mount.offset_m.is_some(),
@@ -255,6 +257,7 @@ fn reply(snap: &Snapshot, req: &MeasureRequest, frame: &DetectionFrame) -> Value
         })
         .collect();
     let arm_dof = 6.min(snap.commanded.len());
+    let tcp_pose = crate::motion::end_to_tcp(&snap.pose, &snap.tcp_offset);
     json!({
         "frame_id": frame.frame_id,
         "age_ms": Instant::now().saturating_duration_since(frame.captured_at).as_secs_f64() * 1000.0,
@@ -264,7 +267,8 @@ fn reply(snap: &Snapshot, req: &MeasureRequest, frame: &DetectionFrame) -> Value
             "pose_source": "commanded",
             "commanded_rad": &snap.commanded[..arm_dof],
             "measured_rad": &snap.measured[..arm_dof.min(snap.measured.len())],
-            "tcp": {"xyz_m": snap.pose.p, "quat_wxyz": kinematics::r_to_quat(&snap.pose.r)},
+            "end_pose": {"xyz_m": snap.pose.p, "quat_wxyz": kinematics::r_to_quat(&snap.pose.r)},
+            "tcp": {"xyz_m": tcp_pose.p, "quat_wxyz": kinematics::r_to_quat(&tcp_pose.r)},
             "origin_m": snap.cam.origin(&snap.pose),
             "quat_wxyz": kinematics::r_to_quat(&snap.cam.rotation(&snap.pose)),
             "fx": snap.cam.fx, "fy": snap.cam.fy, "cx": snap.cam.cx, "cy": snap.cam.cy, "size": snap.cam.size,

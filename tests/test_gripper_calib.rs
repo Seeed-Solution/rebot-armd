@@ -305,10 +305,10 @@ async fn test_ws_calibration_write_and_rest_get() {
     assert_eq!(r5["type"], "command_reject");
     assert_eq!(r5["code"], "INVALID_COMMAND");
 
-    // 3. Valid calibration write
+    // 3. Valid calibration write (jaw_opening covers [open_rad, closed_rad] = [-5.7, 0.0])
     let valid_write_body = json!({
         "jaw_opening": {
-            "points": [[0.0, 0.0], [-5.0, 0.08]],
+            "points": [[0.0, 0.0], [-5.7, 0.08]],
             "calibrated": true
         },
         "offset_rad": 0.02
@@ -325,7 +325,7 @@ async fn test_ws_calibration_write_and_rest_get() {
     let jaw = &ack["jaw_opening"];
     assert_eq!(jaw["calibrated"], true);
     assert!((jaw["points"][0][0].as_f64().unwrap() - 0.02).abs() < 1e-3);
-    assert!((jaw["points"][1][0].as_f64().unwrap() - (-4.98)).abs() < 1e-3);
+    assert!((jaw["points"][1][0].as_f64().unwrap() - (-5.68)).abs() < 1e-3);
 
     // 4. REST GET /api/v1/gripper/calibration (no lease)
     let client = reqwest::Client::new();

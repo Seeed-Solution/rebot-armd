@@ -48,7 +48,7 @@ export const posOf = (T) => [T[0][3], T[1][3], T[2][3]];
 export const make = (R, t) => [[...R[0], t[0]], [...R[1], t[1]], [...R[2], t[2]], [0, 0, 0, 1]];
 export const mul = mm;
 export const inv = (T) => { const Rt = tr(rotOf(T)), p = mv3(Rt, posOf(T)); return make(Rt, [-p[0], -p[1], -p[2]]); };
-const apply = (T, p) => [T[0][0] * p[0] + T[0][1] * p[1] + T[0][2] * p[2] + T[0][3], T[1][0] * p[0] + T[1][1] * p[1] + T[1][2] * p[2] + T[1][3], T[2][0] * p[0] + T[2][1] * p[1] + T[2][2] * p[2] + T[2][3]];
+export const apply = (T, p) => [T[0][0] * p[0] + T[0][1] * p[1] + T[0][2] * p[2] + T[0][3], T[1][0] * p[0] + T[1][1] * p[1] + T[1][2] * p[2] + T[1][3], T[2][0] * p[0] + T[2][1] * p[1] + T[2][2] * p[2] + T[2][3]];
 const I3 = () => [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 
 // symmetric Jacobi eigen-decomposition -> { vals, vecs } (eigenvector i = column i)
@@ -778,12 +778,21 @@ export function interpPose(A, B, f) {
   return make(mm(Ra, rodrigues(scl3(w, f))), add3(posOf(A), scl3(sub3(posOf(B), posOf(A)), f)));
 }
 // tool points to keep above the board: end_link origin (jaw tips), the wrist 0.155 m back along the
-// tool axis (end_link x), the camera centre
-export const toolPoints = (Tend, X) => { const p = posOf(Tend), x = [Tend[0][0], Tend[1][0], Tend[2][0]]; return [p, sub3(p, scl3(x, 0.155)), apply(Tend, posOf(X))]; };
+// tool axis (end_link x), the camera centre, and any active schema workspace check points in end_link frame.
+export const toolPoints = (Tend, X, extraEndPoints = null) => {
+  const p = posOf(Tend), x = [Tend[0][0], Tend[1][0], Tend[2][0]];
+  const pts = [p, sub3(p, scl3(x, 0.155)), apply(Tend, posOf(X))];
+  if (Array.isArray(extraEndPoints)) {
+    for (const ep of extraEndPoints) {
+      if (Array.isArray(ep) && ep.length === 3 && ep.every(Number.isFinite)) pts.push(apply(Tend, ep));
+    }
+  }
+  return pts;
+};
 /* Straight-line transition A -> B checked at interpolated points (<= stepM / stepRad apart) with the IK
    (ik(T, qSeed) -> { ok, q }); refuses an IK failure, a joint jump > maxJointStep between samples (branch
    flip), joint limits, a tool point below the clearance plane. Returns { ok, q, reason, at }. */
-export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, stepM = 0.01, stepRad = 0.05, maxJointStep = 0.25 }) {
+export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, extraEndPoints = null, stepM = 0.01, stepRad = 0.05, maxJointStep = 0.25 }) {
   const d = norm3(sub3(posOf(B), posOf(A))), a = norm3(logRot(mm(tr(rotOf(A)), rotOf(B))));
   const n = Math.max(1, Math.ceil(Math.max(d / stepM, a / stepRad)));
   let q = qA.slice();
@@ -792,7 +801,7 @@ export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, ste
     if (!s || !s.ok) return { ok: false, reason: 'ik', at: k / n };
     if (s.q.some((v, i) => Math.abs(v - q[i]) > maxJointStep)) return { ok: false, reason: 'flip', at: k / n };
     if (lo && s.q.some((v, i) => v < lo[i] - 1e-6 || v > hi[i] + 1e-6)) return { ok: false, reason: 'limits', at: k / n };
-    if (plane && toolPoints(T, X).some((p) => dot3(sub3(p, plane.p), plane.n) < clearance)) return { ok: false, reason: 'clearance', at: k / n };
+    if (plane && toolPoints(T, X, extraEndPoints).some((p) => dot3(sub3(p, plane.p), plane.n) < clearance)) return { ok: false, reason: 'clearance', at: k / n };
     q = s.q;
   }
   return { ok: true, q };
@@ -810,7 +819,7 @@ export const generatePoses = (args) => runSync(generatePosesSteps(args));
 export function* generatePosesSteps({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = null, hi = null, n = 20, size = IMAGE,
   dists = [0.18, 0.20, 0.23, 0.26, 0.30, 0.35], tilts = [0, 10, 20, 30], azimuths = 8, rolls = [0, 15, -15],
   aims = [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.65], [0.7, 0.65]], minMarkers = GATES.minMarkers,
-  clearance = 0.10, distRange = [0.18, 0.35], exclude = [] }) {
+  clearance = 0.10, distRange = [0.18, 0.35], exclude = [], extraEndPoints = null }) {
   const Rb = rotOf(Tbb), plane = boardPlane(Tbb), c = plane.p, nz = plane.n;
   const ex = unit(sub3([Rb[0][0], Rb[1][0], Rb[2][0]], scl3(nz, dot3([Rb[0][0], Rb[1][0], Rb[2][0]], nz)))), ey = cross(nz, ex);
   const T0 = fk(q0), Rc0 = mm(rotOf(T0), rotOf(X)), xc0 = [Rc0[0][0], Rc0[1][0], Rc0[2][0]];
@@ -837,7 +846,7 @@ export function* generatePosesSteps({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo
     const Rend = mm(Rc, tr(Rec)), pend = sub3(pc, mv3(Rend, tec)), T = make(Rend, pend), Tcam = make(Rc, pc);
     const vis = visibleMarkers(K, Tcam, Tbb, board, { size });
     if (vis.length < minMarkers) { stats.markers++; continue; }
-    if (toolPoints(T, X).some((p) => dot3(sub3(p, c), nz) < clearance)) { stats.clearance++; continue; }
+    if (toolPoints(T, X, extraEndPoints).some((p) => dot3(sub3(p, c), nz) < clearance)) { stats.clearance++; continue; }
     const s = ik(T, q0);
     if (!s || !s.ok || (lo && s.q.some((v, i) => v < lo[i] - 1e-6 || v > hi[i] + 1e-6))) { stats.reach++; continue; }
     if (exclude.some((E) => norm3(sub3(posOf(E), pend)) < 0.01 && rotDist(rotOf(E), Rend) < 3)) continue;
@@ -869,7 +878,7 @@ export function* generatePosesSteps({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo
     let took = -1;
     for (let i = 0; i < left.length && took < 0; i++) {
       yield;
-      const tr2 = checkTransition(curT, curQ, left[i].T, { ik, X, plane, clearance, lo, hi });
+      const tr2 = checkTransition(curT, curQ, left[i].T, { ik, X, plane, clearance, lo, hi, extraEndPoints });
       if (tr2.ok) { took = i; left[i].q = tr2.q; } else stats.transition++;
     }
     if (took < 0) break;
@@ -1609,7 +1618,7 @@ export function fitBoardPose(markers, board, K, order = ORDERS[0]) {
 /* One hover point. observations: [{ markers, joints?, q? }]; tipCam (m, camera frame); edgeToLow (m or null);
    target: corner in the board frame [x, y] (m); Tend: T_base_end from the candidate kinematics at the measured
    joints (optional; gives z_end_m and the optical plane); X: T_end_cam of the candidate. */
-export function hoverPoint({ observations, board, K, tipCam, edgeToLow = null, target = null, Tend = null, X = null, order = ORDERS[0] }) {
+export function hoverPoint({ observations, board, K, tipCam, edgeToLow = null, target = null, Tend = null, X = null, order = ORDERS[0], physicalContactEnd = null }) {
   const fits = (observations || []).map((o) => fitBoardPose(o.markers || [], board, K, order)).filter(Boolean);
   if (!fits.length) return { ok: false, why: 'markers', frames: 0 };
   const ps = fits.map((f) => tipInBoard(f.T, tipCam));
@@ -1621,14 +1630,16 @@ export function hoverPoint({ observations, board, K, tipCam, edgeToLow = null, t
   if (target) out.target_xy_m = target;
   if (Tend) {
     out.z_end_m = Tend[2][3];
+    const hasContact = Array.isArray(physicalContactEnd) && physicalContactEnd.length === 3 && physicalContactEnd.every(Number.isFinite);
+    out.z_contact_m = hasContact ? apply(Tend, physicalContactEnd)[2] : null;
     if (X) { const Tbb = mm(mm(Tend, X), fits[0].T); out.optical_board_z_m = Tbb[2][3]; out.board_normal_z = Tbb[2][2]; }
   }
   return out;
 }
 
-/* Gates and the working table height over the hover points (results of hoverPoint with z_end_m). Returns
-   { ok, gates, table_z_m (null without a known tool), optical_table_z_m, height_spread_m, max_xy_m, points }. */
-export function evaluateHovers(points, { edgeToLow = null, gates = HOVER_GATES } = {}) {
+/* Gates and the working table height over the hover points (results of hoverPoint with z_contact_m / z_end_m).
+   Returns { ok, gates, table_z_m (null without a known tool or known physicalContactEnd), optical_table_z_m, height_spread_m, max_xy_m, points }. */
+export function evaluateHovers(points, { edgeToLow = null, gates = HOVER_GATES, thickness = 0, physicalContactEnd = undefined } = {}) {
   const ok = points.filter((p) => p && p.ok);
   const out = { gates: [], points: ok.length };
   const gate = (key, pass, value, limit, blocking = true) => out.gates.push({ key, ok: pass, value, limit, blocking });
@@ -1641,8 +1652,14 @@ export function evaluateHovers(points, { edgeToLow = null, gates = HOVER_GATES }
   out.min_height_m = hs.length ? Math.min(...hs) : NaN;
   gate('clearance', hs.length > 0 && out.min_height_m > 0, out.min_height_m, 0);
   gate('tool', edgeToLow != null, edgeToLow == null ? 'unknown' : edgeToLow, 'known edge_to_low_m', false);
-  const withZ = ok.filter((p) => Number.isFinite(p.z_end_m));
-  out.table_z_m = edgeToLow != null && withZ.length ? withZ.reduce((s, p) => s + p.z_end_m - p.height_m, 0) / withZ.length : null;
+  const contactKnown = physicalContactEnd === undefined
+    ? ok.length > 0 && ok.every((p) => ('z_contact_m' in p ? Number.isFinite(p.z_contact_m) : Number.isFinite(p.z_end_m)))
+    : Array.isArray(physicalContactEnd) && physicalContactEnd.length === 3 && physicalContactEnd.every(Number.isFinite);
+  const contactZ = (p) => ('z_contact_m' in p ? p.z_contact_m : p.z_end_m);
+  const withZ = ok.filter((p) => Number.isFinite(contactZ(p)));
+  out.table_z_m = edgeToLow != null && contactKnown && withZ.length === ok.length && withZ.length > 0
+    ? withZ.reduce((s, p) => s + contactZ(p) - p.height_m - thickness, 0) / withZ.length
+    : null;
   const opt = ok.filter((p) => Number.isFinite(p.optical_board_z_m));
   out.optical_table_z_m = opt.length ? opt.reduce((s, p) => s + p.optical_board_z_m, 0) / opt.length : null;
   out.ok = out.gates.every((g) => g.ok || !g.blocking);
@@ -1694,8 +1711,12 @@ export const kinPose = kinT;
    needs count >= minCount and both board axes covered (minCount 1 / count 2 for confirmation hovers, where tableZ
    puts the end_link at tableZ + clearanceM, the working table semantics of evaluateHovers). Returns { ok, why, points: [{ id, corner, approach_m, hover_m,
    rpy_rad, q, predicted_clearance_m, visible }] }. */
-export function planHover({ Tbb, X, tipCam, edgeToLow = null, ch, kCand, kLive, q0, K, board, lo = null, hi = null, plan = HOVER_PLAN, gates = HOVER_GATES, size = IMAGE, tableZ = null }) {
+export function planHover({ Tbb, X, tipCam, edgeToLow = null, ch, kCand, kLive, q0, K, board, lo = null, hi = null, plan = HOVER_PLAN, gates = HOVER_GATES, size = IMAGE, tableZ = null, physicalContactEnd = null, thickness = 0 }) {
   const tipEnd = apply(X, tipCam), drop = edgeToLow == null ? plan.unknownEdgeM : edgeToLow;
+  const hasContact = Array.isArray(physicalContactEnd) && physicalContactEnd.length === 3 && physicalContactEnd.every(Number.isFinite);
+  if (tableZ != null && !hasContact) {
+    return { ok: false, why: 'contact', points: [], candidates: 0 };
+  }
   // tool down; the yaw about the vertical turns the camera toward the board (the camera sees only what lies ahead
   // of the fingertip): per corner the yaw with the most markers in view, the smallest turn on a tie
   const yaws = plan.yawsDeg || [0, 45, -45, 90, -90, 135, -135, 180];
@@ -1704,10 +1725,10 @@ export function planHover({ Tbb, X, tipCam, edgeToLow = null, ch, kCand, kLive, 
     const pb = apply(Tbb, c);
     let best = null;
     for (const yd of yaws) {
-      const R = mm(rpyR(0, 0, yd / D), rpyR(...plan.rpy)), rTip = mv3(R, tipEnd);
+      const R = mm(rpyR(0, 0, yd / D), rpyR(...plan.rpy)), rTip = mv3(R, tipEnd), rContact = hasContact ? mv3(R, physicalContactEnd) : null;
       // end_link origin: sticker edge above the corner, lowest point clearanceM above the paper
-      // (tableZ, confirmation hovers: the end_link at tableZ + clearance, the working table semantics)
-      const pe = [pb[0] - rTip[0], pb[1] - rTip[1], tableZ != null ? tableZ + plan.clearanceM : pb[2] + plan.clearanceM + drop - rTip[2]];
+      // (tableZ, confirmation hovers: rotated physical_contact_end at tableZ + thickness + clearanceM)
+      const pe = [pb[0] - rTip[0], pb[1] - rTip[1], tableZ != null ? tableZ + thickness + plan.clearanceM - rContact[2] : pb[2] + plan.clearanceM + drop - rTip[2]];
       const T = make(R, pe);
       const vis = visibleMarkers(K, mm(T, X), Tbb, board, { size });
       if (!vis.length || (best && vis.length <= best.vis.length)) continue;

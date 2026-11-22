@@ -691,8 +691,19 @@ impl ArmModel {
 
     /// Workspace excess for armd joint positions `q` (`kinematics::workspace_violation`).
     pub fn workspace_violation(&self, q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> k::Violation {
+        self.workspace_violation_with_tcp(q, ws, cam, [0.0; 3])
+    }
+
+    /// [`Self::workspace_violation`] also checking `max_reach_m` on `tcp_offset` when nonzero.
+    pub fn workspace_violation_with_tcp(
+        &self,
+        q: &[f32],
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+    ) -> k::Violation {
         let Some(f) = self.frames_f32(q) else { return k::Violation::invalid(); };
-        let mut v = k::workspace_violation_pose_at(&f.end, ws, cam, self.shoulder_rz());
+        let mut v = k::workspace_violation_pose_at_tcp(&f.end, ws, cam, self.shoulder_rz(), &tcp_offset);
         if !ws.link_capsules.is_empty() {
             let floor = f64::from(ws.floor_z_m);
             let lo = ws.box_min_m.map(f64::from);
@@ -997,6 +1008,8 @@ pub struct WorkspaceEvaluator<'a> {
     box_hi: [f64; 3],
     keepouts: Vec<([f64; 3], [f64; 3])>,
     end_locals: Vec<[f64; 3]>,
+    tcp_offset: [f64; 3],
+    has_tcp_reach: bool,
     has_cam: bool,
     capsules: Vec<(Option<FrameRef>, [f64; 3], [f64; 3], f64)>,
     self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
@@ -1007,8 +1020,10 @@ pub struct WorkspaceEvaluator<'a> {
     pub num_end_pts: usize,
     pub num_geoms: usize,
     pub has_reach: bool,
+    pub reach_slots: usize,
     pub self_collision_slot_start: usize,
     pub total_slots: usize,
+    pub escape_tol: f64,
 }
 
 impl<'a> WorkspaceEvaluator<'a> {
@@ -1016,6 +1031,15 @@ impl<'a> WorkspaceEvaluator<'a> {
         model: &'a ArmModel,
         ws: &'a crate::model::WorkspacePolicy,
         cam: &'a crate::model::CameraMount,
+    ) -> Self {
+        Self::new_with_tcp(model, ws, cam, [0.0; 3])
+    }
+
+    pub fn new_with_tcp(
+        model: &'a ArmModel,
+        ws: &'a crate::model::WorkspacePolicy,
+        cam: &'a crate::model::CameraMount,
+        tcp_offset: [f64; 3],
     ) -> Self {
         let mut end_locals = Vec::with_capacity(1 + ws.check_points_end_m.len() + 1);
         end_locals.push([0.0; 3]);
@@ -1026,7 +1050,11 @@ impl<'a> WorkspaceEvaluator<'a> {
         if let Some(o) = cam.offset_m {
             end_locals.push(o.map(f64::from));
         }
-        let max_end_off = end_locals.iter().map(k::norm).fold(0.0, f64::max);
+        let has_tcp_reach = ws.max_reach_m.is_some() && tcp_offset != [0.0; 3];
+        let mut max_end_off = end_locals.iter().map(k::norm).fold(0.0, f64::max);
+        if has_tcp_reach {
+            max_end_off = max_end_off.max(k::norm(&tcp_offset));
+        }
         let end_reach = model.joint_reach(max_end_off);
 
         let mut capsules = Vec::with_capacity(ws.link_capsules.len());
@@ -1078,7 +1106,8 @@ impl<'a> WorkspaceEvaluator<'a> {
         let num_geoms = num_end_pts + capsules.len();
         let slots_per_geom = 7 + keepouts.len();
         let has_reach = ws.max_reach_m.is_some();
-        let self_collision_slot_start = num_geoms * slots_per_geom + usize::from(has_reach);
+        let reach_slots = usize::from(has_reach) + usize::from(has_tcp_reach);
+        let self_collision_slot_start = num_geoms * slots_per_geom + reach_slots;
         let total_slots = self_collision_slot_start + self_pairs.len();
 
         Self {
@@ -1091,6 +1120,8 @@ impl<'a> WorkspaceEvaluator<'a> {
             box_hi: ws.box_max_m.map(f64::from),
             keepouts,
             end_locals,
+            tcp_offset,
+            has_tcp_reach,
             has_cam,
             capsules,
             self_pairs,
@@ -1101,9 +1132,16 @@ impl<'a> WorkspaceEvaluator<'a> {
             num_end_pts,
             num_geoms,
             has_reach,
+            reach_slots,
             self_collision_slot_start,
             total_slots,
+            escape_tol: k::WORKSPACE_EPS,
         }
+    }
+
+    pub fn with_escape_tol(mut self, escape_tol: f64) -> Self {
+        self.escape_tol = escape_tol;
+        self
     }
 
     pub fn alloc_buf(&self) -> k::SlotBuf {
@@ -1196,9 +1234,15 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
         if let Some(reach) = self.ws.max_reach_m {
+            let reach_base = self.num_geoms * self.slots_per_geom;
             let p0 = f.end.p;
             let d = k::shoulder_reach_from(&p0, &self.shoulder);
-            buf[self.num_geoms * self.slots_per_geom] = f64::from(reach) - d;
+            buf[reach_base] = f64::from(reach) - d;
+            if self.has_tcp_reach {
+                let p_tcp = f.end.transform_point(&self.tcp_offset);
+                let d_tcp = k::shoulder_reach_from(&p_tcp, &self.shoulder);
+                buf[reach_base + 1] = f64::from(reach) - d_tcp;
+            }
         }
         if !self.self_pairs.is_empty() {
             if !self.self_collision_min_clearance.is_finite() || self.self_collision_min_clearance < 0.0 {
@@ -1266,12 +1310,22 @@ impl<'a> WorkspaceEvaluator<'a> {
                 }),
             };
         }
-        if self.has_reach && slot == self.num_geoms * self.slots_per_geom {
+        if self.has_reach && slot >= self.num_geoms * self.slots_per_geom {
+            let reach_idx = slot - self.num_geoms * self.slots_per_geom;
             let bound = f64::from(self.ws.max_reach_m.unwrap_or(0.0));
             let cid = "max_reach".to_string();
-            let gid = "end_origin".to_string();
+            let (point, gid) = if reach_idx == 0 {
+                (0, "end_origin".to_string())
+            } else {
+                let tcp_f32 = self.tcp_offset.map(|v| v as f32);
+                let pt = self.ws.check_points_end_m
+                    .iter()
+                    .position(|c| (c[0] - tcp_f32[0]).abs() <= 1e-6 && (c[1] - tcp_f32[1]).abs() <= 1e-6 && (c[2] - tcp_f32[2]).abs() <= 1e-6)
+                    .map_or(0, |i| i + 1);
+                (pt, "tcp_origin".to_string())
+            };
             return WorkspaceFailure {
-                point: 0,
+                point,
                 limit: "reach".into(),
                 value: bound - clr,
                 bound,
@@ -1356,7 +1410,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         phase: &str,
     ) -> Result<(), WorkspaceFailure> {
         let cs = clr.as_slice();
-        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection(cs, min_depths.as_slice()) {
+        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol) {
             return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
         }
         k::advance_min_depths(cs, min_depths.as_mut_slice());
@@ -1371,7 +1425,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         phase: &str,
     ) -> Result<(), WorkspaceFailure> {
         let cs = clr.as_slice();
-        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection(cs, min_depths.as_slice()) {
+        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection_with_tol(cs, min_depths.as_slice(), self.escape_tol) {
             return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
         }
         Ok(())
@@ -1388,7 +1442,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         tr: &[f64],
         arm_dof: usize,
     ) -> Result<Option<(usize, f64, f64)>, WorkspaceFailure> {
-        let mut geom_bounds = [0.0f64; 34];
+        let mut geom_bounds = [0.0f64; 48];
         let mut heap_bounds = Vec::new();
         let bounds: &mut [f64] = if self.num_geoms <= geom_bounds.len() {
             &mut geom_bounds[..self.num_geoms]
@@ -1427,7 +1481,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             let allowed = if min_d <= k::WORKSPACE_EPS {
                 k::WORKSPACE_EPS
             } else {
-                min_d + k::WORKSPACE_EPS
+                min_d + self.escape_tol
             };
             let d_max = 0.5 * (l_g - s0[slot] - s1[slot]);
             if d_max > allowed {

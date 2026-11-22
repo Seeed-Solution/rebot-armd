@@ -188,10 +188,12 @@ async fn disconnect_during_descent_parks_keeps_observations_and_resumes() {
     // the lease watchdog parks the arm: torque off in the end, visible to a reconnecting client
     let parked = r.wait_job(&job_id, 40.0, false, |j| j["arm"]["is_torqued"] == false).await;
     assert_eq!(parked["arm"]["is_torqued"], false, "{parked}");
-    // reconnect and resume by job id: only point b runs again
+    // reconnect and resume by job id: missing candidate_fingerprint is rejected (M05); matching resumes point b
     let (ws, generation, epoch) = Rig::control(r.addr, &r.sup).await;
     r.ws = ws; r.generation = generation; r.epoch = epoch;
-    let ack = r.rpc(armd::calib_hover::PATH, json!({"resume": job_id})).await;
+    let rej_no_fp = r.rpc(armd::calib_hover::PATH, json!({"resume": job_id})).await;
+    assert_eq!(rej_no_fp["code"], "INVALID_COMMAND", "{rej_no_fp}");
+    let ack = r.rpc(armd::calib_hover::PATH, json!({"resume": job_id, "candidate_fingerprint": "cafe0123"})).await;
     assert_eq!(ack["type"], "command_ack", "{ack}");
     assert_eq!(ack["job_id"], job_id.as_str());
     let first_frames = job["points"][0]["observations"].clone();
@@ -200,9 +202,9 @@ async fn disconnect_during_descent_parks_keeps_observations_and_resumes() {
     assert_eq!(job["runs"], 2);
     assert_eq!(job["points"][0]["observations"], first_frames, "point a is not repeated");
     assert_eq!(job["points"][1]["observations"].as_array().unwrap().len(), 3);
-    let rej = r.rpc(armd::calib_hover::PATH, json!({"resume": job_id})).await;
+    let rej = r.rpc(armd::calib_hover::PATH, json!({"resume": job_id, "candidate_fingerprint": "cafe0123"})).await;
     assert_eq!(rej["code"], "INVALID_COMMAND", "nothing left: {rej}");
-    let rej = r.rpc(armd::calib_hover::PATH, json!({"resume": "hv-nope"})).await;
+    let rej = r.rpc(armd::calib_hover::PATH, json!({"resume": "hv-nope", "candidate_fingerprint": "cafe0123"})).await;
     assert_eq!(rej["code"], "JOB_NOT_FOUND", "{rej}");
 }
 

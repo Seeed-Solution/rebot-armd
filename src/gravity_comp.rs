@@ -105,6 +105,9 @@ impl SupervisorInner {
         if !self.gravity_compensated {
             return Err(reason("UNSUPPORTED", "The URDF gravity model was not found or failed its checksum"));
         }
+        if !self.config.dynamics_qualified {
+            return Err(reason("UNSUPPORTED", "Gravity compensation is disabled: active tool dynamics are unqualified"));
+        }
         if let Some(d) = &self.driver {
             let Ok(drv) = d.lock() else { return Err(reason("UNSUPPORTED", "driver lock poisoned")); };
             if !drv.supports_mit_mode_switch() {

@@ -169,8 +169,13 @@ pub enum SafetyError {
     #[error("Invalid non-finite float value (NaN or Inf) encountered")]
     InvalidValue,
 
-    #[error("Arm is not at resting pose (current: {current:?}, expected: {expected:?})")]
-    ArmNotAtRestingPose { current: Vec<f32>, expected: Vec<f32> },
+    #[error("Arm is not at resting pose{}: (current: {current:?}, expected: {expected:?})", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default())]
+    ArmNotAtRestingPose {
+        current: Vec<f32>,
+        expected: Vec<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 
     #[error("Motion forbidden in fault/estop state: {0}")]
     MotionForbiddenInFaultState(String),
@@ -181,8 +186,11 @@ pub enum SafetyError {
     #[error("Motion busy: an action trajectory is running")]
     MotionBusy,
 
-    #[error("{0}")]
+    #[error("Collision hold active: {0}")]
     CollisionHold(String),
+
+    #[error("Tool commissioning required before {0}; confirm commissioning or use low-speed debug (speed_scale <= 0.2)")]
+    CommissioningRequired(String),
 
     #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation {

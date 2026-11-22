@@ -344,6 +344,7 @@ fn test_gripper_motion_torque_less_holding() {
     policy.open_rad = 1.0;
     policy.holding_mode = HoldingMode::PositionGap;
     policy.holding_gap_rad = 0.05;
+    policy.max_close_torque_nm = None;
 
     let limit = JointLimit::new("gripper", -0.2, 1.5, 2.0, 5.0);
     let mut motion = GripperMotion::new(req, policy, limit, 1.0, 6);
@@ -710,6 +711,7 @@ fn test_gripper_motion_load_and_gap_holding() {
     policy.holding_mode = HoldingMode::LoadAndGap;
     policy.holding_gap_rad = 0.05;
     policy.holding_load_fraction = Some(0.30);
+    policy.max_close_torque_nm = None;
 
     let limit = JointLimit::new("gripper", -0.2, 1.5, 2.0, 5.0);
 

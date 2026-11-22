@@ -1,0 +1,2371 @@
+//! Integration tests for tool safety & admission fixes:
+//! B1, B3, B4, B5, B6, B7, B9, B11, M1, M2, M3, M16.
+
+mod common;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use serde_json::{json, Value};
+
+use armd::backlash::{self, DescentRules, Pre};
+use armd::calibration::{self, CalibrationFile};
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
+use armd::grasp::{self, GraspSetup};
+use armd::kinematics::{self, Pose};
+use armd::model::{ArmConfig, GripperPolicy, JointLimit, JointState};
+use armd::motion::{GoalSpec, GripperCommand, GripperMotion, GripperRequest, Speed, StepCtx, StepStatus};
+use armd::poses::{NamedPose, PoseList, PoseTcp};
+use armd::recording::{EpisodeMetadata, EpisodeSidecar, RecordFrame};
+use armd::replay::{self, ReplayInput, ReplayRequest};
+use armd::tool::{self, ActiveToolInfo, ToolPackConfig};
+use armd::{ArmError, ArmSupervisor, SupervisorInner};
+use common::INSPECT;
+
+const FINRAY_PACK_JSON: &str = r#"{
+  "id": "soft_finray_gripper",
+  "name": "Soft FinRay Parallel Gripper",
+  "kind": "gripper",
+  "version": "1.0.0",
+  "robots": ["b601dm"],
+  "attach_body": "end_link",
+  "tcp_offset": [0.0288, 0.0, 0.0],
+  "armd": {
+    "extra_check_points_end_m": [
+      [0.032,  0.082,  0.022],
+      [0.032,  0.082, -0.022],
+      [0.032, -0.082,  0.022],
+      [0.032, -0.082, -0.022]
+    ],
+    "physical_contact_end_m": [0.0288, 0.0, 0.0],
+    "contact_opening_m": 0.0036,
+    "dynamics": { "mass_delta_kg": 0.035, "com_moment_delta_nm": 0.018 },
+    "gripper_policy": {
+      "jaw_opening_nominal": [[-5.7, 0.0886], [0.0, 0.0036]],
+      "holding_gap_rad": 0.30,
+      "holding_torque_nm": 0.0667,
+      "contact_torque_nm": 0.6,
+      "squeeze_rad": 0.15,
+      "max_close_torque_nm": 1.0
+    },
+    "grasp": { "max_grasp_width_m": 0.075, "grasp_height_m": 0.015, "edge_to_low_m": null }
+  }
+}"#;
+
+const OTHER_TOOL_PACK_JSON: &str = r#"{
+  "id": "custom_tool_b",
+  "name": "Custom Tool B",
+  "kind": "gripper",
+  "version": "1.0.0",
+  "robots": ["b601dm"],
+  "attach_body": "end_link",
+  "tcp_offset": [0.045, 0.0, 0.0],
+  "armd": {
+    "extra_check_points_end_m": [[0.045, 0.0, 0.0]],
+    "physical_contact_end_m": [0.045, 0.0, 0.0],
+    "contact_opening_m": 0.002,
+    "dynamics": { "mass_delta_kg": 0.025, "com_moment_delta_nm": 0.012 },
+    "gripper_policy": {
+      "jaw_opening_nominal": [[-5.7, 0.085], [0.0, 0.002]],
+      "holding_gap_rad": 0.30,
+      "holding_torque_nm": 0.0667,
+      "contact_torque_nm": 0.6,
+      "squeeze_rad": 0.15,
+      "max_close_torque_nm": 1.0
+    },
+    "grasp": { "max_grasp_width_m": 0.075, "grasp_height_m": 0.015, "edge_to_low_m": 0.001 }
+  }
+}"#;
+
+fn finray_cfg() -> ArmConfig {
+    let base = ArmConfig::rebot_dm();
+    let pack: ToolPackConfig = serde_json::from_str(FINRAY_PACK_JSON).unwrap();
+    tool::apply_tool_overlay(&base, &pack).unwrap()
+}
+
+fn other_tool_cfg() -> ArmConfig {
+    let base = ArmConfig::rebot_dm();
+    let pack: ToolPackConfig = serde_json::from_str(OTHER_TOOL_PACK_JSON).unwrap();
+    tool::apply_tool_overlay(&base, &pack).unwrap()
+}
+
+#[derive(Clone)]
+struct MockFbArm {
+    state: Arc<Mutex<MockFbState>>,
+    torque_feedback: bool,
+}
+
+struct MockFbState {
+    q: [f32; 7],
+    vel: [f32; 7],
+    torques: [f32; 7],
+    torqued: bool,
+    feedback_valid: bool,
+    feedback_age: Duration,
+    rx_instants: Option<Vec<Option<Instant>>>,
+    fail_read: bool,
+    clear_fault_calls: usize,
+    clear_disables: Vec<usize>,
+    hw_fault: bool,
+}
+
+impl MockFbArm {
+    fn new(q: [f32; 7], torque_feedback: bool) -> Self {
+        Self {
+            torque_feedback,
+            state: Arc::new(Mutex::new(MockFbState {
+                q,
+                vel: [0.0; 7],
+                torques: [0.0; 7],
+                torqued: true,
+                feedback_valid: true,
+                feedback_age: Duration::from_millis(5),
+                rx_instants: None,
+                fail_read: false,
+                clear_fault_calls: 0,
+                clear_disables: Vec::new(),
+                hw_fault: false,
+            })),
+        }
+    }
+}
+
+impl ArmDriver for MockFbArm {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: self.torque_feedback,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn enable_state(&self) -> EnableState {
+        if self.state.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled }
+    }
+    fn is_feedback_valid(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.feedback_valid && s.feedback_age <= Duration::from_millis(250)
+    }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        let s = self.state.lock().unwrap();
+        vec![Some(s.feedback_age); 7]
+    }
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.state.lock().unwrap().rx_instants.clone().unwrap_or_default()
+    }
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.state.lock().unwrap().torqued = enable;
+        Ok(())
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let s = self.state.lock().unwrap();
+        if s.fail_read {
+            return Err(ArmDriverError::Timeout(1));
+        }
+        Ok((0..7).map(|i| JointState { position: s.q[i], velocity: s.vel[i], torque: s.torques[i], temperature: 30.0 }).collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut s = self.state.lock().unwrap();
+        for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; }
+        Ok(())
+    }
+    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+    fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
+        if self.state.lock().unwrap().hw_fault {
+            Err(ArmDriverError::HardwareFault("latched hw fault".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn clear_fault_disables_joints(&self) -> Vec<usize> {
+        self.state.lock().unwrap().clear_disables.clone()
+    }
+    fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
+        let mut s = self.state.lock().unwrap();
+        s.clear_fault_calls += 1;
+        s.hw_fault = false;
+        s.torqued = false;
+        Ok(())
+    }
+}
+
+// =========================================================================
+// B1: Commissioning admission & persistence
+// =========================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_commissioning_admission_gates_ordinary_motions_and_persists_confirm() {
+    let dir = tempfile::tempdir().unwrap();
+    let comm_path = dir.path().join("tool_commissioning.json");
+    let calib_path = dir.path().join("gripper_calib.json");
+
+    let sup = Arc::new(ArmSupervisor::new(finray_cfg()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_path.clone());
+        inner.gripper_calib_path = Some(calib_path.clone());
+    }
+    let (mut ws, gen, epoch, _sup, addr) = common::torqued_rig(sup, &INSPECT).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 1. Commissioning required initially
+    let st: Value = client.get(format!("{base}/api/v1/tool/commissioning")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(st["commissioning_required"], true);
+    let expected_digest = st["active_tool"]["config_digest"].as_str().unwrap().to_string();
+
+    // 2. Ordinary motions rejected with COMMISSIONING_REQUIRED
+    for (path, body) in [
+        ("/api/v1/motion/home", json!({})),
+        ("/api/v1/action/move_to_pose", json!({"name": "scan"})),
+        ("/api/v1/action/place", json!({"position": [0.25, 0.0, 0.15]})),
+        ("/api/v1/action/grasp", json!({"box_norm": [0.4, 0.4, 0.6, 0.6]})),
+        ("/api/v1/action/replay", json!({"episode": "ep1"})),
+        ("/api/v1/action/run_sequence", json!({"name": "seq1"})),
+        ("/api/v1/action/move_to", json!({"position": [0.25, 0.0, 0.15], "speed_scale": 0.5})),
+        ("/api/v1/action/move_relative", json!({"frame": "base", "dx": 0.01, "dy": 0.0, "dz": 0.0, "speed_scale": 0.5})),
+        ("/api/v1/motion/jog", json!({"target_positions": INSPECT, "speed_scale": 0.5})),
+        ("/api/v1/action/gripper", json!({"command": "open", "speed": 0.8})),
+    ] {
+        let rej = common::rpc(&mut ws, gen, epoch, path, body).await;
+        assert_eq!(rej["type"], "command_reject", "{path}: {rej}");
+        assert_eq!(rej["code"], "COMMISSIONING_REQUIRED", "{path}: {rej}");
+    }
+
+    // Servo frame rejected during commissioning
+    common::servo(&mut ws, gen, epoch, &INSPECT).await;
+    let srej = common::servo_reject_within(&mut ws, 300).await.expect("servo_reject");
+    assert_eq!(srej["code"], "COMMISSIONING_REQUIRED", "{srej}");
+
+    // 3. Saving gripper_calib is allowed AND does NOT clear commissioning_required
+    let ack_gc = common::rpc(&mut ws, gen, epoch, "/api/v1/gripper/calibration", json!({
+        "jaw_opening": {"points": [[0.0, 0.0036], [-5.7, 0.0886]], "calibrated": true}
+    })).await;
+    assert_eq!(ack_gc["type"], "command_ack", "{ack_gc}");
+    let st2: Value = client.get(format!("{base}/api/v1/tool/commissioning")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(st2["commissioning_required"], true);
+
+    // 4. Low-speed debug moves (<= 0.2), controlled gripper (<= 0.4 / speed_scale <= 0.2), stop, unload are allowed
+    let ack_jog = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/jog", json!({"target_positions": INSPECT, "speed_scale": 0.2})).await;
+    assert_eq!(ack_jog["type"], "command_ack", "{ack_jog}");
+    let ack_stop0 = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/stop", json!({})).await;
+    assert_eq!(ack_stop0["type"], "command_ack", "{ack_stop0}");
+    let ack_grip = common::rpc(&mut ws, gen, epoch, "/api/v1/action/gripper", json!({"command": "open", "speed": 0.3})).await;
+    assert_eq!(ack_grip["type"], "command_ack", "{ack_grip}");
+    let ack_stop = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/stop", json!({})).await;
+    assert_eq!(ack_stop["type"], "command_ack", "{ack_stop}");
+
+    // 5. Explicit commissioning confirmation requires confirm: true, matching tool_id and tool_config_digest
+    let resp = client
+        .post(format!("{base}/api/v1/tool/commissioning/confirm"))
+        .json(&json!({
+            "confirm": true,
+            "tool_id": "soft_finray_gripper",
+            "tool_config_digest": expected_digest,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["commissioning_required"], false);
+    assert!(comm_path.exists());
+
+    // After confirm, home is admitted
+    let ack_home = common::rpc(&mut ws, gen, epoch, "/api/v1/motion/home", json!({})).await;
+    assert_eq!(ack_home["type"], "command_ack", "{ack_home}");
+
+    // 6. Fresh supervisor with exact same tool reloads commissioning_required == false
+    let reloaded = ArmSupervisor::new(finray_cfg());
+    tool::load_commissioning_into(&reloaded, &comm_path).await;
+    {
+        let inner = reloaded.inner().read().await;
+        assert_eq!(inner.config.active_tool.config_digest, expected_digest);
+        assert!(!inner.config.active_tool.commissioning_required);
+    }
+
+    // 7. Fresh supervisor with DIFFERENT tool stays commissioning_required == true
+    let swapped = ArmSupervisor::new(other_tool_cfg());
+    tool::load_commissioning_into(&swapped, &comm_path).await;
+    assert!(swapped.inner().read().await.config.active_tool.commissioning_required);
+}
+
+// =========================================================================
+// B3: Hard close-torque cap requires torque_feedback and fresh telemetry
+// =========================================================================
+#[test]
+fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedback() {
+    // 1. start_gripper / start_macro_gripper / zero_check refuse closing when torque_feedback == false
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.gripper_policy.as_mut().unwrap().max_close_torque_nm = Some(1.0);
+    let drv = MockFbArm::new(INSPECT, false);
+    let mut inner = SupervisorInner::new(cfg);
+    inner.driver = Some(Mutex::new(Box::new(drv)));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = vec![0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
+    inner.measured_positions = inner.commanded_positions.clone();
+    inner.target_positions = inner.commanded_positions.clone();
+    inner.tick(0.02);
+    let ep0 = inner.safety.epoch_id();
+
+    let close_req = GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: Some(5.0), tag: None };
+    assert!(inner.start_gripper(close_req.clone(), ep0).is_err(), "closing must reject without torque_feedback");
+    let open_req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(5.0), tag: None };
+    assert!(inner.start_gripper(open_req, ep0).is_ok(), "opening remains allowed");
+
+    // 2. GripperMotion::step stops immediately on !feedback_fresh when max_close_torque_nm is set
+    let mut policy = GripperPolicy::rebot_dm();
+    policy.max_close_torque_nm = Some(1.0);
+    let lim = JointLimit::new("j7", -6.0, 0.5, 2.0, 5.0);
+    let mut gm = GripperMotion::new(close_req, policy, lim, 1.0, 6);
+    let meas = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.5];
+    let zeros = [0.0; 7];
+    let out = gm.step(&StepCtx {
+        dt: 0.02,
+        time_scale: 1.0,
+        measured: &meas,
+        measured_velocities: &zeros,
+        commanded: &meas,
+        commanded_velocities: &zeros,
+        torques: &zeros,
+        loads: &zeros,
+        feedback_fresh: false,
+        torque_feedback: true,
+        load_feedback: false,
+        gripper_stalled: false,
+        gripper_stall_sign: 1.0,
+        gripper_force_capped: false,
+    });
+    assert!(matches!(out.status, StepStatus::Failed { code: "FEEDBACK_UNAVAILABLE", .. }), "{:?}", out.status);
+    assert!((out.positions[6] - (-2.5)).abs() < 1e-6);
+
+    // 3. Streaming servo close latches force-cap hold when feedback becomes stale
+    let mut cfg2 = ArmConfig::rebot_dm();
+    cfg2.gripper_policy.as_mut().unwrap().max_close_torque_nm = Some(1.0);
+    let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
+    let drv2 = MockFbArm::new(q0, true);
+    let mut inner2 = SupervisorInner::new(cfg2);
+    inner2.driver = Some(Mutex::new(Box::new(drv2.clone())));
+    inner2.lease_enabled = false;
+    inner2.set_torque(true).unwrap();
+    inner2.commanded_positions = q0.to_vec();
+    inner2.measured_positions = q0.to_vec();
+    inner2.target_positions = q0.to_vec();
+
+    // Stream closing servo target (closed_rad = 0.0 > -3.0), then lose freshness
+    let mut tgt = q0.to_vec();
+    tgt[6] = -0.2;
+    let ep = inner2.safety.epoch_id();
+    inner2.servo(tgt, ep).unwrap();
+    drv2.state.lock().unwrap().feedback_age = Duration::from_millis(500);
+    inner2.tick(0.02);
+    assert!(inner2.gripper_force_capped);
+    assert!(inner2.gripper_stalled);
+    assert!(inner2.commanded_positions[6] <= -2.99, "must freeze instead of closing without torque feedback: {}", inner2.commanded_positions[6]);
+}
+
+// =========================================================================
+// B4: Calibration precedence across tool swaps
+// =========================================================================
+#[tokio::test]
+async fn b4_calibration_precedence_isolates_tool_records_and_preserves_camera_kinematics() {
+    let dir = tempfile::tempdir().unwrap();
+    let gc_path = dir.path().join("gripper_calib.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    // Persist finray-stamped gripper_calib and grasp_setup
+    let fin = finray_cfg();
+    let fin_sup = ArmSupervisor::new(fin.clone());
+    {
+        let mut inner = fin_sup.inner().write().await;
+        inner.gripper_calib_path = Some(gc_path.clone());
+        let prep_gc = armd::gripper_calib::prepare_update(&mut inner, &json!({
+            "jaw_opening": {"points": [[0.0, 0.0036], [-5.7, 0.0886]], "calibrated": true},
+            "offset_rad": 0.01
+        })).unwrap();
+        if let Some(w) = prep_gc.write.as_ref() { std::fs::write(&w.path, &w.text).unwrap(); }
+        let prep_gs = grasp::prepare_setup_update(&inner, &json!({"table_z_m": 0.042}), Some(&gs_path), false).unwrap();
+        if let Some(w) = prep_gs.write.as_ref() { std::fs::write(&w.path, &w.text).unwrap(); }
+    }
+
+    // Load under a different tool -> ignored without mutating defaults
+    let other = other_tool_cfg();
+    let other_sup = ArmSupervisor::new(other.clone());
+    armd::gripper_calib::load_into(&other_sup, &gc_path).await;
+    grasp::load_into(&other_sup, &gs_path).await;
+    {
+        let inner = other_sup.inner().read().await;
+        assert!(inner.gripper_calib_jaw_opening.is_none());
+        assert!(inner.gripper_calib_offset.is_none());
+        assert_eq!(inner.grasp_setup().unwrap().table_z_m, 0.0);
+    }
+
+    // CalibrationFile with camera_mount + intrinsics + tool + acceptance + hover table_z
+    let cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {"offset_m": [-0.07, 0.0, 0.06], "q_end_cam": [1.0, 0.0, 0.0, 0.0]},
+        "intrinsics": {"fx": 830.0},
+        "table_z_m": 0.024,
+        "table_z_source": "hover",
+        "tool": {"tool_id": "soft_finray_gripper", "tool_config_digest": fin.active_tool.config_digest, "x_fingerprint": "xf", "tip_cam_m": [0.0, 0.0, 0.1], "measured_at": "2026-11-22T00:00:00Z"},
+        "acceptance": {"fingerprint": "fp-1", "gate_version": 1, "passed": true, "tool_id": "soft_finray_gripper", "tool_config_digest": fin.active_tool.config_digest, "measured_at": "2026-11-22T00:00:00Z", "board": {}, "points": [], "summary": {"table_z_m": 0.024}}
+    })).unwrap();
+    assert!(calibration::tool_valid_for(&cal, "xf", &fin.active_tool));
+    assert!(!calibration::tool_valid_for(&cal, "xf", &other.active_tool));
+    assert!(!calibration::acceptance_valid_for(&cal, "fp-1", &other.active_tool));
+    let (eff, src, _) = calibration::effective_floor_for(0.0, Some(&cal), "fp-1", &other.active_tool);
+    assert_eq!((eff, src), (0.0, "profile"));
+
+    let mut stripped = cal.clone();
+    calibration::strip_mismatched_tool_records(&mut stripped, &other.active_tool);
+    assert!(stripped.tool.is_none() && stripped.acceptance.is_none() && stripped.table_z_source.is_none());
+    assert!(stripped.camera_mount.offset_m.is_some() && stripped.intrinsics.is_some(), "camera calibration stays intact across tool swap");
+
+    // Legacy unkeyed setup applies ONLY on stock, NOT on non-stock
+    std::fs::write(&gs_path, r#"{"table_z_m": 0.033}"#).unwrap();
+    let (s_stock, out_stock) = grasp::load_setup_for_tool(&gs_path, &GraspSetup::default(), &ActiveToolInfo::default());
+    assert_eq!((s_stock.table_z_m, matches!(out_stock, grasp::LoadOutcome::Loaded)), (0.033, true));
+    let (s_non, out_non) = grasp::load_setup_for_tool(&gs_path, &GraspSetup::default(), &fin.active_tool);
+    assert_eq!(s_non.table_z_m, 0.0);
+    assert!(matches!(out_non, grasp::LoadOutcome::Invalid(_)));
+}
+
+// =========================================================================
+// B5 & B6: Gripper-bearing replay provenance & TCP reach envelope
+// =========================================================================
+#[tokio::test]
+async fn b5_b6_replay_checks_tool_provenance_and_tcp_reach_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    let fin = finray_cfg();
+    let other = other_tool_cfg();
+
+    // 1. Episode with gripper motion under finray
+    let ep_grip = dir.path().join("ep_grip.parquet");
+    let mut frames_g = Vec::new();
+    for k in 0..20 {
+        let mut q = INSPECT;
+        q[6] = -2.0 + 1.5 * (k as f32 / 19.0);
+        frames_g.push(RecordFrame { timestamp: k as f64 * 0.02, observation_state: q.to_vec(), action: q.to_vec() });
+    }
+    let meta_g = EpisodeMetadata {
+        profile_id: fin.profile_id.clone(),
+        arm_dof: Some(6),
+        gripper_joint: Some(6),
+        joint_names: Some(fin.limits.iter().map(|l| l.name.clone()).collect()),
+        tool_id: Some(fin.active_tool.id.clone()),
+        tool_config_digest: Some(fin.active_tool.config_digest.clone()),
+        has_gripper_motion: Some(true),
+    };
+    armd::recording::write_frames_to_parquet_with_meta(&ep_grip, &frames_g, Some(&meta_g)).unwrap();
+
+    // Standalone replay under other tool: gripper:true -> TOOL_MISMATCH, gripper:false -> Ok
+    let make_input = |cfg: &ArmConfig, path: std::path::PathBuf, episode: &str, gripper: bool| {
+        let mut inner = common::sim_at(cfg.clone(), &INSPECT);
+        inner.config.active_tool.commissioning_required = false;
+        ReplayInput {
+            request: ReplayRequest { episode: episode.into(), speed: 1.0, gripper, tag: None, allow_stale: false },
+            path,
+            profile_id: cfg.profile_id.clone(),
+            dof: cfg.dof,
+            arm_dof: cfg.arm_dof(),
+            gripper_idx: cfg.gripper_index(),
+            joint_names: cfg.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: cfg.limits.clone(),
+            speed_limits: cfg.limits.clone(),
+            ws: cfg.workspace.clone().map(|w| (w, cfg.camera_mount.clone())),
+            arm: cfg.arm_model.clone(),
+            start: INSPECT.to_vec(),
+            control_hz: 50,
+            epoch: 0,
+            workspace_revision: 0,
+            power: None,
+            store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+            zero_offsets: vec![0.0; 6],
+            tcp_offset: cfg.tcp_offset,
+            active_tool: cfg.active_tool.clone(),
+        }
+    };
+    let err = replay::plan(make_input(&other, ep_grip.clone(), "ep_grip", true)).unwrap_err();
+    assert!(matches!(err, ArmError::Rejected { ref code, .. } if code == "TOOL_MISMATCH"), "{err:?}");
+    assert!(replay::plan(make_input(&other, ep_grip, "ep_grip", false)).is_ok());
+
+    // Sequence replay step with mismatched gripper-bearing episode -> TOOL_MISMATCH
+    let mut seq_sup = common::sim_at(other.clone(), &INSPECT);
+    seq_sup.config.active_tool.commissioning_required = false;
+    seq_sup.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+    let sc_g = EpisodeSidecar {
+        id: "ep_grip_seq".into(),
+        dataset: "default".into(),
+        task: "t".into(),
+        source: "sdk".into(),
+        sequence_id: None,
+        repeat_index: None,
+        outcome: "ok".into(),
+        recorded_at: "2026-11-22T00:00:00Z".into(),
+        duration_s: 0.4,
+        frames: frames_g.len(),
+        joint_names: other.limits.iter().map(|l| l.name.clone()).collect(),
+        units: "rad".into(),
+        joint_zero: armd::recording::JointZeroStamp::of(&seq_sup.joint_zero_offsets),
+        profile_id: other.profile_id.clone(),
+        armd_version: "test".into(),
+        fps_nominal: 50.0,
+        truncated: false,
+        stopped_by: None,
+        arm_dof: Some(6),
+        gripper_joint: Some(6),
+        tool_id: Some(fin.active_tool.id.clone()),
+        tool_config_digest: Some(fin.active_tool.config_digest.clone()),
+        has_gripper_motion: Some(true),
+        recovered: None,
+        first_state: Some(frames_g[0].observation_state.clone()),
+        last_state: Some(frames_g.last().unwrap().observation_state.clone()),
+    };
+    seq_sup.episodes.write_episode(&sc_g, &frames_g, None).unwrap();
+    let save_seq = armd::sequences::save(&mut seq_sup, &json!({
+        "name": "s_mismatch",
+        "steps": [{"type": "replay", "episode_id": "ep_grip_seq", "gripper": true}]
+    })).unwrap();
+    let seq_err = armd::sequences::prepare_run(&seq_sup, &json!({"id": save_seq.0.id}), seq_sup.safety.epoch_id()).unwrap_err();
+    assert!(matches!(seq_err, ArmError::Rejected { ref code, .. } if code == "TOOL_MISMATCH"), "{seq_err:?}");
+
+    // 2. B6: EndLink inside max_reach_m (0.53 m) while extended TCP (0.06 m) crosses max_reach_m (0.53 m)
+    let mut ext_cfg = fin.clone();
+    ext_cfg.tcp_offset = [0.06, 0.0, 0.0];
+    ext_cfg.workspace.as_mut().unwrap().max_reach_m = Some(0.53);
+    ext_cfg.active_tool.tcp_offset_m = [0.06, 0.0, 0.0];
+    ext_cfg.active_tool.commissioning_required = false;
+
+    // Solve an IK pose with EndLink at radius 0.475 m pointing radially +X
+    let r_rad = kinematics::rpy_to_r(0.0, 0.0, 0.0);
+    let sol = ext_cfg.arm_model.solve_dls(
+        &Pose::new(r_rad, [0.475, 0.0, 0.18]),
+        &[0.0, 0.2, -0.5, 0.0, 0.0, 0.0],
+        &std::array::from_fn(|i| ext_cfg.limits[i].min_position as f64),
+        &std::array::from_fn(|i| ext_cfg.limits[i].max_position as f64),
+        kinematics::PAR.w,
+    );
+    assert!(sol.ok, "reachable test pose");
+    let end_p = ext_cfg.arm_model.fk(&sol.q).p;
+    let end_r = kinematics::norm(&end_p);
+    let tcp_r = kinematics::norm(&armd::motion::end_to_tcp(&ext_cfg.arm_model.fk(&sol.q), &ext_cfg.tcp_offset).p);
+    assert!(end_r < 0.53 && tcp_r > 0.53, "end_r={end_r:.3}, tcp_r={tcp_r:.3}");
+    let q_far: Vec<f32> = sol.q.iter().map(|&v| v as f32).chain([0.0]).collect();
+
+    let ep_far = dir.path().join("ep_far.parquet");
+    let frames_far: Vec<RecordFrame> = (0..100).map(|k| {
+        let f = k as f32 / 99.0;
+        let q: Vec<f32> = INSPECT.iter().zip(&q_far).map(|(a, b)| a + (b - a) * f).collect();
+        RecordFrame { timestamp: k as f64 * 0.1, observation_state: q.clone(), action: q }
+    }).collect();
+    let meta_far = EpisodeMetadata {
+        profile_id: ext_cfg.profile_id.clone(),
+        arm_dof: Some(6),
+        gripper_joint: Some(6),
+        joint_names: Some(ext_cfg.limits.iter().map(|l| l.name.clone()).collect()),
+        tool_id: Some(ext_cfg.active_tool.id.clone()),
+        tool_config_digest: Some(ext_cfg.active_tool.config_digest.clone()),
+        has_gripper_motion: Some(false),
+    };
+    armd::recording::write_frames_to_parquet_with_meta(&ep_far, &frames_far, Some(&meta_far)).unwrap();
+
+    let reach_err = replay::plan(make_input(&ext_cfg, ep_far.clone(), "ep_far", false)).unwrap_err();
+    assert!(matches!(reach_err, ArmError::WorkspaceRejected { .. }), "{reach_err:?}");
+
+    // Also via sequence Step::Replay executing through ArmSupervisor (uses active tcp_offset)
+    let seq_sup_arc = std::sync::Arc::new(ArmSupervisor::new(ext_cfg.clone()));
+    let (action_id, epoch) = {
+        let mut inner = seq_sup_arc.inner().write().await;
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+        let sc_far = EpisodeSidecar {
+            id: "ep_far_seq".into(),
+            dataset: "default".into(),
+            task: "t".into(),
+            source: "sdk".into(),
+            sequence_id: None,
+            repeat_index: None,
+            outcome: "ok".into(),
+            recorded_at: "2026-11-22T00:00:00Z".into(),
+            duration_s: 9.9,
+            frames: frames_far.len(),
+            joint_names: ext_cfg.limits.iter().map(|l| l.name.clone()).collect(),
+            units: "rad".into(),
+            joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
+            profile_id: ext_cfg.profile_id.clone(),
+            armd_version: "test".into(),
+            fps_nominal: 10.0,
+            truncated: false,
+            stopped_by: None,
+            arm_dof: Some(6),
+            gripper_joint: Some(6),
+            tool_id: Some(ext_cfg.active_tool.id.clone()),
+            tool_config_digest: Some(ext_cfg.active_tool.config_digest.clone()),
+            has_gripper_motion: Some(false),
+            recovered: None,
+            first_state: Some(frames_far[0].observation_state.clone()),
+            last_state: Some(frames_far.last().unwrap().observation_state.clone()),
+        };
+        inner.episodes.write_episode(&sc_far, &frames_far, None).unwrap();
+        let save_far = armd::sequences::save(&mut inner, &json!({
+            "name": "s_far",
+            "steps": [{"type": "replay", "episode_id": "ep_far_seq", "gripper": false}]
+        })).unwrap();
+        let epoch = inner.safety.epoch_id();
+        // Direct replay_input check proves ReplayInput carries ext_cfg.tcp_offset
+        let seq_input = inner.replay_input(ReplayRequest {
+            episode: "ep_far_seq".into(),
+            speed: 0.5,
+            gripper: false,
+            tag: None,
+            allow_stale: false,
+        }, epoch).unwrap();
+        let seq_res = replay::plan(seq_input);
+        assert!(matches!(seq_res, Err(ArmError::WorkspaceRejected { .. })), "got {seq_res:?}");
+
+        let run_plan = armd::sequences::prepare_run(&inner, &json!({"id": save_far.0.id}), epoch).unwrap();
+        let (id, _) = armd::sequences::begin(&mut inner, &seq_sup_arc, run_plan).unwrap();
+        (id, epoch)
+    };
+    let mut seq_done = None;
+    for _ in 0..100 {
+        if let Some(a) = seq_sup_arc.inner().read().await.last_action.clone().filter(|a| a.id == action_id && !a.is_running()) {
+            seq_done = Some(a);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = epoch;
+    let seq_done = seq_done.expect("sequence replay should terminate with failure");
+    assert_eq!(seq_done.state, "failed", "{seq_done:?}");
+    assert_eq!(seq_done.code.as_deref(), Some("WORKSPACE_VIOLATION"), "{seq_done:?}");
+}
+
+// =========================================================================
+// B7: Actual grasp & place descent rejects table intrusion without unchecked fallback
+// =========================================================================
+#[test]
+fn b7_install_macro_path_and_place_plan_reject_table_intrusion_without_unchecked_fallback() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let mut inner = common::sim_at(cfg, &INSPECT);
+    let input = inner.plan_input().unwrap();
+    let p0 = input.arm.fk(&input.q0).p;
+    let goal = armd::motion::resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0], p0[1], p0[2] - 0.04], r: None });
+    let speed = Speed { linear: 0.03, angular: armd::motion::DEFAULT_ANGULAR_RPS };
+    let direct = armd::motion::plan_cartesian(&input, goal, speed).unwrap();
+    let id = inner.begin_macro("grasp", &input, None).unwrap();
+
+    // Extended corner at [0.032, 0.082, -0.022] dips below tight table bound -> must fail WORKSPACE_VIOLATION, not install direct
+    let end_pose = input.arm.fk_f32(direct.last_slice()).unwrap();
+    let corner_z = end_pose.transform_point(&[0.032, 0.082, -0.022])[2];
+    let rules = DescentRules {
+        from_above: vec![[0.0288, 0.0, 0.0]],
+        table: Some((vec![[0.0, 0.0, 0.0], [0.032, 0.082, -0.022]], corner_z + 0.002)),
+    };
+    let plan = inner.approach_plan("grasp_final", backlash::Request::Profile).unwrap();
+    let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&rules), speed, false);
+    assert!(matches!(pre, Pre::Direct(_)));
+    let err = inner.install_macro_path_same_side_with_rules(id, &input, direct, pre, Some(&plan), Some(&rules)).unwrap_err();
+    assert!(matches!(err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })), "{err:?}");
+    assert!(inner.active_trajectory.is_none(), "rejected fallback must not install trajectory");
+
+    // place::plan also rejects when descend_path violates table_clearance
+    let mut inner_p = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    inner_p.set_grasp_setup(GraspSetup { table_z_m: 0.14, ..GraspSetup::default() });
+    let pending = armd::place::prepare(&inner_p, &json!({"position": [p0[0], p0[1], 0.142]}), inner_p.safety.epoch_id()).unwrap();
+    let place_err = armd::place::plan(pending).unwrap_err();
+    assert!(matches!(place_err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })), "{place_err:?}");
+}
+
+// =========================================================================
+// B9: Manual table capture requires fresh feedback and settled stillness
+// =========================================================================
+#[test]
+fn b9_table_z_from_tcp_rejects_stale_or_moving_arm_without_changing_revision_or_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    // Vertical pose
+    let q_seed = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
+    let target_r = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    let p_end = cfg.arm_model.fk(&q_seed).p;
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let sol = cfg.arm_model.solve_dls(&Pose::new(target_r, p_end), &q_seed, &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_vert: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+
+    let drv = MockFbArm::new(q_vert, true);
+    let mut inner = SupervisorInner::new(cfg);
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = q_vert.to_vec();
+    inner.measured_positions = q_vert.to_vec();
+    inner.target_positions = q_vert.to_vec();
+    let rev0 = inner.grasp_setup_revision;
+
+    // 1. Before settling 0.2s -> rejected, revision & disk unchanged
+    let e_unsettled = grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), Some(&gs_path), false).unwrap_err();
+    assert!(format!("{e_unsettled:?}").contains("still"), "{e_unsettled:?}");
+    assert_eq!(inner.grasp_setup_revision, rev0);
+    assert!(!gs_path.exists());
+
+    // 2. Tick 15 times (0.30s) with advancing hardware receive timestamps -> succeeds
+    let mut t_rx = Instant::now();
+    for _ in 0..15 {
+        t_rx += Duration::from_millis(20);
+        drv.state.lock().unwrap().rx_instants = Some(vec![Some(t_rx); 7]);
+        inner.tick(0.02);
+    }
+    assert!(grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), Some(&gs_path), false).is_ok());
+
+    // 3. Stale feedback -> rejected
+    drv.state.lock().unwrap().feedback_age = Duration::from_millis(500);
+    let e_stale = grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), Some(&gs_path), false).unwrap_err();
+    assert!(format!("{e_stale:?}").contains("fresh"), "{e_stale:?}");
+    assert_eq!(inner.grasp_setup_revision, rev0);
+    assert!(!gs_path.exists());
+
+    // 4. Moving measured velocity -> rejected
+    drv.state.lock().unwrap().feedback_age = Duration::from_millis(5);
+    drv.state.lock().unwrap().vel[0] = 0.08;
+    inner.tick(0.02);
+    let e_mov = grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), Some(&gs_path), false).unwrap_err();
+    assert!(format!("{e_mov:?}").contains("0.02"), "{e_mov:?}");
+    assert_eq!(inner.grasp_setup_revision, rev0);
+    assert!(!gs_path.exists());
+}
+
+// =========================================================================
+// B11: Measured park endpoint violating workspace blocks torque release
+// =========================================================================
+#[test]
+fn b11_park_retains_torque_when_measured_endpoint_violates_workspace_within_joint_tolerance() {
+    let mut cfg = ArmConfig::rebot_dm();
+    let shoulder = cfg.arm_model.shoulder_rz();
+    let rest_p = cfg.arm_model.fk_f32(&cfg.home_positions).unwrap().p;
+    let rest_reach = kinematics::shoulder_reach_from(&rest_p, &shoulder);
+    // Nominal home is valid inside max_reach_m = rest_reach + 0.001 m
+    cfg.workspace.as_mut().unwrap().max_reach_m = Some((rest_reach + 0.001) as f32);
+
+    // Perturb J2/J3 within resting_pose.position_tolerances (0.08 rad) so measured endpoint exceeds max_reach_m + WORKSPACE_EPS
+    let q_meas = [(-0.07f32, -0.07f32), (-0.07, 0.07), (0.07, -0.07), (0.07, 0.07)]
+        .into_iter()
+        .map(|(d1, d2)| {
+            let mut q = cfg.home_positions.clone();
+            q[1] += d1;
+            q[2] += d2;
+            q
+        })
+        .max_by(|a, b| {
+            let ra = kinematics::shoulder_reach_from(&cfg.arm_model.fk_f32(a).unwrap().p, &shoulder);
+            let rb = kinematics::shoulder_reach_from(&cfg.arm_model.fk_f32(b).unwrap().p, &shoulder);
+            ra.total_cmp(&rb)
+        })
+        .unwrap();
+    let meas_p = cfg.arm_model.fk_f32(&q_meas).unwrap().p;
+    let meas_reach = kinematics::shoulder_reach_from(&meas_p, &shoulder);
+    assert!(meas_reach > rest_reach + 0.004, "meas_reach={meas_reach:.4}, rest_reach={rest_reach:.4}");
+
+    let mut inner = SupervisorInner::new(cfg);
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = inner.config.home_positions.clone();
+    inner.target_positions = inner.config.home_positions.clone();
+    inner.measured_positions = inner.config.home_positions.clone();
+    inner.measured_velocities = vec![0.0; 7];
+    assert!(inner.resting_pose_static_violation().is_none(), "nominal home must be valid in workspace");
+
+    inner.measured_positions = q_meas;
+    let v = inner.resting_pose_static_violation().expect("must fail on measured workspace violation");
+    assert!(v.contains("max_reach"), "expected violation naming max_reach, got: {v}");
+    assert!(inner.set_torque(false).is_err(), "set_torque(false) must refuse to drop torque while measured pose violates workspace");
+    assert!(inner.is_torqued, "holding torque must remain enabled");
+}
+
+// =========================================================================
+// M1: Hover job resume binds tool, candidate, and rechecks floor
+// =========================================================================
+#[test]
+fn m1_calib_hover_resume_rejects_tool_mismatch_candidate_mismatch_and_floor_violation() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let mut inner = common::sim_at(cfg, &INSPECT);
+
+    let body = json!({
+        "candidate_fingerprint": "fp-A",
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
+        "points": [
+            {"id": "p1", "approach_m": [0.25, 0.0, 0.14], "hover_m": [0.25, 0.0, 0.08]},
+            {"id": "p2", "approach_m": [0.25, 0.05, 0.14], "hover_m": [0.25, 0.05, 0.08]}
+        ]
+    });
+    let mut plan = armd::calib_hover::prepare(&inner, &body, inner.safety.epoch_id()).unwrap();
+    let job_id = plan.job.id.clone();
+    plan.job.points[0].state = "done".into();
+    plan.job.state = "failed".into();
+    inner.hover_jobs.push(plan.job);
+
+    // 1. Mismatched candidate_fingerprint -> FINGERPRINT_MISMATCH
+    let err_fp = armd::calib_hover::prepare(&inner, &json!({"resume": job_id, "candidate_fingerprint": "fp-B"}), inner.safety.epoch_id()).unwrap_err();
+    assert!(matches!(err_fp, ArmError::Detailed { ref code, .. } if code == "FINGERPRINT_MISMATCH"), "{err_fp:?}");
+
+    // 2. Updated floor above pending point p2 (0.08 < floor 0.075 + 0.008) -> WORKSPACE_VIOLATION
+    inner.config.workspace.as_mut().unwrap().floor_z_m = 0.075;
+    let err_fl = armd::calib_hover::prepare(&inner, &json!({"resume": job_id, "candidate_fingerprint": "fp-A"}), inner.safety.epoch_id()).unwrap_err();
+    assert!(matches!(err_fl, ArmError::Detailed { ref code, .. } if code == "WORKSPACE_VIOLATION"), "{err_fl:?}");
+    inner.config.workspace.as_mut().unwrap().floor_z_m = 0.0;
+
+    // 3. Tool swap -> TOOL_MISMATCH
+    inner.config.active_tool = other_tool_cfg().active_tool;
+    let err_tl = armd::calib_hover::prepare(&inner, &json!({"resume": job_id, "candidate_fingerprint": "fp-A"}), inner.safety.epoch_id()).unwrap_err();
+    assert!(matches!(err_tl, ArmError::Detailed { ref code, .. } if code == "TOOL_MISMATCH"), "{err_tl:?}");
+}
+
+// =========================================================================
+// M2: Post-edit grasp setup rejects max_grasp_width_m > reachable open width
+// =========================================================================
+#[test]
+fn m2_grasp_setup_edit_rejects_max_grasp_width_above_jaw_reach() {
+    let inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let err = grasp::prepare_setup_update(&inner, &json!({"max_grasp_width_m": 0.12}), None, false).unwrap_err();
+    assert!(format!("{err:?}").contains("max_grasp_width_m"), "{err:?}");
+    assert!(grasp::prepare_setup_update(&inner, &json!({"max_grasp_width_m": 0.070}), None, false).is_ok());
+}
+
+// =========================================================================
+// M3: Measurement wire frames emit distinct EndLink end_pose and TCP tcp
+// =========================================================================
+#[tokio::test]
+async fn m3_depth_measure_emits_distinct_end_pose_and_tcp() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+    }
+    #[derive(Clone)]
+    struct DummyDet;
+    impl armd::grasp::DetectionSource for DummyDet {
+        fn inference_enabled(&self) -> armd::grasp::BoxFuture<'_, Result<bool, String>> {
+            Box::pin(async { Ok(true) })
+        }
+        fn set_inference(&self, _enabled: bool) -> armd::grasp::BoxFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn next_frame(&self, _after: Option<u64>, _w: u64) -> armd::grasp::BoxFuture<'_, Result<Option<armd::grasp::DetectionFrame>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn trigger(&self, _p: &'static [&'static str], _w: u64) -> armd::grasp::BoxFuture<'_, Result<Option<armd::grasp::DetectionFrame>, String>> {
+            Box::pin(async {
+                Ok(Some(armd::grasp::DetectionFrame {
+                    frame_id: 1,
+                    captured_at: Instant::now(),
+                    policy_captured_at: None,
+                    image_size_px: [640.0, 360.0],
+                    detections: vec![],
+                    depth: None,
+                    model_generation: None,
+                }))
+            })
+        }
+        fn per_request_pipelines(&self) -> armd::grasp::BoxFuture<'_, Result<bool, String>> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+    let out = armd::depth_measure::measure(&sup, &DummyDet, &json!({})).await.unwrap();
+    let end_xyz: [f64; 3] = serde_json::from_value(out["camera"]["end_pose"]["xyz_m"].clone()).unwrap();
+    let tcp_xyz: [f64; 3] = serde_json::from_value(out["camera"]["tcp"]["xyz_m"].clone()).unwrap();
+    let expected_end = cfg.arm_model.fk_f32(&INSPECT).unwrap();
+    let expected_tcp = armd::motion::end_to_tcp(&expected_end, &cfg.tcp_offset);
+    assert!(kinematics::norm(&kinematics::sub(&end_xyz, &expected_end.p)) < 1e-6);
+    assert!(kinematics::norm(&kinematics::sub(&tcp_xyz, &expected_tcp.p)) < 1e-6);
+    assert!(kinematics::norm(&kinematics::sub(&tcp_xyz, &end_xyz)) > 0.025);
+}
+
+// =========================================================================
+// M16: Saved-pose display unconditionally recomputes or clears stale cache
+// =========================================================================
+#[tokio::test]
+async fn m16_saved_pose_display_recomputes_uncached_and_clears_incompatible_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("poses.json");
+    let stale_cache = Some(PoseTcp { position: [0.99, 0.99, 0.99], rpy: [0.1, 0.2, 0.3] });
+    let list = PoseList {
+        poses: vec![
+            NamedPose { id: "id1".into(), name: "valid_no_cache".into(), positions: INSPECT.to_vec(), tcp: None, saved_at_ms: 1, ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    std::fs::write(&path, serde_json::to_string(&list).unwrap()).unwrap();
+
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let sup = ArmSupervisor::new(cfg.clone());
+    armd::poses::load_into(&sup, &path).await;
+    let mut inner = sup.inner().write().await;
+    let expected_tcp = cfg.tcp_pose_f32(&INSPECT).unwrap();
+    let got_tcp = inner.poses.list.poses[0].tcp.as_ref().expect("valid joints must recompute TCP even when tcp was None");
+    assert!(kinematics::norm(&kinematics::sub(&got_tcp.position, &expected_tcp.p)) < 1e-6);
+
+    // Also verify refresh_pose_tcps clears stale cached TCP when positions are invalid or arm_dof is incompatible
+    inner.poses.list.poses.push(NamedPose { id: "id2".into(), name: "empty_stale".into(), positions: vec![], tcp: stale_cache.clone(), saved_at_ms: 1, ..Default::default() });
+    inner.poses.list.poses.push(NamedPose { id: "id3".into(), name: "wrong_dof_stale".into(), positions: INSPECT.to_vec(), tcp: stale_cache, saved_at_ms: 1, arm_dof: Some(5), ..Default::default() });
+    inner.refresh_pose_tcps();
+    assert!(inner.poses.list.poses[1].tcp.is_none(), "empty positions must clear stale cached TCP");
+    assert!(inner.poses.list.poses[2].tcp.is_none(), "incompatible arm_dof must clear stale cached TCP");
+}
+
+// =========================================================================
+// R2 Negative & Regression Tests (B04/m01, B05, B06, B07, B08/M14, B09, B11, M05, M06, M12)
+// =========================================================================
+
+#[test]
+fn r2_b04_m01_clear_fault_and_torque_off_enforce_measured_workspace_envelope() {
+    let mut cfg = ArmConfig::rebot_dm();
+    let shoulder = cfg.arm_model.shoulder_rz();
+    let rest_p = cfg.arm_model.fk_f32(&cfg.home_positions).unwrap().p;
+    let rest_reach = kinematics::shoulder_reach_from(&rest_p, &shoulder);
+    cfg.workspace.as_mut().unwrap().max_reach_m = Some((rest_reach + 0.001) as f32);
+
+    // Joint perturbation within resting tolerances yet violating max_reach_m
+    let mut q_bad = cfg.home_positions.clone();
+    q_bad[1] += 0.07;
+    q_bad[2] -= 0.07;
+    let q_bad_arr: [f32; 7] = q_bad.clone().try_into().unwrap();
+    assert!(kinematics::shoulder_reach_from(&cfg.arm_model.fk_f32(&q_bad).unwrap().p, &shoulder) > rest_reach + 0.002);
+
+    let drv = MockFbArm::new(q_bad_arr, true);
+    {
+        let mut s = drv.state.lock().unwrap();
+        s.hw_fault = true;
+        s.clear_disables = vec![0, 1, 2, 3, 4, 5];
+    }
+    let mut inner = SupervisorInner::new(cfg);
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+
+    // m01: set_torque(false) returns ArmNotAtRestingPose carrying workspace constraint + geometry point
+    let off_err = inner.set_torque(false).unwrap_err();
+    let off_msg = off_err.to_string();
+    assert!(off_msg.contains("max_reach") && off_msg.contains("point 0"), "got: {off_msg}");
+
+    // B04: trigger fault, clear_fault must block BEFORE calling drv.clear_fault()
+    inner.safety.trigger_fault_coded(armd::FaultCode::HardwareFault, armd::FaultReason::Other("latched".into()));
+    let cf_err = inner.clear_fault().unwrap_err();
+    assert!(cf_err.to_string().contains("max_reach"), "{cf_err}");
+    assert_eq!(drv.state.lock().unwrap().clear_fault_calls, 0, "driver reset must never run on workspace violation");
+}
+
+#[test]
+fn r2_b06_table_z_from_tcp_rejects_cached_or_gapped_hw_timestamps() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let q_seed = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
+    let target_r = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    let p_end = cfg.arm_model.fk(&q_seed).p;
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let sol = cfg.arm_model.solve_dls(&Pose::new(target_r, p_end), &q_seed, &lo, &hi, kinematics::PAR.w);
+    let q_vert: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+
+    let drv = MockFbArm::new(q_vert, true);
+    let fixed_rx = Instant::now();
+    drv.state.lock().unwrap().rx_instants = Some(vec![Some(fixed_rx); 7]);
+
+    let mut inner = SupervisorInner::new(cfg);
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = q_vert.to_vec();
+    inner.measured_positions = q_vert.to_vec();
+    inner.target_positions = q_vert.to_vec();
+
+    // 1. Constant hardware receive timestamps across ticks -> only 1 distinct sample -> rejected
+    for _ in 0..20 {
+        inner.tick(0.02);
+    }
+    let err_dup = grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).unwrap_err();
+    assert!(format!("{err_dup:?}").contains("still"), "{err_dup:?}");
+
+    // 2. Advancing hardware receive timestamps accumulate -> succeeds, then read error clears window
+    let mut t_rx = fixed_rx;
+    for _ in 0..15 {
+        t_rx += Duration::from_millis(20);
+        drv.state.lock().unwrap().rx_instants = Some(vec![Some(t_rx); 7]);
+        inner.tick(0.02);
+    }
+    assert!(grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).is_ok());
+
+    drv.state.lock().unwrap().fail_read = true;
+    inner.tick(0.02);
+    drv.state.lock().unwrap().fail_read = false;
+    t_rx += Duration::from_millis(20);
+    drv.state.lock().unwrap().rx_instants = Some(vec![Some(t_rx); 7]);
+    inner.tick(0.02);
+    assert!(grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).is_err());
+
+    // 3. B06 (R3): Two stationary hardware samples 20 ms apart, then frozen cache for 200 ms -> rejected
+    drv.state.lock().unwrap().fail_read = true;
+    inner.tick(0.02);
+    drv.state.lock().unwrap().fail_read = false;
+    let freeze_rx = t_rx + Duration::from_millis(20);
+    drv.state.lock().unwrap().feedback_age = Duration::from_millis(5);
+    drv.state.lock().unwrap().rx_instants = Some(vec![Some(freeze_rx); 7]);
+    inner.tick(0.02);
+    let second_rx = freeze_rx + Duration::from_millis(20);
+    drv.state.lock().unwrap().rx_instants = Some(vec![Some(second_rx); 7]);
+    inner.tick(0.02);
+    // Freeze rx_instants at second_rx while sim_time_s advances past 200 ms and age remains <= 250 ms
+    for k in 1..=10 {
+        drv.state.lock().unwrap().feedback_age = Duration::from_millis(20 * k);
+        inner.tick(0.02);
+    }
+    let err_two_then_freeze = grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).unwrap_err();
+    assert!(format!("{err_two_then_freeze:?}").contains("still"), "{err_two_then_freeze:?}");
+
+    // 4. Partial-joint freeze (one joint stuck at +20 ms while others reach +220 ms) -> rejected
+    drv.state.lock().unwrap().feedback_age = Duration::from_millis(5);
+    let mut partial_rx = vec![Some(freeze_rx + Duration::from_millis(220)); 7];
+    partial_rx[3] = Some(second_rx);
+    drv.state.lock().unwrap().rx_instants = Some(partial_rx);
+    inner.tick(0.02);
+    assert!(grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).is_err());
+
+    // 5. All joints advance >= 200 ms from first_rx -> succeeds
+    drv.state.lock().unwrap().rx_instants = Some(vec![Some(freeze_rx + Duration::from_millis(220)); 7]);
+    inner.tick(0.02);
+    assert!(grasp::prepare_setup_update(&inner, &json!({"table_z_from_tcp": true}), None, false).is_ok());
+}
+
+#[test]
+fn r2_b07_commissioning_jog_scales_j7_velocity_and_requires_torque_feedback_on_close() {
+    let cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    let mut q_open = INSPECT;
+    q_open[6] = -3.0;
+    let drv_no_tq = MockFbArm::new(q_open, false);
+    let mut inner = SupervisorInner::new(cfg.clone());
+    inner.driver = Some(Mutex::new(Box::new(drv_no_tq)));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = q_open.to_vec();
+    inner.measured_positions = q_open.to_vec();
+    inner.target_positions = q_open.to_vec();
+
+    let mut q_close = q_open;
+    q_close[6] = -0.2;
+    let ep = inner.safety.epoch_id();
+    assert!(
+        inner.jog_action_with_speed_scale(q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)).is_err(),
+        "closing J7 jog during commissioning must require torque_feedback when max_close_torque_nm is configured"
+    );
+
+    let drv_tq = MockFbArm::new(q_open, true);
+    inner.driver = Some(Mutex::new(Box::new(drv_tq)));
+    let max_j7_vel = cfg.limits[6].max_velocity * 0.2;
+    let (_ep, _id, dur) = inner.jog_action_with_speed_scale(q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)).unwrap();
+    let dq7 = (q_close[6] - q_open[6]).abs() as f64;
+    // Quintic peak velocity = 1.875 * |dq| / T <= max_j7_vel
+    let peak_v7 = 1.875 * dq7 / dur;
+    assert!(peak_v7 <= max_j7_vel as f64 + 1e-4, "peak_v7={peak_v7} exceeded scaled J7 limit {max_j7_vel}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_b08_m14_commissioning_confirm_strict_validation_and_damaged_store_preservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let comm_path = dir.path().join("tool_commissioning.json");
+    let sup = Arc::new(ArmSupervisor::new(finray_cfg()));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_path.clone());
+    }
+    let (_ws, _gen, _epoch, _sup, addr) = common::torqued_rig(sup.clone(), &INSPECT).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let st0: Value = client.get(format!("{base}/api/v1/tool/commissioning")).send().await.unwrap().json().await.unwrap();
+    let rev0 = st0["revision"].as_u64().unwrap();
+    let dig = st0["active_tool"]["config_digest"].as_str().unwrap().to_string();
+
+    for bad_body in [
+        json!({}),
+        json!({"confirm": false, "tool_id": "soft_finray_gripper", "tool_config_digest": dig}),
+        json!({"confirm": "true", "tool_id": "soft_finray_gripper", "tool_config_digest": dig}),
+        json!({"confirm": true, "tool_config_digest": dig}),
+        json!({"confirm": true, "tool_id": "wrong", "tool_config_digest": dig}),
+        json!({"confirm": true, "tool_id": "soft_finray_gripper"}),
+        json!({"confirm": true, "tool_id": "soft_finray_gripper", "tool_config_digest": "v1:wrong"}),
+    ] {
+        let r = client.post(format!("{base}/api/v1/tool/commissioning/confirm")).json(&bad_body).send().await.unwrap();
+        assert_eq!(r.status(), 400, "body {bad_body} must be rejected");
+        assert!(!comm_path.exists());
+        let st: Value = client.get(format!("{base}/api/v1/tool/commissioning")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(st["revision"].as_u64().unwrap(), rev0);
+        assert_eq!(st["commissioning_required"], true);
+    }
+
+    // M14: Damaged commissioning store file must never be overwritten or quarantined on load or confirm
+    let corrupt_bytes = b"{not valid json!!";
+    std::fs::write(&comm_path, corrupt_bytes).unwrap();
+    let loaded_sup = ArmSupervisor::new(finray_cfg());
+    tool::load_commissioning_into(&loaded_sup, &comm_path).await;
+    assert!(loaded_sup.inner().read().await.config.active_tool.commissioning_required);
+    assert_eq!(std::fs::read(&comm_path).unwrap(), corrupt_bytes);
+
+    let r_dmg = client
+        .post(format!("{base}/api/v1/tool/commissioning/confirm"))
+        .json(&json!({"confirm": true, "tool_id": "soft_finray_gripper", "tool_config_digest": dig}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_dmg.status(), 500);
+    let body_dmg: Value = r_dmg.json().await.unwrap();
+    assert_eq!(body_dmg["code"], "COMMISSIONING_STORE_DAMAGED");
+    assert_eq!(std::fs::read(&comm_path).unwrap(), corrupt_bytes, "damaged store must be untouched");
+    assert!(sup.inner().read().await.config.active_tool.commissioning_required);
+    assert_eq!(sup.inner().read().await.tool_commissioning_revision, rev0);
+
+    // M14 (R3): Valid JSON with misspelled top-level key (`recordz`) or missing `records` must
+    // also fail closed without overwriting file, incrementing revision, or clearing gate.
+    for bad_json_bytes in [br#"{"recordz":[]}"#.as_slice(), br#"{}"#.as_slice()] {
+        std::fs::write(&comm_path, bad_json_bytes).unwrap();
+        let misspelled_sup = ArmSupervisor::new(finray_cfg());
+        tool::load_commissioning_into(&misspelled_sup, &comm_path).await;
+        assert!(misspelled_sup.inner().read().await.config.active_tool.commissioning_required);
+        assert_eq!(std::fs::read(&comm_path).unwrap(), bad_json_bytes);
+
+        let r_bad_key = client
+            .post(format!("{base}/api/v1/tool/commissioning/confirm"))
+            .json(&json!({"confirm": true, "tool_id": "soft_finray_gripper", "tool_config_digest": dig}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_bad_key.status(), 500);
+        let body_bad_key: Value = r_bad_key.json().await.unwrap();
+        assert_eq!(body_bad_key["code"], "COMMISSIONING_STORE_DAMAGED");
+        assert_eq!(std::fs::read(&comm_path).unwrap(), bad_json_bytes, "misspelled store must be untouched");
+        assert!(sup.inner().read().await.config.active_tool.commissioning_required);
+        assert_eq!(sup.inner().read().await.tool_commissioning_revision, rev0);
+    }
+}
+
+#[test]
+fn r2_b09_place_approach_checks_table_clearance() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    // Start with roll = 90 deg at tcp=[0.26, 0.0, 0.28]: lateral +/-0.082 m check points hang down to z=0.198 m.
+    // Place target at tcp=[0.26, 0.0, 0.25], rpy=[0, 0, 0] (roll=0): descend corners stay >= 0.228 m.
+    // With table_z_m = 0.190 (bound 0.215 m), descend clears while lift/approach violates table clearance.
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_rolled = kinematics::rpy_to_r(std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+    let end_goal = cfg.tcp_to_end(&Pose::new(r_rolled, [0.26, 0.0, 0.28]));
+    let sol = cfg.arm_model.solve_dls(&end_goal, &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok, "rolled start IK");
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+
+    let mut inner = common::sim_at(cfg, &q_start);
+    inner.set_grasp_setup(GraspSetup { table_z_m: 0.190, ..GraspSetup::default() });
+    let pending = armd::place::prepare(
+        &inner,
+        &json!({
+            "position": [0.26, 0.0, 0.25],
+            "orientation": {"rpy": [0.0, 0.0, 0.0]},
+            "approach_height_m": 0.04,
+        }),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    let err = armd::place::plan(pending).unwrap_err();
+    assert!(
+        matches!(err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "expected WORKSPACE_VIOLATION on approach/lift/retreat table dip, got {err:?}"
+    );
+}
+
+#[test]
+fn r2_b11_read_joint_states_error_clears_freshness_and_freezes_streaming_close() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.gripper_policy.as_mut().unwrap().max_close_torque_nm = Some(1.0);
+    let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -3.0];
+    let drv = MockFbArm::new(q0, true);
+    let mut inner = SupervisorInner::new(cfg);
+    inner.driver = Some(Mutex::new(Box::new(drv.clone())));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.tick(0.02);
+    assert!(inner.last_can_feedback_instant.is_some());
+
+    let mut tgt = q0.to_vec();
+    tgt[6] = -0.2;
+    let ep = inner.safety.epoch_id();
+    inner.servo(tgt, ep).unwrap();
+    // Single bus read failure must clear last_can_feedback_instant immediately and trip force-cap hold
+    drv.state.lock().unwrap().fail_read = true;
+    inner.tick(0.02);
+    assert!(inner.last_can_feedback_instant.is_none());
+    assert!(inner.gripper_force_capped);
+    assert!(inner.gripper_stalled);
+}
+
+#[test]
+fn r2_m05_m06_hover_resume_requires_fp_and_physical_jaw_curve_required() {
+    // M05: resume without candidate_fingerprint -> rejected
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let mut inner = common::sim_at(cfg, &INSPECT);
+    let body = json!({
+        "candidate_fingerprint": "fp-A",
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
+        "points": [{"id": "p1", "approach_m": [0.25, 0.0, 0.14], "hover_m": [0.25, 0.0, 0.08]}]
+    });
+    let mut plan = armd::calib_hover::prepare(&inner, &body, inner.safety.epoch_id()).unwrap();
+    let job_id = plan.job.id.clone();
+    plan.job.state = "failed".into();
+    inner.hover_jobs.push(plan.job);
+    let err_missing_fp = armd::calib_hover::prepare(&inner, &json!({"resume": job_id}), inner.safety.epoch_id()).unwrap_err();
+    assert!(err_missing_fp.to_string().contains("candidate_fingerprint"), "{err_missing_fp}");
+
+    // M06: physical non-sim driver with missing jaw_opening curve: no sim_default() verification;
+    // the width is unverified and the setup update is accepted (existing arms have no curve)
+    let mut no_curve_cfg = ArmConfig::rebot_dm();
+    no_curve_cfg.gripper_policy.as_mut().unwrap().jaw_opening = None;
+    let drv = MockFbArm::new(INSPECT, true);
+    let mut phys_inner = SupervisorInner::new(no_curve_cfg);
+    phys_inner.driver = Some(Mutex::new(Box::new(drv)));
+    phys_inner.follower = Some("rebot-dm".into());
+    assert!(phys_inner.requires_real_jaw_curve());
+    assert!(grasp::prepare_setup_update(&phys_inner, &json!({"max_grasp_width_m": 0.12}), None, false).is_ok());
+    assert_eq!(phys_inner.grasp_width_check(0.12), Some(armd::model::GraspWidthCheck::Unverified));
+}
+
+#[test]
+fn r2_b05_replay_rejects_embedded_parquet_sidecar_conflict_and_m12_so101_manifest_check() {
+    // B05: replay rejects episode whose parquet embedded provenance conflicts with sidecar
+    let dir = tempfile::tempdir().unwrap();
+    let fin = finray_cfg();
+    let other = other_tool_cfg();
+    let store = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+    let mut frames = Vec::new();
+    for k in 0..10 {
+        frames.push(RecordFrame { timestamp: k as f64 * 0.02, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() });
+    }
+    let sc = EpisodeSidecar {
+        id: "ep_conflict".into(),
+        dataset: "default".into(),
+        task: "t".into(),
+        source: "sdk".into(),
+        sequence_id: None,
+        repeat_index: None,
+        outcome: "ok".into(),
+        recorded_at: "2026-11-22T00:00:00Z".into(),
+        duration_s: 0.2,
+        frames: frames.len(),
+        joint_names: fin.limits.iter().map(|l| l.name.clone()).collect(),
+        units: "rad".into(),
+        joint_zero: armd::recording::JointZeroStamp::of(&[0.0; 7]),
+        profile_id: fin.profile_id.clone(),
+        armd_version: "test".into(),
+        fps_nominal: 50.0,
+        truncated: false,
+        stopped_by: None,
+        arm_dof: Some(6),
+        gripper_joint: Some(6),
+        tool_id: Some(fin.active_tool.id.clone()),
+        tool_config_digest: Some(fin.active_tool.config_digest.clone()),
+        has_gripper_motion: Some(false),
+        recovered: None,
+        first_state: Some(frames[0].observation_state.clone()),
+        last_state: Some(frames[0].observation_state.clone()),
+    };
+    let pq_path = store.write_episode(&sc, &frames, None).unwrap();
+    // Overwrite parquet with DIFFERENT embedded tool_id while keeping sidecar as finray -> conflict!
+    let conflicting_meta = EpisodeMetadata {
+        profile_id: fin.profile_id.clone(),
+        arm_dof: Some(6),
+        gripper_joint: Some(6),
+        joint_names: Some(fin.limits.iter().map(|l| l.name.clone()).collect()),
+        tool_id: Some(other.active_tool.id.clone()),
+        tool_config_digest: Some(other.active_tool.config_digest.clone()),
+        has_gripper_motion: Some(false),
+    };
+    armd::recording::write_frames_to_parquet_with_meta(&pq_path, &frames, Some(&conflicting_meta)).unwrap();
+    let input = ReplayInput {
+        request: ReplayRequest { episode: "ep_conflict".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
+        path: pq_path,
+        profile_id: fin.profile_id.clone(),
+        dof: fin.dof,
+        arm_dof: fin.arm_dof(),
+        gripper_idx: fin.gripper_index(),
+        joint_names: fin.limits.iter().map(|l| l.name.clone()).collect(),
+        limits: fin.limits.clone(),
+        speed_limits: fin.limits.clone(),
+        ws: None,
+        arm: fin.arm_model.clone(),
+        start: INSPECT.to_vec(),
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+        store,
+        zero_offsets: vec![0.0; 7],
+        tcp_offset: fin.tcp_offset,
+        active_tool: fin.active_tool.clone(),
+    };
+    let err = replay::plan(input).unwrap_err();
+    assert!(format!("{err:?}").contains("conflicts"), "{err:?}");
+
+    // M12: validate_tool_manifest rejects armd.gripper_policy violating target robot limits (so-arm101)
+    let bad_so101: armd::mjcf_compose::ToolManifest = serde_json::from_value(json!({
+        "id": "bad_so101_gp",
+        "kind": "gripper",
+        "robots": ["so-arm101"],
+        "tcp_offset": [0.02, 0.0, 0.0],
+        "armd": {
+            "gripper_policy": {
+                "closed_rad": -2.0
+            }
+        }
+    })).unwrap();
+    assert!(armd::mjcf_compose::validate_tool_manifest(&bad_so101, None).is_err());
+}
+
+#[tokio::test]
+async fn m6_stream_contact_speed_invalidates_commissioning_and_m8_rejects_non_string_parquet_meta() {
+    // M6: Changing base profile stream_contact_speed_rad_s invalidates prior commissioning.
+    let comm_dir = tempfile::tempdir().unwrap();
+    let comm_file = comm_dir.path().join("tool_commissioning.json");
+    let pack: ToolPackConfig = serde_json::from_str(FINRAY_PACK_JSON).unwrap();
+    let base1 = ArmConfig::rebot_dm();
+    let mut base2 = base1.clone();
+    base2.gripper_policy.as_mut().unwrap().stream_contact_speed_rad_s = Some(0.15);
+    let cfg1 = tool::apply_tool_overlay(&base1, &pack).unwrap();
+    let cfg2 = tool::apply_tool_overlay(&base2, &pack).unwrap();
+    assert_ne!(cfg1.active_tool.config_digest, cfg2.active_tool.config_digest);
+    let sup1 = Arc::new(ArmSupervisor::new(cfg1.clone()));
+    {
+        let mut inner = sup1.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_file.clone());
+    }
+    let prep = {
+        let inner = sup1.inner().read().await;
+        tool::prepare_commissioning_confirm(
+            &inner,
+            &json!({
+                "confirm": true,
+                "tool_id": cfg1.active_tool.id,
+                "tool_config_digest": cfg1.active_tool.config_digest
+            }),
+            false,
+        )
+        .unwrap()
+    };
+    prep.write.unwrap().run().await.unwrap();
+    let sup2 = Arc::new(ArmSupervisor::new(cfg2));
+    tool::load_commissioning_into(&sup2, &comm_file).await;
+    assert!(
+        sup2.inner().read().await.config.active_tool.commissioning_required,
+        "changing stream_contact_speed_rad_s must invalidate old commissioning"
+    );
+
+    // M8: Non-string tool_id / tool_config_digest in Parquet rebot.episode metadata must be rejected.
+    let mut kv_bad_tid = std::collections::HashMap::new();
+    kv_bad_tid.insert("rebot.episode".to_string(), r#"{"tool_id": 42}"#.to_string());
+    assert!(armd::recording::import::extract_embedded_provenance(&kv_bad_tid)
+        .unwrap_err()
+        .contains("tool_id"));
+
+    let mut kv_bad_dig = std::collections::HashMap::new();
+    kv_bad_dig.insert("rebot.episode".to_string(), r#"{"tool_config_digest": []}"#.to_string());
+    assert!(armd::recording::import::extract_embedded_provenance(&kv_bad_dig)
+        .unwrap_err()
+        .contains("tool_config_digest"));
+
+    // R2 M4: Explicit JSON null for tool_id or tool_config_digest in rebot.episode must be rejected,
+    // while genuine legacy rebot.episode omitting both keys still succeeds.
+    for null_json in [
+        r#"{"tool_id": null, "tool_config_digest": null}"#,
+        r#"{"tool_id": null}"#,
+        r#"{"tool_config_digest": null}"#,
+    ] {
+        let mut kv_null = std::collections::HashMap::new();
+        kv_null.insert("rebot.episode".to_string(), null_json.to_string());
+        assert!(
+            armd::recording::import::extract_embedded_provenance(&kv_null).is_err(),
+            "{null_json} must be rejected"
+        );
+    }
+    let mut kv_legacy = std::collections::HashMap::new();
+    kv_legacy.insert("rebot.episode".to_string(), r#"{"id":"legacy_ep","units":"rad"}"#.to_string());
+    let legacy_emb = armd::recording::import::extract_embedded_provenance(&kv_legacy).unwrap();
+    assert_eq!(legacy_emb.tool_id, None);
+    assert_eq!(legacy_emb.tool_config_digest, None);
+}
+
+#[tokio::test]
+async fn r3_m4_settle_ms_changes_digest_and_invalidates_commissioning() {
+    let comm_dir = tempfile::tempdir().unwrap();
+    let comm_file = comm_dir.path().join("tool_commissioning.json");
+    let pack: ToolPackConfig = serde_json::from_str(FINRAY_PACK_JSON).unwrap();
+    let base1 = ArmConfig::rebot_dm();
+    let mut base2 = base1.clone();
+    base2.gripper_policy.as_mut().unwrap().settle_ms = 650;
+    let cfg1 = tool::apply_tool_overlay(&base1, &pack).unwrap();
+    let cfg2 = tool::apply_tool_overlay(&base2, &pack).unwrap();
+    assert_ne!(cfg1.active_tool.config_digest, cfg2.active_tool.config_digest);
+
+    let sup1 = Arc::new(ArmSupervisor::new(cfg1.clone()));
+    {
+        let mut inner = sup1.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_file.clone());
+    }
+    let prep = {
+        let inner = sup1.inner().read().await;
+        tool::prepare_commissioning_confirm(
+            &inner,
+            &json!({
+                "confirm": true,
+                "tool_id": cfg1.active_tool.id,
+                "tool_config_digest": cfg1.active_tool.config_digest
+            }),
+            false,
+        )
+        .unwrap()
+    };
+    prep.write.unwrap().run().await.unwrap();
+
+    // Same settle_ms loads as commissioned; modified settle_ms invalidates commissioning.
+    let sup_same = Arc::new(ArmSupervisor::new(cfg1));
+    tool::load_commissioning_into(&sup_same, &comm_file).await;
+    assert!(!sup_same.inner().read().await.config.active_tool.commissioning_required);
+
+    let sup_changed = Arc::new(ArmSupervisor::new(cfg2));
+    tool::load_commissioning_into(&sup_changed, &comm_file).await;
+    assert!(
+        sup_changed.inner().read().await.config.active_tool.commissioning_required,
+        "changing settle_ms must invalidate old commissioning"
+    );
+}
+
+#[test]
+fn r3_minor1_place_table_violation_preserves_actual_point_value_and_bound() {
+    let mut cfg = finray_cfg();
+    cfg.active_tool.commissioning_required = false;
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_rolled = kinematics::rpy_to_r(std::f64::consts::FRAC_PI_2, 0.0, 0.0);
+    let end_goal = cfg.tcp_to_end(&Pose::new(r_rolled, [0.26, 0.0, 0.28]));
+    let sol = cfg.arm_model.solve_dls(&end_goal, &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+
+    let mut inner = common::sim_at(cfg, &q_start);
+    inner.set_grasp_setup(GraspSetup { table_z_m: 0.190, ..GraspSetup::default() });
+    let pending = armd::place::prepare(
+        &inner,
+        &json!({
+            "position": [0.26, 0.0, 0.25],
+            "orientation": {"rpy": [0.0, 0.0, 0.0]},
+            "approach_height_m": 0.04,
+        }),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    let err = armd::place::plan(pending).unwrap_err();
+    match err {
+        ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { s, point, value, bound, .. }) => {
+            let expected_bound = 0.190 + armd::grasp::TABLE_CLEARANCE_M;
+            assert!((bound - expected_bound).abs() < 1e-6, "expected effective table+clearance bound {expected_bound}, got {bound}");
+            assert!(value < bound, "expected measured height {value} < bound {bound}");
+            assert!(value != 0.0 && bound != 0.0, "must not emit placeholder zero metrics: value={value}, bound={bound}");
+            assert!(point > 0, "rolled finray lateral point (not point 0) should trigger violation, got point={point}, s={s}");
+        }
+        other => panic!("expected WorkspaceViolation, got {other:?}"),
+    }
+}
+
+#[test]
+fn r4_m1_commissioning_caps_joint_path_same_side_final_approach_velocity() {
+    let mut cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    // High backlash_approach speed_rad_s (0.5) must still be capped by speed_scale (0.2)
+    // during commissioning on BOTH the main quintic leg and the final approach leg.
+    cfg.backlash_approach = Some(armd::backlash::BacklashApproach {
+        enabled: true,
+        applies_to: vec!["move_to_precise".into()],
+        delta_deg: 2.0,
+        speed_rad_s: 0.5,
+        joints: None,
+    });
+    let mut inner = common::sim_at(cfg.clone(), &INSPECT);
+    let input = inner.plan_input_tcp().unwrap();
+    let mut q_goal = [0.0f64; 6];
+    for (j, slot) in q_goal.iter_mut().enumerate() {
+        *slot = f64::from(INSPECT[j]);
+    }
+    q_goal[0] += 0.3;
+
+    let max_arm_vel: Vec<f32> = inner
+        .planning_limits()
+        .iter()
+        .take(6)
+        .map(|l| l.max_velocity * 0.2)
+        .collect();
+
+    let (_id, _dur) = inner
+        .install_joint_goal(
+            &input,
+            &q_goal,
+            0.2,
+            "move_to",
+            None,
+            Some(backlash::Request::Profile),
+        )
+        .unwrap();
+
+    let active = inner.active_trajectory.as_ref().expect("active trajectory");
+    let main_leg = match &active.reference {
+        armd::motion::Reference::Quintic(q) => q,
+        other => panic!("expected main Quintic leg, got {other:?}"),
+    };
+    let dt = 0.005;
+    let n_main = ((main_leg.duration / dt).ceil() as usize).max(2);
+    for k in 0..=n_main {
+        let t = (k as f64 * dt).min(main_leg.duration);
+        let pt = main_leg.sample(t);
+        for j in 0..6 {
+            assert!(
+                pt.velocities[j].abs() <= max_arm_vel[j] + 1e-4,
+                "main quintic leg joint {j} velocity {} exceeded 0.2 * planning limit {} at t={t:.3}",
+                pt.velocities[j],
+                max_arm_vel[j]
+            );
+        }
+    }
+    let final_leg = active.then.as_ref().expect("same-side final approach leg");
+    let n = ((final_leg.duration / dt).ceil() as usize).max(2);
+    for k in 0..=n {
+        let t = (k as f64 * dt).min(final_leg.duration);
+        let pt = final_leg.sample(t);
+        for j in 0..6 {
+            assert!(
+                pt.velocities[j].abs() <= max_arm_vel[j] + 1e-4,
+                "final approach leg joint {j} velocity {} exceeded 0.2 * planning limit {} at t={t:.3}",
+                pt.velocities[j],
+                max_arm_vel[j]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn r4_m7_m8_m9_calibration_backup_reset_and_fingerprint_provenance() {
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
+    let vision_rev = Arc::new(Mutex::new(0u64));
+    let vision_vals = Arc::new(Mutex::new(json!({
+        "fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0,
+        "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+        "width": 640, "height": 360
+    })));
+    let vr_g = vision_rev.clone();
+    let vv_g = vision_vals.clone();
+    let vr_p = vision_rev.clone();
+    let vv_p = vision_vals.clone();
+    let mock_vision = axum::Router::new()
+        .route(
+            "/api/calibration/intrinsics",
+            get(move || {
+                let vr_g = vr_g.clone();
+                let vv_g = vv_g.clone();
+                async move {
+                    let mut v = vv_g.lock().unwrap().clone();
+                    v["revision"] = json!(*vr_g.lock().unwrap());
+                    axum::Json(v)
+                }
+            })
+            .put(move |axum::Json(body): axum::Json<Value>| {
+                let vr_p = vr_p.clone();
+                let vv_p = vv_p.clone();
+                async move {
+                    let mut r = vr_p.lock().unwrap();
+                    *r += 1;
+                    *vv_p.lock().unwrap() = body.clone();
+                    let mut out = body;
+                    out["revision"] = json!(*r);
+                    axum::Json(out)
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, mock_vision).await.unwrap() });
+    let up = armd::api::proxy::DetectorUpstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+    let deps = armd::calibration::CalibrationDeps::new(cal_path.clone(), Some(gs_path.clone()), up);
+    let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+
+    // M7: Backup manifest under Tool A preserves tool_id & tool_config_digest.
+    let mut tool_a = finray_cfg();
+    tool_a.active_tool.commissioning_required = false;
+    {
+        let s = tool_a.grasp.as_mut().unwrap();
+        s.max_grasp_width_m = 0.071;
+    }
+    let sup_a = Arc::new(ArmSupervisor::new(tool_a.clone()));
+    let apply_body = json!({
+        "intrinsics": {"fx": 831.5, "fy": 829.0, "cx": 318.2, "cy": 183.4, "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0, "width": 640, "height": 360},
+        "camera_mount": {"offset_m": [-0.0728, 0.0012, 0.0655], "q_end_cam": kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0))},
+        "table_z_m": 0.012
+    });
+    let req_a1 = armd::calibration::parse_apply(&apply_body).unwrap();
+    let res_a1 = armd::calibration::apply(&sup_a, &deps, req_a1, &check).await.unwrap();
+    // Apply a second time so the backup captures Tool A's calibrated state + grasp_setup (max_grasp_width_m=0.071).
+    let res_a2 = armd::calibration::apply(&sup_a, &deps, armd::calibration::parse_apply(&apply_body).unwrap(), &check).await.unwrap();
+    let backup_dir = std::path::PathBuf::from(res_a2["backup"].as_str().unwrap());
+    let manifest_val: Value = serde_json::from_str(&std::fs::read_to_string(backup_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest_val["tool_id"], tool_a.active_tool.id);
+    assert_eq!(manifest_val["tool_config_digest"], tool_a.active_tool.config_digest);
+    let _ = res_a1;
+
+    // Now switch to Tool B (`custom_tool_b`, max_grasp_width_m=0.041), persist Tool B's grasp_setup, and restore Tool A's backup!
+    let mut tool_b = other_tool_cfg();
+    tool_b.active_tool.commissioning_required = false;
+    tool_b.grasp.as_mut().unwrap().max_grasp_width_m = 0.041;
+    std::fs::write(&gs_path, armd::grasp::serialize_setup_for_tool(tool_b.grasp.as_ref().unwrap(), &tool_b.active_tool)).unwrap();
+    let sup_b = Arc::new(ArmSupervisor::new(tool_b.clone()));
+    let backup_name = backup_dir.file_name().unwrap().to_string_lossy().into_owned();
+    let _restored = armd::calibration::restore(&sup_b, &deps, &json!({"backup": backup_name}), &check).await.unwrap();
+    // R4 M7 + R5 M3: Tool B's grasp_setup.json and live max_grasp_width_m MUST keep Tool B's 0.041
+    // AND refresh Tool B's camera-derived fields (fx/fy/cx/cy/table_z_m/camera_tilt_deg/grip_pixel_norm)
+    // in the same restore transaction so backprojection never stays stuck on old intrinsics.
+    let gs_after_restore: Value = serde_json::from_str(&std::fs::read_to_string(&gs_path).unwrap()).unwrap();
+    assert_eq!(gs_after_restore["max_grasp_width_m"], json!(0.041));
+    assert_eq!(gs_after_restore["tool_id"], tool_b.active_tool.id);
+    assert_eq!(gs_after_restore["tool_config_digest"], tool_b.active_tool.config_digest);
+    assert!((gs_after_restore["fx_px"].as_f64().unwrap() - 831.5).abs() < 1e-6, "{gs_after_restore}");
+    assert!((gs_after_restore["fy_px"].as_f64().unwrap() - 829.0).abs() < 1e-6, "{gs_after_restore}");
+    assert!((gs_after_restore["cx_px"].as_f64().unwrap() - 318.2).abs() < 1e-6, "{gs_after_restore}");
+    assert!((gs_after_restore["cy_px"].as_f64().unwrap() - 183.4).abs() < 1e-6, "{gs_after_restore}");
+    assert!((gs_after_restore["table_z_m"].as_f64().unwrap() - 0.012).abs() < 1e-6, "{gs_after_restore}");
+    assert!((gs_after_restore["camera_tilt_deg"].as_f64().unwrap() - (-15.0)).abs() < 1e-4, "{gs_after_restore}");
+    let live_b_gs = sup_b.inner().read().await.grasp_setup().unwrap();
+    assert!((live_b_gs.max_grasp_width_m - 0.041).abs() < 1e-6);
+    assert!((live_b_gs.fx_px - 831.5).abs() < 1e-6);
+    assert!((live_b_gs.fy_px - 829.0).abs() < 1e-6);
+    assert!((live_b_gs.table_z_m - 0.012).abs() < 1e-6);
+
+    // M8 + R5 m3: Startup invalid calibration.json resets grasp_setup camera model back to profile defaults
+    // while preserving active_tool provenance (never dropping tool_id/digest).
+    std::fs::write(&cal_path, "{corrupt json").unwrap();
+    let mut mod_setup = tool_b.grasp.clone().unwrap();
+    mod_setup.fx_px = 831.5; // differs from profile_grasp so reset triggers
+    mod_setup.fy_px = 829.0;
+    std::fs::write(&gs_path, armd::grasp::serialize_setup_for_tool(&mod_setup, &tool_b.active_tool)).unwrap();
+    let sup_boot = Arc::new(ArmSupervisor::new(tool_b.clone()));
+    grasp::load_into(&sup_boot, &gs_path).await;
+    calibration::load_into(&sup_boot, &cal_path, Some(&gs_path)).await.unwrap();
+    let gs_after_reset: Value = serde_json::from_str(&std::fs::read_to_string(&gs_path).unwrap()).unwrap();
+    let default_b_gs = tool_b.grasp.as_ref().unwrap();
+    assert_eq!(gs_after_reset["tool_id"], tool_b.active_tool.id);
+    assert_eq!(gs_after_reset["tool_config_digest"], tool_b.active_tool.config_digest);
+    assert!((gs_after_reset["fx_px"].as_f64().unwrap() - default_b_gs.fx_px).abs() < 1e-6);
+    assert!((gs_after_reset["fy_px"].as_f64().unwrap() - default_b_gs.fy_px).abs() < 1e-6);
+    let live_after_reset = sup_boot.inner().read().await.grasp_setup().unwrap();
+    assert!((live_after_reset.fx_px - default_b_gs.fx_px).abs() < 1e-6);
+    assert!((live_after_reset.fy_px - default_b_gs.fy_px).abs() < 1e-6);
+
+    // M9: Same tool_id (`same_id_tool`) with different tcp_offset produces a different candidate fingerprint
+    // and rejects old hover acceptance.
+    let make_same_id_cfg = |dx: f64| {
+        let pack: ToolPackConfig = serde_json::from_value(json!({
+            "id": "same_id_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [dx, 0.0, 0.0]
+        })).unwrap();
+        let mut c = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack).unwrap();
+        c.active_tool.commissioning_required = false;
+        c
+    };
+    let cfg_dx1 = make_same_id_cfg(0.02);
+    let cfg_dx2 = make_same_id_cfg(0.04);
+    assert_ne!(cfg_dx1.active_tool.config_digest, cfg_dx2.active_tool.config_digest);
+
+    let sup_dx1 = Arc::new(ArmSupervisor::new(cfg_dx1));
+    let sup_dx2 = Arc::new(ArmSupervisor::new(cfg_dx2));
+    let mut dry_body = apply_body.clone();
+    dry_body["dry_run"] = json!(true);
+    let dry1 = armd::calibration::apply(&sup_dx1, &deps, armd::calibration::parse_apply(&dry_body).unwrap(), &check).await.unwrap();
+    let dry2 = armd::calibration::apply(&sup_dx2, &deps, armd::calibration::parse_apply(&dry_body).unwrap(), &check).await.unwrap();
+    let fp1 = dry1["after"]["fingerprint"].as_str().unwrap();
+    let fp2 = dry2["after"]["fingerprint"].as_str().unwrap();
+    assert_ne!(fp1, fp2, "changing tcp_offset for same tool_id must change candidate_fingerprint");
+
+    // Passing fp1's acceptance to cfg_dx2 apply must fail 409 ACCEPTANCE_STALE.
+    let mut acc_body = apply_body;
+    acc_body["acceptance"] = json!({
+        "fingerprint": fp1,
+        "gate_version": 1,
+        "passed": true,
+        "board": {},
+        "points": [],
+        "summary": {"table_z_m": 0.012}
+    });
+    let err = armd::calibration::apply(&sup_dx2, &deps, armd::calibration::parse_apply(&acc_body).unwrap(), &check).await.unwrap_err();
+    assert_eq!(err.code, "ACCEPTANCE_STALE");
+
+    server.abort();
+}
+
+#[test]
+fn r4_m10_effective_envelope_and_table_clearance_include_physical_contact_end_m() {
+    // Non-stock tool declaring physical_contact_end_m=[0.045, 0, 0] with extra_check_points_end_m=[]
+    // and smaller tcp_offset=[0.02, 0, 0] MUST include [0.045, 0, 0] in both effective_tool_envelope_points_end_m()
+    // and workspace check_points_end_m + grasp/place table-clearance envelopes.
+    let pack: ToolPackConfig = serde_json::from_value(json!({
+        "id": "contact_only_tool",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.02, 0.0, 0.0],
+        "armd": {
+            "physical_contact_end_m": [0.045, 0.0, 0.0]
+        }
+    })).unwrap();
+    let mut cfg = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack).unwrap();
+    cfg.active_tool.commissioning_required = false;
+
+    let has_pc = |pts: &[[f32; 3]]| pts.iter().any(|p| (p[0] - 0.045).abs() < 1e-6 && p[1].abs() < 1e-6 && p[2].abs() < 1e-6);
+    assert!(has_pc(&cfg.effective_tool_envelope_points_end_m()));
+    assert!(has_pc(&cfg.workspace.as_ref().unwrap().check_points_end_m));
+
+    let env = grasp::envelope_with_contact(
+        cfg.workspace.as_ref(),
+        &cfg.camera_mount,
+        &kinematics::IDENTITY,
+        cfg.effective_physical_contact_end_m(),
+    );
+    assert!(
+        env.iter().any(|p| (p[0] - 0.045).abs() < 1e-6 && p[1].abs() < 1e-6 && p[2].abs() < 1e-6),
+        "grasp::envelope_with_contact must include physical_contact_end_m"
+    );
+
+    // Verify table-clearance check in place::plan catches a dip of physical_contact_end_m=[0.045, 0, 0]
+    // below table_z_m + TABLE_CLEARANCE_M even when tcp_offset=[0.02, 0, 0] stays above it.
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_down = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    // Pointing straight down (-Z): end_link +x points along -Z.
+    // tcp at z=0.200 -> end_link origin at z=0.220 -> physical_contact_end_m at z = 0.220 - 0.045 = 0.175!
+    // With table_z_m = 0.175 (bound = 0.180), tcp (0.200) clears while physical_contact_end_m (0.175) violates!
+    let end_goal = cfg.tcp_to_end(&Pose::new(r_down, [0.26, 0.0, 0.22]));
+    let sol = cfg.arm_model.solve_dls(&end_goal, &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+    let mut inner = common::sim_at(cfg, &q_start);
+    inner.set_grasp_setup(GraspSetup { table_z_m: 0.175, ..GraspSetup::default() });
+    let pending = armd::place::prepare(
+        &inner,
+        &json!({
+            "position": [0.26, 0.0, 0.20],
+            "orientation": {"rpy": [0.0, std::f64::consts::FRAC_PI_2, 0.0]},
+            "approach_height_m": 0.02,
+        }),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    let err = armd::place::plan(pending).unwrap_err();
+    assert!(
+        matches!(err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "physical_contact_end_m table dip must be caught, got {err:?}"
+    );
+}
+
+#[test]
+fn r5_m1_table_datum_without_workspace_checks_physical_contact_end_m() {
+    // 1. Declaring physical_contact_end_m on a profile without workspace must fail overlay validation.
+    let mut no_ws = ArmConfig::rebot_dm();
+    no_ws.workspace = None;
+    let pc_pack: ToolPackConfig = serde_json::from_value(json!({
+        "id": "contact_no_ws",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.0, 0.0, 0.0],
+        "armd": {
+            "physical_contact_end_m": [0.045, 0.0, 0.0]
+        }
+    })).unwrap();
+    assert!(tool::apply_tool_overlay(&no_ws, &pc_pack).is_err());
+
+    // 2. When a config has table_z datum (grasp_setup) and workspace_policy is None, BOTH place::plan
+    // and grasp::plan still enforce envelope_with_contact table-clearance checks (including physical_contact_end_m).
+    let pack: ToolPackConfig = serde_json::from_value(json!({
+        "id": "contact_only_tool",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.02, 0.0, 0.0],
+        "armd": {
+            "physical_contact_end_m": [0.060, 0.0, 0.0]
+        }
+    })).unwrap();
+    let mut cfg = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack).unwrap();
+    cfg.active_tool.commissioning_required = false;
+    cfg.workspace = None; // simulate missing workspace_policy while table_z datum exists
+
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_down = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    // For place::plan: start at tcp z=0.200 (end z=0.220, contact z=0.160 < 0.180).
+    let end_goal = cfg.tcp_to_end(&Pose::new(r_down, [0.26, 0.0, 0.22]));
+    let sol = cfg.arm_model.solve_dls(&end_goal, &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+    let mut inner = common::sim_at(cfg.clone(), &q_start);
+    inner.set_grasp_setup(GraspSetup { table_z_m: 0.175, ..GraspSetup::default() });
+    assert!(inner.workspace_policy().is_none());
+
+    let pending_place = armd::place::prepare(
+        &inner,
+        &json!({
+            "position": [0.26, 0.0, 0.20],
+            "orientation": {"rpy": [0.0, std::f64::consts::FRAC_PI_2, 0.0]},
+            "approach_height_m": 0.02,
+        }),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    assert!(
+        matches!(armd::place::plan(pending_place).unwrap_err(), ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "place::plan must enforce physical_contact_end_m table clearance even when workspace_policy is None"
+    );
+
+    // For grasp::plan: start higher (end z=0.280, contact z=0.220 > 0.180) looking down at table_z=0.175;
+    // approach_height_m=0.025 puts approach TCP at z=0.200 (clear) while contact [0.06, 0, 0] dips to z=0.160 < 0.180.
+    let mut cfg_grasp = cfg;
+    cfg_grasp.camera_mount.tilt_deg = 0.0;
+    cfg_grasp.camera_mount.q_end_cam = Some(kinematics::r_to_quat(&cfg_grasp.arm_model.cam_mount(false, 0.0, 0.0)));
+    let sol_hi = cfg_grasp.arm_model.solve_dls(&Pose::new(r_down, [0.26, 0.0, 0.28]), &[0.0, -1.167, -1.565, 1.435, 0.0, 0.0], &lo, &hi, kinematics::PAR.w);
+    assert!(sol_hi.ok);
+    let q_hi: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol_hi.q[i] as f32 } else { 0.0 });
+    let mut inner_grasp = common::sim_at(cfg_grasp, &q_hi);
+    inner_grasp.set_grasp_setup(GraspSetup {
+        table_z_m: 0.175,
+        grasp_height_m: 0.005,
+        approach_height_m: 0.025,
+        lift_height_m: 0.05,
+        camera_tilt_deg: 0.0,
+        ..GraspSetup::default()
+    });
+    let pending_grasp = armd::grasp::prepare(
+        &inner_grasp,
+        &json!({
+            "box_norm": [0.45, 0.45, 0.55, 0.55],
+            "label": "part",
+            "frame_id": 1
+        }),
+        inner_grasp.safety.epoch_id(),
+    )
+    .unwrap();
+    assert!(pending_grasp.physical_contact_end_m == Some([0.060, 0.0, 0.0]));
+    let grasp_err = armd::grasp::plan(pending_grasp).err().expect("grasp::plan must reject physical_contact_end_m table dip");
+    assert!(
+        matches!(grasp_err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })),
+        "grasp::plan must enforce physical_contact_end_m table clearance even when workspace_policy is None, got {grasp_err:?}"
+    );
+}
+
+#[tokio::test]
+async fn r5_m4_and_m5_fingertip_digest_binding_and_lateral_tcp_grip_pixel() {
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
+    let vision_vals = Arc::new(Mutex::new(json!({
+        "fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0,
+        "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+        "width": 640, "height": 360
+    })));
+    let vv_g = vision_vals.clone();
+    let vv_p = vision_vals.clone();
+    let mock_vision = axum::Router::new().route(
+        "/api/calibration/intrinsics",
+        get(move || {
+            let vv_g = vv_g.clone();
+            async move {
+                let mut v = vv_g.lock().unwrap().clone();
+                v["revision"] = json!(1);
+                axum::Json(v)
+            }
+        })
+        .put(move |axum::Json(body): axum::Json<Value>| {
+            let vv_p = vv_p.clone();
+            async move {
+                *vv_p.lock().unwrap() = body.clone();
+                let mut out = body;
+                out["revision"] = json!(2);
+                axum::Json(out)
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, mock_vision).await.unwrap() });
+    let up = armd::api::proxy::DetectorUpstream::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+    let deps = armd::calibration::CalibrationDeps::new(cal_path.clone(), Some(gs_path), up);
+    let check: armd::calibration::LeaseCheck = Box::new(|_| Ok(()));
+
+    let mut tool_a = finray_cfg();
+    tool_a.active_tool.commissioning_required = false;
+    let mut tool_b = other_tool_cfg();
+    tool_b.active_tool.commissioning_required = false;
+
+    let sup_b = Arc::new(ArmSupervisor::new(tool_b.clone()));
+    let base_apply = json!({
+        "intrinsics": {"fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0, "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0, "width": 640, "height": 360},
+        "camera_mount": {"offset_m": [-0.0731, 0.0005, 0.066], "q_end_cam": kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0))},
+        "table_z_m": 0.012
+    });
+    let mut dry_b = base_apply.clone();
+    dry_b["dry_run"] = json!(true);
+    let x_fp = armd::calibration::apply(&sup_b, &deps, armd::calibration::parse_apply(&dry_b).unwrap(), &check)
+        .await
+        .unwrap()["after"]["x_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // M4: Stale digest from Tool A OR omitted digest on non-stock Tool B must be rejected with TOOL_STALE.
+    for stale_tool in [
+        json!({"tool_id": tool_a.active_tool.id, "tool_config_digest": tool_a.active_tool.config_digest, "tip_cam_m": [0.0, 0.0, 0.1], "x_fingerprint": x_fp}),
+        json!({"tool_id": tool_b.active_tool.id, "tip_cam_m": [0.0, 0.0, 0.1], "x_fingerprint": x_fp}),
+    ] {
+        let mut body = base_apply.clone();
+        body["tool"] = stale_tool;
+        let err = armd::calibration::apply(&sup_b, &deps, armd::calibration::parse_apply(&body).unwrap(), &check)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, "TOOL_STALE", "stale/omitted tool digest must be rejected: {err:?}");
+        assert!(!cal_path.exists(), "rejected fingertip apply must not persist calibration.json");
+    }
+
+    // Matching Tool B id + digest succeeds.
+    let mut ok_body = base_apply.clone();
+    ok_body["tool"] = json!({
+        "tool_id": tool_b.active_tool.id,
+        "tool_config_digest": tool_b.active_tool.config_digest,
+        "tip_cam_m": [0.0, 0.0, 0.1],
+        "x_fingerprint": x_fp
+    });
+    let ok_res = armd::calibration::apply(&sup_b, &deps, armd::calibration::parse_apply(&ok_body).unwrap(), &check)
+        .await
+        .unwrap();
+    assert_eq!(ok_res["calibration"]["tool"]["tool_config_digest"], tool_b.active_tool.config_digest);
+    // m1: GET /api/v1/calibration status includes active_tool with config_digest.
+    let status_val = armd::calibration::status(&sup_b, &deps).await;
+    assert_eq!(status_val["active_tool"]["id"], tool_b.active_tool.id);
+    assert_eq!(status_val["active_tool"]["config_digest"], tool_b.active_tool.config_digest);
+
+    // M5: Lateral tcp_offset (y != 0) shifts grip_pixel_norm horizontally relative to y = 0.
+    let make_lat_cfg = |dy: f64| {
+        let pack: ToolPackConfig = serde_json::from_value(json!({
+            "id": "lat_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.02, dy, 0.0]
+        })).unwrap();
+        let mut c = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack).unwrap();
+        c.active_tool.commissioning_required = false;
+        c
+    };
+    let sup_c0 = Arc::new(ArmSupervisor::new(make_lat_cfg(0.0)));
+    let sup_cy = Arc::new(ArmSupervisor::new(make_lat_cfg(0.03)));
+    let d0 = armd::calibration::apply(&sup_c0, &deps, armd::calibration::parse_apply(&dry_b).unwrap(), &check).await.unwrap();
+    let dy = armd::calibration::apply(&sup_cy, &deps, armd::calibration::parse_apply(&dry_b).unwrap(), &check).await.unwrap();
+    let gp0 = d0["after"]["grip_pixel_model"].as_array().unwrap();
+    let gpy = dy["after"]["grip_pixel_model"].as_array().unwrap();
+    assert!(
+        (gpy[0].as_f64().unwrap() - gp0[0].as_f64().unwrap()).abs() > 0.02,
+        "lateral tcp_offset must shift grip_pixel_model: gp0={gp0:?} gpy={gpy:?}"
+    );
+    let stored_y = dy["after"]["grasp"]["grip_pixel_norm"].as_array().unwrap();
+    assert!((stored_y[0].as_f64().unwrap() - gpy[0].as_f64().unwrap()).abs() < 1e-6);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn r6_m4_startup_tool_swap_syncs_shared_camera_calibration_into_new_tool_grasp_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    let mut tool_a = finray_cfg();
+    tool_a.active_tool.commissioning_required = false;
+    let mut gs_a = tool_a.grasp.clone().unwrap();
+    gs_a.fx_px = 700.0;
+    gs_a.max_grasp_width_m = 0.071;
+    std::fs::write(&gs_path, armd::grasp::serialize_setup_for_tool(&gs_a, &tool_a.active_tool)).unwrap();
+
+    // Shared camera calibration (intrinsics + mount + camera table_z_m), plus Tool A's fingertip record.
+    let q_tilt15 = kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0));
+    let shared_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": [-0.0725, 0.0010, 0.0650],
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {
+            "fx": 835.0,
+            "fy": 833.0,
+            "cx": 319.0,
+            "cy": 181.0,
+            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            "width": 640, "height": 360
+        },
+        "table_z_m": 0.014,
+        "table_z_source": "camera",
+        "tool": {
+            "tool_id": tool_a.active_tool.id,
+            "tool_config_digest": tool_a.active_tool.config_digest,
+            "tip_cam_m": [0.0, 0.0, 0.1],
+            "x_fingerprint": "old_xf",
+            "measured_at": "2026-11-22T00:00:00Z"
+        }
+    })).unwrap();
+    std::fs::write(&cal_path, serde_json::to_string_pretty(&shared_cal).unwrap()).unwrap();
+
+    // Boot under Tool B (with lateral tcp_offset so grip_pixel_norm_for_tcp differs from [0,0,0]).
+    let lat_pack: ToolPackConfig = serde_json::from_value(json!({
+        "id": "tool_b_lat",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.025, 0.030, 0.0],
+        "armd": {
+            "gripper_policy": {
+                "jaw_opening_nominal": [[-5.7, 0.041], [0.0, 0.0]]
+            },
+            "grasp": {
+                "max_grasp_width_m": 0.041
+            }
+        }
+    })).unwrap();
+    let tool_b = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &lat_pack).unwrap();
+    let sup_b = Arc::new(ArmSupervisor::new(tool_b.clone()));
+
+    grasp::load_into(&sup_b, &gs_path).await;
+    calibration::load_into(&sup_b, &cal_path, Some(&gs_path)).await.unwrap();
+
+    let live_b = sup_b.inner().read().await.grasp_setup().unwrap();
+    assert!((live_b.max_grasp_width_m - 0.041).abs() < 1e-6, "Tool B grasp width must stay 0.041");
+    assert!((live_b.fx_px - 835.0).abs() < 1e-6, "fx_px must sync from shared calibration");
+    assert!((live_b.fy_px - 833.0).abs() < 1e-6, "fy_px must sync from shared calibration");
+    assert_eq!(live_b.cx_px, Some(319.0));
+    assert_eq!(live_b.cy_px, Some(181.0));
+    assert!((live_b.table_z_m - 0.014).abs() < 1e-6, "table_z_m must sync from shared camera calibration");
+    assert!((live_b.camera_tilt_deg - (-15.0)).abs() < 1e-3);
+
+    let mount_b = sup_b.inner().read().await.config.camera_mount.clone();
+    let arm_b = sup_b.inner().read().await.config.arm_model.clone();
+    let cam_b = grasp::CamModel::assumed(&arm_b, &live_b, &mount_b);
+    let expected_gp = calibration::grip_pixel_norm_for_tcp(&cam_b, &live_b, &tool_b.tcp_offset).unwrap();
+    assert!(
+        (live_b.grip_pixel_norm[0] - expected_gp[0]).abs() < 1e-6
+            && (live_b.grip_pixel_norm[1] - expected_gp[1]).abs() < 1e-6,
+        "grip_pixel_norm={:?} expected={expected_gp:?}",
+        live_b.grip_pixel_norm
+    );
+    assert!(sup_b.inner().read().await.calibration.as_ref().unwrap().tool.is_none());
+}
+
+#[test]
+fn r6_m5_calib_hover_enforces_commissioning_linear_and_angular_speed_caps() {
+    let mut cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    let mut inner = common::sim_at(cfg.clone(), &INSPECT);
+
+    let body = json!({
+        "candidate_fingerprint": "fp-hover-comm",
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
+        "approach_speed_mps": 0.05,
+        "descent_speed_mps": 0.015,
+        "points": [{
+            "id": "p0",
+            "approach_m": [0.28, 0.0, 0.14],
+            "hover_m": [0.28, 0.0, 0.05]
+        }]
+    });
+    let plan = armd::calib_hover::prepare(&inner, &body, inner.safety.epoch_id()).unwrap();
+    assert!(
+        plan.job.params.approach_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9,
+        "uncommissioned approach_speed_mps={} exceeded 0.03",
+        plan.job.params.approach_speed_mps
+    );
+    assert!(
+        plan.job.params.descent_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9,
+        "uncommissioned descent_speed_mps={} exceeded 0.03",
+        plan.job.params.descent_speed_mps
+    );
+    assert!(
+        plan.angular_speed_rps <= armd::calib_hover::COMMISSIONING_MAX_ANGULAR_RPS + 1e-9,
+        "uncommissioned angular_speed_rps={} exceeded 0.2",
+        plan.angular_speed_rps
+    );
+
+    // Resume of a previously saved fast job while still uncommissioned must also enforce the caps.
+    let mut fast_job = plan.job.clone();
+    fast_job.id = "hv-resume-comm".into();
+    fast_job.params.approach_speed_mps = 0.05;
+    fast_job.state = "failed".into();
+    inner.hover_jobs.push(fast_job);
+    let resumed = armd::calib_hover::prepare(
+        &inner,
+        &json!({"resume": "hv-resume-comm", "candidate_fingerprint": "fp-hover-comm"}),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    assert!(resumed.job.params.approach_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9);
+    assert!(resumed.angular_speed_rps <= armd::calib_hover::COMMISSIONING_MAX_ANGULAR_RPS + 1e-9);
+
+    // Once commissioned, full configured speeds are allowed.
+    cfg.active_tool.commissioning_required = false;
+    let inner_ok = common::sim_at(cfg, &INSPECT);
+    let plan_ok = armd::calib_hover::prepare(&inner_ok, &body, inner_ok.safety.epoch_id()).unwrap();
+    assert!((plan_ok.job.params.approach_speed_mps - 0.05).abs() < 1e-9);
+    assert!((plan_ok.angular_speed_rps - armd::motion::DEFAULT_ANGULAR_RPS).abs() < 1e-9);
+}
+
+#[test]
+fn r7_m5_calib_hover_backlash_quintic_segment_respects_commissioning_caps() {
+    let mut cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    cfg.backlash_approach = Some(armd::backlash::BacklashApproach {
+        enabled: true,
+        applies_to: vec!["move_to_precise".into()],
+        delta_deg: 2.5,
+        speed_rad_s: 0.5,
+        joints: None,
+    });
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_down = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    let p_approach = [0.28, 0.0, 0.14];
+    let p_hover = [0.28, 0.0, 0.10];
+    let q_seed: [f64; 6] = std::array::from_fn(|i| f64::from(INSPECT[i]));
+    let sol = cfg.arm_model.solve_dls(&Pose::new(r_down, p_approach), &q_seed, &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+    let mut inner = common::sim_at(cfg.clone(), &q_start);
+
+    let input = inner.plan_input().unwrap();
+    let speed = Speed { linear: 0.015, angular: 0.2 };
+    let (goal, opts) = armd::motion::resolve_goal_opts(&input, &GoalSpec::Absolute { p: p_hover, r: Some(r_down) });
+    let direct = armd::motion::plan_cartesian_opts(&input, goal, speed, opts).unwrap();
+    let plan = inner.approach_plan("move_to_precise", backlash::Request::Profile).unwrap();
+    let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&DescentRules::tcp()), speed, opts);
+    let id = inner.begin_orchestrated_action("calib_hover", None, inner.safety.epoch_id()).unwrap();
+    let _dur = inner.install_macro_path_same_side_with_rules(id, &input, direct, pre, Some(&plan), Some(&DescentRules::tcp())).unwrap();
+
+    let active = inner.active_trajectory.as_ref().expect("active trajectory");
+    let seg = active.then.as_ref().expect("backlash quintic segment");
+    let dt = 0.005;
+    let n = ((seg.duration / dt).ceil() as usize).max(2);
+    let mut prev_tcp = cfg.arm_model.fk_f32(&seg.sample(0.0).positions).map(|e| cfg.end_to_tcp(&e).p);
+    for k in 1..=n {
+        let t = (k as f64 * dt).min(seg.duration);
+        let pt = seg.sample(t);
+        for j in 0..6 {
+            assert!(
+                pt.velocities[j].abs() <= 0.2 + 1e-4,
+                "R7 M5: backlash quintic joint {j} vel {} exceeded 0.2 rad/s at t={t:.3}",
+                pt.velocities[j]
+            );
+        }
+        let cur_tcp = cfg.arm_model.fk_f32(&pt.positions).map(|e| cfg.end_to_tcp(&e).p);
+        if let (Some(p0), Some(p1)) = (prev_tcp, cur_tcp) {
+            let tcp_mps = kinematics::norm(&kinematics::sub(&p1, &p0)) / dt;
+            assert!(
+                tcp_mps <= 0.03 + 1e-3,
+                "R7 M5: backlash quintic TCP speed {tcp_mps:.4} m/s exceeded 0.03 m/s at t={t:.3}"
+            );
+        }
+        prev_tcp = cur_tcp;
+    }
+}
+
+#[tokio::test]
+async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    // M6: Invalid persisted intrinsics (fx=0) during the startup camera sync do not stop the
+    // start: the setup is synced without them and stays valid.
+    let q_tilt15 = kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0));
+    let bad_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": [-0.0725, 0.0010, 0.0650],
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {"fx": 0.0, "fy": 830.0, "cx": 320.0, "cy": 180.0},
+        "table_z_m": 0.014,
+        "joint_zero": {
+            "joints": [
+                {"offset_rad": 0.05}, {"offset_rad": 0.0}, {"offset_rad": 0.0},
+                {"offset_rad": 0.0}, {"offset_rad": 0.0}, {"offset_rad": 0.0}, {"offset_rad": 0.0}
+            ],
+            "method": "software",
+            "set_at": "2026-11-22T00:00:00Z"
+        }
+    })).unwrap();
+    std::fs::write(&cal_path, serde_json::to_string_pretty(&bad_cal).unwrap()).unwrap();
+
+    let tool_b = other_tool_cfg();
+    let orig_mount = tool_b.camera_mount.clone();
+    let orig_dof = tool_b.dof;
+    let sup_bad = Arc::new(ArmSupervisor::new(tool_b));
+    grasp::load_into(&sup_bad, &gs_path).await; // Missing -> sets grasp_setup_needs_camera_sync=true
+    calibration::load_into(&sup_bad, &cal_path, Some(&gs_path)).await.expect("invalid intrinsics must not stop the start");
+    {
+        let inner = sup_bad.inner().read().await;
+        assert_ne!(inner.config.camera_mount, orig_mount, "M6: the calibrated mount is installed");
+        assert_eq!(inner.joint_zero_offsets.len(), orig_dof);
+        assert!(!inner.grasp_setup_needs_camera_sync);
+        assert!(inner.calibration.is_some());
+        let g = inner.grasp_setup().unwrap();
+        assert!(g.validate().is_ok() && g.fx_px > 10.0, "fx 0 is not synced: {}", g.fx_px);
+        assert_eq!(g.table_z_m, 0.014, "the rest of the sync is applied");
+    }
+
+    // M7: Legacy unkeyed stock AcceptanceRecord (no tool_id/tool_config_digest, pre-tool-pack fingerprint)
+    // stays valid on stock active tool (preserving calibrated floor_z_m), while non-stock rejects it.
+    let mut stock_cfg = ArmConfig::rebot_dm();
+    stock_cfg.camera_mount.q_end_cam = Some(q_tilt15);
+    stock_cfg.validate().unwrap();
+    let x_fp = calibration::x_fingerprint(Some(&json!({"fx": 824.0})), &stock_cfg.camera_mount);
+    let legacy_fp = calibration::legacy_fingerprint(&x_fp, None, &vec![0.0; stock_cfg.dof], None, None);
+    let legacy_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": stock_cfg.camera_mount.offset_m,
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {"fx": 824.0},
+        "table_z_m": 0.025,
+        "table_z_source": "hover",
+        "acceptance": {
+            "fingerprint": legacy_fp,
+            "gate_version": 1,
+            "passed": true,
+            "measured_at": "2026-11-22T00:00:00Z",
+            "board": {},
+            "points": [],
+            "summary": {"table_z_m": 0.025}
+        }
+    })).unwrap();
+    let mut sup_stock = common::sim_at(stock_cfg.clone(), &INSPECT);
+    sup_stock.set_calibration(Some(legacy_cal.clone()));
+    assert_eq!(sup_stock.floor_source, "calibration_hover", "stock device must keep legacy hover floor");
+    let expected_stock_floor = (0.025 - 0.003) as f32;
+    assert!(
+        (sup_stock.config.workspace.as_ref().unwrap().floor_z_m - expected_stock_floor).abs() < 1e-6,
+        "stock calibrated hover floor must be preserved"
+    );
+
+    // R8 m2: calibration::apply dry_run `before.floor` must also honor the legacy stock hover floor.
+    {
+        let vision_app = axum::Router::new().route(
+            "/api/calibration/intrinsics",
+            axum::routing::get(|| async {
+                axum::Json(json!({
+                    "fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0,
+                    "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+                    "width": 640, "height": 360, "marker_size": 0.05, "revision": 1
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move { axum::serve(listener, vision_app).await.unwrap() });
+        let up = armd::api::proxy::DetectorUpstream::parse(&url).unwrap();
+        let deps = calibration::CalibrationDeps::new(dir.path().join("dry_cal.json"), None, up);
+        let sup_arc = Arc::new(ArmSupervisor::new(stock_cfg.clone()));
+        sup_arc.inner().write().await.set_calibration(Some(legacy_cal.clone()));
+        let mut intrinsics = serde_json::Map::new();
+        intrinsics.insert("fx".into(), json!(824.0));
+        intrinsics.insert("fy".into(), json!(824.0));
+        intrinsics.insert("cx".into(), json!(320.0));
+        intrinsics.insert("cy".into(), json!(180.0));
+        let req = calibration::ApplyRequest {
+            intrinsics,
+            offset_m: stock_cfg.camera_mount.offset_m.unwrap_or([0.0; 3]),
+            q_end_cam: q_tilt15,
+            table_z_m: 0.025,
+            rms: None,
+            solved_at: None,
+            dry_run: true,
+            kinematics: None,
+            table_z_source: "camera".to_string(),
+            tool: None,
+            acceptance: None,
+        };
+        let check: calibration::LeaseCheck = Box::new(|_| Ok(()));
+        let dry = calibration::apply(&sup_arc, &deps, req, &check).await.unwrap();
+        srv.abort();
+        assert_eq!(dry["before"]["floor"]["source"], "calibration_hover", "{dry}");
+        assert!(
+            (dry["before"]["floor"]["effective_floor_z_m"].as_f64().unwrap() - f64::from(expected_stock_floor)).abs() < 1e-6,
+            "{dry}"
+        );
+    }
+
+    // Non-stock tool must still reject legacy fingerprint even if acceptance record had no tool_id.
+    let mut fin = finray_cfg();
+    fin.camera_mount.q_end_cam = Some(q_tilt15);
+    let (_, fin_fp) = calibration::file_fingerprints(
+        Some(&legacy_cal),
+        &fin.camera_mount,
+        &vec![0.0; fin.dof],
+        Some(&fin.active_tool.config_digest),
+    );
+    let (fin_floor, fin_src, _) = calibration::effective_floor_for_with_legacy(
+        0.0,
+        Some(&legacy_cal),
+        &fin_fp,
+        Some(&legacy_fp),
+        &fin.active_tool,
+    );
+    assert_eq!((fin_floor, fin_src), (0.0, "profile"));
+}

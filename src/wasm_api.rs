@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::collision::{CollisionGuard, CollisionPolicy, Sensitivity};
 use crate::kinematics::{self as k, Mat3};
 use crate::model::{ArmConfig, FollowingErrorPolicy, KeepoutBox};
-use crate::motion::{self, GoalSpec, JointPath, MotionError, PlanInput, Speed};
+use crate::motion::{self, GoalFrame, GoalSpec, JointPath, MotionError, PlanInput, Speed};
 use crate::torque_guard::TorqueGuard;
 
 const MAX_PATHS: usize = 32;
@@ -26,8 +26,14 @@ enum Request {
         boxes: Vec<KeepoutBox>,
     },
     SetToolEnvelope {
-        tcp_offset: [f64; 3],
-        extra_check_points_end_m: Vec<[f32; 3]>,
+        #[serde(default)]
+        tcp_offset: Option<[f64; 3]>,
+        #[serde(default)]
+        extra_check_points_end_m: Option<Vec<[f32; 3]>>,
+        #[serde(default)]
+        permanent_tool_check_points_end_m: Option<Vec<[f32; 3]>>,
+        #[serde(default)]
+        transient_payload_check_points_end_m: Option<Vec<[f32; 3]>>,
     },
     FkPose {
         q_motor: [f64; 6],
@@ -66,6 +72,11 @@ enum Request {
         tool_manifest: Option<Box<crate::mjcf_compose::ToolManifest>>,
         tool_xml: Option<String>,
         tool_preset: Option<String>,
+    },
+    ResolveToolConfig {
+        manifest: Box<crate::tool::ToolPackConfig>,
+        #[serde(default)]
+        robot_id: Option<String>,
     },
 }
 
@@ -156,9 +167,6 @@ impl FollowingErrorMonitor {
 struct WasmEngine {
     config: ArmConfig,
     profile_keepouts: Vec<KeepoutBox>,
-    base_check_points: Vec<[f32; 3]>,
-    extra_check_points: Vec<[f32; 3]>,
-    tcp_offset: [f64; 3],
     generation: u64,
     workspace_revision: u64,
     next_path_id: u64,
@@ -172,22 +180,16 @@ struct WasmEngine {
 
 impl Default for WasmEngine {
     fn default() -> Self {
-        let config = ArmConfig::rebot_dm();
+        let mut config = ArmConfig::rebot_dm();
+        let _ = config.validate();
         Self {
             profile_keepouts: config
                 .workspace
                 .as_ref()
                 .map(|w| w.keepout_boxes.clone())
                 .unwrap_or_default(),
-            base_check_points: config
-                .workspace
-                .as_ref()
-                .map(|w| w.check_points_end_m.clone())
-                .unwrap_or_default(),
             collision: CollisionGuard::from_policy(&config.collision.unwrap_or_default()),
             config,
-            extra_check_points: Vec::new(),
-            tcp_offset: [0.0; 3],
             generation: 0,
             workspace_revision: 0,
             next_path_id: 1,
@@ -312,14 +314,7 @@ impl WasmEngine {
                     .as_ref()
                     .map(|w| w.keepout_boxes.clone())
                     .unwrap_or_default();
-                self.base_check_points = config
-                    .workspace
-                    .as_ref()
-                    .map(|w| w.check_points_end_m.clone())
-                    .unwrap_or_default();
                 self.config = config;
-                self.extra_check_points.clear();
-                self.tcp_offset = [0.0; 3];
                 self.generation += 1;
                 self.invalidate_paths();
                 self.reset_guards();
@@ -365,35 +360,95 @@ impl WasmEngine {
             Request::SetToolEnvelope {
                 tcp_offset,
                 extra_check_points_end_m,
+                permanent_tool_check_points_end_m,
+                transient_payload_check_points_end_m,
             } => {
-                finite(&tcp_offset, "tcp_offset")?;
-                for p in &extra_check_points_end_m {
-                    finite_f32(p, "extra_check_points_end_m")?;
+                if let Some(off) = &tcp_offset {
+                    finite(off, "tcp_offset")?;
+                }
+                for (name, pts_opt) in [
+                    ("extra_check_points_end_m", &extra_check_points_end_m),
+                    ("permanent_tool_check_points_end_m", &permanent_tool_check_points_end_m),
+                    ("transient_payload_check_points_end_m", &transient_payload_check_points_end_m),
+                ] {
+                    if let Some(pts) = pts_opt {
+                        for p in pts {
+                            finite_f32(p, name)?;
+                        }
+                    }
                 }
                 if self.config.kinematics.is_none() || self.config.workspace.is_none() {
                     return Err(MotionError::Unsupported(
                         "tool envelope needs kinematics and a workspace".into(),
                     ));
                 }
-                let mut points = self.base_check_points.clone();
-                for point in &extra_check_points_end_m {
-                    if !points.contains(point) {
-                        points.push(*point);
-                    }
+                if self.config.active_tool.is_stock
+                    && permanent_tool_check_points_end_m
+                        .as_ref()
+                        .is_some_and(|p| !p.is_empty())
+                    && tcp_offset.is_none()
+                {
+                    return Err(MotionError::InvalidCommand(
+                        "switching from stock to non-stock custom_envelope with permanent_tool_check_points_end_m requires explicit tcp_offset".into(),
+                    ));
                 }
                 let mut candidate = self.config.clone();
+                if let Some(off) = tcp_offset {
+                    candidate.tcp_offset = off;
+                }
+                if let Some(perm) = permanent_tool_check_points_end_m {
+                    candidate.permanent_tool_check_points_end_m = perm;
+                }
+                if let Some(payload) = transient_payload_check_points_end_m {
+                    candidate.transient_payload_check_points_end_m = payload;
+                } else if let Some(extra) = extra_check_points_end_m {
+                    candidate.transient_payload_check_points_end_m = extra;
+                }
                 candidate
-                    .workspace
-                    .as_mut()
-                    .expect("workspace checked")
-                    .check_points_end_m = points;
+                    .rebuild_effective_check_points()
+                    .map_err(MotionError::InvalidCommand)?;
+                if candidate.tcp_offset != [0.0; 3] || !candidate.permanent_tool_check_points_end_m.is_empty() {
+                    let robot_id = candidate
+                        .profile_id
+                        .as_deref()
+                        .and_then(crate::tool::normalize_robot_id)
+                        .unwrap_or("unknown");
+                    let (max_w, grasp_h) = crate::tool::baseline_grasp_limits(&candidate);
+                    let edge_to_low = candidate.calibration_tool.as_ref().and_then(|c| c.edge_to_low_m);
+                    candidate.active_tool = crate::tool::ActiveToolInfo {
+                        schema_version: 1,
+                        id: "custom_envelope".into(),
+                        is_stock: false,
+                        kind: "gripper".into(),
+                        tcp_offset_m: candidate.tcp_offset,
+                        config_digest: crate::tool::compute_tool_config_digest(
+                            robot_id,
+                            "custom_envelope",
+                            "gripper",
+                            candidate.tcp_offset,
+                            &candidate.permanent_tool_check_points_end_m,
+                            candidate.physical_contact_end_m,
+                            candidate.contact_opening_m,
+                            None,
+                            candidate.gripper_policy.as_ref(),
+                            max_w,
+                            grasp_h,
+                            edge_to_low,
+                        ),
+                        pack_digest: None,
+                        commissioning_required: false,
+                    };
+                } else {
+                    candidate.active_tool = crate::tool::stock_active_tool_info(&candidate);
+                }
                 candidate.validate().map_err(MotionError::InvalidCommand)?;
-                if self.tcp_offset != tcp_offset
-                    || self.extra_check_points != extra_check_points_end_m
+                if self.config.tcp_offset != candidate.tcp_offset
+                    || self.config.permanent_tool_check_points_end_m != candidate.permanent_tool_check_points_end_m
+                    || self.config.transient_payload_check_points_end_m != candidate.transient_payload_check_points_end_m
+                    || self.config.workspace.as_ref().map(|w| &w.check_points_end_m)
+                        != candidate.workspace.as_ref().map(|w| &w.check_points_end_m)
                 {
                     self.config = candidate;
-                    self.tcp_offset = tcp_offset;
-                    self.extra_check_points = extra_check_points_end_m;
                     self.invalidate_paths();
                 }
                 Ok(json!({"ok": true, "workspace_revision": self.workspace_revision}))
@@ -403,10 +458,12 @@ impl WasmEngine {
                 include_tool_tcp,
             } => {
                 finite(&q_motor, "q_motor")?;
-                let mut pose = self.config.arm_model.fk(&q_motor);
-                if include_tool_tcp.unwrap_or(false) {
-                    pose.p = k::add(&pose.p, &k::mat_vec(&pose.r, &self.tcp_offset));
-                }
+                let end = self.config.arm_model.fk(&q_motor);
+                let pose = if include_tool_tcp.unwrap_or(false) {
+                    self.config.end_to_tcp(&end)
+                } else {
+                    end
+                };
                 Ok(
                     json!({"ok": true, "xyz": pose.p, "rpy": k::r_to_rpy(&pose.r), "rot_mat": pose.r}),
                 )
@@ -433,6 +490,11 @@ impl WasmEngine {
                 if !scale.is_finite() || scale <= 0.0 {
                     return invalid("speed_scale must be positive and finite");
                 }
+                let goal_frame = if include_tool_tcp.unwrap_or(false) {
+                    GoalFrame::Tcp
+                } else {
+                    GoalFrame::EndLink
+                };
                 let input = PlanInput {
                     q0: q0_motor,
                     j7,
@@ -444,6 +506,8 @@ impl WasmEngine {
                     epoch: self.generation,
                     workspace_revision: self.workspace_revision,
                     power: self.config.power_budget.clone(),
+                    tcp_offset: self.config.tcp_offset,
+                    goal_frame,
                 };
                 let r = goal.orientation()?;
                 let spec = match auto_yaw {
@@ -454,21 +518,15 @@ impl WasmEngine {
                     },
                     None => GoalSpec::Absolute { p: goal.xyz, r },
                 };
-                let (mut target, mut yaw_free) = motion::resolve_goal_ex(&input, &spec);
-                if include_tool_tcp.unwrap_or(false) && self.tcp_offset != [0.0; 3] {
-                    target.p = k::sub(&target.p, &k::mat_vec(&target.r, &self.tcp_offset));
-                    // A free-yaw IK solution can rotate the TCP offset away from the
-                    // requested point. Resolve auto-yaw first, then constrain that rotation.
-                    yaw_free = false;
-                }
-                let path = motion::plan_cartesian_ex(
+                let (target, opts) = motion::resolve_goal_opts(&input, &spec);
+                let path = motion::plan_cartesian_opts(
                     &input,
                     target,
                     Speed {
                         linear: speed_mps.unwrap_or(motion::DEFAULT_LINEAR_MPS) * scale,
                         angular: angular_rps.unwrap_or(motion::DEFAULT_ANGULAR_RPS),
                     },
-                    yaw_free,
+                    opts,
                 )?;
                 let id = self.next_path_id;
                 self.next_path_id += 1;
@@ -517,10 +575,11 @@ impl WasmEngine {
                         "workspace check is disabled".into(),
                     ));
                 };
-                let violation = self.config.arm_model.workspace_violation(
+                let violation = self.config.arm_model.workspace_violation_with_tcp(
                     &q_motor,
                     ws,
                     &self.config.camera_mount,
+                    self.config.tcp_offset,
                 );
                 Ok(json!({"ok": true, "violation_total": violation.total,
                     "violated": violation.total > k::WORKSPACE_EPS,
@@ -577,6 +636,15 @@ impl WasmEngine {
                 )
                 .map_err(MotionError::InvalidCommand)?;
                 Ok(json!({"ok": true, "xml": xml}))
+            }
+            Request::ResolveToolConfig { manifest, robot_id } => {
+                let summary = crate::tool::resolve_tool_config_summary(
+                    &manifest,
+                    robot_id.as_deref(),
+                )
+                .map_err(MotionError::InvalidCommand)?;
+                serde_json::to_value(summary)
+                    .map_err(|e| MotionError::InvalidCommand(e.to_string()))
             }
         }
     }
@@ -801,8 +869,21 @@ mod tests {
         ok(json!({"op":"init_profile", "robot":"b601dm"}))
     }
 
-    fn init_config(config: ArmConfig) -> Value {
-        ok(json!({"op":"init_profile", "config_json":config}))
+    fn init_config(mut config: ArmConfig) -> Value {
+        config.validate().unwrap();
+        ENGINE.with(|e| {
+            let mut eng = e.borrow_mut();
+            eng.profile_keepouts = config
+                .workspace
+                .as_ref()
+                .map(|w| w.keepout_boxes.clone())
+                .unwrap_or_default();
+            eng.config = config;
+            eng.generation += 1;
+            eng.invalidate_paths();
+            eng.reset_guards();
+        });
+        json!({"ok": true})
     }
 
     fn xyz(value: &Value) -> [f64; 3] {
@@ -1121,7 +1202,7 @@ mod tests {
         );
         assert_code(
             call(json!({"op":"set_tool_envelope","tcp_offset":[0.2,0.0,0.0],
-            "extra_check_points_end_m":(0..20).map(|i| [0.0,0.3,i as f32 * 0.01]).collect::<Vec<_>>()})),
+            "extra_check_points_end_m":(0..30).map(|i| [0.0,0.3,i as f32 * 0.01]).collect::<Vec<_>>()})),
             "INVALID_COMMAND",
         );
         assert_eq!(pose(true), original, "invalid envelope must not update TCP");
@@ -1175,7 +1256,7 @@ mod tests {
         ENGINE.with(|e| {
             let engine = e.borrow();
             let points = &engine.config.workspace.as_ref().unwrap().check_points_end_m;
-            assert_eq!(points, &vec![base[0], [0.02, 0.03, 0.04]]);
+            assert_eq!(points, &vec![base[0], [0.03, 0.0, 0.0], [0.02, 0.03, 0.04]]);
         });
         ok(
             json!({"op":"set_tool_envelope","tcp_offset":[0.0,0.0,0.0],"extra_check_points_end_m":[]}),
@@ -1271,5 +1352,245 @@ mod tests {
         assert_eq!(response["power_scale"], path.power_scale);
         let last: [f32; 7] = serde_json::from_value(response["last_q"].clone()).unwrap();
         assert_eq!(last, path.last());
+    }
+
+    #[test]
+    fn four_layer_envelope_and_tcp_only_floor_and_payload_lifecycle() {
+        // Start with permanent tool envelope points + nonzero tcp_offset via apply_tool_overlay.
+        let base_cfg = ArmConfig::rebot_dm();
+        let base_count = base_cfg.workspace.as_ref().unwrap().check_points_end_m.len();
+        let pack: crate::tool::ToolPackConfig = serde_json::from_value(json!({
+            "id": "perm_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.05, 0.0, 0.0],
+            "armd": {
+                "extra_check_points_end_m": [[0.02, 0.04, 0.01]]
+            }
+        }))
+        .unwrap();
+        let config = crate::tool::apply_tool_overlay(&base_cfg, &pack).unwrap();
+        assert_eq!(
+            config.workspace.as_ref().unwrap().check_points_end_m.len(),
+            base_count + 2
+        );
+        init_config(config);
+
+        // Attach a transient payload, then detach it (`extra_check_points_end_m: []`);
+        // permanent tool check points AND tcp_offset must remain intact!
+        let payload_pt = [0.0, 0.15, 0.0];
+        let attached = ok(json!({
+            "op": "set_tool_envelope",
+            "extra_check_points_end_m": [payload_pt]
+        }));
+        assert_eq!(attached["ok"], true);
+        ENGINE.with(|e| {
+            let eng = e.borrow();
+            assert_eq!(eng.config.tcp_offset, [0.05, 0.0, 0.0]);
+            assert_eq!(
+                eng.config.permanent_tool_check_points_end_m,
+                vec![[0.02, 0.04, 0.01]]
+            );
+            assert_eq!(eng.config.transient_payload_check_points_end_m, vec![payload_pt]);
+            assert_eq!(
+                eng.config.workspace.as_ref().unwrap().check_points_end_m.len(),
+                base_count + 3
+            );
+        });
+        let detached = ok(json!({
+            "op": "set_tool_envelope",
+            "extra_check_points_end_m": []
+        }));
+        assert_eq!(detached["ok"], true);
+        ENGINE.with(|e| {
+            let eng = e.borrow();
+            assert_eq!(eng.config.tcp_offset, [0.05, 0.0, 0.0]);
+            assert_eq!(
+                eng.config.permanent_tool_check_points_end_m,
+                vec![[0.02, 0.04, 0.01]]
+            );
+            assert!(eng.config.transient_payload_check_points_end_m.is_empty());
+            assert_eq!(
+                eng.config.workspace.as_ref().unwrap().check_points_end_m.len(),
+                base_count + 2
+            );
+        });
+
+        // TCP-offset-only floor rejection: bare base check_points clear floor_z, while
+        // tcp_offset extending downward breaks floor_z even with extra_check_points_end_m = [].
+        let mut bare_cfg = ArmConfig::rebot_dm();
+        // Keep only origin in base check points so ONLY tcp_offset extends downward.
+        bare_cfg.workspace.as_mut().unwrap().check_points_end_m = vec![[0.0, 0.0, 0.0]];
+        bare_cfg.base_check_points_end_m = vec![[0.0, 0.0, 0.0]];
+        let end_pose = bare_cfg.arm_model.fk(&INSPECT);
+        // Set floor_z just 1 cm below end_link, while tcp_offset puts TCP 3 cm below end_link.
+        let r = end_pose.r;
+        let down_in_end = k::mat_vec(&k::transpose(&r), &[0.0, 0.0, -0.04]);
+        bare_cfg.workspace.as_mut().unwrap().floor_z_m = (end_pose.p[2] - 0.01) as f32;
+        bare_cfg.tcp_offset = down_in_end;
+        bare_cfg.rebuild_effective_check_points().unwrap();
+        let robot_id = bare_cfg
+            .profile_id
+            .as_deref()
+            .and_then(crate::tool::normalize_robot_id)
+            .unwrap_or("unknown");
+        let (max_w, grasp_h) = crate::tool::baseline_grasp_limits(&bare_cfg);
+        bare_cfg.active_tool = crate::tool::ActiveToolInfo {
+            schema_version: 1,
+            id: "tcp_only_test".into(),
+            is_stock: false,
+            kind: "gripper".into(),
+            tcp_offset_m: bare_cfg.tcp_offset,
+            config_digest: crate::tool::compute_tool_config_digest(
+                robot_id,
+                "tcp_only_test",
+                "gripper",
+                bare_cfg.tcp_offset,
+                &bare_cfg.permanent_tool_check_points_end_m,
+                bare_cfg.physical_contact_end_m,
+                bare_cfg.contact_opening_m,
+                None,
+                bare_cfg.gripper_policy.as_ref(),
+                max_w,
+                grasp_h,
+                None,
+            ),
+            pack_digest: None,
+            commissioning_required: false,
+        };
+        init_config(bare_cfg);
+
+        let tcp_start = pose(true);
+        let mut target = xyz(&tcp_start);
+        target[0] += 0.01;
+        let rej = plan_to(target, true);
+        assert_code(rej.clone(), "WORKSPACE_VIOLATION");
+        assert!(rej["message"].as_str().unwrap().contains("floor"), "{rej}");
+    }
+
+    #[test]
+    fn resolve_tool_config_returns_canonical_digest_and_rejects_omitted_tcp_offset() {
+        let res = ok(json!({
+            "op": "resolve_tool_config",
+            "robot_id": "b601dm",
+            "manifest": {
+                "id": "soft_finray_gripper",
+                "kind": "gripper",
+                "robots": ["b601dm"],
+                "tcp_offset": [0.0288, 0.0, 0.0],
+                "armd": {
+                    "extra_check_points_end_m": [
+                        [0.032,  0.082,  0.022],
+                        [0.032,  0.082, -0.022],
+                        [0.032, -0.082,  0.022],
+                        [0.032, -0.082, -0.022],
+                        [0.032,  0.000,  0.022],
+                        [0.032,  0.000, -0.022],
+                        [0.000,  0.082,  0.022],
+                        [0.000,  0.082, -0.022],
+                        [0.000, -0.082,  0.022],
+                        [0.000, -0.082, -0.022]
+                    ],
+                    "physical_contact_end_m": [0.0288, 0.0, 0.0],
+                    "contact_opening_m": 0.0036,
+                    "dynamics": { "mass_delta_kg": 0.035, "com_moment_delta_nm": 0.018 },
+                    "gripper_policy": {
+                        "jaw_opening_nominal": [[-5.7, 0.0886], [0.0, 0.0036]],
+                        "holding_gap_rad": 0.30,
+                        "holding_torque_nm": 0.0667,
+                        "contact_torque_nm": 0.6,
+                        "squeeze_rad": 0.15,
+                        "max_close_torque_nm": 1.0
+                    },
+                    "grasp": { "max_grasp_width_m": 0.075, "grasp_height_m": 0.015, "edge_to_low_m": null }
+                }
+            }
+        }));
+        assert_eq!(res["id"], "soft_finray_gripper");
+        assert_eq!(res["robot_id"], "b601dm");
+        assert_eq!(res["is_stock"], false);
+        assert_eq!(res["kind"], "gripper");
+        assert_eq!(res["tcp_offset_m"], json!([0.0288, 0.0, 0.0]));
+        assert_eq!(
+            res["config_digest"],
+            "v1:377d453f74a2016a65bd15dfd2a471fc3c6afe9d3cf9c8f0c494fea024d14360"
+        );
+        assert!(res["canonical_json"].as_str().unwrap().contains("\"tool_id\":\"soft_finray_gripper\""));
+
+        let stock_so101 = ok(json!({
+            "op": "resolve_tool_config",
+            "robot_id": "so101",
+            "manifest": {"id": "default", "kind": "gripper"}
+        }));
+        assert_eq!(stock_so101["is_stock"], true);
+        assert_eq!(
+            stock_so101["config_digest"],
+            "v1:4a99263dd305f5bf7e7f0f6a96dc2802b6be9b4255e26b88fcbd53f3112c0ef0"
+        );
+
+        let missing_tcp = call(json!({
+            "op": "resolve_tool_config",
+            "robot_id": "b601dm",
+            "manifest": {"id": "no_tcp", "kind": "gripper", "robots": ["b601dm"]}
+        }));
+        assert_code(missing_tcp.clone(), "INVALID_COMMAND");
+        assert!(missing_tcp["message"].as_str().unwrap().contains("tcp_offset"));
+
+        // R2 M3: ComposeMjcf with non-stock manifest + explicit tcp_offset + omitted/whitespace tool_xml
+        // still updates base <site name="tcp"> and fails closed when <site name="tcp"> is missing.
+        for tool_xml_field in [json!(null), json!(""), json!("   ")] {
+            let mut req = json!({
+                "op": "compose_mjcf",
+                "tool_manifest": {
+                    "id": "offset_only_tool",
+                    "kind": "gripper",
+                    "robots": ["b601dm"],
+                    "tcp_offset": [0.025, 0.0, 0.0]
+                }
+            });
+            if !tool_xml_field.is_null() {
+                req["tool_xml"] = tool_xml_field;
+            }
+            let out = ok(req);
+            let xml = out["xml"].as_str().unwrap();
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            let tcp_site = doc
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+                .unwrap();
+            assert_eq!(tcp_site.attribute("pos"), Some("0.025 0 0"));
+        }
+        let no_tcp_err = call(json!({
+            "op": "compose_mjcf",
+            "base_xml": "<mujoco><worldbody><body name=\"end_link\"/></worldbody></mujoco>",
+            "tool_manifest": {
+                "id": "offset_only_tool",
+                "kind": "gripper",
+                "robots": ["b601dm"],
+                "tcp_offset": [0.025, 0.0, 0.0]
+            },
+            "tool_xml": ""
+        }));
+        assert_code(no_tcp_err, "INVALID_COMMAND");
+
+        // R7 M10: switching from stock -> custom_envelope with permanent_tool_check_points_end_m requires explicit tcp_offset,
+        // while updating transient payload when already non-stock allows omitting tcp_offset.
+        init_config(crate::model::ArmConfig::rebot_dm());
+        let err_missing_tcp = call(json!({
+            "op": "set_tool_envelope",
+            "permanent_tool_check_points_end_m": [[0.03, 0.0, 0.0]]
+        }));
+        assert_code(err_missing_tcp, "INVALID_COMMAND");
+
+        let _ = ok(json!({
+            "op": "set_tool_envelope",
+            "tcp_offset": [0.0, 0.0, 0.0],
+            "permanent_tool_check_points_end_m": [[0.03, 0.0, 0.0]]
+        }));
+
+        let _ = ok(json!({
+            "op": "set_tool_envelope",
+            "transient_payload_check_points_end_m": [[0.04, 0.0, 0.0]]
+        }));
     }
 }

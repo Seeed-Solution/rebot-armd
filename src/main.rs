@@ -13,6 +13,9 @@ struct CliArgs {
     follower_port: Option<String>,
     port: Option<u16>,
     config: Option<String>,
+    tool: Option<String>,
+    tool_info: Option<String>,
+    robot: Option<String>,
     log_dir: Option<String>,
     blackbox_dir: Option<String>,
     episodes_dir: Option<String>,
@@ -30,6 +33,9 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 --follower <MODEL>           rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
                 --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
                 --config <JSON>              ArmConfig profile (must match follower joint count)\n\
+                --tool <JSON>                Tool pack manifest (tool.json; or ARMD_TOOL)\n\
+                --tool-info <JSON>           Validate tool.json and print single-line summary JSON to stdout\n\
+                --robot <ID>                 Target robot profile for --tool-info (b601dm, so101, so100, b601rs)\n\
                 --port <PORT>                HTTP / WebSocket port (default 8765)\n\
                 --log-dir <DIR>              rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
                 --blackbox-dir <DIR>         black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
@@ -56,6 +62,9 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 | "--follower-port"
                 | "--port"
                 | "--config"
+                | "--tool"
+                | "--tool-info"
+                | "--robot"
                 | "--log-dir"
                 | "--blackbox-dir"
                 | "--episodes-dir"
@@ -72,6 +81,24 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--follower" => cli.follower = Some(value),
             "--follower-port" => cli.follower_port = Some(value),
             "--config" => cli.config = Some(value),
+            "--tool" => {
+                if value.is_empty() {
+                    return Err("--tool must not be empty".into());
+                }
+                cli.tool = Some(value);
+            }
+            "--tool-info" => {
+                if value.is_empty() {
+                    return Err("--tool-info must not be empty".into());
+                }
+                cli.tool_info = Some(value);
+            }
+            "--robot" => {
+                if value.is_empty() {
+                    return Err("--robot must not be empty".into());
+                }
+                cli.robot = Some(value);
+            }
             "--log-dir" => cli.log_dir = Some(value),
             "--blackbox-dir" => cli.blackbox_dir = Some(value),
             "--episodes-dir" => cli.episodes_dir = Some(value),
@@ -239,11 +266,63 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
     Ok(config)
 }
 
+fn apply_cli_tool(config: ArmConfig, cli_tool: Option<&str>) -> Result<ArmConfig, String> {
+    let env_tool = std::env::var_os("ARMD_TOOL").filter(|s| !s.is_empty());
+    apply_cli_tool_with_env(config, cli_tool, env_tool.as_deref())
+}
+
+fn apply_cli_tool_with_env(
+    config: ArmConfig,
+    cli_tool: Option<&str>,
+    env_tool: Option<&std::ffi::OsStr>,
+) -> Result<ArmConfig, String> {
+    let path: std::path::PathBuf = match cli_tool {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match env_tool {
+            Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => return Ok(config),
+        },
+    };
+    let pack = armd::tool::load_tool_file(&path)?;
+    armd::tool::validate_reserved_stock_pack(&pack, None)?;
+    let updated = armd::tool::apply_tool_overlay(&config, &pack)?;
+    info!(
+        "Loaded tool '{}' (digest {}, dynamics_qualified={}) from {}",
+        updated.active_tool.id,
+        updated.active_tool.config_digest,
+        updated.dynamics_qualified,
+        path.display()
+    );
+    Ok(updated)
+}
+
+fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
+    let pack = armd::tool::load_tool_file(path)?;
+    let summary = armd::tool::resolve_tool_config_summary(&pack, robot)?;
+    serde_json::to_string(&summary).map_err(|e| format!("serialize tool info: {e}"))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let system = armd::diagnostics::boot::SystemInfo::read();
     let cli = parse_cli_args()?;
+
+    if let Some(tool_path) = cli.tool_info.as_deref() {
+        match run_tool_info(tool_path, cli.robot.as_deref()) {
+            Ok(line) => {
+                println!("{line}");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if cli.robot.is_some() {
+        return Err("--robot is only valid with --tool-info".into());
+    }
 
     // stdout as before (the init script redirects it); a copy in a rotating file on
     // /userdata that survives a reboot.
@@ -276,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
+    let config = apply_cli_tool(config, cli.tool.as_deref())?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());
     }
@@ -320,6 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::sequences::load_into(&supervisor, &armd::sequences::path_from_env()).await;
     armd::calib_hover::load_into(&supervisor, &armd::calibration::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
+    armd::tool::load_commissioning_into(&supervisor, &armd::tool::commissioning_path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]
@@ -587,5 +668,79 @@ mod shutdown_tests {
         let rs = resolve_follower_config("rebot-rs", Some(profile)).unwrap();
         assert_eq!(rs.dof, 6);
         assert!(rs.kinematics.is_some() && rs.workspace.is_some());
+    }
+
+    #[test]
+    fn apply_cli_tool_loads_valid_and_rejects_invalid_tool_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid_path = dir.path().join("tool.json");
+        std::fs::write(
+            &valid_path,
+            r#"{
+              "id": "soft_finray_gripper",
+              "kind": "gripper",
+              "robots": ["b601dm"],
+              "tcp_offset": [0.0288, 0.0, 0.0],
+              "armd": {
+                "extra_check_points_end_m": [[0.032, 0.082, 0.022]],
+                "dynamics": {"mass_delta_kg": 0.035, "com_moment_delta_nm": 0.018}
+              }
+            }"#,
+        )
+        .unwrap();
+        let base = ArmConfig::rebot_dm();
+        let applied = apply_cli_tool(base.clone(), Some(valid_path.to_str().unwrap())).unwrap();
+        assert_eq!(applied.active_tool.id, "soft_finray_gripper");
+        assert_eq!(applied.tcp_offset, [0.0288, 0.0, 0.0]);
+
+        let bad_path = dir.path().join("bad_tool.json");
+        std::fs::write(
+            &bad_path,
+            r#"{"id":"bad","kind":"gripper","robots":["b601dm"],"armd":{"unknown_field":1}}"#,
+        )
+        .unwrap();
+        assert!(apply_cli_tool(base.clone(), Some(bad_path.to_str().unwrap())).is_err());
+
+        // Non-stock tools omitting tcp_offset must be rejected even if tool_xml / tcp_site are declared.
+        let missing_tcp_tool = dir.path().join("missing_tcp_tool.json");
+        std::fs::write(
+            &missing_tcp_tool,
+            r#"{"id":"need_tcp","kind":"gripper","robots":["b601dm"],"tool_xml":"absent.xml","tcp_site":"finray_tcp"}"#,
+        )
+        .unwrap();
+        let err_missing_tcp = apply_cli_tool(base.clone(), Some(missing_tcp_tool.to_str().unwrap())).unwrap_err();
+        assert!(err_missing_tcp.contains("tcp_offset"), "{err_missing_tcp}");
+
+        // M04 (R3): Reserved `id="default"` with custom tool_xml must be refused.
+        let default_spoof_tool = dir.path().join("default_spoof_tool.json");
+        std::fs::write(
+            &default_spoof_tool,
+            r#"{"id":"default","kind":"gripper","tool_xml":"default_spoof.xml"}"#,
+        )
+        .unwrap();
+        let err = apply_cli_tool(base, Some(default_spoof_tool.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("default"), "{err}");
+
+        let out = run_tool_info(valid_path.to_str().unwrap(), None).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["id"], "soft_finray_gripper");
+        assert_eq!(parsed["robot_id"], "b601dm");
+        assert_eq!(parsed["tcp_offset_m"], serde_json::json!([0.0288, 0.0, 0.0]));
+
+        // B1: Non-UTF-8 ARMD_TOOL path must not be silently swallowed into stock fallback.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let base = ArmConfig::rebot_dm();
+            let non_utf8_missing = std::ffi::OsStr::from_bytes(b"/nonexistent_\xff/tool.json");
+            assert!(apply_cli_tool_with_env(base.clone(), None, Some(non_utf8_missing)).is_err());
+
+            let non_utf8_path = dir.path().join(std::ffi::OsStr::from_bytes(b"tool_\xff.json"));
+            std::fs::copy(&valid_path, &non_utf8_path).unwrap();
+            let loaded = apply_cli_tool_with_env(base, None, Some(non_utf8_path.as_os_str())).unwrap();
+            assert_eq!(loaded.active_tool.id, "soft_finray_gripper");
+            assert!(loaded.active_tool.commissioning_required);
+        }
     }
 }

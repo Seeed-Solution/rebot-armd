@@ -673,6 +673,8 @@ pub struct Violation {
 
 /// Tolerance used by the workspace rule (m).
 pub const WORKSPACE_EPS: f64 = 1e-4;
+/// Jitter tolerance for monotonic escape of already-violated constraints during `park` (m).
+pub const WORKSPACE_PARK_ESCAPE_EPS: f64 = 1e-3;
 
 pub const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
 pub const BOX_CONSTRAINT_IDS: [[&str; 2]; 3] = [["box_min_x", "box_max_x"], ["box_min_y", "box_max_y"], ["box_min_z", "box_max_z"]];
@@ -839,6 +841,17 @@ pub fn workspace_violation_pose(pose: &Pose, ws: &crate::model::WorkspacePolicy,
 /// [`workspace_violation_pose`] with the reach measured from the shoulder axis `shoulder`
 /// (radius, height).
 pub fn workspace_violation_pose_at(pose: &Pose, ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount, shoulder: [f64; 2]) -> Violation {
+    workspace_violation_pose_at_tcp(pose, ws, cam, shoulder, &[0.0; 3])
+}
+
+/// [`workspace_violation_pose_at`] also checking `max_reach_m` on `tcp_offset` when nonzero.
+pub fn workspace_violation_pose_at_tcp(
+    pose: &Pose,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    shoulder: [f64; 2],
+    tcp_offset: &[f64; 3],
+) -> Violation {
     let mut v = Violation::default();
     let mut note = |excess: f64, point: usize, limit: &'static str, value: f64, bound: f64, keepout: Option<usize>| {
         if excess > 0.0 {
@@ -875,6 +888,18 @@ pub fn workspace_violation_pose_at(pose: &Pose, ws: &crate::model::WorkspacePoli
             note(depth, idx, "keepout", depth, 0.0, Some(b));
         }
     }
+    if *tcp_offset != [0.0; 3] {
+        if let Some(reach) = ws.max_reach_m {
+            let p_tcp = pose.transform_point(tcp_offset);
+            let d = shoulder_reach_from(&p_tcp, &shoulder);
+            let tcp_f32 = tcp_offset.map(|v| v as f32);
+            let pt_idx = ws.check_points_end_m
+                .iter()
+                .position(|c| (c[0] - tcp_f32[0]).abs() <= 1e-6 && (c[1] - tcp_f32[1]).abs() <= 1e-6 && (c[2] - tcp_f32[2]).abs() <= 1e-6)
+                .map_or(0, |i| i + 1);
+            note(d - f64::from(reach), pt_idx, "reach", d, f64::from(reach), None);
+        }
+    }
     v
 }
 
@@ -882,6 +907,16 @@ pub fn workspace_violation_pose_at(pose: &Pose, ws: &crate::model::WorkspacePoli
 /// the first slot where `depth > allowed` (where `allowed = WORKSPACE_EPS` when `min_depth <=
 /// WORKSPACE_EPS`, else `min_depth + WORKSPACE_EPS`).
 pub fn first_workspace_rejection(clearances: &[f64], min_depths: &[f64]) -> Option<(usize, f64, f64, f64)> {
+    first_workspace_rejection_with_tol(clearances, min_depths, WORKSPACE_EPS)
+}
+
+/// [`first_workspace_rejection`] with an explicit jitter tolerance `escape_tol` for
+/// already-violated constraints (`min_depth > WORKSPACE_EPS`).
+pub fn first_workspace_rejection_with_tol(
+    clearances: &[f64],
+    min_depths: &[f64],
+    escape_tol: f64,
+) -> Option<(usize, f64, f64, f64)> {
     for (idx, (&clr, &min_d)) in clearances.iter().zip(min_depths).enumerate() {
         if clr.is_nan() || !min_d.is_finite() {
             return Some((idx, f64::NAN, min_d, WORKSPACE_EPS));
@@ -890,7 +925,7 @@ pub fn first_workspace_rejection(clearances: &[f64], min_depths: &[f64]) -> Opti
         if !depth.is_finite() {
             return Some((idx, f64::INFINITY, min_d, WORKSPACE_EPS));
         }
-        let allowed = if min_d <= WORKSPACE_EPS { WORKSPACE_EPS } else { min_d + WORKSPACE_EPS };
+        let allowed = if min_d <= WORKSPACE_EPS { WORKSPACE_EPS } else { min_d + escape_tol };
         if depth > allowed {
             return Some((idx, depth, min_d, allowed));
         }
