@@ -992,8 +992,19 @@ impl crate::supervisor::SupervisorInner {
         self.is_torqued = false;
         self.disable_pending = false;
         self.pending_rearm = false;
+        // an E-stop that arrived while the disables were confirmed wins: never end in Idle
+        self.consume_pending_estop();
+        if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+            self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
+            return Err(SafetyError::EStopActive);
+        }
+        crate::supervisor::SupervisorInner::check_concurrent_estop(self)?;
         self.safety.clear_fault()?;
         let _ = self.safety.set_torque(false);
+        if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+            self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
+            return Err(SafetyError::EStopActive);
+        }
         Ok(self.safety.state().clone())
     }
 }

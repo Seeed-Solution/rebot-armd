@@ -1297,3 +1297,19 @@ fn mit_expiry_recovery_reads_fresh_feedback_first() {
     let _ = inner.clear_fault_confirmed(true);
     assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery ran although fresh feedback shows no expiry");
 }
+
+/// Round 6, #2: an E-stop that arrives while the recovery waits for the disable confirmations
+/// does not end in Idle: the recovery finishes through the concurrent E-stop recheck and the
+/// state is EStop, the reply is not a success.
+#[test]
+fn mit_expiry_recovery_honours_an_estop_arriving_mid_recovery() {
+    let (mut inner, bus, _clock) = expired_after_loss();
+    let (count, latched) = (inner.requested_estop_count.clone(), inner.e_stop_latched.clone());
+    bus.with(|s| s.on_disable = Some(std::sync::Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        latched.store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let r = inner.clear_fault_confirmed(true);
+    assert!(r.is_err(), "the recovery reported success with an E-stop pending: {r:?}");
+    assert_eq!(*inner.safety.state(), armd::SafetyState::EStop, "{:?}", inner.safety.state());
+}
