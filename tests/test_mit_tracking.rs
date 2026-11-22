@@ -1020,3 +1020,50 @@ fn mit_handover_is_fenced_from_the_first_switch_frame() {
     assert_eq!(mit_after, 1, "MIT frames after the switch: only the hold; the rollback after the 45 ms trip must send none ({mit_after})");
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mode uncertain after an unconfirmed rollback");
 }
+
+/// Review round 3, #8: the handover's first MIT frame (the hold) obeys the effort bound on the
+/// decoded wire fields too. The joint creeps at a stationary-allowed velocity and gravity drives
+/// tau_ff to the bound; the limit is chosen so the bound lands exactly on the torque grid, where
+/// an undecoded kd would push the decoded total past it.
+#[test]
+fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
+    let l4 = b601_limits()[3];
+    // a pose where gravity loads J4 positively (the 12-bit velocity field's zero is +0.0073 rad/s
+    // on the wire, which adds to pd on that side)
+    let mut qh = Q0;
+    qh[3] = -1.435;
+    let g = ArmConfig::rebot_dm().arm_model.gravity_torques(&qh[..6]).unwrap()[3];
+    let sign = g.signum();
+    let grid = |x: f32, lo: f32, hi: f32, bits: u32| damiao::uint_to_float(damiao::float_to_uint(x, lo, hi, bits), lo, hi, bits);
+    let v_m = grid(-sign * 0.04, l4.v_min, l4.v_max, 12); // pd = -kd v_m pushes toward g's side
+    let mut worst = f32::MIN;
+    for k in 0..6 {
+        let t_grid = grid(sign * (0.15 + 0.013 * k as f32), l4.t_min, l4.t_max, 12);
+        let hold_kd = 0.4_f32;
+        let l = t_grid.abs() + hold_kd * v_m.abs(); // the clamp bound L - pd equals the grid point
+        if l >= g.abs() { continue; }
+        let mut cfg = mit_config_j4();
+        { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.effort_limit_nm = l; j4.hold_kd = Some(hold_kd); }
+        let bus = FakeBus::new(&b601_limits());
+        bus.with(|s| { s.follow_commands = false; for (i, m) in s.motors.iter_mut().enumerate() { m.q = qh[i]; } s.motors[3].v = v_m; });
+        let mut d = disabled_driver(&bus);
+        d.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        inner.lease_enabled = false;
+        inner.tick(DT);
+        inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
+        with_record(&mut inner, record_j4(2000));
+        inner.set_torque(true).unwrap();
+        bus.clear_log();
+        for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
+        assert!(inner.mit_active(), "{:?}", inner.mit.handover_error);
+        let log = bus.tx_log();
+        let w = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data).unwrap();
+        let (p, v, kp, kd, t) = mit_frames(&log[w..], 4)[0];
+        let (q_m, vm) = (inner.measured_positions[3], inner.measured_velocities[3]);
+        let total = kp * (p - q_m) + kd * (v - vm) + t;
+        worst = worst.max(total.abs() - l);
+    }
+    assert!(worst > f32::MIN, "no case exercised");
+    assert!(worst <= 1e-6, "handover hold frame exceeds the effort limit by {worst} N·m on the decoded fields");
+}
