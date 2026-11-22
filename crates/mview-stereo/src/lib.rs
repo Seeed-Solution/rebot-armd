@@ -59,7 +59,7 @@ pub use ncc_backend::{
     backend_diagnostics, kernel_counts, reset_kernel_counts, BackendDiagnostics, KernelCallCounts,
     NccBackendKind,
 };
-pub use pose::{marker_corrs, refine_poses, refine_views, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
+pub use pose::{marker_corrs, refine_poses, refine_views, refine_views_prepared, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
 #[cfg(feature = "mview-profile")]
 pub use pose::{PosePassProfile, PoseProfile};
 
@@ -361,7 +361,7 @@ pub struct Stats {
     pub edge_points: usize,
     /// Edge points that passed the consistency check.
     pub edge_consistent: usize,
-    /// Half-resolution images.
+    /// Half-resolution images (built here; ~0 when shared, [`reconstruct_shared`]).
     pub pyramid_ms: f64,
     pub features_ms: f64,
     /// Coarse and fine ray sweeps, left-right back sweeps included.
@@ -378,6 +378,8 @@ pub struct Stats {
 pub struct RecProfile {
     pub ncc_calls: std::collections::BTreeMap<String, u64>,
     pub total_ncc_calls: u64,
+    /// Sub-stage times (ms) and counters (`features.*`, `sweep.*`, `refine.*`).
+    pub stages: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -467,6 +469,7 @@ mod profile_tls {
             RecProfile {
                 ncc_calls,
                 total_ncc_calls,
+                stages: Default::default(),
             }
         }
     }
@@ -488,6 +491,57 @@ mod profile_tls {
 
 #[cfg(feature = "mview-profile")]
 pub(crate) use profile_tls::half_grid_counts as half_grid_profile_counts;
+
+/// Stage timers and counters (thread-local, `mview-profile`): [`ProfT::stop`] adds the elapsed ms
+/// under a key, [`prof_count`] adds a count; the callers take the map at stage boundaries. Without
+/// the feature both are no-ops (a zero-sized timer).
+pub(crate) mod stage_prof {
+    #[cfg(feature = "mview-profile")]
+    use std::{cell::RefCell, collections::BTreeMap};
+
+    #[cfg(feature = "mview-profile")]
+    thread_local! {
+        static ACC: RefCell<BTreeMap<&'static str, f64>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    pub(crate) struct ProfT(#[cfg(feature = "mview-profile")] std::time::Instant);
+
+    impl ProfT {
+        #[inline(always)]
+        pub(crate) fn start() -> Self {
+            Self(
+                #[cfg(feature = "mview-profile")]
+                std::time::Instant::now(),
+            )
+        }
+
+        #[inline(always)]
+        #[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+        pub(crate) fn stop(self, key: &'static str) {
+            #[cfg(feature = "mview-profile")]
+            add(key, self.0.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+
+    #[cfg(feature = "mview-profile")]
+    pub(crate) fn add(key: &'static str, v: f64) {
+        ACC.with(|a| *a.borrow_mut().entry(key).or_insert(0.0) += v);
+    }
+
+    #[inline(always)]
+    #[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+    pub(crate) fn prof_count(key: &'static str, n: u64) {
+        #[cfg(feature = "mview-profile")]
+        add(key, n as f64);
+    }
+
+    /// The accumulated stages since the last take (and reset).
+    #[cfg(feature = "mview-profile")]
+    pub(crate) fn take() -> BTreeMap<String, f64> {
+        ACC.with(|a| std::mem::take(&mut *a.borrow_mut()).into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    }
+}
+pub(crate) use stage_prof::{prof_count, ProfT};
 
 // ---- patches ----
 
@@ -595,6 +649,42 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
     let sw = f64::from(t.sw);
     let var = s2 - s1 * s1 / sw;
     Some(if var > 1e-3 * sw { dot / var.sqrt() as f32 } else { 0.0 })
+}
+
+/// What `ncc(img, t, x, y, true)` samples for a template of radius `r`: the patch origin and the
+/// four f32 bilinear weights (bits); None when it returns None before sampling. Two positions
+/// with the same key give the same score (the reconstruction's walkers reuse it).
+#[inline]
+fn bilinear_key(img: &Gray, r: usize, x: f64, y: f64) -> Option<(usize, usize, [u32; 4])> {
+    if !img.inside(x, y, r, 1.0) { return None; }
+    let (fx0, fy0) = (x.floor(), y.floor());
+    let (fx, fy) = ((x - fx0) as f32, (y - fy0) as f32);
+    let w = [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy];
+    Some(((fx0 as usize).checked_sub(r)?, (fy0 as usize).checked_sub(r)?, w.map(f32::to_bits)))
+}
+
+/// As [`bilinear_key`] for the nearest-pixel `ncc(img, t, x, y, false)`: the patch origin.
+#[inline]
+fn nearest_key(img: &Gray, r: usize, x: f64, y: f64) -> Option<(usize, usize)> {
+    if !img.inside(x, y, r, 0.5) { return None; }
+    let (cx, cy) = (x.round() as usize, y.round() as usize);
+    Some((cx.checked_sub(r)?, cy.checked_sub(r)?))
+}
+
+/// Nearest-pixel `ncc` with the last evaluated key and score of this target (the coarse sweep:
+/// neighbouring depth samples often round to the same pixel of the half-resolution image).
+#[inline]
+fn ncc_nearest_last(img: &Gray, t: &Tmpl, x: f64, y: f64, last: &mut Option<((usize, usize), Option<f32>)>) -> Option<f32> {
+    let key = nearest_key(img, t.r, x, y)?;
+    if let Some((k, v)) = *last {
+        if k == key {
+            prof_count("reuse.coarse_hits", 1);
+            return v;
+        }
+    }
+    let v = ncc(img, t, x, y, false);
+    *last = Some((key, v));
+    v
 }
 
 const HALF_GRID_MAX_R: usize = ncc_backend::HALF_GRID_MAX_R;
@@ -726,15 +816,36 @@ fn stream_corner_row<const SUB_OLD: bool, const EMIT_LAM: bool>(
     }
 }
 
+/// The corner response (smaller eigenvalue of the 5x5 structure tensor) of [`features`] over the
+/// pixels x0..x0+rw, y0..y0+rh of one image. The tensor sums are exact in f32 for 8-bit images
+/// (multiples of 1/4 below 2^22), so a sub-rectangle of a larger map is bitwise the map of the
+/// sub-rectangle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CornerMap {
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+    lam: Vec<f32>,
+}
+
 /// Corners in `region` (quotas inside / outside `inner`) and edge points in `edge_region` (see the
 /// module doc).
 pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params) -> Vec<Feature> {
+    features_shared(img, region, inner, edge_region, p, None, None)
+}
+
+/// [`features`] reading the corner response from `map_in` (of the same image) when it covers the
+/// region, and storing the region's map in `map_out`.
+pub(crate) fn features_shared(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params,
+    map_in: Option<&CornerMap>, map_out: Option<&mut Option<CornerMap>>) -> Vec<Feature> {
     let m = PATCH_R + 4;
     let x0 = (region[0].floor().max(0.0) as usize).max(m);
     let y0 = (region[1].floor().max(0.0) as usize).max(m);
     let x1 = (region[2].ceil().max(0.0) as usize).min(img.w.saturating_sub(m + 1));
     let y1 = (region[3].ceil().max(0.0) as usize).min(img.h.saturating_sub(m + 1));
     if x1 <= x0 + 2 || y1 <= y0 + 2 { return Vec::new(); }
+    let t_map = ProfT::start();
     // gradients over the region plus a 2 px border (structure tensor window 5x5)
     let (gx0, gy0) = (x0 - 2, y0 - 2);
     let (gw, gh) = (x1 - x0 + 5, y1 - y0 + 5);
@@ -745,6 +856,32 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     } else {
         (Vec::new(), Vec::new())
     };
+    let shared = map_in.filter(|mp| mp.x0 <= x0 && mp.y0 <= y0 && x0 + rw <= mp.x0 + mp.rw && y0 + rh <= mp.y0 + mp.rh);
+    let mut lam;
+    let mut max_l = 0.0f32;
+    if let Some(mp) = shared {
+        prof_count("features.map_shared", 1);
+        lam = Vec::with_capacity(rw * rh);
+        for j in 0..rh {
+            let o = (y0 - mp.y0 + j) * mp.rw + x0 - mp.x0;
+            lam.extend_from_slice(&mp.lam[o..o + rw]);
+        }
+        // as the streamed maximum: every response in row order, from 0
+        for &l in &lam { max_l = max_l.max(l); }
+        if need_edges {
+            for j in 0..gh {
+                let y = gy0 + j;
+                let row_c = &img.px[y * img.w + gx0 - 1..][..gw + 2];
+                let row_u = &img.px[(y - 1) * img.w + gx0..][..gw];
+                let row_d = &img.px[(y + 1) * img.w + gx0..][..gw];
+                let (gx_slice, gy_slice) = (&mut gxv[j * gw..(j + 1) * gw], &mut gyv[j * gw..(j + 1) * gw]);
+                for i in 0..gw {
+                    gx_slice[i] = 0.5 * (f32::from(row_c[i + 2]) - f32::from(row_c[i]));
+                    gy_slice[i] = 0.5 * (f32::from(row_d[i]) - f32::from(row_u[i]));
+                }
+            }
+        }
+    } else {
     let (mut gx_row, mut gy_row) = if need_edges {
         (Vec::new(), Vec::new())
     } else {
@@ -753,8 +890,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     // separable 5x5 box sums of gx^2, gy^2, gx gy streamed by row
     let mut hs_ring = vec![[0.0f32; 3]; 5 * rw];
     let mut vacc = vec![[0.0f32; 3]; rw];
-    let mut lam = vec![0.0f32; rw * rh];
-    let mut max_l = 0.0f32;
+    lam = vec![0.0f32; rw * rh];
     for j in 0..gh {
         let (gx_slice, gy_slice) = if need_edges {
             (&mut gxv[j * gw..(j + 1) * gw], &mut gyv[j * gw..(j + 1) * gw])
@@ -781,6 +917,9 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
             stream_corner_row::<true, true>(gx_slice, gy_slice, ring_row, &mut vacc, lam_row, &mut max_l);
         }
     }
+    }
+    t_map.stop("features.map_ms");
+    let t_sel = ProfT::start();
     // corners: relative and absolute floors (a 5x5 window of 2-grey-level gradients is no corner)
     let floor = (p.corner_rel_floor * max_l).max(100.0);
     let mut cand: Vec<(f32, usize, usize)> = Vec::new();
@@ -792,6 +931,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
             if local_max { cand.push((l, x0 + i, y0 + j)); }
         }
     }
+    if let Some(o) = map_out { *o = Some(CornerMap { x0, y0, rw, rh, lam }); }
     cand.sort_by(|a, b| b.0.total_cmp(&a.0));
     if p.corner_cell_px > 0 {
         // by rank within the cell, then strength: a high-contrast pattern (black and white codes)
@@ -827,7 +967,10 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     // of the corners in the box
     let quota_plain = p.max_edge_features;
     let quota_tex = (p.max_edge_features / 3).saturating_sub(n_in / 5);
+    t_sel.stop("features.corner_select_ms");
+    prof_count("features.calls", 1);
     if quota_plain == 0 { return out; }
+    let t_edge = ProfT::start();
     let g = |i: usize, j: usize| -> (f32, f32) { let k = (j + 2) * gw + i + 2; (gxv[k], gyv[k]) };
     // squared gradient magnitudes over the region (no hypot: it is slow on the device's libm)
     let mag2: Vec<f32> = (0..rw * rh).map(|k| { let (a, b) = g(k % rw, k / rw); a * a + b * b }).collect();
@@ -903,6 +1046,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
         if plain { n_plain += 1 } else { n_tex += 1 }
         if n_plain >= quota_plain && n_tex >= quota_tex { break; }
     }
+    t_edge.stop("features.edge_ms");
     out
 }
 
@@ -940,7 +1084,37 @@ impl Spacing {
 struct PView<'a> {
     cam: Camera,
     full: &'a Gray,
-    half: Gray,
+    half: &'a Gray,
+}
+
+/// The half-resolution image ([`Gray::half`]) of every view.
+pub fn half_images(views: &[View]) -> Vec<Gray> { views.iter().map(|v| v.img.half()).collect() }
+
+/// What the pose refinement and the reconstruction of one set of views share
+/// ([`refine_views_prepared`], [`reconstruct_prepared`]): the half-resolution image of every
+/// view, and the reference view's corner response map, left by the pose refinement's feature
+/// selection and taken (released) by the reconstruction's.
+#[derive(Debug, Default)]
+pub struct Prepared {
+    pub halves: Vec<Gray>,
+    ref_map: std::sync::Mutex<Option<(usize, CornerMap)>>,
+}
+
+impl Prepared {
+    /// For `views` (the same views must be passed to the prepared calls).
+    pub fn new(views: &[View]) -> Self { Self { halves: half_images(views), ref_map: Default::default() } }
+
+    /// With half images built elsewhere (`halves[i]` = `views[i].img.half()`; another length is rebuilt).
+    pub fn from_halves(halves: Vec<Gray>) -> Self { Self { halves, ref_map: Default::default() } }
+
+    pub(crate) fn put_ref_map(&self, reference: usize, map: CornerMap) {
+        if let Ok(mut g) = self.ref_map.lock() { *g = Some((reference, map)); }
+    }
+
+    pub(crate) fn take_ref_map(&self, reference: usize) -> Option<CornerMap> {
+        let mut g = self.ref_map.lock().ok()?;
+        match g.take() { Some((r, m)) if r == reference => Some(m), _ => None }
+    }
 }
 
 enum SweepEnd { NoPeak, Ambiguous }
@@ -986,20 +1160,25 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
     let step = 2.0 * p.sweep_step_px;
     let n = ((span / step).ceil() as usize).clamp(2, 600);
     let dw = (w1 - w0) / n as f64;
+    let t_coarse = ProfT::start();
+    prof_count(if tf.is_some() { "sweep.fwd_calls" } else { "sweep.back_calls" }, 1);
+    prof_count("sweep.coarse_samples", (n + 1) as u64);
     let proj: Vec<RayProj> = targets.iter().map(|v| RayProj::new(src, &d, &v.cam)).collect();
     let mut scores = vec![f32::NEG_INFINITY; n + 1];
+    let mut last = vec![None; targets.len()];
     for (i, s) in scores.iter_mut().enumerate() {
         let w = w0 + i as f64 * dw;
         let mut sum = 0.0f32;
         let mut ok = true;
-        for (v, pr) in targets.iter().zip(&proj) {
-            match pr.at(w).and_then(|q| { let h = to_half(q); ncc(&v.half, tc, h[0], h[1], false) }) {
+        for ((v, pr), last) in targets.iter().zip(&proj).zip(last.iter_mut()) {
+            match pr.at(w).and_then(|q| { let h = to_half(q); ncc_nearest_last(v.half, tc, h[0], h[1], last) }) {
                 Some(c) => sum += c,
                 None => { ok = false; break; }
             }
         }
         if ok { *s = sum / targets.len() as f32; }
     }
+    t_coarse.stop(if tf.is_some() { "sweep.coarse_ms" } else { "sweep.back_coarse_ms" });
     let (ib, &best) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).ok_or(SweepEnd::NoPeak)?;
     if f64::from(best) < p.sweep_min { return Err(SweepEnd::NoPeak); }
     // best separate peak: local maxima at least 2 px of image motion from the best
@@ -1027,7 +1206,9 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
         sum / targets.len() as f32
     };
     let q = dw / 2.0;
+    let t_fine = ProfT::start();
     let fine: Vec<(f64, f32)> = (-4..=4).map(|k| { let w = wb + f64::from(k) * q; (w, score_at(w)) }).collect();
+    t_fine.stop("sweep.fine_ms");
     let (k, _) = fine.iter().enumerate().max_by(|a, b| a.1.1.total_cmp(&b.1.1)).ok_or(SweepEnd::NoPeak)?;
     let mut w = fine[k].0;
     if k > 0 && k + 1 < fine.len() {
@@ -1047,17 +1228,27 @@ fn parabola(a: f32, b: f32, c: f32) -> f64 {
 
 /// 2D sub-pixel match of `t` near `q`: NCC on a 3x3 grid of 0.5 px (moved while the best is on
 /// its edge), then a parabola per axis. Returns the pixel and its NCC.
+/// The previous grid's scores are reused where a cell samples the same pixels and weights
+/// ([`bilinear_key`]).
 fn refine_2d(img: &Gray, t: &Tmpl, mut q: [f64; 2]) -> Option<([f64; 2], f64)> {
     const H: f64 = 0.5;
+    let mut prev: [Option<((usize, usize, [u32; 4]), f32)>; 9] = [None; 9];
     for _ in 0..6 {
         let mut g = [[f32::NEG_INFINITY; 3]; 3];
+        let mut cur: [Option<((usize, usize, [u32; 4]), f32)>; 9] = [None; 9];
         let mut best = (1usize, 1usize, f32::NEG_INFINITY);
         for (j, row) in g.iter_mut().enumerate() {
             for (i, cell) in row.iter_mut().enumerate() {
-                *cell = ncc(img, t, q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H, true)?;
+                let (x, y) = (q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H);
+                let key = bilinear_key(img, t.r, x, y);
+                let hit = key.and_then(|k| prev.iter().flatten().find(|e| e.0 == k).map(|e| e.1));
+                prof_count(if hit.is_some() { "reuse.refine_2d_hits" } else { "reuse.refine_2d_evals" }, 1);
+                *cell = match hit { Some(v) => v, None => ncc(img, t, x, y, true)? };
+                cur[j * 3 + i] = key.map(|k| (k, *cell));
                 if *cell > best.2 { best = (i, j, *cell); }
             }
         }
+        prev = cur;
         let (i, j, s) = best;
         if (i, j) != (1, 1) { q = [q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H]; continue; }
         let dx = parabola(g[1][0], g[1][1], g[1][2]);
@@ -1110,10 +1301,24 @@ pub(crate) fn refine_2d_pose(img: &Gray, t: &Tmpl, q: [f64; 2]) -> Option<([f64;
 
 /// Match of `t` near `q` along the unit image direction `e` only (an edge point): NCC at
 /// -0.5, 0, 0.5 px (moved while the best is at an end), parabola.
+/// The previous step's scores are reused where a sample reads the same pixels and weights
+/// ([`bilinear_key`]).
 fn refine_1d(img: &Gray, t: &Tmpl, mut q: [f64; 2], e: [f64; 2]) -> Option<([f64; 2], f64)> {
     const H: f64 = 0.5;
+    let mut prev: [Option<((usize, usize, [u32; 4]), f32)>; 3] = [None; 3];
     for _ in 0..8 {
-        let s: Vec<f32> = (-1..=1).map(|k| ncc(img, t, q[0] + f64::from(k) * H * e[0], q[1] + f64::from(k) * H * e[1], true)).collect::<Option<_>>()?;
+        let mut s = [0.0f32; 3];
+        let mut cur: [Option<((usize, usize, [u32; 4]), f32)>; 3] = [None; 3];
+        for (k, sk) in s.iter_mut().enumerate() {
+            let kf = k as f64 - 1.0;
+            let (x, y) = (q[0] + kf * H * e[0], q[1] + kf * H * e[1]);
+            let key = bilinear_key(img, t.r, x, y);
+            let hit = key.and_then(|kk| prev.iter().flatten().find(|p| p.0 == kk).map(|p| p.1));
+            prof_count(if hit.is_some() { "reuse.refine_1d_hits" } else { "reuse.refine_1d_evals" }, 1);
+            *sk = match hit { Some(v) => v, None => ncc(img, t, x, y, true)? };
+            cur[k] = key.map(|kk| (kk, *sk));
+        }
+        prev = cur;
         if s[0] > s[1] && s[0] >= s[2] { q = [q[0] - H * e[0], q[1] - H * e[1]]; continue; }
         if s[2] > s[1] && s[2] > s[0] { q = [q[0] + H * e[0], q[1] + H * e[1]]; continue; }
         let dt = parabola(s[0], s[1], s[2]) * H;
@@ -1202,6 +1407,20 @@ pub fn reconstruct(views: &[View], reference: usize, region: [f64; 4], object_bo
 /// [`reconstruct`] with `perturb(view index, pixel)` applied to every matched pixel before the
 /// triangulation (the tests add localisation noise with it).
 pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
+    perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
+    reconstruct_impl(views, None, None, None, reference, region, object_box, p, perturb)
+}
+
+/// [`reconstruct`] with the cameras `cams` (None: the views' cameras; e.g. the refined ones of
+/// [`refine_views_prepared`]) and the images prepared for these `views` (half images, rebuilt
+/// when of another length; the reference corner map when the pose refinement left one): no
+/// image is copied or built twice.
+pub fn reconstruct_prepared(views: &[View], cams: Option<&[Camera]>, prep: &Prepared, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params) -> Reconstruction {
+    let map = prep.take_ref_map(reference);
+    reconstruct_impl(views, cams, Some(&prep.halves), map.as_ref(), reference, region, object_box, p, |_, q| q)
+}
+
+fn reconstruct_impl(views: &[View], cams: Option<&[Camera]>, halves: Option<&[Gray]>, ref_map: Option<&CornerMap>, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
     mut perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
     let t_all = Instant::now();
     let mut rec = Reconstruction::default();
@@ -1214,9 +1433,19 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     }
     #[cfg(feature = "mview-profile")]
     let rec_guard = profile_tls::RecProfileGuard::enter();
+    #[cfg(feature = "mview-profile")]
+    let _ = stage_prof::take();
     let t0 = Instant::now();
-    let pv: Vec<PView> = views.iter().map(|v| PView { cam: v.cam, full: &v.img, half: v.img.half() }).collect();
-    let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
+    let owned: Vec<Gray>;
+    let halves: &[Gray] = match halves {
+        Some(h) if h.len() == views.len() => h,
+        _ => { owned = half_images(views); &owned }
+    };
+    let cams: Vec<Camera> = match cams {
+        Some(c) if c.len() == views.len() => c.to_vec(),
+        _ => views.iter().map(|v| v.cam).collect(),
+    };
+    let pv: Vec<PView> = views.iter().zip(halves).zip(&cams).map(|((v, h), c)| PView { cam: *c, full: &v.img, half: h }).collect();
     rec.stats.pyramid_ms = ms(t0);
     let rv = &pv[reference];
     let others: Vec<usize> = (0..views.len()).filter(|i| *i != reference).collect();
@@ -1225,7 +1454,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     let edge_region = [object_box[0] - EDGE_REGION_GROW * bw - 4.0, object_box[1] - EDGE_REGION_GROW * bh - 4.0,
         object_box[2] + EDGE_REGION_GROW * bw + 4.0, object_box[3] + EDGE_REGION_GROW * bh + 4.0];
     let t0 = Instant::now();
-    let feats = features(rv.full, region, object_box, edge_region, p);
+    let feats = features_shared(rv.full, region, object_box, edge_region, p, ref_map, None);
     rec.stats.features_ms = ms(t0);
     rec.stats.features = feats.len();
     rec.stats.corners = feats.iter().filter(|f| f.normal.is_none()).count();
@@ -1254,7 +1483,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         let swept = if f.normal.is_none() { corner_sweep.clone() } else { spread(&cams, &valid, &rv.cam.c, SWEEP_VIEWS) };
         let hq = to_half(px);
         let (Some(tc), Some(tf)) = (
-            sample_bilinear(&rv.half, hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, f.normal, f.side)),
+            sample_bilinear(rv.half, hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, f.normal, f.side)),
             make_tmpl(sample_int(rv.full, f.x, f.y, PATCH_R), PATCH_R, f.normal, f.side),
         ) else { rec.stats.no_peak += 1; rec.outcomes.push((f, "flat")); continue; };
         let t0 = Instant::now();
@@ -1273,6 +1502,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         for &vi in &valid {
             let v = &pv[vi];
             let t0 = Instant::now();
+            let t_ref = ProfT::start();
             let m = v.cam.project(&x0).and_then(|q0| match f.normal {
                 None => refine_2d(v.full, &tf, q0),
                 Some(_) => {
@@ -1283,13 +1513,14 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
                     e.and_then(|e| refine_1d(v.full, &tf, q0, e))
                 }
             });
+            t_ref.stop(if f.normal.is_none() { "refine.corner_2d_ms" } else { "refine.edge_1d_ms" });
             rec.stats.refine_ms += ms(t0);
             let Some((q, _)) = m.filter(|(_, s)| *s >= p.ncc_min) else { fail = true; rec.stats.refine_rejected += 1; rec.outcomes.push((f, "refine")); break; };
             if swept.contains(&vi) {
                 // left-right: this view's patch swept back (coarse) along its own ray into the reference
                 let t0 = Instant::now();
                 let hq = to_half(q);
-                let back = sample_bilinear(&v.half, hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, f.normal, f.side))
+                let back = sample_bilinear(v.half, hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, f.normal, f.side))
                     .and_then(|tb| sweep(&v.cam, q, &tb, None, &[rv], z_lo, z_hi, p).ok())
                     .and_then(|wb| { let db = v.cam.ray(q); rv.cam.project(&v.cam.at_inv_depth(&db, wb)) });
                 rec.stats.sweep_ms += ms(t0);
@@ -1320,7 +1551,9 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     rec.stats.total_ms = ms(t_all);
     #[cfg(feature = "mview-profile")]
     {
-        rec.profile = Some(rec_guard.finish());
+        let mut prof = rec_guard.finish();
+        prof.stages = stage_prof::take();
+        rec.profile = Some(prof);
     }
     rec
 }
@@ -1643,6 +1876,196 @@ mod tests {
                 assert_eq!(sa.to_bits(), sb.to_bits(), "score mismatch: {sa} vs {sb}");
             }
             _ => panic!("option mismatch: {a:?} vs {b:?}"),
+        }
+    }
+
+    /// The walkers and the coarse sweep before the evaluation reuse (oracles).
+    fn refine_2d_oracle(img: &Gray, t: &Tmpl, mut q: [f64; 2]) -> Option<([f64; 2], f64)> {
+        const H: f64 = 0.5;
+        for _ in 0..6 {
+            let mut g = [[f32::NEG_INFINITY; 3]; 3];
+            let mut best = (1usize, 1usize, f32::NEG_INFINITY);
+            for (j, row) in g.iter_mut().enumerate() {
+                for (i, cell) in row.iter_mut().enumerate() {
+                    *cell = ncc(img, t, q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H, true)?;
+                    if *cell > best.2 { best = (i, j, *cell); }
+                }
+            }
+            let (i, j, s) = best;
+            if (i, j) != (1, 1) { q = [q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H]; continue; }
+            let dx = parabola(g[1][0], g[1][1], g[1][2]);
+            let dy = parabola(g[0][1], g[1][1], g[2][1]);
+            return Some(([q[0] + dx * H, q[1] + dy * H], f64::from(s)));
+        }
+        None
+    }
+
+    fn refine_1d_oracle(img: &Gray, t: &Tmpl, mut q: [f64; 2], e: [f64; 2]) -> Option<([f64; 2], f64)> {
+        const H: f64 = 0.5;
+        for _ in 0..8 {
+            let s: Vec<f32> = (-1..=1).map(|k| ncc(img, t, q[0] + f64::from(k) * H * e[0], q[1] + f64::from(k) * H * e[1], true)).collect::<Option<_>>()?;
+            if s[0] > s[1] && s[0] >= s[2] { q = [q[0] - H * e[0], q[1] - H * e[1]]; continue; }
+            if s[2] > s[1] && s[2] > s[0] { q = [q[0] + H * e[0], q[1] + H * e[1]]; continue; }
+            let dt = parabola(s[0], s[1], s[2]) * H;
+            return Some(([q[0] + dt * e[0], q[1] + dt * e[1]], f64::from(s[1])));
+        }
+        None
+    }
+
+    /// The coarse score array of `sweep` without the last-key reuse.
+    fn coarse_scores_oracle(src: &Camera, d: &Vec3, tc: &Tmpl, targets: &[&PView], w0: f64, dw: f64, n: usize) -> Vec<f32> {
+        let proj: Vec<RayProj> = targets.iter().map(|v| RayProj::new(src, d, &v.cam)).collect();
+        let mut scores = vec![f32::NEG_INFINITY; n + 1];
+        for (i, s) in scores.iter_mut().enumerate() {
+            let w = w0 + i as f64 * dw;
+            let mut sum = 0.0f32;
+            let mut ok = true;
+            for (v, pr) in targets.iter().zip(&proj) {
+                match pr.at(w).and_then(|q| { let h = to_half(q); ncc(v.half, tc, h[0], h[1], false) }) {
+                    Some(c) => sum += c,
+                    None => { ok = false; break; }
+                }
+            }
+            if ok { *s = sum / targets.len() as f32; }
+        }
+        scores
+    }
+
+    /// The same coarse array through `ncc_nearest_last` (as in `sweep`).
+    fn coarse_scores_reused(src: &Camera, d: &Vec3, tc: &Tmpl, targets: &[&PView], w0: f64, dw: f64, n: usize) -> Vec<f32> {
+        let proj: Vec<RayProj> = targets.iter().map(|v| RayProj::new(src, d, &v.cam)).collect();
+        let mut scores = vec![f32::NEG_INFINITY; n + 1];
+        let mut last = vec![None; targets.len()];
+        for (i, s) in scores.iter_mut().enumerate() {
+            let w = w0 + i as f64 * dw;
+            let mut sum = 0.0f32;
+            let mut ok = true;
+            for ((v, pr), last) in targets.iter().zip(&proj).zip(last.iter_mut()) {
+                match pr.at(w).and_then(|q| { let h = to_half(q); ncc_nearest_last(v.half, tc, h[0], h[1], last) }) {
+                    Some(c) => sum += c,
+                    None => { ok = false; break; }
+                }
+            }
+            if ok { *s = sum / targets.len() as f32; }
+        }
+        scores
+    }
+
+    fn lcg_image(w: usize, h: usize, seed: u64, smooth: bool) -> Gray {
+        let mut st = seed;
+        let mut px: Vec<u8> = (0..w * h).map(|_| { st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (st >> 56) as u8 }).collect();
+        if smooth {
+            // a few box blurs: smooth texture with clear peaks for the walkers to climb
+            for _ in 0..2 {
+                let src = px.clone();
+                for y in 1..h - 1 { for x in 1..w - 1 {
+                    let mut a = 0u32;
+                    for dy in 0..3 { for dx in 0..3 { a += u32::from(src[(y + dy - 1) * w + x + dx - 1]); } }
+                    px[y * w + x] = (a / 9) as u8;
+                } }
+            }
+        }
+        Gray::new(w, h, px).unwrap()
+    }
+
+    fn bits(r: Option<([f64; 2], f64)>) -> Option<([u64; 2], u64)> { r.map(|(q, s)| ([q[0].to_bits(), q[1].to_bits()], s.to_bits())) }
+
+    /// Reused evaluations give bitwise the uncached walkers: plain and weighted templates,
+    /// integer, half and arbitrary sub-pixel starts, starts near and over the image borders
+    /// (None), flat images (zero scores, ties), and the coarse sweep arrays (borders, behind
+    /// the camera, the first failing target).
+    #[test]
+    fn evaluation_reuse_matches_uncached_walkers_and_coarse_sweep_bitwise() {
+        let (w, h) = (96, 64);
+        let imgs = [lcg_image(w, h, 7, true), lcg_image(w, h, 11, false), Gray::new(w, h, vec![90; w * h]).unwrap()];
+        let tsrc = lcg_image(w, h, 7, true);
+        let mut st = 12345u64;
+        let mut rnd = || { st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (st >> 11) as f64 / (1u64 << 53) as f64 };
+        let (mut n2, mut n1, mut some2, mut some1) = (0, 0, 0, 0);
+        for (k, img) in imgs.iter().enumerate() {
+            for trial in 0..400 {
+                let (cx, cy) = (6 + (trial * 7) % (w - 12), 6 + (trial * 13) % (h - 12));
+                let normal = (trial % 3 == 0).then(|| { let a = rnd() * std::f64::consts::TAU; [a.cos(), a.sin()] });
+                let side = [0.0f32, 1.0, -1.0][trial % 3];
+                let Some(t) = make_tmpl(sample_int(&tsrc, cx, cy, PATCH_R), PATCH_R, normal, side) else { continue; };
+                let q = match trial % 4 {
+                    0 => [cx as f64 + 1.0, cy as f64],
+                    1 => [cx as f64 + 0.5, cy as f64 - 0.5],
+                    2 => [rnd() * w as f64, rnd() * h as f64],
+                    _ => [cx as f64 + 3.0 * rnd() - 1.5, cy as f64 + 3.0 * rnd() - 1.5],
+                };
+                let a = refine_2d(img, &t, q);
+                assert_eq!(bits(a), bits(refine_2d_oracle(img, &t, q)), "img {k} trial {trial} q {q:?}");
+                n2 += 1; some2 += usize::from(a.is_some());
+                let ang = rnd() * std::f64::consts::TAU;
+                let e = [ang.cos(), ang.sin()];
+                let b = refine_1d(img, &t, q, e);
+                assert_eq!(bits(b), bits(refine_1d_oracle(img, &t, q, e)), "img {k} trial {trial} q {q:?} e {e:?}");
+                n1 += 1; some1 += usize::from(b.is_some());
+            }
+        }
+        assert!(some2 > n2 / 4 && some2 < n2 && some1 > n1 / 4 && some1 < n1, "{some2}/{n2} {some1}/{n1}");
+        // coarse sweep arrays: reference camera and two targets, rays across the image
+        let look = [0.30, 0.0, 0.0];
+        let (c0, c1, c2) = (cam_at([0.30, 0.0, 0.45], look), cam_at([0.30, -0.05, 0.45], look), cam_at([0.36, 0.04, 0.44], look));
+        let full = [lcg_image(640, 360, 3, true), lcg_image(640, 360, 5, true)];
+        let halves: Vec<Gray> = full.iter().map(Gray::half).collect();
+        let pv = [PView { cam: c1, full: &full[0], half: &halves[0] }, PView { cam: c2, full: &full[1], half: &halves[1] }];
+        let targets: Vec<&PView> = pv.iter().collect();
+        let tsrc = halves[0].clone();
+        let mut hits = 0u32;
+        for trial in 0..200 {
+            let px = [rnd() * 640.0, rnd() * 360.0];
+            let Some(tc) = make_tmpl(sample_int(&tsrc, 10 + trial % 290, 10 + (trial * 7) % 160, COARSE_R), COARSE_R, None, 0.0) else { continue; };
+            let d = c0.ray(px);
+            let (w0, w1) = (1.0 / 0.9, 1.0 / 0.05);
+            let n = 200 + trial % 400;
+            let dw = (w1 - w0) / n as f64;
+            for tg in [&targets[..], &targets[..1], &targets[1..]] {
+                let a = coarse_scores_reused(&c0, &d, &tc, tg, w0, dw, n);
+                let b = coarse_scores_oracle(&c0, &d, &tc, tg, w0, dw, n);
+                assert_eq!(a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "trial {trial}");
+                hits += u32::from(a.iter().any(|v| v.is_finite()) && a.iter().any(|v| !v.is_finite()));
+            }
+        }
+        assert!(hits > 0, "no array with both valid and invalid samples");
+    }
+
+    /// A corner map of a larger region read for a sub-region gives bitwise the features computed
+    /// from the image: random, smooth and saturated images, regions at the image borders,
+    /// cropped edge regions and the pose and reconstruction parameters.
+    #[test]
+    fn shared_corner_map_gives_bitwise_the_computed_features() {
+        let (w, h) = (200, 140);
+        let mut sat = lcg_image(w, h, 21, false);
+        for v in sat.px.iter_mut() { *v = if *v > 127 { 255 } else { 0 }; }
+        let imgs = [lcg_image(w, h, 13, false), lcg_image(w, h, 17, true), sat];
+        let mut rec_p = Params::new(0.0);
+        rec_p.exclude_px = Some([150.0, 100.0, 200.0, 140.0]);
+        let mut pose_p = Params::new(0.0);
+        (pose_p.max_object_features, pose_p.max_table_features, pose_p.max_edge_features, pose_p.min_feature_dist_px, pose_p.corner_rel_floor, pose_p.corner_cell_px) = (0, 600, 0, 8.0, 0.01, 0);
+        let full = [0.0, 0.0, w as f64 - 1.0, h as f64 - 1.0];
+        for img in &imgs {
+            let mut map = None;
+            let a = features_shared(img, full, [60.0, 40.0, 90.0, 80.0], [0.0; 4], &pose_p, None, Some(&mut map));
+            assert_eq!(a, features(img, full, [60.0, 40.0, 90.0, 80.0], [0.0; 4], &pose_p));
+            let map = map.unwrap();
+            let mut n = 0;
+            for (region, bx) in [([30.5, 20.2, 150.7, 110.0], [60.0, 40.0, 100.0, 80.0]), ([0.0, 0.0, 199.0, 139.0], [80.0, 50.0, 120.0, 90.0]),
+                ([150.0, 90.0, 260.0, 200.0], [170.0, 100.0, 190.0, 130.0]), ([-20.0, -5.0, 40.0, 30.0], [5.0, 5.0, 20.0, 20.0])] {
+                let edge = [bx[0] - 12.0, bx[1] - 12.0, bx[2] + 12.0, bx[3] + 12.0];
+                for p in [&rec_p, &pose_p] {
+                    let exp = features(img, region, bx, edge, p);
+                    let got = features_shared(img, region, bx, edge, p, Some(&map), None);
+                    assert_eq!(got.len(), exp.len());
+                    for (g, e) in got.iter().zip(&exp) {
+                        assert_eq!((g.x, g.y, g.normal.map(|v| v.map(f64::to_bits)), g.side.to_bits(), g.strength.to_bits()),
+                            (e.x, e.y, e.normal.map(|v| v.map(f64::to_bits)), e.side.to_bits(), e.strength.to_bits()));
+                    }
+                    n += exp.len();
+                }
+            }
+            assert!(n > 100, "{n}");
         }
     }
 

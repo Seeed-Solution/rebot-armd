@@ -167,10 +167,64 @@ impl PosePassProfile {
     }
 }
 
+/// One Levenberg-Marquardt call of a `refine_poses` (`mview-profile`).
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LmCallProfile {
+    /// `round` (free cameras, outlier/cap rounds), `cap_resolve` (after the last cap round) or
+    /// `before` (fixed cameras, the kinematic rms diagnostic).
+    pub role: &'static str,
+    pub round: usize,
+    pub n_free: usize,
+    pub n_points: usize,
+    pub iters: u32,
+    pub accepted: u32,
+    pub rejected: u32,
+    /// `gain` (relative gain below 1e-7), `lambda` (damping above 1e6), `singular`, `iters`.
+    pub exit: &'static str,
+    pub ms: f64,
+}
+
+/// The solves of one `refine_poses` call: per LM call, and the stage times / counters
+/// (`lm.*`: init, assembly, schur, dense, backsub, trial_cost, rms; allocations).
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LmProfile {
+    pub calls: Vec<LmCallProfile>,
+    pub stages: std::collections::BTreeMap<String, f64>,
+}
+
+#[cfg(feature = "mview-profile")]
+mod lm_prof {
+    use super::{LmCallProfile, LmProfile};
+    use std::cell::RefCell;
+    thread_local! {
+        static CALLS: RefCell<Vec<LmCallProfile>> = const { RefCell::new(Vec::new()) };
+        static ROLE: RefCell<(&'static str, usize)> = const { RefCell::new(("round", 0)) };
+    }
+    pub(super) fn set_role(role: &'static str, round: usize) { ROLE.with(|r| *r.borrow_mut() = (role, round)); }
+    pub(super) fn role() -> (&'static str, usize) { ROLE.with(|r| *r.borrow()) }
+    pub(super) fn push(c: LmCallProfile) { CALLS.with(|v| v.borrow_mut().push(c)); }
+    pub(super) fn take() -> LmProfile {
+        LmProfile { calls: CALLS.with(|v| std::mem::take(&mut *v.borrow_mut())), stages: crate::stage_prof::take() }
+    }
+}
+
+#[inline(always)]
+#[cfg_attr(not(feature = "mview-profile"), allow(unused_variables))]
+fn lm_role(role: &'static str, round: usize) {
+    #[cfg(feature = "mview-profile")]
+    lm_prof::set_role(role, round);
+}
+
 /// Top-level pose refinement profile collected under `mview-profile`.
 #[cfg(feature = "mview-profile")]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PoseProfile {
+    /// Preparation sub-stages (`prep.features_ms`, `prep.halves_ms`, `prep.templates_ms`, ...).
+    pub prep_stages: std::collections::BTreeMap<String, f64>,
+    pub pass1_lm: LmProfile,
+    pub pass2_lm: LmProfile,
     pub prep_ms: f64,
     pub pass1_match_ms: f64,
     pub pass1_solve_ms: f64,
@@ -1138,16 +1192,24 @@ struct PreparedFeat {
     tf: Tmpl,
 }
 
-struct TexturePrep {
+struct TexturePrep<'h> {
     reference: usize,
-    halves: Vec<Gray>,
+    /// Half-resolution image per view: built here, or shared with the reconstruction.
+    halves: std::borrow::Cow<'h, [Gray]>,
     feats: Vec<PreparedFeat>,
 }
 
-impl TexturePrep {
+impl<'h> TexturePrep<'h> {
     fn new(views: &[View], ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+        Self::prepared(views, None, ref_cam, reference, object_box, exclude, table_z)
+    }
+
+    /// [`TexturePrep::new`] with the images prepared for `views` (half images, rebuilt when of
+    /// another length); leaves the reference corner map there for the reconstruction.
+    fn prepared(views: &[View], prep: Option<&'h Prepared>, ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+        let halves = prep.map(|pr| pr.halves.as_slice());
         if reference >= views.len() || views.len() < 2 {
-            return Self { reference, halves: Vec::new(), feats: Vec::new() };
+            return Self { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() };
         }
         let rv = &views[reference];
         let m = POSE_BOX_MARGIN_PX;
@@ -1163,9 +1225,19 @@ impl TexturePrep {
         // the box quota is 0: corners in it are left out; corners in an excluded region are dropped
         // afterwards, so the quota is taken twice
         p.max_table_features *= 2;
-        let raw_feats: Vec<Feature> = features(&rv.img, full, grown, [0.0; 4], &p).into_iter()
+        let t = ProfT::start();
+        let mut map = None;
+        let raw_feats: Vec<Feature> = features_shared(&rv.img, full, grown, [0.0; 4], &p, None, prep.is_some().then_some(&mut map)).into_iter()
             .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
-        let halves: Vec<Gray> = views.iter().map(|v| v.img.half()).collect();
+        if let (Some(pr), Some(m)) = (prep, map) { pr.put_ref_map(reference, m); }
+        t.stop("prep.features_ms");
+        let t = ProfT::start();
+        let halves: std::borrow::Cow<'h, [Gray]> = match halves {
+            Some(h) if h.len() == views.len() => std::borrow::Cow::Borrowed(h),
+            _ => std::borrow::Cow::Owned(half_images(views)),
+        };
+        t.stop("prep.halves_ms");
+        let t = ProfT::start();
         let mut feats = Vec::new();
         for f in raw_feats {
             let px = [f.x as f64, f.y as f64];
@@ -1181,6 +1253,8 @@ impl TexturePrep {
             ) else { continue; };
             feats.push(PreparedFeat { px, x0, tc, tf });
         }
+        t.stop("prep.templates_ms");
+        prof_count("prep.n_features", feats.len() as u64);
         Self { reference, halves, feats }
     }
 
@@ -1449,11 +1523,12 @@ fn inv3(m: &Mat3) -> Option<Mat3> {
     Some(r)
 }
 
-/// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting).
-fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+/// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting) in place: `a`
+/// and `b` are overwritten and the solution goes to `x` (len n); false when singular or not finite.
+fn solve_dense_in(a: &mut [f64], b: &mut [f64], n: usize, x: &mut [f64]) -> bool {
     for col in 0..n {
-        let piv = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
-        if a[piv * n + col].abs() < 1e-15 { return None; }
+        let Some(piv) = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs())) else { return false; };
+        if a[piv * n + col].abs() < 1e-15 { return false; }
         if piv != col {
             for k in 0..n { a.swap(piv * n + k, col * n + k); }
             b.swap(piv, col);
@@ -1465,12 +1540,11 @@ fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
             b[r] -= f * b[col];
         }
     }
-    let mut x = vec![0.0; n];
     for r in (0..n).rev() {
         let s: f64 = (r + 1..n).map(|k| a[r * n + k] * x[k]).sum();
         x[r] = (b[r] - s) / a[r * n + r];
     }
-    x.iter().all(|v| v.is_finite()).then_some(x)
+    x[..n].iter().all(|v| v.is_finite())
 }
 
 // ---- bundle adjustment ----
@@ -1535,20 +1609,44 @@ impl Problem<'_> {
     /// Levenberg-Marquardt on the rotations of the `free` views (index into the parameter
     /// blocks) and the points.
     fn solve(&self, s: &mut State, free: &[Option<usize>]) {
+        #[cfg(feature = "mview-profile")]
+        let t_call = Instant::now();
+        #[cfg(feature = "mview-profile")]
+        let mut cp = {
+            let (role, round) = lm_prof::role();
+            LmCallProfile { role, round, n_free: free.iter().filter(|f| f.is_some()).count(), n_points: self.corrs.len(), exit: "iters", ..Default::default() }
+        };
         let nf = free.iter().filter(|f| f.is_some()).count();
         let nc = 3 * nf;
         let mut lambda = 1e-3;
+        let t = ProfT::start();
         let mut cost = self.cost(s, free);
+        t.stop("lm.trial_cost_ms");
+        // buffers of every iteration (refilled; the arithmetic is the same as with fresh ones)
+        let mut sm = vec![0.0; nc * nc];
+        let mut bc = vec![0.0; nc];
+        let mut rhs = vec![0.0; nc];
+        let mut dc = vec![0.0; nc];
+        // per point: Hpp^-1, gp, and the range of its blocks with the free views in `hpc_all`
+        let mut per: Vec<Option<(Mat3, Vec3, usize, usize)>> = Vec::with_capacity(self.corrs.len());
+        let mut hpc_all: Vec<(usize, Mat3)> = Vec::with_capacity(self.corrs.len() * nf.min(4));
+        let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+        prof_count("lm.alloc", 8);
         for _ in 0..LM_ITERS {
-            let mut sm = vec![0.0; nc * nc];
-            let mut bc = vec![0.0; nc];
-            // per point: Hpp^-1, gp, and its blocks with the free views
-            let mut per: Vec<Option<(Mat3, Vec3, Vec<(usize, Mat3)>)>> = Vec::with_capacity(self.corrs.len());
+            #[cfg(feature = "mview-profile")]
+            {
+                cp.iters += 1;
+            }
+            sm.fill(0.0);
+            bc.fill(0.0);
+            per.clear();
+            hpc_all.clear();
             for (i, c) in self.corrs.iter().enumerate() {
+                let t_asm = ProfT::start();
                 let wt = self.weight(c);
                 let mut hpp = [[0.0; 3]; 3];
                 let mut gp = [0.0; 3];
-                let mut hpc: Vec<(usize, Mat3)> = Vec::new();
+                let h0 = hpc_all.len();
                 for (k, (a, q)) in c.obs.iter().enumerate() {
                     if !self.active[i][k] { continue; }
                     let Some((p, jx, d)) = proj_jac(&s.cams[*a], &s.x[i]) else { continue; };
@@ -1573,9 +1671,9 @@ impl Problem<'_> {
                                 b[u][v] = wgt * (jx[0][u] * jd[0][v] + jx[1][u] * jd[1][v]);
                             }
                         }
-                        match hpc.iter_mut().find(|e| e.0 == fi) {
+                        match hpc_all[h0..].iter_mut().find(|e| e.0 == fi) {
                             Some(e) => for u in 0..3 { for v in 0..3 { e.1[u][v] += b[u][v]; } },
-                            None => hpc.push((fi, b)),
+                            None => hpc_all.push((fi, b)),
                         }
                     }
                 }
@@ -1586,18 +1684,22 @@ impl Problem<'_> {
                     gp[2] += hw * self.plane_w * r;
                 }
                 for u in 0..3 { hpp[u][u] = hpp[u][u] * (1.0 + lambda) + 1e-9; }
+                t_asm.stop("lm.assembly_ms");
+                let t_schur = ProfT::start();
                 let Some(inv) = inv3(&hpp) else { per.push(None); continue; };
+                let (h1, hpc) = (hpc_all.len(), &hpc_all[h0..]);
                 // Schur complement: S -= B1^T inv B2, b -= B1^T inv gp
-                for (f1, b1) in &hpc {
+                for (f1, b1) in hpc {
                     let t = mat_mul(&kinematics::transpose(b1), &inv);
                     let tg = kinematics::mat_vec(&t, &gp);
                     for u in 0..3 { bc[3 * f1 + u] -= tg[u]; }
-                    for (f2, b2) in &hpc {
+                    for (f2, b2) in hpc {
                         let m = mat_mul(&t, b2);
                         for u in 0..3 { for v in 0..3 { sm[(3 * f1 + u) * nc + 3 * f2 + v] -= m[u][v]; } }
                     }
                 }
-                per.push(Some((inv, gp, hpc)));
+                per.push(Some((inv, gp, h0, h1)));
+                t_schur.stop("lm.schur_ms");
             }
             for (a, f) in free.iter().enumerate() {
                 let Some(fi) = f else { continue; };
@@ -1608,13 +1710,27 @@ impl Problem<'_> {
                 }
             }
             for u in 0..nc { sm[u * nc + u] *= 1.0 + lambda; }
-            let dc = if nc > 0 { match solve_dense(sm, bc.iter().map(|v| -v).collect(), nc) { Some(d) => d, None => break } } else { Vec::new() };
+            let t = ProfT::start();
+            if nc > 0 {
+                for (r, v) in rhs.iter_mut().zip(&bc) { *r = -v; }
+                if !solve_dense_in(&mut sm, &mut rhs, nc, &mut dc) {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "singular";
+                    }
+                    break;
+                }
+            }
+            t.stop("lm.dense_ms");
             // back-substitution and the trial state
-            let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+            let t = ProfT::start();
+            trial.cams.copy_from_slice(&s.cams);
+            trial.w.copy_from_slice(&s.w);
+            trial.x.copy_from_slice(&s.x);
             for (i, e) in per.iter().enumerate() {
-                let Some((inv, gp, hpc)) = e else { continue; };
+                let Some((inv, gp, h0, h1)) = e else { continue; };
                 let mut g = *gp;
-                for (fi, b) in hpc {
+                for (fi, b) in &hpc_all[*h0..*h1] {
                     let bd = kinematics::mat_vec(b, &[dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]]);
                     for u in 0..3 { g[u] += bd[u]; }
                 }
@@ -1627,22 +1743,51 @@ impl Problem<'_> {
                 trial.cams[a].r = mat_mul(&rodrigues(&d), &trial.cams[a].r);
                 for u in 0..3 { trial.w[a][u] += d[u]; }
             }
+            t.stop("lm.backsub_ms");
+            let t = ProfT::start();
             let tc = self.cost(&trial, free);
+            t.stop("lm.trial_cost_ms");
             if tc < cost {
+                #[cfg(feature = "mview-profile")]
+                {
+                    cp.accepted += 1;
+                }
                 let gain = (cost - tc) / cost.max(1e-12);
-                *s = trial;
+                std::mem::swap(s, &mut trial);
                 cost = tc;
                 lambda = (lambda * 0.3).max(1e-7);
-                if gain < 1e-7 { break; }
+                if gain < 1e-7 {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "gain";
+                    }
+                    break;
+                }
             } else {
+                #[cfg(feature = "mview-profile")]
+                {
+                    cp.rejected += 1;
+                }
                 lambda *= 10.0;
-                if lambda > 1e6 { break; }
+                if lambda > 1e6 {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "lambda";
+                    }
+                    break;
+                }
             }
+        }
+        #[cfg(feature = "mview-profile")]
+        {
+            cp.ms = ms(t_call);
+            lm_prof::push(cp);
         }
     }
 
     /// Reprojection rms (px) per view over the active observations.
     fn rms(&self, s: &State, nv: usize) -> Vec<Option<f64>> {
+        let _t = RmsTimer(ProfT::start());
         let mut acc = vec![(0.0, 0usize); nv];
         for (i, c) in self.corrs.iter().enumerate() {
             for (k, (a, q)) in c.obs.iter().enumerate() {
@@ -1654,9 +1799,16 @@ impl Problem<'_> {
     }
 }
 
+struct RmsTimer(ProfT);
+impl Drop for RmsTimer { fn drop(&mut self) { std::mem::replace(&mut self.0, ProfT::start()).stop("lm.rms_ms"); } }
+struct InitTimer(ProfT);
+impl Drop for InitTimer { fn drop(&mut self) { std::mem::replace(&mut self.0, ProfT::start()).stop("lm.init_ms"); } }
+
 /// Initial points: the triangulation of the observations (the table plane for a point that
 /// does not triangulate).
 fn init_points(cams: &[Camera], corrs: &[Corr], table_z: f64) -> Vec<Vec3> {
+    let _t = InitTimer(ProfT::start());
+    prof_count("lm.init_calls", 1);
     corrs.iter().map(|c| {
         let cs: Vec<Camera> = c.obs.iter().map(|o| cams[o.0]).collect();
         let ps: Vec<[f64; 2]> = c.obs.iter().map(|o| o.1).collect();
@@ -1674,17 +1826,31 @@ fn init_points(cams: &[Camera], corrs: &[Corr], table_z: f64) -> Vec<Vec3> {
 /// `guided_window_px` of the prediction of the refined cameras (views the first solve did not
 /// refine keep `window_px`), and solved again from the kinematic cameras.
 pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+    refine_views_impl(views, None, reference, object_box, exclude, table_z, extra, texture, pp)
+}
+
+/// [`refine_views`] with the images prepared for `views` ([`Prepared`]), shared with
+/// [`reconstruct_prepared`] so that they are built once.
+pub fn refine_views_prepared(views: &[View], prep: &Prepared, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+    refine_views_impl(views, Some(prep), reference, object_box, exclude, table_z, extra, texture, pp)
+}
+
+fn refine_views_impl(views: &[View], prep_imgs: Option<&Prepared>, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
     let t0 = Instant::now();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
     #[cfg(feature = "mview-profile")]
+    let _ = (crate::stage_prof::take(), lm_prof::take());
+    #[cfg(feature = "mview-profile")]
     let t_prep = Instant::now();
     let prep = texture.then(|| match cams.get(reference) {
-        Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
-        None => TexturePrep { reference, halves: Vec::new(), feats: Vec::new() },
+        Some(rc) => TexturePrep::prepared(views, prep_imgs, rc, reference, object_box, exclude, table_z),
+        None => TexturePrep { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() },
     });
     #[cfg(feature = "mview-profile")]
     let prep_ms = if texture { ms(t_prep) } else { 0.0 };
+    #[cfg(feature = "mview-profile")]
+    let prep_stages = crate::stage_prof::take();
     let mut cache = prep.as_ref().map(|p| MatchCache::new(p.feats.len(), views.len()));
     #[cfg(feature = "mview-profile")]
     let mut pass1_prof = PosePassProfile::new_seeded();
@@ -1705,9 +1871,12 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     let pass1_match_ms = ms(t_p1_match);
     #[cfg(feature = "mview-profile")]
     let t_p1_solve = Instant::now();
-    let r1 = refine_poses(&cams, reference, &first, table_z, pp);
+    // with the texture, pass one only steers pass two (statuses and cameras): no diagnostics
+    let r1 = refine_poses_with(&cams, reference, &first, table_z, pp, prep.is_none());
     #[cfg(feature = "mview-profile")]
     let pass1_solve_ms = ms(t_p1_solve);
+    #[cfg(feature = "mview-profile")]
+    let pass1_lm = lm_prof::take();
     #[cfg(feature = "mview-profile")]
     let mut pass2_prof = PosePassProfile::new_seeded();
     #[cfg(feature = "mview-profile")]
@@ -1717,6 +1886,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
             let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
             #[cfg(feature = "mview-profile")]
             let t_p2_match = Instant::now();
+            #[cfg(feature = "mview-profile")]
+            let _ = crate::stage_prof::take();
             let second = with(p.corrs_with_cache_profiled(
                 views,
                 &r1.cams,
@@ -1744,6 +1915,9 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     #[cfg(feature = "mview-profile")]
     {
         out.profile = Some(PoseProfile {
+            prep_stages,
+            pass1_lm,
+            pass2_lm: if prep.is_some() { lm_prof::take() } else { LmProfile::default() },
             prep_ms,
             pass1_match_ms,
             pass1_solve_ms,
@@ -1759,6 +1933,12 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
 
 /// Refine the rotations of every view but `reference` from `corrs` (see the module doc).
 pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams) -> PoseRefinement {
+    refine_poses_with(cams, reference, corrs, table_z, pp, true)
+}
+
+/// [`refine_poses`]; without `diagnostics` the per-view `rms_before_px` / `rms_after_px` are None
+/// (the fixed-camera solve and the rms passes are skipped; cameras and statuses are the same).
+fn refine_poses_with(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams, diagnostics: bool) -> PoseRefinement {
     let t0 = Instant::now();
     let nv = cams.len();
     let mut prob = Problem { corrs, active: corrs.iter().map(|c| vec![true; c.obs.len()]).collect(), table_z,
@@ -1779,16 +1959,27 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
         let mut k = 0;
         fixed.iter().map(|f| if f.is_none() { k += 1; Some(k - 1) } else { None }).collect()
     };
-    let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+    // every solve starts from the kinematic cameras and these points
+    let x_init = init_points(cams, corrs, table_z);
+    let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: x_init.clone() };
     let mut st = fresh();
     let mut rejected = vec![[0.0; 3]; nv];
+    // the observations and free views of round 0's solve
+    let mut round0: Option<(Vec<Vec<bool>>, Vec<Option<usize>>)> = None;
     // round 0: solve and drop the outliers; then solve until no free view exceeds the cap
     for round in 0..4 {
-        st = fresh();
         let free = free_of(&fixed);
-        if free.iter().all(Option::is_none) { break; }
-        prob.solve(&mut st, &free);
+        if free.iter().all(Option::is_none) { st = fresh(); break; }
+        // round 1 with round 0's observations and free views is round 0's solve (same start): reuse it
+        let same_as_round0 = round == 1 && round0.as_ref().is_some_and(|(a, f)| *a == prob.active && *f == free);
+        prof_count("lm.round_reused", u64::from(same_as_round0));
+        if !same_as_round0 {
+            st = fresh();
+            lm_role("round", round);
+            prob.solve(&mut st, &free);
+        }
         if round == 0 {
+            round0 = Some((prob.active.clone(), free));
             for (i, c) in corrs.iter().enumerate() {
                 for (k, (a, q)) in c.obs.iter().enumerate() {
                     if st.cams[*a].project(&st.x[i]).is_none_or(|p| (p[0] - q[0]).hypot(p[1] - q[1]) > pp.outlier_px) { prob.active[i][k] = false; }
@@ -1807,17 +1998,19 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
             }
         }
         if !changed { break; }
-        if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { prob.solve(&mut st, &free); } }
+        if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { lm_role("cap_resolve", round); prob.solve(&mut st, &free); } }
     }
     if free_of(&fixed).iter().all(Option::is_none) { st = fresh(); }
     // before: the same observations triangulated with the kinematic cameras (no coplanarity)
-    let before = {
+    let (before, after) = if diagnostics {
         let pb = Problem { corrs, active: prob.active.clone(), table_z, plane_w: 0.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
-        let mut s0 = State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+        let mut s0 = fresh();
+        lm_role("before", 0);
         pb.solve(&mut s0, &vec![None; nv]);
-        pb.rms(&s0, nv)
+        (pb.rms(&s0, nv), prob.rms(&st, nv))
+    } else {
+        (vec![None; nv], vec![None; nv])
     };
-    let after = prob.rms(&st, nv);
     let views = (0..nv).map(|a| {
         let (n, nm) = count(&prob, a);
         let w = if fixed[a] == Some("correction_too_large") { rejected[a] } else { st.w[a] };
@@ -1894,6 +2087,324 @@ mod tests {
         assert_eq!((r.views[1].status, r.views[2].status), ("correction_too_large", "correction_too_large"), "{:?}", r.views);
         assert!((r.views[1].correction_mrad - 1.5).abs() < 0.2, "{:?}", r.views[1]);
         assert_eq!(r.cams, kin.to_vec());
+    }
+
+    /// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting).
+    fn solve_dense_oracle(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+        for col in 0..n {
+            let piv = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
+            if a[piv * n + col].abs() < 1e-15 { return None; }
+            if piv != col {
+                for k in 0..n { a.swap(piv * n + k, col * n + k); }
+                b.swap(piv, col);
+            }
+            for r in col + 1..n {
+                let f = a[r * n + col] / a[col * n + col];
+                if f == 0.0 { continue; }
+                for k in col..n { a[r * n + k] -= f * a[col * n + k]; }
+                b[r] -= f * b[col];
+            }
+        }
+        let mut x = vec![0.0; n];
+        for r in (0..n).rev() {
+            let s: f64 = (r + 1..n).map(|k| a[r * n + k] * x[k]).sum();
+            x[r] = (b[r] - s) / a[r * n + r];
+        }
+        x.iter().all(|v| v.is_finite()).then_some(x)
+    }
+
+
+    fn solve_oracle(pr: &Problem, s: &mut State, free: &[Option<usize>]) {
+        let nf = free.iter().filter(|f| f.is_some()).count();
+        let nc = 3 * nf;
+        let mut lambda = 1e-3;
+        let mut cost = pr.cost(s, free);
+        for _ in 0..LM_ITERS {
+            let mut sm = vec![0.0; nc * nc];
+            let mut bc = vec![0.0; nc];
+            // per point: Hpp^-1, gp, and its blocks with the free views
+            let mut per: Vec<Option<(Mat3, Vec3, Vec<(usize, Mat3)>)>> = Vec::with_capacity(pr.corrs.len());
+            for (i, c) in pr.corrs.iter().enumerate() {
+                let wt = pr.weight(c);
+                let mut hpp = [[0.0; 3]; 3];
+                let mut gp = [0.0; 3];
+                let mut hpc: Vec<(usize, Mat3)> = Vec::new();
+                for (k, (a, q)) in c.obs.iter().enumerate() {
+                    if !pr.active[i][k] { continue; }
+                    let Some((p, jx, d)) = proj_jac(&s.cams[*a], &s.x[i]) else { continue; };
+                    let r = [p[0] - q[0], p[1] - q[1]];
+                    let (_, hw) = huber(wt * r[0].hypot(r[1]), pr.huber_px);
+                    let wgt = wt * wt * hw;
+                    for u in 0..3 {
+                        gp[u] += wgt * (jx[0][u] * r[0] + jx[1][u] * r[1]);
+                        for v in 0..3 { hpp[u][v] += wgt * (jx[0][u] * jx[0][v] + jx[1][u] * jx[1][v]); }
+                    }
+                    if let Some(fi) = free[*a] {
+                        // d(pixel)/d(delta) = jx [d]x
+                        let dx = [[0.0, -d[2], d[1]], [d[2], 0.0, -d[0]], [-d[1], d[0], 0.0]];
+                        let mut jd = [[0.0; 3]; 2];
+                        for rr in 0..2 { for cc in 0..3 { jd[rr][cc] = (0..3).map(|l| jx[rr][l] * dx[l][cc]).sum(); } }
+                        let o = 3 * fi;
+                        let mut b = [[0.0; 3]; 3];
+                        for u in 0..3 {
+                            bc[o + u] += wgt * (jd[0][u] * r[0] + jd[1][u] * r[1]);
+                            for v in 0..3 {
+                                sm[(o + u) * nc + o + v] += wgt * (jd[0][u] * jd[0][v] + jd[1][u] * jd[1][v]);
+                                b[u][v] = wgt * (jx[0][u] * jd[0][v] + jx[1][u] * jd[1][v]);
+                            }
+                        }
+                        match hpc.iter_mut().find(|e| e.0 == fi) {
+                            Some(e) => for u in 0..3 { for v in 0..3 { e.1[u][v] += b[u][v]; } },
+                            None => hpc.push((fi, b)),
+                        }
+                    }
+                }
+                if c.on_table && pr.plane_w > 0.0 {
+                    let r = (s.x[i][2] - pr.table_z) * pr.plane_w;
+                    let (_, hw) = huber(r.abs(), pr.huber_px);
+                    hpp[2][2] += hw * pr.plane_w * pr.plane_w;
+                    gp[2] += hw * pr.plane_w * r;
+                }
+                for u in 0..3 { hpp[u][u] = hpp[u][u] * (1.0 + lambda) + 1e-9; }
+                let Some(inv) = inv3(&hpp) else { per.push(None); continue; };
+                // Schur complement: S -= B1^T inv B2, b -= B1^T inv gp
+                for (f1, b1) in &hpc {
+                    let t = mat_mul(&kinematics::transpose(b1), &inv);
+                    let tg = kinematics::mat_vec(&t, &gp);
+                    for u in 0..3 { bc[3 * f1 + u] -= tg[u]; }
+                    for (f2, b2) in &hpc {
+                        let m = mat_mul(&t, b2);
+                        for u in 0..3 { for v in 0..3 { sm[(3 * f1 + u) * nc + 3 * f2 + v] -= m[u][v]; } }
+                    }
+                }
+                per.push(Some((inv, gp, hpc)));
+            }
+            for (a, f) in free.iter().enumerate() {
+                let Some(fi) = f else { continue; };
+                let ip = 1.0 / (pr.prior_rad * pr.prior_rad);
+                for u in 0..3 {
+                    sm[(3 * fi + u) * nc + 3 * fi + u] += ip;
+                    bc[3 * fi + u] += ip * s.w[a][u];
+                }
+            }
+            for u in 0..nc { sm[u * nc + u] *= 1.0 + lambda; }
+            let dc = if nc > 0 {
+                match solve_dense_oracle(sm, bc.iter().map(|v| -v).collect(), nc) {
+                    Some(d) => d,
+                    None => {
+                        break;
+                    }
+                }
+            } else { Vec::new() };
+            // back-substitution and the trial state
+            let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+            for (i, e) in per.iter().enumerate() {
+                let Some((inv, gp, hpc)) = e else { continue; };
+                let mut g = *gp;
+                for (fi, b) in hpc {
+                    let bd = kinematics::mat_vec(b, &[dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]]);
+                    for u in 0..3 { g[u] += bd[u]; }
+                }
+                let dx = kinematics::mat_vec(inv, &g);
+                for u in 0..3 { trial.x[i][u] -= dx[u]; }
+            }
+            for (a, f) in free.iter().enumerate() {
+                let Some(fi) = f else { continue; };
+                let d = [dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]];
+                trial.cams[a].r = mat_mul(&rodrigues(&d), &trial.cams[a].r);
+                for u in 0..3 { trial.w[a][u] += d[u]; }
+            }
+            let tc = pr.cost(&trial, free);
+            if tc < cost {
+                let gain = (cost - tc) / cost.max(1e-12);
+                *s = trial;
+                cost = tc;
+                lambda = (lambda * 0.3).max(1e-7);
+                if gain < 1e-7 {
+                    break;
+                }
+            } else {
+                lambda *= 10.0;
+                if lambda > 1e6 {
+                    break;
+                }
+            }
+        }
+    }
+
+
+    /// The reused LM buffers give bitwise the solve with fresh ones (the previous solve as
+    /// oracle): all views free, some fixed, none free, coplanarity on/off, markers, inactive
+    /// observations, and a non-finite (singular) start.
+    #[test]
+    fn lm_solve_with_reused_buffers_matches_fresh_buffers_bitwise() {
+        let look = [0.30, 0.0, 0.0];
+        let truth = [cam_at([0.30, 0.0, 0.45], look), cam_at([0.30, -0.04, 0.45], look), cam_at([0.30, 0.04, 0.45], look), cam_at([0.34, 0.0, 0.45], look)];
+        let mut kin = truth;
+        kin[1].r = mat_mul(&rodrigues(&[0.0015, 0.0, 0.0]), &kin[1].r);
+        kin[2].r = mat_mul(&rodrigues(&[0.0, -0.001, 0.0011]), &kin[2].r);
+        kin[3].r = mat_mul(&rodrigues(&[0.0, 0.0006, -0.0021]), &kin[3].r);
+        let mut corrs = Vec::new();
+        for i in 0..8 {
+            for j in 0..6 {
+                let x = [0.22 + 0.022 * f64::from(i), -0.10 + 0.04 * f64::from(j), 0.0];
+                let obs: Vec<(usize, [f64; 2])> = truth.iter().enumerate().filter_map(|(k, c)| c.project(&x).map(|q| (k, q))).collect();
+                corrs.push(Corr { obs, on_table: (i + j) % 3 != 0, marker: j == 5 });
+            }
+        }
+        corrs[3].obs[1].1[0] += 6.0;
+        corrs[10].obs[2].1[1] -= 9.0;
+        let mut active: Vec<Vec<bool>> = corrs.iter().map(|c| vec![true; c.obs.len()]).collect();
+        active[7][2] = false;
+        active[11].iter_mut().for_each(|a| *a = false);
+        let nv = kin.len();
+        let x0 = init_points(&kin, &corrs, 0.0);
+        let frees: [Vec<Option<usize>>; 4] = [
+            vec![None, Some(0), Some(1), Some(2)],
+            vec![None, None, Some(0), Some(1)],
+            vec![None, Some(0), None, None],
+            vec![None; 4],
+        ];
+        for plane_w in [0.0, 1000.0] {
+            let prob = Problem { corrs: &corrs, active: active.clone(), table_z: 0.0, plane_w, prior_rad: POSE_PRIOR_RAD, huber_px: POSE_HUBER_PX, marker_weight: MARKER_WEIGHT };
+            for free in &frees {
+                let mut a = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+                let mut b = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+                prob.solve(&mut a, free);
+                solve_oracle(&prob, &mut b, free);
+                assert_eq!((&a.cams, &a.w, &a.x), (&b.cams, &b.w, &b.x), "plane_w {plane_w} free {free:?}");
+            }
+            // a point at the camera centre: singular point block, the dense solve sees NaN
+            let mut bad = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+            bad.x[0] = [f64::NAN; 3];
+            let mut bad2 = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: bad.x.clone() };
+            prob.solve(&mut bad, &frees[0]);
+            solve_oracle(&prob, &mut bad2, &frees[0]);
+            assert_eq!(format!("{:?}", (&bad.cams, &bad.w, &bad.x)), format!("{:?}", (&bad2.cams, &bad2.w, &bad2.x)));
+        }
+    }
+
+    /// The refine_poses of before the shared initial points, the round-0 reuse and the
+    /// diagnostics switch (oracle for the equivalence tests).
+    fn refine_poses_oracle(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams) -> (Vec<Camera>, Vec<ViewRefine>) {
+        let nv = cams.len();
+        let mut prob = Problem { corrs, active: corrs.iter().map(|c| vec![true; c.obs.len()]).collect(), table_z,
+            plane_w: pp.plane_px_per_mm * 1000.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
+        let count = |prob: &Problem, a: usize| -> (usize, usize) {
+            let mut n = (0, 0);
+            for (i, c) in corrs.iter().enumerate() {
+                if c.obs.iter().enumerate().any(|(k, o)| o.0 == a && prob.active[i][k]) && prob.active[i].iter().filter(|x| **x).count() >= 2 {
+                    n.0 += 1;
+                    if c.marker { n.1 += 1; }
+                }
+            }
+            n
+        };
+        let mut fixed: Vec<Option<&'static str>> = (0..nv).map(|a| (a == reference).then_some("reference")).collect();
+        for a in 0..nv { if fixed[a].is_none() && count(&prob, a).0 < pp.min_points { fixed[a] = Some("too_few_points"); } }
+        let free_of = |fixed: &[Option<&'static str>]| -> Vec<Option<usize>> {
+            let mut k = 0;
+            fixed.iter().map(|f| if f.is_none() { k += 1; Some(k - 1) } else { None }).collect()
+        };
+        let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+        let mut st = fresh();
+        let mut rejected = vec![[0.0; 3]; nv];
+        for round in 0..4 {
+            st = fresh();
+            let free = free_of(&fixed);
+            if free.iter().all(Option::is_none) { break; }
+            prob.solve(&mut st, &free);
+            if round == 0 {
+                for (i, c) in corrs.iter().enumerate() {
+                    for (k, (a, q)) in c.obs.iter().enumerate() {
+                        if st.cams[*a].project(&st.x[i]).is_none_or(|p| (p[0] - q[0]).hypot(p[1] - q[1]) > pp.outlier_px) { prob.active[i][k] = false; }
+                    }
+                    if prob.active[i].iter().filter(|x| **x).count() < 2 { prob.active[i].iter_mut().for_each(|x| *x = false); }
+                }
+                for a in 0..nv { if fixed[a].is_none() && count(&prob, a).0 < pp.min_points { fixed[a] = Some("too_few_points"); } }
+                continue;
+            }
+            let mut changed = false;
+            for a in 0..nv {
+                if fixed[a].is_none() && kinematics::norm(&st.w[a]) > pp.max_correction_rad {
+                    fixed[a] = Some("correction_too_large");
+                    rejected[a] = st.w[a];
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+            if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { prob.solve(&mut st, &free); } }
+        }
+        if free_of(&fixed).iter().all(Option::is_none) { st = fresh(); }
+        let before = {
+            let pb = Problem { corrs, active: prob.active.clone(), table_z, plane_w: 0.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
+            let mut s0 = State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+            pb.solve(&mut s0, &vec![None; nv]);
+            pb.rms(&s0, nv)
+        };
+        let after = prob.rms(&st, nv);
+        let views = (0..nv).map(|a| {
+            let (n, nm) = count(&prob, a);
+            let w = if fixed[a] == Some("correction_too_large") { rejected[a] } else { st.w[a] };
+            ViewRefine {
+                status: fixed[a].unwrap_or("refined"),
+                rot_mrad: w.map(|v| v * 1000.0), correction_mrad: kinematics::norm(&w) * 1000.0,
+                n_points: n, n_marker_corners: nm, rms_before_px: before[a], rms_after_px: after[a],
+            }
+        }).collect();
+        (st.cams, views)
+    }
+
+    /// Bitwise equality with the oracle: unchanged mask (round-0 reuse), changed mask (outliers),
+    /// all views fixed, marker-only, and cap rejections in round 1 and later rounds; without
+    /// diagnostics only the rms fields differ (None).
+    #[test]
+    fn refine_poses_matches_oracle_bitwise() {
+        let look = [0.30, 0.0, 0.0];
+        let truth = [cam_at([0.30, 0.0, 0.45], look), cam_at([0.30, -0.04, 0.45], look), cam_at([0.30, 0.04, 0.45], look), cam_at([0.34, 0.0, 0.45], look)];
+        let mut kin = truth;
+        kin[1].r = mat_mul(&rodrigues(&[0.0015, 0.0, 0.0]), &kin[1].r);
+        kin[2].r = mat_mul(&rodrigues(&[0.0, -0.001, 0.0011]), &kin[2].r);
+        kin[3].r = mat_mul(&rodrigues(&[0.0, 0.0006, -0.0021]), &kin[3].r);
+        let grid = |marker: bool| -> Vec<Corr> {
+            let mut corrs = Vec::new();
+            for i in 0..8 {
+                for j in 0..6 {
+                    let x = [0.22 + 0.022 * f64::from(i), -0.10 + 0.04 * f64::from(j), if marker { 0.003 } else { 0.0 }];
+                    let obs: Vec<(usize, [f64; 2])> = truth.iter().enumerate().filter_map(|(k, c)| c.project(&x).map(|q| (k, q))).collect();
+                    corrs.push(Corr { obs, on_table: !marker, marker });
+                }
+            }
+            corrs
+        };
+        let clean = grid(false);
+        let mut outliers = clean.clone();
+        outliers[3].obs[1].1[0] += 6.0;
+        outliers[10].obs[2].1[1] -= 9.0;
+        outliers[20].obs[3].1[0] -= 7.0;
+        let markers = grid(true);
+        let cap = |c: f64| PoseParams { max_correction_rad: c, ..PoseParams::default() };
+        let cases: Vec<(&str, &[Corr], PoseParams)> = vec![
+            ("unchanged_mask", &clean, PoseParams::default()),
+            ("changed_mask", &outliers, PoseParams::default()),
+            ("all_fixed", &clean[..8], PoseParams::default()),
+            ("marker_only", &markers, PoseParams::default()),
+            ("cap_round1_unchanged", &clean, cap(0.0013)),
+            ("cap_round1_changed", &outliers, cap(0.0013)),
+            ("cap_later_rounds", &clean, cap(0.0019)),
+            ("cap_all", &outliers, cap(0.0001)),
+        ];
+        for (name, corrs, pp) in cases {
+            let (cams, views) = refine_poses_oracle(&kin, 0, corrs, 0.0, &pp);
+            let r = refine_poses(&kin, 0, corrs, 0.0, &pp);
+            assert_eq!(r.cams, cams, "{name}");
+            assert_eq!(r.views, views, "{name}");
+            let nd = refine_poses_with(&kin, 0, corrs, 0.0, &pp, false);
+            assert_eq!(nd.cams, cams, "{name}");
+            for (a, b) in nd.views.iter().zip(&views) {
+                assert_eq!(*a, ViewRefine { rms_before_px: None, rms_after_px: None, ..*b }, "{name}");
+            }
+        }
     }
 
     #[test]

@@ -1193,20 +1193,18 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
     let mut p = Params::new(table_z);
     p.exclude_px = views.get(reference).map(|v| gripper_region_px([v.img.w as f64, v.img.h as f64]));
     mview_stereo::reset_kernel_counts();
+    // one half-resolution image per view (and the reference corner map) for the pose
+    // refinement and the reconstruction
+    let prep = mview_stereo::Prepared::new(views);
     let pose = (mode != PoseRefine::Off).then(|| {
         let mut pp = mview_stereo::PoseParams::default();
         let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();
         let corners = mview_stereo::marker_corrs(markers, reference, ref_box_px);
         if mode == PoseRefine::Aruco { pp.min_points = MIN_MARKER_CORNERS; }
-        mview_stereo::refine_views(views, reference, ref_box_px, &exclude, table_z, &corners, mode == PoseRefine::Auto, &pp)
+        mview_stereo::refine_views_prepared(views, &prep, reference, ref_box_px, &exclude, table_z, &corners, mode == PoseRefine::Auto, &pp)
     });
-    let rec = match &pose {
-        Some(pr) => {
-            let refined: Vec<View> = views.iter().zip(&pr.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
-            mview_stereo::reconstruct(&refined, reference, region_px, ref_box_px, &p)
-        }
-        None => mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p),
-    };
+    // the refined cameras with the same images and half-resolution images (no copies)
+    let rec = mview_stereo::reconstruct_prepared(views, pose.as_ref().map(|pr| pr.cams.as_slice()), &prep, reference, region_px, ref_box_px, &p);
     let ncc_backend = mview_stereo::backend_diagnostics();
     // heights from the table plane fitted to the points outside the box (else z = table_z)
     let cam0 = views.get(reference).map(|v| v.cam);
