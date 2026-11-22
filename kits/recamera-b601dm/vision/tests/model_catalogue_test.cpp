@@ -197,7 +197,26 @@ static void test_default_models() {
     CHECK(a.configured && !b.configured);
 }
 
+static void test_first_loadable() {
+    const std::vector<std::string> c = {"seg384", "missing", "detect", "obb"};
+    std::vector<std::string> tried, failed;
+    auto exists = [](const std::string& p) { return p != "missing"; };
+    // the first existing candidate is corrupt: the next one that loads wins
+    int k = first_loadable(c, exists, [&](const std::string& p) { tried.push_back(p); return p != "seg384"; }, &failed);
+    CHECK(k == 2);
+    CHECK((tried == std::vector<std::string>{"seg384", "detect"}));
+    CHECK((failed == std::vector<std::string>{"seg384"}));
+    // the first loads: nothing else tried
+    tried.clear();
+    CHECK(first_loadable(c, exists, [&](const std::string& p) { tried.push_back(p); return true; }) == 0 && tried.size() == 1);
+    // none loads / none exists
+    failed.clear();
+    CHECK(first_loadable(c, exists, [](const std::string&) { return false; }, &failed) == -1 && failed.size() == 3);
+    CHECK(first_loadable(c, [](const std::string&) { return false; }, [](const std::string&) { return true; }) == -1);
+}
+
 int main() {
+    test_first_loadable();
     test_default_models();
     test_budget_table();
     test_catalogue_parsing();

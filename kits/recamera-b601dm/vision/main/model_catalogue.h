@@ -119,6 +119,14 @@ inline const std::string& after_swap(const SlotChange& s, const std::string& cur
     return s.change ? s.name : current;
 }
 
+/**
+ * The automatic startup model: the first of `candidates` that exists and loads. `load` is tried on
+ * each existing candidate in order until one returns true; every failed load is appended to
+ * `failed` (when given). Returns its index, or -1 when none loaded (also when none exists).
+ */
+int first_loadable(const std::vector<std::string>& candidates, const std::function<bool(const std::string&)>& exists,
+                   const std::function<bool(const std::string&)>& load, std::vector<std::string>* failed = nullptr);
+
 }  // namespace rv
 
 #endif  // REBOT_VISION_MODEL_CATALOGUE_H_
