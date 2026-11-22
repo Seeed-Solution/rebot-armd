@@ -3139,7 +3139,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.is_enabled = false;
             self.pending_rearm = true;
             self.last_target_frames.fill(None);
-            self.mit_fence = None;
+            // MIT tracking: the fence stays until every motor is confirmed disabled
+            let mit_fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
             self.last_query_instant = Some(self.now());
             // Poll for responses confirming disable for DAMIAO_DISABLE_CONFIRM, bounded by time only
             // (a cap of 10 checks with 2 ms sleeps ended it after ~20 ms, before a late motor
@@ -3152,7 +3153,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.read_joint_states();
                 if !self.motor_ids.is_empty() && (0..self.motor_ids.len()).all(|i| confirmed(self, i)) {
                     tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(poll_start));
-                    break;
+                    if mit_fenced { self.mit_fence = None; }
+                    return Ok(());
                 }
                 if DAMIAO_ENABLE_RETRY_AT.get(retries).is_some_and(|t| self.since(poll_start) >= *t) {
                     for i in 0..self.motor_ids.len() {
@@ -3168,6 +3170,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     retries += 1;
                 }
                 self.pause(Duration::from_micros(500));
+            }
+            if mit_fenced {
+                // unconfirmed: the motors may still be energized in MIT; keep the fence (no recovery,
+                // no poll) and report the failure
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "Disable not confirmed by fresh state-0 feedback from every motor within {} ms; the MIT fence stays",
+                    DAMIAO_DISABLE_CONFIRM.as_millis())));
             }
             Ok(())
         } else {

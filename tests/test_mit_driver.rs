@@ -463,3 +463,20 @@ fn mit_hand_back_past_the_deadline_fails_and_plain_switch_is_refused_after_a_tri
     assert!(d.set_joint_modes(&[JointMode::Mit; 7], &hold).is_err(), "plain switch accepted after a trip");
     assert!(bus.tx_log().is_empty(), "{:?}", bus.tx_log());
 }
+
+/// Review round 3, #5: with the MIT fence armed, a disable that is not confirmed by fresh state-0
+/// feedback from every motor fails and keeps the fence: no status poll resumes afterwards.
+#[test]
+fn mit_unconfirmed_disable_fails_and_keeps_the_fence() {
+    let (mut d, bus, clock) = mit_rig(2000);
+    bus.with(|s| s.motors[J4].silent = true);
+    assert!(d.set_torque(false).is_err(), "an unconfirmed disable reported success");
+    bus.clear_log();
+    for _ in 0..6 { clock.advance(Duration::from_millis(110)); let _ = d.read_joint_states(); }
+    let log = bus.tx_log();
+    assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC), "status polls resumed: {log:?}");
+    // confirmed disable: fence released, polls allowed again
+    let (mut d, _bus, _) = mit_rig(2000);
+    d.set_torque(false).expect("confirmed disable");
+    assert!(d.mit_fence_trip().is_none());
+}
