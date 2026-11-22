@@ -208,6 +208,42 @@ Result (spark, 2026-11-17, `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_
 
 `grip_pixel_model` [0.503, −0.327]: outside the image, so `grip_pixel_norm` stayed and the grasp acquired camera-down. Grasp: `done`, holding, 3 centring corrections, cube lifted 0.100 m. Corner noise is drawn per frame, so the numbers differ between runs (two other runs: fx 800.33 / 800.64, offset 0.07 / 0.13 mm, rotation 0.038° / 0.028°). Simulation only; not run on the arm.
 
+## Joint tracking A/B check (position lead)
+
+Run this before enabling `joint_tracking` on a real arm, and after any change to the tracking code or to a profile's `joint_tracking` block. No device access.
+
+```bash
+scripts/tracking_lead_sim.sh                                   # kit profile, J1 = position_lead (lag 0.68 s, 0.03 rad)
+scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json        # a B601-DM profile copied from the device, joint_tracking as written
+scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json 0.68,0.65,0.71,0.17,0,0,0   # plant time constants J1..J7 (s)
+```
+
+The script runs `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact` (`REBOT_TRACKING_PROFILE`, `REBOT_TRACKING_PLANT_TAU`). The test drives `SupervisorInner::tick` (the output path of armd) with a first-order POS_VEL lag plant, `dq/dt = (q_out − q) / τ` per joint; the default τ are the B601-DM fits J1..J4 0.68, 0.65, 0.71, 0.17 s. `rebot-sim` does not model this lag (see "Not simulated"), so the check does not use `armd --follower sim`. Sequence: home → A, then A → B → A three times with 3 s holds, A = (0.255, 0.08, 0.43), B = (0.255, 0.12, 0.43), pitch 41°, `yaw: "outward"`, `path: "joint"`, `speed_scale` 0.3; tick periods cycle through 18–26 ms. It runs once with tracking off and once on, prints per lead joint the moving RMS and peak of q_m − q_d (mrad, while the reference moves) and the error 1 s after each stop, and fails on:
+
+- any fault, or fewer than six completed A ↔ B moves;
+- a moving-RMS reduction below 30 %, a higher peak error, or a higher endpoint error than with tracking off;
+- an issued frame outside the output contract below.
+
+Output contract of position lead (`src/tracking.rs`, `compute_position_lead_output_with_limits_and_budget`):
+
+- The motion's caps (`speed_scale`, servo / policy caps, power governor) bound the nominal reference q_d. A nominal step above them is rejected, as before.
+- Issued output q_out = q_d + lead. Per lead joint (`position_lead`, `lag_s` > 0): |v_out| ≤ min(v_phys, v_cap + lag_s · a_cap), |a_out| ≤ a_phys, |lead| ≤ `max_lead_rad`, |lead_k − lead_(k−1)| ≤ lag_s · a_cap · dt. v_cap / a_cap: the motion caps; v_phys / a_phys: the profile joint limits. Joints without lead keep the motion caps.
+- The lead moves toward its target lag_s · v_d with braking at a_phys / 2 toward the target, toward ±`max_lead_rad` and, while streaming, toward the measured-lead allowance q_m ± `servo_max_lead_rad`; it is continuous at motion start, stop, reversal and saturation.
+- When the lead output fails validation (dynamics, keep-out sweep, stream allowance, torque hold), armd sends the lead withdrawn toward zero under the same bounds and the motion continues. Only a violation of the nominal reference, or a withdrawal that itself fails (for example a keep-out on its chord), takes the existing fault / hold path.
+
+Incident it reproduces (2026-11-22, rebot-teleop 1.5.0-rc2, B601-DM, only J1 = `position_lead`): the first A → B move latched `JOINT_LIMIT` "joint 1 output velocity -0.715 rad/s exceeds limit 0.135". Phase 1 checked the issued output against the nominal cap: at tick 11 of the move (v_d 0.023 rad/s, lead 13.2 mrad) the full lead needed 0.1356 rad/s (nominal 0.023 + lead growth 0.68 · a_d), above 0.135; the multipliers ½ … 0 dropped the lead in one tick (0 → −0.639 rad/s in the rig, −0.715 rad/s on the arm) and every candidate failed. Regression test: `tracking_lead_incident_2026_11_22_regression`.
+
+Result (spark, 2026-11-22, default arguments):
+
+| J1, mrad | moving RMS | peak | error 1 s after stop | faults | moves |
+|---|---|---|---|---|---|
+| tracking off | 43.0 | 63.4 | ±9.3 | 0 | 6 |
+| tracking on | 25.2 (−41.5 %) | 39.9 | ±4.8 | 0 | 6 |
+| real arm, off (2026-11-22) | 43 | 69 | | 0 | 6 |
+| before the fix, on (rig) | | | | JOINT_LIMIT on the first A → B move | 0 |
+
+The plant is first order with a fixed τ; friction, backlash, load-dependent lag and the arm's own POS_VEL loop are not modelled. A passing check does not show the lead is safe or effective on the arm; that needs the device qualification of the joint-tracking spec (J1 only, operator at the arm, off/on comparison).
+
 ## Friction identification (`rebot-sysid`)
 
 `rebot-sysid` (`sim/mujoco/src/rebot_sim/sysid.py`, console script of the `sim/mujoco` uv project) identifies Coulomb and viscous friction per joint J1..J6 through armd and suggests collision thresholds. It runs on a PC with numpy / matplotlib and connects to armd as an ordinary WebSocket client (`websockets`); nothing is installed on the reCamera. The same command works against `armd --follower sim` and the real arm.
