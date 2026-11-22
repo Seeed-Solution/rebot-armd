@@ -23,6 +23,8 @@ set -euo pipefail
 # PATH and SG200X_SDK_PATH / SSCMA_ROOT must be set.
 #
 # REBOT_VISION_ALLOW_UNPINNED=1 builds against an SSCMA_ROOT off the lock commit.
+# REBOT_VISION_PUBLISH_PREBUILT=<binary> skips the build and publishes that file (and
+# <binary>.map when present) through the same output path; scripts/tests use it.
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,25 +104,49 @@ swap_link() {
 
 START_GEN="$(readlink "${CURRENT}" 2>/dev/null || true)"
 
+# Remove $1 only when it is a real directory directly inside GEN_ROOT.
+remove_gen_child() {
+    local p="$1" rest
+    case "${p}" in
+        "${GEN_ROOT}"/*) rest="${p#"${GEN_ROOT}"/}" ;;
+        *) echo "build_vision.sh: refusing to remove ${p}" >&2; return 1 ;;
+    esac
+    case "${rest}" in
+        "" | . | .. | */*) echo "build_vision.sh: refusing to remove ${p}" >&2; return 1 ;;
+    esac
+    if [ -d "${p}" ] && [ ! -L "${p}" ]; then
+        rm -rf -- "${p}"
+    fi
+}
+
 # Old generations beyond KEEP_GENERATIONS (never the current one) and staging directories of
-# builds that are no longer running. Called with the lock held.
+# builds that are no longer running. Called with the lock held. Paths stay quoted (glob
+# arrays), so a checkout path with spaces cannot split into deletion candidates.
 collect_garbage() {
-    local cur keep=0 d pid
+    local cur keep=0 d name pid i
+    local LC_ALL=C
+    local gens=() stages=()
     cur="$(readlink "${CURRENT}" 2>/dev/null || true)"
-    for d in $(ls -1d "${GEN_ROOT}"/g.* 2>/dev/null | sort -r); do
-        if [ "generations/$(basename "${d}")" = "${cur}" ]; then
+    shopt -s nullglob
+    gens=("${GEN_ROOT}"/g.*)
+    stages=("${GEN_ROOT}"/.staging.*)
+    shopt -u nullglob
+    # g.<UTC timestamp>.<pid>: the glob sorts oldest first, walk newest first
+    for ((i = ${#gens[@]} - 1; i >= 0; i--)); do
+        d="${gens[i]}"
+        if [ "generations/${d##*/}" = "${cur}" ]; then
             continue
         fi
         keep=$((keep + 1))
         if [ "${keep}" -ge "${KEEP_GENERATIONS}" ]; then
-            rm -rf "${d}"
+            remove_gen_child "${d}"
         fi
     done
-    for d in "${GEN_ROOT}"/.staging.*; do
-        [ -d "${d}" ] || continue
-        pid="$(basename "${d}" | cut -d. -f3)"
+    for d in ${stages[@]+"${stages[@]}"}; do
+        name="${d##*/}"
+        pid="$(printf '%s' "${name}" | cut -d. -f3)"
         if [ "${d}" != "${STAGE_DIR}" ] && [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
-            rm -rf "${d}"
+            remove_gen_child "${d}"
         fi
     done
 }
@@ -150,7 +176,12 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ -n "${RECAMERA_DOCKER:-}" ]; then
+if [ -n "${REBOT_VISION_PUBLISH_PREBUILT:-}" ]; then
+    cp "${REBOT_VISION_PUBLISH_PREBUILT}" "${STAGE_BIN}"
+    if [ -f "${REBOT_VISION_PUBLISH_PREBUILT}.map" ]; then
+        cp "${REBOT_VISION_PUBLISH_PREBUILT}.map" "${STAGE_MAP}"
+    fi
+elif [ -n "${RECAMERA_DOCKER:-}" ]; then
     C="${RECAMERA_DOCKER}"
     R="${RECAMERA_ROOT:-/recamera}"
     GCC_BIN="${RECAMERA_GCC:-$R/host-tools/gcc/riscv64-linux-musl-x86_64/bin}"
