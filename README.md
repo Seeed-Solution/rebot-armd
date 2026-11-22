@@ -447,7 +447,7 @@ the header).
   yet. Expert mode shows J1–J6 residual torque bars against the thresholds (green below 50 %,
   yellow up to 100 %, red when tripped).
 - **3D view** ("Video | 3D" switch at the top-left of the video; arrow keys change the view,
-  Escape stays the E-stop key): the arm drawn from `reBot-DevArm_gripper.urdf` with the
+  Escape is Stop, Space is the E-stop): the arm drawn from `reBot-DevArm_gripper.urdf` with the
   measured joint angles (solid) and `commanded_positions` (translucent blue, shown when they
   differ), a floor grid, the workspace box, keep-out boxes (`GET /api/v1/workspace/keepout`) and
   stored poses as orange dots. On opening, the camera aims at the robot's bounding box in the
