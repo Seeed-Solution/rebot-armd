@@ -388,7 +388,7 @@ async fn permission_matrix_program_vs_operator_and_live_revocation() {
     assert_eq!(ack_c["revision"], 2);
 
     let ack_g = common::rpc(&mut op_ws, op_gen, cur_epoch, "/api/v1/gripper/calibration", json!({
-        "jaw_opening": {"points": [[0.0, 0.0], [-5.0, 0.08]], "calibrated": true},
+        "jaw_opening": {"points": [[0.0, 0.0], [-5.7, 0.08]], "calibrated": true},
         "offset_rad": 0.02,
         "expected_revision": 1
     })).await;
@@ -502,7 +502,7 @@ async fn expected_revision_mismatch_and_persist_failed_preserve_memory() {
     assert_eq!(col["revision"], 1);
 
     let fail_g = common::rpc(&mut ws, gen, epoch, "/api/v1/gripper/calibration", json!({
-        "jaw_opening": {"points": [[0.0, 0.0], [-5.0, 0.08]], "calibrated": true},
+        "jaw_opening": {"points": [[0.0, 0.0], [-5.7, 0.08]], "calibrated": true},
         "offset_rad": 0.02,
         "expected_revision": 1
     })).await;

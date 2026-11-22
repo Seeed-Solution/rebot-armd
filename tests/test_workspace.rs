@@ -218,7 +218,17 @@ async fn ws_servo_and_preset_rejections_carry_the_workspace_code() {
     assert_eq!(reply["type"], "command_reject");
     assert_eq!(reply["code"], "WORKSPACE_VIOLATION");
     let reply = common::preset(&mut ws, generation, epoch, "park", None).await;
-    assert_eq!(reply["type"], "preset_ack", "park is exempt: {reply}");
+    assert_eq!(reply["type"], "preset_reject", "park crossing floor must be rejected: {reply}");
+    assert_eq!(reply["code"], "WORKSPACE_VIOLATION", "{reply}");
+    assert_eq!(reply["violation_phase"], "park", "{reply}");
+    // From a clear starting pose (INSPECT), park succeeds.
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+    }
+    let reply = common::preset(&mut ws, generation, epoch, "park", None).await;
+    assert_eq!(reply["type"], "preset_ack", "park from INSPECT must succeed: {reply}");
 }
 
 #[test]
@@ -488,23 +498,32 @@ fn link_capsules_reject_upper_arm_intrusion_and_validate_frames() {
 
 #[test]
 fn park_from_violating_outer_boundary_allowed_but_crossing_keepout_rejected() {
-    // 7. park from violating outer boundary (floor_z + box + reach) still allowed;
-    //    park crossing keep-out box still rejected with violation_phase == "park".
-    let mut cfg = ArmConfig::rebot_dm();
-    cfg.workspace.as_mut().unwrap().max_reach_m = Some(0.15); // INSPECT also violates max_reach
+    // 7. park from a pose violating floor_z to a legal resting pose is allowed when it recovers
+    //    monotonically; park whose resting pose violates max_reach_m or crosses a keep-out box
+    //    is rejected with violation_phase == "park".
+    let cfg = ArmConfig::rebot_dm();
     let deeper = lerp(&DIP_A, &DIP_B, 0.5);
     let mut inner = armed(cfg.clone(), &deeper);
-    assert!(inner.unload_action().unwrap().is_some(), "park from violating outer boundary must succeed");
+    assert!(inner.unload_action().unwrap().is_some(), "park retreating from floor_z to legal HOME must succeed");
+
+    let mut cfg_reach = cfg.clone();
+    cfg_reach.workspace.as_mut().unwrap().max_reach_m = Some(0.15); // HOME also violates max_reach
+    let mut inner = armed(cfg_reach, &deeper);
+    let err = inner.unload_action().unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else { panic!("expected WorkspaceViolation, got {err:?}") };
+    assert_eq!(detail.constraint_id.as_deref(), Some("reach"));
+    assert_eq!(detail.violation_phase.as_deref(), Some("park"));
 
     // Now add a keepout box on the park path from deeper -> HOME
-    let mid: Vec<f32> = deeper.iter().zip(&cfg.home_positions).map(|(a, b)| 0.5 * (a + b)).collect();
+    let mut cfg_keepout = cfg;
+    let mid: Vec<f32> = deeper.iter().zip(&cfg_keepout.home_positions).map(|(a, b)| 0.5 * (a + b)).collect();
     let p_mid = ArmModel::REBOT_DEV_ARM.fk_f32(&mid).unwrap().p;
-    cfg.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+    cfg_keepout.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
         name: "park_wall".into(),
         min_m: p_mid.map(|v| (v - 0.04) as f32),
         max_m: p_mid.map(|v| (v + 0.04) as f32),
     });
-    let mut inner = armed(cfg, &deeper);
+    let mut inner = armed(cfg_keepout, &deeper);
     let err = inner.unload_action().unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else { panic!("expected WorkspaceViolation, got {err:?}") };
     assert_eq!(detail.constraint_id.as_deref(), Some("keepout:park_wall"));

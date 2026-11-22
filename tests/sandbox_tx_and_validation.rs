@@ -173,6 +173,7 @@ fn write_disk_tool(dir: &Path, id: &str, tool_xml: &str, extra_files: &[(&str, &
         "version": "1.0.0",
         "tool_xml": "tool.xml",
         "robots": ["b601dm"],
+        "tcp_offset": [0.0, 0.0, 0.0],
         "assets": []
     });
     std::fs::write(
@@ -1955,7 +1956,9 @@ async fn sandbox_m01_builtin_disk_tool_sends_both_tool_dir_and_tool_digest() {
         serde_json::to_vec(&json!({
             "id": "suction",
             "name": "Suction Cup",
-            "robots": ["b601dm"]
+            "kind": "suction",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.0, 0.0, 0.0]
         }))
         .unwrap(),
     )

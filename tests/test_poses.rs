@@ -40,13 +40,21 @@ async fn poses_file_round_trips_and_corrupt_file_is_not_overwritten_on_start() {
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&supervisor, &path).await;
     let loaded = supervisor.inner().read().await.poses.list.clone();
-    // a pose saved before ids gets one on load, written back to the file
+    // a pose saved before ids gets one on load, written back to the file; M16: valid joints always refresh TCP
     assert!(armd::recording::is_ulid(&loaded.poses[0].id));
+    assert!(loaded.poses[0].tcp.is_some(), "M16: load_locked recomputes TCP when positions are valid");
     let mut no_ids = loaded.clone();
     no_ids.poses[0].id.clear();
+    no_ids.poses[0].tcp = None;
     assert_eq!(no_ids, list);
     let on_disk: PoseList = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(on_disk, loaded);
+    assert_eq!(on_disk.poses.len(), loaded.poses.len());
+    assert_eq!(on_disk.poses[0].id, loaded.poses[0].id);
+    assert_eq!(on_disk.poses[0].positions, loaded.poses[0].positions);
+    let dt = on_disk.poses[0].tcp.as_ref().unwrap();
+    let lt = loaded.poses[0].tcp.as_ref().unwrap();
+    assert!(dt.position.iter().zip(&lt.position).all(|(a, b)| (a - b).abs() < 1e-12));
+    assert!(dt.rpy.iter().zip(&lt.rpy).all(|(a, b)| (a - b).abs() < 1e-12));
     let again = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&again, &path).await;
     assert_eq!(again.inner().read().await.poses.list.poses[0].id, loaded.poses[0].id, "ids are stable across restarts");

@@ -731,6 +731,8 @@ fn replay_is_slowed_to_fit() {
         workspace_revision: 0, power: inner.power_budget().cloned(),
         store: armd::recording::EpisodeStore::new(None),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: inner.config.tcp_offset,
+        active_tool: inner.config.active_tool.clone(),
     };
     let t0 = std::time::Instant::now();
     let plan = armd::replay::plan_frames(input, &frames).unwrap();
