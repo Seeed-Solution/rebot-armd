@@ -448,16 +448,18 @@ impl SupervisorInner {
                     if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::Exiting { hold, elapsed_s: elapsed }; }
                 } else {
                     let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
-                    let fresh = self.feedback_numeric_valid
-                        && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms));
-                    let stationary = !tracking_active || self.gravity_comp_is_stationary(max_vel);
-                    // When tracking will take over POS_VEL output, wait for the arm to settle
-                    // under the stiff MIT hold before transferring ownership (bounded by exit_hold + 1.0 s).
-                    if fresh && !stationary && elapsed < exit_hold + 1.0 {
-                        if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::Exiting { hold, elapsed_s: elapsed }; }
-                    } else {
-                        self.gravity_comp_switch_back(hold);
+                    if tracking_active {
+                        let fresh = self.feedback_numeric_valid
+                            && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms));
+                        let stationary = self.gravity_comp_is_stationary(max_vel);
+                        // When tracking will take over POS_VEL output, wait for the arm to settle
+                        // under the stiff MIT hold before transferring ownership (bounded by exit_hold + 1.0 s).
+                        if fresh && !stationary && elapsed < exit_hold + 1.0 {
+                            if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::Exiting { hold, elapsed_s: elapsed }; }
+                            return;
+                        }
                     }
+                    self.gravity_comp_switch_back(hold);
                 }
             }
             GravityCompPhase::ExitFailed { hold, retry_in_s } => {
@@ -491,10 +493,11 @@ impl SupervisorInner {
             .gravity_comp
             .as_ref()
             .map_or((100, 0.05), |r| (r.policy.feedback_max_age_ms, r.policy.entry_max_velocity));
-        let fresh = self.feedback_numeric_valid
-            && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms))
-            && self.measured_positions.len() >= ARM
-            && self.measured_positions[..ARM].iter().all(|q| q.is_finite());
+        let fresh = !tracking_active
+            || (self.feedback_numeric_valid
+                && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms))
+                && self.measured_positions.len() >= ARM
+                && self.measured_positions[..ARM].iter().all(|q| q.is_finite()));
         let stationary = !tracking_active || self.gravity_comp_is_stationary(max_vel);
         let gripper = self.commanded_positions[ARM];
         let result = if !fresh {

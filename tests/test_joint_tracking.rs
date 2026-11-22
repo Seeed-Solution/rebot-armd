@@ -2564,3 +2564,64 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
     }
 }
+
+/// T1: With tracking OFF, gravity-comp exit restores pre-change behavior (attempts POS_VEL
+/// handback after exit_hold_ms without latching GravityCompFailed on stale RX); with tracking ON,
+/// stale RX blocks handback and latches GravityCompFailed.
+#[test]
+fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+
+    // Tracking OFF: stale feedback (150 ms > 100 ms gravity_comp max_age) does NOT block POS_VEL handback.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(JointTrackingConfig::rebot_dm()), // enabled = false
+            ..ArmConfig::rebot_dm()
+        };
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        inner.enter_gravity_comp(Default::default()).unwrap();
+        inner.tick(DT);
+        inner.exit_gravity_comp("REQUESTED", "t1_off");
+        drv.with(|s| s.feedback_age = Duration::from_millis(150));
+        for _ in 0..6 {
+            inner.tick(DT);
+        }
+        assert!(
+            inner.gravity_comp.is_none(),
+            "tracking OFF must attempt and complete POS_VEL handback after exit_hold_ms even with stale RX"
+        );
+        assert!(
+            inner.safety.state().is_operational(),
+            "tracking OFF must not latch GravityCompFailed on stale RX: {:?}",
+            inner.safety.state()
+        );
+    }
+
+    // Tracking ON: stale feedback blocks POS_VEL handback and latches GravityCompFailed.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        inner.enter_gravity_comp(Default::default()).unwrap();
+        inner.tick(DT);
+        inner.exit_gravity_comp("REQUESTED", "t1_on");
+        drv.with(|s| s.feedback_age = Duration::from_millis(150));
+        for _ in 0..6 {
+            inner.tick(DT);
+        }
+        assert!(
+            inner.gravity_comp.is_some(),
+            "tracking ON must not transfer ownership back to tracking on stale RX"
+        );
+        assert!(
+            matches!(inner.safety.state(), SafetyState::Fault(_)),
+            "tracking ON must latch GravityCompFailed when stale RX blocks handback"
+        );
+    }
+}
