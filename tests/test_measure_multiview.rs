@@ -1325,6 +1325,14 @@ fn malformed_gray_descriptor_does_not_select_gray() {
     bad["width"] = json!("640");
     assert_eq!(mm::select_frame_source(&mode(Some(bad))), mm::FrameSource::Snapshot);
     assert_eq!(mm::select_frame_source(&mode(Some(json!("RGF1")))), mm::FrameSource::Snapshot);
+    for wrong in [json!("false"), json!(0), json!(null)] {
+        let mut bad = good.clone();
+        bad["exposure_qualified"] = wrong;
+        assert_eq!(mm::select_frame_source(&mode(Some(bad))), mm::FrameSource::Snapshot);
+    }
+    let mut qualified = good.clone();
+    qualified["exposure_qualified"] = json!(true);
+    assert_eq!(mm::select_frame_source(&mode(Some(qualified))), mm::FrameSource::Gray);
     let mut unsupported = good;
     unsupported["stride"] = json!(704);
     assert_eq!(mm::select_frame_source(&mode(Some(unsupported))), mm::FrameSource::Snapshot);

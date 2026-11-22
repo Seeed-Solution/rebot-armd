@@ -905,7 +905,11 @@ impl GrayFormatDescriptor {
             height: usize::try_from(g.get("height")?.as_u64()?).ok()?,
             stride: usize::try_from(g.get("stride")?.as_u64()?).ok()?,
             ring: usize::try_from(g.get("ring")?.as_u64()?).ok()?,
-            exposure_qualified: g.get("exposure_qualified").and_then(Value::as_bool).unwrap_or(false),
+            // optional (false when absent); any other type than bool makes the descriptor malformed
+            exposure_qualified: match g.get("exposure_qualified") {
+                None => false,
+                Some(v) => v.as_bool()?,
+            },
             frame_size,
             crop,
             luma,
@@ -6017,6 +6021,8 @@ mod tests {
         for (key, bad) in [
             ("width", serde_json::json!("640")), ("crop", serde_json::json!([0, 140, 640])),
             ("frame_size", serde_json::json!(null)), ("luma", serde_json::json!(1)), ("ring", serde_json::json!(-1)),
+            ("exposure_qualified", serde_json::json!("yes")), ("exposure_qualified", serde_json::json!(1)),
+            ("luma_range", serde_json::json!(null)),
         ] {
             let mut g = good.clone();
             g[key] = bad;
