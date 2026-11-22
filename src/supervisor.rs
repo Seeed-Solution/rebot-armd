@@ -1718,6 +1718,26 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// How long `obs` (computed now by [`Self::current_observation`]) stays correct with
+    /// no write: until the first clock-driven flip of the lease holder, the previous-action
+    /// window or the 250 ms feedback freshness behind `feedback_valid` / `enable_state`.
+    pub fn observation_valid_for(&self, obs: &ArmObservation) -> Duration {
+        const FEEDBACK_FRESH: Duration = Duration::from_millis(250);
+        let mut valid = Duration::MAX;
+        if let Some(lease) = self.active_lease.as_ref() {
+            valid = valid.min(self.lease_timeout.saturating_sub(lease.acquired_at.elapsed()));
+        }
+        if let Some((_, until)) = self.previous_action.as_ref() {
+            if obs.timestamp < *until { valid = valid.min(Duration::from_secs_f64(until - obs.timestamp)); }
+        }
+        // ages are whole ms, truncated: one more ms of margin
+        if let Some(oldest) = obs.feedback_age_ms.iter().flatten().max() {
+            let age = Duration::from_millis(oldest.saturating_add(1));
+            if age <= FEEDBACK_FRESH { valid = valid.min(FEEDBACK_FRESH - age); }
+        }
+        valid
+    }
+
     pub fn current_observation(&self) -> ArmObservation {
         let timestamp = self.start_time.elapsed().as_secs_f64();
         let tcp = if self.config.kinematics.is_some() {
@@ -7397,6 +7417,7 @@ pub struct ArmSupervisor {
     obs_snapshot: std::sync::Mutex<Option<ObservationSnapshot>>,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
+    obs_publish_skipped: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -7430,6 +7451,7 @@ impl ArmSupervisor {
             obs_snapshot: std::sync::Mutex::new(None),
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
+            obs_publish_skipped: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7460,8 +7482,15 @@ impl ArmSupervisor {
             self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
             return (*obs).clone();
         }
-        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.read().await;
+        // A tick may have published while this call waited for the lock: serve that one
+        // instead of recomputing (and of a timestamp older than the published one).
+        if let Some(obs) = self.cached_observation() {
+            drop(inner);
+            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return (*obs).clone();
+        }
+        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
         inner.current_observation()
     }
 
@@ -7471,6 +7500,22 @@ impl ArmSupervisor {
         snap.as_ref()
             .filter(|s| s.generation == generation && s.at.elapsed() <= s.max_age)
             .map(|s| Arc::clone(&s.obs))
+    }
+
+    /// Never blocks the tick: when a reader holds the snapshot mutex the tick skips the
+    /// publication; the previous snapshot carries an older generation and is not served.
+    fn publish_observation(&self, snap: ObservationSnapshot) {
+        let mut slot = match self.obs_snapshot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.obs_publish_skipped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+        let old = slot.replace(snap);
+        drop(slot);
+        drop(old);
     }
 
     /// Scheduling of the control thread, reported by it after its real-time request.
@@ -7746,9 +7791,9 @@ impl ArmSupervisor {
             let pending_zc = inner.pending_zero_check_persist.take();
             let control_hz = inner.config.control_frequency_hz;
             // Published before the guard drops: no other write can come in between.
-            let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)));
-            *self.obs_snapshot.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
+            let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
+                .min(inner.observation_valid_for(&obs));
+            self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
             (obs, locked - started, locked.elapsed(), control_hz, pending_zc)
         };
         let released = Instant::now();
@@ -8001,6 +8046,7 @@ impl ArmSupervisor {
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
             misses: self.obs_cache_misses.load(Ordering::Relaxed),
+            publish_skipped: self.obs_publish_skipped.load(Ordering::Relaxed),
         };
         snap
     }
@@ -8017,3 +8063,93 @@ impl ArmSupervisor {
 #[cfg(test)]
 #[path = "supervisor_servo_order_tests.rs"]
 mod servo_order_tests;
+
+#[cfg(test)]
+mod observation_snapshot_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_holding_the_snapshot_mutex_does_not_delay_the_tick() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.tick(0.02).await;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let sup = sup.clone();
+            // a preempted reader: holds the mutex until released
+            std::thread::spawn(move || {
+                let _g = sup.obs_snapshot.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let t = Instant::now();
+        let obs = tokio::time::timeout(Duration::from_millis(500), sup.tick(0.02)).await.expect("tick must not wait for the snapshot mutex");
+        assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // the skipped publication leaves the older snapshot, which is not served
+        let served = sup.get_observation().await;
+        assert!(served.timestamp >= obs.timestamp);
+        let c = sup.tick_stats().observation_cache;
+        assert_eq!((c.hits, c.misses, c.publish_skipped), (0, 1, 1));
+        sup.tick(0.02).await;
+        sup.get_observation().await;
+        assert_eq!(sup.tick_stats().observation_cache.hits, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_waited_for_the_lock_serves_the_snapshot_published_meanwhile() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let writer = sup.inner().write().await;
+        let reader = {
+            let sup = sup.clone();
+            tokio::spawn(async move { sup.get_observation().await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // what a tick does under its guard
+        let mut published = writer.current_observation();
+        published.timestamp = 123.0;
+        sup.publish_observation(ObservationSnapshot {
+            generation: sup.inner().generation(),
+            at: Instant::now(),
+            max_age: Duration::from_secs(1),
+            obs: Arc::new(published),
+        });
+        drop(writer);
+        assert_eq!(reader.await.unwrap().timestamp, 123.0);
+        let c = sup.tick_stats().observation_cache;
+        assert_eq!((c.hits, c.misses), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_expires_before_the_lease_or_feedback_freshness_flips() {
+        let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+        {
+            let mut inner = sup.inner().write().await;
+            let timeout = inner.lease_timeout;
+            inner.active_lease = Some(ActiveLease {
+                client_id: "c".into(),
+                generation: 1,
+                label: "x".into(),
+                acquired_at: Instant::now() - timeout + Duration::from_millis(5),
+                last_valid_motion_instant: None,
+            });
+        }
+        let obs = sup.tick(0.02).await;
+        assert_eq!(obs.lease_holder.as_deref(), Some("x"));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        // within two periods of the tick, but the lease has expired: recomputed
+        assert_eq!(sup.get_observation().await.lease_holder, None);
+        assert_eq!(sup.tick_stats().observation_cache.misses, 1);
+
+        let mut inner = sup.inner().write().await;
+        inner.active_lease = None;
+        let mut obs = inner.current_observation();
+        obs.feedback_age_ms = vec![Some(10), Some(240), None];
+        assert_eq!(inner.observation_valid_for(&obs), Duration::from_millis(9));
+        obs.feedback_age_ms = vec![Some(300)];
+        assert_eq!(inner.observation_valid_for(&obs), Duration::MAX);
+    }
+}

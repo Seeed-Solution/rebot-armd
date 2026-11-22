@@ -81,11 +81,14 @@ pub struct ControlThreadSched {
 }
 
 /// Observations served by `GET /api/v1/observation` from the tick's snapshot (`hits`) or
-/// computed under the supervisor read lock (`misses`).
+/// computed under the supervisor read lock (`misses`); a hit after waiting for the read
+/// lock (a tick published meanwhile) counts as a hit.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct ObservationCacheStats {
     pub hits: u64,
     pub misses: u64,
+    /// Ticks that skipped publishing because a reader held the snapshot mutex.
+    pub publish_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
