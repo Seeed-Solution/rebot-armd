@@ -36,6 +36,12 @@ on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.
   caller until it is deleted or not kept alive for `ttl_ms` (default 3000). What runs is the union of
   the active subscriptions' pipelines at the highest requested rate, capped at the configured `fps`
   (`vision.json`, default 5, 1..15).
+  `"pipelines": []` is a camera hold (`GET /api/mode` `"camera_hold": true`): no inference, the camera
+  gate stays open so a trigger is served by the next frame; it expires like any subscription.
+  Subscription bodies carry `instance_id` (this process). `DELETE /api/subscribe/<id>?client=<c>&instance_id=<i>`
+  deletes only the subscription of client `c` made by instance `i`: 409 `NOT_OWNER` for another client's,
+  409 `INSTANCE_CHANGED` after a restart (ids start again at `s1`), 404 when unknown. Without the query it
+  deletes by id (cockpit overlay).
 - `/api/mode` (modes `off` / `yolo` / `aruco` / `both`) sets the default subscription, which never
   expires; it joins the union like any other subscription.
 

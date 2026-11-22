@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armd::grasp::{BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GrayFrame, GrayFrameError, GrayTriggerResult};
+use armd::grasp::{BoxFuture, CameraHoldTicket, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GrayFrame, GrayFrameError, GrayTriggerResult};
 use armd::kinematics::{self, Pose};
 use armd::measure_multiview as mm;
 use armd::model::KeepoutBox;
@@ -75,6 +75,20 @@ struct FakeVision {
     on_gray_fetch: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     gray_trigger_timeouts: AtomicU64,
     on_gray_trigger_timeout: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Camera hold (rebot-vision subscription without pipelines): supported (default true), the
+    /// hold requests (first and refreshes) and the releases, and whether a hold is active.
+    hold_supported: AtomicBool,
+    holds: AtomicU64,
+    releases: Mutex<Vec<String>>,
+    held: AtomicBool,
+    /// From this many hold requests on (0: never) the hold answers as a restarted provider:
+    /// another id ("s1") of another instance ("rv-restarted").
+    hold_restart_after: AtomicU64,
+    /// (client, instance id) of every release, and the client of every hold request.
+    release_args: Mutex<Vec<(String, Option<String>)>>,
+    hold_clients: Mutex<Vec<String>>,
+    /// Called at the start of every trigger (JPEG and gray).
+    on_trigger: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -143,6 +157,7 @@ impl FakeVision {
     }
 
     async fn frame_with_pipelines(&self, pipelines: &[&str]) -> ((DetectionFrame, Vec<armd::mview_stereo::Marker>), bool) {
+        if let Some(cb) = self.on_trigger.lock().unwrap().as_ref() { cb(); }
         if pipelines.contains(&"gray") {
             if let Some(c) = self.shake_on_gray_trigger.lock().unwrap().as_ref() {
                 c.lock().unwrap().shake = true;
@@ -262,6 +277,30 @@ impl DetectionSource for FakeVision {
     fn next_frame(&self, _a: Option<u64>, _w: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move { Ok(Some(self.frame_now().await)) })
     }
+    fn camera_hold(&self, client: &str, ttl_ms: u64) -> BoxFuture<'_, Result<Option<CameraHoldTicket>, String>> {
+        assert!(client.starts_with(mm::CAMERA_HOLD_CLIENT_PREFIX) && ttl_ms == mm::CAMERA_HOLD_TTL_MS, "{client} {ttl_ms}");
+        self.hold_clients.lock().unwrap().push(client.to_string());
+        Box::pin(async move {
+            if !self.hold_supported.load(Ordering::SeqCst) { return Ok(None); }
+            let n = self.holds.fetch_add(1, Ordering::SeqCst) + 1;
+            self.held.store(true, Ordering::SeqCst);
+            let restart = self.hold_restart_after.load(Ordering::SeqCst);
+            Ok(Some(if restart > 0 && n >= restart {
+                CameraHoldTicket { id: "s1".into(), instance_id: Some("rv-restarted".into()) }
+            } else {
+                CameraHoldTicket { id: "s7".into(), instance_id: Some("rv-fake-1".into()) }
+            }))
+        })
+    }
+    fn camera_release(&self, ticket: &CameraHoldTicket, client: &str) -> BoxFuture<'_, Result<(), String>> {
+        let (id, inst, client) = (ticket.id.clone(), ticket.instance_id.clone(), client.to_string());
+        Box::pin(async move {
+            self.held.store(false, Ordering::SeqCst);
+            self.releases.lock().unwrap().push(id);
+            self.release_args.lock().unwrap().push((client, inst));
+            Ok(())
+        })
+    }
     fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
         Box::pin(async move {
             self.snapshots.fetch_add(1, Ordering::SeqCst);
@@ -321,7 +360,9 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
         gray: AtomicBool::new(false), instance_id: Mutex::new("rv-fake-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
-        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false),
+        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -406,6 +447,7 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     for v in m["views"].as_array().unwrap() {
         assert!(v["trigger_ms"].is_number() && v["snapshot_wait_ms"].is_number() && v["snapshot_polls"].as_u64() == Some(0), "{v}");
     }
+    check_timing(m, 0.0, 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -522,7 +564,7 @@ async fn refused_without_operator_session_and_bad_bodies() {
     assert_eq!(resp.status().as_u16(), 403);
     // bounds (no auth)
     let mut r = rig(ArmConfig::rebot_dm()).await;
-    for bad in [json!({"speed_scale": 0.8}), json!({"views": 7}), json!({"baseline_m": 0.2})] {
+    for bad in [json!({"speed_scale": 0.8}), json!({"views": 7}), json!({"baseline_m": 0.2}), json!({"settle_min_s": 0.2}), json!({"settle_min_s": 3.5})] {
         let rej = r.start(bad.clone()).await;
         assert_eq!(rej["code"], "INVALID_COMMAND", "{bad}: {rej}");
     }
@@ -572,6 +614,8 @@ struct Creep {
     shake_t0: Option<f32>,
     /// Time the clock stood still.
     paused: Duration,
+    /// J4 offset by `.2` (rad) from `.0` for `.1`, then back (a move-and-return).
+    bump: Option<(Instant, Duration, f32)>,
 }
 
 /// common::TestArm reporting positions with creep and limit cycles (real B601-DM, 2026-11-22).
@@ -589,6 +633,9 @@ impl CreepArm {
         if a > 0.0 {
             p[3] = a * (tau * t / per).sin();
             v[3] = a * tau / per * (tau * t / per).cos();
+        }
+        if let Some((t0, d, amp)) = c.bump {
+            if t0.elapsed() < d { p[3] += amp; }
         }
         if c.shake {
             let ts = *c.shake_t0.get_or_insert(t);
@@ -715,6 +762,10 @@ async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
     let doc = &bundle.doc;
     assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
     assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
+    // phase timing in the bundle: per view and in the stored measurement
+    for k in 0..3 { assert_eq!(doc["views"][k]["timing"], m["views"][k]["timing"], "view {k}"); }
+    assert_eq!(doc["measurement"]["timing"], m["timing"]);
+    check_timing(m, 0.0, 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -916,10 +967,38 @@ fn off_uses_the_kinematic_cameras() {
     assert!((auto.measure.unwrap().height_m - off.measure.unwrap().height_m).abs() < 0.002);
 }
 
+/// `measurement.timing` and `views[].timing` are consistent: per-view phases add up to the
+/// action sums, every trigger / fetch took at least the fake provider's delay, the overlap of the
+/// reconstruction with the return is within both, and the phases fit in the total.
+fn check_timing(m: &Value, trigger_min_ms: f64, fetch_min_ms: f64) {
+    let t = &m["timing"];
+    let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or_else(|| panic!("{k} in {v}"));
+    let views = m["views"].as_array().unwrap();
+    for (k, v) in views.iter().enumerate() {
+        let vt = &v["timing"];
+        assert!(f(vt, "trigger_ms") >= trigger_min_ms && f(vt, "fetch_ms") >= fetch_min_ms, "view {k}: {vt}");
+        assert!(f(vt, "capture_ms") + 0.2 >= f(vt, "trigger_ms") + f(vt, "fetch_ms"), "view {k}: {vt}");
+        assert!(f(vt, "settle_ms") > 0.0, "view {k}: {vt}");
+        if k == 0 { assert_eq!(f(vt, "motion_ms"), 0.0, "{vt}"); } else { assert!(f(vt, "motion_ms") > 100.0, "view {k}: {vt}"); }
+    }
+    for key in ["motion_ms", "settle_ms", "trigger_ms", "fetch_ms", "capture_ms"] {
+        let sum: f64 = views.iter().map(|v| f(&v["timing"], key)).sum();
+        assert!((sum - f(t, key)).abs() < 0.5, "{key}: {sum} vs {t}");
+    }
+    let (ret, comp, ov, total) = (f(t, "return_ms"), f(t, "compute_ms"), f(t, "compute_return_overlap_ms"), f(t, "total_ms"));
+    assert!(ret > 100.0 && comp > 0.0 && ov >= 0.0 && ov <= ret.min(comp) + 0.2, "{t}");
+    let first = &views[0]["timing"];
+    assert!(f(t, "detect_ms") + 0.5 >= f(first, "settle_ms") + f(first, "capture_ms"), "{t}");
+    let parts = f(t, "negotiate_ms") + f(t, "detect_ms") + f(t, "views_ms") + ret + comp - ov;
+    assert!(parts <= total + 50.0 && total <= parts + 2000.0, "parts {parts} vs {t}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
     let mut r = rig(ArmConfig::rebot_dm()).await;
     r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(40, Ordering::SeqCst);
+    r.vision.gray_fetch_delay_ms.store(30, Ordering::SeqCst);
     let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let a = r.wait(id, 150.0).await;
@@ -939,6 +1018,177 @@ async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
         assert!(v["feedback_age_a_ms"].is_number() && v["feedback_age_b_ms"].is_number(), "{v}");
     }
     assert!(m["stats"]["frame_fetch_ms"].is_number() && m["stats"]["parse_ms"].is_number(), "{}", m["stats"]);
+    check_timing(m, 40.0, 30.0);
+    println!("timing {}", m["timing"]);
+    // the start view skips the minimum settle wait (still windows only); the view poses wait 2 s
+    let settle: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["timing"]["settle_ms"].as_f64().unwrap()).collect();
+    assert!(settle[0] < 1000.0 && settle[0] >= (mm::STILL_WINDOW as f64 - 1.0) * 20.0, "{settle:?}");
+    assert!(settle[1..].iter().all(|s| *s >= mm::MIN_SETTLE_S * 1000.0), "{settle:?}");
+    // the camera was held for the run (refreshed: the run lasts several refresh periods) and released
+    assert_eq!(m["camera_hold"], "held", "{m}");
+    assert!(r.vision.holds.load(Ordering::SeqCst) >= 3, "{}", r.vision.holds.load(Ordering::SeqCst));
+    assert!(!r.vision.held.load(Ordering::SeqCst) && *r.vision.releases.lock().unwrap() == vec!["s7".to_string()]);
+}
+
+/// After the action ended: the camera hold is released once and no longer refreshed.
+async fn assert_released(r: &Rig) {
+    let t = Instant::now();
+    while r.vision.held.load(Ordering::SeqCst) {
+        assert!(t.elapsed() < Duration::from_secs(3), "the camera hold was not released");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let n = r.vision.holds.load(Ordering::SeqCst);
+    tokio::time::sleep(mm::CAMERA_HOLD_REFRESH + Duration::from_millis(300)).await;
+    assert_eq!(r.vision.holds.load(Ordering::SeqCst), n, "refreshed after the release");
+    assert!(!r.vision.held.load(Ordering::SeqCst));
+    assert_eq!(*r.vision.releases.lock().unwrap(), vec!["s7".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_camera_hold_is_released_on_failure_and_on_lease_loss() {
+    // failure after motion: TARGET_LOST in the first side view, the arm returns, the hold ends
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.hide_after_start.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}")), 90.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("TARGET_LOST")), "{a}");
+    assert!(r.vision.holds.load(Ordering::SeqCst) >= 1);
+    assert_released(&r).await;
+    // lease loss during a view motion: the action ends cancelled, the hold ends
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"speed_scale": 0.1})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(Instant::now() < until, "no view motion");
+        common::send(&mut r.ws, json!({"type":"heartbeat", "generation": r.generation, "epoch_id": r.epoch})).await;
+        common::drain(&mut r.ws, 5).await;
+        let moving = r.sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase.clone()).is_some_and(|p| p.starts_with("move:"));
+        if moving { break; }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(r.vision.held.load(Ordering::SeqCst), "held during the views");
+    let reply = common::ws_reply(&mut r.ws, json!({"type":"release_lease", "generation": r.generation}), &["lease_released"]).await;
+    assert_eq!(reply["success"], true);
+    let t = Instant::now();
+    loop {
+        let obs = r.sup.get_observation().await;
+        if let Some(a) = [obs.action, obs.previous_action].into_iter().flatten().find(|a| a.id == id && !a.is_running()) {
+            assert_eq!(a.code.as_deref(), Some("LEASE_LOST"), "{a:?}");
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(3), "the action did not end");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_released(&r).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_camera_hold_release_uses_the_latest_ticket_after_a_provider_restart() {
+    // from the second hold request on (the first refresh) the provider answers as restarted: a
+    // new subscription s1 of another instance; the release names that one, not the first id s7
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.hold_restart_after.store(2, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(r.vision.holds.load(Ordering::SeqCst) >= 2);
+    assert_eq!(*r.vision.releases.lock().unwrap(), vec!["s1".to_string()]);
+    assert_eq!(*r.vision.release_args.lock().unwrap(), vec![(mm::camera_hold_client(id), Some("rv-restarted".to_string()))]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_run_holds_the_camera_under_its_own_client() {
+    // two runs one after the other: each holds, refreshes and releases under armd-mview-<action
+    // id>, so a late release of the first cannot end the second's hold at an owner-checking provider
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "views": 2})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 150.0).await;
+        assert_eq!(a["state"], "done", "{a}");
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+    let clients = r.vision.hold_clients.lock().unwrap().clone();
+    let (c0, c1) = (mm::camera_hold_client(ids[0]), mm::camera_hold_client(ids[1]));
+    assert_eq!(c0, format!("armd-mview-{}", ids[0]));
+    let split = clients.iter().position(|c| *c == c1).expect("the second run held the camera");
+    assert!(split > 0 && clients[..split].iter().all(|c| *c == c0) && clients[split..].iter().all(|c| *c == c1), "{clients:?}");
+    let released: Vec<String> = r.vision.release_args.lock().unwrap().iter().map(|(c, _)| c.clone()).collect();
+    assert_eq!(released, vec![c0, c1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_camera_hold_the_run_is_unchanged_and_snapshots_never_hold() {
+    // an older provider (no camera hold): the gray run measures as before
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.hold_supported.store(false, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(a["measurement"]["camera_hold"], "unsupported");
+    assert!((a["measurement"]["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003);
+    assert!(r.vision.releases.lock().unwrap().is_empty());
+    // snapshot source: the hold is never requested (the snapshot would refresh with frames that
+    // are not the trigger's)
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 150.0).await;
+    assert_eq!((a["state"].as_str(), a["measurement"]["camera_hold"].as_str()), (Some("done"), Some("off")), "{a}");
+    assert_eq!(r.vision.holds.load(Ordering::SeqCst), 0);
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_min_s_sets_the_wait_at_the_view_poses() {
+    // 0.5 s instead of 2.0 s at the view poses (the start view has none); the still windows and
+    // the bracket still decide, the measurement is the same
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "settle_min_s": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}")), 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    let m = &a["measurement"];
+    assert_eq!(m["settle_min_s"], 0.5);
+    let settle: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["timing"]["settle_ms"].as_f64().unwrap()).collect();
+    assert!(settle[0] < 1000.0, "{settle:?}");
+    assert!(settle[1..].iter().all(|s| (500.0..1500.0).contains(s)), "{settle:?}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
+    let d = r.sup.inner().read().await.safety_describe();
+    assert_eq!(d["limits"]["measure_multiview"]["settle_min_s"], json!([0.5, 3.0]));
+    // the longest settle deadline a request can get: settle_min_s 3 + the 2 s of still windows
+    assert_eq!(d["limits"]["measure_multiview"]["max_settle_s"], json!(5.0));
+    assert_eq!((mm::max_settle_s(mm::MIN_SETTLE_S), mm::max_settle_s(0.5)), (mm::MAX_SETTLE_S, 2.5));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_arm_moving_at_the_start_fails_not_settled_before_any_trigger() {
+    // J4 drifts 50 mrad/s from the start (above the 0.03 rad/s still velocity): without the
+    // minimum wait the start view still needs a still window, so it ends NOT_SETTLED after the
+    // window time (MAX_SETTLE_S - MIN_SETTLE_S) without triggering the camera or moving
+    let creep = Arc::new(Mutex::new(Creep { shake: true, shake_rate: 0.05, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let ack = r.start(json!({"label": "box"})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 30.0).await;
+    let took = t0.elapsed().as_secs_f64();
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "{a}");
+    let window = mm::MAX_SETTLE_S - mm::MIN_SETTLE_S;
+    assert!(a["message"].as_str().unwrap().contains(&format!("within {window} s")), "{a}");
+    assert!(took >= window && took < window + 3.0, "{took}");
+    assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger before the arm is still");
+    assert!(r.at_start().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1125,7 +1375,9 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
         gray: AtomicBool::new(true), instance_id: Mutex::new("rv-fb-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
-        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false),
+        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1339,4 +1591,68 @@ fn malformed_gray_descriptor_does_not_select_gray() {
     let mut remote = mode(None);
     remote.upstream_loopback = false;
     assert_eq!(mm::select_frame_source(&remote), mm::FrameSource::Snapshot);
+}
+
+/// TestArm whose feedback looks fresh (age 0) but, once `frozen`, reports the same per-joint
+/// sequence counters: the supervisor keeps re-reading a cached sample.
+struct FrozenFeedbackArm { inner: common::TestArm, frozen: Arc<AtomicBool>, seq: u64 }
+
+impl ArmDriver for FrozenFeedbackArm {
+    fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+    fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
+    fn feedback_seqs(&self) -> Vec<u64> { vec![self.seq; 7] }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        if !self.frozen.load(Ordering::SeqCst) { self.seq += 1; }
+        self.inner.read_joint_states()
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn supports_mit_mode_switch(&self) -> bool { false }
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_feedback_without_new_samples_never_counts_as_still() {
+    // feedback within the freshness bound but no new sample (sequence counters stand still): the
+    // start view's still window never fills, so NOT_SETTLED without any trigger
+    for gray in [false, true] {
+        let frozen = Arc::new(AtomicBool::new(false));
+        let d = FrozenFeedbackArm { inner: common::TestArm::new(), frozen: frozen.clone(), seq: 0 };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(d)).await;
+        r.vision.gray.store(gray, Ordering::SeqCst);
+        frozen.store(true, Ordering::SeqCst);
+        let ack = r.start(json!({"label": "box"})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 30.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "gray {gray}: {a}");
+        assert!(a["message"].as_str().unwrap().contains("0 taken"), "{a}");
+        assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger while the feedback is cached");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_and_return_between_the_bracket_samples_fails_moved() {
+    // J4 jumps 10 mrad for 80 ms at the start of every trigger (200 ms) and comes back before
+    // sample B: the endpoints agree, the joints polled in between do not
+    for gray in [false, true] {
+        let creep = Arc::new(Mutex::new(Creep::default()));
+        let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+        let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+        r.vision.gray.store(gray, Ordering::SeqCst);
+        r.vision.trigger_delay_ms.store(200, Ordering::SeqCst);
+        let c = creep.clone();
+        *r.vision.on_trigger.lock().unwrap() = Some(Box::new(move || {
+            c.lock().unwrap().bump = Some((Instant::now(), Duration::from_millis(80), 0.010));
+        }));
+        let ack = r.start(json!({"pose_refine": "off"})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 60.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "gray {gray}: {a}");
+        let msg = a["message"].as_str().unwrap();
+        assert!(msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
+        assert_eq!(r.vision.frame.load(Ordering::SeqCst), mm::SNAPSHOT_TRIES as u64, "gray {gray}");
+    }
 }

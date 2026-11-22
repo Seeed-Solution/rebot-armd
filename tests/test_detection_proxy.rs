@@ -123,12 +123,26 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                     }
                     ("POST", "/api/subscribe") => {
                         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
-                        let body = serde_json::json!({"api_version": 2, "id": "s1", "client": v["client"], "pipelines": v["pipelines"],
-                            "fps": 5, "ttl_ms": 3000, "expires_in_ms": 3000});
-                        ("200 OK", body.to_string(), false)
+                        // "pipelines": [] = camera hold (client "pre-hold" plays an older rebot-vision: 400)
+                        let hold = v["pipelines"].as_array().is_some_and(|a| a.is_empty());
+                        if hold && v["client"] == "pre-hold" {
+                            ("400 Bad Request", r#"{"api_version":2,"error":"pipelines must be a non-empty list"}"#.to_string(), false)
+                        } else {
+                            let body = serde_json::json!({"api_version": 2, "id": "s1", "client": v["client"], "pipelines": v["pipelines"],
+                                "fps": 5, "ttl_ms": v.get("ttl_ms").cloned().unwrap_or(serde_json::json!(3000)), "expires_in_ms": 3000, "hold": hold,
+                                "instance_id": "rv-1"});
+                            ("200 OK", body.to_string(), false)
+                        }
                     }
                     ("POST", "/api/subscribe/s1/keepalive") => ("200 OK", r#"{"api_version":2,"id":"s1","expires_in_ms":3000}"#.to_string(), false),
+                    // owner-checked delete (rebot-vision with ?client=&instance_id=): s1 belongs to client
+                    // "armd-mview-1" of instance "rv-1"
+                    ("DELETE", "/api/subscribe/s1") if query.contains("client=") && !query.contains("client=armd-mview-1") =>
+                        ("409 Conflict", r#"{"api_version":2,"error":"NOT_OWNER"}"#.to_string(), false),
+                    ("DELETE", "/api/subscribe/s1") if query.contains("instance_id=") && !query.contains("instance_id=rv-1") =>
+                        ("409 Conflict", r#"{"api_version":2,"error":"INSTANCE_CHANGED"}"#.to_string(), false),
                     ("DELETE", "/api/subscribe/s1") => ("200 OK", r#"{"api_version":2,"deleted":"s1"}"#.to_string(), false),
+                    ("DELETE", "/api/subscribe/s5") => ("500 Internal Server Error", r#"{"error":"boom"}"#.to_string(), false),
                     ("GET", "/api/subscriptions") => ("200 OK", r#"{"api_version":2,"subscriptions":[{"id":"s1"}]}"#.to_string(), false),
                     (_, p) if p.starts_with("/api/subscribe/") => ("404 Not Found", r#"{"api_version":2,"error":"no such subscription"}"#.to_string(), false),
                     _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string(), false),
@@ -440,6 +454,47 @@ async fn http_detection_source_reads_and_sets_vision_mode() {
     assert_eq!(old.vision_mode().await.unwrap(), None);
     let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
     assert!(down.vision_mode().await.is_err());
+}
+
+#[tokio::test]
+async fn http_detection_source_holds_and_releases_the_camera() {
+    use armd::grasp::{CameraHoldTicket, DetectionSource, HttpDetectionSource};
+    let (up, seen) = spawn_mock_upstream().await;
+    let src = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}")).unwrap(), image_size_px: [640.0, 360.0] };
+    let ticket = src.camera_hold("armd-mview-1", 5000).await.unwrap().expect("held");
+    assert_eq!(ticket, CameraHoldTicket { id: "s1".into(), instance_id: Some("rv-1".into()) });
+    {
+        let s = seen.lock().unwrap();
+        let last = s.last().unwrap();
+        assert_eq!((last.method.as_str(), last.target.as_str()), ("POST", "/api/subscribe"));
+        let body: serde_json::Value = serde_json::from_str(&last.body).unwrap();
+        assert_eq!(body, serde_json::json!({"client": "armd-mview-1", "pipelines": [], "ttl_ms": 5000}));
+    }
+    let last_target = || seen.lock().unwrap().last().map(|r| (r.method.clone(), r.target.clone()));
+    src.camera_release(&ticket, "armd-mview-1").await.unwrap();
+    assert_eq!(last_target(), Some(("DELETE".into(), "/api/subscribe/s1?client=armd-mview-1&instance_id=rv-1".into())));
+    // not ours any more (another client's s1, or a restarted provider's): 409, nothing to end
+    src.camera_release(&ticket, "armd-mview-2").await.unwrap();
+    assert_eq!(last_target(), Some(("DELETE".into(), "/api/subscribe/s1?client=armd-mview-2&instance_id=rv-1".into())));
+    let restarted = CameraHoldTicket { id: "s1".into(), instance_id: Some("rv-0".into()) };
+    src.camera_release(&restarted, "armd-mview-1").await.unwrap();
+    // a provider without instance ids: by client only
+    let no_inst = CameraHoldTicket { id: "s1".into(), instance_id: None };
+    src.camera_release(&no_inst, "armd-mview-1").await.unwrap();
+    assert_eq!(last_target(), Some(("DELETE".into(), "/api/subscribe/s1?client=armd-mview-1".into())));
+    // already expired: not an error; a server error is
+    src.camera_release(&CameraHoldTicket { id: "s9".into(), instance_id: None }, "armd-mview-1").await.unwrap();
+    assert!(src.camera_release(&CameraHoldTicket { id: "s5".into(), instance_id: None }, "armd-mview-1").await.is_err());
+    // a client name that cannot go into the query is refused before any request
+    let n = seen.lock().unwrap().len();
+    assert!(src.camera_release(&ticket, "a b").await.is_err());
+    assert_eq!(seen.lock().unwrap().len(), n);
+    // older rebot-vision (400 for "pipelines": []) and a provider without subscriptions (404): no hold
+    assert_eq!(src.camera_hold("pre-hold", 5000).await.unwrap(), None);
+    let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert_eq!(old.camera_hold("armd-measure-multiview", 5000).await.unwrap(), None);
+    let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(down.camera_hold("armd-measure-multiview", 5000).await.is_err());
 }
 
 #[tokio::test]

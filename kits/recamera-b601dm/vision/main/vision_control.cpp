@@ -150,6 +150,10 @@ Continuous VisionControl::continuous_locked() const noexcept {
         c.fps = fps_;
     }
     for (const Subscription& s : subs_) {
+        if (s.hold()) {
+            ++c.holds;
+            continue;
+        }
         c.pipelines = c.pipelines | s.pipelines;
         c.fps = std::max(c.fps, s.fps);
         ++c.subscriptions;
@@ -166,8 +170,9 @@ int VisionControl::fps_locked() const noexcept {
 
 int VisionControl::gate_locked() const noexcept {
     const Continuous c = continuous_locked();
-    // a pending swap opens the gate like a trigger: the frame thread applies it on the next frame
-    const bool wake = !triggers_.empty() || swap_ == SwapState::Pending;
+    // a pending swap opens the gate like a trigger: the frame thread applies it on the next frame;
+    // a camera hold keeps it open without inference (the next trigger is served by the next frame)
+    const bool wake = !triggers_.empty() || swap_ == SwapState::Pending || c.holds > 0;
     return camera_gate_fps(c.active() || wake, wake, c.active() ? c.fps : fps_);
 }
 
@@ -400,6 +405,21 @@ bool VisionControl::unsubscribe(const std::string& id) {
     }
     cv_.notify_all();
     return found;
+}
+
+VisionControl::Status VisionControl::unsubscribe_owned(const std::string& id, const std::string& client,
+                                                       const std::string& instance) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!instance.empty() && instance != instance_id_) return Status::InstanceChanged;
+        const auto it = std::find_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.id == id; });
+        if (it == subs_.end()) return Status::NotFound;
+        if (!client.empty() && it->client != client) return Status::NotOwner;
+        subs_.erase(it);
+        notify_locked();
+    }
+    cv_.notify_all();
+    return Status::Ok;
 }
 
 std::vector<Subscription> VisionControl::subscriptions(uint64_t now_ms) {
@@ -859,7 +879,7 @@ static nlohmann::json pipeline_list(Pipelines p) {
 
 static nlohmann::json continuous_json(const Continuous& c) {
     return {{"active", c.active()}, {"pipelines", pipeline_list(c.pipelines)}, {"fps", c.fps},
-            {"subscriptions", c.subscriptions}};
+            {"subscriptions", c.subscriptions}, {"holds", c.holds}};
 }
 
 static nlohmann::json subscription_json(const Subscription& s, uint64_t now_ms, int cap) {
@@ -868,7 +888,8 @@ static nlohmann::json subscription_json(const Subscription& s, uint64_t now_ms, 
             {"pipelines", pipeline_list(s.pipelines)},
             {"fps", std::min(s.fps, cap)},
             {"requested_fps", s.fps},
-            {"ttl_ms", s.ttl_ms}, {"expires_in_ms", left < 0 ? 0 : left}};
+            {"ttl_ms", s.ttl_ms}, {"expires_in_ms", left < 0 ? 0 : left},
+            {"hold", s.hold()}};
 }
 
 static nlohmann::json mask_focus_json(const MaskFocus& f, uint64_t now_ms) {
@@ -1003,6 +1024,7 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0, Re
         {"trigger", true},
         {"per_request_pipelines", true},
         {"subscriptions", true},
+        {"camera_hold", true},
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
         {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}, {"gray", gray_avail}}},
@@ -1161,7 +1183,8 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out, bool allow_
     return true;
 }
 
-static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\"";
+static const char* kPipelinesError =
+    "\"pipelines\" must be a list of \"yolo\", \"aruco\", \"depth\" ([] = camera hold)";
 static const char* kTriggerPipelinesError =
     "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\", \"gray\"";
 
@@ -1492,6 +1515,8 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
         case VisionControl::Status::Full: return {503, error_body("too many subscriptions")};
         case VisionControl::Status::NotFound: return {404, error_body("no such subscription")};
         case VisionControl::Status::SwapBusy: return {409, error_body("SWAP_BUSY")};
+        case VisionControl::Status::NotOwner: return {409, error_body("NOT_OWNER")};
+        case VisionControl::Status::InstanceChanged: return {409, error_body("INSTANCE_CHANGED")};
         default: return {200, ok_body};
     }
 }
@@ -1544,6 +1569,8 @@ static HttpReply post_models(VisionControl& ctl, const std::string& body) {
 static std::string subscription_body(VisionControl& ctl, const Subscription& s, uint64_t mono) {
     nlohmann::json j = subscription_json(s, mono, ctl.active_fps());
     j["api_version"] = kApiVersion;
+    // the process the id belongs to: DELETE ?instance_id= refuses after a restart
+    j["instance_id"] = ctl.instance_id();
     j["continuous"] = continuous_json(ctl.continuous());
     return j.dump();
 }
@@ -1556,7 +1583,9 @@ static HttpReply post_subscribe(VisionControl& ctl, const std::string& body, uin
         return {400, error_body("\"client\" must be a string of 1..64 characters")};
     Pipelines p;
     const auto pl = j.find("pipelines");
-    if (pl == j.end() || !parse_pipelines(*pl, p)) return {400, error_body(kPipelinesError)};
+    // [] = a camera hold (Subscription::hold): no pipelines, the camera gate stays open
+    const bool hold = pl != j.end() && pl->is_array() && pl->empty();
+    if (pl == j.end() || (!hold && !parse_pipelines(*pl, p))) return {400, error_body(kPipelinesError)};
     int fps = 0;
     if (auto it = j.find("fps"); it != j.end()) {
         if (!it->is_number_integer()) return {400, error_body("fps must be an integer in 1..15")};
@@ -1652,7 +1681,13 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             return status_reply(st, st == VisionControl::Status::Ok ? subscription_body(ctl, s, mono) : "");
         }
         if (!keep && method == "DELETE") {
-            if (!ctl.unsubscribe(id)) return {404, error_body("no such subscription")};
+            // ?client=<owner>&instance_id=<instance>: delete only the caller's own subscription
+            // of this process (409 NOT_OWNER / INSTANCE_CHANGED); without them, by id alone
+            std::string client, instance;
+            query_param(query, "client", client);
+            query_param(query, "instance_id", instance);
+            const VisionControl::Status st = ctl.unsubscribe_owned(id, client, instance);
+            if (st != VisionControl::Status::Ok) return status_reply(st, "");
             nlohmann::json j = {{"api_version", kApiVersion}, {"deleted", id},
                                 {"continuous", continuous_json(ctl.continuous())}};
             return {200, j.dump()};
