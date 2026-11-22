@@ -31,5 +31,33 @@ check '[ "${#gens[@]}" -eq 3 ]'
 check '[ "$(cat "${OUT}/rebot-vision")" = "gen-5" ]'
 check '[ "$(cat "${OUT}/current/rebot-vision.sha256" | cut -d" " -f1)" = "$(printf gen-5 | sha256sum | cut -d" " -f1)" ]'
 
+# 2. Lock fallback without flock (REBOT_VISION_NO_FLOCK=1).
+LOCK="${OUT}/.publish.lock"
+#    a. Leftovers of an owner that died while taking the lock (an empty lock directory of the
+#       mkdir scheme, a lock naming a dead PID) do not block the next publisher.
+mkdir -p "${LOCK}.d"
+dead=999999; while kill -0 "${dead}" 2>/dev/null; do dead=$((dead - 1)); done
+ln -s "${dead}" "${LOCK}.owner"
+check 'timeout 20 bash -c "$(declare -f publish); T=\"${T}\" ROOT=\"${ROOT}\" publish stale-1 REBOT_VISION_NO_FLOCK=1"'
+check '[ "$(cat "${OUT}/rebot-vision")" = "stale-1" ] && [ ! -e "${LOCK}.owner" ] && [ ! -L "${LOCK}.owner" ]'
+rmdir "${LOCK}.d" 2>/dev/null || true
+#    b. A lock held by a live process is not taken over; the publisher waits for its release.
+sleep 30 & holder=$!
+ln -s "${holder}" "${LOCK}.owner"
+( publish held-1 REBOT_VISION_NO_FLOCK=1 ) & waiter=$!
+sleep 2
+check 'kill -0 "${waiter}" 2>/dev/null && [ "$(readlink "${LOCK}.owner")" = "${holder}" ]'
+kill "${holder}"; wait "${holder}" 2>/dev/null || true
+check 'timeout 20 bash -c "while kill -0 ${waiter} 2>/dev/null; do sleep 0.2; done"'
+wait "${waiter}"; check '[ $? -eq 0 ] && [ "$(cat "${OUT}/rebot-vision")" = "held-1" ] && [ ! -L "${LOCK}.owner" ]'
+#    c. Concurrent publishers all finish, the result is one complete generation, no lock remains.
+pids=()
+for i in 1 2 3 4; do ( publish "par-${i}" REBOT_VISION_NO_FLOCK=1 ) & pids+=($!); done
+for p in "${pids[@]}"; do check "wait ${p}"; done
+check '[ ! -L "${LOCK}.owner" ]'
+cur="$(cat "${OUT}/rebot-vision")"
+check 'case "${cur}" in par-*) true ;; *) false ;; esac'
+check '[ "$(cut -d" " -f1 "${OUT}/current/rebot-vision.sha256")" = "$(printf %s "${cur}" | sha256sum | cut -d" " -f1)" ]'
+
 if [ "${FAIL}" != 0 ]; then echo "build_vision publish tests: FAILED" >&2; exit 1; fi
 echo "build_vision publish tests: all passed"

@@ -56,41 +56,59 @@ STAGE_SHA="${STAGE_DIR}/rebot-vision.sha256"
 HOST_BUILD=""
 CONTAINER_WORK=""
 PUBLISHED=0
-LOCK_DIR="${LOCK_FILE}.d"
-LOCK_HELD_DIR=0
+LOCK_LINK="${LOCK_FILE}.owner"
+LOCK_HELD=0
+
+pid_alive() {
+    kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
+}
 
 # Serialise publishers. flock(1) when present: the kernel drops the lock when the holder dies.
-# Otherwise a mkdir lock that records its owner's PID; a lock whose owner is gone is taken over,
-# and the EXIT trap releases a lock this shell holds.
+# Otherwise LOCK_LINK, a symlink whose target is the owner's PID: ln -s creates lock and PID in
+# one atomic step, so no lock exists without an owner. A lock whose owner is gone is renamed
+# aside and removed only when the aside still names that owner; a successor's lock moved by
+# mistake is put back. The EXIT trap releases a lock this shell holds, and release removes the
+# link only while it names this shell. (REBOT_VISION_NO_FLOCK=1 forces the fallback; tests.)
 acquire_lock() {
-    if [ "${LOCK_HELD_DIR}" = 1 ]; then
+    if [ "${LOCK_HELD}" = 1 ]; then
         return 0
     fi
-    if command -v flock >/dev/null 2>&1; then
+    if [ "${REBOT_VISION_NO_FLOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
         exec 9>"${LOCK_FILE}"
         flock -x 9
+        LOCK_HELD=1
         return 0
     fi
-    while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
-        local owner
-        owner="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-        if [ -n "${owner}" ] && ! kill -0 "${owner}" 2>/dev/null; then
-            rm -rf "${LOCK_DIR}"
+    local owner aside moved
+    aside="${LOCK_LINK}.stale.$$"
+    while ! ln -s "$$" "${LOCK_LINK}" 2>/dev/null; do
+        owner="$(readlink "${LOCK_LINK}" 2>/dev/null || true)"
+        if [ -n "${owner}" ] && ! pid_alive "${owner}"; then
+            if mv "${LOCK_LINK}" "${aside}" 2>/dev/null; then
+                moved="$(readlink "${aside}" 2>/dev/null || true)"
+                if [ "${moved}" != "${owner}" ] && [ -n "${moved}" ]; then
+                    ln -s "${moved}" "${LOCK_LINK}" 2>/dev/null \
+                        || echo "build_vision.sh: lock of ${moved} moved during reclaim" >&2
+                fi
+                rm -f "${aside}"
+            fi
             continue
         fi
         sleep 0.1
     done
-    echo $$ > "${LOCK_DIR}/pid"
-    LOCK_HELD_DIR=1
+    LOCK_HELD=1
 }
 
 release_lock() {
-    if command -v flock >/dev/null 2>&1; then
-        exec 9>&-
-    elif [ "${LOCK_HELD_DIR}" = 1 ]; then
-        rm -rf "${LOCK_DIR}"
-        LOCK_HELD_DIR=0
+    if [ "${LOCK_HELD}" != 1 ]; then
+        return 0
     fi
+    if [ "${REBOT_VISION_NO_FLOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
+        exec 9>&-
+    elif [ "$(readlink "${LOCK_LINK}" 2>/dev/null || true)" = "$$" ]; then
+        rm -f "${LOCK_LINK}"
+    fi
+    LOCK_HELD=0
 }
 
 # Atomically point `link` at `target` (rename(2) of a fresh symlink over the old entry).
@@ -145,7 +163,7 @@ collect_garbage() {
     for d in ${stages[@]+"${stages[@]}"}; do
         name="${d##*/}"
         pid="$(printf '%s' "${name}" | cut -d. -f3)"
-        if [ "${d}" != "${STAGE_DIR}" ] && [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+        if [ "${d}" != "${STAGE_DIR}" ] && [ -n "${pid}" ] && ! pid_alive "${pid}"; then
             remove_gen_child "${d}"
         fi
     done
@@ -162,8 +180,8 @@ cleanup() {
                 if [ -f "${OUT_DIR}/${f}" ] && [ ! -L "${OUT_DIR}/${f}" ]; then rm -f "${OUT_DIR}/${f}"; fi
             done
         fi
-        release_lock || true
     fi
+    release_lock || true
     rm -rf "${STAGE_DIR}"
     if [ -n "${HOST_BUILD}" ]; then
         rm -rf "${HOST_BUILD}"
