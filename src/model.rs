@@ -372,12 +372,18 @@ impl WorkspacePolicy {
 
     pub fn validate(&self) -> Result<(), String> {
         let finite3 = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+        let valid_cp = |v: &[f32; 3]| {
+            finite3(v)
+                && (f64::from(v[0]).powi(2) + f64::from(v[1]).powi(2) + f64::from(v[2]).powi(2))
+                    .sqrt()
+                    <= crate::tool::MAX_CHECK_POINT_NORM_M
+        };
         if !self.floor_z_m.is_finite() || !finite3(&self.box_min_m) || !finite3(&self.box_max_m)
             || self.box_min_m.iter().zip(&self.box_max_m).any(|(lo, hi)| lo >= hi)
             || self.max_reach_m.is_some_and(|r| !r.is_finite() || r <= 0.0)
-            || self.check_points_end_m.is_empty() || self.check_points_end_m.len() > 16
-            || !self.check_points_end_m.iter().all(finite3) {
-            return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
+            || self.check_points_end_m.is_empty() || self.check_points_end_m.len() > 32
+            || !self.check_points_end_m.iter().all(valid_cp) {
+            return Err("Invalid workspace policy: finite values, box_min < box_max, 1..32 check points within 0.50 m".into());
         }
         if self.link_capsules.len() > MAX_LINK_CAPSULES {
             return Err(format!("Invalid workspace policy: at most {MAX_LINK_CAPSULES} link_capsules"));
@@ -591,6 +597,14 @@ fn default_true() -> bool {
     true
 }
 
+fn is_zero_tcp(v: &[f64; 3]) -> bool {
+    *v == [0.0; 3]
+}
+
+fn is_stock_active_tool(t: &crate::tool::ActiveToolInfo) -> bool {
+    t.is_stock && t.id == crate::tool::STOCK_TOOL_ID
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -712,6 +726,127 @@ impl GripperPolicy {
     pub fn is_calibrated(&self) -> bool {
         self.jaw_opening.as_ref().is_some_and(|jo| jo.calibrated)
     }
+}
+
+/// Unified post-merge validation for an effective [`GripperPolicy`]: checks policy bounds,
+/// `jaw_opening` monotonicity, direction (`open_rad` wider than `closed_rad`), full angular span
+/// coverage `[min(closed, open), max(closed, open)]`, and reachable open width `>= max_grasp_width_m`.
+pub fn validate_effective_gripper_policy(
+    g: &GripperPolicy,
+    lim: Option<&JointLimit>,
+    max_grasp_width_m: Option<f64>,
+) -> Result<(), String> {
+    validate_effective_gripper_policy_with_mode(g, lim, max_grasp_width_m, true, true)
+}
+
+/// Like [`validate_effective_gripper_policy`], optionally skipping J7 limit checks on
+/// `jaw_opening` points (after a calibration zero-offset shift clamped only `open_rad`).
+pub fn validate_effective_gripper_policy_ex(
+    g: &GripperPolicy,
+    lim: Option<&JointLimit>,
+    max_grasp_width_m: Option<f64>,
+    check_jaw_limits: bool,
+) -> Result<(), String> {
+    validate_effective_gripper_policy_with_mode(g, lim, max_grasp_width_m, check_jaw_limits, true)
+}
+
+/// Like [`validate_effective_gripper_policy_ex`], with explicit `allow_sim_default` gate:
+/// when `false` and `max_grasp_width_m > 0`, missing `jaw_opening` is rejected instead of falling
+/// back to [`JawOpening::sim_default()`].
+pub fn validate_effective_gripper_policy_with_mode(
+    g: &GripperPolicy,
+    lim: Option<&JointLimit>,
+    max_grasp_width_m: Option<f64>,
+    check_jaw_limits: bool,
+    allow_sim_default: bool,
+) -> Result<(), String> {
+    let in_lim = |v: f32| lim.is_none_or(|l| v >= l.min_position && v <= l.max_position);
+    if ![g.closed_rad, g.open_rad, g.holding_gap_rad, g.holding_torque_nm, g.squeeze_rad]
+        .iter()
+        .all(|v| v.is_finite())
+        || !in_lim(g.closed_rad)
+        || !in_lim(g.open_rad)
+        || (g.closed_rad - g.open_rad).abs() < 0.1
+        || g.holding_gap_rad < 0.0
+        || g.holding_torque_nm < 0.0
+        || !(0.0..=0.5).contains(&g.squeeze_rad)
+        || g.settle_ms == 0
+        || g.settle_ms > 5000
+    {
+        return Err(
+            "Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)"
+                .into(),
+        );
+    }
+    if let Some(frac) = g.holding_load_fraction {
+        if !frac.is_finite() || !(0.0..=1.0).contains(&frac) {
+            return Err("Invalid gripper policy: holding_load_fraction must be in 0.0..=1.0".into());
+        }
+    }
+    let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
+    if !positive(g.max_close_torque_nm)
+        || !positive(g.contact_torque_nm)
+        || !positive(g.max_lead_rad)
+        || !positive(g.stream_contact_speed_rad_s)
+    {
+        return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
+    }
+    if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
+        if contact >= cap {
+            return Err(
+                "Invalid gripper policy: contact_torque_nm must be below max_close_torque_nm".into(),
+            );
+        }
+    }
+    if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
+        return Err(
+            "Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0"
+                .into(),
+        );
+    }
+    if let Some(jo) = &g.jaw_opening {
+        jo.validate(if check_jaw_limits { lim } else { None })
+            .map_err(|e| format!("Invalid gripper policy: {e}"))?;
+        let w_closed = jo.opening_m(g.closed_rad);
+        let w_open = jo.opening_m(g.open_rad);
+        if w_open <= w_closed + 1e-6 {
+            return Err(format!(
+                "Invalid gripper policy: jaw_opening at open_rad ({w_open:.4} m) must be wider than at closed_rad ({w_closed:.4} m)"
+            ));
+        }
+        let first = jo.points.first().expect("validated >= 2 points");
+        let last = jo.points.last().expect("validated >= 2 points");
+        let slope_dir = (last[1] - first[1]) / (last[0] - first[0]);
+        if slope_dir * (g.open_rad - g.closed_rad) <= 0.0 {
+            return Err(
+                "Invalid gripper policy: jaw_opening direction opposes closed_rad -> open_rad"
+                    .into(),
+            );
+        }
+        let jo_min = jo.points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+        let jo_max = jo.points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        let pol_min = g.closed_rad.min(g.open_rad);
+        let pol_max = g.closed_rad.max(g.open_rad);
+        if jo_min > pol_min + 1e-4 || jo_max < pol_max - 1e-4 {
+            return Err(format!(
+                "Invalid gripper policy: jaw_opening span [{jo_min:.4}, {jo_max:.4}] does not cover policy span [{pol_min:.4}, {pol_max:.4}]"
+            ));
+        }
+    }
+    if let Some(max_w) = max_grasp_width_m.filter(|w| *w > 0.0) {
+        if !allow_sim_default && g.jaw_opening.is_none() {
+            return Err(format!(
+                "Invalid gripper policy: jaw_opening calibration curve is required on physical/non-stock tools to verify max_grasp_width_m {max_w:.4} m"
+            ));
+        }
+        let w_open = g.opening_m(g.open_rad);
+        if f64::from(w_open) + 1e-6 < max_w {
+            return Err(format!(
+                "Invalid gripper policy: reachable open width {w_open:.4} m is below max_grasp_width_m {max_w:.4} m"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1106,6 +1241,30 @@ pub struct ArmConfig {
     /// known tool (the acceptance then reports sticker-edge heights and sets no table height).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_tool: Option<CalibrationToolSpec>,
+    /// Active tool/gripper identity (stock `"default"` when no `--tool` overlay is applied).
+    #[serde(default, skip_deserializing, skip_serializing_if = "is_stock_active_tool")]
+    pub active_tool: crate::tool::ActiveToolInfo,
+    /// Tool TCP offset in the `end_link` frame (m).
+    #[serde(default, skip_serializing_if = "is_zero_tcp")]
+    pub tcp_offset: [f64; 3],
+    /// Layer 1 of the collision envelope: robot/rail check points in `end_link` frame (m).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_check_points_end_m: Vec<[f32; 3]>,
+    /// Layer 3 of the collision envelope: permanent tool check points in `end_link` frame (m).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permanent_tool_check_points_end_m: Vec<[f32; 3]>,
+    /// Layer 4 of the collision envelope: transient payload check points in `end_link` frame (m).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transient_payload_check_points_end_m: Vec<[f32; 3]>,
+    /// Physical resting contact point in `end_link` frame (m) for table datum derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_contact_end_m: Option<[f64; 3]>,
+    /// Jaw contact opening gap when closed (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_opening_m: Option<f32>,
+    /// Whether active tool dynamics are qualified for gravity compensation / feedforward.
+    #[serde(default = "default_true", skip_deserializing, skip_serializing_if = "is_true")]
+    pub dynamics_qualified: bool,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -1185,12 +1344,141 @@ impl Default for ArmConfig {
             zero_pose: None,
             zero_reference: None,
             calibration_tool: None,
+            active_tool: crate::tool::ActiveToolInfo::default(),
+            tcp_offset: [0.0; 3],
+            base_check_points_end_m: Vec::new(),
+            permanent_tool_check_points_end_m: Vec::new(),
+            transient_payload_check_points_end_m: Vec::new(),
+            physical_contact_end_m: None,
+            contact_opening_m: None,
+            dynamics_qualified: true,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
 }
 
 impl ArmConfig {
+    /// Convert an `end_link` pose into the active TCP pose (`p_tcp = p_end + R_end * tcp_offset`).
+    pub fn end_to_tcp(&self, end: &crate::kinematics::Pose) -> crate::kinematics::Pose {
+        if self.tcp_offset == [0.0; 3] {
+            return *end;
+        }
+        crate::kinematics::Pose::new(
+            end.r,
+            crate::kinematics::add(&end.p, &crate::kinematics::mat_vec(&end.r, &self.tcp_offset)),
+        )
+    }
+
+    /// Convert a TCP pose into the `end_link` pose (`p_end = p_tcp - R_tcp * tcp_offset`).
+    pub fn tcp_to_end(&self, tcp: &crate::kinematics::Pose) -> crate::kinematics::Pose {
+        if self.tcp_offset == [0.0; 3] {
+            return *tcp;
+        }
+        crate::kinematics::Pose::new(
+            tcp.r,
+            crate::kinematics::sub(&tcp.p, &crate::kinematics::mat_vec(&tcp.r, &self.tcp_offset)),
+        )
+    }
+
+    /// TCP pose from model angles `q`.
+    pub fn tcp_pose(&self, q: &[f64; 6]) -> crate::kinematics::Pose {
+        self.end_to_tcp(&self.arm_model.fk(q))
+    }
+
+    /// TCP pose from armd motor angles `q`.
+    pub fn tcp_pose_f32(&self, q: &[f32]) -> Option<crate::kinematics::Pose> {
+        self.arm_model.fk_f32(q).map(|end| self.end_to_tcp(&end))
+    }
+
+    /// Physical contact point in `end_link` frame for table datum derivation
+    /// (`physical_contact_end_m` when set, else `[0, 0, 0]` for stock grippers).
+    pub fn effective_physical_contact_end_m(&self) -> Option<[f64; 3]> {
+        self.physical_contact_end_m
+            .or_else(|| self.active_tool.is_stock.then_some([0.0; 3]))
+    }
+
+    /// Recompute `workspace.check_points_end_m` as the deduplicated 4-layer union of
+    /// `base_check_points_end_m`, `tcp_offset` (if nonzero), `permanent_tool_check_points_end_m`,
+    /// and `transient_payload_check_points_end_m`.
+    pub fn rebuild_effective_check_points(&mut self) -> Result<(), String> {
+        crate::tool::validate_tcp_offset(&self.tcp_offset)?;
+        let no_extra_layers = self.tcp_offset == [0.0; 3]
+            && self.permanent_tool_check_points_end_m.is_empty()
+            && self.transient_payload_check_points_end_m.is_empty();
+        if self.base_check_points_end_m.is_empty() && !no_extra_layers {
+            if let Some(ws) = &self.workspace {
+                self.base_check_points_end_m = ws.check_points_end_m.clone();
+            }
+        }
+        let ws_base = (self.base_check_points_end_m.is_empty() && no_extra_layers)
+            .then(|| self.workspace.as_ref().map(|w| w.check_points_end_m.as_slice()))
+            .flatten()
+            .unwrap_or(&[]);
+        for (label, pts) in [
+            ("base_check_points_end_m", if self.base_check_points_end_m.is_empty() { ws_base } else { self.base_check_points_end_m.as_slice() }),
+            ("permanent_tool_check_points_end_m", self.permanent_tool_check_points_end_m.as_slice()),
+            ("transient_payload_check_points_end_m", self.transient_payload_check_points_end_m.as_slice()),
+        ] {
+            for (i, p) in pts.iter().enumerate() {
+                if !p.iter().all(|v| v.is_finite()) {
+                    return Err(format!("{label}[{i}] must be finite"));
+                }
+                let norm = (f64::from(p[0]).powi(2)
+                    + f64::from(p[1]).powi(2)
+                    + f64::from(p[2]).powi(2))
+                .sqrt();
+                if norm > crate::tool::MAX_CHECK_POINT_NORM_M {
+                    return Err(format!(
+                        "{label}[{i}] norm {norm:.4} m exceeds limit {:.2} m",
+                        crate::tool::MAX_CHECK_POINT_NORM_M
+                    ));
+                }
+            }
+        }
+        if self.base_check_points_end_m.is_empty() && no_extra_layers {
+            return Ok(());
+        }
+        let mut effective: Vec<[f32; 3]> = Vec::new();
+        let mut push_unique = |pt: [f32; 3]| {
+            if !effective.iter().any(|e| {
+                (e[0] - pt[0]).abs() <= 1e-6
+                    && (e[1] - pt[1]).abs() <= 1e-6
+                    && (e[2] - pt[2]).abs() <= 1e-6
+            }) {
+                effective.push(pt);
+            }
+        };
+        for &p in &self.base_check_points_end_m {
+            push_unique(p);
+        }
+        if self.tcp_offset != [0.0; 3] {
+            push_unique([
+                self.tcp_offset[0] as f32,
+                self.tcp_offset[1] as f32,
+                self.tcp_offset[2] as f32,
+            ]);
+        }
+        for &p in &self.permanent_tool_check_points_end_m {
+            push_unique(p);
+        }
+        for &p in &self.transient_payload_check_points_end_m {
+            push_unique(p);
+        }
+        if effective.len() > crate::tool::MAX_EFFECTIVE_CHECK_POINTS {
+            return Err(format!(
+                "effective check_points_end_m count {} exceeds limit {}",
+                effective.len(),
+                crate::tool::MAX_EFFECTIVE_CHECK_POINTS
+            ));
+        }
+        if let Some(ws) = self.workspace.as_mut() {
+            if effective.is_empty() {
+                return Err("effective check_points_end_m cannot be empty".into());
+            }
+            ws.check_points_end_m = effective;
+        }
+        Ok(())
+    }
     /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
     pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
 
@@ -1248,6 +1536,8 @@ impl ArmConfig {
         let mut config: Self = serde_json::from_reader(std::io::BufReader::new(file))
             .map_err(|e| format!("profile {}: {e}", path.display()))?;
         config.load_arm_model(path.parent())?;
+        config.active_tool = crate::tool::stock_active_tool_info(&config);
+        config.dynamics_qualified = true;
         Ok(config)
     }
 
@@ -1475,34 +1765,14 @@ impl ArmConfig {
         if let Some(q) = &cam.q_end_cam { unit_quaternion(q)?; }
         if let Some(g) = &self.gripper_policy {
             let lim = self.gripper_index().and_then(|idx| self.limits.get(idx));
-            let in_lim = |v: f32| lim.is_some_and(|l| v >= l.min_position && v <= l.max_position);
-            if ![g.closed_rad, g.open_rad, g.holding_gap_rad, g.holding_torque_nm, g.squeeze_rad].iter().all(|v| v.is_finite())
-                || !in_lim(g.closed_rad) || !in_lim(g.open_rad) || (g.closed_rad - g.open_rad).abs() < 0.1
-                || g.holding_gap_rad < 0.0 || g.holding_torque_nm < 0.0
-                || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
+            if lim.is_none() {
                 return Err("Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)".into());
             }
-            if let Some(frac) = g.holding_load_fraction {
-                if !frac.is_finite() || !(0.0..=1.0).contains(&frac) {
-                    return Err("Invalid gripper policy: holding_load_fraction must be in 0.0..=1.0".into());
-                }
-            }
-            let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
-            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) || !positive(g.max_lead_rad)
-                || !positive(g.stream_contact_speed_rad_s) {
-                return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
-            }
-            if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
-                if contact >= cap {
-                    return Err("Invalid gripper policy: contact_torque_nm must be below max_close_torque_nm".into());
-                }
-            }
-            if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
-                return Err("Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0".into());
-            }
-            if let Some(jo) = &g.jaw_opening {
-                jo.validate(lim).map_err(|e| format!("Invalid gripper policy: {e}"))?;
-            }
+            #[cfg(not(target_arch = "wasm32"))]
+            let max_w = self.grasp.as_ref().map(|gr| gr.max_grasp_width_m);
+            #[cfg(target_arch = "wasm32")]
+            let max_w = crate::tool::baseline_grasp_limits(self).0;
+            validate_effective_gripper_policy(g, lim, max_w)?;
         }
         if let Some(ranges) = &self.damiao_ranges {
             let ok = |x: f32| x.is_finite() && x > 0.0;
@@ -1631,6 +1901,42 @@ impl ArmConfig {
         if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {
             return Err("Home positions must be finite and within joint limits".into());
         }
+        crate::tool::validate_tcp_offset(&self.tcp_offset)?;
+        if self.workspace.is_some()
+            || !self.base_check_points_end_m.is_empty()
+            || !self.permanent_tool_check_points_end_m.is_empty()
+            || !self.transient_payload_check_points_end_m.is_empty()
+            || self.tcp_offset != [0.0; 3]
+        {
+            self.rebuild_effective_check_points()?;
+        }
+        if (self.active_tool.id == crate::tool::STOCK_TOOL_ID) != self.active_tool.is_stock {
+            return Err("active_tool id 'default' is reserved exclusively for stock configuration".into());
+        }
+        if !crate::tool::is_valid_tool_kind(&self.active_tool.kind) {
+            return Err(format!("active_tool.kind '{}' is invalid", self.active_tool.kind));
+        }
+        if self.active_tool.is_stock {
+            if self.tcp_offset != [0.0; 3]
+                || !self.permanent_tool_check_points_end_m.is_empty()
+                || self.active_tool.commissioning_required
+                || self.active_tool.tcp_offset_m != [0.0; 3]
+                || self.active_tool.kind != "gripper"
+            {
+                return Err("stock active_tool cannot carry non-zero tcp_offset, permanent tool check points, commissioning requirement, or non-gripper kind".into());
+            }
+            self.active_tool = crate::tool::stock_active_tool_info(self);
+            self.dynamics_qualified = true;
+        } else {
+            if !valid_tool_id(&self.active_tool.id)
+                || self.active_tool.schema_version != 1
+                || !self.active_tool.config_digest.starts_with("v1:")
+                || self.active_tool.config_digest.len() <= 3
+                || self.active_tool.tcp_offset_m != self.tcp_offset
+            {
+                return Err("non-stock active_tool identity must have schema_version=1, valid tool id, 'v1:' config_digest, and matching tcp_offset_m".into());
+            }
+        }
         Ok(())
     }
 
@@ -1747,6 +2053,14 @@ impl ArmConfig {
             zero_pose: Some(ZeroPoseDoc::rebot_b601()),
             zero_reference: Some(zero_reference),
             calibration_tool: Some(CalibrationToolSpec::b601dm_gripper()),
+            active_tool: crate::tool::ActiveToolInfo::default(),
+            tcp_offset: [0.0; 3],
+            base_check_points_end_m: Vec::new(),
+            permanent_tool_check_points_end_m: Vec::new(),
+            transient_payload_check_points_end_m: Vec::new(),
+            physical_contact_end_m: None,
+            contact_opening_m: None,
+            dynamics_qualified: true,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -2379,8 +2693,8 @@ impl CalibrationToolSpec {
 
     pub fn validate(&self) -> Result<(), String> {
         if !valid_tool_id(&self.tool_id) { return Err("calibration_tool.tool_id must be 1..64 of A-Z a-z 0-9 _ - .".into()); }
-        if self.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(0.0..=0.05).contains(&e)) {
-            return Err("calibration_tool.edge_to_low_m must be in [0, 0.05] m".into());
+        if self.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(-0.10..=0.10).contains(&e)) {
+            return Err("calibration_tool.edge_to_low_m must be in [-0.10, 0.10] m".into());
         }
         Ok(())
     }
@@ -2547,6 +2861,12 @@ pub struct ObservationSchema {
     /// Joint zero check against `zero_reference` (`{status: "ok" | "legacy_j6" | "unchecked", message}`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_convention: Option<serde_json::Value>,
+    /// Active tool/gripper identity (`schema_version`, `id`, `is_stock`, `config_digest`, ...).
+    #[serde(default)]
+    pub active_tool: crate::tool::ActiveToolInfo,
+    /// Physical resting contact point in `end_link` frame (m) for table datum derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_contact_end_m: Option<[f64; 3]>,
 }
 
 impl ObservationSchema {
@@ -2652,6 +2972,12 @@ impl ObservationSchema {
             zero_reference: config.zero_reference.clone(),
             joint_zero: None,
             zero_convention: None,
+            active_tool: if config.active_tool.is_stock {
+                crate::tool::stock_active_tool_info(config)
+            } else {
+                config.active_tool.clone()
+            },
+            physical_contact_end_m: config.effective_physical_contact_end_m(),
         }
     }
 }

@@ -236,6 +236,7 @@
     "approach_height_m": 0.08,
     "grasp_height_m": 0.015,
     "lift_height_m": 0.07,
+    "max_grasp_width_m": 0.065,
     "camera_tilt_deg": -34.9454,
     "acquire_camera_down": "off",
     "align_j6": false

@@ -105,8 +105,8 @@ impl SupervisorInner {
                 "lease_required": false,
                 "effect": watchdog_effect,
                 "outcomes": {
-                    "park_then_torque_off": "driver supports automatic unload and the profile has a resting pose: park at the resting pose, settle, torque off",
-                    "hold_and_fault": "otherwise, or when the park cannot start (no plan, or its path enters a keep-out box) or exceeds its budget: hold position with torque on and latch WATCHDOG_TIMEOUT",
+                    "park_then_torque_off": "driver supports automatic unload and the profile has a resting pose: park at the resting pose (checking all enabled workspace constraints), settle, torque off",
+                    "hold_and_fault": "otherwise, or when the park cannot start (no plan, or its path/destination violates the workspace) or exceeds its budget: hold position with torque on and latch WATCHDOG_TIMEOUT",
                 },
                 "park_budget": {
                     "min_ms": ms(WATCHDOG_PARK_TIMEOUT),
@@ -352,6 +352,7 @@ impl SupervisorInner {
                     "return_to_start": "default true: joint-space move back to the start joints after the captures or a measurement failure; not after a stop, fault, collision, torque limit or lease loss",
                     "return_after": crate::measure_multiview::RETURN_AFTER,
                 });
+        let active_tool = self.schema().active_tool;
         json!({
             "describe_version": DESCRIBE_VERSION,
             "device": {
@@ -360,6 +361,8 @@ impl SupervisorInner {
                 "profile_version": c.profile_version,
                 "dof": c.dof,
                 "joint_names": c.joint_names,
+                "active_tool": active_tool,
+                "dynamics_qualified": c.dynamics_qualified,
             },
             "timing": {
                 "control_hz": c.control_frequency_hz,

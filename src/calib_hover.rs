@@ -114,6 +114,10 @@ pub struct HoverParams {
 pub struct HoverJob {
     pub id: String,
     pub candidate_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub params: HoverParams,
@@ -162,6 +166,20 @@ fn num(body: &Value, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, A
 
 fn valid_job_id(id: &str) -> bool { !id.is_empty() && id.len() <= 40 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') }
 
+fn validate_hover_point(i: usize, approach: [f64; 3], hover: [f64; 3], floor: f64) -> Result<(), ArmError> {
+    let rise = approach[2] - hover[2];
+    if !(APPROACH_RISE_M[0]..=APPROACH_RISE_M[1]).contains(&rise) {
+        return Err(invalid(format!("points[{i}]: approach_m must be {}..{} m above hover_m (is {rise:.3})", APPROACH_RISE_M[0], APPROACH_RISE_M[1])));
+    }
+    if (approach[0] - hover[0]).hypot(approach[1] - hover[1]) > MAX_DESCENT_XY_M {
+        return Err(invalid(format!("points[{i}]: the descent must be vertical (approach and hover x, y within {MAX_DESCENT_XY_M} m)")));
+    }
+    if hover[2] < floor + MIN_HOVER_ABOVE_FLOOR_M {
+        return Err(ArmError::detailed(422, "WORKSPACE_VIOLATION", format!("points[{i}]: hover_m z {:.4} m is less than {MIN_HOVER_ABOVE_FLOOR_M} m above the effective floor {floor:.4} m", hover[2]), json!({"point": i})));
+    }
+    Ok(())
+}
+
 /// Check a run under the lock (fresh job or `resume`).
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<HoverPlan, ArmError> {
     if epoch != inner.safety.epoch_id() {
@@ -169,16 +187,47 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Hove
     }
     if inner.workspace_policy().is_none() { return Err(ArmError::detailed(400, "UNSUPPORTED", "calib_hover needs the Cartesian workspace (profile workspace + kinematics)", Value::Null)); }
     let o = body.as_object().ok_or_else(|| invalid("Command body must be an object"))?;
+    let floor = inner.workspace_policy().map_or(0.0, |(ws, _)| f64::from(ws.floor_z_m));
     let job = if let Some(r) = o.get("resume") {
-        for k in o.keys() { if k != "resume" { return Err(invalid(format!("resume takes no other field ({k})"))); } }
+        for k in o.keys() {
+            if k != "resume" && k != "candidate_fingerprint" {
+                return Err(invalid(format!("resume takes no other field ({k})")));
+            }
+        }
         let id = r.as_str().filter(|i| valid_job_id(i)).ok_or_else(|| invalid("resume must be a job id"))?;
         let mut job = inner.hover_jobs.iter().find(|j| j.id == id).cloned()
             .ok_or_else(|| ArmError::detailed(404, "JOB_NOT_FOUND", format!("no hover job {id} (GET /api/v1/calibration/hover)"), Value::Null))?;
         if job.state == "running" { return Err(ArmError::detailed(409, "JOB_RUNNING", format!("hover job {id} is running"), Value::Null)); }
+        if !inner.config.active_tool.matches_record(job.tool_id.as_deref(), job.tool_config_digest.as_deref()) {
+            return Err(ArmError::detailed(
+                409,
+                "TOOL_MISMATCH",
+                format!(
+                    "hover job {id} belongs to tool {:?}/{:?}, not active tool {}/{}",
+                    job.tool_id, job.tool_config_digest, inner.config.active_tool.id, inner.config.active_tool.config_digest
+                ),
+                Value::Null,
+            ));
+        }
+        let fp = o.get("candidate_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty() && f.len() <= 64)
+            .ok_or_else(|| invalid("resume requires candidate_fingerprint (1..64 bytes)"))?;
+        if fp != job.candidate_fingerprint {
+            return Err(ArmError::detailed(
+                409,
+                "FINGERPRINT_MISMATCH",
+                format!("hover job {id} belongs to candidate {}, not {}", job.candidate_fingerprint, fp),
+                Value::Null,
+            ));
+        }
         for p in job.points.iter_mut().filter(|p| p.state != "done") {
             p.state = "pending".into(); p.code = None; p.message = None; p.observations.clear(); p.discarded.clear(); p.settled_joints = None; p.settled_end_m = None;
         }
         if job.points.iter().all(|p| p.state == "done") { return Err(invalid(format!("hover job {id} has no point left"))); }
+        for (i, p) in job.points.iter().enumerate().filter(|(_, p)| p.state != "done") {
+            validate_hover_point(i, p.approach_m, p.hover_m, floor)?;
+        }
         job
     } else {
         for k in o.keys() {
@@ -198,30 +247,34 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Hove
             frames: num(body, "frames", DEFAULT_FRAMES as f64, 1.0, MAX_FRAMES as f64)? as usize,
             discard: num(body, "discard", MIN_DISCARD as f64, MIN_DISCARD as f64, 4.0)? as usize,
         };
-        let floor = inner.workspace_policy().map_or(0.0, |(ws, _)| f64::from(ws.floor_z_m));
         let mut points = Vec::with_capacity(pts.len());
         for (i, p) in pts.iter().enumerate() {
             let id = p.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 32).ok_or_else(|| invalid(format!("points[{i}].id must be a string of 1..32 bytes")))?;
             let approach = vec3(p.get("approach_m"), &format!("points[{i}].approach_m"), 1.0)?;
             let hover = vec3(p.get("hover_m"), &format!("points[{i}].hover_m"), 1.0)?;
             let prpy = match p.get("rpy_rad") { None | Some(Value::Null) => rpy, v => vec3(v, &format!("points[{i}].rpy_rad"), 7.0)? };
-            let rise = approach[2] - hover[2];
-            if !(APPROACH_RISE_M[0]..=APPROACH_RISE_M[1]).contains(&rise) {
-                return Err(invalid(format!("points[{i}]: approach_m must be {}..{} m above hover_m (is {rise:.3})", APPROACH_RISE_M[0], APPROACH_RISE_M[1])));
-            }
-            if (approach[0] - hover[0]).hypot(approach[1] - hover[1]) > MAX_DESCENT_XY_M {
-                return Err(invalid(format!("points[{i}]: the descent must be vertical (approach and hover x, y within {MAX_DESCENT_XY_M} m)")));
-            }
-            if hover[2] < floor + MIN_HOVER_ABOVE_FLOOR_M {
-                return Err(ArmError::detailed(422, "WORKSPACE_VIOLATION", format!("points[{i}]: hover_m z {:.4} m is less than {MIN_HOVER_ABOVE_FLOOR_M} m above the effective floor {floor:.4} m", hover[2]), json!({"point": i})));
-            }
+            validate_hover_point(i, approach, hover, floor)?;
             points.push(HoverPoint { id: id.into(), approach_m: approach, hover_m: hover, rpy_rad: prpy, state: "pending".into(), code: None, message: None,
                 observations: Vec::new(), discarded: Vec::new(), settled_joints: None, settled_end_m: None });
         }
         let t = now();
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        HoverJob { id: format!("hv-{nanos:x}"), candidate_fingerprint: fp.into(), created_at: t.clone(), updated_at: t, params, points,
-            state: "pending".into(), code: None, message: None, action_id: None, runs: 0, end: None }
+        HoverJob {
+            id: format!("hv-{nanos:x}"),
+            candidate_fingerprint: fp.into(),
+            tool_id: Some(inner.config.active_tool.id.clone()),
+            tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+            created_at: t.clone(),
+            updated_at: t,
+            params,
+            points,
+            state: "pending".into(),
+            code: None,
+            message: None,
+            action_id: None,
+            runs: 0,
+            end: None,
+        }
     };
     inner.action_preconditions()?;
     inner.gravity_comp_motion_busy()?;

@@ -270,21 +270,47 @@ pub struct DescentRules {
 }
 
 impl DescentRules {
-    /// The grasp / place default: the TCP from above, no table rule.
+    /// The grasp / place default: the `end_link` origin from above, no table rule.
     pub fn tcp() -> Self { Self { from_above: vec![[0.0; 3]], table: None } }
+
+    /// Protect an explicit local point in `end_link` frame (`tcp_offset` for TCP actions).
+    pub fn tcp_at(point_end_m: [f64; 3]) -> Self { Self { from_above: vec![point_end_m], table: None } }
 }
 
 /// The table rule of [`DescentRules::table`] along joint-space samples `qs` (the first is the start).
-pub fn table_clear(arm: &crate::chain::ArmModel, points: &[crate::kinematics::Vec3], bound: f64, qs: &[Vec<f32>]) -> Result<(), String> {
-    let Some(start) = qs.first().and_then(|q| arm.fk_f32(q)) else { return Ok(()) };
+pub fn table_clear<Q: AsRef<[f32]>>(arm: &crate::chain::ArmModel, points: &[crate::kinematics::Vec3], bound: f64, qs: &[Q]) -> Result<(), String> {
+    table_clear_iter(arm, points, bound, qs.iter().map(AsRef::as_ref))
+}
+
+/// Iterator variant of [`table_clear`].
+pub fn table_clear_iter<'a>(arm: &crate::chain::ArmModel, points: &[crate::kinematics::Vec3], bound: f64, qs: impl IntoIterator<Item = &'a [f32]>) -> Result<(), String> {
+    let mut iter = qs.into_iter();
+    let Some(start) = iter.next().and_then(|q| arm.fk_f32(q)) else { return Ok(()) };
     let floor: Vec<f64> = points.iter().map(|p| start.transform_point(p)[2].min(bound)).collect();
-    for q in &qs[1..] {
+    for q in iter {
         let Some(pose) = arm.fk_f32(q) else { continue };
         if points.iter().zip(&floor).any(|(p, f)| pose.transform_point(p)[2] < f - 1e-6) {
             return Err(format!("table: a tool point comes closer than the clearance ({bound:.3} m)"));
         }
     }
     Ok(())
+}
+
+/// Convert a [`table_clear`] failure into a `WORKSPACE_VIOLATION` [`MotionError`].
+pub fn table_violation_from_clear(msg: String) -> MotionError {
+    MotionError::WorkspaceViolation {
+        s: 1.0,
+        point: 0,
+        limit: "table_z_m + 0.005".into(),
+        value: 0.0,
+        bound: 0.0,
+        detail: Box::new(crate::kinematics::WorkspaceViolationDetail {
+            constraint_id: Some("table_z".into()),
+            geometry_id: None,
+            violation_phase: Some("plan".into()),
+            reason: Some(msg),
+        }),
+    }
 }
 
 /// Same-side settings of one motion, taken under the supervisor lock.
@@ -340,7 +366,8 @@ fn plan_cartesian_pre_inner(input: &crate::motion::PlanInput, direct: &crate::mo
         flipped = keep_from_above(&target, &mut pre, &mut signs, delta, &input.limits, lowest)?;
         segment_from_above(&target, &pre, lowest)?;
     }
-    let goal = input.arm.fk_f32(&pre).ok_or_else(|| "pre_target: no kinematic model".to_string())?;
+    let end = input.arm.fk_f32(&pre).ok_or_else(|| "pre_target: no kinematic model".to_string())?;
+    let goal = crate::motion::end_to_frame(&end, input);
     let path = crate::motion::plan_cartesian_opts(input, goal, speed, opts).map_err(|e| format!("pre_target: {}", e.code()))?;
     if !reached_pre(path.last_slice(), &pre, delta) {
         return Err("pre_target: the path to the pre-target ends elsewhere (IK)".into());
@@ -454,23 +481,50 @@ mod runtime {
         /// fails a check. Returns (action id, expected duration).
         pub fn install_path_same_side(&mut self, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
             kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+            self.install_path_same_side_with_rules(input, direct, pre, plan, None, kind, tag)
+        }
+
+        /// [`install_path_same_side`](Self::install_path_same_side) with `rules` enforced on the
+        /// actually selected path (`cp.path` + `seg`, or `direct` on any fallback).
+        #[allow(clippy::too_many_arguments)]
+        pub fn install_path_same_side_with_rules(&mut self, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
+            rules: Option<&DescentRules>, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+            let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
+                if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+                    table_clear(&input.arm, points, *bound, &path.q).map_err(|r| ArmError::from(table_violation_from_clear(r)))?;
+                }
+                Ok(())
+            };
             let (cp, plan) = match (pre, plan) {
                 (Pre::Ready(cp), Some(plan)) => (cp, plan),
                 (Pre::Direct(r), _) => {
+                    check_direct_table(&direct)?;
                     let started = self.install_path(input, direct, kind, tag)?;
                     self.record_approach(started.0, &Outcome::direct(r));
                     return Ok(started);
                 }
-                _ => return self.install_path(input, direct, kind, tag),
+                _ => {
+                    check_direct_table(&direct)?;
+                    return self.install_path(input, direct, kind, tag);
+                }
             };
             let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
                 Ok(x) => x,
-                Err(r) => return self.install_path_same_side(input, direct, Pre::Direct(r), None, kind, tag),
+                Err(r) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(r), None, rules, kind, tag),
             };
+            if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+                let seg_qs = match self.workspace_samples(&seg) {
+                    Ok(s) => s,
+                    Err(e) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules, kind, tag),
+                };
+                if let Err(r) = table_clear_iter(&input.arm, points, *bound, cp.path.q.iter().map(|q| q.as_slice()).chain(seg_qs.iter().map(Vec::as_slice))) {
+                    return self.install_path_same_side_with_rules(input, direct, Pre::Direct(r), None, rules, kind, tag);
+                }
+            }
             let target = cp.target.clone();
             let (id, d1) = match self.install_path(input, cp.path, kind, tag.clone()) {
                 Ok(x) => x,
-                Err(e) => return self.install_path_same_side(input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, kind, tag),
+                Err(e) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules, kind, tag),
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
@@ -487,23 +541,49 @@ mod runtime {
         /// place final descent). Records the outcome on action `id`. Returns the expected duration.
         pub fn install_macro_path_same_side(&mut self, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
             plan: Option<&Plan>) -> Result<f64, ArmError> {
+            self.install_macro_path_same_side_with_rules(id, input, direct, pre, plan, None)
+        }
+
+        /// [`install_macro_path_same_side`](Self::install_macro_path_same_side) with `rules`
+        /// enforced on the actually selected path (`cp.path` + `seg`, or `direct` on any fallback).
+        pub fn install_macro_path_same_side_with_rules(&mut self, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
+            plan: Option<&Plan>, rules: Option<&DescentRules>) -> Result<f64, ArmError> {
+            let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
+                if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+                    table_clear(&input.arm, points, *bound, &path.q).map_err(|r| ArmError::from(table_violation_from_clear(r)))?;
+                }
+                Ok(())
+            };
             let (cp, plan) = match (pre, plan) {
                 (Pre::Ready(cp), Some(plan)) => (cp, plan),
                 (Pre::Direct(r), _) => {
+                    check_direct_table(&direct)?;
                     let d = self.install_macro_path(id, input, direct)?;
                     self.record_approach(id, &Outcome::direct(r));
                     return Ok(d);
                 }
-                _ => return self.install_macro_path(id, input, direct),
+                _ => {
+                    check_direct_table(&direct)?;
+                    return self.install_macro_path(id, input, direct);
+                }
             };
             let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
                 Ok(x) => x,
-                Err(r) => return self.install_macro_path_same_side(id, input, direct, Pre::Direct(r), None),
+                Err(r) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(r), None, rules),
             };
+            if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
+                let seg_qs = match self.workspace_samples(&seg) {
+                    Ok(s) => s,
+                    Err(e) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules),
+                };
+                if let Err(r) = table_clear_iter(&input.arm, points, *bound, cp.path.q.iter().map(|q| q.as_slice()).chain(seg_qs.iter().map(Vec::as_slice))) {
+                    return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(r), None, rules);
+                }
+            }
             let target = cp.target.clone();
             let d1 = match self.install_macro_path(id, input, cp.path) {
                 Ok(d) => d,
-                Err(e) => return self.install_macro_path_same_side(id, input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None),
+                Err(e) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules),
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {

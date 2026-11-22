@@ -112,6 +112,8 @@ pub struct ToolCalibration {
     /// Measurement report (frames, reprojection, ambiguity gap, std), passed through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fit: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
 }
 
 /// `calibration.json` `acceptance`: the automatic hover acceptance (tool-down hovers over board
@@ -138,6 +140,10 @@ pub struct AcceptanceRecord {
     /// Set by a zero: measured with the old zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalidated: Option<CalibrationStale>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
 }
 
 /// Most points in an acceptance record.
@@ -187,20 +193,65 @@ pub fn live_fingerprints(inner: &SupervisorInner) -> (String, String) {
 /// The stored fingertip is valid: bound to the camera calibration whose x fingerprint is `x_fp`.
 pub fn tool_valid(c: &CalibrationFile, x_fp: &str) -> bool { c.has_camera() && c.tool.as_ref().is_some_and(|t| t.x_fingerprint == x_fp) }
 
+/// [`tool_valid`] plus active-tool `(tool_id, tool_config_digest)` match.
+pub fn tool_valid_for(c: &CalibrationFile, x_fp: &str, active_tool: &crate::tool::ActiveToolInfo) -> bool {
+    c.has_camera()
+        && c.tool
+            .as_ref()
+            .is_some_and(|t| t.x_fingerprint == x_fp && active_tool.matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref()))
+}
+
 /// The stored acceptance is valid: passed, not invalidated, the calibration not stale and its
 /// fingerprint `fp` unchanged.
 pub fn acceptance_valid(c: &CalibrationFile, fp: &str) -> bool {
     c.has_camera() && c.stale.is_none() && c.acceptance.as_ref().is_some_and(|a| a.passed && a.invalidated.is_none() && a.fingerprint == fp)
 }
 
+/// [`acceptance_valid`] plus active-tool `(tool_id, tool_config_digest)` match.
+pub fn acceptance_valid_for(c: &CalibrationFile, fp: &str, active_tool: &crate::tool::ActiveToolInfo) -> bool {
+    c.has_camera()
+        && c.stale.is_none()
+        && c.acceptance.as_ref().is_some_and(|a| {
+            a.passed
+                && a.invalidated.is_none()
+                && a.fingerprint == fp
+                && active_tool.matches_record(a.tool_id.as_deref(), a.tool_config_digest.as_deref())
+        })
+}
+
 /// Effective floor (design T20 D): `max(profile floor, valid calibrated table_z_m - 3 mm)`.
 /// A table height is valid when the camera calibration is in effect and not stale, and, for
 /// `table_z_source: hover`, its acceptance is valid. Returns (floor, source, table_z used).
 pub fn effective_floor(profile_floor: f32, c: Option<&CalibrationFile>, fp: &str) -> (f32, &'static str, Option<f64>) {
+    effective_floor_inner(profile_floor, c, fp, None)
+}
+
+/// [`effective_floor`] enforcing active-tool matching on hover acceptance.
+pub fn effective_floor_for(
+    profile_floor: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> (f32, &'static str, Option<f64>) {
+    effective_floor_inner(profile_floor, c, fp, Some(active_tool))
+}
+
+fn effective_floor_inner(
+    profile_floor: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    active_tool: Option<&crate::tool::ActiveToolInfo>,
+) -> (f32, &'static str, Option<f64>) {
     let table = c.filter(|c| c.has_camera() && c.stale.is_none()).and_then(|c| {
         let z = c.table_z_m.filter(|z| z.is_finite())?;
         match c.table_z_source.as_deref() {
-            Some("hover") => acceptance_valid(c, fp).then_some((z, "calibration_hover")),
+            Some("hover") => {
+                let ok = match active_tool {
+                    Some(t) => acceptance_valid_for(c, fp, t),
+                    None => acceptance_valid(c, fp),
+                };
+                ok.then_some((z, "calibration_hover"))
+            }
             _ => Some((z, "calibration_camera")),
         }
     });
@@ -208,6 +259,33 @@ pub fn effective_floor(profile_floor: f32, c: Option<&CalibrationFile>, fp: &str
         Some((z, src)) if (z - FLOOR_BELOW_TABLE_M) as f32 > profile_floor => ((z - FLOOR_BELOW_TABLE_M) as f32, src, Some(z)),
         Some((z, _)) => (profile_floor, "profile", Some(z)),
         None => (profile_floor, "profile", None),
+    }
+}
+
+/// Strip tool-dependent fingertip and hover acceptance records that belong to another tool
+/// while preserving `camera_mount`, `intrinsics`, `kinematics`, and `joint_zero`.
+pub fn strip_mismatched_tool_records(file: &mut CalibrationFile, active_tool: &crate::tool::ActiveToolInfo) {
+    if let Some(ref t) = file.tool {
+        if !active_tool.matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref()) {
+            tracing::warn!(
+                "Dropping calibration fingertip record for tool '{}' ({:?}); active tool is '{}' ({})",
+                t.tool_id, t.tool_config_digest, active_tool.id, active_tool.config_digest
+            );
+            file.tool = None;
+        }
+    }
+    if let Some(ref a) = file.acceptance {
+        if !active_tool.matches_record(a.tool_id.as_deref(), a.tool_config_digest.as_deref()) {
+            tracing::warn!(
+                "Dropping calibration hover acceptance for tool {:?}/{:?}; active tool is '{}' ({})",
+                a.tool_id, a.tool_config_digest, active_tool.id, active_tool.config_digest
+            );
+            file.acceptance = None;
+            if file.table_z_source.as_deref() == Some("hover") {
+                file.table_z_source = None;
+                file.table_z_m = None;
+            }
+        }
     }
 }
 
@@ -274,7 +352,7 @@ fn validate_tool(t: &ToolCalibration) -> Result<(), String> {
     if !t.tip_cam_m.iter().all(|v| v.is_finite() && v.abs() <= 0.3) || t.tip_cam_m[2] <= 0.0 {
         return Err("tool.tip_cam_m must be three values within 0.3 m, in front of the camera (z > 0)".into());
     }
-    if t.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(0.0..=0.05).contains(&e)) { return Err("tool.edge_to_low_m must be in [0, 0.05] m".into()); }
+    if t.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(-0.10..=0.10).contains(&e)) { return Err("tool.edge_to_low_m must be in [-0.10, 0.10] m".into()); }
     if t.gripper_opening.is_some_and(|g| !g.is_finite() || !(0.0..=1.0).contains(&g)) { return Err("tool.gripper_opening must be in [0, 1]".into()); }
     if t.x_fingerprint.is_empty() || t.x_fingerprint.len() > 64 || t.measured_at.len() > 64 { return Err("tool.x_fingerprint / measured_at: at most 64 bytes".into()); }
     if t.fit.as_ref().is_some_and(|f| !f.is_object()) { return Err("tool.fit must be an object".into()); }
@@ -346,6 +424,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
     let mut inner = supervisor.inner().write().await;
     match loaded {
         crate::persist::Loaded::Loaded(mut file) => {
+            strip_mismatched_tool_records(&mut file, &inner.config.active_tool);
             if let Some(z) = &file.joint_zero {
                 match z.validate(Some(inner.config.dof)).and_then(|()| inner.set_joint_zero_offsets(&z.offsets())) {
                     Ok(()) => tracing::info!("Joint zero loaded from {} (method {}, set {}): offsets {:?} rad", path.display(), z.method,
@@ -724,17 +803,34 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
     let intrinsics = Some(Value::Object(req.intrinsics.clone()));
     let x_fp = x_fingerprint(intrinsics.as_ref(), &mount);
     let tool = match &req.tool {
-        // a stored fingertip stays only while it is bound to the same camera calibration
-        None => inner.calibration.as_ref().and_then(|c| c.tool.clone()).filter(|t| t.x_fingerprint == x_fp),
+        // a stored fingertip stays only while it is bound to the same camera calibration and active tool
+        None => inner
+            .calibration
+            .as_ref()
+            .and_then(|c| c.tool.clone())
+            .filter(|t| {
+                t.x_fingerprint == x_fp
+                    && inner
+                        .config
+                        .active_tool
+                        .matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref())
+            }),
         Some(None) => None,
         Some(Some(t)) => {
             if t.x_fingerprint != x_fp {
                 return Err(CalibError::new(409, "TOOL_STALE", "tool.x_fingerprint does not match this calibration (intrinsics or camera mount changed since the fingertip was measured); measure the fingertip again"));
             }
             let spec = inner.config.calibration_tool.as_ref().filter(|s| s.tool_id == t.tool_id);
-            let tool = ToolCalibration { tool_id: t.tool_id.clone(), tip_cam_m: t.tip_cam_m, edge_to_low_m: spec.and_then(|s| s.edge_to_low_m),
-                gripper_opening: t.gripper_opening, measured_at: t.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now),
-                x_fingerprint: t.x_fingerprint.clone(), fit: t.fit.clone() };
+            let tool = ToolCalibration {
+                tool_id: t.tool_id.clone(),
+                tip_cam_m: t.tip_cam_m,
+                edge_to_low_m: spec.and_then(|s| s.edge_to_low_m),
+                gripper_opening: t.gripper_opening,
+                measured_at: t.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now),
+                x_fingerprint: t.x_fingerprint.clone(),
+                fit: t.fit.clone(),
+                tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+            };
             validate_tool(&tool).map_err(CalibError::invalid)?;
             Some(tool)
         }
@@ -757,9 +853,19 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         if a.fingerprint != fp {
             return Err(CalibError::new(409, "ACCEPTANCE_STALE", "acceptance.fingerprint does not match this calibration (camera, kinematics, joint zero or tool changed since the hovers); run the acceptance again"));
         }
-        let rec = AcceptanceRecord { fingerprint: a.fingerprint.clone(), gate_version: a.gate_version, passed: a.passed,
-            measured_at: a.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now), board: a.board.clone(), points: a.points.clone(),
-            summary: a.summary.clone(), job_id: a.job_id.clone(), invalidated: None };
+        let rec = AcceptanceRecord {
+            fingerprint: a.fingerprint.clone(),
+            gate_version: a.gate_version,
+            passed: a.passed,
+            measured_at: a.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now),
+            board: a.board.clone(),
+            points: a.points.clone(),
+            summary: a.summary.clone(),
+            job_id: a.job_id.clone(),
+            invalidated: None,
+            tool_id: Some(inner.config.active_tool.id.clone()),
+            tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+        };
         validate_acceptance(&rec).map_err(CalibError::invalid)?;
         file.acceptance = Some(rec);
     }
@@ -1047,8 +1153,14 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
         let gripper_write = gripper_stale.then(|| {
             inner.gripper_calib_stale = Some(CalibrationStale { reason: reason.clone(), at: at.clone() });
             inner.gripper_calib_revision += 1;
-            let f = crate::gripper_calib::GripperCalibFile { offset_rad: inner.gripper_calib_offset, jaw_opening: inner.gripper_calib_jaw_opening.clone(),
-                ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())), stale: inner.gripper_calib_stale.clone() };
+            let f = crate::gripper_calib::GripperCalibFile {
+                offset_rad: inner.gripper_calib_offset,
+                jaw_opening: inner.gripper_calib_jaw_opening.clone(),
+                ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                stale: inner.gripper_calib_stale.clone(),
+                tool_id: Some(inner.config.active_tool.id.clone()),
+                tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+            };
             let path = inner.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
             crate::persist::PendingWrite::new(path, serde_json::to_string_pretty(&f).unwrap_or_default())
         });
@@ -1207,14 +1319,14 @@ impl Txn<'_> {
         let Some(setup) = after.grasp_setup.clone() else { return Ok(()); };
         let cw_lock = self.sup.config_write_lock();
         let _cw = cw_lock.lock().await;
-        let (setup, base_rev) = {
+        let (setup, base_rev, active_tool) = {
             let inner = self.sup.inner().read().await;
             let mut setup = setup;
             setup.camera_tilt_deg = f64::from(inner.config.camera_mount.tilt_deg);
-            (setup, inner.grasp_setup_revision)
+            (setup, inner.grasp_setup_revision, inner.config.active_tool.clone())
         };
         if let Some(path) = self.deps.setup_path.clone() {
-            let text = serde_json::to_string_pretty(&setup).unwrap_or_default();
+            let text = crate::grasp::serialize_setup_for_tool(&setup, &active_tool);
             let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(path, text))
                 .await
                 .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup stage task: {e}")).at("grasp_setup"))?
@@ -1406,14 +1518,31 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     let vision_values = validate_intrinsics(&vision_target).map_err(|e| CalibError::invalid(format!("backup {name}: vision_intrinsics.json: {e}")))?;
     if let Some(c) = &target.calibration { c.validate().map_err(CalibError::invalid)?; }
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
-    let before = {
+    let (before, active_tool) = {
         let inner = sup.inner().read().await;
+        if let Some(g) = &target.grasp_setup {
+            if let Some(gp) = inner.config.gripper_policy.as_ref() {
+                let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
+                crate::model::validate_effective_gripper_policy_with_mode(
+                    gp,
+                    lim,
+                    Some(g.max_grasp_width_m),
+                    true,
+                    !inner.requires_real_jaw_curve(),
+                )
+                .map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup incompatible with gripper_policy: {e}")))?;
+            }
+        }
         if let Some(k) = target.calibration.as_ref().and_then(|c| c.kinematics.as_ref()) {
             inner.config.arm_model.with_correction(Some(&k.joints)).map_err(|e| CalibError::new(400, "UNSUPPORTED", format!("backup {name}: {e}")))?;
         }
         if correction_of(target.calibration.as_ref()) != correction_of(inner.calibration.as_ref()) { kinematics_armed(&inner)?; }
-        armd_state(&inner)
+        (armd_state(&inner), inner.config.active_tool.clone())
     };
+    // Tool-dependent fingertip / hover acceptance records from another tool do not carry over across tool swaps.
+    if let Some(c) = target.calibration.as_mut() {
+        strip_mismatched_tool_records(c, &active_tool);
+    }
     // the joint zero is not part of a camera restore: the live one stays (it has its own restore,
     // `/api/v1/calibration/joint_zero/restore`)
     let live_zero = before.calibration.as_ref().and_then(|c| c.joint_zero.clone());
@@ -1436,11 +1565,21 @@ pub fn floor_view(profile: f32, c: Option<&CalibrationFile>, fp: &str) -> Value 
     json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
 }
 
+pub fn floor_view_for(
+    profile: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> Value {
+    let (eff, src, z) = effective_floor_for(profile, c, fp, active_tool);
+    json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
+}
+
 /// `{x_fingerprint, fingerprint, tool_valid, acceptance_valid, tip_end_m?}` of the calibration in effect.
 pub fn verification_view(inner: &SupervisorInner) -> Value {
     let (x_fp, fp) = live_fingerprints(inner);
     let c = inner.calibration.as_ref();
-    let tool_ok = c.is_some_and(|c| tool_valid(c, &x_fp));
+    let tool_ok = c.is_some_and(|c| tool_valid_for(c, &x_fp, &inner.config.active_tool));
     // tip_end = X · tip_cam with the X in effect
     let tip_end = c.and_then(|c| c.tool.as_ref()).filter(|_| tool_ok).and_then(|t| {
         let m = &inner.config.camera_mount;
@@ -1450,7 +1589,7 @@ pub fn verification_view(inner: &SupervisorInner) -> Value {
         Some([p[0] + f64::from(o[0]), p[1] + f64::from(o[1]), p[2] + f64::from(o[2])])
     });
     json!({"x_fingerprint": x_fp, "fingerprint": fp, "tool_valid": tool_ok, "tip_end_m": tip_end,
-        "acceptance_valid": c.is_some_and(|c| acceptance_valid(c, &fp)),
+        "acceptance_valid": c.is_some_and(|c| acceptance_valid_for(c, &fp, &inner.config.active_tool)),
         "table_z_source": c.and_then(|c| c.table_z_source.as_deref()).unwrap_or(if c.is_some_and(CalibrationFile::has_camera) { "camera" } else { "none" })})
 }
 
@@ -1470,7 +1609,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "calibration_tools": inner.calibration_tools(),
         "calibration_tool": inner.config.calibration_tool,
         "verification": verification_view(&inner),
-        "floor": inner.profile_floor_z_m.map(|p| floor_view(p, inner.calibration.as_ref(), &live_fingerprints(&inner).1)),
+        "floor": inner.profile_floor_z_m.map(|p| floor_view_for(p, inner.calibration.as_ref(), &live_fingerprints(&inner).1, &inner.config.active_tool)),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
         "backups": list_backups(deps)})
 }

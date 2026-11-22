@@ -83,6 +83,10 @@ pub struct ReplayInput {
     /// Episode store the episode is read from, and the joint zero in effect (stale check).
     pub store: crate::recording::EpisodeStore,
     pub zero_offsets: Vec<f32>,
+    /// Active tool TCP offset in `end_link` frame (m).
+    pub tcp_offset: [f64; 3],
+    /// Active tool identity (gripper provenance check).
+    pub active_tool: crate::tool::ActiveToolInfo,
 }
 
 /// A checked replay ready to install.
@@ -97,6 +101,10 @@ pub struct ReplayPlan {
     /// Power-budget time scale of the playback (1 = at the requested speed); None without a
     /// planning budget.
     pub power_scale: Option<f64>,
+    pub has_gripper_motion: bool,
+    pub tool_provenance_ok: bool,
+    pub recorded_tool_id: Option<String>,
+    pub recorded_tool_digest: Option<String>,
 }
 
 fn rejected(status: u16, code: &str, message: String) -> ArmError {
@@ -208,7 +216,51 @@ pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
         }
         Err(e) => return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("episode '{}' cannot be read: {e}", input.request.episode))),
     };
-    plan_frames(input, &frames)
+    let parquet_kv = crate::recording::read_parquet_kv(&input.path)
+        .map_err(|e| rejected(422, "REPLAY_INVALID_EPISODE", format!("episode '{}' parquet metadata cannot be read: {e}", input.request.episode)))?;
+    let emb = crate::recording::import::extract_embedded_provenance(&parquet_kv)
+        .map_err(|e| rejected(422, "REPLAY_INVALID_EPISODE", format!("episode '{}' invalid embedded metadata: {e}", input.request.episode)))?;
+    if (emb.tool_id.is_some() && emb.tool_id != sidecar.tool_id)
+        || (emb.tool_config_digest.is_some() && emb.tool_config_digest != sidecar.tool_config_digest)
+        || (emb.has_gripper_motion.is_some() && sidecar.has_gripper_motion.is_some() && emb.has_gripper_motion != sidecar.has_gripper_motion)
+    {
+        return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!(
+            "Episode '{}' sidecar provenance ({:?}/{:?}, gripper={:?}) conflicts with parquet embedded metadata ({:?}/{:?}, gripper={:?})",
+            input.request.episode,
+            sidecar.tool_id,
+            sidecar.tool_config_digest,
+            sidecar.has_gripper_motion,
+            emb.tool_id,
+            emb.tool_config_digest,
+            emb.has_gripper_motion
+        )));
+    }
+    let eff_tool_id = emb.tool_id.or(sidecar.tool_id.clone());
+    let eff_tool_digest = emb.tool_config_digest.or(sidecar.tool_config_digest.clone());
+    let frames_gripper = crate::recording::store::episode_has_gripper_motion(&frames, input.gripper_idx);
+    let sidecar_has_gripper = emb.has_gripper_motion == Some(true)
+        || sidecar.has_gripper_motion == Some(true)
+        || frames_gripper;
+    let approach_moves_gripper = input.gripper_idx.is_some_and(|g| {
+        frames.first().and_then(|f| f.observation_state.get(g).copied())
+            .zip(input.start.get(g).copied())
+            .is_some_and(|(first_g, start_g)| (first_g - start_g).abs() > 1e-3)
+    });
+    let provenance_ok = input
+        .active_tool
+        .matches_record(eff_tool_id.as_deref(), eff_tool_digest.as_deref());
+    if input.request.gripper && (sidecar_has_gripper || approach_moves_gripper) && !provenance_ok {
+        return Err(rejected(409, "TOOL_MISMATCH", format!(
+            "Episode '{}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({}); pass gripper: false for arm-only playback",
+            input.request.episode, eff_tool_id, eff_tool_digest, input.active_tool.id, input.active_tool.config_digest
+        )));
+    }
+    let mut plan = plan_frames(input, &frames)?;
+    plan.has_gripper_motion = sidecar_has_gripper;
+    plan.tool_provenance_ok = provenance_ok;
+    plan.recorded_tool_id = eff_tool_id;
+    plan.recorded_tool_digest = eff_tool_digest;
+    Ok(plan)
 }
 
 /// [`plan`] for frames already in memory.
@@ -268,7 +320,7 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
             q
         };
         let path: Vec<Vec<f32>> = samples.iter().map(|q| held(q)).collect();
-        crate::supervisor::check_path_with(&input.arm, ws, cam, &input.start, path.iter().map(Vec::as_slice))
+        crate::supervisor::check_path_with_tcp_tol(&input.arm, ws, cam, input.tcp_offset, crate::kinematics::WORKSPACE_EPS, &input.start, path.iter().map(Vec::as_slice))
             .map_err(workspace_reject)?;
         let at = |t: f64| -> Vec<f32> {
             let k = (t.floor() as usize).min(path.len() - 1);
@@ -290,9 +342,10 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
             tr
         };
         let knots: Vec<f64> = (0..path.len()).map(|k| k as f64).collect();
-        crate::supervisor::keepout_sweep_with(&input.arm, ws, cam, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
+        crate::supervisor::keepout_sweep_with_tcp_tol(&input.arm, ws, cam, input.tcp_offset, crate::kinematics::WORKSPACE_EPS, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
             .map_err(workspace_reject)?;
     }
+    let has_gripper_motion = crate::recording::store::episode_has_gripper_motion(frames, input.gripper_idx);
     // power budget: the playback (at the chosen speed) is slowed to fit, or refused
     let power_scale = match input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         None => None,
@@ -315,7 +368,17 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
             Some(fit.scale)
         }
     };
-    Ok(ReplayPlan { input, samples, sample_dt, duration, power_scale })
+    Ok(ReplayPlan {
+        input,
+        samples,
+        sample_dt,
+        duration,
+        power_scale,
+        has_gripper_motion,
+        tool_provenance_ok: true,
+        recorded_tool_id: None,
+        recorded_tool_digest: None,
+    })
 }
 
 fn workspace_reject(e: SafetyError) -> ArmError {
@@ -457,6 +520,7 @@ impl SupervisorInner {
 
     /// Snapshot for [`plan`] (under the lock, after the lease / epoch checks).
     pub fn replay_input(&self, request: ReplayRequest, epoch: u64) -> Result<ReplayInput, ArmError> {
+        self.check_commissioning_for_ordinary_motion("replay")?;
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
@@ -480,6 +544,8 @@ impl SupervisorInner {
             power: self.power_budget().cloned(),
             store: self.episodes.clone(),
             zero_offsets: self.joint_zero_offsets.clone(),
+            tcp_offset: self.config.tcp_offset,
+            active_tool: self.config.active_tool.clone(),
             request,
         })
     }
@@ -546,6 +612,15 @@ impl SupervisorInner {
         let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| self.commanded_positions[g]);
         let mut first = plan.samples[0].clone();
         if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
+        let approach_moves_gripper = gripper_idx.is_some_and(|g| {
+            input.request.gripper && (first[g] - self.commanded_positions[g]).abs() > 1e-3
+        });
+        if input.request.gripper && (plan.has_gripper_motion || approach_moves_gripper) && !plan.tool_provenance_ok {
+            return Err(rejected(409, "TOOL_MISMATCH", format!(
+                "Episode '{}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({})",
+                input.request.episode, plan.recorded_tool_id, plan.recorded_tool_digest, self.config.active_tool.id, self.config.active_tool.config_digest
+            )));
+        }
         self.safety.validate_motion_command(Some(input.epoch), &first, &self.config.limits)?;
         let limits = self.planning_limits();
         let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &first,
@@ -554,7 +629,7 @@ impl SupervisorInner {
         let checks = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
 
-        let ReplayPlan { input, samples, sample_dt, duration, power_scale } = plan;
+        let ReplayPlan { input, samples, sample_dt, duration, power_scale, .. } = plan;
         let motion = ReplayMotion {
             episode: input.request.episode.clone(), speed: input.request.speed * power_scale.unwrap_or(1.0), gripper: input.request.gripper,
             gripper_idx, samples, sample_dt, duration, hold_gripper, tag: input.request.tag.clone(),

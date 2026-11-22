@@ -47,6 +47,10 @@ pub struct NamedPose {
     pub gripper_joint: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
     /// Set by a joint zero change: the pose was taught with the old zero, so the arm reaches a
     /// different physical pose. Saving the pose again clears it. Always present (null when not
     /// stale).
@@ -243,15 +247,33 @@ fn check_positions(q: &[f32], config: &crate::model::ArmConfig) -> Result<(), St
 impl SupervisorInner {
     fn pose_tcp(&self, q: &[f32]) -> Option<PoseTcp> {
         self.config.kinematics?;
-        let pose = self.config.arm_model.fk_f32(q)?;
+        let pose = self.config.tcp_pose_f32(q)?;
         Some(PoseTcp { position: pose.p, rpy: crate::kinematics::r_to_rpy(&pose.r) })
     }
 
-    /// Recompute the TCP of every stored pose that has one (in memory) after the arm model
-    /// changed (kinematic correction).
-    pub(crate) fn refresh_pose_tcps(&mut self) {
-        let tcps: Vec<_> = self.poses.list.poses.iter().map(|p| p.tcp.as_ref().and(self.pose_tcp(&p.positions))).collect();
-        for (p, tcp) in self.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
+    fn recompute_pose_tcp(&self, p: &NamedPose) -> Option<PoseTcp> {
+        let cfg_pid = self.config.profile_id.as_ref();
+        let pose_pid = p.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
+        if let (Some(pp), Some(cp)) = (pose_pid, cfg_pid) {
+            if pp != cp { return None; }
+        }
+        let pose_arm_dof = p.arm_dof.or(self.poses.list.arm_dof);
+        if self.config.arm_dof() == 5 && pose_arm_dof.is_none() { return None; }
+        if pose_arm_dof.is_some_and(|ad| ad != self.config.arm_dof()) { return None; }
+        if p.gripper_joint.is_some_and(|gj| Some(gj) != self.config.gripper_index()) { return None; }
+        if let Some(ref jn) = p.joint_names {
+            let cfg_jn: Vec<String> = self.config.limits.iter().map(|l| l.name.clone()).collect();
+            if jn != &cfg_jn { return None; }
+        }
+        if check_positions(&p.positions, &self.config).is_err() { return None; }
+        self.pose_tcp(&p.positions)
+    }
+
+    /// Recompute the TCP of every stored pose (in memory) from its joints, clearing stale
+    /// cached TCPs whenever the joints are invalid or incompatible with the active config.
+    pub fn refresh_pose_tcps(&mut self) {
+        let tcps: Vec<_> = self.poses.list.poses.iter().map(|p| self.recompute_pose_tcp(p)).collect();
+        for (p, tcp) in self.poses.list.poses.iter_mut().zip(tcps) { p.tcp = tcp; }
     }
 
     pub(crate) fn poses_write(&self) -> Option<PendingWrite> {
@@ -269,6 +291,7 @@ impl SupervisorInner {
     /// segment (phase `approach`) reaches the pose.
     pub fn move_to_pose_ex(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64,
         approach: crate::backlash::Request) -> Result<(u64, f64), ArmError> {
+        self.check_commissioning_for_ordinary_motion("move_to_pose")?;
         let pose = self.poses.find(name)?;
         let cfg_joint_names: Vec<String> = self.config.limits.iter().map(|l| l.name.clone()).collect();
         let effective_pid = pose.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
@@ -415,6 +438,8 @@ pub fn prepare_save_with(
         arm_dof: Some(arm_dof),
         gripper_joint,
         joint_names: Some(joint_names.clone()),
+        tool_id: Some(inner.config.active_tool.id.clone()),
+        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
         stale: None,
     };
     let mut next_list = inner.poses.list.clone();
@@ -581,10 +606,8 @@ async fn load_locked(supervisor: &ArmSupervisor, path: &Path) -> Option<PendingW
         Loaded::Loaded(list) => {
             tracing::info!("{} named poses loaded from {}", list.poses.len(), path.display());
             inner.poses.list = list;
-            // a saved TCP follows from the positions; files saved under another kinematic model
-            // (before the J6 offset, 2026-11-12) carry a stale one
-            let tcps: Vec<_> = inner.poses.list.poses.iter().map(|p| p.tcp.as_ref().and(inner.pose_tcp(&p.positions))).collect();
-            for (p, tcp) in inner.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
+            // Recompute TCP unconditionally from valid compatible joints (or clear stale cached TCPs).
+            inner.refresh_pose_tcps();
             if inner.poses.assign_ids() { return inner.poses_write(); }
         }
         Loaded::Missing => {}

@@ -348,6 +348,7 @@ pub struct Plan {
     pub calibration_revision: u64,
     pub setup: GraspSetup,
     pub cam: CamModel,
+    pub tcp_offset: [f64; 3],
     /// Commanded joints at the start (all joints).
     pub start: Vec<f32>,
     pub arm_dof: usize,
@@ -356,6 +357,7 @@ pub struct Plan {
 
 /// Check the run under the lock.
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan, ArmError> {
+    inner.check_commissioning_for_ordinary_motion("measure_multiview")?;
     let request = parse_request(body)?;
     if epoch != inner.safety.epoch_id() {
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
@@ -375,7 +377,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
         request, epoch, workspace_revision: inner.workspace_revision, calibration_revision: inner.calibration_revision,
-        setup, cam, start: inner.commanded_positions.clone(), arm_dof: inner.config.arm_dof(), deadline_s,
+        setup, cam, tcp_offset: inner.config.tcp_offset, start: inner.commanded_positions.clone(), arm_dof: inner.config.arm_dof(), deadline_s,
     })
 }
 
@@ -603,15 +605,19 @@ fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
 fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
     table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, fallbacks: &[Value], compute_ms: f64) -> Value {
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
-    let views: Vec<Value> = caps.iter().map(|c| json!({
-        "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
-        "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
-        "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
-        "joints_rad": c.joints.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>(),
-        "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
-        "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
-        "settle_s": (c.settle_s * 100.0).round() / 100.0,
-    })).collect();
+    let views: Vec<Value> = caps.iter().map(|c| {
+        let tcp_pose = crate::motion::end_to_tcp(&c.pose, &plan.tcp_offset);
+        json!({
+            "end_pose": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
+            "tcp": {"xyz_m": tcp_pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&tcp_pose.r)},
+            "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
+            "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
+            "joints_rad": c.joints.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>(),
+            "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
+            "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
+            "settle_s": (c.settle_s * 100.0).round() / 100.0,
+        })
+    }).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
             "label": target.label, "score": target.score,
@@ -823,10 +829,12 @@ fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, jpegs: &[(usi
 fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_px: [f64; 4], c: &Computed, measurement: &Value) -> Value {
     let views: Vec<Value> = caps.iter().enumerate().map(|(k, v)| {
         let cam = camera_at(&plan.cam, &v.pose);
+        let tcp_pose = crate::motion::end_to_tcp(&v.pose, &plan.tcp_offset);
         json!({
             "file": format!("view_{k}.jpg"), "offset_m": v.offset, "frame_id": v.frame_id,
             "joints_rad": v.joints, "bracket_rad": v.bracket, "snapshot_tries_mrad": v.snapshot_tries.iter().map(|t| t * 1000.0).collect::<Vec<f32>>(),
-            "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
+            "end_pose": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
+            "tcp": {"xyz_m": tcp_pose.p, "r": mat_json(&tcp_pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
         })

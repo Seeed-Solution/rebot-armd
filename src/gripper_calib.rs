@@ -27,6 +27,10 @@ pub struct GripperCalibFile {
     /// Set by a zero of the gripper joint: the calibration was taught with the old zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale: Option<crate::calibration::CalibrationStale>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
 }
 
 impl GripperCalibFile {
@@ -132,6 +136,8 @@ pub fn prepare_update_with(
         jaw_opening: Some(b.jaw_opening.clone()),
         ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
         stale: None,
+        tool_id: Some(inner.config.active_tool.id.clone()),
+        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
     };
 
     let write = inner.gripper_calib_path.clone().or_else(|| Some(path_from_env())).map(|path| {
@@ -217,6 +223,17 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let j7_lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx)).cloned();
     match persist::load::<GripperCalibFile>(path, |f| f.validate(j7_lim.as_ref())) {
         Loaded::Loaded(calib) => {
+            if !inner.config.active_tool.matches_record(calib.tool_id.as_deref(), calib.tool_config_digest.as_deref()) {
+                tracing::warn!(
+                    "Ignoring gripper calibration from {} (record tool {:?}/{:?} does not match active tool {}/{})",
+                    path.display(),
+                    calib.tool_id,
+                    calib.tool_config_digest,
+                    inner.config.active_tool.id,
+                    inner.config.active_tool.config_digest
+                );
+                return;
+            }
             tracing::info!("Gripper calibration loaded from {}", path.display());
             if let Err(e) = inner.apply_gripper_calibration(calib.offset_rad, calib.jaw_opening) {
                 tracing::warn!("Ignoring invalid gripper calibration: {e}");

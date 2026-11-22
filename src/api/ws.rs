@@ -117,10 +117,18 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
         "/api/v1/safety/clear_fault" => { inner.clear_fault().map_err(ArmError::from)?; }
         "/api/v1/motion/servo" => { inner.servo(positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
         "/api/v1/motion/jog" => {
-            let (_, id, duration) = inner.jog_action(positions(body.get("target_positions"))?, body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "joint_move")?;
+            let speed_scale = motion::num(body, "speed_scale").map_err(ArmError::from)?;
+            let (_, id, duration) = inner.jog_action_with_speed_scale(
+                positions(body.get("target_positions"))?,
+                body.get("duration_secs").and_then(Value::as_f64),
+                Some(epoch),
+                "joint_move",
+                speed_scale,
+            )?;
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/home" => {
+            inner.check_commissioning_for_ordinary_motion("home")?;
             let (_, id, duration) = inner.jog_action(inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
             return Ok(Some((id, duration)));
         }
@@ -350,7 +358,24 @@ fn prepare_action(
         "/api/v1/action/move_to" => ("move_to", motion::parse_move_to(body)),
         "/api/v1/action/move_relative" => ("move_relative", motion::parse_move_relative(body)),
         "/api/v1/action/gripper" => {
-            let request = motion::parse_gripper(body).map_err(ArmError::from)?;
+            let mut request = motion::parse_gripper(body).map_err(ArmError::from)?;
+            if let Some(scale) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
+                if !(0.05..=1.0).contains(&scale) {
+                    return Err(ArmError::from(motion::MotionError::InvalidCommand(
+                        "speed_scale must be in [0.05, 1.0]".into(),
+                    ))
+                    .into());
+                }
+                if inner.config.active_tool.commissioning_required && scale > 0.2 + 1e-6 {
+                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
+                        "gripper (speed_scale {scale:.2} > 0.2)"
+                    )))
+                    .into());
+                }
+                if body.get("speed").is_none_or(Value::is_null) {
+                    request.speed = (2.0 * scale).clamp(0.01, 2.0);
+                }
+            }
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
@@ -404,7 +429,8 @@ fn prepare_action(
         }
         _ => return Err(invalid_command("Unknown action")),
     };
-    let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
+    let (mut spec, mut speed, tag) = parsed.map_err(ArmError::from)?;
+    let _ = &mut spec;
     // move_to / move_relative keep their straight line to the goal; `precise: true` (profile
     // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
     let precise = motion::flag(body, "precise", false).map_err(ArmError::from)?;
@@ -414,15 +440,55 @@ fn prepare_action(
     if path_mode == motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
         return Err(invalid_command("speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"));
     }
+    let linear_speed_scale = if path_mode == motion::PathMode::Linear {
+        if let Some(s) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
+            if !(0.05..=1.0).contains(&s) {
+                return Err(invalid_command("speed_scale must be in [0.05, 1.0]"));
+            }
+            if body.get("speed").is_none_or(Value::is_null) {
+                speed.linear = (motion::MAX_LINEAR_MPS * s).min(motion::MAX_LINEAR_MPS);
+                speed.angular = (motion::MAX_ANGULAR_RPS * s).min(motion::MAX_ANGULAR_RPS);
+            }
+            Some(s)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let approach = if same_side && path_mode == motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
-    let input = inner.plan_input()?;
+    let input = inner.plan_input_tcp()?;
     let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
     let joint = match path_mode {
-        motion::PathMode::Linear => None,
-        motion::PathMode::Joint => Some(JointGoal {
-            speed_scale: crate::poses::speed_scale(body)?,
-            same_side: same_side.then_some(request),
-        }),
+        motion::PathMode::Linear => {
+            if inner.config.active_tool.commissioning_required {
+                let scale_ok = linear_speed_scale.is_none_or(|s| s <= 0.2 + 1e-6);
+                let speed_ok = speed.linear <= 0.2 * motion::MAX_LINEAR_MPS + 1e-6
+                    && speed.angular <= 0.2 * motion::MAX_ANGULAR_RPS + 1e-6;
+                if !scale_ok || !speed_ok {
+                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
+                        "{kind} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
+                        0.2 * motion::MAX_LINEAR_MPS,
+                        0.2 * motion::MAX_ANGULAR_RPS
+                    )))
+                    .into());
+                }
+            }
+            None
+        }
+        motion::PathMode::Joint => {
+            let speed_scale = crate::poses::speed_scale(body)?;
+            if inner.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
+                return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
+                    "{kind} (speed_scale {speed_scale:.2} > 0.2)"
+                )))
+                .into());
+            }
+            Some(JointGoal {
+                speed_scale,
+                same_side: same_side.then_some(request),
+            })
+        }
     };
     let seeds = motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
     Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint, seeds }))
@@ -471,6 +537,7 @@ enum PreparedConfigWrite {
     PosesRename(crate::poses::PreparedPosesSave),
     Sequences(crate::sequences::PreparedSequences),
     GraspSetup(Box<crate::grasp::PreparedGraspSetup>),
+    ToolCommissioning(crate::tool::PreparedToolCommissioning),
 }
 
 impl PreparedConfigWrite {
@@ -491,6 +558,7 @@ impl PreparedConfigWrite {
             "/api/v1/sequences/save" => crate::sequences::prepare_save(inner, body).map(Self::Sequences),
             "/api/v1/sequences/delete" => crate::sequences::prepare_delete(inner, body).map(Self::Sequences),
             "/api/v1/grasp/setup" => crate::grasp::prepare_setup_update(inner, body, setup_path, require_expected_revision).map(|p| Self::GraspSetup(Box::new(p))),
+            "/api/v1/tool/commissioning/confirm" => crate::tool::prepare_commissioning_confirm(inner, body, require_expected_revision).map(Self::ToolCommissioning),
             _ => return None,
         })
     }
@@ -505,6 +573,7 @@ impl PreparedConfigWrite {
             Self::PosesRename(_) => "/api/v1/poses/rename",
             Self::Sequences(p) => if p.sequence.is_some() { "/api/v1/sequences/save" } else { "/api/v1/sequences/delete" },
             Self::GraspSetup(_) => "/api/v1/grasp/setup",
+            Self::ToolCommissioning(_) => "/api/v1/tool/commissioning/confirm",
         }
     }
 
@@ -518,6 +587,7 @@ impl PreparedConfigWrite {
             Self::PosesRename(p) => p.write.is_some(),
             Self::Sequences(p) => p.write.is_some(),
             Self::GraspSetup(p) => p.write.is_some(),
+            Self::ToolCommissioning(p) => p.write.is_some(),
         }
     }
 
@@ -531,6 +601,7 @@ impl PreparedConfigWrite {
             Self::PosesRename(p) => p.write.take(),
             Self::Sequences(p) => p.write.take(),
             Self::GraspSetup(p) => p.write.take(),
+            Self::ToolCommissioning(p) => p.write.take(),
         }
     }
 
@@ -573,6 +644,7 @@ impl PreparedConfigWrite {
             Self::PosesRename(p) => crate::poses::precheck_save(inner, p).err(),
             Self::Sequences(p) => crate::sequences::precheck(inner, p).err(),
             Self::GraspSetup(p) => crate::grasp::precheck_setup_update(inner, p).err(),
+            Self::ToolCommissioning(p) => crate::tool::precheck_commissioning_confirm(inner, p).err(),
         }
     }
 
@@ -627,6 +699,14 @@ impl PreparedConfigWrite {
                 let (setup, revision) = crate::grasp::commit_setup_update(inner, *p)?;
                 Ok(vec![
                     ("setup", json!(setup)),
+                    ("revision", json!(revision)),
+                ])
+            }
+            Self::ToolCommissioning(p) => {
+                let (active_tool, revision) = crate::tool::commit_commissioning_confirm(inner, p)?;
+                Ok(vec![
+                    ("active_tool", json!(active_tool)),
+                    ("commissioning_required", json!(active_tool.commissioning_required)),
                     ("revision", json!(revision)),
                 ])
             }
@@ -708,7 +788,8 @@ fn check_operator_privilege(
         | "/api/v1/poses/delete"
         | "/api/v1/sequences/save"
         | "/api/v1/sequences/delete"
-        | "/api/v1/grasp/setup" => Some(ApiError::operator_required(path)),
+        | "/api/v1/grasp/setup"
+        | "/api/v1/tool/commissioning/confirm" => Some(ApiError::operator_required(path)),
         // moves the arm and triggers the camera (like /api/v1/detection/trigger)
         crate::measure_multiview::PATH => Some(ApiError::operator_required(path)),
         // a sequence run that records writes episodes (like /api/v1/dataset/record/*)
@@ -1275,7 +1356,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 let (path, body) = match name {
                                     "home" => ("/api/v1/motion/home", json!({})),
                                     "park" | "unload" => ("/api/v1/motion/unload", json!({})),
-                                    _ => ("/api/v1/motion/jog", json!({"target_positions":value.get("positions")})),
+                                    _ => {
+                                        let mut j = json!({"target_positions":value.get("positions")});
+                                        if let Some(s) = value.get("speed_scale") {
+                                            j["speed_scale"] = s.clone();
+                                        }
+                                        ("/api/v1/motion/jog", j)
+                                    }
                                 };
                                 response = Some(match execute_command(&mut inner, path, &body, epoch) {
                                     Ok(started) => {

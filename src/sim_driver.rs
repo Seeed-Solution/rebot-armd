@@ -298,6 +298,11 @@ impl ArmDriver for SimArmDriver {
         vec![self.snapshot().1; self.dof]
     }
 
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        let rx = self.shared.lock().ok().and_then(|s| s.received_at);
+        vec![rx; self.dof]
+    }
+
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
         (joint < self.dof && self.modes[joint] == JointMode::Position).then_some(POS_VEL_VLIM)
     }

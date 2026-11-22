@@ -1507,6 +1507,8 @@ impl SandboxState {
         if check_assets {
             verify_pack_assets_from_map(&files, &manifest.assets)?;
         }
+        crate::mjcf_compose::validate_tool_manifest(&manifest, Some(&tool_xml))
+            .map_err(PackFileError::InvalidPack)?;
         Ok(ValidUserPack {
             canon_dir,
             manifest,
@@ -2304,6 +2306,7 @@ fn validate_and_write_pack<M: serde::de::DeserializeOwned + serde::Serialize>(
     required_elem: Option<&str>,
     parse_meta: fn(&M) -> (&str, &str, &[serde_json::Value]),
     set_id: fn(&mut M, String),
+    extra_validate: Option<fn(&M, Option<&str>) -> Result<(), String>>,
 ) -> Result<(String, serde_json::Value), (StatusCode, &'static str, String)> {
     let mut file_map = extract_files_map(files, primary_json, primary_xml, assets)
         .map_err(|(sc, msg)| (sc, "INVALID_PACK", msg))?;
@@ -2361,6 +2364,13 @@ fn validate_and_write_pack<M: serde::de::DeserializeOwned + serde::Serialize>(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
     let digest = validate_pack_map(primary_xml_rel, required_elem, &btree)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
+    if let Some(validate_fn) = extra_validate {
+        let primary_xml_str = btree
+            .get(primary_xml_rel)
+            .and_then(|b| std::str::from_utf8(b).ok());
+        validate_fn(&manifest, primary_xml_str)
+            .map_err(|msg| (StatusCode::BAD_REQUEST, "INVALID_PACK", msg))?;
+    }
 
     let target_dir = root.join(dir_name).join(&pack_id);
     let total_pack_bytes: u64 = file_map.values().map(|v| v.len() as u64).sum();
@@ -2426,6 +2436,7 @@ pub async fn upload_scene(
             Some("worldbody"),
             |m| (&m.id, &m.world_xml, &m.assets),
             |m, id| m.id = id,
+            None,
         )
     })
     .await
@@ -2484,6 +2495,7 @@ pub async fn upload_tool(
             None,
             |m| (&m.id, &m.tool_xml, &m.assets),
             |m, id| m.id = id,
+            Some(|m, xml| crate::mjcf_compose::validate_tool_manifest(m, xml).map(|_| ())),
         )
     })
     .await
@@ -4440,6 +4452,14 @@ pub async fn activate(
         &scene_manifest,
         &tool_manifest,
     )?;
+    if tool_manifest.armd.is_some() {
+        crate::mjcf_compose::validate_tool_manifest_for_robot(
+            &tool_manifest,
+            Some(&tool_xml),
+            &running_robot,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
+    }
 
     // M21: Validate policy completely BEFORE prepare (never run fallible disk checks after remote commit).
     let policy_id = match payload.policy {
@@ -5190,6 +5210,14 @@ pub async fn get_bundle(
         &scene_manifest,
         &tool_manifest,
     )?;
+    if tool_manifest.armd.is_some() {
+        crate::mjcf_compose::validate_tool_manifest_for_robot(
+            &tool_manifest,
+            Some(&tw),
+            &running_robot,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
+    }
 
     let policy_manifest = if let Some(ref p) = current.active_policy {
         let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
@@ -5804,7 +5832,8 @@ mod tests {
                 "id": "test_gripper",
                 "name": "Custom Test Gripper",
                 "kind": "gripper",
-                "tool_xml": "tool.xml"
+                "tool_xml": "tool.xml",
+                "tcp_offset": [0.0, 0.0, 0.0]
             },
             "tool_xml": "<mujoco model=\"test_tool\"><worldbody><body name=\"test_finger\" pos=\"0 0 0\"><geom type=\"box\" size=\"0.01 0.01 0.01\"/></body></worldbody></mujoco>"
         });
@@ -6135,7 +6164,8 @@ mod tests {
                     "id": "race_tool",
                     "name": format!("Race Tool Variant {i}"),
                     "kind": "gripper",
-                    "tool_xml": "tool.xml"
+                    "tool_xml": "tool.xml",
+                    "tcp_offset": [0.0, 0.0, 0.0]
                 });
                 files.insert("tool.json".to_string(), serde_json::to_vec(&tool_json).unwrap());
                 files.insert(
@@ -6813,6 +6843,7 @@ mod tests {
                 "kind": "gripper",
                 "tool_xml": "tool.xml",
                 "robots": ["b601dm"],
+                "tcp_offset": [0.0, 0.0, 0.0],
                 "assets": []
             },
             "tool_xml": r#"<mujoco model="digest_tool"><compiler meshdir="meshes"/><asset><mesh name="jaw" file="jaw.stl"/></asset><worldbody><geom name="jaw_geom" type="mesh" mesh="jaw"/></worldbody></mujoco>"#,

@@ -493,6 +493,7 @@ pub struct RunPlan {
 /// Check a run under the lock: sequence, steps, references (pinned), stale data, recorder,
 /// motion preconditions; computes the duration bound.
 pub fn prepare_run(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<RunPlan, ArmError> {
+    inner.check_commissioning_for_ordinary_motion("run_sequence")?;
     let request = parse_run(body)?;
     if epoch != inner.safety.epoch_id() {
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
@@ -521,6 +522,27 @@ pub fn prepare_run(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<
             Step::Replay { episode_id, speed, gripper } => {
                 let e = inner.episodes.get(episode_id).ok_or_else(|| missing(format!("no episode '{episode_id}'")))?;
                 if e.joint_zero.stale_against(&inner.joint_zero_offsets) { stale.push(i); }
+                if *gripper {
+                    let gripper_involved = e.has_gripper_motion == Some(true)
+                        || inner.config.gripper_index().is_some_and(|g| {
+                            e.first_state
+                                .as_ref()
+                                .and_then(|fs| fs.get(g).copied())
+                                .zip(inner.commanded_positions.get(g).copied())
+                                .is_some_and(|(fg, cg)| (fg - cg).abs() > 1e-3)
+                        });
+                    if gripper_involved
+                        && !inner
+                            .config
+                            .active_tool
+                            .matches_record(e.tool_id.as_deref(), e.tool_config_digest.as_deref())
+                    {
+                        return Err(rejected(409, "TOOL_MISMATCH", format!(
+                            "step {i}: episode '{episode_id}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({})",
+                            e.tool_id, e.tool_config_digest, inner.config.active_tool.id, inner.config.active_tool.config_digest
+                        )));
+                    }
+                }
                 PinnedStep::Replay { episode_id: episode_id.clone(), speed: *speed, gripper: *gripper }
             }
         };
