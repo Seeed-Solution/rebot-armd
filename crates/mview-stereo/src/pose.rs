@@ -120,47 +120,288 @@ pub struct PoseRefinement {
 
 fn inside_any(x: f64, y: f64, rects: &[[f64; 4]]) -> bool { rects.iter().any(|r| in_rect(x, y, r)) }
 
-/// Coarse candidates of `t` in `img` (half resolution): the local maxima of the NCC on the
-/// integer grid within `r` px of `c` with at least [`POSE_COARSE_MIN`], best first (at most 4).
-fn window_peaks(img: &Gray, t: &Tmpl, c: [f64; 2], r: i32) -> Vec<[f64; 2]> {
-    let n = (2 * r + 1) as usize;
-    let (cx, cy) = (c[0].round(), c[1].round());
-    let mut s = vec![f32::NEG_INFINITY; n * n];
-    for j in 0..n {
-        for i in 0..n {
-            if let Some(v) = ncc(img, t, cx + i as f64 - r as f64, cy + j as f64 - r as f64, false) { s[j * n + i] = v; }
+const MAX_CACHE_CELLS: usize = 1_000_000;
+const MAX_CACHE_REFINES: usize = 32_768;
+const MAX_CACHE_PAIRS: usize = 4_096;
+
+type RefinedEntry = ((i32, i32), Option<([f64; 2], f64)>);
+
+#[derive(Default)]
+struct MatchScratch {
+    scores: Vec<f32>,
+    peaks: Vec<(f32, [f64; 2])>,
+    matches: Vec<([f64; 2], f64)>,
+}
+
+struct CoarseRect {
+    cx: i32,
+    cy: i32,
+    r: i32,
+    scores: Vec<f32>,
+}
+
+struct RevCache {
+    q_bits: [u64; 2],
+    px_bits: [u64; 2],
+    win_bits: u64,
+    tmpl_valid: bool,
+    outcome: Option<[f64; 2]>,
+    coarse: Option<CoarseRect>,
+    refined: Vec<RefinedEntry>,
+}
+
+#[derive(Default)]
+struct PairCache {
+    last_key: Option<([u64; 2], u64)>, // (q0_bits, win_bits)
+    last_outcome: Option<[f64; 2]>,
+    fwd_coarse: Option<CoarseRect>,
+    fwd_refined: Vec<RefinedEntry>,
+    rev: Option<RevCache>,
+}
+
+struct CacheBudget {
+    used_cells: usize,
+    max_cells: usize,
+    used_refines: usize,
+    max_refines: usize,
+}
+
+impl CacheBudget {
+    fn try_reserve_cells(&mut self, k: usize) -> bool {
+        let Some(next) = self.used_cells.checked_add(k) else { return false; };
+        if next > self.max_cells { return false; }
+        self.used_cells = next;
+        true
+    }
+
+    fn try_reserve_refine(&mut self) -> bool {
+        if self.used_refines >= self.max_refines { return false; }
+        self.used_refines += 1;
+        true
+    }
+}
+
+struct MatchCache {
+    n_views: usize,
+    pairs: Vec<PairCache>, // empty when n_feats * n_views > max_pairs (graceful fallback)
+    budget: CacheBudget,
+}
+
+impl MatchCache {
+    fn new(n_feats: usize, n_views: usize) -> Self {
+        Self::with_limits(n_feats, n_views, MAX_CACHE_PAIRS, MAX_CACHE_CELLS, MAX_CACHE_REFINES)
+    }
+
+    fn with_limits(n_feats: usize, n_views: usize, max_pairs: usize, max_cells: usize, max_refines: usize) -> Self {
+        let pairs = n_feats
+            .checked_mul(n_views)
+            .filter(|&n| n <= max_pairs)
+            .map(|n| (0..n).map(|_| PairCache::default()).collect())
+            .unwrap_or_default();
+        Self {
+            n_views,
+            pairs,
+            budget: CacheBudget { used_cells: 0, max_cells, used_refines: 0, max_refines },
         }
     }
-    let mut peaks: Vec<(f32, [f64; 2])> = Vec::new();
-    for j in 0..n as i32 {
-        for i in 0..n as i32 {
-            let v = s[j as usize * n + i as usize];
+}
+
+trait GetTmpl {
+    fn get_tmpl(&mut self) -> Option<&Tmpl>;
+}
+
+impl GetTmpl for &Tmpl {
+    fn get_tmpl(&mut self) -> Option<&Tmpl> { Some(self) }
+}
+
+struct LazyTmpl<F> {
+    slot: Option<Option<Tmpl>>,
+    build: F,
+}
+
+impl<F: FnMut() -> Option<Tmpl>> LazyTmpl<F> {
+    fn new(build: F) -> Self { Self { slot: None, build } }
+}
+
+impl<F: FnMut() -> Option<Tmpl>> GetTmpl for LazyTmpl<F> {
+    fn get_tmpl(&mut self) -> Option<&Tmpl> {
+        self.slot.get_or_insert_with(&mut self.build).as_ref()
+    }
+}
+
+enum CoarseCache<'a> {
+    None,
+    Read(&'a CoarseRect),
+    ReadWrite(&'a mut Option<CoarseRect>),
+}
+
+impl<'a> CoarseCache<'a> {
+    fn as_ref(&self) -> Option<&CoarseRect> {
+        match self {
+            Self::None => None,
+            Self::Read(c) => Some(c),
+            Self::ReadWrite(c) => c.as_ref(),
+        }
+    }
+}
+
+struct PeakCache<'a> {
+    coarse: CoarseCache<'a>,
+    refined: Option<&'a mut Vec<RefinedEntry>>,
+    budget: Option<&'a mut CacheBudget>,
+}
+
+impl PeakCache<'_> {
+    fn none() -> Self {
+        Self { coarse: CoarseCache::None, refined: None, budget: None }
+    }
+}
+
+/// Coarse candidates of `t` in `img` (half resolution): the local maxima of the NCC on the
+/// integer grid within `r` px of `c` with at least [`POSE_COARSE_MIN`], best first (at most 4).
+fn window_peaks_cached(
+    img: &Gray,
+    mut get_t: impl GetTmpl,
+    c: [f64; 2],
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
+    if r < 0 {
+        scratch.scores.clear();
+        return (([[0.0; 2]; 4], 0), None);
+    }
+    let n = (2 * r + 1) as usize;
+    let (cx, cy) = (c[0].round(), c[1].round());
+    scratch.scores.resize(n * n, f32::NEG_INFINITY);
+    scratch.scores.fill(f32::NEG_INFINITY);
+
+    let center = (cx.abs() < 1e7 && cy.abs() < 1e7 && r < 1_000_000).then_some((cx as i32, cy as i32));
+    if let Some((cxi, cyi)) = center {
+        let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
+        for j in 0..n {
+            let gy = cyi + j as i32 - r;
+            let row_off = j * n;
+            let cj_opt = cached.and_then(|cr| {
+                let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
+                (0 <= cj && cj < cn as i64).then_some(cj as usize)
+            });
+            for i in 0..n {
+                let gx = cxi + i as i32 - r;
+                if let (Some(cr), Some(cj)) = (cached, cj_opt) {
+                    let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
+                    if 0 <= ci && ci < cn as i64 {
+                        scratch.scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
+                        continue;
+                    }
+                }
+                if let Some(t) = get_t.get_tmpl() {
+                    if let Some(v) = ncc(img, t, f64::from(gx), f64::from(gy), false) {
+                        scratch.scores[row_off + i] = v;
+                    }
+                }
+            }
+        }
+    } else {
+        for j in 0..n {
+            let y = cy + j as f64 - r as f64;
+            let row_off = j * n;
+            for i in 0..n {
+                if let Some(t) = get_t.get_tmpl() {
+                    if let Some(v) = ncc(img, t, cx + i as f64 - r as f64, y, false) {
+                        scratch.scores[row_off + i] = v;
+                    }
+                }
+            }
+        }
+    }
+
+    scratch.peaks.clear();
+    let ni = n as i32;
+    for j in 0..ni {
+        for i in 0..ni {
+            let v = scratch.scores[j as usize * n + i as usize];
             if v.is_nan() || f64::from(v) < POSE_COARSE_MIN { continue; }
             let local = (-1..=1).all(|dj| (-1..=1).all(|di| {
                 let (a, b) = (i + di, j + dj);
-                (di == 0 && dj == 0) || a < 0 || b < 0 || a >= n as i32 || b >= n as i32 || s[b as usize * n + a as usize] <= v
+                (di == 0 && dj == 0) || a < 0 || b < 0 || a >= ni || b >= ni || scratch.scores[b as usize * n + a as usize] <= v
             }));
-            if local { peaks.push((v, [cx + f64::from(i - r), cy + f64::from(j - r)])); }
+            if local {
+                scratch.peaks.push((v, [cx + f64::from(i - r), cy + f64::from(j - r)]));
+            }
         }
     }
-    peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
-    peaks.into_iter().take(4).map(|p| p.1).collect()
+    scratch.peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut top = [[0.0; 2]; 4];
+    let len = scratch.peaks.len().min(4);
+    for (dst, src) in top[..len].iter_mut().zip(&scratch.peaks[..len]) {
+        *dst = src.1;
+    }
+    ((top, len), center)
+}
+
+#[cfg(test)]
+fn window_peaks(img: &Gray, t: &Tmpl, c: [f64; 2], r: i32) -> Vec<[f64; 2]> {
+    let mut scratch = MatchScratch::default();
+    let ((top, len), _) = window_peaks_cached(img, t, c, r, None, &mut scratch);
+    top[..len].to_vec()
+}
+
+fn pick_match(matches: &mut [([f64; 2], f64)]) -> Option<[f64; 2]> {
+    matches.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let (q, best) = *matches.first()?;
+    if best < POSE_NCC_MIN { return None; }
+    let second = matches.iter().filter(|(p, _)| (p[0] - q[0]).hypot(p[1] - q[1]) > 2.0).map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    if second.is_finite() && (1.0 - best) > POSE_RATIO * (1.0 - second) { return None; }
+    Some(q)
 }
 
 /// 2D match of the full-resolution patch `tf` (half-resolution `tc`) of one image in `full` /
 /// `half` of another, in a window of `win` px around `q0` (full resolution): the coarse peaks
 /// refined at full resolution; the best needs [`POSE_NCC_MIN`] and must pass the ratio test
 /// against the best other match more than 2 px away.
-fn match_2d(full: &Gray, half: &Gray, tc: &Tmpl, tf: &Tmpl, q0: [f64; 2], win: f64) -> Option<[f64; 2]> {
-    let mut m: Vec<([f64; 2], f64)> = window_peaks(half, tc, to_half(q0), (win / 2.0).ceil() as i32).into_iter()
-        .filter_map(|h| refine_2d_pose(full, tf, [2.0 * h[0] + 0.5, 2.0 * h[1] + 0.5]))
-        .filter(|(q, _)| (q[0] - q0[0]).abs() <= win + 2.0 && (q[1] - q0[1]).abs() <= win + 2.0).collect();
-    m.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let (q, best) = *m.first()?;
-    if best < POSE_NCC_MIN { return None; }
-    let second = m.iter().filter(|(p, _)| (p[0] - q[0]).hypot(p[1] - q[1]) > 2.0).map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-    if second.is_finite() && (1.0 - best) > POSE_RATIO * (1.0 - second) { return None; }
-    Some(q)
+fn match_2d_cached(
+    imgs: (&Gray, &Gray),
+    get_tc: impl GetTmpl,
+    mut get_tf: impl GetTmpl,
+    q0: [f64; 2],
+    win: f64,
+    mut pcache: PeakCache<'_>,
+    scratch: &mut MatchScratch,
+) -> Option<[f64; 2]> {
+    let (full, half) = imgs;
+    let r = (win / 2.0).ceil() as i32;
+    let ((top, top_len), center) = window_peaks_cached(half, get_tc, to_half(q0), r, pcache.coarse.as_ref(), scratch);
+    if let (CoarseCache::ReadWrite(slot), Some(budget), Some((cx, cy))) = (pcache.coarse, pcache.budget.as_deref_mut(), center) {
+        if slot.is_none() && budget.try_reserve_cells(scratch.scores.len()) {
+            *slot = Some(CoarseRect { cx, cy, r, scores: scratch.scores.clone() });
+        }
+    }
+    scratch.matches.clear();
+    for h in &top[..top_len] {
+        let key = (h[0].abs() < 1e7 && h[1].abs() < 1e7).then(|| (h[0] as i32, h[1] as i32));
+        let cached_res = key.and_then(|k| {
+            pcache.refined.as_deref().and_then(|rv| rv.iter().find(|&&(rk, _)| rk == k).map(|&(_, v)| v))
+        });
+        let res = match cached_res {
+            Some(v) => v,
+            None => {
+                let computed = get_tf.get_tmpl().and_then(|tf| refine_2d_pose(full, tf, [2.0 * h[0] + 0.5, 2.0 * h[1] + 0.5]));
+                if let (Some(k), Some(rv), Some(budget)) = (key, pcache.refined.as_deref_mut(), pcache.budget.as_deref_mut()) {
+                    if budget.try_reserve_refine() {
+                        rv.push((k, computed));
+                    }
+                }
+                computed
+            }
+        };
+        if let Some((q, s)) = res {
+            if (q[0] - q0[0]).abs() <= win + 2.0 && (q[1] - q0[1]).abs() <= win + 2.0 {
+                scratch.matches.push((q, s));
+            }
+        }
+    }
+    pick_match(&mut scratch.matches)
 }
 
 struct PreparedFeat {
@@ -217,24 +458,120 @@ impl TexturePrep {
     }
 
     fn corrs(&self, views: &[View], cams: &[Camera], win: &[f64]) -> Vec<Corr> {
+        self.corrs_with_cache(views, cams, win, None)
+    }
+
+    fn corrs_with_cache(&self, views: &[View], cams: &[Camera], win: &[f64], mut cache: Option<&mut MatchCache>) -> Vec<Corr> {
         if self.reference >= views.len() || views.len() < 2 || cams.len() != views.len() || win.len() != views.len() || self.halves.len() != views.len() {
             return Vec::new();
         }
         let rv = &views[self.reference];
         let mut out = Vec::new();
-        for f in &self.feats {
+        let mut scratch = MatchScratch::default();
+        let use_cache = cache.as_ref().is_some_and(|c| {
+            !c.pairs.is_empty() && c.n_views == views.len() && c.pairs.len() == self.feats.len() * c.n_views
+        });
+        for (feat_idx, f) in self.feats.iter().enumerate() {
             let px = f.px;
             let mut obs = vec![(self.reference, px)];
             for (j, v) in views.iter().enumerate() {
                 if j == self.reference { continue; }
                 let Some(q0) = cams[j].project(&f.x0) else { continue; };
-                let Some(q) = match_2d(&v.img, &self.halves[j], &f.tc, &f.tf, q0, win[j]) else { continue; };
-                // left-right: this view's patch searched back in the reference around the feature
-                let hq = to_half(q);
-                let back = sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
-                    .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)))
-                    .and_then(|(bc, bf)| match_2d(&rv.img, &self.halves[self.reference], &bc, &bf, px, win[j]));
-                if back.is_some_and(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX) { obs.push((j, q)); }
+
+                if !use_cache {
+                    let Some(q) = match_2d_cached((&v.img, &self.halves[j]), &f.tc, &f.tf, q0, win[j], PeakCache::none(), &mut scratch) else { continue; };
+                    // left-right: this view's patch searched back in the reference around the feature
+                    let hq = to_half(q);
+                    let back = sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
+                        .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)))
+                        .and_then(|(bc, bf)| match_2d_cached((&rv.img, &self.halves[self.reference]), &bc, &bf, px, win[j], PeakCache::none(), &mut scratch));
+                    if back.is_some_and(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX) { obs.push((j, q)); }
+                    continue;
+                }
+
+                let cache_ref = cache.as_deref_mut().unwrap();
+                let pair = &mut cache_ref.pairs[feat_idx * cache_ref.n_views + j];
+                let budget = &mut cache_ref.budget;
+                let key = ([q0[0].to_bits(), q0[1].to_bits()], win[j].to_bits());
+                if pair.last_key == Some(key) {
+                    if let Some(q) = pair.last_outcome { obs.push((j, q)); }
+                    continue;
+                }
+
+                let fwd_q = match_2d_cached(
+                    (&v.img, &self.halves[j]),
+                    &f.tc,
+                    &f.tf,
+                    q0,
+                    win[j],
+                    PeakCache { coarse: CoarseCache::ReadWrite(&mut pair.fwd_coarse), refined: Some(&mut pair.fwd_refined), budget: Some(budget) },
+                    &mut scratch,
+                );
+
+                let accepted = fwd_q.and_then(|q| {
+                    let q_bits = [q[0].to_bits(), q[1].to_bits()];
+                    let px_bits = [px[0].to_bits(), px[1].to_bits()];
+                    let win_bits = win[j].to_bits();
+                    let back = if let Some(rev) = pair.rev.as_mut().filter(|r| r.q_bits == q_bits && r.px_bits == px_bits) {
+                        if !rev.tmpl_valid {
+                            None
+                        } else if rev.win_bits == win_bits {
+                            rev.outcome
+                        } else {
+                            let hq = to_half(q);
+                            let lazy_bc = LazyTmpl::new(|| sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0)));
+                            let lazy_bf = LazyTmpl::new(|| sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)));
+                            let coarse = rev.coarse.as_ref().map_or(CoarseCache::None, CoarseCache::Read);
+                            match_2d_cached(
+                                (&rv.img, &self.halves[self.reference]),
+                                lazy_bc,
+                                lazy_bf,
+                                px,
+                                win[j],
+                                PeakCache { coarse, refined: Some(&mut rev.refined), budget: Some(budget) },
+                                &mut scratch,
+                            )
+                        }
+                    } else {
+                        let hq = to_half(q);
+                        let tmpls = sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
+                            .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)));
+                        match tmpls {
+                            None => {
+                                if pair.rev.is_none() {
+                                    pair.rev = Some(RevCache { q_bits, px_bits, win_bits, tmpl_valid: false, outcome: None, coarse: None, refined: Vec::new() });
+                                }
+                                None
+                            }
+                            Some((bc, bf)) => {
+                                if pair.rev.is_none() {
+                                    let mut rev_coarse = None;
+                                    let mut rev_refined = Vec::new();
+                                    let b = match_2d_cached(
+                                        (&rv.img, &self.halves[self.reference]),
+                                        &bc,
+                                        &bf,
+                                        px,
+                                        win[j],
+                                        PeakCache { coarse: CoarseCache::ReadWrite(&mut rev_coarse), refined: Some(&mut rev_refined), budget: Some(budget) },
+                                        &mut scratch,
+                                    );
+                                    pair.rev = Some(RevCache { q_bits, px_bits, win_bits, tmpl_valid: true, outcome: b, coarse: rev_coarse, refined: rev_refined });
+                                    b
+                                } else {
+                                    match_2d_cached((&rv.img, &self.halves[self.reference]), &bc, &bf, px, win[j], PeakCache::none(), &mut scratch)
+                                }
+                            }
+                        }
+                    };
+                    back.filter(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX).map(|_| q)
+                });
+
+                if pair.last_key.is_none() {
+                    pair.last_key = Some(key);
+                    pair.last_outcome = accepted;
+                }
+                if let Some(q) = accepted { obs.push((j, q)); }
             }
             if obs.len() >= 2 { out.push(Corr { obs, on_table: true, marker: false }); }
         }
@@ -537,18 +874,19 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
         Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
         None => TexturePrep { reference, halves: Vec::new(), feats: Vec::new() },
     });
-    let first = match &prep {
-        Some(p) => with(p.corrs(views, &cams, &vec![pp.window_px; views.len()])),
-        None => extra.to_vec(),
+    let mut cache = prep.as_ref().map(|p| MatchCache::new(p.feats.len(), views.len()));
+    let first = match (&prep, cache.as_mut()) {
+        (Some(p), c) => with(p.corrs_with_cache(views, &cams, &vec![pp.window_px; views.len()], c)),
+        (None, _) => extra.to_vec(),
     };
     let r1 = refine_poses(&cams, reference, &first, table_z, pp);
-    let mut out = match &prep {
-        Some(p) => {
+    let mut out = match (&prep, cache.as_mut()) {
+        (Some(p), c) => {
             let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
-            let second = with(p.corrs(views, &r1.cams, &win));
+            let second = with(p.corrs_with_cache(views, &r1.cams, &win, c));
             refine_poses(&cams, reference, &second, table_z, pp)
         }
-        None => r1,
+        (None, _) => r1,
     };
     out.ms = ms(t0);
     out
@@ -773,5 +1111,328 @@ mod tests {
         let exp2 = texture_corrs(&views, &cams2, 0, object_box, &exclude, 0.0, &win2);
         assert!(!got2.is_empty(), "guided pass should yield correspondences");
         assert_eq!(got2, exp2);
+    }
+
+    fn render_table_view(cam: &Camera) -> Gray {
+        let (w, h) = (320usize, 180usize);
+        let mut px = vec![128u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let d = cam.ray([x as f64, y as f64]);
+                let t = -cam.c[2] / d[2];
+                let wx = cam.c[0] + t * d[0];
+                let wy = cam.c[1] + t * d[1];
+                let gx = (wx / 0.0045).floor() as i64;
+                let gy = (wy / 0.0045).floor() as i64;
+                let h1 = ((gx.wrapping_mul(73856093) ^ gy.wrapping_mul(19349663)).wrapping_mul(83492791) >> 24) & 0xff;
+                let gx2 = (wx / 0.0073).floor() as i64;
+                let gy2 = (wy / 0.0073).floor() as i64;
+                let h2 = ((gx2.wrapping_mul(19349663) ^ gy2.wrapping_mul(83492791)).wrapping_mul(73856093) >> 24) & 0xff;
+                px[y * w + x] = ((h1 + h2) / 2) as u8;
+            }
+        }
+        Gray::new(w, h, px).unwrap()
+    }
+
+    #[test]
+    fn coarse_cache_recomputes_boundary_peaks_on_window_change() {
+        let (w, h) = (64usize, 64usize);
+        let mut px = vec![128u8; w * h];
+        // Textured 5x5 patch centered at (20, 20)
+        let patch: [[u8; 5]; 5] = [
+            [40, 200, 60, 190, 50],
+            [180, 30, 210, 45, 175],
+            [70, 220, 25, 205, 80],
+            [195, 55, 185, 35, 215],
+            [45, 170, 90, 225, 65],
+        ];
+        // Exact copy at (23, 20): score ~ 1.0
+        for dy in 0..5 {
+            for dx in 0..5 {
+                px[(18 + dy) * w + (21 + dx)] = patch[dy][dx];
+            }
+        }
+        // Slightly perturbed copy at (22, 20) — note (22, 20) overlaps (23, 20) unless separated in y or we place (22, 20) vs (23, 20):
+        // Place exact copy at (23, 25) and weaker copy at (22, 25) so they are 8-neighbors? No, (22, 25) and (23, 25) overlap in 5x5!
+        // Instead, construct a smooth/non-overlapping test using a 5x5 template with a non-uniform background:
+        // Wait: even simpler! Reset px to flat 128, put a 5x5 patch at (10, 10) for template, and put:
+        // - exact copy at (43, 40)
+        // - slightly attenuated copy at (42, 40) won't overlap if we put exact copy at (20, 43) and check row-by-row? Still overlaps in 5x5!
+        // Better: put exact copy at (43, 40) -> peak at (43, 40), and let's see what score (42, 40) gets, OR put a different high-contrast patch:
+        // Actually, if we put a 1D-periodic or distinct patch at (42, 40), (43, 40) overlaps it by 4 cols.
+        // Wait: what if the template is [0, 0, 255, 0, 0] in a row, and in the image at x=42..=44 we put [100, 200, 255]?
+        // Then at x=42 (centered on 100): window sees [0, 0, 100, 200, 255] -> positive NCC (>0.7)? Let's check!
+        // Even cleaner: fill px with 20, put template at (10, 10) with centered impulse: [20,20,20,20,20] except center=220 and (dx=0,dy=-1)=180.
+        px.fill(20);
+        // Template at (10, 10): only center (dx=2,dy=2) is bright (220), neighbors are 20.
+        // Wait: at (43, 40) put pixel=220, at (42, 40) put pixel=180!
+        // Check NCC with single bright pixel template at (43,40) vs (42,40) vs (44,40):
+        // With single pixel 220 at (43,40) and 180 at (42,40), at x=42 center is 180 and right-neighbor is 220, so NCC at x=42 is LOWER than at x=43!
+        // What if we put 200 at (42,40) and 250 at (43,40) and 20 elsewhere?
+        // At x=42: window [20, 20, 200, 250, 20], template [20, 20, 220, 20, 20] -> dot ~ 200*1, at x=43: [20, 200, 250, 20, 20] -> dot ~ 250*1!
+        // Even better: check NCC of template [20,20,220,20,20] (in middle row, 20 elsewhere) against [20, 20, 180, 240, 20]:
+        // Wait: with 240 at (43,40) and 180 at (42,40), NCC(43,40) is positive (>0.7), while NCC(42,40) has 240 on off-center!
+        // To make BOTH > 0.7 AND strictly ordered, make the template a 5x5 ramp/step or check directly:
+        // Put pixel(x=42, y=40)=190, pixel(x=43, y=40)=240? No, if we use a 5-pixel tall vertical bar of width 1 at x=43 (240) and x=42 (180), wait:
+        // Template: column dx=2 is 220, all other cols are 20!
+        // In image at (40, 40), window [38..=42]: if x=42 is 200 and x=43 is 240:
+        // Let's just compute NCC with a template that has col dx=2 = [20,20,220,20,20] -> wait, vertical bar:
+        // For col dx=2 = 220, others = 20: dot with window centered at x is proportional to (sum(col x) - mean_window).
+        // At x=42: col 42 has 200*5, col 43 has 240*5, mean is (200+240+60)/5 = 100 -> col42 - mean = 100! Wait: var = ... NCC is < 0.7 because col43 is also bright.
+        // How to get TWO peaks > 0.7 that are 8-neighbors of each other?
+        // Put them 1 pixel apart diagonally? Still 5x5 overlaps. What if they are 1 pixel apart AND have score > 0.7?
+        // Can two adjacent pixels BOTH have NCC > 0.7 with the same 5x5 template?
+        // YES! Smooth horizontal Gaussian / triangle! E.g. image has a blurred blob centered at x=42.7:
+        // Suppose template is a 5x5 Gaussian peak: [50, 150, 240, 150, 50] in each row!
+        // At x=42 vs x=43, for a wide smooth blob [20, 80, 160, 230, 250, 170, 90, 30], BOTH x=42 and x=43 match [50, 150, 240, 150, 50] with NCC > 0.85, and x=43 > x=42!
+        px.fill(20);
+        // Template source at (10, 10): smooth symmetric bump across dx=0..5
+        let t_profile = [50u8, 150, 240, 150, 50];
+        let v_profile = [40u8, 130, 255, 130, 40];
+        for dy in 0..5 {
+            for dx in 0..5 {
+                let val = ((u16::from(t_profile[dx]) * u16::from(v_profile[dy])) / 255) as u8;
+                px[(8 + dy) * w + (8 + dx)] = val;
+            }
+        }
+        // Target smooth bump centered near x=43, y=40:
+        // at x=42 (win 40..=44): [20, 60, 180, 245, 160] -> off-center, NCC ~ 0.82
+        // at x=43 (win 41..=45): [60, 180, 245, 160, 55] -> centered, NCC ~ 0.99!
+        let vals = [20u8, 60, 180, 245, 160, 55]; // x = 40..=45
+        for dy in 0..5 {
+            for (k, &tx) in vals.iter().enumerate() {
+                let val = ((u16::from(tx) * u16::from(v_profile[dy])) / 255) as u8;
+                px[(38 + dy) * w + (40 + k)] = val;
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let tc = make_tmpl(sample_int(&img, 10, 10, COARSE_R), COARSE_R, None, 0.0).unwrap();
+
+        // Wide window centered at (40, 40), r = 4 (x in 36..=44):
+        // (43, 40) is inside the window and dominates (42, 40), so (42, 40) is NOT a peak.
+        let mut scratch = MatchScratch::default();
+        let ((wide_arr, wide_len), center_wide) = window_peaks_cached(&img, &tc, [40.0, 40.0], 4, None, &mut scratch);
+        let wide_peaks = &wide_arr[..wide_len];
+        let uncached_wide = window_peaks(&img, &tc, [40.0, 40.0], 4);
+        assert_eq!(wide_peaks, uncached_wide.as_slice());
+        assert!(wide_peaks.contains(&[43.0, 40.0]), "wide window should find true peak at (43,40): {wide_peaks:?}");
+        assert!(!wide_peaks.contains(&[42.0, 40.0]), "(42,40) should be suppressed by (43,40) in wide window: {wide_peaks:?}");
+
+        let (cx, cy) = center_wide.unwrap();
+        let cr_wide = CoarseRect { cx, cy, r: 4, scores: scratch.scores.clone() };
+
+        // Shrink window at same center (40, 40), r = 2 (x in 38..=42):
+        // (43, 40) is now outside the rectangle, so boundary pixel (42, 40) BECOMES a local maximum!
+        let mut lazy_called = false;
+        let lazy_never = LazyTmpl::new(|| {
+            lazy_called = true;
+            make_tmpl(sample_int(&img, 10, 10, COARSE_R), COARSE_R, None, 0.0)
+        });
+        let ((shrunk_arr, shrunk_len), center_shrunk) = window_peaks_cached(&img, lazy_never, [40.0, 40.0], 2, Some(&cr_wide), &mut scratch);
+        assert!(!lazy_called, "full cache hit on shrunk window must not construct lazy template");
+        let shrunk_peaks = &shrunk_arr[..shrunk_len];
+        let uncached_shrunk = window_peaks(&img, &tc, [40.0, 40.0], 2);
+        assert!(shrunk_peaks.contains(&[42.0, 40.0]), "boundary pixel (42,40) must become a local maximum when window shrinks: {shrunk_peaks:?}");
+        assert_eq!(shrunk_peaks, uncached_shrunk.as_slice(), "cached shrunk peaks must match uncached bit-for-bit");
+
+        // Now shift/grow from cr_shrunk (x in 38..=42) to center (41, 40), r = 2 (x in 39..=43):
+        // (43, 40) re-enters the rectangle, so (42, 40) CEASES to be a local maximum!
+        let (scx, scy) = center_shrunk.unwrap();
+        let cr_shrunk = CoarseRect { cx: scx, cy: scy, r: 2, scores: scratch.scores.clone() };
+        let mut lazy_shifted_called = false;
+        let lazy_shifted = LazyTmpl::new(|| {
+            lazy_shifted_called = true;
+            make_tmpl(sample_int(&img, 10, 10, COARSE_R), COARSE_R, None, 0.0)
+        });
+        let ((shifted_arr, shifted_len), _) = window_peaks_cached(&img, lazy_shifted, [41.0, 40.0], 2, Some(&cr_shrunk), &mut scratch);
+        assert!(lazy_shifted_called, "missing column x=43 must trigger lazy template construction");
+        let shifted_peaks = &shifted_arr[..shifted_len];
+        let uncached_shifted = window_peaks(&img, &tc, [41.0, 40.0], 2);
+        assert!(!shifted_peaks.contains(&[42.0, 40.0]), "(42,40) must cease to be a local maximum when (43,40) enters: {shifted_peaks:?}");
+        assert!(shifted_peaks.contains(&[43.0, 40.0]), "shifted window must find (43,40): {shifted_peaks:?}");
+        assert_eq!(shifted_peaks, uncached_shifted.as_slice(), "cached shifted peaks must match uncached bit-for-bit");
+    }
+
+    #[test]
+    fn match_cache_reuses_fixed_view_failed_refinements_and_reverse_keys() {
+        // Part 1: Failed (None) full refinement is cached and reused on pass 2 without re-evaluating.
+        {
+            let (w, h) = (32usize, 32usize);
+            let mut full_px = vec![40u8; w * h];
+            let mut ref_px = vec![40u8; w * h];
+            // Bump at full=(6, 16) -> half=(2.75, 7.75), so coarse tc at half=(3, 8) gets NCC > 0.9.
+            // tf sampled at ref=(13, 16) (bump at dx=+3 inside tf) walks refine_2d_pose left from
+            // x=6.5 toward x=3.0 and hits full.inside(4.0, ..., 4, 0.5) == false -> returns None.
+            for dy in -6i32..=6 {
+                for dx in -6i32..=6 {
+                    let r2 = (dx * dx + dy * dy) as f64;
+                    let v = (40.0 + 200.0 * (-r2 / 10.0).exp()).round() as u8;
+                    ref_px[(16 + dy) as usize * w + (16 + dx) as usize] = v;
+                    let fx = 6 + dx;
+                    if fx >= 0 {
+                        full_px[(16 + dy) as usize * w + fx as usize] = v;
+                    }
+                }
+            }
+            let full = Gray::new(w, h, full_px).unwrap();
+            let half = full.half();
+            let ref_full = Gray::new(w, h, ref_px).unwrap();
+            let ref_half = ref_full.half();
+            let tc = make_tmpl(sample_bilinear(&ref_half, 7.75, 7.75, COARSE_R).unwrap(), COARSE_R, None, 0.0).unwrap();
+            let tf = make_tmpl(sample_int(&ref_full, 13, 16, PATCH_R), PATCH_R, None, 0.0).unwrap();
+
+            let mut pair = PairCache::default();
+            let mut budget = CacheBudget { used_cells: 0, max_cells: 10_000, used_refines: 0, max_refines: 100 };
+            let mut scratch = MatchScratch::default();
+
+            let r1 = match_2d_cached(
+                (&full, &half), &tc, &tf, [7.0, 17.0], 4.0,
+                PeakCache { coarse: CoarseCache::ReadWrite(&mut pair.fwd_coarse), refined: Some(&mut pair.fwd_refined), budget: Some(&mut budget) },
+                &mut scratch,
+            );
+            assert!(r1.is_none());
+            assert!(!pair.fwd_refined.is_empty(), "coarse peaks near border must have been refined");
+            assert!(pair.fwd_refined.iter().any(|&(_, v)| v.is_none()), "failed refinement (None) must be cached: {:?}", pair.fwd_refined);
+            let refines_after_p1 = budget.used_refines;
+            let cells_after_p1 = budget.used_cells;
+
+            // Pass 2: shrink window so same peak is hit; refine_2d_pose must NOT run again for cached None peaks.
+            let mut tf_sentinel = false;
+            let lazy_tf = LazyTmpl::new(|| {
+                tf_sentinel = true;
+                make_tmpl(sample_int(&ref_full, 13, 16, PATCH_R), PATCH_R, None, 0.0)
+            });
+            let r2 = match_2d_cached(
+                (&full, &half), &tc, lazy_tf, [7.0, 17.0], 2.0,
+                PeakCache { coarse: CoarseCache::ReadWrite(&mut pair.fwd_coarse), refined: Some(&mut pair.fwd_refined), budget: Some(&mut budget) },
+                &mut scratch,
+            );
+            assert!(r2.is_none());
+            assert_eq!(budget.used_cells, cells_after_p1);
+            assert_eq!(budget.used_refines, refines_after_p1);
+            assert!(!tf_sentinel, "cached failed refinements must not reconstruct/re-evaluate tf");
+        }
+
+        // Part 2: Fixed-view whole-outcome reuse and reverse-key reuse / non-reuse.
+        let look = [0.30, 0.0, 0.0];
+        let mut cam0 = cam_at([0.30, -0.02, 0.45], look);
+        let mut cam1 = cam_at([0.30, 0.02, 0.45], look);
+        let mut cam2 = cam_at([0.28, 0.01, 0.45], look);
+        for c in [&mut cam0, &mut cam1, &mut cam2] {
+            c.cx = 160.0;
+            c.cy = 90.0;
+        }
+        let views = vec![
+            View { cam: cam0, img: render_table_view(&cam0) },
+            View { cam: cam1, img: render_table_view(&cam1) },
+            View { cam: cam2, img: render_table_view(&cam2) },
+        ];
+        let object_box = [140.0, 75.0, 180.0, 105.0];
+        let exclude = [[0.0, 0.0, 20.0, 20.0]];
+        let prep = TexturePrep::new(&views, &cam0, 0, object_box, &exclude, 0.0);
+        assert!(!prep.feats.is_empty());
+
+        // Fixed view (2-view prep): pass 2 with identical cam1 and win1 must do 0 new cells and 0 new refines.
+        let prep2 = TexturePrep::new(&views[..2], &cam0, 0, object_box, &exclude, 0.0);
+        assert!(!prep2.feats.is_empty());
+        let mut fixed_cache = MatchCache::new(prep2.feats.len(), 2);
+        let fixed_p1 = prep2.corrs_with_cache(&views[..2], &[cam0, cam1], &[15.0, 15.0], Some(&mut fixed_cache));
+        assert!(!fixed_p1.is_empty());
+        let used_cells_fixed = fixed_cache.budget.used_cells;
+        let used_refines_fixed = fixed_cache.budget.used_refines;
+        assert!(used_cells_fixed > 0 && used_refines_fixed > 0);
+        let fixed_p2 = prep2.corrs_with_cache(&views[..2], &[cam0, cam1], &[15.0, 15.0], Some(&mut fixed_cache));
+        assert_eq!(fixed_p2, fixed_p1);
+        assert_eq!(fixed_cache.budget.used_cells, used_cells_fixed);
+        assert_eq!(fixed_cache.budget.used_refines, used_refines_fixed);
+
+        // Reverse exact hit when q0 shifts slightly (same win=15.0, last_key misses, fwd returns same q):
+        let mut cam1_tiny = cam1;
+        cam1_tiny.r = mat_mul(&rodrigues(&[1e-5, -1e-5, 0.0]), &cam1.r);
+        let mut rev_exact_cache = MatchCache::new(prep2.feats.len(), 2);
+        let _ = prep2.corrs_with_cache(&views[..2], &[cam0, cam1], &[15.0, 15.0], Some(&mut rev_exact_cache));
+        // Flip q_bits on one cached RevCache and poison its outcome: mismatched q must NOT reuse rev.outcome.
+        let mut flipped_feat = None;
+        for f_idx in 0..prep2.feats.len() {
+            let p = &mut rev_exact_cache.pairs[f_idx * 2 + 1];
+            if let Some(r) = p.rev.as_mut().filter(|r| r.outcome.is_some()) {
+                r.q_bits[0] ^= 1;
+                r.outcome = None;
+                flipped_feat = Some(f_idx);
+                break;
+            }
+        }
+        assert!(flipped_feat.is_some(), "expected at least one valid reverse cache entry");
+        let rev_hit = prep2.corrs_with_cache(&views[..2], &[cam0, cam1_tiny], &[15.0, 15.0], Some(&mut rev_exact_cache));
+        let rev_exp = prep2.corrs(&views[..2], &[cam0, cam1_tiny], &[15.0, 15.0]);
+        assert_eq!(rev_hit, rev_exp);
+
+        // Reverse shrunk win (15.0 -> 4.0) with same q (tiny cam1 perturbation so last_key misses):
+        let mut rev_shrunk_cache = MatchCache::new(prep2.feats.len(), 2);
+        let _ = prep2.corrs_with_cache(&views[..2], &[cam0, cam1], &[15.0, 15.0], Some(&mut rev_shrunk_cache));
+        let rev_shrunk = prep2.corrs_with_cache(&views[..2], &[cam0, cam1_tiny], &[15.0, 4.0], Some(&mut rev_shrunk_cache));
+        let rev_shrunk_exp = prep2.corrs(&views[..2], &[cam0, cam1_tiny], &[15.0, 4.0]);
+        assert_eq!(rev_shrunk, rev_shrunk_exp);
+
+        // Reverse non-reuse when q changes: perturb cam2 significantly enough to shift fwd_q on some features.
+        let mut cam2_p = cam2;
+        cam2_p.r = mat_mul(&rodrigues(&[0.0025, -0.002, 0.001]), &cam2.r);
+        let mut cache3 = MatchCache::new(prep.feats.len(), 3);
+        let c3_p1 = prep.corrs_with_cache(&views, &[cam0, cam1, cam2], &[15.0, 15.0, 15.0], Some(&mut cache3));
+        let c3_p2 = prep.corrs_with_cache(&views, &[cam0, cam1, cam2_p], &[15.0, 15.0, 4.0], Some(&mut cache3));
+        assert_eq!(c3_p1, texture_corrs(&views, &[cam0, cam1, cam2], 0, object_box, &exclude, 0.0, &[15.0, 15.0, 15.0]));
+        assert_eq!(c3_p2, texture_corrs(&views, &[cam0, cam1, cam2_p], 0, object_box, &exclude, 0.0, &[15.0, 15.0, 4.0]));
+    }
+
+    #[test]
+    fn match_cache_exhaustion_falls_back_to_exact_uncached_results() {
+        let look = [0.30, 0.0, 0.0];
+        let mut cam0 = cam_at([0.30, -0.02, 0.45], look);
+        let mut cam1 = cam_at([0.30, 0.02, 0.45], look);
+        let mut cam2 = cam_at([0.28, 0.01, 0.45], look);
+        for c in [&mut cam0, &mut cam1, &mut cam2] {
+            c.cx = 160.0;
+            c.cy = 90.0;
+        }
+        let views = vec![
+            View { cam: cam0, img: render_table_view(&cam0) },
+            View { cam: cam1, img: render_table_view(&cam1) },
+            View { cam: cam2, img: render_table_view(&cam2) },
+        ];
+        let object_box = [140.0, 75.0, 180.0, 105.0];
+        let exclude = [[0.0, 0.0, 20.0, 20.0]];
+
+        let mut cam2_p = cam2;
+        cam2_p.r = mat_mul(&rodrigues(&[0.0008, -0.0005, 0.0004]), &cam2.r);
+        let cams1 = [cam0, cam1, cam2];
+        let win1 = [15.0, 15.0, 15.0];
+        let cams2 = [cam0, cam1, cam2_p];
+        let win2 = [15.0, 15.0, 4.0];
+
+        let exp1 = texture_corrs(&views, &cams1, 0, object_box, &exclude, 0.0, &win1);
+        let exp2 = texture_corrs(&views, &cams2, 0, object_box, &exclude, 0.0, &win2);
+        assert!(!exp1.is_empty() && !exp2.is_empty());
+
+        let prep = TexturePrep::new(&views, &cam0, 0, object_box, &exclude, 0.0);
+        let n_feats = prep.feats.len();
+        let configs = [
+            ("default", MatchCache::new(n_feats, 3)),
+            ("zero_pairs", MatchCache::with_limits(n_feats, 3, 0, MAX_CACHE_CELLS, MAX_CACHE_REFINES)),
+            ("zero_cells", MatchCache::with_limits(n_feats, 3, MAX_CACHE_PAIRS, 0, MAX_CACHE_REFINES)),
+            ("zero_refines", MatchCache::with_limits(n_feats, 3, MAX_CACHE_PAIRS, MAX_CACHE_CELLS, 0)),
+            ("tiny_partial", MatchCache::with_limits(n_feats, 3, MAX_CACHE_PAIRS, 100, 2)),
+        ];
+
+        for (label, mut cache) in configs {
+            let got1 = prep.corrs_with_cache(&views, &cams1, &win1, Some(&mut cache));
+            let got2 = prep.corrs_with_cache(&views, &cams2, &win2, Some(&mut cache));
+            assert_eq!(got1, exp1, "pass 1 mismatch for budget config '{label}'");
+            assert_eq!(got2, exp2, "pass 2 mismatch for budget config '{label}'");
+            assert!(cache.budget.used_cells <= cache.budget.max_cells);
+            assert!(cache.budget.used_refines <= cache.budget.max_refines);
+            if label == "zero_pairs" {
+                assert!(cache.pairs.is_empty());
+            }
+        }
     }
 }
