@@ -393,6 +393,9 @@ pub struct SupervisorInner {
     pub joint_feedback_instants: Vec<Option<Instant>>,
     /// Monotonic per-joint hardware feedback sequence counter (same length as `measured_positions`).
     pub joint_feedback_seqs: Vec<u64>,
+    /// Per joint, the receive-queue bound of its last sample ([`ArmDriver::feedback_queue_bounds`]);
+    /// empty when the driver has no receive queue (the receive instant bounds the sample then).
+    pub joint_feedback_queue_bounds: Vec<Option<Instant>>,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
@@ -646,6 +649,7 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             joint_feedback_instants: vec![None; dof],
             joint_feedback_seqs: vec![0; dof],
+            joint_feedback_queue_bounds: Vec::new(),
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             requested_estop_count: Arc::new(AtomicU64::new(0)),
@@ -1409,11 +1413,18 @@ impl SupervisorInner {
     fn record_driver_feedback_timing(
         joint_feedback_instants: &mut Vec<Option<Instant>>,
         joint_feedback_seqs: &mut Vec<u64>,
+        joint_feedback_queue_bounds: &mut Vec<Option<Instant>>,
         dof: usize,
         driver: &dyn ArmDriver,
     ) {
         let instants = driver.feedback_instants();
         let seqs = driver.feedback_seqs();
+        let bounds = driver.feedback_queue_bounds();
+        if bounds.len() == dof {
+            *joint_feedback_queue_bounds = bounds;
+        } else {
+            joint_feedback_queue_bounds.clear();
+        }
         if joint_feedback_seqs.len() != dof {
             joint_feedback_seqs.resize(dof, 0);
         }
@@ -1431,6 +1442,15 @@ impl SupervisorInner {
             }
         }
         *joint_feedback_instants = instants;
+    }
+
+    /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
+    /// driver's receive-queue bound, or the receive instant for drivers without a receive queue.
+    pub fn arm_feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        self.config.arm_joint_indices().iter().map(|&i| match self.joint_feedback_queue_bounds.get(i) {
+            Some(b) => *b,
+            None => self.joint_feedback_instants.get(i).copied().flatten(),
+        }).collect()
     }
 
     /// Snapshot of `(measured_positions, arm_velocities, arm_feedback_instants, arm_feedback_seqs)`
@@ -1879,6 +1899,7 @@ impl SupervisorInner {
                 Self::record_driver_feedback_timing(
                     &mut self.joint_feedback_instants,
                     &mut self.joint_feedback_seqs,
+                    &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     driver.as_ref(),
                 );
@@ -2275,6 +2296,7 @@ impl SupervisorInner {
                 Self::record_driver_feedback_timing(
                     &mut self.joint_feedback_instants,
                     &mut self.joint_feedback_seqs,
+                    &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     drv.as_ref(),
                 );
@@ -2330,6 +2352,7 @@ impl SupervisorInner {
             Self::record_driver_feedback_timing(
                 &mut self.joint_feedback_instants,
                 &mut self.joint_feedback_seqs,
+                &mut self.joint_feedback_queue_bounds,
                 self.config.dof,
                 drv.as_ref(),
             );
@@ -4397,6 +4420,7 @@ impl SupervisorInner {
                         Self::record_driver_feedback_timing(
                     &mut self.joint_feedback_instants,
                     &mut self.joint_feedback_seqs,
+                    &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     driver.as_ref(),
                 );
@@ -4429,6 +4453,7 @@ impl SupervisorInner {
             self.joint_feedback_instants.resize(self.config.dof, Some(now));
             self.joint_feedback_instants.fill(Some(now));
             self.joint_feedback_seqs.resize(self.config.dof, 0);
+            self.joint_feedback_queue_bounds.clear();
             for seq in &mut self.joint_feedback_seqs {
                 *seq = seq.wrapping_add(1);
             }

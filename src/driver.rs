@@ -116,6 +116,14 @@ pub trait ArmDriver: Send {
     /// driver does not report explicit counters (supervisor falls back to instant advances).
     fn feedback_seqs(&self) -> Vec<u64> { Vec::new() }
 
+    /// Per joint, a monotonic instant at which the driver saw its receive queue empty before it
+    /// read that joint's last decoded sample, so the sample was enqueued after this instant
+    /// (None: no empty queue was seen before it). Decode-time instants cannot bound queued
+    /// frames: a bounded drain can decode a backlog several ticks after it arrived. Empty means
+    /// the driver has no receive queue between bus and decode (request/response transports);
+    /// callers then use [`Self::feedback_instants`].
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> { Vec::new() }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -2047,6 +2055,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_target_frames: Vec<Option<CanFrame>>,
     last_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
+    /// Instant taken before the last receive call that found the RX queue empty.
+    rx_empty_instant: Option<Instant>,
+    /// `rx_empty_instant` when each joint's last sample was decoded.
+    feedback_queue_bound: Vec<Option<Instant>>,
     motor_status: Vec<u8>,
     is_enabled: bool,
     pending_rearm: bool,
@@ -2088,6 +2100,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_target_frames: vec![None; dof],
             last_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
+            rx_empty_instant: None,
+            feedback_queue_bound: vec![None; dof],
             motor_status: vec![0; dof],
             is_enabled: false,
             pending_rearm: true,
@@ -2435,6 +2449,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn feedback_seqs(&self) -> Vec<u64> {
         self.feedback_seq.clone()
+    }
+
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        self.feedback_queue_bound.clone()
     }
 
 
@@ -2846,6 +2864,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut frames_processed = 0;
         let mut rx_drained = false;
         while frames_processed < 64 && t0.elapsed() < MAX_RX_DURATION {
+            // Taken before the receive: an empty result means the queue was empty after it.
+            let attempt = Instant::now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -2912,6 +2932,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
@@ -2921,6 +2942,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
+                    self.rx_empty_instant = Some(attempt);
                     if self.awaiting_rx_boundary {
                         self.awaiting_rx_boundary = false;
                         self.last_feedback_instant.fill(None);
@@ -3022,6 +3044,10 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
+    /// Instant taken before the last receive call that found the RX queue empty.
+    rx_empty_instant: Option<Instant>,
+    /// `rx_empty_instant` when each joint's last sample was decoded.
+    feedback_queue_bound: Vec<Option<Instant>>,
     fault_flags: Vec<u8>,
 }
 
@@ -3038,6 +3064,8 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
+            rx_empty_instant: None,
+            feedback_queue_bound: vec![None; dof],
             fault_flags: vec![0; dof],
         }
     }
@@ -3073,6 +3101,10 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_seqs(&self) -> Vec<u64> {
         self.feedback_seq.clone()
+    }
+
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        self.feedback_queue_bound.clone()
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -3175,6 +3207,8 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let t0 = Instant::now();
         let mut frames_processed = 0;
         while frames_processed < 64 {
+            // Taken before the receive: an empty result means the queue was empty after it.
+            let attempt = Instant::now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -3192,12 +3226,17 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
                     if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
                         break;
                     }
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.rx_empty_instant = Some(attempt);
+                    break;
                 }
                 Err(_) => break,
             }

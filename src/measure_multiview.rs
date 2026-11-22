@@ -527,11 +527,19 @@ fn max_feedback_age_ms(now: Instant, instants: &[Option<Instant>]) -> Option<f64
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
-/// Wait until every arm joint has a hardware feedback sample acquired at or after `after` whose
-/// sequence counter has advanced by at least 2 beyond `fence_seqs` (the first update after the
-/// fence may have been queued in the SocketCAN RX buffer before the fence; the second cannot),
+/// Wait until every arm joint has a hardware feedback sample that was enqueued after `after`,
 /// bounded by [`FEEDBACK_WAIT_MAX`] and the action deadline / `recheck` invariants.
+///
+/// Decode instants and sequence counters alone do not prove that: the Damiao driver stamps and
+/// counts at decode, and its bounded per-tick drain can decode a pre-fence backlog (several old
+/// replies per joint) ticks later. A sample therefore also needs a receive-queue bound at or
+/// after `after` ([`ArmDriver::feedback_queue_bounds`]: the driver saw its RX queue empty at
+/// that instant before reading the sample). Drivers without a receive queue (Feetech/SO-ARM101,
+/// FashionStar request/response, sim, driverless mock) report none; their receive instant is
+/// the bound. The sequence counter must still advance by at least 2 beyond `fence_seqs`.
 /// Returns `(positions, arm_feedback_instants, wait_ms)`.
+///
+/// [`ArmDriver::feedback_queue_bounds`]: crate::driver::ArmDriver::feedback_queue_bounds
 async fn sample_fresh_after(
     ctx: &MacroCtx,
     plan: &Plan,
@@ -541,14 +549,22 @@ async fn sample_fresh_after(
     let wait_start = Instant::now();
     loop {
         recheck(ctx, plan).await?;
-        let (pos, instants, seqs) = sample_with_timing(ctx).await;
+        let (pos, instants, seqs, bounds) = {
+            let inner = ctx.sup.inner().read().await;
+            let (pos, _, instants, seqs) = inner.arm_feedback_snapshot();
+            (pos, instants, seqs, inner.arm_feedback_queue_bounds())
+        };
         let ready = !instants.is_empty()
             && instants.len() == fence_seqs.len()
             && seqs.len() == fence_seqs.len()
+            && bounds.len() == fence_seqs.len()
             && instants
                 .iter()
+                .zip(bounds.iter())
                 .zip(seqs.iter().zip(fence_seqs.iter()))
-                .all(|(t, (&seq, &base))| t.is_some_and(|ts| ts >= after) && seq.wrapping_sub(base) >= 2);
+                .all(|((t, q), (&seq, &base))| {
+                    t.is_some_and(|ts| ts >= after) && q.is_some_and(|qb| qb >= after) && seq.wrapping_sub(base) >= 2
+                });
         if ready {
             return Ok((pos, instants, wait_start.elapsed().as_secs_f64() * 1000.0));
         }
