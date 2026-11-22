@@ -113,8 +113,14 @@ pub const MAX_SETTLE_S: f64 = 4.0;
 /// The snapshot's pose: the joints sampled before the trigger request and right after the fresh
 /// snapshot, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the two,
 /// trigger and snapshot are retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`]
-/// times, then `MOVED`.
+/// times, then `MOVED`. With `pose_refine` `off`; see [`BRACKET_REFINED_RAD`].
 pub const BRACKET_RAD: f32 = 0.002;
+/// [`BRACKET_RAD`] when the views' rotations are refined from the images (`pose_refine` `auto` or
+/// `aruco`): the refinement absorbs a residual rotation (real B601-DM, rc25: 1.9-5.5 mrad per
+/// view), a 5 mrad joint change moves the camera by well under 1 mm, and a drift of a few mrad
+/// per second does not blur a ~30 ms exposure. Real B601-DM, rc25: brackets of 2.3-4.6 mrad over
+/// the ~1 s trigger made 2 of 6 measurements fail `MOVED`.
+pub const BRACKET_REFINED_RAD: f32 = 0.005;
 pub const SNAPSHOT_TRIES: usize = 3;
 pub const SNAPSHOT_GAP_RETRY: Duration = Duration::from_millis(500);
 pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
@@ -504,9 +510,10 @@ pub fn is_still(win: &std::collections::VecDeque<(Vec<f32>, Vec<f32>)>, arm: &[u
     })
 }
 
-/// Largest difference of the arm joints between two samples (rad).
-pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> f32 {
-    arm.iter().map(|&i| (a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs()).fold(0.0, f32::max)
+/// Largest difference of the arm joints between two samples (rad), and that joint's index.
+pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> (f32, usize) {
+    arm.iter().map(|&i| ((a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs(), i))
+        .fold((0.0, arm.first().copied().unwrap_or(0)), |m, x| if x.0 > m.0 { x } else { m })
 }
 
 /// One view's capture.
@@ -549,7 +556,8 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
     let mut s0 = snap().await?;
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
-    let mut tries = Vec::new();
+    let mut tries: Vec<(f32, usize)> = Vec::new();
+    let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
     let mut got = None;
     for k in 0..SNAPSHOT_TRIES {
         if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
@@ -578,9 +586,9 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         };
         let wait_ms = t_reply.elapsed().as_secs_f64() * 1000.0;
         let (b, _) = sample(ctx).await;
-        let spread = bracket_spread(&a, &b, &arm);
-        tries.push(spread);
-        if spread <= BRACKET_RAD {
+        let (spread, joint) = bracket_spread(&a, &b, &arm);
+        tries.push((spread, joint));
+        if spread <= bracket_limit {
             let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
             got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls));
             break;
@@ -588,8 +596,8 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         s0 = jpeg;
     }
     let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls)) = got else {
-        let mrad: Vec<String> = tries.iter().map(|t| format!("{:.1}", t * 1000.0)).collect();
-        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
+        let mrad: Vec<String> = tries.iter().map(|(t, j)| format!("J{} {:.1}", j + 1, t * 1000.0)).collect();
+        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
     };
     recheck(ctx, plan).await?;
     let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
@@ -607,7 +615,7 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
     Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
-        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks })
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(), settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -1381,7 +1389,9 @@ mod tests {
         let mut b = a.clone();
         b[4] = 0.0025;
         b[6] = 0.5; // the gripper is not an arm joint
-        assert!((bracket_spread(&a, &b, &arm) - 0.0025).abs() < 1e-7);
+        let (d, j) = bracket_spread(&a, &b, &arm);
+        assert!((d - 0.0025).abs() < 1e-7);
+        assert_eq!(j, 4, "the joint with the largest change");
     }
 
     #[test]

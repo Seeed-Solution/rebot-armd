@@ -540,16 +540,34 @@ async fn shaking_during_the_snapshots_retries_then_fails_moved() {
     r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
     r.vision.trigger_delay_ms.store(100, Ordering::SeqCst);
     *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
-    let ack = r.start(json!({})).await;
+    let ack = r.start(json!({"pose_refine": "off"})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let a = r.wait(id, 60.0).await;
     println!("{} {}", a["code"], a["message"]);
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
     let msg = a["message"].as_str().unwrap();
-    assert!(msg.contains("3 snapshots") && msg.contains("mrad"), "{msg}");
+    assert!(msg.contains("3 snapshots") && msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
     // at the start view: the snapshot before the first trigger, then one per try (each differs
     // from the one before it at once)
     assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_pose_refine_the_bracket_limit_is_5_mrad() {
+    // as above at twice the drift: every bracket moves about 9.6 mrad, above the 5 mrad limit
+    // that applies when the views' rotations are refined (pose_refine auto, the default)
+    let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.06, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(100, Ordering::SeqCst);
+    *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
+    let ack = r.start(json!({})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 60.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
+    let msg = a["message"].as_str().unwrap();
+    assert!(msg.contains("J4") && msg.contains("limit 5.0"), "{msg}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
