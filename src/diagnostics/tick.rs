@@ -86,6 +86,8 @@ pub struct ControlThreadSched {
 pub struct ObservationCacheStats {
     pub hits: u64,
     pub misses: u64,
+    /// Ticks that skipped publishing because a reader held the snapshot mutex.
+    pub publish_skipped: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
