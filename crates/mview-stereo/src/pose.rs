@@ -1510,11 +1510,12 @@ fn inv3(m: &Mat3) -> Option<Mat3> {
     Some(r)
 }
 
-/// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting).
-fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+/// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting) in place: `a`
+/// and `b` are overwritten and the solution goes to `x` (len n); false when singular or not finite.
+fn solve_dense_in(a: &mut [f64], b: &mut [f64], n: usize, x: &mut [f64]) -> bool {
     for col in 0..n {
-        let piv = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
-        if a[piv * n + col].abs() < 1e-15 { return None; }
+        let Some(piv) = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs())) else { return false; };
+        if a[piv * n + col].abs() < 1e-15 { return false; }
         if piv != col {
             for k in 0..n { a.swap(piv * n + k, col * n + k); }
             b.swap(piv, col);
@@ -1526,12 +1527,11 @@ fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
             b[r] -= f * b[col];
         }
     }
-    let mut x = vec![0.0; n];
     for r in (0..n).rev() {
         let s: f64 = (r + 1..n).map(|k| a[r * n + k] * x[k]).sum();
         x[r] = (b[r] - s) / a[r * n + r];
     }
-    x.iter().all(|v| v.is_finite()).then_some(x)
+    x[..n].iter().all(|v| v.is_finite())
 }
 
 // ---- bundle adjustment ----
@@ -1609,22 +1609,31 @@ impl Problem<'_> {
         let t = ProfT::start();
         let mut cost = self.cost(s, free);
         t.stop("lm.trial_cost_ms");
+        // buffers of every iteration (refilled; the arithmetic is the same as with fresh ones)
+        let mut sm = vec![0.0; nc * nc];
+        let mut bc = vec![0.0; nc];
+        let mut rhs = vec![0.0; nc];
+        let mut dc = vec![0.0; nc];
+        // per point: Hpp^-1, gp, and the range of its blocks with the free views in `hpc_all`
+        let mut per: Vec<Option<(Mat3, Vec3, usize, usize)>> = Vec::with_capacity(self.corrs.len());
+        let mut hpc_all: Vec<(usize, Mat3)> = Vec::with_capacity(self.corrs.len() * nf.min(4));
+        let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+        prof_count("lm.alloc", 8);
         for _ in 0..LM_ITERS {
             #[cfg(feature = "mview-profile")]
             {
                 cp.iters += 1;
             }
-            let mut sm = vec![0.0; nc * nc];
-            let mut bc = vec![0.0; nc];
-            // per point: Hpp^-1, gp, and its blocks with the free views
-            let mut per: Vec<Option<(Mat3, Vec3, Vec<(usize, Mat3)>)>> = Vec::with_capacity(self.corrs.len());
-            prof_count("lm.alloc", 3);
+            sm.fill(0.0);
+            bc.fill(0.0);
+            per.clear();
+            hpc_all.clear();
             for (i, c) in self.corrs.iter().enumerate() {
                 let t_asm = ProfT::start();
                 let wt = self.weight(c);
                 let mut hpp = [[0.0; 3]; 3];
                 let mut gp = [0.0; 3];
-                let mut hpc: Vec<(usize, Mat3)> = Vec::new();
+                let h0 = hpc_all.len();
                 for (k, (a, q)) in c.obs.iter().enumerate() {
                     if !self.active[i][k] { continue; }
                     let Some((p, jx, d)) = proj_jac(&s.cams[*a], &s.x[i]) else { continue; };
@@ -1649,9 +1658,9 @@ impl Problem<'_> {
                                 b[u][v] = wgt * (jx[0][u] * jd[0][v] + jx[1][u] * jd[1][v]);
                             }
                         }
-                        match hpc.iter_mut().find(|e| e.0 == fi) {
+                        match hpc_all[h0..].iter_mut().find(|e| e.0 == fi) {
                             Some(e) => for u in 0..3 { for v in 0..3 { e.1[u][v] += b[u][v]; } },
-                            None => hpc.push((fi, b)),
+                            None => hpc_all.push((fi, b)),
                         }
                     }
                 }
@@ -1665,17 +1674,18 @@ impl Problem<'_> {
                 t_asm.stop("lm.assembly_ms");
                 let t_schur = ProfT::start();
                 let Some(inv) = inv3(&hpp) else { per.push(None); continue; };
+                let (h1, hpc) = (hpc_all.len(), &hpc_all[h0..]);
                 // Schur complement: S -= B1^T inv B2, b -= B1^T inv gp
-                for (f1, b1) in &hpc {
+                for (f1, b1) in hpc {
                     let t = mat_mul(&kinematics::transpose(b1), &inv);
                     let tg = kinematics::mat_vec(&t, &gp);
                     for u in 0..3 { bc[3 * f1 + u] -= tg[u]; }
-                    for (f2, b2) in &hpc {
+                    for (f2, b2) in hpc {
                         let m = mat_mul(&t, b2);
                         for u in 0..3 { for v in 0..3 { sm[(3 * f1 + u) * nc + 3 * f2 + v] -= m[u][v]; } }
                     }
                 }
-                per.push(Some((inv, gp, hpc)));
+                per.push(Some((inv, gp, h0, h1)));
                 t_schur.stop("lm.schur_ms");
             }
             for (a, f) in free.iter().enumerate() {
@@ -1688,26 +1698,26 @@ impl Problem<'_> {
             }
             for u in 0..nc { sm[u * nc + u] *= 1.0 + lambda; }
             let t = ProfT::start();
-            let dc = if nc > 0 {
-                match solve_dense(sm, bc.iter().map(|v| -v).collect(), nc) {
-                    Some(d) => d,
-                    None => {
-                        #[cfg(feature = "mview-profile")]
-                        {
-                            cp.exit = "singular";
-                        }
-                        break;
+            if nc > 0 {
+                for (r, v) in rhs.iter_mut().zip(&bc) { *r = -v; }
+                if !solve_dense_in(&mut sm, &mut rhs, nc, &mut dc) {
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        cp.exit = "singular";
                     }
+                    break;
                 }
-            } else { Vec::new() };
+            }
             t.stop("lm.dense_ms");
             // back-substitution and the trial state
             let t = ProfT::start();
-            let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+            trial.cams.copy_from_slice(&s.cams);
+            trial.w.copy_from_slice(&s.w);
+            trial.x.copy_from_slice(&s.x);
             for (i, e) in per.iter().enumerate() {
-                let Some((inv, gp, hpc)) = e else { continue; };
+                let Some((inv, gp, h0, h1)) = e else { continue; };
                 let mut g = *gp;
-                for (fi, b) in hpc {
+                for (fi, b) in &hpc_all[*h0..*h1] {
                     let bd = kinematics::mat_vec(b, &[dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]]);
                     for u in 0..3 { g[u] += bd[u]; }
                 }
@@ -1730,7 +1740,7 @@ impl Problem<'_> {
                     cp.accepted += 1;
                 }
                 let gain = (cost - tc) / cost.max(1e-12);
-                *s = trial;
+                std::mem::swap(s, &mut trial);
                 cost = tc;
                 lambda = (lambda * 0.3).max(1e-7);
                 if gain < 1e-7 {
@@ -2054,6 +2064,201 @@ mod tests {
         assert_eq!((r.views[1].status, r.views[2].status), ("correction_too_large", "correction_too_large"), "{:?}", r.views);
         assert!((r.views[1].correction_mrad - 1.5).abs() < 0.2, "{:?}", r.views[1]);
         assert_eq!(r.cams, kin.to_vec());
+    }
+
+    /// Solve the dense n x n system `a x = b` (Gaussian elimination, partial pivoting).
+    fn solve_dense_oracle(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+        for col in 0..n {
+            let piv = (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs()))?;
+            if a[piv * n + col].abs() < 1e-15 { return None; }
+            if piv != col {
+                for k in 0..n { a.swap(piv * n + k, col * n + k); }
+                b.swap(piv, col);
+            }
+            for r in col + 1..n {
+                let f = a[r * n + col] / a[col * n + col];
+                if f == 0.0 { continue; }
+                for k in col..n { a[r * n + k] -= f * a[col * n + k]; }
+                b[r] -= f * b[col];
+            }
+        }
+        let mut x = vec![0.0; n];
+        for r in (0..n).rev() {
+            let s: f64 = (r + 1..n).map(|k| a[r * n + k] * x[k]).sum();
+            x[r] = (b[r] - s) / a[r * n + r];
+        }
+        x.iter().all(|v| v.is_finite()).then_some(x)
+    }
+
+
+    fn solve_oracle(pr: &Problem, s: &mut State, free: &[Option<usize>]) {
+        let nf = free.iter().filter(|f| f.is_some()).count();
+        let nc = 3 * nf;
+        let mut lambda = 1e-3;
+        let mut cost = pr.cost(s, free);
+        for _ in 0..LM_ITERS {
+            let mut sm = vec![0.0; nc * nc];
+            let mut bc = vec![0.0; nc];
+            // per point: Hpp^-1, gp, and its blocks with the free views
+            let mut per: Vec<Option<(Mat3, Vec3, Vec<(usize, Mat3)>)>> = Vec::with_capacity(pr.corrs.len());
+            for (i, c) in pr.corrs.iter().enumerate() {
+                let wt = pr.weight(c);
+                let mut hpp = [[0.0; 3]; 3];
+                let mut gp = [0.0; 3];
+                let mut hpc: Vec<(usize, Mat3)> = Vec::new();
+                for (k, (a, q)) in c.obs.iter().enumerate() {
+                    if !pr.active[i][k] { continue; }
+                    let Some((p, jx, d)) = proj_jac(&s.cams[*a], &s.x[i]) else { continue; };
+                    let r = [p[0] - q[0], p[1] - q[1]];
+                    let (_, hw) = huber(wt * r[0].hypot(r[1]), pr.huber_px);
+                    let wgt = wt * wt * hw;
+                    for u in 0..3 {
+                        gp[u] += wgt * (jx[0][u] * r[0] + jx[1][u] * r[1]);
+                        for v in 0..3 { hpp[u][v] += wgt * (jx[0][u] * jx[0][v] + jx[1][u] * jx[1][v]); }
+                    }
+                    if let Some(fi) = free[*a] {
+                        // d(pixel)/d(delta) = jx [d]x
+                        let dx = [[0.0, -d[2], d[1]], [d[2], 0.0, -d[0]], [-d[1], d[0], 0.0]];
+                        let mut jd = [[0.0; 3]; 2];
+                        for rr in 0..2 { for cc in 0..3 { jd[rr][cc] = (0..3).map(|l| jx[rr][l] * dx[l][cc]).sum(); } }
+                        let o = 3 * fi;
+                        let mut b = [[0.0; 3]; 3];
+                        for u in 0..3 {
+                            bc[o + u] += wgt * (jd[0][u] * r[0] + jd[1][u] * r[1]);
+                            for v in 0..3 {
+                                sm[(o + u) * nc + o + v] += wgt * (jd[0][u] * jd[0][v] + jd[1][u] * jd[1][v]);
+                                b[u][v] = wgt * (jx[0][u] * jd[0][v] + jx[1][u] * jd[1][v]);
+                            }
+                        }
+                        match hpc.iter_mut().find(|e| e.0 == fi) {
+                            Some(e) => for u in 0..3 { for v in 0..3 { e.1[u][v] += b[u][v]; } },
+                            None => hpc.push((fi, b)),
+                        }
+                    }
+                }
+                if c.on_table && pr.plane_w > 0.0 {
+                    let r = (s.x[i][2] - pr.table_z) * pr.plane_w;
+                    let (_, hw) = huber(r.abs(), pr.huber_px);
+                    hpp[2][2] += hw * pr.plane_w * pr.plane_w;
+                    gp[2] += hw * pr.plane_w * r;
+                }
+                for u in 0..3 { hpp[u][u] = hpp[u][u] * (1.0 + lambda) + 1e-9; }
+                let Some(inv) = inv3(&hpp) else { per.push(None); continue; };
+                // Schur complement: S -= B1^T inv B2, b -= B1^T inv gp
+                for (f1, b1) in &hpc {
+                    let t = mat_mul(&kinematics::transpose(b1), &inv);
+                    let tg = kinematics::mat_vec(&t, &gp);
+                    for u in 0..3 { bc[3 * f1 + u] -= tg[u]; }
+                    for (f2, b2) in &hpc {
+                        let m = mat_mul(&t, b2);
+                        for u in 0..3 { for v in 0..3 { sm[(3 * f1 + u) * nc + 3 * f2 + v] -= m[u][v]; } }
+                    }
+                }
+                per.push(Some((inv, gp, hpc)));
+            }
+            for (a, f) in free.iter().enumerate() {
+                let Some(fi) = f else { continue; };
+                let ip = 1.0 / (pr.prior_rad * pr.prior_rad);
+                for u in 0..3 {
+                    sm[(3 * fi + u) * nc + 3 * fi + u] += ip;
+                    bc[3 * fi + u] += ip * s.w[a][u];
+                }
+            }
+            for u in 0..nc { sm[u * nc + u] *= 1.0 + lambda; }
+            let dc = if nc > 0 {
+                match solve_dense_oracle(sm, bc.iter().map(|v| -v).collect(), nc) {
+                    Some(d) => d,
+                    None => {
+                        break;
+                    }
+                }
+            } else { Vec::new() };
+            // back-substitution and the trial state
+            let mut trial = State { cams: s.cams.clone(), w: s.w.clone(), x: s.x.clone() };
+            for (i, e) in per.iter().enumerate() {
+                let Some((inv, gp, hpc)) = e else { continue; };
+                let mut g = *gp;
+                for (fi, b) in hpc {
+                    let bd = kinematics::mat_vec(b, &[dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]]);
+                    for u in 0..3 { g[u] += bd[u]; }
+                }
+                let dx = kinematics::mat_vec(inv, &g);
+                for u in 0..3 { trial.x[i][u] -= dx[u]; }
+            }
+            for (a, f) in free.iter().enumerate() {
+                let Some(fi) = f else { continue; };
+                let d = [dc[3 * fi], dc[3 * fi + 1], dc[3 * fi + 2]];
+                trial.cams[a].r = mat_mul(&rodrigues(&d), &trial.cams[a].r);
+                for u in 0..3 { trial.w[a][u] += d[u]; }
+            }
+            let tc = pr.cost(&trial, free);
+            if tc < cost {
+                let gain = (cost - tc) / cost.max(1e-12);
+                *s = trial;
+                cost = tc;
+                lambda = (lambda * 0.3).max(1e-7);
+                if gain < 1e-7 {
+                    break;
+                }
+            } else {
+                lambda *= 10.0;
+                if lambda > 1e6 {
+                    break;
+                }
+            }
+        }
+    }
+
+
+    /// The reused LM buffers give bitwise the solve with fresh ones (the previous solve as
+    /// oracle): all views free, some fixed, none free, coplanarity on/off, markers, inactive
+    /// observations, and a non-finite (singular) start.
+    #[test]
+    fn lm_solve_with_reused_buffers_matches_fresh_buffers_bitwise() {
+        let look = [0.30, 0.0, 0.0];
+        let truth = [cam_at([0.30, 0.0, 0.45], look), cam_at([0.30, -0.04, 0.45], look), cam_at([0.30, 0.04, 0.45], look), cam_at([0.34, 0.0, 0.45], look)];
+        let mut kin = truth;
+        kin[1].r = mat_mul(&rodrigues(&[0.0015, 0.0, 0.0]), &kin[1].r);
+        kin[2].r = mat_mul(&rodrigues(&[0.0, -0.001, 0.0011]), &kin[2].r);
+        kin[3].r = mat_mul(&rodrigues(&[0.0, 0.0006, -0.0021]), &kin[3].r);
+        let mut corrs = Vec::new();
+        for i in 0..8 {
+            for j in 0..6 {
+                let x = [0.22 + 0.022 * f64::from(i), -0.10 + 0.04 * f64::from(j), 0.0];
+                let obs: Vec<(usize, [f64; 2])> = truth.iter().enumerate().filter_map(|(k, c)| c.project(&x).map(|q| (k, q))).collect();
+                corrs.push(Corr { obs, on_table: (i + j) % 3 != 0, marker: j == 5 });
+            }
+        }
+        corrs[3].obs[1].1[0] += 6.0;
+        corrs[10].obs[2].1[1] -= 9.0;
+        let mut active: Vec<Vec<bool>> = corrs.iter().map(|c| vec![true; c.obs.len()]).collect();
+        active[7][2] = false;
+        active[11].iter_mut().for_each(|a| *a = false);
+        let nv = kin.len();
+        let x0 = init_points(&kin, &corrs, 0.0);
+        let frees: [Vec<Option<usize>>; 4] = [
+            vec![None, Some(0), Some(1), Some(2)],
+            vec![None, None, Some(0), Some(1)],
+            vec![None, Some(0), None, None],
+            vec![None; 4],
+        ];
+        for plane_w in [0.0, 1000.0] {
+            let prob = Problem { corrs: &corrs, active: active.clone(), table_z: 0.0, plane_w, prior_rad: POSE_PRIOR_RAD, huber_px: POSE_HUBER_PX, marker_weight: MARKER_WEIGHT };
+            for free in &frees {
+                let mut a = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+                let mut b = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+                prob.solve(&mut a, free);
+                solve_oracle(&prob, &mut b, free);
+                assert_eq!((&a.cams, &a.w, &a.x), (&b.cams, &b.w, &b.x), "plane_w {plane_w} free {free:?}");
+            }
+            // a point at the camera centre: singular point block, the dense solve sees NaN
+            let mut bad = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: x0.clone() };
+            bad.x[0] = [f64::NAN; 3];
+            let mut bad2 = State { cams: kin.to_vec(), w: vec![[0.0; 3]; nv], x: bad.x.clone() };
+            prob.solve(&mut bad, &frees[0]);
+            solve_oracle(&prob, &mut bad2, &frees[0]);
+            assert_eq!(format!("{:?}", (&bad.cams, &bad.w, &bad.x)), format!("{:?}", (&bad2.cams, &bad2.w, &bad2.x)));
+        }
     }
 
     /// The refine_poses of before the shared initial points, the round-0 reuse and the
