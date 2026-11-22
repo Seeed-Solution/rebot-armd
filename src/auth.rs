@@ -46,6 +46,7 @@ struct OperatorAuthInner {
     pin: String,
     ttl: Duration,
     public_origin: Option<String>,
+    allowed_origins: Vec<OriginTuple>,
     trust_forwarded_proto: bool,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
     rate_limit: Arc<Mutex<UnlockRateLimit>>,
@@ -120,6 +121,10 @@ fn parse_authority(raw: &str, default_scheme: &str) -> Option<(String, u16)> {
     }
 }
 
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 fn resolve_public_origin(configured: Option<&str>) -> Option<String> {
     if let Some(v) = configured.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(v.to_string());
@@ -128,6 +133,20 @@ fn resolve_public_origin(configured: Option<&str>) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn resolve_allowed_origins(configured: &[OriginTuple]) -> Vec<OriginTuple> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    std::env::var("REBOT_ALLOWED_ORIGINS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| parse_origin(s.trim().trim_end_matches('/')))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse an HTTP `Origin` header (`scheme://host[:port]`) into a normalized `(scheme, host, effective_port)`.
@@ -155,8 +174,13 @@ pub fn parse_host_header(raw: &str, scheme: &str) -> Option<OriginTuple> {
     Some(OriginTuple { scheme, host, port })
 }
 
-/// Validate a request's `Origin` header against `Host` and optional `REBOT_PUBLIC_ORIGIN` override.
-pub fn validate_origin_headers(headers: &HeaderMap, configured_public_origin: Option<&str>) -> bool {
+/// Validate a request's `Origin` header against `Host`, optional `REBOT_PUBLIC_ORIGIN` override,
+/// and explicitly configured/env `allowed_origins`.
+pub fn validate_origin_headers_with_allowed(
+    headers: &HeaderMap,
+    configured_public_origin: Option<&str>,
+    configured_allowed_origins: &[OriginTuple],
+) -> bool {
     let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
     let Some(origin_hdr) = origins.next() else {
         return true;
@@ -171,34 +195,43 @@ pub fn validate_origin_headers(headers: &HeaderMap, configured_public_origin: Op
     let host_hdr = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok());
+    let allowed_origins = resolve_allowed_origins(configured_allowed_origins);
 
     if let Some(pub_raw) = resolve_public_origin(configured_public_origin) {
-        if pub_raw.eq_ignore_ascii_case("http") || pub_raw.eq_ignore_ascii_case("https") {
-            let expected_scheme = pub_raw.to_ascii_lowercase();
-            return host_hdr
-                .and_then(|h| parse_host_header(h, &expected_scheme))
-                .is_some_and(|expected| expected == origin);
-        }
         let Some(pub_origin) = parse_origin(pub_raw.trim_end_matches('/')) else {
             return false;
         };
         if origin == pub_origin {
             return true;
         }
-        // Allow direct local HTTP Cockpit requests only when Host does not target the configured public origin.
-        return host_hdr
-            .and_then(|h| parse_host_header(h, "http"))
-            .is_some_and(|expected| {
-                let shadows_public = expected.host == pub_origin.host
-                    && (expected.port == pub_origin.port
-                        || (expected.port == 80 && pub_origin.port == 443));
-                expected == origin && !shadows_public
-            });
+        let shadows_public = origin.host == pub_origin.host
+            && (origin.port == pub_origin.port
+                || (origin.port == 80 && pub_origin.port == 443));
+        if allowed_origins.iter().any(|allowed| *allowed == origin)
+            && !(shadows_public && origin.scheme != pub_origin.scheme)
+        {
+            return true;
+        }
+        return origin.scheme == "http"
+            && is_loopback_host(&origin.host)
+            && host_hdr
+                .and_then(|h| parse_host_header(h, "http"))
+                .is_some_and(|expected| expected == origin)
+            && !shadows_public;
+    }
+
+    if allowed_origins.iter().any(|allowed| *allowed == origin) {
+        return true;
     }
 
     host_hdr
         .and_then(|h| parse_host_header(h, "http"))
         .is_some_and(|expected| expected == origin)
+}
+
+/// Validate a request's `Origin` header against `Host` and optional `REBOT_PUBLIC_ORIGIN` override.
+pub fn validate_origin_headers(headers: &HeaderMap, configured_public_origin: Option<&str>) -> bool {
+    validate_origin_headers_with_allowed(headers, configured_public_origin, &[])
 }
 
 /// Shared operator authentication handle used by HTTP routes, WS connections, and `safety/describe`.
@@ -229,6 +262,7 @@ impl OperatorAuth {
             pin: String::new(),
             ttl: Duration::from_secs(DEFAULT_TTL_S),
             public_origin: None,
+            allowed_origins: Vec::new(),
             trust_forwarded_proto: false,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: Arc::new(Mutex::new(UnlockRateLimit {
@@ -245,6 +279,7 @@ impl OperatorAuth {
             pin: pin.into(),
             ttl: Duration::from_secs(ttl_s),
             public_origin: None,
+            allowed_origins: Vec::new(),
             trust_forwarded_proto: false,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: Arc::new(Mutex::new(UnlockRateLimit {
@@ -261,6 +296,21 @@ impl OperatorAuth {
             pin: self.0.pin.clone(),
             ttl: self.0.ttl,
             public_origin: origin,
+            allowed_origins: self.0.allowed_origins.clone(),
+            trust_forwarded_proto: self.0.trust_forwarded_proto,
+            sessions: Arc::clone(&self.0.sessions),
+            rate_limit: Arc::clone(&self.0.rate_limit),
+        }))
+    }
+
+    /// Explicitly approve additional origins (otherwise read from comma-separated `REBOT_ALLOWED_ORIGINS`).
+    pub fn with_allowed_origins(self, origins: Vec<OriginTuple>) -> Self {
+        Self(Arc::new(OperatorAuthInner {
+            enforced: self.0.enforced,
+            pin: self.0.pin.clone(),
+            ttl: self.0.ttl,
+            public_origin: self.0.public_origin.clone(),
+            allowed_origins: origins,
             trust_forwarded_proto: self.0.trust_forwarded_proto,
             sessions: Arc::clone(&self.0.sessions),
             rate_limit: Arc::clone(&self.0.rate_limit),
@@ -274,6 +324,7 @@ impl OperatorAuth {
             pin: self.0.pin.clone(),
             ttl: self.0.ttl,
             public_origin: self.0.public_origin.clone(),
+            allowed_origins: self.0.allowed_origins.clone(),
             trust_forwarded_proto: trust,
             sessions: Arc::clone(&self.0.sessions),
             rate_limit: Arc::clone(&self.0.rate_limit),
@@ -281,7 +332,11 @@ impl OperatorAuth {
     }
 
     pub fn validate_origin(&self, headers: &HeaderMap) -> bool {
-        validate_origin_headers(headers, self.0.public_origin.as_deref())
+        validate_origin_headers_with_allowed(
+            headers,
+            self.0.public_origin.as_deref(),
+            &self.0.allowed_origins,
+        )
     }
 
     /// Whether `Set-Cookie` should include `; Secure`.
