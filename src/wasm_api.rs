@@ -1525,5 +1525,42 @@ mod tests {
         }));
         assert_code(missing_tcp.clone(), "INVALID_COMMAND");
         assert!(missing_tcp["message"].as_str().unwrap().contains("tcp_offset"));
+
+        // R2 M3: ComposeMjcf with non-stock manifest + explicit tcp_offset + omitted/whitespace tool_xml
+        // still updates base <site name="tcp"> and fails closed when <site name="tcp"> is missing.
+        for tool_xml_field in [json!(null), json!(""), json!("   ")] {
+            let mut req = json!({
+                "op": "compose_mjcf",
+                "tool_manifest": {
+                    "id": "offset_only_tool",
+                    "kind": "gripper",
+                    "robots": ["b601dm"],
+                    "tcp_offset": [0.025, 0.0, 0.0]
+                }
+            });
+            if !tool_xml_field.is_null() {
+                req["tool_xml"] = tool_xml_field;
+            }
+            let out = ok(req);
+            let xml = out["xml"].as_str().unwrap();
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            let tcp_site = doc
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+                .unwrap();
+            assert_eq!(tcp_site.attribute("pos"), Some("0.025 0 0"));
+        }
+        let no_tcp_err = call(json!({
+            "op": "compose_mjcf",
+            "base_xml": "<mujoco><worldbody><body name=\"end_link\"/></worldbody></mujoco>",
+            "tool_manifest": {
+                "id": "offset_only_tool",
+                "kind": "gripper",
+                "robots": ["b601dm"],
+                "tcp_offset": [0.025, 0.0, 0.0]
+            },
+            "tool_xml": ""
+        }));
+        assert_code(no_tcp_err, "INVALID_COMMAND");
     }
 }

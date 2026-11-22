@@ -1399,4 +1399,24 @@ async fn m6_stream_contact_speed_invalidates_commissioning_and_m8_rejects_non_st
     assert!(armd::recording::import::extract_embedded_provenance(&kv_bad_dig)
         .unwrap_err()
         .contains("tool_config_digest"));
+
+    // R2 M4: Explicit JSON null for tool_id or tool_config_digest in rebot.episode must be rejected,
+    // while genuine legacy rebot.episode omitting both keys still succeeds.
+    for null_json in [
+        r#"{"tool_id": null, "tool_config_digest": null}"#,
+        r#"{"tool_id": null}"#,
+        r#"{"tool_config_digest": null}"#,
+    ] {
+        let mut kv_null = std::collections::HashMap::new();
+        kv_null.insert("rebot.episode".to_string(), null_json.to_string());
+        assert!(
+            armd::recording::import::extract_embedded_provenance(&kv_null).is_err(),
+            "{null_json} must be rejected"
+        );
+    }
+    let mut kv_legacy = std::collections::HashMap::new();
+    kv_legacy.insert("rebot.episode".to_string(), r#"{"id":"legacy_ep","units":"rad"}"#.to_string());
+    let legacy_emb = armd::recording::import::extract_embedded_provenance(&kv_legacy).unwrap();
+    assert_eq!(legacy_emb.tool_id, None);
+    assert_eq!(legacy_emb.tool_config_digest, None);
 }

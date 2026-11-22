@@ -106,7 +106,7 @@ pub fn extract_embedded_provenance(
         if !val.is_object() {
             return Err("parquet metadata 'rebot.episode' must be a JSON object".into());
         }
-        if let Some(v) = val.get("tool_id").filter(|v| !v.is_null()) {
+        if let Some(v) = val.get("tool_id") {
             let tid = v
                 .as_str()
                 .ok_or_else(|| "parquet metadata 'rebot.episode.tool_id' must be a string".to_string())?;
@@ -121,7 +121,7 @@ pub fn extract_embedded_provenance(
                 top.tool_id = Some(tid.to_string());
             }
         }
-        if let Some(v) = val.get("tool_config_digest").filter(|v| !v.is_null()) {
+        if let Some(v) = val.get("tool_config_digest") {
             let tdig = v
                 .as_str()
                 .ok_or_else(|| "parquet metadata 'rebot.episode.tool_config_digest' must be a string".to_string())?;

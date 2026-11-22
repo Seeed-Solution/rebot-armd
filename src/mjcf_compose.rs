@@ -1434,9 +1434,8 @@ pub fn compose_mjcf(
     }
 
     // 2. Tool elements to remove & inject
-    let is_tool_active = tool_manifest.is_some()
-        && tool_manifest.map(|m| m.id.as_str()) != Some("default")
-        && tool_doc.is_some();
+    let is_non_stock_tool = tool_manifest.is_some_and(|m| m.id.as_str() != crate::tool::STOCK_TOOL_ID);
+    let is_tool_active = is_non_stock_tool && tool_doc.is_some();
 
     let mut tool_worldbody_xml = String::new();
     let mut tool_asset_xml = String::new();
@@ -1444,97 +1443,102 @@ pub fn compose_mjcf(
     let mut tool_actuator_xml = String::new();
     let mut tool_tendon_xml = String::new();
 
-    if is_tool_active {
+    if is_non_stock_tool {
         let tm = tool_manifest.unwrap();
-        let td = tool_doc.as_ref().unwrap();
-        let raw_tool_xml = tool_xml.unwrap();
-        let site_name = tm.tcp_site.as_deref().unwrap_or("tcp");
-        let skip_range = if site_name.trim().is_empty() {
-            None
-        } else {
-            td.descendants()
-                .find(|n| {
-                    n.is_element()
-                        && n.tag_name().name() == "site"
-                        && n.attribute("name") == Some(site_name)
-                })
-                .map(|n| n.range())
-        };
-        let resolved_tcp = resolve_tool_tcp_offset(tm, Some(raw_tool_xml))?;
-        let should_override_tcp_site = tm.tcp_offset.is_some() || skip_range.is_some();
+        let resolved_tcp = resolve_tool_tcp_offset(tm, tool_xml)?;
+        let skip_range = if let (Some(td), Some(raw_tool_xml)) = (tool_doc.as_ref(), tool_xml) {
+            let site_name = tm.tcp_site.as_deref().unwrap_or("tcp");
+            let skip_range = if site_name.trim().is_empty() {
+                None
+            } else {
+                td.descendants()
+                    .find(|n| {
+                        n.is_element()
+                            && n.tag_name().name() == "site"
+                            && n.attribute("name") == Some(site_name)
+                    })
+                    .map(|n| n.range())
+            };
 
-        // Extract tool sections
-        for node in td.descendants() {
-            if node.is_element() {
-                match node.tag_name().name() {
-                    "worldbody" => {
-                        let wb = extract_children_xml(node, raw_tool_xml, skip_range.clone());
-                        tool_worldbody_xml.push_str(&wb);
+            // Extract tool sections
+            for node in td.descendants() {
+                if node.is_element() {
+                    match node.tag_name().name() {
+                        "worldbody" => {
+                            let wb = extract_children_xml(node, raw_tool_xml, skip_range.clone());
+                            tool_worldbody_xml.push_str(&wb);
+                        }
+                        "asset" => {
+                            tool_asset_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
+                        }
+                        "equality" => {
+                            tool_equality_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
+                        }
+                        "actuator" => {
+                            tool_actuator_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
+                        }
+                        "tendon" => {
+                            tool_tendon_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
+                        }
+                        _ => {}
                     }
-                    "asset" => {
-                        tool_asset_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                    }
-                    "equality" => {
-                        tool_equality_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                    }
-                    "actuator" => {
-                        tool_actuator_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                    }
-                    "tendon" => {
-                        tool_tendon_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                    }
-                    _ => {}
                 }
             }
-        }
 
-        // Delete replaced bodies, geoms, equalities, actuators
-        for node in base_doc.descendants() {
-            if !node.is_element() {
-                continue;
-            }
-            let tag = node.tag_name().name();
-            let name = node.attribute("name").unwrap_or("");
-            let should_delete = (tag == "body" && tm.replace_bodies.iter().any(|b| b == name))
-                || (tag == "geom" && tm.replace_geoms.iter().any(|g| g == name))
-                || (node.parent().map(|p| p.tag_name().name()) == Some("equality")
-                    && tm.replace_equalities.iter().any(|eq| eq == name))
-                || (node.parent().map(|p| p.tag_name().name()) == Some("actuator")
-                    && tm.replace_actuators.iter().any(|act| act == name));
+            // Delete replaced bodies, geoms, equalities, actuators
+            for node in base_doc.descendants() {
+                if !node.is_element() {
+                    continue;
+                }
+                let tag = node.tag_name().name();
+                let name = node.attribute("name").unwrap_or("");
+                let should_delete = (tag == "body" && tm.replace_bodies.iter().any(|b| b == name))
+                    || (tag == "geom" && tm.replace_geoms.iter().any(|g| g == name))
+                    || (node.parent().map(|p| p.tag_name().name()) == Some("equality")
+                        && tm.replace_equalities.iter().any(|eq| eq == name))
+                    || (node.parent().map(|p| p.tag_name().name()) == Some("actuator")
+                        && tm.replace_actuators.iter().any(|act| act == name));
 
-            if should_delete {
-                edits.push(XmlEdit {
-                    start: node.range().start,
-                    end: node.range().end,
-                    replacement: String::new(),
-                });
-            }
-        }
-
-        // Insert tool worldbody children inside <body name="{attach_body}">
-        let attach_name = if tm.attach_body.trim().is_empty() { "end_link" } else { tm.attach_body.as_str() };
-        let mut attached = false;
-        for node in base_doc.descendants() {
-            if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name) {
-                let range = node.range();
-                let slice = &base_xml[range.clone()];
-                if let Some(close_idx) = slice.rfind("</body") {
-                    let insert_pos = range.start + close_idx;
+                if should_delete {
                     edits.push(XmlEdit {
-                        start: insert_pos,
-                        end: insert_pos,
-                        replacement: format!("\n{}\n", tool_worldbody_xml),
+                        start: node.range().start,
+                        end: node.range().end,
+                        replacement: String::new(),
                     });
-                    attached = true;
-                    break;
                 }
             }
-        }
-        if !attached && !tool_worldbody_xml.is_empty() {
-            return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
-        }
 
-        // Update base TCP site pos: explicit Some([0,0,0]) forces 0 0 0; None inherits resolved XML site.
+            // Insert tool worldbody children inside <body name="{attach_body}">
+            let attach_name = if tm.attach_body.trim().is_empty() { "end_link" } else { tm.attach_body.as_str() };
+            let mut attached = false;
+            for node in base_doc.descendants() {
+                if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name) {
+                    let range = node.range();
+                    let slice = &base_xml[range.clone()];
+                    if let Some(close_idx) = slice.rfind("</body") {
+                        let insert_pos = range.start + close_idx;
+                        edits.push(XmlEdit {
+                            start: insert_pos,
+                            end: insert_pos,
+                            replacement: format!("\n{}\n", tool_worldbody_xml),
+                        });
+                        attached = true;
+                        break;
+                    }
+                }
+            }
+            if !attached && !tool_worldbody_xml.is_empty() {
+                return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
+            }
+
+            skip_range
+        } else {
+            None
+        };
+
+        // Update base TCP site pos even when tool_xml is empty/omitted:
+        // explicit Some([0,0,0]) forces 0 0 0; None inherits resolved XML site.
+        let should_override_tcp_site = tm.tcp_offset.is_some() || skip_range.is_some();
         if should_override_tcp_site {
             let pos_val = format!("{} {} {}", resolved_tcp[0], resolved_tcp[1], resolved_tcp[2]);
             let mut tcp_site_updated = false;
@@ -2074,5 +2078,20 @@ mod tests {
             "tcp_offset": [0.02, 0.0, 0.0],
             "armd_": {}
         })).is_err());
+
+        // 9. R2 M3: Non-stock manifest with empty/whitespace/None tool_xml STILL updates base tcp site
+        // and fails closed if base MJCF lacks <site name="tcp">.
+        for empty_xml in [None, Some(""), Some("   \n\t ")] {
+            let composed_empty = compose_mjcf(single_quote_base, None, Some(&sq_manifest), empty_xml).unwrap();
+            let doc_empty = roxmltree::Document::parse(&composed_empty).unwrap();
+            let site_empty = doc_empty
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+                .unwrap();
+            assert_eq!(site_empty.attribute("pos"), Some("0.025 0 0"), "tool_xml={empty_xml:?}");
+
+            let missing_err_empty = compose_mjcf(missing_tcp_base, None, Some(&sq_manifest), empty_xml).unwrap_err();
+            assert!(missing_err_empty.contains("tcp"), "{missing_err_empty}");
+        }
     }
 }

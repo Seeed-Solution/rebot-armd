@@ -3836,7 +3836,22 @@ fn resolve_remote_target_locally(
         state.resolve_tool_checked_full(r_tool),
         get_base_robot_xml_for_robot(running_robot),
     ) {
-        if scene_pack.digest == r_sd && tool_pack.digest == r_td {
+        if scene_pack.digest == r_sd
+            && tool_pack.digest == r_td
+            && validate_robot_compatibility(
+                running_robot,
+                None,
+                &scene_pack.manifest,
+                &tool_pack.manifest,
+            )
+            .is_ok()
+            && crate::mjcf_compose::validate_tool_manifest_for_robot(
+                &tool_pack.manifest,
+                Some(&tool_pack.xml),
+                running_robot,
+            )
+            .is_ok()
+        {
             if let Ok(composed) = compose_mjcf(
                 &base_xml,
                 Some(&scene_pack.xml),

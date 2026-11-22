@@ -1408,11 +1408,15 @@ fn apply_tool_overlay_with_details(
     candidate.permanent_tool_check_points_end_m = extra_points;
     let contact_opening_f64 = armd
         .and_then(|a| a.contact_opening_m)
-        .or_else(|| is_stock.then_some(0.0));
+        .or_else(|| is_stock.then(|| candidate.contact_opening_m.map_or(0.0, f64::from)));
     candidate.physical_contact_end_m = armd
         .and_then(|a| a.physical_contact_end_m)
-        .or_else(|| is_stock.then_some([0.0; 3]));
-    candidate.contact_opening_m = contact_opening_f64.map(|v| v as f32);
+        .or_else(|| is_stock.then(|| candidate.physical_contact_end_m.unwrap_or([0.0; 3])));
+    candidate.contact_opening_m = if is_stock {
+        candidate.contact_opening_m.or(Some(0.0))
+    } else {
+        contact_opening_f64.map(|v| v as f32)
+    };
     candidate.rebuild_effective_check_points()?;
 
     // 7. Dynamics qualification gate.
@@ -2199,5 +2203,21 @@ mod tests {
         // m1: ToolPackConfig rejects unknown top-level fields (e.g. "armd_").
         let bad_top = r#"{"id":"bad","kind":"gripper","robots":["b601dm"],"tcp_offset":[0,0,0],"armd_":{"dynamics":{}}}"#;
         assert!(serde_json::from_str::<ToolPackConfig>(bad_top).is_err());
+
+        // R2 M1: Explicit `default` pack preserves profile contact_opening_m and physical_contact_end_m.
+        let mut custom_stock_base = ArmConfig::rebot_dm();
+        custom_stock_base.physical_contact_end_m = Some([0.04, 0.0, 0.0]);
+        custom_stock_base.contact_opening_m = Some(0.004);
+        custom_stock_base.validate().unwrap();
+        let implicit_digest = custom_stock_base.active_tool.config_digest.clone();
+        let explicit_default: ToolPackConfig = serde_json::from_value(serde_json::json!({
+            "id": "default",
+            "kind": "gripper"
+        }))
+        .unwrap();
+        let explicit_applied = apply_tool_overlay(&custom_stock_base, &explicit_default).unwrap();
+        assert_eq!(explicit_applied.physical_contact_end_m, Some([0.04, 0.0, 0.0]));
+        assert_eq!(explicit_applied.contact_opening_m, Some(0.004));
+        assert_eq!(explicit_applied.active_tool.config_digest, implicit_digest);
     }
 }

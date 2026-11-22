@@ -2471,4 +2471,124 @@ async fn sandbox_m09_prepare_ack_rejects_202_missing_state_or_wrong_tx_id() {
     }
 }
 
+#[tokio::test]
+async fn sandbox_r2_m2_recover_split_rejects_incompatible_remote_tool_for_running_robot() {
+    let _env_guard = SIM_ENV_LOCK.lock().await;
+    let _up_guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let so101_cfg = armd::tool::baseline_arm_config_for_robot("so101").unwrap();
+
+    for (tool_id, tool_json) in [
+        (
+            "dm_only_gripper",
+            json!({
+                "id": "dm_only_gripper",
+                "name": "dm_only_gripper",
+                "kind": "gripper",
+                "robots": ["b601dm"],
+                "tcp_offset": [0.02, 0.0, 0.0]
+            }),
+        ),
+        (
+            "dm_limits_unrestricted_gripper",
+            json!({
+                "id": "dm_limits_unrestricted_gripper",
+                "name": "dm_limits_unrestricted_gripper",
+                "kind": "gripper",
+                "robots": [],
+                "tcp_offset": [0.02, 0.0, 0.0],
+                "armd": {
+                    "gripper_policy": {
+                        "closed_rad": -2.0
+                    }
+                }
+            }),
+        ),
+    ] {
+        let upload_state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let upload_app = app_for(so101_cfg.clone(), upload_state.clone());
+        let (st, up) = send_json(
+            &upload_app,
+            "POST",
+            "/api/v1/sandbox/tools",
+            Some(json!({
+                "id": tool_id,
+                "tool_json": tool_json,
+                "tool_xml": "<mujoco><worldbody><body name=\"dm_only_body\"><geom type=\"box\" size=\"0.01 0.01 0.01\"/></body></worldbody></mujoco>"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{tool_id}: {up}");
+        let remote_td = up["pack_digest"].as_str().unwrap().to_string();
+
+        let td_state = remote_td.clone();
+        let tid = tool_id.to_string();
+        let td_commit = remote_td.clone();
+        let mock_sim = axum::Router::new()
+            .route(
+                "/sim/state",
+                get(move || {
+                    let td = td_state.clone();
+                    let tname = tid.clone();
+                    async move {
+                        axum::Json(json!({
+                            "tx_id": "split-tx-r2-m2",
+                            "activation_state": "DEGRADED_SPLIT",
+                            "robot": "so-arm101",
+                            "scene": "default",
+                            "tool": tname,
+                            "scene_digest": Value::Null,
+                            "tool_digest": td
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/sim/scene/commit",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let td = td_commit.clone();
+                    async move {
+                        axum::Json(json!({
+                            "ok": true,
+                            "state": "COMMITTED",
+                            "tx_id": b["tx_id"],
+                            "robot": "so-arm101",
+                            "scene_digest": Value::Null,
+                            "tool_digest": td
+                        }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+        std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+        let rec_state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let rec_app = app_for(so101_cfg.clone(), rec_state.clone());
+        let (st_rec, rec) = send_json(
+            &rec_app,
+            "POST",
+            "/api/v1/sandbox/recover-split",
+            Some(json!({"action": "replay_camera"})),
+        )
+        .await;
+        std::env::remove_var("ARMD_SIM_URL");
+        server.abort();
+
+        assert_eq!(st_rec, StatusCode::OK, "{tool_id}: {rec}");
+        let active = rec_state.active.read().await;
+        assert_eq!(active.active_tool, "default", "{tool_id} must not be adopted on so-arm101");
+        assert!(!active.cached_mjcf.contains("dm_only_body"), "{tool_id} MJCF must not be published");
+    }
+}
+
 
