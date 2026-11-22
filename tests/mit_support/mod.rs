@@ -54,6 +54,8 @@ pub struct FakeMotor {
     /// CTRL_MODE write (mode accepted, hold and post-switch feedback lost; a rollback works).
     pub mute_feedback_after_mode_ack: bool,
     pub mute_feedback: bool,
+    /// Never any feedback frame (register replies still come).
+    pub no_feedback: bool,
     /// Last executed command and when it arrived (fake clock).
     pub last_cmd: Option<MotorCmd>,
     pub last_cmd_at: Option<Instant>,
@@ -76,7 +78,7 @@ impl FakeMotor {
         regs.insert(damiao::RID_TIMEOUT, 0u32.to_le_bytes());
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, silent_after_mode_ack: false,
-            mute_feedback_after_mode_ack: false, mute_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0 }
+            mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0 }
     }
 
     pub fn reg_u32(&self, rid: u8) -> u32 { u32::from_le_bytes(self.regs[&rid]) }
@@ -165,7 +167,7 @@ impl FakeBusState {
     pub fn motor_mut(&mut self, id: u16) -> Option<&mut FakeMotor> { self.motors.iter_mut().find(|m| m.id == id) }
 
     pub fn push_feedback(&mut self, i: usize) {
-        if !self.motors[i].silent && !self.motors[i].mute_feedback {
+        if !self.motors[i].silent && !self.motors[i].mute_feedback && !self.motors[i].no_feedback {
             let f = self.motors[i].feedback_frame();
             self.rx.push_back(f);
         }
@@ -215,7 +217,7 @@ impl FakeBusState {
             let reply = match op {
                 0xCC => {
                     if poll_feeds && m.enabled { m.last_cmd_at = now; }
-                    (!m.mute_feedback).then(|| m.feedback_frame())
+                    (!m.mute_feedback && !m.no_feedback).then(|| m.feedback_frame())
                 }
                 damiao::REG_READ => m.regs.get(&rid).map(|v| m.reg_reply(damiao::REG_READ, rid, *v)),
                 damiao::REG_WRITE => {

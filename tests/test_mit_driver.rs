@@ -364,3 +364,30 @@ fn mit_stale_queued_replies_never_satisfy_a_transaction() {
     });
     assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err(), "stale ACK + feedback confirmed the switch");
 }
+
+/// Review #6: the rollback of a failed switch needs fresh feedback after its acknowledgement too
+/// (here the motor acknowledges register writes but sends no feedback at all): unconfirmed.
+#[test]
+fn mit_rollback_requires_post_ack_feedback() {
+    let (mut d, bus, _) = rig(2000);
+    let hold = hold_at(&mut d);
+    bus.with(|s| s.motors[J4].no_feedback = true);
+    assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err());
+    assert!(d.joint_modes_uncertain(), "rollback confirmed by an acknowledgement alone");
+}
+
+/// Review #6: a hand back (confirmed switch while the fence is armed) after the deadline sends
+/// nothing: no mode write, no hold, no poll.
+#[test]
+fn mit_hand_back_respects_the_fence() {
+    let (mut d, bus, clock) = mit_rig(2000);
+    clock.advance(Duration::from_millis(20));
+    let t = targets(&mut d, 0.0);
+    d.write_joint_targets(&t).unwrap();
+    clock.advance(Duration::from_millis(50)); // past the deadline, nothing read
+    bus.clear_log();
+    let hold = (0..7).map(|i| JointTarget::mit(t[i].position, 0.0, 12.0, 0.4, 0.5)).collect::<Vec<_>>();
+    assert!(d.set_joint_modes_confirmed(&[JointMode::Position; 7], &hold).is_err());
+    assert!(bus.tx_log().is_empty(), "sent after the deadline: {:?}", bus.tx_log());
+    assert!(d.mit_fence_trip().is_some());
+}

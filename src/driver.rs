@@ -2414,14 +2414,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// reply all succeed. Without it the matching reply alone confirms the joint, as before
     /// joint tracking (e4f72b6): hold transmit and flush errors are ignored.
     fn write_modes(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool) -> Vec<usize> {
-        self.write_modes_with(joints, modes, hold, dual_hold, false)
-    }
-
-    /// `write_modes`; `force_strict` applies the strict hold / flush rule whatever
-    /// `strict_mode_handover` says (MIT tracking handover).
-    fn write_modes_with(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool,
-        force_strict: bool) -> Vec<usize> {
-        let strict = self.strict_mode_handover || force_strict;
+        let strict = self.strict_mode_handover;
         self.register_replies.clear();
         self.register_reply_log.clear();
         let mut unsent = Vec::new();
@@ -2542,6 +2535,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Transmit on an MIT transaction: fenced while the fence is armed or tripped.
+    fn tx_mit(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() { self.transmit_fenced(frame) } else { self.transmit_with_retry(frame) }
+    }
+
     /// `transmit_with_retry` with the fence checked before every attempt.
     fn transmit_fenced(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
         let mut retries = 0;
@@ -2606,7 +2604,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut failed: Vec<usize> = Vec::new();
         for &i in joints {
             let id = self.motor_ids[i];
-            if self.transmit_with_retry(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
+            if self.tx_mit(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
                 failed.push(i);
                 continue;
             }
@@ -2618,11 +2616,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 vec![self.pos_vel_frame(i, hold[i].position)]
             };
             for frame in frames {
-                if self.transmit_with_retry(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
+                if self.tx_mit(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
             }
         }
         let mut why = "mode write, hold or flush";
+        let batch_start = self.now();
         if self.can.flush().is_err() { failed = joints.to_vec(); }
+        if failed.is_empty() && self.mit_fence.is_some() && self.fence_check().is_ok() {
+            // the holds are the switched joints' complete commands
+            self.mit_fence_last_tx = Some(batch_start);
+        }
         let sent = self.mark();
         self.mode_write_mark = sent;
         let pending: Vec<usize> = joints.iter().copied().filter(|i| !failed.contains(i)).collect();
@@ -2646,7 +2649,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let missing = unconfirmed(self);
             if missing.is_empty() || self.since(start) >= REGISTER_REPLY_TIMEOUT { break; }
             if !polled && ack_seq.iter().all(Option::is_some) {
-                for &i in &missing { let _ = self.can.transmit(&damiao::build_refresh_frame(self.motor_ids[i])); }
+                for &i in &missing { let _ = self.tx_mit(&damiao::build_refresh_frame(self.motor_ids[i])); }
                 let _ = self.can.flush();
                 polled = true;
             }
@@ -2675,9 +2678,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.control_mode != DamiaoControlMode::PosVel {
             return Err(ArmDriverError::Protocol("joint mode switching needs the POS_VEL base mode".into()));
         }
-        if let Some((reason, _)) = &self.mit_fence_trip {
-            return Err(ArmDriverError::HardwareFault(format!("MIT deadline fence tripped: {reason}; rearm first")));
-        }
+        // armed fence (hand back): the deadline holds for the switch too; tripped: refused
+        self.fence_check().map_err(|e| ArmDriverError::HardwareFault(format!("{e}; rearm first")))?;
         let target: Vec<DamiaoControlMode> = modes.iter().map(|m| match m {
             JointMode::Position => self.control_mode,
             JointMode::Mit => DamiaoControlMode::Mit,
@@ -2704,7 +2706,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         for &i in &changing { self.joint_modes[i] = None; }
         let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.control_mode)).collect();
-        let unrecovered = self.write_modes_with(&changing, &back, hold, true, true);
+        // the rollback is confirmed like the forward switch (acknowledgement + fresh feedback)
+        let (unrecovered, _) = self.write_modes_confirmed(&changing, &back, hold, true);
         Err(ArmDriverError::HardwareFault(format!(
             "Control-mode switch not confirmed for joints {:?} (no {why}); switched back{}",
             failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
