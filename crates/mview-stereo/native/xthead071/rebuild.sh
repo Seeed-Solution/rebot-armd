@@ -2,8 +2,16 @@
 set -eu
 export LC_ALL=C
 
+caller_cwd=$PWD
 src=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-dest=${1:-$src}
+if [ $# -ge 1 ] && [ -n "$1" ]; then
+    case "$1" in
+        /*) dest=$1 ;;
+        *) dest="$caller_cwd/$1" ;;
+    esac
+else
+    dest=$src
+fi
 B=${XUANTIE_BIN:-/home/harve/waste-cvi/host-tools/gcc/riscv64-linux-musl-x86_64/bin}
 P=$B/riscv64-unknown-linux-musl
 
