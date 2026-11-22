@@ -2993,6 +2993,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn clock_now(&self) -> Instant { self.now() }
 
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+        // after a trip the poll obeys the same clearance + quiet-period gate as every other poll
+        if let Some((_, at)) = &self.mit_fence_trip {
+            if !self.poll_tx_allowed() {
+                let remaining = self.mit_fence_holdoff.saturating_sub(self.since(*at));
+                return Err(format!("{}: the motors' command timeout may still be running; no frame is sent for {} ms more after the loss",
+                    crate::mit::QUIET_PERIOD_CODE, remaining.as_millis().max(1)));
+            }
+        }
         let pre = self.rx_boundary().map_err(|e| e.to_string())?;
         for &id in &self.motor_ids.clone() {
             self.can.transmit(&damiao::build_refresh_frame(id)).map_err(|e| format!("status poll not sent: {e}"))?;

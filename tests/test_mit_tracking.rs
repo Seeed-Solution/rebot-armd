@@ -1206,6 +1206,7 @@ fn expired_after_loss() -> (SupervisorInner, FakeBus, armd::transport::MockClock
     inner.tick(DT);
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     bus.with(|s| s.fail_tx_after = None);
+    bus.clear_log(); // from here on the log holds everything sent after the loss
     for _ in 0..8 { clock.advance(std::time::Duration::from_millis(50)); inner.tick(DT); }
     assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled), "J4 did not expire");
     assert!(bus.with(|s| s.motors.iter().enumerate().all(|(i, m)| i == 3 || m.enabled)), "the other motors stay enabled");
@@ -1264,17 +1265,17 @@ fn recovery_commands(log: &[armd::transport::CanFrame]) -> usize {
 /// code and a message that every joint loses torque; nothing but read-only polls goes out.
 #[test]
 fn mit_expiry_recovery_needs_the_operator_confirmation() {
-    let (mut inner, bus, clock) = expired_after_loss();
-    inner.clear_fault_confirmed(false).ok(); // acknowledges the trip (polls may resume)
-    clock.advance(std::time::Duration::from_millis(300));
-    inner.tick(DT);
-    bus.clear_log();
+    let (mut inner, bus, _clock) = expired_after_loss();
+    // the full log since the loss: only read-only polls, no recovery command, no motion
+    let start = bus.tx_log().len();
     let e = inner.clear_fault_confirmed(false).unwrap_err();
     let (code, msg) = match &e { armd::ArmError::Rejected { code, message, .. } => (code.clone(), message.clone()), other => (String::new(), other.to_string()) };
     assert_eq!(code, "MIT_RECOVERY_CONFIRM_REQUIRED", "{e}");
     assert!(msg.contains("torque off on every joint") && msg.to_lowercase().contains("support"), "{msg}");
-    assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery commands without confirmation");
-    assert!(motion_frames(&bus.tx_log()).is_empty());
+    let log = bus.tx_log();
+    assert_eq!(recovery_commands(&log), 0, "recovery commands without confirmation");
+    assert!(motion_frames(&log).is_empty(), "{:?}", motion_frames(&log));
+    assert!(log[start..].iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC), "{:?}", &log[start..]);
     assert!(inner.safety.state().is_stopped());
 }
 
@@ -1343,4 +1344,27 @@ fn mit_rollback_tau_is_the_slew_reference_of_the_next_frame() {
     for w in frames.windows(2) {
         assert!((w[1].4 - w[0].4).abs() <= 15.0 * DT as f32 + lsb_t + 1e-4, "tau_ff stepped {} -> {} (frames {frames:?})", w[0].4, w[1].4);
     }
+}
+
+/// Round 7: a clear_fault inside the post-trip quiet period (>= 250 ms, 2 x measured expiry)
+/// sends nothing at all and is refused with MIT_QUIET_PERIOD; after it the fresh read proceeds.
+#[test]
+fn mit_clear_inside_the_quiet_period_sends_nothing() {
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
+    bus.with(|s| s.fail_tx_after = Some(3));
+    inner.tick(DT);
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    bus.with(|s| s.fail_tx_after = None);
+    bus.clear_log();
+    let e = inner.clear_fault_confirmed(false).unwrap_err();
+    let code = match &e { armd::ArmError::Rejected { code, .. } => code.clone(), other => other.to_string() };
+    assert_eq!(code, "MIT_QUIET_PERIOD", "{e}");
+    assert!(e.to_string().contains("ms"), "{e}");
+    assert!(bus.tx_log().is_empty(), "frames inside the quiet period: {:?}", bus.tx_log());
+    clock.advance(std::time::Duration::from_millis(300));
+    inner.tick(DT);
+    let r = inner.clear_fault_confirmed(false);
+    let polls = bus.tx_log().iter().filter(|f| f.id == 0x7FF && f.data[2] == 0xCC).count();
+    assert!(polls > 0, "no fresh read after the quiet period: {r:?}");
+    assert!(motion_frames(&bus.tx_log()).is_empty(), "{:?}", bus.tx_log());
 }

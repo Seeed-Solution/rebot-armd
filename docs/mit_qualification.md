@@ -24,7 +24,9 @@ commissioned again.
 When MIT tracking is lost and a motor's own TIMEOUT then expires, that motor disables itself and
 reports error 0xD (CAN communication loss) while the other motors stay enabled.
 `/api/v1/safety/clear_fault` (operator session) first reads fresh feedback from every motor and
-decides from it (stale feedback: refused, nothing sent). In the expiry state it needs the
+decides from it (stale feedback: refused, nothing sent). Inside the quiet period after the loss
+(at least 250 ms, 2 × `measured_expiry_ms`) it sends no frame at all and is refused with `409
+MIT_QUIET_PERIOD` and the remaining milliseconds. In the expiry state it needs the
 explicit body `{"mit_recovery": "torque_off_all"}` (without it: `409
 MIT_RECOVERY_CONFIRM_REQUIRED`; the cockpit shows the warning and sends the confirmation only on
 a second tap within 8 s). With it armd recovers under control: it sends the Damiao

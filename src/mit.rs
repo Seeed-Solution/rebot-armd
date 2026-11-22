@@ -46,6 +46,8 @@ pub const RECOVERY_CONFIRM_CODE: &str = "MIT_RECOVERY_CONFIRM_REQUIRED";
 /// What the confirmation accepts: torque goes off on every joint.
 pub const RECOVERY_WARNING: &str = "A motor's command timeout expired after the MIT loss. Clearing recovers by turning torque off on every joint: \
     the arm drops like a park torque-off. Support the arm or bring it to rest, then clear again with {\"mit_recovery\": \"torque_off_all\"}";
+/// Code of a clear_fault refused inside the post-trip quiet period (no frame is sent).
+pub const QUIET_PERIOD_CODE: &str = "MIT_QUIET_PERIOD";
 /// Body value of clear_fault that confirms the MIT expiry recovery.
 pub const RECOVERY_CONFIRM_VALUE: &str = "torque_off_all";
 
@@ -1025,6 +1027,8 @@ impl crate::supervisor::SupervisorInner {
         res.map_err(|e| match e {
             crate::safety::SafetyError::ClearFaultRejected(m) if m.starts_with(RECOVERY_CONFIRM_CODE) =>
                 crate::supervisor::ArmError::Rejected { status: 409, code: RECOVERY_CONFIRM_CODE.into(), message: RECOVERY_WARNING.into() },
+            crate::safety::SafetyError::ClearFaultRejected(m) if m.contains(QUIET_PERIOD_CODE) =>
+                crate::supervisor::ArmError::Rejected { status: 409, code: QUIET_PERIOD_CODE.into(), message: m },
             other => crate::supervisor::ArmError::from(other),
         })
     }
