@@ -950,7 +950,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
         jaw_clear: None,
         depth_angle_deg: None,
         depth_angle_conf: None,
-        depth_width_px: None,
+        depth_width_px: None, contour_norm: None,
     };
     let c = grasp::Centred {
         last: dummy_det.clone(),

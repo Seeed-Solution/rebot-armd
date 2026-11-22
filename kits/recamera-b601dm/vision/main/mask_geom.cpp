@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace rv {
@@ -408,6 +409,167 @@ int select_focus_box(const MaskFocus& focus,
         }
     }
     return best_idx;
+}
+
+namespace {
+
+double seg_dist(const std::array<float, 2>& p, const std::array<float, 2>& a, const std::array<float, 2>& b) {
+    const double dx = b[0] - a[0], dy = b[1] - a[1];
+    const double l2 = dx * dx + dy * dy;
+    double t = l2 < 1e-18 ? 0.0 : ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2;
+    t = std::max(0.0, std::min(1.0, t));
+    const double ex = a[0] + t * dx - p[0], ey = a[1] + t * dy - p[1];
+    return std::sqrt(ex * ex + ey * ey);
+}
+
+// Douglas-Peucker on chain[i..j] (iterative, bounded stack)
+void dp_mark(const Contour& c, size_t i, size_t j, double eps, std::vector<char>& keep) {
+    std::vector<std::pair<size_t, size_t>> st;
+    st.emplace_back(i, j);
+    while (!st.empty()) {
+        auto [a, b] = st.back();
+        st.pop_back();
+        if (b <= a + 1) continue;
+        double best = -1;
+        size_t bi = a;
+        for (size_t k = a + 1; k < b; ++k) {
+            const double d = seg_dist(c[k], c[a], c[b]);
+            if (d > best) {
+                best = d;
+                bi = k;
+            }
+        }
+        if (best > eps) {
+            keep[bi] = 1;
+            st.emplace_back(a, bi);
+            st.emplace_back(bi, b);
+        }
+    }
+}
+
+Contour simplify_closed(const Contour& poly, double eps, int max_vertices) {
+    if (poly.size() <= 3 || max_vertices < 3) return poly;
+    size_t far = 1;
+    double fd = -1;
+    for (size_t k = 1; k < poly.size(); ++k) {
+        const double dx = poly[k][0] - poly[0][0], dy = poly[k][1] - poly[0][1];
+        if (dx * dx + dy * dy > fd) {
+            fd = dx * dx + dy * dy;
+            far = k;
+        }
+    }
+    // the chain far .. n-1, 0 as its own array
+    Contour wrap(poly.begin() + static_cast<long>(far), poly.end());
+    wrap.push_back(poly[0]);
+    double e = std::max(eps, 1e-6);
+    for (;;) {
+        std::vector<char> keep(poly.size(), 0), keep2(wrap.size(), 0);
+        keep[0] = keep[far] = 1;
+        dp_mark(poly, 0, far, e, keep);
+        dp_mark(wrap, 0, wrap.size() - 1, e, keep2);
+        for (size_t k = 0; k + 1 < wrap.size(); ++k)
+            if (keep2[k]) keep[far + k] = 1;
+        Contour out;
+        for (size_t k = 0; k < poly.size(); ++k)
+            if (keep[k]) out.push_back(poly[k]);
+        if (static_cast<int>(out.size()) <= max_vertices) return out;
+        e *= 2;
+    }
+}
+
+}  // namespace
+
+Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int max_vertices, float eps_cells) {
+    Contour out;
+    if (m == nullptr || w <= 0 || h <= 0 || stride < w) return out;
+    // label the 4-connected components; keep the largest
+    std::vector<int> label(static_cast<size_t>(w) * h, 0);
+    std::vector<int> stack;
+    int best = 0, best_n = 0, next = 0;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t s = static_cast<size_t>(y) * w + x;
+            if (!m[static_cast<size_t>(y) * stride + x] || label[s]) continue;
+            const int id = ++next;
+            int n = 0;
+            label[s] = id;
+            stack.push_back(static_cast<int>(s));
+            while (!stack.empty()) {
+                const int k = stack.back();
+                stack.pop_back();
+                ++n;
+                const int kx = k % w, ky = k / w;
+                const int nb[4][2] = {{kx - 1, ky}, {kx + 1, ky}, {kx, ky - 1}, {kx, ky + 1}};
+                for (const auto& q : nb) {
+                    if (q[0] < 0 || q[1] < 0 || q[0] >= w || q[1] >= h) continue;
+                    const size_t qi = static_cast<size_t>(q[1]) * w + q[0];
+                    if (m[static_cast<size_t>(q[1]) * stride + q[0]] && !label[qi]) {
+                        label[qi] = id;
+                        stack.push_back(static_cast<int>(qi));
+                    }
+                }
+            }
+            if (n > best_n) {
+                best_n = n;
+                best = id;
+            }
+        }
+    }
+    if (best == 0) return out;
+    auto at = [&](int x, int y) { return x >= 0 && y >= 0 && x < w && y < h && label[static_cast<size_t>(y) * w + x] == best; };
+    int sx = 0, sy = 0;
+    for (size_t k = 0; k < label.size(); ++k) {
+        if (label[k] == best) {
+            sx = static_cast<int>(k % w);
+            sy = static_cast<int>(k / w);
+            break;
+        }
+    }
+    // crack following, the component on the right: 0 right, 1 down, 2 left, 3 up (y down)
+    static const int D[4][2] = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+    int x = sx, y = sy, d = 0;
+    Contour raw;
+    const size_t limit = 4 * (static_cast<size_t>(w) + 1) * (h + 1) + 8;
+    for (size_t it = 0; it < limit; ++it) {
+        bool fl, fr;
+        switch (d) {
+            case 0: fl = at(x, y - 1); fr = at(x, y); break;
+            case 1: fl = at(x, y); fr = at(x - 1, y); break;
+            case 2: fl = at(x - 1, y); fr = at(x - 1, y - 1); break;
+            default: fl = at(x - 1, y - 1); fr = at(x, y - 1); break;
+        }
+        const int nd = !fr ? (d + 1) % 4 : (fl ? (d + 3) % 4 : d);
+        if (nd != d) raw.push_back({static_cast<float>(x), static_cast<float>(y)});
+        d = nd;
+        if (!fr || fl) {
+            if (x == sx && y == sy && d == 0 && !raw.empty()) break;
+            continue;
+        }
+        x += D[d][0];
+        y += D[d][1];
+        if (x == sx && y == sy && d == 0) break;
+    }
+    // start at the top-left corner of the first cell; drop a repeated closing vertex
+    for (size_t k = 0; k < raw.size(); ++k) {
+        if (raw[k][0] == static_cast<float>(sx) && raw[k][1] == static_cast<float>(sy)) {
+            std::rotate(raw.begin(), raw.begin() + static_cast<long>(k), raw.end());
+            break;
+        }
+    }
+    raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
+    if (raw.size() > 1 && raw.front() == raw.back()) raw.pop_back();
+    return simplify_closed(raw, eps_cells, max_vertices);
+}
+
+void contour_to_frame_norm(Contour& c, const CellToFrame& t) {
+    const float s = t.scale > 0 ? t.scale : 1.0f;
+    const float fw = t.frame_w > 0 ? t.frame_w : 1.0f, fh = t.frame_h > 0 ? t.frame_h : 1.0f;
+    for (auto& p : c) {
+        const float ix = (static_cast<float>(t.crop_x) + p[0]) * t.cell_w;
+        const float iy = (static_cast<float>(t.crop_y) + p[1]) * t.cell_h;
+        p[0] = ((ix - t.pad_x) / s + t.src_x) / fw;
+        p[1] = ((iy - t.pad_y) / s + t.src_y) / fh;
+    }
 }
 
 }  // namespace rv

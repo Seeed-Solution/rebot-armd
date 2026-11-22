@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "depth_geom.h"
+#include "mask_geom.h"  // kMaxContourVertices
 #include "vision_control.h"
 
 namespace rv {
@@ -45,6 +46,8 @@ struct DetBox {
     float depth_width_px = NAN;    ///< depth PCA cross-section width
     bool has_obb = false;
     std::array<std::array<float, 2>, 4> obb_corners{};
+    /** Mask contour normalised to the model input like x, y (mask_geom.h); empty: omitted. */
+    std::vector<std::array<float, 2>> contour{};
 };
 
 /**
@@ -62,7 +65,9 @@ void apply_box_depth(DetBox& d, const BoxDepthResult& r) noexcept;
 
 /**
  * Detections JSON array (the yolo-detector field set) normalised to the content rect,
- * i.e. the visible image, not the letterboxed model input.
+ * i.e. the visible image, not the letterboxed model input. A detection with a mask contour
+ * (3 or more vertices) gets "contour": [[x, y], ...] in the same normalisation, clamped to
+ * [0, 1], at most kMaxContourVertices (128) vertices (about 2 KB per detection).
  */
 std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& rect, int inference_w,
                             int inference_h);

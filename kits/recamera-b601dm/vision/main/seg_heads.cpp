@@ -255,4 +255,21 @@ SegBoxOut seg_box_to_frame(const SegCandidate& c, const SegHeadsInfo& info, cons
     return o;
 }
 
+CellToFrame seg_cells_to_frame(const SegHeadsInfo& info, const LetterboxGeom& g, const SegBoxOut& b, float frame_w,
+                               float frame_h) {
+    CellToFrame t;
+    t.cell_w = info.proto_w > 0 ? static_cast<float>(info.in_w) / info.proto_w : 4.0f;
+    t.cell_h = info.proto_h > 0 ? static_cast<float>(info.in_h) / info.proto_h : 4.0f;
+    t.crop_x = b.crop_x;
+    t.crop_y = b.crop_y;
+    t.pad_x = static_cast<float>(g.pad_x);
+    t.pad_y = static_cast<float>(g.pad_y);
+    t.scale = g.scale;
+    t.src_x = g.src_x;
+    t.src_y = g.src_y;
+    t.frame_w = frame_w;
+    t.frame_h = frame_h;
+    return t;
+}
+
 }  // namespace rv

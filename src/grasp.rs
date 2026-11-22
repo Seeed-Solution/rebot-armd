@@ -944,6 +944,34 @@ pub struct Detection {
     pub depth_angle_deg: Option<f64>,
     pub depth_angle_conf: Option<f64>,
     pub depth_width_px: Option<f64>,
+    /// Exterior contour of the segmentation mask (rebot-vision `contour`, [x, y] normalised to the
+    /// visible image like `box_norm`, at most [`MAX_CONTOUR_VERTICES`]): None when absent,
+    /// Some(Err(reason)) when malformed (that detection's contour only is unusable).
+    pub contour_norm: Option<Result<Vec<[f64; 2]>, String>>,
+}
+
+/// Most vertices a detection contour may have.
+pub const MAX_CONTOUR_VERTICES: usize = 128;
+
+/// A detection's `contour` value: [[x, y], ...] normalised (pixels when the box was in pixels:
+/// divided by `size`), 3..=[`MAX_CONTOUR_VERTICES`] finite vertices within [-0.01, 1.01] (clamped
+/// to [0, 1]) and a non-zero area.
+pub fn parse_contour(v: &Value, pixel: bool, size: [f64; 2]) -> Result<Vec<[f64; 2]>, String> {
+    let arr = v.as_array().ok_or("contour_not_an_array")?;
+    if arr.len() > MAX_CONTOUR_VERTICES { return Err("contour_too_many_vertices".into()); }
+    let (sx, sy) = if pixel { (size[0], size[1]) } else { (1.0, 1.0) };
+    let mut out = Vec::with_capacity(arr.len());
+    for p in arr {
+        let q = p.as_array().filter(|q| q.len() == 2).ok_or("contour_vertex_not_a_pair")?;
+        let (Some(x), Some(y)) = (q[0].as_f64(), q[1].as_f64()) else { return Err("contour_vertex_not_numeric".into()) };
+        let (x, y) = (x / sx, y / sy);
+        if !(x.is_finite() && y.is_finite()) || !(-0.01..=1.01).contains(&x) || !(-0.01..=1.01).contains(&y) {
+            return Err("contour_vertex_out_of_range".into());
+        }
+        out.push([x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)]);
+    }
+    crate::mview_stereo::footprint::validate_polygon(&out, MAX_CONTOUR_VERTICES).map_err(str::to_string)?;
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2140,8 +2168,9 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         let depth_angle_conf = item.is_object().then(|| f(item, &["depth_angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
         let depth_width_px = item.is_object().then(|| f(item, &["depth_width_px"])).flatten().filter(|w| *w > 0.0);
         let raw_score_valid = raw_score_opt.is_some_and(|s| s.is_finite() && (0.0..=1.0).contains(&s));
+        let contour_norm = item.get("contour").filter(|c| !c.is_null()).map(|c| parse_contour(c, pixel, size));
         out.push(Detection { label, score: score.clamp(0.0, 1.0), raw_score_valid, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus, disp_fg, disp_bg, depth_conf, length_px, jaw_clear,
-            depth_angle_deg, depth_angle_conf, depth_width_px });
+            depth_angle_deg, depth_angle_conf, depth_width_px, contour_norm });
     }
     out
 }
@@ -5073,7 +5102,7 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, raw_score_valid: true, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }
+        Detection { label: "cup".into(), score: 0.9, raw_score_valid: true, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None, contour_norm: None }
     }
 
     #[test]
@@ -5659,7 +5688,7 @@ mod tests {
             jaw_clear: Some(true),
             depth_angle_deg: None,
             depth_angle_conf: None,
-            depth_width_px: None,
+            depth_width_px: None, contour_norm: None,
         };
         let meas = measure_detection_depth(&cam, &pose, &det, Some(&depth_info), None, table_z).expect("measurement valid");
         assert!((meas.height_m - 0.04).abs() < 0.005, "height error: {}", (meas.height_m - 0.04).abs());
@@ -5704,7 +5733,7 @@ mod tests {
             jaw_clear: Some(true),
             depth_angle_deg: None,
             depth_angle_conf: None,
-            depth_width_px: None,
+            depth_width_px: None, contour_norm: None,
         };
         let meas = measure_detection_depth_with_cal(&cam, &pose, &det, &cal).expect("valid measurement");
         let expected_w = 30.0 * z_fg / 600.0;
@@ -5796,7 +5825,7 @@ mod tests {
                 jaw_clear: Some(true),
                 depth_angle_deg: None,
                 depth_angle_conf: None,
-                depth_width_px: None,
+                depth_width_px: None, contour_norm: None,
             }],
             depth: None,
             model_generation: None,

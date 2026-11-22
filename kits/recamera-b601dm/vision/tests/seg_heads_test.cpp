@@ -275,7 +275,31 @@ static void test_real(const std::string& dir) {
     CHECK(k45.size() == 2 && k45[0].class_id == 41 && k45[1].class_id == 66);
 }
 
+// seg384: a box's mask crop maps through seg_cells_to_frame like its box through seg_box_to_frame
+static void test_seg384_contour_mapping() {
+    const LetterboxGeom g = letterbox_geom(0, 140, 640, 360, 640, 384);
+    SegHeadsInfo info;
+    info.in_w = 640;
+    info.in_h = 384;
+    info.proto_w = 160;
+    info.proto_h = 96;
+    SegCandidate c;
+    c.x0 = 100;
+    c.y0 = 52;
+    c.x1 = 200;
+    c.y1 = 112;
+    const SegBoxOut b = seg_box_to_frame(c, info, g, 640, 640);
+    Contour corners = {{0, 0}, {static_cast<float>(b.crop_w), 0}, {static_cast<float>(b.crop_w), static_cast<float>(b.crop_h)}};
+    contour_to_frame_norm(corners, seg_cells_to_frame(info, g, b, 640, 640));
+    // crop cells are whole cells around the box: x 100..200 -> cells 25..50, y 52..112 -> 13..28
+    CHECK(std::abs(corners[0][0] - 100.0f / 640) < 1e-6 && std::abs(corners[0][1] - (52.0f - 12 + 140) / 640) < 1e-6);
+    CHECK(std::abs(corners[2][0] - 200.0f / 640) < 1e-6 && std::abs(corners[2][1] - (112.0f - 12 + 140) / 640) < 1e-6);
+    // the box centre (frame-normalised) lies inside the mapped crop
+    CHECK(b.y > corners[0][1] && b.y < corners[2][1]);
+}
+
 int main(int argc, char** argv) {
+    test_seg384_contour_mapping();
     test_layout();
     test_dfl_logit();
     test_prefilter_synthetic();

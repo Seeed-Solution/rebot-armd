@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -67,5 +68,37 @@ void decode_crop_mask(
     uint8_t* out_mask,
     float* scratch_acc = nullptr
 );
+
+/** Most vertices of a detection contour (the perception API's bound; armd refuses more). */
+constexpr int kMaxContourVertices = 128;
+
+using Contour = std::vector<std::array<float, 2>>;
+
+/**
+ * Exterior contour of the largest 4-connected component of a binary mask (`w` x `h`, `stride`
+ * bytes per row, non-zero = set), traced along the cell edges: vertices at cell corners in cell
+ * units of the mask (its top-left corner at 0, 0), clockwise in image coordinates. Simplified by
+ * Douglas-Peucker from `eps_cells`, the tolerance doubling until at most `max_vertices` remain.
+ * Empty for an empty mask. Allocation only for the component labels (w x h ints).
+ */
+Contour mask_exterior_contour(const uint8_t* m, int w, int h, int stride, int max_vertices = kMaxContourVertices,
+                              float eps_cells = 0.7f);
+
+/**
+ * Where mask cells land in the detection's normalised frame: cell (u, v) of a crop starting at
+ * prototype cell (crop_x, crop_y) is model-input pixel ((crop_x + u) * cell_w, (crop_y + v) * cell_h),
+ * frame pixel (input - pad) / scale + src, then divided by the frame size (the space of Detection
+ * x, y). The 640-square model: cell 4, pad 0, scale 1, src 0, frame 640x640 (VPSS letterboxed the
+ * content already); the 10-output seg model: its LetterboxGeom (seg384: pad_y 12).
+ */
+struct CellToFrame {
+    float cell_w = 4, cell_h = 4;
+    int crop_x = 0, crop_y = 0;
+    float pad_x = 0, pad_y = 0;
+    float scale = 1;
+    float src_x = 0, src_y = 0;
+    float frame_w = 640, frame_h = 640;
+};
+void contour_to_frame_norm(Contour& c, const CellToFrame& t);
 
 }  // namespace rv

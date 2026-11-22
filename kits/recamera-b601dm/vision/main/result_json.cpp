@@ -1,5 +1,6 @@
 #include "result_json.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <iomanip>
@@ -93,6 +94,18 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         if (std::isfinite(d.depth_angle_conf))
             s << ",\"depth_angle_conf\":" << std::setprecision(3) << d.depth_angle_conf;
         if (std::isfinite(d.depth_width_px)) s << ",\"depth_width_px\":" << std::setprecision(2) << d.depth_width_px;
+        if (d.contour.size() >= 3) {
+            s << ",\"contour\":[" << std::setprecision(4);
+            const size_t n = std::min(d.contour.size(), static_cast<size_t>(kMaxContourVertices));
+            for (size_t k = 0; k < n; ++k) {
+                if (k) s << ',';
+                const float cu = (d.contour[k][0] * inference_w - rect.x) / rw;
+                const float cv = (d.contour[k][1] * inference_h - rect.y) / rh;
+                s << '[' << std::min(1.0f, std::max(0.0f, std::isfinite(cu) ? cu : 0.0f)) << ','
+                  << std::min(1.0f, std::max(0.0f, std::isfinite(cv) ? cv : 0.0f)) << ']';
+            }
+            s << ']';
+        }
         s << '}';
     }
     s << ']';
