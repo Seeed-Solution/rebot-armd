@@ -341,3 +341,26 @@ async fn mit_record_is_invalidated_on_disk_before_the_zero_and_a_failed_write_re
     let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
     assert!(file.mit_record().unwrap().unwrap().invalidated.is_some());
 }
+
+/// Review round 3, #4: a software zero refused by its own validation (offset beyond the limit)
+/// leaves the MIT qualification valid: validation runs before the invalidation.
+#[tokio::test]
+async fn refused_software_zero_does_not_invalidate_the_mit_record() {
+    let with_record = |dir: &Path| {
+        let mut file = CalibrationFile { joint_zero: Some(armd::joint_zero::JointZero::new(&[0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0], "software", "rest")), ..Default::default() };
+        file.mit_qualification = Some(mit_record_j2());
+        std::fs::write(dir.join("calibration.json"), serde_json::to_string(&file).unwrap()).unwrap();
+    };
+    let mut r = rig(None, with_record).await;
+    let mut q = Q;
+    q[1] = 1.5; // offset 2.0 + reading 1.5 is beyond the joint zero offset limit (pi)
+    set_q(&r, q).await;
+    let rej = cmd(&mut r, PATH, json!({"joints": [2], "force": true, "method": "software"})).await;
+    assert_eq!(rej["type"], "command_reject", "{rej}");
+    assert!(rej["message"].as_str().unwrap_or("").contains("nothing was changed"), "{rej}");
+    let inner = r.sup.inner().read().await;
+    assert!(inner.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_none(), "record invalidated by a refused zero");
+    drop(inner);
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.mit_record().unwrap().unwrap().invalidated.is_none(), "record invalidated on disk by a refused zero");
+}

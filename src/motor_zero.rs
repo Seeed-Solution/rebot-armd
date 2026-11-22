@@ -250,8 +250,6 @@ fn zero_entry(inner: &SupervisorInner, new: &[f32], method: &str) -> Option<Opti
 
 /// The real run (after [`check`]; the caller holds the busy flags and clears them afterwards).
 pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
-    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
-    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, req.method.as_deref().unwrap_or("motor")).await?;
     if req.method.as_deref() == Some("software") { return run_software(sup, deps, req, check).await; }
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. readings, then disable every motor (official sequence), torque stays off
@@ -281,6 +279,10 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
         }
         tokio::time::sleep(POLL).await;
     }
+    // every check passed: invalidate a qualification of the zeroed joints on disk before the
+    // first zero command (a failed write refuses the zero, nothing changed)
+    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "motor").await?;
     // 3. one set-zero command per joint, spaced; the joint zero offset of each zeroed joint
     // becomes -reference (the motor reads 0 at the reference)
     let mut sent: Vec<(usize, Instant)> = Vec::new();
@@ -363,6 +365,9 @@ async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: Mot
     if let Some(j) = req.joints.iter().find(|&&j| f64::from(new[j].abs()) > crate::joint_zero::MAX_OFFSET_RAD) {
         return Err(CalibError::new(409, "MOTOR_ZERO_FAR", format!("J{} would need a joint zero offset of {:.1} deg; nothing was changed", j + 1, f64::from(new[*j]).to_degrees())));
     }
+    // validated: invalidate a qualification of the zeroed joints on disk first
+    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "software").await?;
     // 3. backup, 4. install, 5. verify, 6. store + invalidate, log
     let backup = write_zero_backup(deps, "software_zero", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
     let t_apply = locked_step(sup, check, "apply", |inner| {
