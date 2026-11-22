@@ -366,3 +366,52 @@ fn thresholds_on_a_dim_glossy_scene() {
         }
     }
 }
+
+/// The shared-image entry points give the copy-and-rebuild results bitwise: pose refinement with
+/// shared half images (texture on and off), reconstruction with refined cameras and shared half
+/// images (no image copies) against reconstruct on copied views, nonzero and zero references,
+/// half images of the wrong length (rebuilt) and no camera override.
+#[test]
+fn shared_half_images_and_cameras_match_copied_views() {
+    let b = BoxObj { xy: [0.30, 0.01], yaw: 0.3, size: [0.05, 0.03, 0.04] };
+    let scene = Scene::new(0.0, vec![b]);
+    let pivot = [0.30, 0.01, 0.02];
+    let el = 55f64.to_radians();
+    let cam0 = render::look_at([pivot[0] - 0.35 * el.cos(), pivot[1], pivot[2] + 0.35 * el.sin()], pivot, FX, SIZE);
+    let offsets = armd::measure_multiview::view_offsets(5, 0.08, armd::measure_multiview::Axes::X);
+    let mut views: Vec<View> = offsets.iter().enumerate().map(|(i, o)| {
+        let cam = render::orbit_xy(&cam0, pivot, *o);
+        View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 40 + i as u64), cam }
+    }).collect();
+    // a small rotation error per non-start view, as the kinematics leaves it
+    for (i, v) in views.iter_mut().enumerate() {
+        let axis = kinematics::unit(&[1.0, -0.7, 0.4 * i as f64]);
+        v.cam.r = kinematics::mat_mul(&kinematics::axis_r(&axis, 0.0004 * i as f64), &v.cam.r);
+    }
+    let strip = |mut s: mview_stereo::Stats| { (s.pyramid_ms, s.features_ms, s.sweep_ms, s.refine_ms, s.triangulate_ms, s.total_ms) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0); s };
+    let halves = mview_stereo::half_images(&views);
+    for reference in [offsets.iter().position(|o| o[0] == 0.0 && o[1] == 0.0).unwrap(), 0] {
+        let bx = render::box_px(&scene, &b, &views[reference].cam);
+        let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
+        let region = [bx[0] - 0.25 * w - 12.0, bx[1] - 0.25 * h - 12.0, bx[2] + 0.25 * w + 12.0, bx[3] + 0.25 * h + 12.0];
+        let p = Params::new(0.0);
+        let pp = mview_stereo::PoseParams::default();
+        for texture in [true, false] {
+            let a = mview_stereo::refine_views(&views, reference, bx, &[], 0.0, &[], texture, &pp);
+            let s = mview_stereo::refine_views_with_halves(&views, &halves, reference, bx, &[], 0.0, &[], texture, &pp);
+            assert_eq!((&a.cams, &a.views, a.n_corrs), (&s.cams, &s.views, s.n_corrs), "reference {reference} texture {texture}");
+            let s2 = mview_stereo::refine_views_with_halves(&views, &halves[..2], reference, bx, &[], 0.0, &[], texture, &pp);
+            assert_eq!((&a.cams, &a.views), (&s2.cams, &s2.views));
+            let copied: Vec<View> = views.iter().zip(&a.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
+            let r0 = mview_stereo::reconstruct(&copied, reference, region, bx, &p);
+            for hv in [&halves[..], &halves[..3]] {
+                let r1 = mview_stereo::reconstruct_shared(&views, Some(&a.cams), hv, reference, region, bx, &p);
+                assert!(r0.points.len() > 20, "{:?}", r0.stats);
+                assert_eq!((&r0.points, &r0.outcomes, strip(r0.stats)), (&r1.points, &r1.outcomes, strip(r1.stats)), "reference {reference}");
+            }
+        }
+        let r0 = mview_stereo::reconstruct(&views, reference, region, bx, &p);
+        let r1 = mview_stereo::reconstruct_shared(&views, None, &halves, reference, region, bx, &p);
+        assert_eq!((&r0.points, &r0.outcomes, strip(r0.stats)), (&r1.points, &r1.outcomes, strip(r1.stats)));
+    }
+}

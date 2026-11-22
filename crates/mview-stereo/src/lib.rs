@@ -59,7 +59,7 @@ pub use ncc_backend::{
     backend_diagnostics, kernel_counts, reset_kernel_counts, BackendDiagnostics, KernelCallCounts,
     NccBackendKind,
 };
-pub use pose::{marker_corrs, refine_poses, refine_views, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
+pub use pose::{marker_corrs, refine_poses, refine_views, refine_views_with_halves, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
 #[cfg(feature = "mview-profile")]
 pub use pose::{PosePassProfile, PoseProfile};
 
@@ -361,7 +361,7 @@ pub struct Stats {
     pub edge_points: usize,
     /// Edge points that passed the consistency check.
     pub edge_consistent: usize,
-    /// Half-resolution images.
+    /// Half-resolution images (built here; ~0 when shared, [`reconstruct_shared`]).
     pub pyramid_ms: f64,
     pub features_ms: f64,
     /// Coarse and fine ray sweeps, left-right back sweeps included.
@@ -1001,8 +1001,12 @@ impl Spacing {
 struct PView<'a> {
     cam: Camera,
     full: &'a Gray,
-    half: Gray,
+    half: &'a Gray,
 }
+
+/// The half-resolution image ([`Gray::half`]) of every view, for [`refine_views_with_halves`]
+/// and [`reconstruct_shared`].
+pub fn half_images(views: &[View]) -> Vec<Gray> { views.iter().map(|v| v.img.half()).collect() }
 
 enum SweepEnd { NoPeak, Ambiguous }
 
@@ -1057,7 +1061,7 @@ fn sweep(src: &Camera, px: [f64; 2], tc: &Tmpl, tf: Option<&Tmpl>, targets: &[&P
         let mut sum = 0.0f32;
         let mut ok = true;
         for (v, pr) in targets.iter().zip(&proj) {
-            match pr.at(w).and_then(|q| { let h = to_half(q); ncc(&v.half, tc, h[0], h[1], false) }) {
+            match pr.at(w).and_then(|q| { let h = to_half(q); ncc(v.half, tc, h[0], h[1], false) }) {
                 Some(c) => sum += c,
                 None => { ok = false; break; }
             }
@@ -1269,6 +1273,18 @@ pub fn reconstruct(views: &[View], reference: usize, region: [f64; 4], object_bo
 /// [`reconstruct`] with `perturb(view index, pixel)` applied to every matched pixel before the
 /// triangulation (the tests add localisation noise with it).
 pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
+    perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
+    reconstruct_impl(views, None, None, reference, region, object_box, p, perturb)
+}
+
+/// [`reconstruct`] with the cameras `cams` (None: the views' cameras; e.g. the refined ones of
+/// [`refine_views_with_halves`]) and the views' half-resolution images `halves`
+/// ([`half_images`]; built here when of another length): no image is copied or built twice.
+pub fn reconstruct_shared(views: &[View], cams: Option<&[Camera]>, halves: &[Gray], reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params) -> Reconstruction {
+    reconstruct_impl(views, cams, Some(halves), reference, region, object_box, p, |_, q| q)
+}
+
+fn reconstruct_impl(views: &[View], cams: Option<&[Camera]>, halves: Option<&[Gray]>, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
     mut perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
     let t_all = Instant::now();
     let mut rec = Reconstruction::default();
@@ -1284,8 +1300,16 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     #[cfg(feature = "mview-profile")]
     let _ = stage_prof::take();
     let t0 = Instant::now();
-    let pv: Vec<PView> = views.iter().map(|v| PView { cam: v.cam, full: &v.img, half: v.img.half() }).collect();
-    let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
+    let owned: Vec<Gray>;
+    let halves: &[Gray] = match halves {
+        Some(h) if h.len() == views.len() => h,
+        _ => { owned = half_images(views); &owned }
+    };
+    let cams: Vec<Camera> = match cams {
+        Some(c) if c.len() == views.len() => c.to_vec(),
+        _ => views.iter().map(|v| v.cam).collect(),
+    };
+    let pv: Vec<PView> = views.iter().zip(halves).zip(&cams).map(|((v, h), c)| PView { cam: *c, full: &v.img, half: h }).collect();
     rec.stats.pyramid_ms = ms(t0);
     let rv = &pv[reference];
     let others: Vec<usize> = (0..views.len()).filter(|i| *i != reference).collect();
@@ -1323,7 +1347,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         let swept = if f.normal.is_none() { corner_sweep.clone() } else { spread(&cams, &valid, &rv.cam.c, SWEEP_VIEWS) };
         let hq = to_half(px);
         let (Some(tc), Some(tf)) = (
-            sample_bilinear(&rv.half, hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, f.normal, f.side)),
+            sample_bilinear(rv.half, hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, f.normal, f.side)),
             make_tmpl(sample_int(rv.full, f.x, f.y, PATCH_R), PATCH_R, f.normal, f.side),
         ) else { rec.stats.no_peak += 1; rec.outcomes.push((f, "flat")); continue; };
         let t0 = Instant::now();
@@ -1360,7 +1384,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
                 // left-right: this view's patch swept back (coarse) along its own ray into the reference
                 let t0 = Instant::now();
                 let hq = to_half(q);
-                let back = sample_bilinear(&v.half, hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, f.normal, f.side))
+                let back = sample_bilinear(v.half, hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, f.normal, f.side))
                     .and_then(|tb| sweep(&v.cam, q, &tb, None, &[rv], z_lo, z_hi, p).ok())
                     .and_then(|wb| { let db = v.cam.ray(q); rv.cam.project(&v.cam.at_inv_depth(&db, wb)) });
                 rec.stats.sweep_ms += ms(t0);

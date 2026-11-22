@@ -1192,16 +1192,23 @@ struct PreparedFeat {
     tf: Tmpl,
 }
 
-struct TexturePrep {
+struct TexturePrep<'h> {
     reference: usize,
-    halves: Vec<Gray>,
+    /// Half-resolution image per view: built here, or shared with the reconstruction.
+    halves: std::borrow::Cow<'h, [Gray]>,
     feats: Vec<PreparedFeat>,
 }
 
-impl TexturePrep {
+impl<'h> TexturePrep<'h> {
     fn new(views: &[View], ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+        Self::with_halves(views, None, ref_cam, reference, object_box, exclude, table_z)
+    }
+
+    /// [`TexturePrep::new`] with the views' half-resolution images (`halves[i]` = `views[i].img.half()`;
+    /// built here when None or of another length).
+    fn with_halves(views: &[View], halves: Option<&'h [Gray]>, ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
         if reference >= views.len() || views.len() < 2 {
-            return Self { reference, halves: Vec::new(), feats: Vec::new() };
+            return Self { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() };
         }
         let rv = &views[reference];
         let m = POSE_BOX_MARGIN_PX;
@@ -1222,7 +1229,10 @@ impl TexturePrep {
             .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
         t.stop("prep.features_ms");
         let t = ProfT::start();
-        let halves: Vec<Gray> = views.iter().map(|v| v.img.half()).collect();
+        let halves: std::borrow::Cow<'h, [Gray]> = match halves {
+            Some(h) if h.len() == views.len() => std::borrow::Cow::Borrowed(h),
+            _ => std::borrow::Cow::Owned(half_images(views)),
+        };
         t.stop("prep.halves_ms");
         let t = ProfT::start();
         let mut feats = Vec::new();
@@ -1813,6 +1823,16 @@ fn init_points(cams: &[Camera], corrs: &[Corr], table_z: f64) -> Vec<Vec3> {
 /// `guided_window_px` of the prediction of the refined cameras (views the first solve did not
 /// refine keep `window_px`), and solved again from the kinematic cameras.
 pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+    refine_views_impl(views, None, reference, object_box, exclude, table_z, extra, texture, pp)
+}
+
+/// [`refine_views`] with the views' half-resolution images ([`half_images`]), shared with
+/// [`reconstruct_shared`] so that they are built once.
+pub fn refine_views_with_halves(views: &[View], halves: &[Gray], reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+    refine_views_impl(views, Some(halves), reference, object_box, exclude, table_z, extra, texture, pp)
+}
+
+fn refine_views_impl(views: &[View], halves: Option<&[Gray]>, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
     let t0 = Instant::now();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
@@ -1821,8 +1841,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     #[cfg(feature = "mview-profile")]
     let t_prep = Instant::now();
     let prep = texture.then(|| match cams.get(reference) {
-        Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
-        None => TexturePrep { reference, halves: Vec::new(), feats: Vec::new() },
+        Some(rc) => TexturePrep::with_halves(views, halves, rc, reference, object_box, exclude, table_z),
+        None => TexturePrep { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() },
     });
     #[cfg(feature = "mview-profile")]
     let prep_ms = if texture { ms(t_prep) } else { 0.0 };
