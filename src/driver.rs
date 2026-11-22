@@ -2146,13 +2146,11 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Register replies with the CAN ID they arrived on and their receive instant (MIT
     /// identity readback and TIMEOUT commissioning).
     register_reply_log: Vec<(damiao::RegisterReply, u32, Instant, u64, u64)>,
-    /// Event counter value of the last observed-empty RX queue: the enqueue lower bound of every
-    /// frame dequeued after it (a frame with bound > a request mark was enqueued after it).
+    /// RX sequence number of the last observed-empty receive queue: every frame dequeued after
+    /// it (sequence number larger) was enqueued after that observation.
     rx_empty_seq: u64,
-    /// Enqueue bound of each joint's last feedback.
-    last_feedback_bound: Vec<u64>,
-    /// Event mark taken right after the last mode writes and holds were sent.
-    mode_write_mark: u64,
+    /// The last `read_joint_states` observed an empty receive queue.
+    last_read_drained: bool,
     /// Deterministic clock of the CAN transport (tests); None = the system clock.
     clock: Option<std::sync::Arc<dyn crate::transport::DriverClock>>,
     /// Sequence number of the last processed RX frame, and of each joint's last feedback.
@@ -2212,8 +2210,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             rx_seq: 0,
             last_feedback_seq: vec![0; dof],
             rx_empty_seq: 0,
-            last_feedback_bound: vec![0; dof],
-            mode_write_mark: 0,
+            last_read_drained: false,
             mit_fence: None,
             mit_fence_last_tx: None,
             mit_fence_trip: None,
@@ -2476,21 +2473,27 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         failed
     }
 
-    /// Event mark after a request was sent: a reply counts only when its enqueue bound is larger.
-    fn mark(&mut self) -> u64 {
-        self.rx_seq += 1;
-        self.rx_seq
+    /// Receive boundary of an MIT transaction, established before its requests go out: read until
+    /// the receive queue is observed empty (bounded). Every frame dequeued afterwards (RX sequence
+    /// number larger than the returned one) was enqueued after the boundary, so frames queued
+    /// before the transaction never count, and a reply arriving right after its request does.
+    fn rx_boundary(&mut self) -> Result<u64, ArmDriverError> {
+        for _ in 0..8 {
+            let _ = self.read_joint_states();
+            if self.last_read_drained { return Ok(self.rx_empty_seq); }
+        }
+        Err(ArmDriverError::HardwareFault("receive queue not drained: no boundary for the register transaction".into()))
     }
 
     /// Bounded reply wait (MIT transactions): poll until every `(joint, write, rid)` has a reply
-    /// whose enqueue bound is after `sent`, or REGISTER_REPLY_TIMEOUT passes.
+    /// dequeued after the boundary `pre`, or REGISTER_REPLY_TIMEOUT passes.
     fn await_replies_after(&mut self, expected: &[(usize, bool, u8)], sent: u64) {
         let start = self.now();
         loop {
             let _ = self.read_joint_states();
             let all = expected.iter().all(|&(i, write, rid)| {
                 let id = self.motor_ids[i];
-                self.register_reply_log.iter().any(|(r, _, _, _, b)| r.motor_id == id && r.write == write && r.rid == rid && *b > sent)
+                self.register_reply_log.iter().any(|(r, _, _, seq, _)| r.motor_id == id && r.write == write && r.rid == rid && *seq > sent)
             });
             if all || self.since(start) >= REGISTER_REPLY_TIMEOUT { return; }
             self.pause(Duration::from_micros(500));
@@ -2573,18 +2576,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// (value, reply CAN ID) per RID.
     fn read_registers_fresh(&mut self, i: usize, rids: &[u8]) -> Result<Vec<([u8; 4], u32)>, ArmDriverError> {
         let id = self.motor_ids[i];
+        let sent = self.rx_boundary()?;
         self.register_replies.clear();
         self.register_reply_log.clear();
         for &rid in rids {
             self.transmit_with_retry(&damiao::build_read_register_frame(id, rid))?;
         }
         self.can.flush()?;
-        let sent = self.mark();
         let expected: Vec<(usize, bool, u8)> = rids.iter().map(|&rid| (i, false, rid)).collect();
         self.await_replies_after(&expected, sent);
         rids.iter().map(|&rid| {
             self.register_reply_log.iter().rev()
-                .find(|(r, _, _, _, bound)| r.motor_id == id && !r.write && r.rid == rid && *bound > sent)
+                .find(|(r, _, _, seq, _)| r.motor_id == id && !r.write && r.rid == rid && *seq > sent)
                 .map(|(r, fid, _, _, _)| (r.value, *fid))
                 .ok_or_else(|| ArmDriverError::HardwareFault(format!("Joint {} (CAN ID 0x{id:X}) did not answer the read of register {rid}", i + 1)))
         }).collect()
@@ -2611,6 +2614,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// succeed. Returns the joints not confirmed (their mode becomes unknown) and why.
     fn write_modes_confirmed(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool)
         -> (Vec<usize>, &'static str) {
+        let Ok(sent) = self.rx_boundary() else {
+            for &i in joints { self.joint_modes[i] = None; }
+            return (joints.to_vec(), "receive boundary (queue not drained)");
+        };
         self.register_replies.clear();
         self.register_reply_log.clear();
         let mut failed: Vec<usize> = Vec::new();
@@ -2638,21 +2645,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // the holds are the switched joints' complete commands
             self.mit_fence_last_tx = Some(batch_start);
         }
-        let sent = self.mark();
-        self.mode_write_mark = sent;
         let pending: Vec<usize> = joints.iter().copied().filter(|i| !failed.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = pending.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
         self.await_replies_after(&expected, sent);
         let ack_seq: Vec<Option<u64>> = pending.iter().map(|&i| {
             let (id, want) = (self.motor_ids[i], Self::mode_value(modes[i]));
             self.register_reply_log.iter().rev()
-                .find(|(r, _, _, _, b)| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE && *b > sent && r.as_u32() == want)
+                .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE && *seq > sent && r.as_u32() == want)
                 .map(|(_, _, _, seq, _)| *seq)
         }).collect();
         if ack_seq.iter().any(Option::is_none) { why = "matching acknowledgement received after the mode write"; }
         let unconfirmed = |d: &Self| -> Vec<usize> {
             pending.iter().zip(&ack_seq)
-                .filter(|(&i, ack)| !ack.is_some_and(|a| d.last_feedback_seq[i] > a && d.last_feedback_bound[i] > sent))
+                .filter(|(&i, ack)| !ack.is_some_and(|a| d.last_feedback_seq[i] > a))
                 .map(|(&i, _)| i).collect()
         };
         let start = self.now();
@@ -2737,15 +2742,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(ArmDriverError::HardwareFault(format!("joint {}: register replies on 0x{:X} but MST_ID {}", i + 1, before.reply_id, before.mst_id)));
             }
             // RAM write (0x55), checked acknowledgement
+            let sent = self.rx_boundary()?;
             self.register_replies.clear();
             self.register_reply_log.clear();
             *written = true;
             self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
             self.can.flush()?;
-            let sent = self.mark();
             self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
             let ack = self.register_reply_log.iter().rev()
-                .find(|(r, _, _, _, b)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *b > sent).copied();
+                .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *seq > sent).copied();
             let Some((ack, ack_id, _, _, _)) = ack else {
                 return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{id:X}) did not acknowledge the TIMEOUT write", i + 1)));
             };
@@ -3370,6 +3375,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let t0 = self.now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
+        self.last_read_drained = false;
         while frames_processed < 64 && self.since(t0) < MAX_RX_DURATION {
             match self.can.receive() {
                 Ok(frame) => {
@@ -3439,7 +3445,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             };
                             self.last_feedback_instant[idx] = Some(self.now());
                             self.last_feedback_seq[idx] = self.rx_seq;
-                            self.last_feedback_bound[idx] = self.rx_empty_seq;
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
@@ -3449,6 +3454,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
+                    self.last_read_drained = true;
                     self.rx_seq += 1;
                     self.rx_empty_seq = self.rx_seq;
                     if self.awaiting_rx_boundary {

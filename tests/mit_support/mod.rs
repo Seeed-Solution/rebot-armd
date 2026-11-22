@@ -136,6 +136,8 @@ pub struct FakeBusState {
     pub inject_on_next_tx: Vec<CanFrame>,
     /// The same, on the next register write (0x7FF, opcode 0x55).
     pub inject_on_reg_write: Vec<CanFrame>,
+    /// Replies enter the receive queue at once (no observed-empty queue between request and reply).
+    pub immediate_replies: bool,
     /// Every frame the driver handed to the transport (also the lost and refused ones), with the
     /// fake time.
     pub tx_log: Vec<CanFrame>,
@@ -284,7 +286,7 @@ impl FakeBus {
 
     fn build(limits: &[DamiaoLimits], clock: Option<MockClock>) -> Self {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
-        Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), tx_log: Vec::new(), tx_times: Vec::new(), clock,
+        Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), immediate_replies: false, tx_log: Vec::new(), tx_times: Vec::new(), clock,
             tx_lost: false, tx_error: false, tx_stall: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
             fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
     }
@@ -323,8 +325,10 @@ impl CanTransport for FakeBus {
         if !s.tx_lost {
             let before = s.rx.len();
             s.handle(frame);
-            let replies: Vec<CanFrame> = s.rx.drain(before..).collect();
-            s.pending.extend(replies);
+            if !s.immediate_replies {
+                let replies: Vec<CanFrame> = s.rx.drain(before..).collect();
+                s.pending.extend(replies);
+            }
         }
         Ok(())
     }

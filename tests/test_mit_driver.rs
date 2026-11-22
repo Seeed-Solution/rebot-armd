@@ -322,8 +322,9 @@ fn reg_reply(id: u16, op: u8, rid: u8, value: [u8; 4]) -> CanFrame {
 }
 
 /// Review #2: replies that were already queued when a request went out (stale) never satisfy a
-/// register read, a TIMEOUT acknowledgement or a mode-switch confirmation; only a reply received
-/// after the queue was observed empty after the request counts. The real reply is withheld.
+/// register read, a TIMEOUT acknowledgement or a mode-switch confirmation: each transaction first
+/// drains the receive queue to an observed-empty boundary, and only frames dequeued after it count.
+/// The real replies are withheld; the stale ones are queued before the transaction's boundary.
 #[test]
 fn mit_stale_queued_replies_never_satisfy_a_transaction() {
     let limits = b601_limits()[J4];
@@ -337,37 +338,54 @@ fn mit_stale_queued_replies_never_satisfy_a_transaction() {
         }
         v
     };
-    // identity readback: J4 silent, a full set of old matching replies queued ahead
-    let (mut d, bus, _) = rig(0);
-    bus.with(|s| { s.motors[J4].silent = true; s.inject_on_next_tx = stale_identity(4); });
-    assert!(d.read_motor_identity(&[J4]).is_err(), "stale replies satisfied the identity read");
+    for immediate in [false, true] {
+        // identity readback: J4 silent, a full set of old matching replies queued
+        let (mut d, bus, _) = rig(0);
+        bus.with(|s| { s.immediate_replies = immediate; s.motors[J4].silent = true; s.rx.extend(stale_identity(4)); });
+        assert!(d.read_motor_identity(&[J4]).is_err(), "stale replies satisfied the identity read");
 
-    // TIMEOUT write: an old matching acknowledgement queued, the real one withheld
+        // TIMEOUT write: an old matching acknowledgement queued, the real one withheld
+        let (mut d, bus, _) = rig(0);
+        bus.with(|s| {
+            s.immediate_replies = immediate;
+            s.motors[J4].no_write_ack = true;
+            // queued with the identity read of the same call, i.e. before the write's boundary
+            s.inject_on_next_tx = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_TIMEOUT, 2000u32.to_le_bytes())];
+        });
+        assert!(d.commission_motor_timeout(&[J4], 2000).is_err(), "a stale acknowledgement satisfied the TIMEOUT write");
+
+        // confirmed mode switch: an old CTRL_MODE acknowledgement and an old feedback queued, the
+        // motor answers nothing after the switch
+        let (mut d, bus, _) = rig(2000);
+        let hold = hold_at(&mut d);
+        let fb = bus.with(|s| s.motors[J4].feedback_frame());
+        bus.with(|s| {
+            s.immediate_replies = immediate;
+            s.motors[J4].no_write_ack = true;
+            s.motors[J4].mute_feedback = true;
+            // queued with the MIT range read that precedes the mode write
+            s.inject_on_next_tx = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT.to_le_bytes()), fb];
+        });
+        assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err(), "stale ACK + feedback confirmed the switch");
+    }
+}
+
+/// Review round 3, #2: a genuine reply that arrives right after its request (before the driver
+/// observes an empty queue again) counts: TIMEOUT write, identity read and mode switch succeed
+/// with immediate replies.
+#[test]
+fn mit_immediate_replies_are_accepted() {
     let clock = MockClock::new();
     let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    bus.with(|s| s.immediate_replies = true);
     let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap();
     bus.with(|s| s.push_all_feedback());
-    let _ = d.read_joint_states();
-    let _ = d.read_joint_states();
-    bus.with(|s| {
-        s.motors[J4].no_write_ack = true;
-        s.inject_on_reg_write = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_TIMEOUT, 2000u32.to_le_bytes())];
-    });
-    let res = d.commission_motor_timeout(&[J4], 2000);
-    assert!(res.is_err(), "a stale acknowledgement satisfied the TIMEOUT write");
-
-    // confirmed mode switch: an old CTRL_MODE acknowledgement and an old feedback queued, the
-    // motor answers nothing after the switch
-    let (mut d, bus, _) = rig(2000);
+    d.read_joint_states().unwrap();
+    let res = d.commission_motor_timeout(&[J4], 2000).expect("immediate ACK accepted");
+    assert_eq!(res[0].readback.timeout_raw, 2000);
+    d.set_torque(true).unwrap();
     let hold = hold_at(&mut d);
-    let fb = bus.with(|s| s.motors[J4].feedback_frame());
-    bus.with(|s| {
-        s.motors[J4].silent_after_mode_ack = false;
-        s.motors[J4].no_write_ack = true;
-        s.motors[J4].mute_feedback = true;
-        s.inject_on_reg_write = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT.to_le_bytes()), fb];
-    });
-    assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err(), "stale ACK + feedback confirmed the switch");
+    d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).expect("immediate ACK + feedback confirm the switch");
 }
 
 /// Review #6: the rollback of a failed switch needs fresh feedback after its acknowledgement too
