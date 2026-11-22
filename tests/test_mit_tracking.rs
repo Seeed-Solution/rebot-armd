@@ -1067,3 +1067,35 @@ fn mit_handover_hold_frame_obeys_the_decoded_effort_bound() {
     assert!(worst > f32::MIN, "no case exercised");
     assert!(worst <= 1e-6, "handover hold frame exceeds the effort limit by {worst} N·m on the decoded fields");
 }
+
+/// Review round 3, #12: a park requested while MIT moves the arm gets an action id at once and
+/// keeps it through the deferral; a STOP during the brake cancels the deferred park (no park is
+/// launched after settling) and ends that action as cancelled.
+#[test]
+fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
+    let moving = |inner: &mut SupervisorInner| {
+        let inp = inner.plan_input().unwrap();
+        let mut goal = [0.0_f64; 6];
+        for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
+        goal[3] -= 0.3;
+        inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+        for _ in 0..15 { inner.tick(DT); }
+    };
+    // park deferred, then STOP
+    let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
+    moving(&mut inner);
+    let id = inner.unload_action().unwrap().expect("the deferred park has an action id");
+    inner.stop_motion();
+    for _ in 0..60 { inner.tick(DT); assert!(!inner.pending_normal_unload, "park launched after a STOP"); }
+    let a = inner.current_observation().action.unwrap();
+    assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "cancelled", Some("STOPPED")), "{a:?}");
+    // park deferred, no STOP: the same action carries the park
+    let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
+    moving(&mut inner);
+    let id = inner.unload_action().unwrap().expect("action id");
+    let mut parked = false;
+    for _ in 0..30 { inner.tick(DT); if inner.pending_normal_unload { parked = true; break; } }
+    assert!(parked);
+    let a = inner.current_observation().action.unwrap();
+    assert_eq!((a.id, a.state.as_str()), (id, "running"), "{a:?}");
+}

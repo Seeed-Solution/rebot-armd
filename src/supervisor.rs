@@ -1440,6 +1440,12 @@ impl SupervisorInner {
 
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
+        // a STOP cancels a park deferred behind the MIT hand back
+        if std::mem::take(&mut self.mit.park_after_hand_back) {
+            if let Some(id) = self.mit.deferred_park_action.take() {
+                self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+            }
+        }
         #[cfg(feature = "policy-runtime")]
         self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         self.servo_target = None;
@@ -3214,6 +3220,12 @@ impl SupervisorInner {
         }
         self.execute_stop(StopPolicy::NormalUnload);
         if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
+        if self.mit.park_after_hand_back && !self.pending_normal_unload {
+            // deferred behind the MIT brake and hand back: the action runs from now on
+            let id = self.begin_action("park", None);
+            self.mit.deferred_park_action = Some(id);
+            return Ok(Some(id));
+        }
         if !self.pending_normal_unload { return Ok(None); }
         let id = self.begin_action("park", None);
         if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
@@ -4064,6 +4076,7 @@ impl SupervisorInner {
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
         if kind == "park" {
+            if self.mit.deferred_park_action == Some(id) { return; }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
                 if let Some(a) = self.last_action.as_mut() { a.progress = progress; }
@@ -5540,9 +5553,19 @@ impl SupervisorInner {
             let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
             if !self.mit_active() || self.safety.state().is_stopped() {
                 self.mit.park_after_hand_back = false;
+                if let Some(id) = self.mit.deferred_park_action.take() {
+                    self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park cancelled: MIT tracking lost or a fault".into()), None, None, None);
+                }
             } else if at_rest && self.mit_hand_back("park").is_ok() {
                 self.mit.park_after_hand_back = false;
                 self.apply_stop_policy(StopPolicy::NormalUnload);
+                if let Some(id) = self.mit.deferred_park_action.take() {
+                    if self.pending_normal_unload {
+                        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+                    } else {
+                        self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park could not start after the MIT hand back".into()), None, None, None);
+                    }
+                }
             }
         }
         if self.pending_normal_unload && self.mit_active() {

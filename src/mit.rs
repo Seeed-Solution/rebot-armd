@@ -496,6 +496,8 @@ pub struct MitRuntime {
     pub lost_reason: Option<String>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
+    /// Action id of that deferred park (its outcome is reported on it).
+    pub deferred_park_action: Option<u64>,
     /// Feedback ages or output gaps at or above [`MIT_NEAR_MISS`] but under the deadline.
     pub near_misses: u64,
 }
