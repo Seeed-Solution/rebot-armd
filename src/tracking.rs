@@ -159,25 +159,69 @@ impl JointTrackingConfig {
     }
 }
 
-/// `ArmConfig.joint_tracking` from a profile. A block whose `enabled` is not `true` is never
-/// evaluated, so it never rejects the profile (as before joint tracking existed, when the
-/// field was ignored): it is kept when it parses, otherwise logged and dropped (None).
-/// An enabled block parses strictly (`deny_unknown_fields`, known strategies).
+/// `ArmConfig.joint_tracking` from a profile. Before joint tracking existed the field was
+/// ignored, so only a JSON object whose `"enabled"` is the literal `true` is parsed (strictly:
+/// `deny_unknown_fields`, known strategies, map form). Anything else (an object without that
+/// key or with another value, an array, a scalar, numbers serde_json cannot represent) never
+/// rejects the profile: a valid disabled object is kept, everything else is logged and
+/// dropped (None). The value is captured unparsed (`RawValue`) so that skipping it cannot fail.
 pub fn deserialize_profile_block<'de, D>(deserializer: D) -> Result<Option<JointTrackingConfig>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let Some(raw) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+    let Some(raw) = Option::<Box<serde_json::value::RawValue>>::deserialize(deserializer)? else {
         return Ok(None);
     };
-    let enabled = raw.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
-    match serde_json::from_value::<JointTrackingConfig>(raw) {
-        Ok(cfg) => Ok(Some(cfg)),
-        Err(e) if enabled => Err(serde::de::Error::custom(format!("joint_tracking: {e}"))),
+    let text = raw.get();
+    if text.trim() == "null" {
+        return Ok(None);
+    }
+    match serde_json::from_str::<EnabledProbe>(text) {
+        Ok(EnabledProbe(true)) => serde_json::from_str::<JointTrackingConfig>(text)
+            .map(Some)
+            .map_err(|e| serde::de::Error::custom(format!("joint_tracking: {e}"))),
+        Ok(EnabledProbe(false)) => match serde_json::from_str::<JointTrackingConfig>(text) {
+            // A map without a literal `"enabled": true` deserializes with enabled = false.
+            Ok(cfg) if !cfg.enabled => Ok(Some(cfg)),
+            Ok(_) => Ok(None),
+            Err(e) => {
+                tracing::warn!("joint_tracking is not enabled and does not parse (ignored): {e}");
+                Ok(None)
+            }
+        },
         Err(e) => {
-            tracing::warn!("joint_tracking is not enabled and does not parse (ignored): {e}");
+            tracing::warn!("joint_tracking is not an object with \"enabled\": true (ignored): {e}");
             Ok(None)
         }
+    }
+}
+
+/// Whether a JSON value is an object holding the key `"enabled"` with the literal `true`.
+/// Fails for anything that is not an object or whose `"enabled"` is not a boolean; every
+/// other member is skipped without being parsed.
+struct EnabledProbe(bool);
+
+impl<'de> Deserialize<'de> for EnabledProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = EnabledProbe;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<EnabledProbe, A::Error> {
+                let mut enabled = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "enabled" {
+                        enabled |= map.next_value::<bool>()?;
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(EnabledProbe(enabled))
+            }
+        }
+        deserializer.deserialize_map(V)
     }
 }
 

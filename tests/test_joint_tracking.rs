@@ -4329,3 +4329,50 @@ fn tracking_rest_reference_expires_across_control_loop_pause() {
     inner.tick(DT);
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "fresh reference one period older is evidence");
 }
+
+/// Review 7: the profile loader ignores (warns about) any `joint_tracking` value that is not
+/// a JSON object whose "enabled" is the literal `true`, including numbers serde_json cannot
+/// represent and positional arrays (e4f72b6 ignored the field); only `{"enabled": true, ..}`
+/// is parsed, strictly.
+#[test]
+fn tracking_profile_loader_ignores_anything_but_enabled_true_object() {
+    let mut base = ArmConfig::rebot_dm();
+    base.joint_tracking = None;
+    let body = serde_json::to_string(&base).unwrap();
+    assert!(body.starts_with('{') && !body.contains("\"joint_tracking\""));
+    let load = |raw: &str| -> Result<ArmConfig, String> {
+        let text = format!("{{\"joint_tracking\":{raw},{}", &body[1..]);
+        let path = std::env::temp_dir().join(format!(
+            "armd-jt-profile-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, text).unwrap();
+        let res = ArmConfig::from_profile_file(&path);
+        let _ = std::fs::remove_file(&path);
+        res
+    };
+    for raw in [
+        r#"{"enabled":false,"extra":1e400}"#,
+        r#"[true, []]"#,
+        r#"[true, [{"strategy":"position_lead","lag_s":0.68}]]"#,
+        r#"{"enabled":1,"joints":[]}"#,
+        r#"{"enabled":"true","joints":[]}"#,
+        r#"{"joints":[],"extra":1}"#,
+        r#"1e400"#,
+        r#""on""#,
+    ] {
+        let mut cfg = load(raw).unwrap_or_else(|e| panic!("{raw}: must load as e4f72b6 did, got {e}"));
+        assert!(
+            !cfg.joint_tracking.as_ref().is_some_and(|jt| jt.enabled),
+            "{raw}: tracking must not be enabled without a literal \"enabled\": true object"
+        );
+        cfg.validate().unwrap_or_else(|e| panic!("{raw}: validate: {e}"));
+    }
+    // A valid enabled object loads; an enabled object with an unknown field is rejected.
+    let seeds = serde_json::to_string(&JointTrackingConfig { enabled: true, ..JointTrackingConfig::rebot_dm() }).unwrap();
+    let cfg = load(&seeds).expect("valid enabled block loads");
+    assert!(cfg.joint_tracking.as_ref().is_some_and(|jt| jt.enabled && jt.joints.len() == 6));
+    assert!(load(r#"{"enabled":true,"joints":[],"extra":1}"#).is_err(), "enabled block stays strict");
+    assert!(load(r#"{"enabled":true,"extra":1e400}"#).is_err(), "enabled block stays strict");
+}
