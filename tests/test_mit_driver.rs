@@ -152,11 +152,16 @@ fn mit_stale_rx_never_replays() {
         for _ in 0..4 { let _ = d.read_joint_states(); }
         assert!({ let t = targets(&mut d, 0.0); d.write_joint_targets(&t) }.is_err());
     }
-    assert!(bus.tx_log().is_empty(), "frames sent within the hold-off after the trip: {:?}", bus.tx_log());
-    // after the hold-off (here 300 ms): only read-only status polls, never a command or replay
+    assert!(bus.tx_log().is_empty(), "frames sent after the trip: {:?}", bus.tx_log());
+    // elapsed time alone never resumes polling (review #9): nothing at 500 ms and later
     let now = clock.now();
     clock.advance(Duration::from_millis(500) - (now - t0).min(Duration::from_millis(500)));
     for _ in 0..4 { clock.advance(Duration::from_millis(110)); let _ = d.read_joint_states(); }
+    assert!(bus.tx_log().is_empty(), "polls resumed on elapsed time: {:?}", bus.tx_log());
+    // after the operator's explicit clearance: only read-only status polls, never a command
+    d.acknowledge_mit_fence_trip();
+    for _ in 0..4 { clock.advance(Duration::from_millis(110)); let _ = d.read_joint_states(); }
+    assert!({ let t = targets(&mut d, 0.0); d.write_joint_targets(&t) }.is_err(), "writes stay refused until a full enable");
     let late = bus.tx_log();
     assert!(!late.is_empty() && late.iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC), "{late:?}");
     assert!(command_frames_to(&late, 4).is_empty());

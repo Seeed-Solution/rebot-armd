@@ -604,7 +604,7 @@ impl crate::supervisor::SupervisorInner {
                     self.mit.last_ff = ff;
                     self.mit.last_output = Some(std::time::Instant::now());
                 }
-                Some(Err(e)) => self.mit_lose(format!("MIT batch write failed: {e}"), crate::safety::FaultCode::DriverWriteFailed),
+                Some(Err(e)) => self.mit_lose(format!("MIT batch write failed: {e}"), crate::safety::FaultCode::BusLoss),
                 None => {}
             }
         }
@@ -626,7 +626,8 @@ impl crate::supervisor::SupervisorInner {
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
-        if !self.safety.state().is_stopped() {
+        // latched also over another fault (an E-stop stays the stronger state)
+        if *self.safety.state() != crate::safety::SafetyState::EStop {
             self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!("MIT_LOST: {reason}")));
         }
     }

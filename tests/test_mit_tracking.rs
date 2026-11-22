@@ -598,18 +598,27 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     bus.with(|s| s.fail_tx_after = Some(3));
     inner.tick(DT);
     let fault = inner.safety.fault().expect("partial write latches");
-    assert_eq!(fault.code, armd::FaultCode::DriverWriteFailed);
+    assert_eq!(fault.code, armd::FaultCode::BusLoss, "a loss latches BUS_LOSS wherever it is detected");
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     assert!(inner.tracking.last_issued_positions.is_none(), "history discarded");
     bus.with(|s| s.fail_tx_after = None);
     bus.clear_log();
     for _ in 0..5 { inner.tick(DT); }
     assert!(command_frames(&bus.tx_log()).is_empty(), "{:?}", bus.tx_log());
-    // reconnect: explicit clearance and rearm (fresh readback, base modes restored), then a fresh handover
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    bus.with(|s| s.push_all_feedback());
-    for _ in 0..8 { std::thread::sleep(std::time::Duration::from_millis(40)); inner.tick(DT); }
-    inner.clear_fault().expect("clear");
+    // time alone resumes nothing
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    bus.clear_log();
+    for _ in 0..5 { inner.tick(DT); }
+    assert!(bus.tx_log().is_empty(), "polls resumed without clearance: {:?}", bus.tx_log());
+    // reconnect: explicit clearance (polls resume, the first try waits for fresh feedback), rearm
+    // (fresh readback, base modes restored), then a fresh handover
+    let mut cleared = false;
+    for _ in 0..20 {
+        if inner.clear_fault().is_ok() { cleared = true; break; }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        inner.tick(DT);
+    }
+    assert!(cleared, "clearance");
     bus.clear_log();
     inner.set_torque(true).expect("rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]), "TIMEOUT readback on the rearm");
@@ -740,4 +749,19 @@ fn mit_effort_bound_holds_on_decoded_wire_fields() {
     assert!(frames_checked > 500);
     assert!(worst_excess <= 1e-5, "decoded effort exceeds the limit by {worst_excess}");
     assert!(worst_excess > -0.01, "the bound was not exercised: {worst_excess}");
+}
+
+/// Review #9: a loss latches BUS_LOSS also when the arm is already stopped by another fault.
+#[test]
+fn mit_loss_latches_bus_loss_even_when_already_stopped() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    inner.safety.trigger_fault_coded(armd::FaultCode::FollowingError, armd::FaultReason::Other("test".into()));
+    bus.with(|s| s.motors[3].silent = true);
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(80) && inner.mit.owner != mit::MitOwner::Lost {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        inner.tick(DT);
+    }
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    assert_eq!(inner.safety.fault().unwrap().code, armd::FaultCode::BusLoss);
 }

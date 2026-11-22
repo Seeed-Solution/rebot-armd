@@ -268,6 +268,11 @@ pub trait ArmDriver: Send {
     /// Why the MIT deadline fence tripped (None = not tripped).
     fn mit_fence_trip(&self) -> Option<String> { None }
 
+    /// Explicit operator clearance of a tripped MIT fence: read-only status polls may resume
+    /// (after the hold-off) so fresh feedback can return; target writes stay refused until the
+    /// next confirmed enable.
+    fn acknowledge_mit_fence_trip(&mut self) {}
+
     /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
     /// acknowledgement and confirm it with a separate read. Torque off only.
     fn commission_motor_timeout(&mut self, _joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
@@ -2160,6 +2165,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_fence_trip: Option<(String, Instant)>,
     /// No autonomous frame (recovery, status poll) this long after a trip.
     mit_fence_holdoff: Duration,
+    /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
+    mit_fence_acked: bool,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2210,6 +2217,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_last_tx: None,
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
+            mit_fence_acked: false,
         }
     }
 
@@ -2526,11 +2534,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// fence is armed or tripped.
     fn recovery_tx_allowed(&self) -> bool { self.mit_fence.is_none() && self.mit_fence_trip.is_none() }
 
-    /// Read-only status polls: never while the fence is armed; after a trip only once its
-    /// hold-off has passed (whether a poll refreshes the motor watchdog is not verified).
+    /// Read-only status polls: never while the fence is armed; after a trip only once the
+    /// operator cleared it and its hold-off has passed (whether a poll refreshes the motor
+    /// watchdog is not verified, so elapsed time alone never resumes them).
     fn poll_tx_allowed(&self) -> bool {
         match &self.mit_fence_trip {
-            Some((_, at)) => self.since(*at) >= self.mit_fence_holdoff,
+            Some((_, at)) => self.mit_fence_acked && self.since(*at) >= self.mit_fence_holdoff,
             None => self.mit_fence.is_none(),
         }
     }
@@ -2888,6 +2897,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
+
+    fn acknowledge_mit_fence_trip(&mut self) {
+        if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }
+    }
 
     fn joint_modes_uncertain(&self) -> bool {
         self.joint_modes.iter().any(Option::is_none)
@@ -3256,6 +3269,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             // confirmed enable with the base modes restored: a new MIT handover arms a new fence
             self.mit_fence = None;
             self.mit_fence_trip = None;
+            self.mit_fence_acked = false;
             self.mit_fence_last_tx = None;
             Ok(())
         }

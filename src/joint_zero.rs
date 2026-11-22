@@ -173,6 +173,7 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
+    fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
         self.inner.commission_motor_timeout(joints, counts)

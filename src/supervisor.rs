@@ -2307,6 +2307,11 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
         }
         if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // the operator's clearance lets the driver poll again (fresh feedback for the checks
+            // below); writes stay refused until the rearm's confirmed enable
+            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) { drv.acknowledge_mit_fence_trip(); }
+        }
         if self.mit.owner == crate::mit::MitOwner::Lost
             && self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.joint_modes_uncertain())) {
             return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
