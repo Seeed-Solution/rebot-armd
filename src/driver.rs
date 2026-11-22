@@ -2937,8 +2937,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         // repeat the last MIT command instead of inventing gains or dropping
                         // its torque feed-forward; the supervisor owns the hold decision.
                         if let Some(frame) = self.last_target_frames[i].filter(|f| f.id == u32::from(id)) {
-                            let _ = self.can.transmit(&frame);
-                            recovery_sent = true;
+                            recovery_sent = self.can.transmit(&frame).is_ok();
                         }
                     }
                     DamiaoControlMode::Mit => {
@@ -2953,8 +2952,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             0.0,
                             &self.limits[i],
                         );
-                        let _ = self.can.transmit(&frame);
-                        recovery_sent = true;
+                        recovery_sent = self.can.transmit(&frame).is_ok();
                     }
                     DamiaoControlMode::PosVel => {
                         let frame = damiao::build_pos_vel_frame(
@@ -2963,8 +2961,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             p,
                             self.default_vlim.abs().clamp(0.1, 4.0),
                         );
-                        let _ = self.can.transmit(&frame);
-                        recovery_sent = true;
+                        recovery_sent = self.can.transmit(&frame).is_ok();
                     }
                 }
                 if recovery_sent && !self.recovery_written_joints.contains(&i) {

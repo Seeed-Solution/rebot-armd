@@ -2708,3 +2708,53 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
     assert!(drv.is_enabled());
     assert!(!drv.joint_modes_uncertain());
 }
+
+/// Review 2 New: When Damiao recovery `can.transmit` returns `Err`, the failed transmit
+/// must NOT be recorded in `take_recovery_writes()`.
+#[test]
+fn damiao_recovery_tx_failure_not_recorded_as_sent() {
+    use armd::driver::DamiaoArmDriver;
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::transport::{CanFrame, CanTransport, MockCanTransport, TransportError};
+
+    struct FailRecoveryTxCan {
+        inner: MockCanTransport,
+        fail_pos_vel: bool,
+    }
+    impl CanTransport for FailRecoveryTxCan {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if self.fail_pos_vel && frame.id == 0x101 {
+                return Err(TransportError::Io(std::io::Error::other("simulated recovery TX failure")));
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+    }
+
+    let mut mock = MockCanTransport::new();
+    let limits = DamiaoLimits::default();
+    let p = damiao::float_to_uint(0.1, limits.p_min, limits.p_max, 16);
+    let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+    mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+    let mut drv = DamiaoArmDriver::new(FailRecoveryTxCan { inner: mock, fail_pos_vel: false }, vec![1]);
+    drv.set_torque(true).unwrap();
+
+    // Sleep past 45 ms recovery threshold, then make recovery TX on 0x101 fail.
+    std::thread::sleep(Duration::from_millis(55));
+    drv.can_mut().fail_pos_vel = true;
+    let _ = drv.read_joint_states();
+    assert!(
+        drv.take_recovery_writes().is_empty(),
+        "failed recovery transmit must not be recorded as sent"
+    );
+
+    // Once TX succeeds, recovery write IS recorded.
+    drv.can_mut().fail_pos_vel = false;
+    let _ = drv.read_joint_states();
+    assert_eq!(drv.take_recovery_writes(), vec![0], "successful recovery transmit must be recorded");
+}
