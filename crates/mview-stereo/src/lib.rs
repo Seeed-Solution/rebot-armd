@@ -50,6 +50,7 @@
 //!   [-0.05, `object_min_h_m`] m of the plane are table points (`table_check`).
 use std::time::Instant;
 
+pub mod footprint;
 pub mod kinematics;
 pub mod ncc_backend;
 pub mod pose;
