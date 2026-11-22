@@ -765,3 +765,93 @@ fn mit_loss_latches_bus_loss_even_when_already_stopped() {
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     assert_eq!(inner.safety.fault().unwrap().code, armd::FaultCode::BusLoss);
 }
+
+/// Review #10: gravity compensation entry validates its request (scale, damping) before it
+/// touches ownership: a refused request leaves MIT active and sends no mode write.
+#[test]
+fn mit_gravity_entry_validates_before_the_hand_back() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    bus.clear_log();
+    let bad = [armd::gravity_comp::GravityCompRequest { scale: Some(9.0), damping_kd: None },
+        armd::gravity_comp::GravityCompRequest { scale: None, damping_kd: Some(vec![99.0; 6]) }];
+    for req in bad {
+        assert!(inner.enter_gravity_comp(req).is_err());
+        assert!(inner.mit_active(), "a refused request changed the owner");
+    }
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0x55), "mode write for a refused request");
+}
+
+/// Review #10 (real path): a collision trip during an MIT move turns J4 into the stationary hold:
+/// hold gains, zero velocity, tau_ff slewing (15 N·m/s) from the moving value to gravity only.
+#[test]
+fn mit_collision_trip_holds_through_the_tick() {
+    let mut cfg = mit_config_j4();
+    { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.coulomb_nm = 0.8; }
+    let (mut inner, bus) = active_rig(cfg, 0.0);
+    // the fake reports the model gravity torque (no residual) plus `extra` on J2
+    let feed = |inner: &SupervisorInner, extra: f32| {
+        let g = inner.config.arm_model.gravity_torques(&inner.measured_positions[..6]).unwrap();
+        bus.with(|s| for i in 0..6 { s.motors[i].tau = g[i] + if i == 1 { extra } else { 0.0 }; });
+    };
+    feed(&inner, 0.0);
+    for _ in 0..3 { inner.tick(DT); feed(&inner, 0.0); }
+    inner.collision.enabled = true;
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
+    goal[3] -= 0.3;
+    inner.install_joint_goal(&inp, &goal, 0.3, "joint_move", None, None).unwrap();
+    for _ in 0..25 { inner.tick(DT); feed(&inner, 0.0); }
+    let moving_tau = mit_frames(&bus.tx_log(), 4).last().unwrap().4;
+    assert!(inner.active_trajectory.is_some(), "{:?}", inner.current_observation().action.map(|a| a.message));
+    // contact on J2: residual far above the trip level
+    let mut tripped_at = None;
+    let mut prev = moving_tau;
+    for k in 0..10 {
+        feed(&inner, 25.0);
+        bus.clear_log();
+        inner.tick(DT);
+        if let Some(&(_, _, _, _, t)) = mit_frames(&bus.tx_log(), 4).first() {
+            assert!((t - prev).abs() <= 15.0 * DT as f32 + 0.005 + 1e-4, "tau_ff jumped {prev} -> {t} before the trip");
+            prev = t;
+        }
+        if inner.collision.hold.is_some() { tripped_at = Some(k); break; }
+    }
+    assert!(tripped_at.is_some(), "no collision trip");
+    let g4 = inner.config.arm_model.gravity_torques(&inner.measured_positions[..6]).unwrap()[3];
+    let jt = mit_config_j4().joint_tracking.unwrap().joints[3].clone();
+    for _ in 0..20 {
+        bus.clear_log();
+        inner.tick(DT);
+        let Some(&(_, v, kp, _, t)) = mit_frames(&bus.tx_log(), 4).first() else { continue };
+        assert!(v.abs() < 0.02 && (kp - jt.hold_kp.unwrap()).abs() < 0.13, "not a stationary hold: v {v} kp {kp}");
+        assert!((t - prev).abs() <= 15.0 * DT as f32 + 0.005 + 1e-4, "tau_ff jumped {prev} -> {t}");
+        prev = t;
+    }
+    assert!((prev - g4.clamp(-3.0, 3.0)).abs() < 0.05, "dynamic terms not removed: {prev} vs gravity {g4}");
+    assert!((moving_tau - prev).abs() > 0.3, "the test did not exercise the removal ({moving_tau} -> {prev})");
+}
+
+/// Review #10 (real path): a torque-guard hold on J4 (measured torque above 60 % of TMAX) keeps
+/// the decoded total effort of every J4 frame out of the held direction.
+#[test]
+fn mit_torque_guard_hold_never_pushes_into_the_held_direction() {
+    let mut cfg = mit_config_j4();
+    { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.gravity_scale = 0.0; }
+    let (mut inner, bus) = active_rig(cfg, 0.0);
+    bus.with(|s| s.motors[3].tau = 7.0);
+    let mut held = false;
+    for _ in 0..30 {
+        bus.clear_log();
+        inner.tick(DT);
+        if let Some(h) = inner.torque_guard.hold.filter(|h| h.joint == 3) {
+            held = true;
+            let (q_m, v_m) = (inner.measured_positions[3], inner.measured_velocities[3]);
+            for (p, v, kp, kd, t) in mit_frames(&bus.tx_log(), 4) {
+                let total = kp * (p - q_m) + kd * (v - v_m) + t;
+                assert!(h.sign * total <= 1e-5, "effort {total} into the held direction {}", h.sign);
+            }
+        }
+    }
+    assert!(held, "no torque-guard hold on J4");
+}

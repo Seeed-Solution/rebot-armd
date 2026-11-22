@@ -204,10 +204,6 @@ impl SupervisorInner {
     pub fn enter_gravity_comp(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
         if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message)); }
-        // hand guiding and MIT tracking own the output exclusively: hand back first (at rest)
-        if self.mit_active() {
-            self.mit_hand_back("gravity compensation").map_err(|e| Self::reject("MIT_HAND_BACK_FAILED", e))?;
-        }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
         let scale = request.scale.unwrap_or(policy.scale);
@@ -221,6 +217,11 @@ impl SupervisorInner {
         };
         let model = self.gravity_comp_model_torque(&policy, scale)
             .ok_or_else(|| Self::reject("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed".into()))?;
+        // hand guiding and MIT tracking own the output exclusively: once the request is valid,
+        // hand back first (confirmed, at rest); a refused request never changes the owner
+        if self.mit_active() {
+            self.mit_hand_back("gravity compensation").map_err(|e| Self::reject("MIT_HAND_BACK_FAILED", e))?;
+        }
         let pose = arm6(&self.measured_positions);
         self.servo_ws_min_depths = None;
         // Start from the torque the position loop is producing now, so the handover to MIT
