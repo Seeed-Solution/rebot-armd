@@ -322,7 +322,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 ./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
+# -> dist/armd-lite_1.5.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
 ```
 
 `--flavor recamera` (the deb) also needs `rebot-vision`, a C++ program built against the
@@ -677,10 +677,13 @@ Reference documents:
 
 - [docs/agent_action_api.md](docs/agent_action_api.md): `move_to`, `move_relative` (base,
   tool and camera frames), `gripper`, `grasp`, `move_to_pose` and named poses, keep-out boxes,
-  the gravity-compensation mode command, action status, fault codes and error codes;
+  the gravity-compensation mode command, action status, fault codes and error codes, depth and
+  multi-view measurement (`measure_multiview`);
 - [docs/control_safety_contract.md](docs/control_safety_contract.md): lease, epochs, driver
   capabilities, timing defaults, speed caps, workspace;
-- [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example.
+- [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example;
+- [docs/mit_qualification.md](docs/mit_qualification.md): MIT tracking qualification on the
+  B601-DM (off by default) and its current status.
 
 ---
 

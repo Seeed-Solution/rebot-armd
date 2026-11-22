@@ -221,7 +221,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 ./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
+# -> dist/armd-lite_1.5.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
 ```
 
 `--flavor recamera`（deb 包）还需要 `rebot-vision`（基于 SG2002 SDK 构建的 C++ 程序）。最简单的方式是使用 [GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.4.0) 中的预编译二进制：
@@ -367,9 +367,10 @@ WebSocket 时序：
 
 参考文档：
 
-- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码；
+- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码，深度测量与多视角测量（`measure_multiview`）；
 - [docs/control_safety_contract.md](docs/control_safety_contract.md)：租约、epoch、驱动能力、时序默认值、限速、工作空间；
-- [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例。
+- [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例；
+- [docs/mit_qualification.md](docs/mit_qualification.md)：B601-DM 上 MIT 跟踪的资格验证（默认关闭）及当前状态。
 
 ---
 
