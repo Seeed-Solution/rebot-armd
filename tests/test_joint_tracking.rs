@@ -1515,3 +1515,182 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
         "first resumed frame must match confirmed fresh baseline {q_m_now:.4}, got {j1_resumed:.4}"
     );
 }
+
+/// M1: Unknown history never bypasses validation; park, moving lease handover, and
+/// torque-guard trip keep prior output and ramp residual lead out smoothly without a 1.5 rad/s step.
+#[test]
+fn tracking_unknown_history_and_handover_ramp_out() {
+    use armd::tracking::TrackingHistoryState;
+
+    // 1. Unknown history + zero lead must still validate (rejects stale feedback and excessive jump from q_m).
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0_f32; 7];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Issued);
+
+        // Invalidate history -> Unknown state.
+        inner.tracking.invalidate();
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
+        inner.commanded_velocities.fill(0.0); // zero lead requested
+        let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
+
+        // Stale feedback with unknown history must be rejected (no unvalidated nominal pass-through).
+        drv.with(|s| s.feedback_age = Duration::from_millis(150));
+        assert!(
+            inner.compute_position_lead_output(DT, &jt).is_err(),
+            "unknown history with stale feedback must fail validation"
+        );
+
+        // Fresh feedback, but nominal q_d jumps 0.05 rad from q_m (2.5 rad/s > 0.45 cap) -> rejected!
+        drv.with(|s| s.feedback_age = Duration::ZERO);
+        inner.measured_positions[0] = 0.0;
+        inner.commanded_positions[0] = 0.05;
+        assert!(
+            inner.compute_position_lead_output(DT, &jt).is_err(),
+            "unknown history must validate q_m -> q_d against dynamics limits even with zero lead"
+        );
+    }
+
+    // 2. Park (NormalUnload) started with active +0.025 rad lead: ramps lead out smoothly
+    //    (no 1.5 rad/s single-tick drop) while keeping park's floor exemption.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0_f32; 7];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let traj = TrajectoryPlanner::plan(
+            &q0,
+            &[0.0; 7],
+            &[0.20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[0.0; 7],
+            Some(5.0),
+            &inner.config.limits,
+        )
+        .unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        for _ in 0..100 {
+            inner.tick(DT);
+        }
+        let last_before_park = drv.with(|s| s.written.last().unwrap()[0].position);
+        let lead_before_park = last_before_park - inner.commanded_positions[0];
+        assert!(lead_before_park > 0.020, "expected active lead before park, got {lead_before_park}");
+
+        let idx_before = drv.with(|s| s.written.len());
+        inner.apply_stop_policy(StopPolicy::NormalUnload);
+        assert!(inner.pending_normal_unload);
+        for _ in 0..15 {
+            inner.tick(DT);
+            assert!(!inner.safety.state().is_stopped(), "park ramp-out should not fault: {:?}", inner.safety.state());
+        }
+        // Check first park write step speed relative to last_before_park: must be <= 0.45 rad/s (NO 1.5 rad/s drop!).
+        let first_park_pos = drv.with(|s| s.written[idx_before][0].position);
+        let first_step_vel = ((first_park_pos - last_before_park) as f64 / DT).abs();
+        assert!(
+            first_step_vel <= 0.45 + 1e-3,
+            "park first write dropped lead too fast: {first_step_vel:.3} rad/s (before={last_before_park:.4}, first={first_park_pos:.4})"
+        );
+    }
+
+    // 3. Moving lease handover (preempt_lease) with active lead ramps lead out smoothly.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0_f32; 7];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        inner.lease_enabled = true;
+        inner.acquire_lease("client_a").unwrap();
+        let traj = TrajectoryPlanner::plan(
+            &q0,
+            &[0.0; 7],
+            &[0.20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            &[0.0; 7],
+            Some(5.0),
+            &inner.config.limits,
+        )
+        .unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        for _ in 0..100 {
+            inner.tick(DT);
+        }
+        let last_before = drv.with(|s| s.written.last().unwrap()[0].position);
+        assert!(last_before - inner.commanded_positions[0] > 0.020);
+
+        let idx_before = drv.with(|s| s.written.len());
+        inner.preempt_lease("client_b", "takeover").unwrap();
+        assert!(inner.handover_settling_since.is_some());
+        let mut prev_pos = last_before;
+        for k in 0..20 {
+            inner.tick(DT);
+            let pos = drv.with(|s| s.written[idx_before + k][0].position);
+            let step_v = ((pos - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= 0.45 + 1e-3, "handover tick {k} exceeded velocity cap: {step_v:.3} rad/s");
+            prev_pos = pos;
+        }
+    }
+
+    // 4. Torque guard trip with active lead ramps smoothly in the relieving direction without a 1.5 rad/s step.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            torque_guard: Some(TorqueGuardPolicy { enabled: true, ratio: 0.60, persist_ms: 40, ..Default::default() }),
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -2.5];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let traj = TrajectoryPlanner::plan(
+            &q0,
+            &[0.0; 7],
+            &[0.20, -1.167, -1.565, 1.435, 0.0, 0.0, -2.5],
+            &[0.0; 7],
+            Some(5.0),
+            &inner.config.limits,
+        )
+        .unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        for _ in 0..100 {
+            inner.tick(DT);
+        }
+        let last_before_trip = drv.with(|s| s.written.last().unwrap()[0].position);
+        assert!(last_before_trip - inner.commanded_positions[0] > 0.020);
+
+        // Force +18.0 N·m on J1 (> 16.8 N·m threshold, sign = +1).
+        drv.with(|s| s.forced_torque[0] = Some(18.0));
+        let idx_trip = drv.with(|s| s.written.len());
+        let mut tripped = false;
+        let mut prev_pos = last_before_trip;
+        for k in 0..20 {
+            inner.tick(DT);
+            if inner.torque_guard.hold.is_some() {
+                tripped = true;
+                drv.with(|s| s.forced_torque[0] = Some(5.0));
+            }
+            let pos = drv.with(|s| s.written[idx_trip + k][0].position);
+            let step_v = ((pos - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= 0.45 + 1e-3, "torque-trip tick {k} exceeded velocity cap: {step_v:.3} rad/s");
+            if tripped {
+                assert!(pos <= prev_pos + 1e-6, "after +1 torque trip, output must not advance in +1 direction");
+            }
+            prev_pos = pos;
+        }
+        assert!(tripped, "torque guard must trip");
+        assert!(inner.safety.state().is_operational(), "torque trip ramp-out must stay operational");
+    }
+}

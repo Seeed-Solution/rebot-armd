@@ -154,9 +154,23 @@ impl JointTrackingConfig {
 ///
 /// Seeded from fresh measurements on torque enable; invalidated on partial
 /// writes, output suspension, safety holds/faults, or mode changes.
+/// Explicit state of tracking output history so unknown baselines never bypass validation.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrackingHistoryState {
+    /// No confirmed output baseline (startup, partial write, bus suspension, recovery).
+    #[default]
+    Unknown,
+    /// Confirmed stationary baseline seeded from fresh measurements with zero velocity.
+    Stationary,
+    /// Last successfully issued combined output vector and its discrete velocity.
+    Issued,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Default)]
 pub struct TrackingRuntime {
+    pub history_state: TrackingHistoryState,
     pub last_issued_positions: Option<Vec<f32>>,
     pub last_issued_velocities: Option<Vec<f32>>,
     /// Persistent monotonic workspace escape baseline for issued tracking outputs,
@@ -173,9 +187,10 @@ pub struct TrackingRuntime {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl TrackingRuntime {
-    /// Seed output history from fresh measurements with zero velocity.
+    /// Seed output history from fresh measurements as a confirmed stationary baseline.
     pub fn seed(&mut self, positions: &[f32]) {
         if positions.iter().all(|q| q.is_finite()) {
+            self.history_state = TrackingHistoryState::Stationary;
             self.last_issued_positions = Some(positions.to_vec());
             self.last_issued_velocities = Some(vec![0.0; positions.len()]);
             self.ws_min_depths = None;
@@ -186,9 +201,22 @@ impl TrackingRuntime {
         }
     }
 
+    /// True when the last issued output differs from nominal `nominal` on any arm joint.
+    pub fn has_residual_lead(&self, nominal: &[f32], arm_indices: &[usize]) -> bool {
+        let Some(prev) = self.last_issued_positions.as_deref() else {
+            return false;
+        };
+        arm_indices.iter().any(|&j| {
+            prev.get(j)
+                .zip(nominal.get(j))
+                .is_some_and(|(p, q)| (p - q).abs() > 1e-5)
+        })
+    }
+
     /// Suspend compensated writes after autonomous driver recovery writes until
     /// confirmed fresh post-recovery feedback establishes a clean baseline.
     pub fn suspend_for_recovery(&mut self, joints: &[usize], at: std::time::Instant) {
+        self.history_state = TrackingHistoryState::Unknown;
         self.last_issued_positions = None;
         self.last_issued_velocities = None;
         self.ws_min_depths = None;
@@ -210,6 +238,7 @@ impl TrackingRuntime {
 
     /// Record a successfully issued combined output vector.
     pub fn record_issued(&mut self, positions: Vec<f32>, velocities: Vec<f32>) {
+        self.history_state = TrackingHistoryState::Issued;
         self.last_issued_positions = Some(positions);
         self.last_issued_velocities = Some(velocities);
     }
@@ -221,6 +250,7 @@ impl TrackingRuntime {
         velocities: Vec<f32>,
         ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     ) {
+        self.history_state = TrackingHistoryState::Issued;
         self.last_issued_positions = Some(positions);
         self.last_issued_velocities = Some(velocities);
         self.ws_min_depths = ws_min_depths;
@@ -228,6 +258,7 @@ impl TrackingRuntime {
 
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
     pub fn invalidate(&mut self) {
+        self.history_state = TrackingHistoryState::Unknown;
         self.last_issued_positions = None;
         self.last_issued_velocities = None;
         self.ws_min_depths = None;
@@ -386,33 +417,28 @@ impl crate::supervisor::SupervisorInner {
 
         let has_desired_lead = base_lead.iter().any(|&l| l != 0.0);
 
-        // 2. Resolve output history; if absent and no lead requested, pass nominal through.
+        // 2. Resolve output history; unknown history NEVER bypasses validation.
         let seeded_q: Vec<f32>;
-        let (prev_q, prev_v): (&[f32], Option<&[f32]>) = match self
-            .tracking
-            .last_issued_positions
-            .as_ref()
-            .filter(|v| v.len() == dof)
-        {
-            Some(pq) => (
-                pq.as_slice(),
-                self.tracking
-                    .last_issued_velocities
-                    .as_ref()
-                    .filter(|v| v.len() == dof)
-                    .map(Vec::as_slice),
-            ),
-            None if !has_desired_lead => {
-                return Ok(TrackingOutput {
-                    positions: self.commanded_positions.clone(),
-                    velocities: vec![0.0; dof],
-                    multiplier: 0.0,
-                    sweep_evals_used: 0,
-                    ws_min_depths: None,
-                });
+        let (prev_q, prev_v): (&[f32], Option<&[f32]>) = match self.tracking.history_state {
+            TrackingHistoryState::Stationary | TrackingHistoryState::Issued => {
+                let Some(pq) = self.tracking.last_issued_positions.as_ref().filter(|v| v.len() == dof) else {
+                    return Err(TrackingReject::JointLimit("tracking output history missing positions".into()));
+                };
+                (
+                    pq.as_slice(),
+                    self.tracking
+                        .last_issued_velocities
+                        .as_ref()
+                        .filter(|v| v.len() == dof)
+                        .map(Vec::as_slice),
+                )
             }
-            None => {
-                // `has_desired_lead` implies `fresh_meas` is true.
+            TrackingHistoryState::Unknown => {
+                if !fresh_meas {
+                    return Err(TrackingReject::JointLimit(
+                        "tracking output history is unknown without fresh feedback".into(),
+                    ));
+                }
                 seeded_q = (0..dof)
                     .map(|i| {
                         if arm_indices.contains(&i) {
@@ -588,6 +614,145 @@ impl crate::supervisor::SupervisorInner {
         }
 
         Err(last_err.unwrap_or_else(|| TrackingReject::JointLimit("no valid tracking candidate".into())))
+    }
+
+    /// Ramp residual tracking lead smoothly from `last_issued_positions` to nominal
+    /// `commanded_positions` during an ownership handover (park, torque hold, or moving
+    /// lease handover) so active lead is never dropped in a single 20 ms step.
+    ///
+    /// When `keepout_only` is true (park / `NormalUnload`), workspace validation uses
+    /// `ws.keepout_only()`, preserving park's floor/outer-box/reach exemptions while
+    /// still enforcing swept keep-out boxes.
+    pub fn compute_lead_ramp_out(
+        &self,
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+        keepout_only: bool,
+    ) -> Result<TrackingOutput, TrackingReject> {
+        use std::time::Duration;
+        use crate::chain::WorkspaceEvaluator;
+        use crate::safety::SafetyError;
+        use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+
+        let dof = self.config.dof;
+        if !dt.is_finite()
+            || dt <= 0.0
+            || active_limits.len() != dof
+            || self.commanded_positions.len() != dof
+            || !self.commanded_positions.iter().all(|q| q.is_finite())
+        {
+            return Err(TrackingReject::JointLimit("invalid nominal state or dt for lead ramp-out".into()));
+        }
+
+        let arm_indices = self.config.arm_joint_indices();
+        let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
+            && self.measured_positions.len() == dof
+            && self.measured_positions.iter().all(|q| q.is_finite());
+
+        let Some(prev_q) = self.tracking.last_issued_positions.as_deref().filter(|v| v.len() == dof) else {
+            return Err(TrackingReject::JointLimit("cannot ramp lead out without prior issued output".into()));
+        };
+        let prev_v = self.tracking.last_issued_velocities.as_deref().filter(|v| v.len() == dof);
+
+        let mut q_next = self.commanded_positions.clone();
+        for &j in &arm_indices {
+            let lim = &active_limits[j];
+            let pq = prev_q[j];
+            let pv = prev_v.map_or(0.0, |v| v[j]);
+            let qd = self.commanded_positions[j].clamp(lim.min_position, lim.max_position);
+            let stepped = if (qd - pq).abs() <= 1e-6 && pv.abs() <= lim.max_acceleration * dt as f32 {
+                qd
+            } else {
+                let Some((q_s, _, _)) = Self::bounded_servo_step(pq, qd, pv, dt, lim) else {
+                    return Err(TrackingReject::JointLimit(format!(
+                        "joint {} lead ramp-out infeasible from {pq:.4} toward {qd:.4}",
+                        j + 1
+                    )));
+                };
+                q_s
+            };
+            let mut q_final = stepped;
+            if let Some(h) = self.torque_guard.hold {
+                if h.joint == j {
+                    // Never advance farther into the torque-held direction while ramping out.
+                    if (q_final - pq) * h.sign > 1e-6 {
+                        q_final = pq;
+                    }
+                    if (pq - h.hold_q) * h.sign <= 1e-6 && (q_final - h.hold_q) * h.sign > 1e-5 {
+                        q_final = h.hold_q;
+                    }
+                }
+            }
+            q_next[j] = q_final;
+        }
+
+        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+        let mut committed_ws_min_d = None;
+        if let Some((ws, cam)) = self.workspace_policy() {
+            let keepout_ws = keepout_only.then(|| ws.keepout_only());
+            let ws_ref = keepout_ws.as_ref().unwrap_or(ws);
+            let skip_ws = keepout_only && ws_ref.keepout_boxes.is_empty();
+            if !skip_ws {
+                let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws_ref, cam);
+                let mut c_prev = eval.alloc_buf();
+                eval.eval_into(prev_q, &mut c_prev, "tracking_ramp_out")
+                    .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+                let mut local_min_d = match &self.tracking.ws_min_depths {
+                    Some((rev, md))
+                        if !keepout_only
+                            && *rev == self.workspace_revision
+                            && md.as_slice().len() == eval.total_slots =>
+                    {
+                        md.clone()
+                    }
+                    _ => eval.init_min_depths(&c_prev),
+                };
+                if let Err((_, f)) = eval.sweep_linear_step(
+                    prev_q,
+                    &q_next,
+                    &c_prev,
+                    &mut local_min_d,
+                    &mut budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_ramp_out",
+                    "tracking_ramp_out",
+                ) {
+                    return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
+                }
+                if fresh_meas {
+                    let mut c_meas = eval.alloc_buf();
+                    eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_ramp_out")
+                        .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
+                    let mut local_meas_min_d = eval.init_min_depths(&c_meas);
+                    if let Err((_, f)) = eval.sweep_linear_step(
+                        &self.measured_positions,
+                        &q_next,
+                        &c_meas,
+                        &mut local_meas_min_d,
+                        &mut budget,
+                        MAX_KEEPOUT_EVALS_PER_TICK,
+                        "tracking_ramp_out",
+                        "tracking_ramp_out",
+                    ) {
+                        return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
+                    }
+                }
+                if !keepout_only {
+                    committed_ws_min_d = Some((self.workspace_revision, local_min_d));
+                }
+            }
+        }
+
+        let v_out: Vec<f32> = (0..dof)
+            .map(|i| ((f64::from(q_next[i]) - f64::from(prev_q[i])) / dt) as f32)
+            .collect();
+        Ok(TrackingOutput {
+            positions: q_next,
+            velocities: v_out,
+            multiplier: 0.0,
+            sweep_evals_used: MAX_KEEPOUT_EVALS_PER_TICK - budget,
+            ws_min_depths: committed_ws_min_d,
+        })
     }
 
     /// Explicitly validate a proposed fallback hold pose `q_hold` against fresh feedback,

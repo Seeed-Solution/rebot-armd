@@ -1965,7 +1965,11 @@ impl SupervisorInner {
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
         self.servo_stream_active = false;
-        self.tracking.invalidate();
+        // M1: keep output history across NormalUnload so park ramps any residual lead out smoothly
+        // instead of dropping active lead in a single tick.
+        if policy != StopPolicy::NormalUnload {
+            self.tracking.invalidate();
+        }
         match policy {
             StopPolicy::NormalUnload => {
                 if self.handover_settling_since.is_some() {
@@ -2073,6 +2077,7 @@ impl SupervisorInner {
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.is_torqued = false;
+                self.tracking.invalidate();
                 self.active_trajectory = None;
                 self.reset_gripper_stall();
                 self.commanded_velocities = vec![0.0; self.config.dof];
@@ -2370,6 +2375,13 @@ impl SupervisorInner {
             true
         };
 
+        let tracking_settled = !self.config.joint_tracking.as_ref().is_some_and(|jt| {
+            jt.enabled
+                && self
+                    .tracking
+                    .has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices())
+        });
+
         (self.safety.state() == &SafetyState::Armed || self.safety.state() == &SafetyState::Idle)
             && self.active_trajectory.is_none()
             && self.servo_target.is_none()
@@ -2377,6 +2389,7 @@ impl SupervisorInner {
             && self.commanded_velocities.iter().all(|v| *v == 0.0)
             && self.hardware_feedback_fresh(Duration::from_millis(100))
             && velocity_settled
+            && tracking_settled
     }
 
     pub fn is_fully_settled_armed_hold(&self) -> bool {
@@ -5277,19 +5290,41 @@ impl SupervisorInner {
 
             if send_to_bus {
                 let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+                let arm_indices = self.config.arm_joint_indices();
+                let has_residual = tracking_active
+                    && self.tracking.has_residual_lead(&self.commanded_positions, &arm_indices);
+                let ramp_out_handover = tracking_active
+                    && self.driver.is_some()
+                    && !self.safety.state().is_stopped()
+                    && (self.pending_normal_unload
+                        || self.handover_settling_since.is_some()
+                        || self.torque_guard.hold.is_some())
+                    && has_residual;
                 let tracking_owned = tracking_active
                     && self.driver.is_some()
                     && !self.safety.state().is_stopped()
-                    && !self.pending_normal_unload
-                    && self.handover_settling_since.is_none();
+                    && !self.pending_normal_unload;
 
                 if tracking_active && self.tracking.recovery_suspended {
                     // Driver emitted an autonomous recovery write; suspend supervisor target
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
-                } else if tracking_owned {
+                } else if ramp_out_handover || tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
-                    match self.compute_position_lead_output_with_limits(servo_dt, jt, &active_limits) {
+                    let eval_res = if ramp_out_handover {
+                        self.compute_lead_ramp_out(servo_dt, &active_limits, self.pending_normal_unload)
+                    } else if self.handover_settling_since.is_some() {
+                        // Moving lease handover with lead already ramped out: validate nominal
+                        // handover hold/braking without adding new lead.
+                        let mut zero_jt = jt.clone();
+                        for j in &mut zero_jt.joints {
+                            j.strategy = crate::tracking::TrackingStrategy::Position;
+                        }
+                        self.compute_position_lead_output_with_limits(servo_dt, &zero_jt, &active_limits)
+                    } else {
+                        self.compute_position_lead_output_with_limits(servo_dt, jt, &active_limits)
+                    };
+                    match eval_res {
                         Ok(out) => {
                             let targets: Vec<JointTarget> = out
                                 .positions
