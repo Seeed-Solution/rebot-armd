@@ -51,6 +51,11 @@ struct TrackingTestState {
     include_gravity_torque: bool,
     /// When true, the next `write_joint_targets` call fails with a bus error (auto-clears).
     fail_next_write: bool,
+    /// When `Some(k)`, the next `write_joint_targets` applies joints `0..k` to the plant,
+    /// records the partial prefix in `partial_written`, and fails on joint `k` (auto-clears).
+    fail_write_at_joint: Option<usize>,
+    /// Prefixes actually transmitted before a partial write failure.
+    partial_written: Vec<Vec<JointTarget>>,
     /// Current per-joint mode as last confirmed by `set_joint_modes`.
     modes: Vec<JointMode>,
     /// Recorded `(modes, hold_targets)` pairs from every `set_joint_modes` call.
@@ -76,6 +81,8 @@ impl TrackingTestState {
             written: Vec::new(),
             include_gravity_torque: true,
             fail_next_write: false,
+            fail_write_at_joint: None,
+            partial_written: Vec::new(),
             modes: vec![JointMode::Position; dof],
             mode_hold_frames: Vec::new(),
             fail_mode_switch: false,
@@ -151,11 +158,21 @@ impl ArmDriver for TrackingTestDriver {
             s.fail_next_write = false;
             return Err(ArmDriverError::Protocol("simulated write failure".into()));
         }
-        s.written.push(targets.to_vec());
-        if s.enabled != EnableState::Enabled {
-            return Ok(());
+        let fail_at = s.fail_write_at_joint.take();
+        let limit = fail_at.map_or(s.dof, |k| k.min(s.dof));
+        if fail_at.is_some() {
+            s.partial_written.push(targets[..limit.min(targets.len())].to_vec());
+        } else {
+            s.written.push(targets.to_vec());
         }
-        for (i, t) in targets.iter().enumerate().take(s.dof) {
+        if s.enabled != EnableState::Enabled {
+            return if let Some(k) = fail_at {
+                Err(ArmDriverError::Protocol(format!("simulated partial write failure at joint {}", k + 1)))
+            } else {
+                Ok(())
+            };
+        }
+        for (i, t) in targets.iter().enumerate().take(limit) {
             if let Some(pin) = s.pinned[i] {
                 s.q[i] = pin;
                 s.v[i] = 0.0;
@@ -186,6 +203,9 @@ impl ArmDriver for TrackingTestDriver {
             }
             s.q[i] = q_next;
             s.v[i] = v_next;
+        }
+        if let Some(k) = fail_at {
+            return Err(ArmDriverError::Protocol(format!("simulated partial write failure at joint {}", k + 1)));
         }
         Ok(())
     }
@@ -2444,20 +2464,30 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
     }
 
-    // 8. PARTIAL WRITE (driver write failure mid-stream -> fault + history Unknown -> clear + re-arm)
+    // 8. PARTIAL WRITE (apply earlier joints 0..2 on plant, fail joint 3 -> fault + history Unknown -> clear + re-arm)
     {
         let mut cfg = ArmConfig::rebot_dm();
         cfg.lease_timeout_ms = 5_000;
         let (mut inner, drv, _) = rig_leased(cfg);
         let (_last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let q0_before_partial = drv.with(|s| s.q[0]);
 
-        drv.with(|s| s.fail_next_write = true);
+        drv.with(|s| s.fail_write_at_joint = Some(2));
         hb(&mut inner, CLIENT_A);
         let obs_fail = inner.tick(DT);
-        assert!(matches!(obs_fail.safety_state, SafetyState::Fault(_)), "write failure must latch fault");
-        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "write failure must invalidate history");
-        assert_eq!(drv.with(|s| s.written.len()), idx_before, "failed write must not append a confirmed frame");
+        assert!(matches!(obs_fail.safety_state, SafetyState::Fault(_)), "partial write failure must latch fault");
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "partial write must invalidate history");
+        assert_eq!(drv.with(|s| s.written.len()), idx_before, "partial write must not record a full confirmed frame");
+        assert_eq!(drv.with(|s| s.partial_written.len()), 1, "expected 1 partial write prefix");
+        assert_eq!(drv.with(|s| s.partial_written[0].len()), 2, "joints 0..2 must have been applied before J3 failed");
+        let q0_after_partial = drv.with(|s| s.q[0]);
+        assert!(
+            q0_after_partial > q0_before_partial + 1e-4,
+            "earlier joint J1 must actually have moved on the plant during partial write ({q0_before_partial:.5} -> {q0_after_partial:.5})"
+        );
 
+        // Let plant settle before re-enabling, then verify first frame after holds actual post-partial-write pose.
+        drv.with(|s| s.v.fill(0.0));
         inner.clear_fault().unwrap();
         inner.set_torque(true).unwrap();
         let idx_after = drv.with(|s| s.written.len());
@@ -2465,7 +2495,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         let obs_after = inner.tick(DT);
         assert!(obs_after.safety_state.is_operational());
         let first_after = drv.with(|s| s.written[idx_after].clone());
-        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3);
+        assert!((first_after[0].position - q0_after_partial).abs() < 1e-3);
         assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
     }
 
