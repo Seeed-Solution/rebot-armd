@@ -225,6 +225,10 @@ pub trait ArmDriver: Send {
 
     /// The offsets in effect at the boundary; None for a driver without it.
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { None }
+
+    /// Joint indices that received an autonomous driver recovery write during
+    /// `read_joint_states` since the previous call, clearing the record.
+    fn take_recovery_writes(&mut self) -> Vec<usize> { Vec::new() }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -2028,6 +2032,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     register_replies: Vec<damiao::RegisterReply>,
     /// Last mapping-range check (`check_mapping_ranges`); None = not run.
     range_check: Option<DriverRangeCheck>,
+    /// Joints that received an autonomous recovery write during `read_joint_states`
+    /// since the supervisor last queried `take_recovery_writes`.
+    recovery_written_joints: Vec<usize>,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2064,6 +2071,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::new(),
             range_check: None,
+            recovery_written_joints: Vec::new(),
         }
     }
 
@@ -2464,6 +2472,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
+
+    fn take_recovery_writes(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.recovery_written_joints)
+    }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("motor_flash", false, vec![
@@ -2904,6 +2916,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // Recovery never replays a queued motion target. A still-fresh,
                 // confirmed enabled joint may only hold its last measured pose.
                 let p = self.cached_states.get(i).map_or(0.0, |s| s.position);
+                let mut recovery_sent = false;
                 match self.joint_modes.get(i).copied().flatten().unwrap_or(self.control_mode) {
                     DamiaoControlMode::Mit if self.control_mode == DamiaoControlMode::PosVel => {
                         // A joint switched to MIT by set_joint_modes (gravity compensation):
@@ -2911,6 +2924,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         // its torque feed-forward; the supervisor owns the hold decision.
                         if let Some(frame) = self.last_target_frames[i].filter(|f| f.id == u32::from(id)) {
                             let _ = self.can.transmit(&frame);
+                            recovery_sent = true;
                         }
                     }
                     DamiaoControlMode::Mit => {
@@ -2926,6 +2940,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             &self.limits[i],
                         );
                         let _ = self.can.transmit(&frame);
+                        recovery_sent = true;
                     }
                     DamiaoControlMode::PosVel => {
                         let frame = damiao::build_pos_vel_frame(
@@ -2935,7 +2950,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.default_vlim.abs().clamp(0.1, 4.0),
                         );
                         let _ = self.can.transmit(&frame);
+                        recovery_sent = true;
                     }
+                }
+                if recovery_sent && !self.recovery_written_joints.contains(&i) {
+                    self.recovery_written_joints.push(i);
                 }
             }
         }

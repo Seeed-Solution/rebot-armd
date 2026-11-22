@@ -1427,6 +1427,7 @@ impl SupervisorInner {
     fn request_disable(&mut self) -> Result<(), SafetyError> {
         self.disable_pending = true;
         self.tracking.invalidate();
+        self.tracking.clear_recovery_suspension();
         self.last_disable_attempt = Some(Instant::now());
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
@@ -2304,6 +2305,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();
+        self.tracking.clear_recovery_suspension();
         // Reset at the measured position; never retain a residual old trajectory target.
         self.commanded_positions = self.measured_positions.clone();
         self.target_positions = self.measured_positions.clone();
@@ -4342,14 +4344,20 @@ impl SupervisorInner {
         let mut invalid_feedback = false;
         let mut motor_errors = None;
         let mut driver_torque_lost = false;
+        let mut recovered_joints = Vec::new();
+        let mut recovery_ages: Option<Vec<Option<Duration>>> = None;
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             if let Ok(mut driver) = d.lock() {
                 if let Ok(states) = driver.read_joint_states() {
+                    recovered_joints = driver.take_recovery_writes();
                     let loads = driver.joint_loads();
                     self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref());
                     invalid_feedback = !self.feedback_numeric_valid;
                     let ages = driver.feedback_ages();
+                    if !recovered_joints.is_empty() || self.tracking.recovery_suspended {
+                        recovery_ages = Some(ages.clone());
+                    }
                     if self.feedback_numeric_valid && ages.len() == self.config.dof && driver.is_feedback_valid() {
                         self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
                             .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
@@ -4381,6 +4389,46 @@ impl SupervisorInner {
         }
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);
+        }
+        // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
+        // tracking output history and suspend compensated writes until fresh post-recovery
+        // feedback confirms a clean baseline across every joint.
+        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+            if !recovered_joints.is_empty() {
+                tracing::warn!(
+                    "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
+                    recovered_joints.iter().map(|i| i + 1).collect::<Vec<_>>()
+                );
+                self.tracking.suspend_for_recovery(&recovered_joints, Instant::now());
+                self.stop_motion();
+                self.servo_stream_active = false;
+            } else if self.tracking.recovery_suspended && self.feedback_numeric_valid {
+                const RECOVERY_FRESH_BOUND: Duration = Duration::from_millis(45);
+                let all_fresh_post_recovery = recovery_ages.as_ref().is_some_and(|ages| {
+                    ages.len() == self.config.dof
+                        && ages.iter().all(|a| a.is_some_and(|age| age < RECOVERY_FRESH_BOUND))
+                        && self.tracking.recovery_joints.iter().all(|&(j, since)| {
+                            ages.get(j)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|age| age <= since.elapsed())
+                        })
+                }) && self.measured_positions.len() == self.config.dof
+                    && self.measured_positions.iter().all(|q| q.is_finite());
+                if all_fresh_post_recovery {
+                    let gripper_idx = self.config.gripper_index();
+                    for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
+                        if Some(i) != gripper_idx {
+                            let l = &self.config.limits[i];
+                            *c = m.clamp(l.min_position, l.max_position);
+                        }
+                    }
+                    self.target_positions = self.commanded_positions.clone();
+                    self.commanded_velocities.fill(0.0);
+                    self.commanded_accelerations.fill(0.0);
+                    self.tracking.seed(&self.commanded_positions);
+                }
+            }
         }
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
@@ -5235,7 +5283,10 @@ impl SupervisorInner {
                     && !self.pending_normal_unload
                     && self.handover_settling_since.is_none();
 
-                if tracking_owned {
+                if tracking_active && self.tracking.recovery_suspended {
+                    // Driver emitted an autonomous recovery write; suspend supervisor target
+                    // writes until fresh post-recovery feedback confirms every joint's baseline.
+                } else if tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
                     match self.compute_position_lead_output_with_limits(servo_dt, jt, &active_limits) {

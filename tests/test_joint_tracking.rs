@@ -1296,3 +1296,194 @@ fn tracking_active_limits_and_measured_segment_contract() {
         assert!(v_out <= 0.10 + 1e-4, "streaming speed {v_out} exceeded servo_max_velocity 0.10");
     }
 }
+
+/// B1: Real DamiaoArmDriver + CanTransport fake with one joint's RX delayed past 45 ms:
+/// autonomous POS_VEL recovery writes are visible to tracking, suspend compensated writes
+/// so the motor never receives q_m followed immediately by q_out, and resume only after
+/// confirmed fresh post-recovery feedback.
+#[test]
+fn tracking_damiao_recovery_suspends_compensated_writes() {
+    use std::collections::VecDeque;
+    use armd::driver::DamiaoArmDriver;
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::transport::{CanFrame, CanTransport, TransportError};
+
+    struct FakeDamiaoBusState {
+        q: [f32; 7],
+        enabled: [bool; 7],
+        limits: [DamiaoLimits; 7],
+        /// When true for joint i, suppresses auto-reply feedback for motor i+1.
+        drop_rx: [bool; 7],
+        rx_queue: VecDeque<CanFrame>,
+        tx_log: Vec<CanFrame>,
+    }
+
+    impl FakeDamiaoBusState {
+        fn push_feedback(&mut self, i: usize) {
+            let lim = &self.limits[i];
+            let p_u = damiao::float_to_uint(self.q[i], lim.p_min, lim.p_max, 16);
+            let v_u = damiao::float_to_uint(0.0, lim.v_min, lim.v_max, 12);
+            let t_u = damiao::float_to_uint(0.0, lim.t_min, lim.t_max, 12);
+            let id = (i + 1) as u8;
+            let state = if self.enabled[i] { 1u8 } else { 0u8 };
+            let data = [
+                (state << 4) | (id & 0x0f),
+                (p_u >> 8) as u8,
+                (p_u & 0xff) as u8,
+                (v_u >> 4) as u8,
+                (((v_u & 0x0f) << 4) | ((t_u >> 8) & 0x0f)) as u8,
+                (t_u & 0xff) as u8,
+                30,
+                30,
+            ];
+            self.rx_queue.push_back(CanFrame::new_standard(0x10 + id as u16, &data).unwrap());
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeDamiaoCan(Arc<Mutex<FakeDamiaoBusState>>);
+
+    impl CanTransport for FakeDamiaoCan {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let mut s = self.0.lock().unwrap();
+            s.tx_log.push(*frame);
+            if frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC] && (1..=7).contains(&frame.id) {
+                let i = (frame.id - 1) as usize;
+                s.enabled[i] = true;
+                if !s.drop_rx[i] { s.push_feedback(i); }
+            } else if frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD] && (1..=7).contains(&frame.id) {
+                let i = (frame.id - 1) as usize;
+                s.enabled[i] = false;
+                if !s.drop_rx[i] { s.push_feedback(i); }
+            } else if (0x101..=0x107).contains(&frame.id) {
+                let i = (frame.id - 0x101) as usize;
+                let pos = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                // First-order lag on J1 (tau = 0.68 s), instant on others.
+                if i == 0 {
+                    let alpha = 1.0 - (-DT / 0.68_f64).exp();
+                    s.q[0] = (f64::from(s.q[0]) + (f64::from(pos) - f64::from(s.q[0])) * alpha) as f32;
+                } else {
+                    s.q[i] = pos;
+                }
+                if !s.drop_rx[i] { s.push_feedback(i); }
+            } else if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    let i = (id - 1) as usize;
+                    if !s.drop_rx[i] { s.push_feedback(i); }
+                }
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.0.lock().unwrap().rx_queue.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { Ok(()) }
+    }
+
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let limits: [DamiaoLimits; 7] = std::array::from_fn(|i| cfg.damiao_ranges.as_ref().unwrap()[i].limits());
+    let bus_state = Arc::new(Mutex::new(FakeDamiaoBusState {
+        q: [0.0; 7],
+        enabled: [false; 7],
+        limits,
+        drop_rx: [false; 7],
+        rx_queue: VecDeque::new(),
+        tx_log: Vec::new(),
+    }));
+    let drv = DamiaoArmDriver::new(FakeDamiaoCan(bus_state.clone()), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.to_vec())
+        .unwrap();
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.tick(DT);
+
+    // Start smooth J1 quintic so active lead is being transmitted on 0x101.
+    let traj = TrajectoryPlanner::plan(
+        &[0.0; 7],
+        &[0.0; 7],
+        &[0.08, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        &[0.0; 7],
+        Some(5.5),
+        &inner.config.limits,
+    )
+    .unwrap();
+    let _ = inner.safety.mark_motion_started();
+    inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+    for _ in 0..100 {
+        inner.tick(DT);
+    }
+    let q_d_before = inner.commanded_positions[0];
+    let q_m_before = inner.measured_positions[0];
+    let last_j1_pos = bus_state
+        .lock()
+        .unwrap()
+        .tx_log
+        .iter()
+        .rev()
+        .find(|f| f.id == 0x101)
+        .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+        .unwrap();
+    assert!(last_j1_pos - q_d_before > 0.010, "expected active lead before delay, got {}", last_j1_pos - q_d_before);
+
+    // Delay ONLY motor 1's RX past Damiao's 45 ms recovery threshold while keeping motors 2..7 fresh!
+    bus_state.lock().unwrap().drop_rx[0] = true;
+    for _ in 0..6 {
+        std::thread::sleep(Duration::from_millis(20));
+        // Keep J2..J7 fresh by running ticks until J1 crosses 45 ms.
+        bus_state.lock().unwrap().tx_log.clear();
+        inner.tick(DT);
+        if inner.tracking.recovery_suspended {
+            break;
+        }
+    }
+    assert!(inner.tracking.recovery_suspended, "recovery write on J1 must suspend tracking compensation");
+
+    // Inspect EVERY transmitted frame on the recovery tick:
+    // J1 (0x101) must have received ONLY the recovery POS_VEL hold at cached q_m, NEVER followed by q_out!
+    let recovery_tx: Vec<CanFrame> = bus_state.lock().unwrap().tx_log.clone();
+    let j1_frames: Vec<f32> = recovery_tx
+        .iter()
+        .filter(|f| f.id == 0x101)
+        .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+        .collect();
+    assert_eq!(j1_frames.len(), 1, "expected exactly 1 recovery frame on 0x101 (no immediate q_out), got {j1_frames:?}");
+    assert!(
+        (j1_frames[0] - q_m_before).abs() < 0.01,
+        "recovery frame must hold cached q_m (~{q_m_before:.4}), not compensated q_out ({last_j1_pos:.4}): got {}",
+        j1_frames[0]
+    );
+    assert!(
+        !recovery_tx.iter().any(|f| (0x102..=0x107).contains(&f.id)),
+        "compensated supervisor writes must be suspended during recovery"
+    );
+
+    // Release J1's RX and push a fresh feedback frame for every joint -> confirmed fresh baseline.
+    {
+        let mut s = bus_state.lock().unwrap();
+        s.drop_rx[0] = false;
+        s.tx_log.clear();
+        for i in 0..7 {
+            s.push_feedback(i);
+        }
+    }
+    inner.tick(DT);
+    assert!(!inner.tracking.recovery_suspended, "fresh post-recovery feedback should resume from confirmed baseline");
+    let resumed_tx: Vec<CanFrame> = bus_state.lock().unwrap().tx_log.clone();
+    let j1_resumed = resumed_tx
+        .iter()
+        .find(|f| f.id == 0x101)
+        .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+        .expect("expected resumed POS_VEL frame on 0x101");
+    let q_m_now = inner.measured_positions[0];
+    assert!(
+        (j1_resumed - q_m_now).abs() <= 1e-4,
+        "first resumed frame must match confirmed fresh baseline {q_m_now:.4}, got {j1_resumed:.4}"
+    );
+}

@@ -162,6 +162,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> { self.inner.set_zero_position(joint) }
     fn set_joint_zero_offsets(&mut self, offsets: &[f32]) { self.offsets = offsets.to_vec(); }
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
+    fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
 }
 
 /// Result of the zero check against the reference pose (`zero_convention`).

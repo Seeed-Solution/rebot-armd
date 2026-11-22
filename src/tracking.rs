@@ -162,6 +162,13 @@ pub struct TrackingRuntime {
     /// Persistent monotonic workspace escape baseline for issued tracking outputs,
     /// tagged with `workspace_revision` and committed only after a successful write.
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    /// True while compensated output is suspended following an autonomous driver
+    /// recovery write (e.g. Damiao 45 ms POS_VEL hold) until fresh post-recovery
+    /// feedback confirms every joint's baseline.
+    pub recovery_suspended: bool,
+    /// Per-joint instant of the latest autonomous driver recovery write awaiting
+    /// fresh post-recovery feedback.
+    pub recovery_joints: Vec<(usize, std::time::Instant)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -172,9 +179,33 @@ impl TrackingRuntime {
             self.last_issued_positions = Some(positions.to_vec());
             self.last_issued_velocities = Some(vec![0.0; positions.len()]);
             self.ws_min_depths = None;
+            self.recovery_suspended = false;
+            self.recovery_joints.clear();
         } else {
             self.invalidate();
         }
+    }
+
+    /// Suspend compensated writes after autonomous driver recovery writes until
+    /// confirmed fresh post-recovery feedback establishes a clean baseline.
+    pub fn suspend_for_recovery(&mut self, joints: &[usize], at: std::time::Instant) {
+        self.last_issued_positions = None;
+        self.last_issued_velocities = None;
+        self.ws_min_depths = None;
+        self.recovery_suspended = true;
+        for &j in joints {
+            if let Some(entry) = self.recovery_joints.iter_mut().find(|(idx, _)| *idx == j) {
+                entry.1 = at;
+            } else {
+                self.recovery_joints.push((j, at));
+            }
+        }
+    }
+
+    /// Clear recovery suspension once a confirmed fresh baseline is established.
+    pub fn clear_recovery_suspension(&mut self) {
+        self.recovery_suspended = false;
+        self.recovery_joints.clear();
     }
 
     /// Record a successfully issued combined output vector.
