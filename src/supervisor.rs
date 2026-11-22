@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
+use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -7384,11 +7385,13 @@ pub fn check_path_with_tcp_tol<'a>(
 
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
-    inner: Arc<RwLock<SupervisorInner>>,
+    inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
     tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
+    tick_stats_wait_us: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -7401,11 +7404,12 @@ impl ArmSupervisor {
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         Self {
-            inner: Arc::new(RwLock::new(inner)),
+            inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
+            tick_stats_wait_us: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7423,7 +7427,7 @@ impl ArmSupervisor {
     }
 
     #[doc(hidden)]
-    pub fn inner(&self) -> &Arc<RwLock<SupervisorInner>> {
+    pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {
         &self.inner
     }
 
@@ -7682,15 +7686,17 @@ impl ArmSupervisor {
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
         let started = Instant::now();
-        let (obs, lock_held, control_hz, pending_zc) = {
-            let mut inner = self.inner.write().await;
+        let (obs, wait, lock_held, control_hz, pending_zc) = {
+            let (mut inner, _generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             inner.defer_zero_check_persist = true;
             let obs = inner.tick(dt);
             inner.defer_zero_check_persist = false;
             let pending_zc = inner.pending_zero_check_persist.take();
-            (obs, locked.elapsed(), inner.config.control_frequency_hz, pending_zc)
+            (obs, locked - started, locked.elapsed(), inner.config.control_frequency_hz, pending_zc)
         };
+        let released = Instant::now();
+        let others = self.inner.take_maxima();
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
@@ -7909,13 +7915,32 @@ impl ArmSupervisor {
         // Broadcast observation to any active WebSocket listeners
         let _ = self.telemetry_tx.send(obs.clone());
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).record(started.elapsed(), lock_held, late);
+        let done = Instant::now();
+        let sample = crate::diagnostics::tick::TickSample {
+            tick: done - started,
+            wait,
+            lock: lock_held,
+            post: done - released,
+            period: if dt.is_finite() && dt >= 0.0 { Duration::from_secs_f64(dt.min(4.0e3)) } else { Duration::ZERO },
+            reader_hold: others.reader_hold,
+            writer_hold: others.writer_hold,
+            reader_acquire: others.reader_acquire,
+            writer_acquire: others.writer_acquire,
+            stats_wait: Duration::from_micros(self.tick_stats_wait_us.load(Ordering::Relaxed)),
+            late,
+        };
+        let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
+        self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        stats.record(&sample);
+        drop(stats);
         obs
     }
 
-    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`).
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
+    /// the stats mutex and sorted after it is released, so this route does not delay a tick.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+        let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
+        window.snapshot()
     }
 
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {

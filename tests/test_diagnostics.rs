@@ -166,10 +166,37 @@ async fn tick_route_reports_timing_and_late_ticks() {
     assert_eq!(body["window"], 22);
     assert_eq!(body["since_boot_ticks"], 22);
     assert_eq!(body["late_count"], 1);
-    for key in ["tick_us", "lock_us"] {
+    for key in ["tick_us", "lock_us", "wait_us", "post_us", "period_us", "reader_hold_us", "writer_hold_us", "stats_wait_us", "reader_acquire_us", "writer_acquire_us"] {
         let p = &body[key];
         let (p50, p99, max) = (p["p50"].as_u64().unwrap(), p["p99"].as_u64().unwrap(), p["max"].as_u64().unwrap());
         assert!(p50 <= p99 && p99 <= max, "{key}: {p}");
     }
     assert!(body["lock_us"]["max"].as_u64().unwrap() <= body["tick_us"]["max"].as_u64().unwrap());
+    // the slowest tick split into phases; the period of the 50 ms tick is the longest
+    let m = &body["max_tick"];
+    assert_eq!(m["tick_us"], body["tick_us"]["max"]);
+    assert!(m["wait_us"].as_u64().unwrap() + m["lock_us"].as_u64().unwrap() <= m["tick_us"].as_u64().unwrap(), "{m}");
+    assert_eq!(body["period_us"]["max"], 50_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    for _ in 0..3 { sup.tick(0.02).await; }
+    let reader = sup.inner().read().await;
+    let ticker = {
+        let sup = sup.clone();
+        tokio::spawn(async move { sup.tick(0.02).await; })
+    };
+    std::thread::sleep(Duration::from_millis(15));
+    drop(reader);
+    ticker.await.unwrap();
+    let snap = sup.tick_stats();
+    let m = snap.max_tick.unwrap();
+    assert_eq!(m.ticks_ago, 0);
+    assert!(m.wait_us >= 14_000, "{m:?}");
+    assert!(m.reader_hold_us >= 14_000, "{m:?}");
+    assert!(m.lock_us < m.wait_us, "{m:?}");
+    assert!(m.tick_us >= m.wait_us + m.lock_us, "{m:?}");
+    assert_eq!(m.period_us, 20_000);
 }

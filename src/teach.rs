@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
 
 use serde_json::{json, Value};
 
@@ -286,7 +285,7 @@ impl ArmSupervisor {
     }
 }
 
-async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: bool, outcome: Option<&str>, writer: Option<ParquetWriter>) -> Result<Stopped, ArmError> {
+async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>, by: Stopper, save: bool, outcome: Option<&str>, writer: Option<ParquetWriter>) -> Result<Stopped, ArmError> {
         let outcome = outcome.unwrap_or("ok");
         if !["ok", "aborted"].contains(&outcome) { return Err(rejected(400, "INVALID_COMMAND", "outcome must be \"ok\" or \"aborted\"")); }
         let monitor = matches!(by, Stopper::Monitor { .. });
@@ -365,7 +364,7 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
 
 /// Stops the recording `id` at the length cap or on low space, discards it after its owner
 /// left. Ends when the recording ends.
-async fn monitor(lock: Arc<RwLock<SupervisorInner>>, id: String) {
+async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>, id: String) {
     let mut last_space: Option<Instant> = None;
     loop {
         tokio::time::sleep(MONITOR_PERIOD).await;
