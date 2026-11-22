@@ -547,7 +547,7 @@ async fn refused_without_operator_session_and_bad_bodies() {
     assert_eq!(resp.status().as_u16(), 403);
     // bounds (no auth)
     let mut r = rig(ArmConfig::rebot_dm()).await;
-    for bad in [json!({"speed_scale": 0.8}), json!({"views": 7}), json!({"baseline_m": 0.2})] {
+    for bad in [json!({"speed_scale": 0.8}), json!({"views": 7}), json!({"baseline_m": 0.2}), json!({"settle_min_s": 0.2}), json!({"settle_min_s": 3.5})] {
         let rej = r.start(bad.clone()).await;
         assert_eq!(rej["code"], "INVALID_COMMAND", "{bad}: {rej}");
     }
@@ -1084,6 +1084,25 @@ async fn without_a_camera_hold_the_run_is_unchanged_and_snapshots_never_hold() {
     assert_eq!(r.vision.holds.load(Ordering::SeqCst), 0);
 }
 
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_min_s_sets_the_wait_at_the_view_poses() {
+    // 0.5 s instead of 2.0 s at the view poses (the start view has none); the still windows and
+    // the bracket still decide, the measurement is the same
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "settle_min_s": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}")), 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    let m = &a["measurement"];
+    assert_eq!(m["settle_min_s"], 0.5);
+    let settle: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["timing"]["settle_ms"].as_f64().unwrap()).collect();
+    assert!(settle[0] < 1000.0, "{settle:?}");
+    assert!(settle[1..].iter().all(|s| (500.0..1500.0).contains(s)), "{settle:?}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
+    let d = r.sup.inner().read().await.safety_describe();
+    assert_eq!(d["limits"]["measure_multiview"]["settle_min_s"], json!([0.5, 3.0]));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_arm_moving_at_the_start_fails_not_settled_before_any_trigger() {

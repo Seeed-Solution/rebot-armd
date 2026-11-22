@@ -11,7 +11,7 @@
 //! - Body `{label?, min_score? (0..1, 0.3), target? {box_norm, frame_id?}, motion? ("orbit" |
 //!   "translate", "orbit"), axes? ("x" | "xy"; "x" for orbit, "xy" for translate), views? (x: 2..5,
 //!   3; xy: 3..5, 5), baseline_m? (0.03..0.12, 0.08), speed_scale? (0.1..0.5, 0.3),
-//!   return_to_start? (true)}`.
+//!   return_to_start? (true), settle_min_s? ([`SETTLE_MIN_S`], [`MIN_SETTLE_S`])}`.
 //! - View offsets ([`view_offsets`]) in the image plane of the start camera: `axes` "x" spreads
 //!   them evenly over [-baseline/2, +baseline/2] on the image x axis (`views` 3: -B/2, 0 (the start
 //!   pose), +B/2); "xy" puts the start pose and `views - 1` offsets on the circle of radius
@@ -86,6 +86,10 @@ pub const DEFAULT_SPEED_SCALE: f64 = 0.3;
 /// trails its POS_VEL command by up to 19 mrad at the end of a view move and the rest decays with
 /// tau ~0.7 s, so after 1 s the trigger-and-snapshot bracket still moved 2.7-5.7 mrad.
 pub const MIN_SETTLE_S: f64 = 2.0;
+/// Bounds of the request's `settle_min_s` (the wait above at the view poses; default
+/// [`MIN_SETTLE_S`]), for tuning it on the real arm. The still windows and the bracket check apply
+/// whatever its value; a shorter wait trades time for more `MOVED` retries.
+pub const SETTLE_MIN_S: [f64; 2] = [0.5, 3.0];
 /// After the trigger: a snapshot equal to the one before the trigger is polled again every
 /// [`REFRESH_POLL`], for at most [`REFRESH_MAX`] (real B601-DM, 2026-11-22: the snapshot changed
 /// 0.03-0.08 s after the trigger returned, and up to 1.1 s later when it was not the trigger's frame;
@@ -302,6 +306,8 @@ pub struct Request {
     /// Write a debug bundle ([`debug_dir`]).
     pub debug: bool,
     pub pose_refine: PoseRefine,
+    /// Minimum wait after a view motion before the still windows ([`SETTLE_MIN_S`]).
+    pub settle_min_s: f64,
 }
 
 fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, ArmError> {
@@ -315,7 +321,7 @@ fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Res
 pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
     let empty = Map::new();
     let o = match body { Value::Null => &empty, Value::Object(o) => o, _ => return Err(invalid("Command body must be an object")) };
-    const KEYS: [&str; 11] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start", "debug", "pose_refine"];
+    const KEYS: [&str; 12] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start", "debug", "pose_refine", "settle_min_s"];
     if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) { return Err(invalid(format!("unknown field {k} ({})", KEYS.join(", ")))); }
     let label = match o.get("label") {
         None | Some(Value::Null) => None,
@@ -379,6 +385,7 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         baseline_m: num(o, "baseline_m", DEFAULT_BASELINE_M, BASELINE_M[0], BASELINE_M[1])?,
         speed_scale: num(o, "speed_scale", DEFAULT_SPEED_SCALE, SPEED_SCALE[0], SPEED_SCALE[1])?,
         return_to_start, debug, pose_refine,
+        settle_min_s: num(o, "settle_min_s", MIN_SETTLE_S, SETTLE_MIN_S[0], SETTLE_MIN_S[1])?,
     })
 }
 
@@ -528,7 +535,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     // (the last one may start just before REFRESH_MAX) and the retry gap
     let try_s = SNAPSHOT_GAP_RETRY.as_secs_f64() + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0)
         + 3.5 + REFRESH_MAX.as_secs_f64() + 3.5;
-    let capture_s = MAX_SETTLE_S + 3.5 + SNAPSHOT_TRIES as f64 * try_s;
+    let capture_s = request.settle_min_s + (MAX_SETTLE_S - MIN_SETTLE_S) + 3.5 + SNAPSHOT_TRIES as f64 * try_s;
     let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
@@ -656,7 +663,7 @@ async fn sample_fresh_after(
 /// Wait until the arm is still (see [`STILL_WINDOW`]): `min_s`, then sliding windows until
 /// `min_s` + ([`MAX_SETTLE_S`] - [`MIN_SETTLE_S`]). Returns the seconds it took. The start view
 /// passes 0 (the arm stood at the start pose before the action; the still windows and the
-/// bracket check still apply), the view poses [`MIN_SETTLE_S`].
+/// bracket check still apply), the view poses the request's `settle_min_s` (default [`MIN_SETTLE_S`]).
 async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     let t0 = Instant::now();
     let until = t0 + Duration::from_secs_f64(min_s);
@@ -1198,6 +1205,7 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "why": why,
         "table_z_m": plan.setup.table_z_m,
         "baseline_m": r4(span(&offsets)),
+        "settle_min_s": plan.request.settle_min_s,
         "fallbacks": fallbacks,
         "stats": st,
         "ncc_backend": ncc_backend,
@@ -1269,7 +1277,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let mut cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers, MIN_SETTLE_S).await.map_err(|s| (s, true))?;
+                    let mut cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers, plan.request.settle_min_s).await.map_err(|s| (s, true))?;
                     cap.timing.motion_ms = motion_ms;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
@@ -1633,7 +1641,7 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
         "created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "request": {"motion": plan.request.motion.name(), "axes": plan.request.axes.name(), "views": plan.request.views,
             "baseline_m": plan.request.baseline_m, "speed_scale": plan.request.speed_scale, "label": plan.request.label, "min_score": plan.request.min_score,
-            "pose_refine": plan.request.pose_refine.name()},
+            "pose_refine": plan.request.pose_refine.name(), "settle_min_s": plan.request.settle_min_s},
         "intrinsics": {"fx": plan.cam.fx, "fy": plan.cam.fy, "cx": plan.cam.cx, "cy": plan.cam.cy, "size": plan.cam.size},
         "cam_mount": {"r_end_cam": mat_json(&plan.cam.rec), "offset_m": plan.cam.offset},
         "table_z_m": tz, "reference": reference, "ref_box_px": ref_box_px, "region_px": c.region_px,
@@ -1947,6 +1955,12 @@ mod tests {
         let r = parse_request(&Value::Null).unwrap();
         assert_eq!((r.views, r.baseline_m, r.speed_scale, r.return_to_start, r.min_score), (3, 0.08, 0.3, true, 0.3));
         assert_eq!((r.motion, r.axes), (Motion::Orbit, Axes::X));
+        assert_eq!(r.settle_min_s, MIN_SETTLE_S);
+        assert_eq!(parse_request(&json!({"settle_min_s": 0.5})).unwrap().settle_min_s, 0.5);
+        assert_eq!(parse_request(&json!({"settle_min_s": 3})).unwrap().settle_min_s, 3.0);
+        for bad in [json!({"settle_min_s": 0.4}), json!({"settle_min_s": 3.01}), json!({"settle_min_s": "1"}), json!({"settle_min_s": -1})] {
+            assert!(parse_request(&bad).is_err(), "{bad}");
+        }
         let r = parse_request(&json!({"motion": "translate"})).unwrap();
         assert_eq!((r.motion, r.axes, r.views), (Motion::Translate, Axes::Xy, 5));
         let r = parse_request(&json!({"motion": "orbit", "axes": "xy", "views": 3})).unwrap();

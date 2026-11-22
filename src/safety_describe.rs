@@ -342,6 +342,7 @@ impl SupervisorInner {
                     "axes": {"x": crate::measure_multiview::Axes::X.views().0, "xy": crate::measure_multiview::Axes::Xy.views().0},
                     "min_frame_margin_px": crate::measure_multiview::MIN_FRAME_MARGIN_PX,
                     "min_settle_s": crate::measure_multiview::MIN_SETTLE_S,
+                    "settle_min_s": crate::measure_multiview::SETTLE_MIN_S,
                     "max_settle_s": crate::measure_multiview::MAX_SETTLE_S,
                     "still": {"window": crate::measure_multiview::STILL_WINDOW, "median_vel_rad_s": crate::measure_multiview::STILL_VEL, "range_rad": crate::measure_multiview::STILL_RANGE_RAD},
                     "snapshot_bracket_rad": crate::measure_multiview::BRACKET_RAD,
