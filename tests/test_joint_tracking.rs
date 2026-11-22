@@ -345,7 +345,7 @@ fn tracking_off_wire_equivalence() {
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.25, 0.25, 0.25, 0.10, 0.05, 0.05, 0.15]);
         if mit_record {
             // Phase 2: an MIT qualification record in the calibration changes nothing while MIT is not requested
-            inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: Some(mit_record_fixture()), ..Default::default() }));
+            inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: serde_json::to_value(mit_record_fixture()).ok(), ..Default::default() }));
         }
         // m1: with tracking absent or disabled, output history must stay empty after enable/tick.
         assert!(inner.tracking.last_issued_positions.is_none(), "history must stay empty when tracking is off");

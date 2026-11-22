@@ -65,7 +65,7 @@ fn record_j4(timeout_raw: u32) -> MitQualificationFile {
 }
 
 fn with_record(inner: &mut SupervisorInner, rec: MitQualificationFile) {
-    inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: Some(rec), ..Default::default() }));
+    inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: serde_json::to_value(&rec).ok(), ..Default::default() }));
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn mit_qualification_record_is_checked_against_a_fresh_readback_before_storing()
     let body = |r: &MitQualificationFile| json!({"record": serde_json::to_value(r).unwrap()});
     // matches the motor: the file to store holds the record
     let file = inner.mit_qualification_check(&body(&record_j4(2000))).unwrap();
-    assert_eq!(file.mit_qualification, Some(record_j4(2000)));
+    assert_eq!(file.mit_record().unwrap(), Some(record_j4(2000)));
     assert!(file.validate().is_ok());
     // mismatching TIMEOUT / firmware / zero, unknown fields, torque on: refused
     assert_eq!(inner.mit_qualification_check(&body(&record_j4(1000))).unwrap_err().code, "MIT_QUALIFICATION_MISMATCH");
@@ -286,17 +286,22 @@ fn mit_qualification_record_is_checked_against_a_fresh_readback_before_storing()
 
 #[test]
 fn mit_qualification_only_calibration_file_validates() {
-    let file = armd::calibration::CalibrationFile { mit_qualification: Some(record_j4(2000)), ..Default::default() };
+    let mut file = armd::calibration::CalibrationFile::default();
+    file.set_mit_record(&record_j4(2000));
     assert!(file.validate().is_ok(), "{:?}", file.validate());
+    assert_eq!(file.mit_record().unwrap(), Some(record_j4(2000)));
     let text = serde_json::to_string(&file).unwrap();
     let back: armd::calibration::CalibrationFile = serde_json::from_str(&text).unwrap();
     assert_eq!(back, file);
-    let mut bad = file.clone();
-    bad.mit_qualification.as_mut().unwrap().joints[0].timeout_raw = 0;
-    assert!(bad.validate().is_err());
-    let mut bad = file;
-    bad.mit_qualification.as_mut().unwrap().joints[0].effort_ceiling_nm = 99.0;
-    assert!(bad.validate().is_err(), "effort ceiling above TMAX");
+    // an invalid record is refused on its own; the file stays valid (review #1)
+    for mutate in [|r: &mut MitQualificationFile| r.joints[0].timeout_raw = 0, |r: &mut MitQualificationFile| r.joints[0].effort_ceiling_nm = 99.0] {
+        let mut r = record_j4(2000);
+        mutate(&mut r);
+        let mut bad = file.clone();
+        bad.set_mit_record(&r);
+        assert!(bad.mit_record().is_err());
+        assert!(bad.validate().is_ok());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -623,4 +628,17 @@ fn mit_failed_rollback_blocks_fault_clearance() {
     assert!(inner.safety.state().is_stopped());
     let e = inner.clear_fault().unwrap_err();
     assert!(e.to_string().contains("uncertain"), "{e}");
+}
+
+/// Review (Phase 2) #1: `"hold_kp": null` / `"hold_kd": null` on a non-MIT joint is refused like
+/// at f258cf9 (an unknown key there), and so is null on an MIT joint.
+#[test]
+fn mit_hold_keys_null_is_refused_like_the_base() {
+    for (slot, key) in [(0usize, "hold_kp"), (0, "hold_kd"), (3, "hold_kp")] {
+        let mut v = serde_json::to_value(mit_config_j4().joint_tracking.unwrap()).unwrap();
+        v["joints"][slot][key] = serde_json::Value::Null;
+        let jt: JointTrackingConfig = serde_json::from_value(v).unwrap();
+        let mut cfg = ArmConfig { joint_tracking: Some(jt), ..mit_config_j4() };
+        assert!(cfg.validate().is_err(), "{key}: null accepted on slot {slot}");
+    }
 }

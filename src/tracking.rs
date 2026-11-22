@@ -51,10 +51,10 @@ pub struct JointTrackingJoint {
     pub effort_limit_nm: f32,
     /// MIT stationary-hold stiffness (N·m/rad); only for `mit` joints, tuned separately from
     /// the tracking `kp` under the same ceilings (Phase 2).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_key")]
     pub hold_kp: Option<f32>,
     /// MIT stationary-hold damping (N·m·s/rad); only for `mit` joints (Phase 2).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_key")]
     pub hold_kd: Option<f32>,
 }
 
@@ -75,6 +75,12 @@ impl Default for JointTrackingJoint {
             hold_kd: None,
         }
     }
+}
+
+/// A present key is Some, also when its value is null (as NaN, refused by validation): absent and
+/// null differ like at f258cf9, where the key was unknown either way.
+fn present_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(Some(Option::<f32>::deserialize(d)?.unwrap_or(f32::NAN)))
 }
 
 /// Startup joint-tracking configuration (`ArmConfig.joint_tracking`).

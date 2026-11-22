@@ -361,7 +361,7 @@ impl crate::supervisor::SupervisorInner {
         check_gate(&cfg, Some(&rec), &self.joint_zero_offsets, &joints, &rb, true)
             .map_err(|e| CalibError::new(409, "MIT_QUALIFICATION_MISMATCH", e))?;
         let mut file = self.calibration.clone().unwrap_or_default();
-        file.mit_qualification = Some(rec);
+        file.set_mit_record(&rec);
         file.validate().map_err(invalid)?;
         Ok(file)
     }
@@ -374,8 +374,12 @@ impl crate::supervisor::SupervisorInner {
         let mut driver = d.lock().map_err(|_| "driver lock poisoned".to_string())?;
         let supports = driver.supports_mit_mode_switch();
         let rb = driver.read_motor_identity(&joints).map_err(|e| format!("register readback failed: {e}"))?;
-        check_gate(&self.config, self.calibration.as_ref().and_then(|c| c.mit_qualification.as_ref()),
-            &self.joint_zero_offsets, &joints, &rb, supports)
+        let rec = match self.calibration.as_ref().map(|c| c.mit_record()) {
+            Some(Err(e)) => return Err(format!("the stored record is invalid: {e}")),
+            Some(Ok(r)) => r,
+            None => None,
+        };
+        check_gate(&self.config, rec.as_ref(), &self.joint_zero_offsets, &joints, &rb, supports)
     }
 }
 
@@ -392,7 +396,7 @@ pub async fn store_qualification(sup: &crate::supervisor::ArmSupervisor, deps: &
     let text = serde_json::to_string_pretty(&file).map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
     crate::calibration::put_file(deps.path.clone(), Some(text)).await
         .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}; nothing changed", deps.path.display())))?;
-    let joints: Vec<usize> = file.mit_qualification.as_ref().map_or_else(Vec::new, |q| q.joints.iter().map(|j| j.joint).collect());
+    let joints: Vec<usize> = file.mit_record().ok().flatten().map_or_else(Vec::new, |q| q.joints.iter().map(|j| j.joint).collect());
     let mut inner = sup.inner().write().await;
     inner.set_calibration(Some(file));
     tracing::warn!("MIT qualification stored for joints {joints:?}");
@@ -508,7 +512,8 @@ impl crate::supervisor::SupervisorInner {
     }
 
     fn mit_holdoff(&self) -> Duration {
-        let rec = self.calibration.as_ref().and_then(|c| c.mit_qualification.as_ref());
+        let rec = self.calibration.as_ref().and_then(|c| c.mit_record().ok().flatten());
+        let rec = rec.as_ref();
         let worst = mit_joints(&self.config).iter().filter_map(|&j| rec.and_then(|r| r.joint(j + 1)))
             .map(|q| Duration::from_secs_f32((q.measured_expiry_ms * 2.0 / 1000.0).clamp(0.0, 10.0))).max().unwrap_or_default();
         worst.max(MIT_TRIP_HOLDOFF_MIN)
@@ -770,4 +775,18 @@ impl crate::supervisor::SupervisorInner {
             self.mit.last_output = None;
         }
     }
+}
+
+/// Mark the MIT qualification record of `c` invalidated when it holds one of `joints` (1-based)
+/// and is not invalidated yet; an unparseable record is marked as well. Returns true on change.
+pub fn invalidate_record(c: &mut crate::calibration::CalibrationFile, joints: &[usize], reason: &str, at: &str) -> bool {
+    let touches = match c.mit_record_raw_joints() {
+        Some(js) => js.iter().any(|j| joints.contains(j)),
+        None => true,
+    };
+    let Some(v) = c.mit_qualification.as_mut() else { return false };
+    let Some(obj) = v.as_object_mut() else { return false };
+    if !touches || obj.get("invalidated").is_some_and(|i| !i.is_null()) { return false; }
+    obj.insert("invalidated".into(), json!({"reason": reason, "at": at}));
+    true
 }
