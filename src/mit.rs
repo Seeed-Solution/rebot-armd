@@ -31,6 +31,8 @@ use crate::calibration::{CalibError, CalibrationStale};
 use crate::model::ArmConfig;
 use crate::protocol::damiao;
 use crate::tracking::{JointTrackingConfig, TrackingStrategy};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::driver::JointTarget;
 
 /// WS path of the TIMEOUT commissioning.
 pub const TIMEOUT_PATH: &str = "/api/v1/calibration/mit_timeout";
@@ -399,3 +401,373 @@ pub async fn store_qualification(sup: &crate::supervisor::ArmSupervisor, deps: &
 
 /// `v` is above `max` or not a number.
 fn exceeds(v: f32, max: f32) -> bool { v.is_nan() || v > max }
+
+/// Output owner of the MIT joints ([`MitRuntime::owner`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MitOwner {
+    /// Position control owns every joint (also: MIT not requested).
+    #[default]
+    Off,
+    /// MIT tracking owns [`MitRuntime::joints`] after a confirmed stationary handover.
+    Active,
+    /// The group was cancelled (deadline, partial or failed write, uncertain mode): no output
+    /// until an explicit fault clearance and a rearm.
+    Lost,
+}
+
+/// Slew limit of the feed-forward torque (N·m/s), as the ordinary gravity output.
+pub const MIT_FF_SLEW_NM_S: f32 = 15.0;
+/// Velocity scale of the Coulomb friction term (rad/s).
+pub const MIT_COULOMB_VEL_RAD_S: f32 = 0.02;
+/// Hold-off of autonomous driver frames after a deadline trip, at least.
+pub const MIT_TRIP_HOLDOFF_MIN: Duration = Duration::from_millis(250);
+
+/// MIT tracking state of the supervisor (`SupervisorInner::mit`).
+#[derive(Debug, Clone, Default)]
+pub struct MitRuntime {
+    pub owner: MitOwner,
+    /// 0-based joints MIT owns while `Active`.
+    pub joints: Vec<usize>,
+    /// Feed-forward torque per joint of the last flushed batch (seeded by the handover hold).
+    pub last_ff: Vec<f32>,
+    /// Last flushed dynamic batch (supervisor clock).
+    pub last_output: Option<std::time::Instant>,
+    /// The qualification gate passed at the current arm: a handover may be tried.
+    pub armed_ok: bool,
+    /// Why the last handover (or hand back) failed.
+    pub handover_error: Option<String>,
+    /// Why the group was cancelled.
+    pub lost_reason: Option<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wire_limits(cfg: &ArmConfig, j: usize) -> damiao::DamiaoLimits {
+    cfg.damiao_ranges.as_ref().and_then(|r| r.get(j)).map_or_else(damiao::DamiaoLimits::default, |r| r.limits())
+}
+
+/// Round `tau` to the 12-bit MIT torque grid of `l` and keep it inside `[lo, hi]` (one step
+/// inward at a bound); None when no grid value lies inside.
+fn quantize_into(tau: f32, lo: f32, hi: f32, l: &damiao::DamiaoLimits) -> Option<f32> {
+    let grid = |t: f32| damiao::uint_to_float(damiao::float_to_uint(t, l.t_min, l.t_max, 12), l.t_min, l.t_max, 12);
+    let lsb = (l.t_max - l.t_min) / 4095.0;
+    let eps = 1e-6;
+    let mut q = grid(tau);
+    if q > hi + eps { q = grid(q - lsb); }
+    if q < lo - eps { q = grid(q + lsb); }
+    (q >= lo - eps && q <= hi + eps).then_some(q)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::supervisor::SupervisorInner {
+    fn mit_slot(&self, j: usize) -> Option<&crate::tracking::JointTrackingJoint> {
+        let k = self.config.arm_joint_indices().iter().position(|&a| a == j)?;
+        self.config.joint_tracking.as_ref()?.joints.get(k)
+    }
+
+    pub fn mit_active(&self) -> bool { self.mit.owner == MitOwner::Active }
+
+    /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
+    pub fn mit_motion_blocker(&self) -> Option<String> {
+        if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
+        match self.mit.owner {
+            MitOwner::Active => None,
+            MitOwner::Off => Some(format!("MIT tracking is not active: {}",
+                self.mit.handover_error.as_deref().unwrap_or("the handover waits for the arm at rest"))),
+            MitOwner::Lost => Some(format!("MIT tracking was cancelled: {}", self.mit.lost_reason.as_deref().unwrap_or("?"))),
+        }
+    }
+
+    /// Gravity torque per joint from the fresh measured posture, when a selected joint uses it.
+    fn mit_gravity(&self) -> Result<Vec<f32>, String> {
+        let dof = self.config.dof;
+        let arm_dof = self.config.arm_dof();
+        let needed = self.mit.joints.iter().chain(mit_joints(&self.config).iter())
+            .any(|&j| self.mit_slot(j).is_some_and(|c| c.gravity_scale > 0.0));
+        if !needed { return Ok(vec![0.0; dof]); }
+        if self.config.gravity_model.is_none() || self.measured_positions.len() < arm_dof {
+            return Err("gravity model unavailable".into());
+        }
+        let tau = self.config.arm_model.gravity_torques(&self.measured_positions[..arm_dof]).map_err(|e| format!("gravity: {e:?}"))?;
+        if !tau[..arm_dof].iter().all(|t| t.is_finite()) { return Err("gravity torque not finite".into()); }
+        let mut g = vec![0.0; dof];
+        g[..arm_dof].copy_from_slice(&tau[..arm_dof]);
+        Ok(g)
+    }
+
+    /// Fresh feedback of every joint younger than the MIT deadline.
+    fn mit_feedback_fresh(&self) -> bool {
+        self.feedback_numeric_valid && self.hardware_feedback_fresh(MIT_DEADLINE.saturating_sub(Duration::from_millis(1)))
+    }
+
+    /// A stationary MIT hold: the reference is at rest (fixed nominal, zero velocity and
+    /// acceleration), or a safety hold or fault owns the arm.
+    fn mit_in_hold(&self, v_d: f32, a_d: f32) -> bool {
+        self.safety.state().is_stopped() || self.collision.hold.is_some() || self.servo_blocked_hold
+            || self.torque_guard.hold.is_some() || (v_d == 0.0 && a_d == 0.0)
+    }
+
+    fn mit_holdoff(&self) -> Duration {
+        let rec = self.calibration.as_ref().and_then(|c| c.mit_qualification.as_ref());
+        let worst = mit_joints(&self.config).iter().filter_map(|&j| rec.and_then(|r| r.joint(j + 1)))
+            .map(|q| Duration::from_secs_f32((q.measured_expiry_ms * 2.0 / 1000.0).clamp(0.0, 10.0))).max().unwrap_or_default();
+        worst.max(MIT_TRIP_HOLDOFF_MIN)
+    }
+
+    /// MIT frame fields for every owned joint of `targets` (nominal `q_d`, `v_d` from the
+    /// target, `a_d` from the reference) and the feed-forward torque of the batch:
+    /// `pd = kp(q_d - q_m) + kd(v_d - v_m)`, `raw = s·G(q_m) + c·clamp(v_d / 0.02) + b·v_d + J·a_d`
+    /// (dynamic terms 0 in a hold), `tau_ff = clamp(raw, I)` with
+    /// `I = [-L, L] ∩ [-L - pd, L - pd] ∩ [last ± 15 dt]` and, in a torque-guard hold, the
+    /// relieving half-space `sign·(pd + tau_ff) <= 0`, rounded to the wire grid inside `I`.
+    /// Refuses (nothing is written) for stale feedback, missing gravity, values outside the
+    /// wire ranges or an empty interval.
+    pub fn mit_prepare(&self, targets: &mut [JointTarget], dt: f64) -> Result<Vec<f32>, String> {
+        if !self.mit_feedback_fresh() { return Err("feedback older than the MIT deadline".into()); }
+        let g = self.mit_gravity()?;
+        let dt = (dt as f32).clamp(0.001, 0.1);
+        let mut ff = self.mit.last_ff.clone();
+        ff.resize(self.config.dof, 0.0);
+        for &j in &self.mit.joints {
+            let c = self.mit_slot(j).ok_or_else(|| format!("J{}: no tracking entry", j + 1))?;
+            let t = targets.get_mut(j).ok_or("target vector too short")?;
+            let (q_d, v_d) = (t.position, t.velocity.unwrap_or(0.0));
+            let a_d = self.commanded_accelerations.get(j).copied().unwrap_or(0.0);
+            let (q_m, v_m) = (self.measured_positions[j], self.measured_velocities[j]);
+            if ![q_d, v_d, a_d, q_m, v_m].iter().all(|x| x.is_finite()) { return Err(format!("J{}: non-finite reference or feedback", j + 1)); }
+            let hold = self.mit_in_hold(v_d, a_d);
+            let (kp, kd) = if hold { (c.hold_kp.unwrap_or(0.0), c.hold_kd.unwrap_or(0.0)) } else { (c.kp, c.kd) };
+            let pd = kp * (q_d - q_m) + kd * (v_d - v_m);
+            let dynamic = if hold { 0.0 } else {
+                c.coulomb_nm * (v_d / MIT_COULOMB_VEL_RAD_S).clamp(-1.0, 1.0) + c.viscous_nm_s_rad * v_d + c.inertia_kg_m2 * a_d
+            };
+            let raw = c.gravity_scale * g[j] + dynamic;
+            let l = c.effort_limit_nm;
+            let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
+            let mut lo = (-l).max(-l - pd).max(last - MIT_FF_SLEW_NM_S * dt);
+            let mut hi = l.min(l - pd).min(last + MIT_FF_SLEW_NM_S * dt);
+            if let Some(h) = self.torque_guard.hold.filter(|h| h.joint == j) {
+                if h.sign > 0.0 { hi = hi.min(-pd); } else { lo = lo.max(-pd); }
+            }
+            if lo.is_nan() || hi.is_nan() || lo > hi {
+                return Err(format!("J{}: empty effort interval [{lo:.3}, {hi:.3}] N·m (pd {pd:.3}, L {l})", j + 1));
+            }
+            let wl = wire_limits(&self.config, j);
+            let tau = quantize_into(raw.clamp(lo, hi), lo, hi, &wl)
+                .ok_or_else(|| format!("J{}: no wire torque value inside [{lo:.4}, {hi:.4}]", j + 1))?;
+            let q_wire = q_d + self.joint_zero_offsets.get(j).copied().unwrap_or(0.0);
+            if q_wire.abs() > wl.p_max || v_d.abs() > wl.v_max || kp > wl.kp_max || kd > wl.kd_max || kp <= 0.0 || kd <= 0.0 {
+                return Err(format!("J{}: MIT frame outside the wire ranges (q {q_wire:.3}, v {v_d:.3}, kp {kp}, kd {kd})", j + 1));
+            }
+            *t = JointTarget::mit(q_d, v_d, kp, kd, tau);
+            ff[j] = tau;
+        }
+        Ok(ff)
+    }
+
+    /// Write one output batch (every ordinary output path). Without MIT: the driver write,
+    /// unchanged. With MIT active: the owned joints get MIT frames ([`Self::mit_prepare`]); the
+    /// feed-forward history advances only after a successful flush; a failed write cancels the
+    /// group. MIT lost: nothing is written (None).
+    pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
+        let ff = match self.mit.owner {
+            MitOwner::Off => None,
+            MitOwner::Lost => return None,
+            MitOwner::Active => match self.mit_prepare(&mut targets, dt) {
+                Ok(ff) => Some(ff),
+                Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
+            },
+        };
+        let res = self.driver.as_ref().and_then(|d| d.lock().ok())
+            .map(|mut drv| drv.write_joint_targets(&targets).map_err(|e| e.to_string()));
+        if let Some(ff) = ff {
+            match &res {
+                Some(Ok(())) => {
+                    self.mit.last_ff = ff;
+                    self.mit.last_output = Some(std::time::Instant::now());
+                }
+                Some(Err(e)) => self.mit_lose(format!("MIT batch write failed: {e}"), crate::safety::FaultCode::DriverWriteFailed),
+                None => {}
+            }
+        }
+        res
+    }
+
+    /// Cancel the group: no further output, latched fault, history and caches dropped.
+    pub(crate) fn mit_lose(&mut self, reason: String, code: crate::safety::FaultCode) {
+        tracing::error!("MIT tracking cancelled: {reason}");
+        self.mit.owner = MitOwner::Lost;
+        self.mit.lost_reason = Some(reason.clone());
+        self.mit.last_output = None;
+        self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            self.commanded_positions = self.measured_positions.clone();
+            self.target_positions = self.measured_positions.clone();
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        if !self.safety.state().is_stopped() {
+            self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!("MIT_LOST: {reason}")));
+        }
+    }
+
+    /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
+    /// and the gap since the last flushed dynamic batch, each against [`MIT_DEADLINE`].
+    pub(crate) fn mit_supervise(&mut self) {
+        if self.mit.owner != MitOwner::Active { return; }
+        let (trip, ages) = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
+            None => (None, Vec::new()),
+        };
+        let reason = if let Some(t) = trip { Some(format!("driver deadline fence: {t}")) }
+            else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(|a| a >= MIT_DEADLINE)) {
+                Some(format!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1))
+            } else if ages.len() != self.config.dof { Some("feedback ages unavailable".into()) }
+            else { self.mit.last_output.map(|t| t.elapsed()).filter(|g| *g >= MIT_DEADLINE)
+                .map(|g| format!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}")) };
+        if let Some(r) = reason { self.mit_lose(r, crate::safety::FaultCode::BusLoss); }
+    }
+
+    /// Positions of a handover hold: owned joints at the measured position, the others (and the
+    /// jaw) at their nominal command; MIT fields use the hold gains and `ff`, so either control
+    /// mode interprets the frame as a stationary hold.
+    fn mit_hold_targets(&self, joints: &[usize], ff: &[f32]) -> Vec<JointTarget> {
+        (0..self.config.dof).map(|i| {
+            if joints.contains(&i) {
+                let c = self.mit_slot(i);
+                JointTarget::mit(self.measured_positions[i], 0.0, c.and_then(|c| c.hold_kp).unwrap_or(0.0),
+                    c.and_then(|c| c.hold_kd).unwrap_or(0.0), ff.get(i).copied().unwrap_or(0.0))
+            } else {
+                JointTarget { position: self.commanded_positions[i], velocity: Some(0.0), torque: Some(0.0), kp: None, kd: None }
+            }
+        }).collect()
+    }
+
+    /// Try the handover to MIT (each tick): only from fresh, stationary, confirmed position
+    /// control of an armed arm whose qualification passed at this arm, with nothing else owning
+    /// the output (no motion, park, gravity compensation, hold or fault).
+    pub(crate) fn mit_maybe_activate(&mut self) {
+        let joints = mit_joints(&self.config);
+        if joints.is_empty() || self.mit.owner != MitOwner::Off || !self.mit.armed_ok || !self.is_torqued
+            || self.disable_pending || self.pending_rearm || self.pending_normal_unload || self.gravity_comp.is_some()
+            || self.safety.state().is_stopped() || !self.safety.state().is_operational() || self.handover_settling_since.is_some()
+            || self.active_trajectory.is_some() || self.servo_target.is_some() || self.servo_stream_active
+            || self.collision.hold.is_some() || self.torque_guard.hold.is_some() || self.servo_blocked_hold
+            || self.commanded_velocities.iter().any(|v| *v != 0.0)
+            || !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() {
+            return;
+        }
+        let g = match self.mit_gravity() {
+            Ok(g) => g,
+            Err(e) => { self.mit.handover_error = Some(e); self.mit.armed_ok = false; return; }
+        };
+        let mut ff = vec![0.0; self.config.dof];
+        for &j in &joints {
+            let Some(c) = self.mit_slot(j) else { return };
+            let l = c.effort_limit_nm;
+            let pd = -c.hold_kd.unwrap_or(0.0) * self.measured_velocities[j];
+            let (lo, hi) = ((-l).max(-l - pd), l.min(l - pd));
+            match (lo <= hi).then(|| quantize_into((c.gravity_scale * g[j]).clamp(lo, hi), lo, hi, &wire_limits(&self.config, j))).flatten() {
+                Some(t) => ff[j] = t,
+                None => {
+                    self.mit.handover_error = Some(format!("J{}: the hold torque does not fit the effort limit", j + 1));
+                    self.mit.armed_ok = false;
+                    return;
+                }
+            }
+        }
+        let hold = self.mit_hold_targets(&joints, &ff);
+        let modes: Vec<crate::driver::JointMode> = (0..self.config.dof)
+            .map(|i| if joints.contains(&i) { crate::driver::JointMode::Mit } else { crate::driver::JointMode::Position }).collect();
+        let holdoff = self.mit_holdoff();
+        let (res, uncertain) = {
+            let Some(Ok(mut drv)) = self.driver.as_ref().map(|d| d.lock()) else { return };
+            let res = drv.set_joint_modes_confirmed(&modes, &hold);
+            if res.is_ok() { drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff); }
+            (res, drv.joint_modes_uncertain())
+        };
+        match res {
+            Ok(()) => {
+                for &j in &joints {
+                    self.commanded_positions[j] = hold[j].position;
+                    self.target_positions[j] = hold[j].position;
+                }
+                self.tracking.seed(&self.commanded_positions);
+                self.mit.owner = MitOwner::Active;
+                self.mit.joints = joints.clone();
+                self.mit.last_ff = ff;
+                self.mit.last_output = Some(std::time::Instant::now());
+                self.mit.handover_error = None;
+                tracing::warn!("MIT tracking owns joints {:?}", joints.iter().map(|j| j + 1).collect::<Vec<_>>());
+            }
+            Err(e) => {
+                self.mit.armed_ok = false;
+                self.mit.handover_error = Some(format!("MIT handover failed: {e}"));
+                self.tracking.invalidate();
+                if uncertain {
+                    self.mit.joints = joints;
+                    self.mit_lose(format!("MIT handover failed and the switch back is not confirmed: {e}"), crate::safety::FaultCode::HardwareFault);
+                }
+            }
+        }
+    }
+
+    /// Hand the MIT joints back to confirmed stationary position control (gravity compensation
+    /// entry, park, rearm). Needs fresh stationary feedback. Nothing to do when MIT is not active.
+    pub fn mit_hand_back(&mut self, why: &str) -> Result<(), String> {
+        if self.mit.owner != MitOwner::Active { return Ok(()); }
+        if !self.mit_feedback_fresh() || !self.tracking_stationary_evidence() || self.commanded_velocities.iter().any(|v| *v != 0.0) {
+            return Err(format!("MIT tracking hands back ({why}) only at rest with fresh feedback"));
+        }
+        let joints = self.mit.joints.clone();
+        let hold = self.mit_hold_targets(&joints, &self.mit.last_ff.clone());
+        let modes = vec![crate::driver::JointMode::Position; self.config.dof];
+        let (res, uncertain) = {
+            let Some(d) = self.driver.as_ref() else { return Err("no driver".into()) };
+            let mut drv = d.lock().map_err(|_| "driver lock poisoned".to_string())?;
+            let res = drv.set_joint_modes_confirmed(&modes, &hold);
+            if res.is_ok() { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+            (res, drv.joint_modes_uncertain())
+        };
+        match res {
+            Ok(()) => {
+                for &j in &joints {
+                    self.commanded_positions[j] = hold[j].position;
+                    self.target_positions[j] = hold[j].position;
+                }
+                self.tracking.seed(&self.commanded_positions);
+                self.mit.owner = MitOwner::Off;
+                self.mit.joints.clear();
+                self.mit.last_output = None;
+                tracing::warn!("MIT tracking handed back to position control ({why})");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("MIT hand back ({why}) failed: {e}");
+                if uncertain {
+                    self.mit_lose(msg.clone(), crate::safety::FaultCode::HardwareFault);
+                } else {
+                    // switched back to MIT with the hold: still the owner
+                    self.mit.last_output = Some(std::time::Instant::now());
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::HardwareFault, crate::safety::FaultReason::Other(msg.clone()));
+                }
+                self.mit.handover_error = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Torque went off: MIT owns nothing; the motors keep CTRL_MODE MIT in RAM until the next
+    /// enable restores the base mode. A cancelled group stays cancelled until cleared.
+    pub(crate) fn mit_torque_off(&mut self) {
+        self.mit.armed_ok = false;
+        if self.mit.owner == MitOwner::Active {
+            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+            self.mit.owner = MitOwner::Off;
+            self.mit.joints.clear();
+            self.mit.last_output = None;
+        }
+    }
+}

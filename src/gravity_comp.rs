@@ -204,6 +204,10 @@ impl SupervisorInner {
     pub fn enter_gravity_comp(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
         if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message)); }
+        // hand guiding and MIT tracking own the output exclusively: hand back first (at rest)
+        if self.mit_active() {
+            self.mit_hand_back("gravity compensation").map_err(|e| Self::reject("MIT_HAND_BACK_FAILED", e))?;
+        }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
         let scale = request.scale.unwrap_or(policy.scale);

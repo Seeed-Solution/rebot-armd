@@ -335,7 +335,7 @@ fn assert_obs_equiv(a: &[ArmObservation], b: &[ArmObservation], label: &str) {
 /// must be bit-identical across quintic, path, replay, stream, braking, park and jaw contact.
 #[test]
 fn tracking_off_wire_equivalence() {
-    let run_scenario = |joint_tracking: Option<JointTrackingConfig>| -> (Vec<Vec<JointTarget>>, Vec<ArmObservation>) {
+    let run_scenario_with = |joint_tracking: Option<JointTrackingConfig>, mit_record: bool| -> (Vec<Vec<JointTarget>>, Vec<ArmObservation>) {
         let cfg = ArmConfig {
             lease_timeout_ms: 600_000,
             joint_tracking,
@@ -343,6 +343,10 @@ fn tracking_off_wire_equivalence() {
         };
         let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -4.0];
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.25, 0.25, 0.25, 0.10, 0.05, 0.05, 0.15]);
+        if mit_record {
+            // Phase 2: an MIT qualification record in the calibration changes nothing while MIT is not requested
+            inner.set_calibration(Some(armd::calibration::CalibrationFile { mit_qualification: Some(mit_record_fixture()), ..Default::default() }));
+        }
         // m1: with tracking absent or disabled, output history must stay empty after enable/tick.
         assert!(inner.tracking.last_issued_positions.is_none(), "history must stay empty when tracking is off");
         assert!(inner.tracking.last_issued_velocities.is_none(), "velocity history must stay empty when tracking is off");
@@ -443,8 +447,13 @@ fn tracking_off_wire_equivalence() {
         (frames, obs_log)
     };
 
+    let run_scenario = |jt: Option<JointTrackingConfig>| run_scenario_with(jt, false);
     let (frames_none, obs_none) = run_scenario(None);
     let (frames_disabled, obs_disabled) = run_scenario(Some(JointTrackingConfig::rebot_dm()));
+    // Phase 2 (MIT not enabled): a disabled block holding MIT joints, and no block with an MIT
+    // qualification record stored
+    let (frames_mit_disabled, obs_mit_disabled) = run_scenario_with(Some(mit_keys_block(false)), true);
+    let (frames_mit_record, obs_mit_record) = run_scenario_with(None, true);
 
     assert!(frames_none.len() > 700, "expected full multi-producer trace, got {}", frames_none.len());
     assert!(
@@ -544,6 +553,34 @@ fn tracking_off_wire_equivalence() {
     };
     check_against_baseline("joint_tracking=None vs e4f72b6", &frames_none, &obs_none);
     check_against_baseline("joint_tracking=enabled:false vs e4f72b6", &frames_disabled, &obs_disabled);
+    check_against_baseline("disabled block with MIT joints + record vs e4f72b6", &frames_mit_disabled, &obs_mit_disabled);
+    check_against_baseline("no block + MIT record vs e4f72b6", &frames_mit_record, &obs_mit_record);
+}
+
+/// Tracking block with J4 and J5 on strategy `mit` (Phase 2 keys), `enabled` as given.
+fn mit_keys_block(enabled: bool) -> JointTrackingConfig {
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = enabled;
+    for k in [3, 4] {
+        let j = &mut jt.joints[k];
+        j.strategy = TrackingStrategy::Mit;
+        j.kp = 8.0;
+        j.kd = 0.2;
+        j.hold_kp = Some(8.0);
+        j.hold_kd = Some(0.2);
+        j.effort_limit_nm = 2.0;
+        j.gravity_scale = 1.0;
+    }
+    jt
+}
+
+fn mit_record_fixture() -> armd::mit::MitQualificationFile {
+    serde_json::from_value(serde_json::json!({"version": 1, "joints": [{
+        "profile_id": "rebot_b601dm", "joint": 4, "joint_name": "joint4", "zero_fingerprint": armd::mit::zero_fingerprint(0.0),
+        "motor_id": 4, "reply_id": 20, "esc_id": 4, "mst_id": 20, "sw_ver": 942747703, "pmax": 12.5, "vmax": 30.0, "tmax": 10.0,
+        "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": false, "tested_response": "disabled",
+        "measured_expiry_ms": 101.0, "load_envelope": "supported", "max_kp": 15.0, "max_kd": 0.5, "effort_ceiling_nm": 4.0,
+        "date": "2026-11-22T00:00:00Z", "trace_id": "t"}]})).unwrap()
 }
 
 /// Phase 1 Test 2: Integrates `dq/dt = (q_out - q) / 0.68` at 20 ms with a smooth

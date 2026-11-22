@@ -355,6 +355,8 @@ pub struct SupervisorInner {
     /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
     /// MIT not requested.
     pub mit_gate_error: Option<String>,
+    /// MIT tracking output owner and history (`src/mit.rs`).
+    pub mit: crate::mit::MitRuntime,
     /// The profile's `workspace.floor_z_m` (None without a workspace). `config.workspace.floor_z_m`
     /// holds the effective floor ([`crate::calibration::effective_floor`]), recomputed by
     /// [`refresh_effective_floor`](Self::refresh_effective_floor) whenever its inputs change.
@@ -635,6 +637,7 @@ impl SupervisorInner {
             workspace_revision: 0,
             calibration: None,
             mit_gate_error: None,
+            mit: Default::default(),
             profile_floor_z_m,
             floor_source: "profile",
             hover_jobs: Vec::new(),
@@ -1451,6 +1454,7 @@ impl SupervisorInner {
 
     /// A successful transport write is not confirmation that torque was removed.
     fn request_disable(&mut self) -> Result<(), SafetyError> {
+        self.mit_torque_off();
         self.disable_pending = true;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
@@ -1790,6 +1794,11 @@ impl SupervisorInner {
                 return Err(SafetyError::ClearFaultRejected(msg));
             }
             self.mit_gate_error = None;
+            // A rearm while MIT owns joints hands them back first (at rest), so the driver's
+            // enable never silently restores the base mode under an active MIT owner.
+            if self.mit_active() {
+                self.mit_hand_back("rearm").map_err(SafetyError::ClearFaultRejected)?;
+            }
 
             // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback
             let any_driver_enabled = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));
@@ -1944,6 +1953,8 @@ impl SupervisorInner {
             self.is_torqued = true;
             self.pending_rearm = false;
             self.disable_pending = false;
+            self.mit.armed_ok = !crate::mit::mit_joints(&self.config).is_empty();
+            self.mit.handover_error = None;
             let now = Instant::now();
             self.last_heartbeat = now;
             self.last_motion_frame = now;
@@ -2052,6 +2063,11 @@ impl SupervisorInner {
                     return;
                 }
 
+                // MIT tracking hands back to position control before the park when the arm is
+                // at rest; otherwise at the first tick at rest during the park.
+                if self.mit_active() {
+                    if let Err(e) = self.mit_hand_back("park") { tracing::warn!("{e}"); }
+                }
                 // Return to home position cleanly, then disable torque.
                 // Allow unload from Operational or Idle.
                 let can_unload = self.is_torqued && !self.pending_rearm && (
@@ -2149,6 +2165,7 @@ impl SupervisorInner {
                     self.measured_velocities = vec![0.0; self.config.dof];
                 }
                 let _ = self.safety.set_torque(false);
+                self.mit_torque_off();
                 if let Some(ref d) = self.driver {
                     if let Ok(mut driver) = d.lock() {
                         let _ = driver.set_torque(false);
@@ -2286,6 +2303,11 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
         }
         if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+        if self.mit.owner == crate::mit::MitOwner::Lost
+            && self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.joint_modes_uncertain())) {
+            return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
+                check the arm and power-cycle the motors".into()));
+        }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
@@ -2371,6 +2393,12 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
         }
         self.pending_rearm = true;
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // cleared: a rearm (fresh readback, base modes restored) and a fresh handover follow
+            self.mit.owner = crate::mit::MitOwner::Off;
+            self.mit.joints.clear();
+            self.mit.armed_ok = false;
+        }
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();
@@ -2827,6 +2855,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
+        if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
@@ -3188,6 +3217,7 @@ impl SupervisorInner {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
         self.collision_hold_check()?;
+        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
         Ok(())
     }
@@ -4264,11 +4294,7 @@ impl SupervisorInner {
                         kd: None,
                     })
                     .collect();
-                let write_res = self
-                    .driver
-                    .as_ref()
-                    .and_then(|d| d.lock().ok())
-                    .map(|mut driver| driver.write_joint_targets(&targets));
+                let write_res = self.write_output(targets, 1.0 / f64::from(self.config.control_frequency_hz.max(1)));
                 match write_res {
                     Some(Ok(())) => {
                         let done = fb.done;
@@ -5489,6 +5515,13 @@ impl SupervisorInner {
                 }
             }
         }
+        // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.
+        // No-ops while MIT is not requested.
+        self.mit_supervise();
+        if self.pending_normal_unload && self.mit_active() {
+            let _ = self.mit_hand_back("park");
+        }
+        self.mit_maybe_activate();
         let gravity_output_enabled = self.gravity_output_enabled();
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
@@ -5617,11 +5650,7 @@ impl SupervisorInner {
                                     kd: None,
                                 })
                                 .collect();
-                            let write_res = self
-                                .driver
-                                .as_ref()
-                                .and_then(|d| d.lock().ok())
-                                .map(|mut driver| driver.write_joint_targets(&targets));
+                            let write_res = self.write_output(targets, servo_dt);
                             match write_res {
                                 Some(Ok(())) => {
                                     self.tracking.record_issued_with_ws_depths(
@@ -5684,29 +5713,28 @@ impl SupervisorInner {
                     if tracking_active {
                         self.tracking.invalidate();
                     }
-                    if let Some(ref d) = self.driver {
-                        if let Ok(mut driver) = d.lock() {
-                            let targets: Vec<JointTarget> = self
-                                .commanded_positions
-                                .iter()
-                                .zip(self.commanded_velocities.iter())
-                                .enumerate()
-                                .map(|(i, (&p, &v))| JointTarget {
-                                    position: p,
-                                    velocity: Some(v),
-                                    torque: if gravity_output_enabled {
-                                        self.gravity_torques_ramped.get(i).copied()
-                                    } else {
-                                        Some(0.0)
-                                    },
-                                    kp: None,
-                                    kd: None,
-                                })
-                                .collect();
-                            match driver.write_joint_targets(&targets) {
-                                Ok(()) => tick_output_accepted = true,
-                                Err(e) => output_error = Some(e.to_string()),
-                            }
+                    if self.driver.is_some() {
+                        let targets: Vec<JointTarget> = self
+                            .commanded_positions
+                            .iter()
+                            .zip(self.commanded_velocities.iter())
+                            .enumerate()
+                            .map(|(i, (&p, &v))| JointTarget {
+                                position: p,
+                                velocity: Some(v),
+                                torque: if gravity_output_enabled {
+                                    self.gravity_torques_ramped.get(i).copied()
+                                } else {
+                                    Some(0.0)
+                                },
+                                kp: None,
+                                kd: None,
+                            })
+                            .collect();
+                        match self.write_output(targets, servo_dt) {
+                            Some(Ok(())) => tick_output_accepted = true,
+                            Some(Err(e)) => output_error = Some(e),
+                            None => {}
                         }
                     } else {
                         tick_output_accepted = true;
