@@ -1875,7 +1875,7 @@ mod tests {
 
         // 2. v2 PGM bundle via write_replay_bundle_gray (exact pixel roundtrip!)
         let v2_dir = dir.path().join("v2_pgm");
-        write_replay_bundle_gray(&v2_dir, &[gray.clone()], &[cam], [64.0, 36.0], 0, [10.0, 10.0, 30.0, 30.0], 0.0).unwrap();
+        write_replay_bundle_gray(&v2_dir, std::slice::from_ref(&gray), &[cam], [64.0, 36.0], 0, [10.0, 10.0, 30.0, 30.0], 0.0).unwrap();
         let b2 = read_bundle(&v2_dir).unwrap();
         assert_eq!(b2.views.len(), 1);
         assert_eq!(b2.views[0].img, gray);
