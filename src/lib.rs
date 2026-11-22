@@ -67,8 +67,8 @@ pub use trajectory::{
     TrajectoryPoint,
 };
 #[cfg(not(target_arch = "wasm32"))] pub use transport::{
-    AsyncTransport, CanFrame, CanTransport, MockCanTransport, MockTransport, SerialTransport,
-    SerialTransportConfig, SlcanCodec, SlcanTransport, Transport, TransportError,
+    AsyncTransport, CanFrame, CanTransport, DriverClock, MockCanTransport, MockClock, MockTransport,
+    SerialTransport, SerialTransportConfig, SlcanCodec, SlcanTransport, Transport, TransportError,
 };
 
 #[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]

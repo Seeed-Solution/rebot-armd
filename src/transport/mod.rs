@@ -8,7 +8,7 @@ pub mod slcan;
 #[cfg(target_os = "linux")]
 pub mod socketcan;
 
-pub use mock::{MockCanTransport, MockTransport};
+pub use mock::{MockCanTransport, MockClock, MockTransport};
 pub use serial::{SerialTransport, SerialTransportConfig};
 pub use slcan::{SlcanCodec, SlcanTransport};
 
@@ -153,8 +153,30 @@ impl fmt::Debug for CanFrame {
     }
 }
 
+/// Monotonic clock and pacing seam for deterministic transport testing.
+///
+/// Production hardware transports return `None` from [`Transport::clock`],
+/// so drivers use `Instant::now()`, `std::thread::sleep()`, and
+/// `std::thread::yield_now()` directly with zero behavioral change.
+pub trait DriverClock: Send + Sync {
+    /// Unique identifier for this clock domain (used to detect transport replacement mismatches).
+    fn clock_id(&self) -> u64;
+    /// Current monotonic timestamp.
+    fn now(&self) -> std::time::Instant;
+    /// Sleep / advance by `duration`.
+    fn sleep(&self, duration: std::time::Duration);
+    /// Yield while polling for bytes.
+    fn yield_now(&self);
+}
+
 /// Synchronous byte-stream hardware transport trait
 pub trait Transport: Send {
+    /// Optional deterministic clock supplied by mock/test transports.
+    /// Production transports return `None` to use the real system clock.
+    fn clock(&self) -> Option<std::sync::Arc<dyn DriverClock>> {
+        None
+    }
+
     /// Read incoming bytes into buffer
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError>;
 
