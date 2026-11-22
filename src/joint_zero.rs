@@ -168,6 +168,22 @@ impl ArmDriver for ZeroOffsetDriver {
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
     fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
     fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
+    fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        match self.to_motor(hold) {
+            None => self.inner.set_joint_modes_confirmed(modes, hold),
+            Some(m) => self.inner.set_joint_modes_confirmed(modes, &m),
+        }
+    }
+    fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
+    fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
+    fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
+    fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
+    fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
+    fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
+    fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
+        self.inner.commission_motor_timeout(joints, counts)
+    }
 }
 
 /// Result of the zero check against the reference pose (`zero_convention`).

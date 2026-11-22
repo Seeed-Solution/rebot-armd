@@ -279,6 +279,10 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
         }
         tokio::time::sleep(POLL).await;
     }
+    // every check passed: invalidate a qualification of the zeroed joints on disk before the
+    // first zero command (a failed write refuses the zero, nothing changed)
+    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "motor").await?;
     // 3. one set-zero command per joint, spaced; the joint zero offset of each zeroed joint
     // becomes -reference (the motor reads 0 at the reference)
     let mut sent: Vec<(usize, Instant)> = Vec::new();
@@ -362,7 +366,10 @@ async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: Mot
         return Err(CalibError::new(409, "MOTOR_ZERO_FAR", format!("J{} would need a joint zero offset of {:.1} deg; nothing was changed", j + 1, f64::from(new[*j]).to_degrees())));
     }
     // 3. backup, 4. install, 5. verify, 6. store + invalidate, log
-    let backup = write_zero_backup(deps, "software_zero", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
+    let backup = write_zero_backup(deps, "software_zero", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed")))?;
+    // validated and backed up: invalidate a qualification of the zeroed joints on disk before the install
+    let one_based: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &one_based, "software").await?;
     let t_apply = locked_step(sup, check, "apply", |inner| {
         inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))?;
         Ok(Instant::now())
@@ -439,7 +446,9 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: Str
         if let Some(z) = &target { z.validate(Some(n)).map_err(|e| invalid(format!("backup {name}: {e}")))?; }
         Ok((inner.joint_zero_offsets.clone(), new, reference(inner)))
     }).await?;
-    let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
+    let changed: Vec<usize> = (0..old.len()).filter(|&j| old.get(j) != new.get(j)).map(|j| j + 1).collect();
+    let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}; nothing was changed")))?;
+    crate::calibration::invalidate_mit_before_zero(sup, deps, &changed, "restored").await?;
     locked_step(sup, check, "apply", |inner| inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))).await?;
     let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();
     let changes: Vec<f32> = joints.iter().map(|&j| old[j] - new[j]).collect();

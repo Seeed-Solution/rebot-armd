@@ -321,6 +321,24 @@ pub const RID_VMAX: u8 = 22;
 pub const RID_TMAX: u8 = 23;
 pub const CTRL_MODE_MIT: u32 = 1;
 pub const CTRL_MODE_POS_VEL: u32 = 2;
+/// Feedback (master) CAN ID of the motor (u32).
+pub const RID_MST_ID: u8 = 7;
+/// Command (ESC) CAN ID of the motor (u32).
+pub const RID_ESC_ID: u8 = 8;
+/// Command timeout (u32 counts; 0 = no timeout). Damiao documents 50 µs per count
+/// (wiki.seeedstudio.com/damiao_series); the unit, the expiry latency and the motor's
+/// response on expiry are NOT verified on the B601-DM firmware (sw_ver 942747703).
+pub const RID_TIMEOUT: u8 = 9;
+/// Firmware version (u32).
+pub const RID_SW_VER: u8 = 14;
+/// Documented TIMEOUT unit (µs per count). Unverified on this firmware: keep it a recorded
+/// value of every commissioning, never a hidden assumption.
+pub const TIMEOUT_UNIT_US_DOCUMENTED: u32 = 50;
+
+/// Build a RAM register write of a u32 value (`0x55`; never the flash store `0xAA`).
+pub fn build_write_register_u32_frame(motor_id: u16, rid: u8, value: u32) -> CanFrame {
+    build_write_register_frame(motor_id, rid, value.to_le_bytes())
+}
 
 /// Build a register read request (`0x7FF`, `[id_l, id_h, 0x33, rid, 0, 0, 0, 0]`).
 pub fn build_read_register_frame(motor_id: u16, rid: u8) -> CanFrame {

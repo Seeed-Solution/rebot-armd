@@ -1850,7 +1850,10 @@ impl ArmConfig {
             }
         }
         if let Some(jt) = &self.joint_tracking {
-            match jt.validate(self.arm_dof(), self.dof, self.gripper_index()) {
+            let checked = jt.validate(self.arm_dof(), self.dof, self.gripper_index());
+            #[cfg(not(target_arch = "wasm32"))]
+            let checked = checked.and_then(|()| crate::mit::validate_profile(self, jt));
+            match checked {
                 Ok(()) => {}
                 Err(e) if jt.enabled => return Err(e),
                 // A disabled block is never evaluated: like a profile without one (before joint

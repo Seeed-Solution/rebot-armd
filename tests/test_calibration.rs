@@ -1184,3 +1184,88 @@ fn legacy_calibration_files_read_with_acceptance_unknown() {
     let bad = CalibrationFile { table_z_source: Some("manual".into()), ..c };
     assert!(bad.validate().is_err());
 }
+
+/// Joint tracking Phase 2: the MIT qualification record (`mit_qualification`) is kept through a
+/// camera apply and a camera restore (not part of either), survives as a file of its own and is
+/// marked invalidated by a zero of a qualified joint; a tracking-only file loads at startup.
+#[tokio::test]
+async fn mit_qualification_survives_apply_and_restore_and_a_zero_invalidates_it() {
+    let rec: armd::mit::MitQualificationFile = serde_json::from_value(json!({"version": 1, "joints": [{
+        "profile_id": "rebot_b601dm", "joint": 4, "joint_name": "joint4", "zero_fingerprint": armd::mit::zero_fingerprint(0.0),
+        "motor_id": 4, "reply_id": 20, "esc_id": 4, "mst_id": 20, "sw_ver": 942747703, "pmax": 12.5, "vmax": 30.0, "tmax": 10.0,
+        "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": true, "tested_response": "disabled",
+        "measured_expiry_ms": 101.0, "worst_latency_ms": 8.0, "load_envelope": "supported", "max_kp": 15.0, "max_kd": 0.5, "effort_ceiling_nm": 4.0,
+        "date": "2026-11-22T00:00:00Z", "trace_id": "t"}]})).unwrap();
+    let mut r = rig().await;
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    let first_backup = Path::new(reply["backup"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+    {
+        let mut inner = r.sup.inner().write().await;
+        let mut c = inner.calibration.clone().unwrap();
+        c.set_mit_record(&rec);
+        inner.set_calibration(Some(c));
+    }
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body_q(false, q_tilt(-20.0))).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert_eq!(file.mit_record().unwrap().as_ref(), Some(&rec), "camera apply kept the record on disk");
+    assert_eq!(r.sup.inner().read().await.calibration.as_ref().unwrap().mit_record().unwrap().as_ref(), Some(&rec));
+    // restoring a backup taken before the record existed keeps the live record
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": first_backup})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_eq!(r.sup.inner().read().await.calibration.as_ref().unwrap().mit_record().unwrap().as_ref(), Some(&rec));
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert_eq!(file.mit_record().unwrap().as_ref(), Some(&rec));
+    // a zero of another joint leaves it; a zero of J4 invalidates it (file and live)
+    let _ = calibration::invalidate_after_zero(&r.sup, &r.deps, &[2], &[0.001], "motor", None).await;
+    assert!(r.sup.inner().read().await.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_none());
+    let _ = calibration::invalidate_after_zero(&r.sup, &r.deps, &[4], &[0.001], "motor", None).await;
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.mit_record().unwrap().unwrap().invalidated.is_some());
+    assert!(r.sup.inner().read().await.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_some());
+
+    // tracking-only file at startup
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calibration.json");
+    std::fs::write(&path, serde_json::to_string(&CalibrationFile { mit_qualification: serde_json::to_value(rec.clone()).ok(), ..Default::default() }).unwrap()).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    calibration::load_into(&sup, &path, None).await.unwrap();
+    let inner = sup.inner().read().await;
+    assert_eq!(inner.calibration.as_ref().unwrap().mit_record().unwrap().as_ref(), Some(&rec));
+    assert!(inner.calibration_load_error.is_none());
+}
+
+/// Review (Phase 2) #1: an invalid optional `mit_qualification` never discards the rest of
+/// calibration.json (joint zero, camera calibration); only the record is flagged, and MIT stays
+/// refused. Absent, malformed (unknown field, wrong type) and semantically invalid records.
+#[tokio::test]
+async fn invalid_mit_record_keeps_joint_zero_and_camera_calibration() {
+    let bad_records = [
+        json!({"version": 9, "joints": []}),
+        json!({"version": 1, "joints": [{"joint": 4, "unknown": 1}]}),
+        json!("not an object"),
+        json!({"version": 1, "joints": [{"profile_id": "rebot_b601dm", "joint": 4, "joint_name": "joint4", "zero_fingerprint": "z",
+            "motor_id": 4, "reply_id": 20, "esc_id": 4, "mst_id": 20, "sw_ver": 1, "pmax": 12.5, "vmax": 30.0, "tmax": 10.0,
+            "timeout_raw": 0, "timeout_unit_us": 50, "timeout_unit_verified": true, "tested_response": "disabled",
+            "measured_expiry_ms": 101.0, "worst_latency_ms": 8.0, "load_envelope": "s", "max_kp": 15.0, "max_kd": 0.5,
+            "effort_ceiling_nm": 4.0, "date": "d", "trace_id": "t"}]}),
+    ];
+    for bad in bad_records {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calibration.json");
+        let mut v = serde_json::to_value(calib_file(v8_q())).unwrap();
+        v["joint_zero"] = serde_json::to_value(armd::joint_zero::JointZero::new(&[0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.0], "software", "rest")).unwrap();
+        v["mit_qualification"] = bad.clone();
+        std::fs::write(&path, v.to_string()).unwrap();
+        let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+        calibration::load_into(&sup, &path, None).await.unwrap();
+        let inner = sup.inner().read().await;
+        assert!((inner.joint_zero_offsets[2] - 0.01).abs() < 1e-6, "{bad}: joint zero lost: {:?}", inner.joint_zero_offsets);
+        let c = inner.calibration.as_ref().unwrap_or_else(|| panic!("{bad}: calibration dropped"));
+        assert!(c.has_camera(), "{bad}: camera calibration dropped");
+        assert!(c.mit_record().is_err(), "{bad}: the record must be refused");
+        let e = inner.calibration_load_error.as_deref().unwrap_or("");
+        assert!(e.contains("mit_qualification"), "{bad}: the record must be flagged: {e:?}");
+    }
+}

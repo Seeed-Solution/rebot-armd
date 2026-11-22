@@ -257,6 +257,62 @@ pub trait ArmDriver: Send {
     /// only when its hold frames and the bus flush also succeed. Off (default) keeps the
     /// pre-tracking behaviour, where a matching mode acknowledgement confirms the switch.
     fn set_strict_mode_handover(&mut self, _strict: bool) {}
+
+    /// Fresh register readback of the motors of `joints` (0-based): identity, firmware, mode,
+    /// mapping ranges and the command timeout (MIT qualification gate, `src/mit.rs`). Read only.
+    fn read_motor_identity(&mut self, _joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> {
+        Err(ArmDriverError::Protocol("motor identity readback is not supported by this driver".into()))
+    }
+
+    /// MIT tracking handover (joint tracking Phase 2): `set_joint_modes` where a joint is
+    /// confirmed only when its mode write, every hold frame, the flush and a matching mode
+    /// acknowledgement succeed AND fresh feedback from that motor arrives after its
+    /// acknowledgement (samples queued before the switch do not count). Otherwise every changed
+    /// joint is switched back (dual holds) and an error is returned.
+    fn set_joint_modes_confirmed(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        Err(ArmDriverError::Protocol("confirmed joint mode switching is not supported by this driver".into()))
+    }
+
+    /// Arm (`Some(deadline)`) or disarm the MIT tracking deadline fence. Armed: a joint feedback
+    /// age or a gap between complete target batches reaching `deadline` trips it, checked before
+    /// every transmit (retries and batch continuations included), and so does an RX backlog the
+    /// bounded read cannot drain; no recovery write and no status poll is sent. Tripped: every
+    /// target write and mode switch is refused and the cached frames are discarded until the
+    /// next confirmed enable; no autonomous frame is sent for `holdoff`.
+    fn set_mit_deadline_fence(&mut self, _deadline: Option<Duration>, _holdoff: Duration) {}
+
+    /// Operator recovery after an MIT loss in which a motor disabled itself (its command TIMEOUT
+    /// expired, error 0xD) while others stay enabled: clear-error to every motor in an error
+    /// state, then disable every motor and require fresh per-motor confirmation (state 0). Sends
+    /// no MIT and no POS_VEL target frame. Err names the joints that did not confirm.
+    fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        Err("MIT expiry recovery is not supported by this driver".into())
+    }
+
+    /// Fresh state of every motor for the MIT expiry recovery decision: a read-only status poll
+    /// to each motor after a receive boundary, and the state codes of feedback received after it.
+    /// Err names the motors without fresh feedback.
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+        Err("fresh status read is not supported by this driver".into())
+    }
+
+    /// Current time of the driver's clock (the transport's deterministic clock in tests).
+    fn clock_now(&self) -> Instant { Instant::now() }
+
+    /// Why the MIT deadline fence tripped (None = not tripped).
+    fn mit_fence_trip(&self) -> Option<String> { None }
+
+    /// Explicit operator clearance of a tripped MIT fence: read-only status polls may resume
+    /// (after the hold-off) so fresh feedback can return; target writes stay refused until the
+    /// next confirmed enable.
+    fn acknowledge_mit_fence_trip(&mut self) {}
+
+    /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
+    /// acknowledgement and confirm it with a separate read. Torque off only.
+    fn commission_motor_timeout(&mut self, joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
+        Err(crate::mit::TimeoutBatchError { not_attempted: joints.to_vec(),
+            ..ArmDriverError::Protocol("motor timeout commissioning is not supported by this driver".into()).into() })
+    }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -2153,6 +2209,33 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     recovery_written_joints: Vec<usize>,
     /// `ArmDriver::set_strict_mode_handover`; false keeps the e4f72b6 `write_modes`.
     strict_mode_handover: bool,
+    /// Register replies with the CAN ID they arrived on and their receive instant (MIT
+    /// identity readback and TIMEOUT commissioning).
+    register_reply_log: Vec<(damiao::RegisterReply, u32, Instant, u64, u64)>,
+    /// RX sequence number of the last observed-empty receive queue: every frame dequeued after
+    /// it (sequence number larger) was enqueued after that observation.
+    rx_empty_seq: u64,
+    /// The last `read_joint_states` observed an empty receive queue.
+    last_read_drained: bool,
+    /// Deterministic clock of the CAN transport (tests); None = the system clock.
+    clock: Option<std::sync::Arc<dyn crate::transport::DriverClock>>,
+    /// Sequence number of the last processed RX frame, and of each joint's last feedback.
+    rx_seq: u64,
+    last_feedback_seq: Vec<u64>,
+    /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
+    mit_fence: Option<Duration>,
+    /// Per joint: when its last confirmed command started out (the earliest frame of it, never
+    /// its completion), while the fence is armed. The output gap is measured from the oldest.
+    mit_fence_last_cmd: Vec<Option<Instant>>,
+    /// Trip reason and instant; refuses writes until a confirmed enable.
+    mit_fence_trip: Option<(String, Instant)>,
+    /// No autonomous frame (recovery, status poll) this long after a trip.
+    mit_fence_holdoff: Duration,
+    /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
+    mit_fence_acked: bool,
+    /// MIT tracking armed a fence since the last confirmed enable: base-mode restores use POS_VEL
+    /// frames only.
+    mit_tracking_used: bool,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2164,6 +2247,7 @@ const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn new(can: C, motor_ids: Vec<u16>) -> Self {
         let dof = motor_ids.len();
+        let clock = can.clock();
         Self {
             can,
             motor_ids,
@@ -2194,6 +2278,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             range_check: None,
             recovery_written_joints: Vec::new(),
             strict_mode_handover: false,
+            register_reply_log: Vec::new(),
+            clock,
+            rx_seq: 0,
+            last_feedback_seq: vec![0; dof],
+            rx_empty_seq: 0,
+            last_read_drained: false,
+            mit_fence: None,
+            mit_fence_last_cmd: vec![None; dof],
+            mit_fence_trip: None,
+            mit_fence_holdoff: Duration::ZERO,
+            mit_fence_acked: false,
+            mit_tracking_used: false,
         }
     }
 
@@ -2238,7 +2334,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// mode is marked unconfirmed, so the enable handshake writes the base mode first.
     pub fn check_mapping_ranges(&mut self) -> &DriverRangeCheck {
         const RIDS: [u8; 4] = [damiao::RID_CTRL_MODE, damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX];
-        let start = Instant::now();
+        let start = self.now();
         let base = Self::mode_value(self.control_mode);
         let mut joints = Vec::with_capacity(self.motor_ids.len());
         for i in 0..self.motor_ids.len() {
@@ -2272,7 +2368,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mismatched: Vec<String> = joints.iter().filter(|j| j.status == RangeCheckStatus::Mismatch)
             .map(|j| format!("J{} reports PMAX/VMAX/TMAX {} (configured {})", j.joint, fmt(&j.reported.unwrap_or_default()), fmt(&j.configured))).collect();
         let silent: Vec<usize> = joints.iter().filter(|j| j.status == RangeCheckStatus::Unverified).map(|j| j.joint).collect();
-        let duration_ms = start.elapsed().as_millis() as u64;
+        let duration_ms = self.since(start).as_millis() as u64;
         let (status, message) = if !mismatched.is_empty() {
             let m = format!("Damiao mapping range mismatch: {}; arming refused until damiao_ranges matches the motors", mismatched.join("; "));
             tracing::error!("{m}");
@@ -2344,7 +2440,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn await_register_replies_for(&mut self, expected: &[(usize, bool, u8)], timeout: Duration) -> Vec<Option<damiao::RegisterReply>> {
-        let start = Instant::now();
+        let start = self.now();
         loop {
             let _ = self.read_joint_states();
             let found: Vec<Option<damiao::RegisterReply>> = expected.iter().map(|&(i, write, rid)| {
@@ -2352,10 +2448,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.register_replies.iter().rev().copied()
                     .find(|r| r.motor_id == id && r.write == write && r.rid == rid)
             }).collect();
-            if found.iter().all(Option::is_some) || start.elapsed() >= timeout {
+            if found.iter().all(Option::is_some) || self.since(start) >= timeout {
                 return found;
             }
-            std::thread::sleep(Duration::from_micros(500));
+            self.pause(Duration::from_micros(500));
         }
     }
 
@@ -2398,7 +2494,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// reply all succeed. Without it the matching reply alone confirms the joint, as before
     /// joint tracking (e4f72b6): hold transmit and flush errors are ignored.
     fn write_modes(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool) -> Vec<usize> {
+        let strict = self.strict_mode_handover;
         self.register_replies.clear();
+        self.register_reply_log.clear();
         let mut unsent = Vec::new();
         let mut hold_failed = Vec::new();
         for &i in joints {
@@ -2419,16 +2517,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let mut all_holds_ok = true;
             for frame in frames {
                 let sent = self.transmit_with_retry(&frame).is_ok();
-                if sent || !self.strict_mode_handover {
+                if sent || !strict {
                     self.last_target_frames[i] = Some(frame);
                 }
                 all_holds_ok &= sent;
             }
-            if !all_holds_ok && self.strict_mode_handover {
+            if !all_holds_ok && strict {
                 hold_failed.push(i);
             }
         }
-        let flush_ok = self.can.flush().is_ok() || !self.strict_mode_handover;
+        let flush_ok = self.can.flush().is_ok() || !strict;
         let sent: Vec<usize> = joints.iter().copied().filter(|i| !unsent.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = sent.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
         let replies = self.await_register_replies(&expected);
@@ -2440,13 +2538,327 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 self.joint_modes[i] = Some(modes[i]);
             } else {
-                if self.strict_mode_handover {
+                if strict {
                     self.joint_modes[i] = None;
                 }
                 failed.push(i);
             }
         }
         failed
+    }
+
+    /// Receive boundary of an MIT transaction, established before its requests go out: read until
+    /// the receive queue is observed empty (bounded). Every frame dequeued afterwards (RX sequence
+    /// number larger than the returned one) was enqueued after the boundary, so frames queued
+    /// before the transaction never count, and a reply arriving right after its request does.
+    fn rx_boundary(&mut self) -> Result<u64, ArmDriverError> {
+        for _ in 0..8 {
+            let _ = self.read_joint_states();
+            if self.last_read_drained { return Ok(self.rx_empty_seq); }
+        }
+        Err(ArmDriverError::HardwareFault("receive queue not drained: no boundary for the register transaction".into()))
+    }
+
+    /// Bounded reply wait (MIT transactions): poll until every `(joint, write, rid)` has a reply
+    /// dequeued after the boundary `pre`, or REGISTER_REPLY_TIMEOUT passes.
+    fn await_replies_after(&mut self, expected: &[(usize, bool, u8)], sent: u64) {
+        let start = self.now();
+        loop {
+            let _ = self.read_joint_states();
+            let all = expected.iter().all(|&(i, write, rid)| {
+                let id = self.motor_ids[i];
+                self.register_reply_log.iter().any(|(r, _, _, seq, _)| r.motor_id == id && r.write == write && r.rid == rid && *seq > sent)
+            });
+            if all || self.since(start) >= REGISTER_REPLY_TIMEOUT { return; }
+            self.pause(Duration::from_micros(500));
+        }
+    }
+
+    fn now(&self) -> Instant { self.clock.as_ref().map_or_else(Instant::now, |c| c.now()) }
+    fn since(&self, t: Instant) -> Duration { self.now().saturating_duration_since(t) }
+    fn pause(&self, d: Duration) {
+        match &self.clock { Some(c) => c.sleep(d), None => std::thread::sleep(d) }
+    }
+
+    fn trip_fence(&mut self, reason: String) {
+        if self.mit_fence_trip.is_none() {
+            tracing::error!("Damiao MIT deadline fence tripped: {reason}");
+            self.mit_fence_trip = Some((reason, self.now()));
+        }
+        // nothing cached may be replayed: the group's outputs are uncertain
+        self.last_target_frames.fill(None);
+    }
+
+    /// Armed fence: every joint's feedback and the last complete batch younger than the deadline.
+    fn fence_check(&mut self) -> Result<(), ArmDriverError> {
+        if let Some((reason, _)) = &self.mit_fence_trip {
+            return Err(ArmDriverError::HardwareFault(format!("MIT deadline fence tripped: {reason}")));
+        }
+        let Some(deadline) = self.mit_fence else { return Ok(()) };
+        let now = self.now();
+        // one comparison for every check: elapsed >= deadline trips
+        let past = |d: Duration| d >= deadline;
+        if let Some(i) = (0..self.motor_ids.len()).find(|&i| self.last_feedback_instant[i].is_none_or(|t| past(now.saturating_duration_since(t)))) {
+            let age = self.last_feedback_instant[i].map(|t| now.saturating_duration_since(t));
+            self.trip_fence(format!("joint {} feedback age {age:?} reached {deadline:?}", i + 1));
+        } else if let Some(gap) = self.mit_fence_last_cmd.iter().flatten().min().map(|t| now.saturating_duration_since(*t)).filter(|g| past(*g)) {
+            self.trip_fence(format!("gap between dynamic outputs {gap:?} reached {deadline:?}"));
+        }
+        match &self.mit_fence_trip {
+            Some((reason, _)) => Err(ArmDriverError::HardwareFault(format!("MIT deadline fence tripped: {reason}"))),
+            None => Ok(()),
+        }
+    }
+
+    /// Recovery writes (cached MIT replay, POS_VEL hold at the measured pose): never while the
+    /// fence is armed or tripped.
+    fn recovery_tx_allowed(&self) -> bool { self.mit_fence.is_none() && self.mit_fence_trip.is_none() }
+
+    /// Read-only status polls: never while the fence is armed; after a trip only once the
+    /// operator cleared it and its hold-off has passed (whether a poll refreshes the motor
+    /// watchdog is not verified, so elapsed time alone never resumes them).
+    fn poll_tx_allowed(&self) -> bool {
+        match &self.mit_fence_trip {
+            Some((_, at)) => self.mit_fence_acked && self.since(*at) >= self.mit_fence_holdoff,
+            None => self.mit_fence.is_none(),
+        }
+    }
+
+    /// Transmit on an MIT transaction: fenced while the fence is armed or tripped.
+    fn tx_mit(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() { self.transmit_fenced(frame) } else { self.transmit_with_retry(frame) }
+    }
+
+    /// `transmit_with_retry` with the fence checked before every attempt.
+    fn transmit_fenced(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
+        let mut retries = 0;
+        loop {
+            self.fence_check()?;
+            match self.can.transmit(frame) {
+                Ok(()) => return Ok(()),
+                Err(TransportError::WouldBlock) if retries < 3 => {
+                    retries += 1;
+                    self.pause(Duration::from_micros(100));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
+    /// replies matched by motor ID, read opcode and RID, newer than the request. Returns
+    /// (value, reply CAN ID) per RID.
+    fn read_registers_fresh(&mut self, i: usize, rids: &[u8]) -> Result<Vec<([u8; 4], u32)>, ArmDriverError> {
+        let id = self.motor_ids[i];
+        let sent = self.rx_boundary()?;
+        self.register_replies.clear();
+        self.register_reply_log.clear();
+        for &rid in rids {
+            self.transmit_with_retry(&damiao::build_read_register_frame(id, rid))?;
+        }
+        self.can.flush()?;
+        let expected: Vec<(usize, bool, u8)> = rids.iter().map(|&rid| (i, false, rid)).collect();
+        self.await_replies_after(&expected, sent);
+        rids.iter().map(|&rid| {
+            self.register_reply_log.iter().rev()
+                .find(|(r, _, _, seq, _)| r.motor_id == id && !r.write && r.rid == rid && *seq > sent)
+                .map(|(r, fid, _, _, _)| (r.value, *fid))
+                .ok_or_else(|| ArmDriverError::HardwareFault(format!("Joint {} (CAN ID 0x{id:X}) did not answer the read of register {rid}", i + 1)))
+        }).collect()
+    }
+
+    fn identity_of(&mut self, i: usize) -> Result<crate::mit::MotorIdentity, ArmDriverError> {
+        const RIDS: [u8; 8] = [damiao::RID_ESC_ID, damiao::RID_MST_ID, damiao::RID_SW_VER, damiao::RID_CTRL_MODE,
+            damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX, damiao::RID_TIMEOUT];
+        let v = self.read_registers_fresh(i, &RIDS)?;
+        let reply_id = v[0].1;
+        if let Some((_, other)) = v.iter().find(|(_, fid)| *fid != reply_id) {
+            return Err(ArmDriverError::HardwareFault(format!("Joint {}: register replies arrived on CAN IDs 0x{reply_id:X} and 0x{other:X}", i + 1)));
+        }
+        let u = |k: usize| u32::from_le_bytes(v[k].0);
+        let f = |k: usize| f32::from_le_bytes(v[k].0);
+        Ok(crate::mit::MotorIdentity { joint: i + 1, motor_id: self.motor_ids[i], reply_id, esc_id: u(0), mst_id: u(1), sw_ver: u(2),
+            ctrl_mode: u(3), pmax: f(4), vmax: f(5), tmax: f(6), timeout_raw: u(7) })
+    }
+
+    /// MIT-path mode write: the CTRL_MODE writes and holds of `joints`, then a matching
+    /// acknowledgement and fresh feedback per joint, each received after the writes went out (enqueue
+    /// bound after the send mark) and the feedback after the acknowledgement in RX order; a
+    /// read-only status poll asks once for missing feedback. Every hold transmit and the flush must
+    /// succeed. Returns the joints not confirmed (their mode becomes unknown) and why.
+    fn write_modes_confirmed(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool)
+        -> (Vec<usize>, &'static str) {
+        let Ok(sent) = self.rx_boundary() else {
+            for &i in joints { self.joint_modes[i] = None; }
+            return (joints.to_vec(), "receive boundary (queue not drained)");
+        };
+        self.register_replies.clear();
+        self.register_reply_log.clear();
+        let mut failed: Vec<usize> = Vec::new();
+        let mut hold_started: Vec<(usize, Instant)> = Vec::new();
+        for &i in joints {
+            let id = self.motor_ids[i];
+            if self.tx_mit(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
+                failed.push(i);
+                continue;
+            }
+            let frames = if dual_hold {
+                vec![self.pos_vel_frame(i, hold[i].position), self.mit_frame(i, &hold[i])]
+            } else if modes[i] == DamiaoControlMode::Mit {
+                vec![self.mit_frame(i, &hold[i])]
+            } else {
+                vec![self.pos_vel_frame(i, hold[i].position)]
+            };
+            hold_started.push((i, self.now()));
+            for frame in frames {
+                if self.tx_mit(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
+            }
+        }
+        let mut why = "mode write, hold or flush";
+        if self.can.flush().is_err() { failed = joints.to_vec(); }
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            // holds completing past the deadline trip it: the switch fails, nothing more is sent
+            if self.fence_check().is_err() {
+                for &i in joints { self.joint_modes[i] = None; }
+                return (joints.to_vec(), "deadline fence (holds completed past it)");
+            }
+            if failed.is_empty() {
+                // each switched joint's hold is its complete command, dated by its first frame
+                for (i, t) in hold_started { self.mit_fence_last_cmd[i] = Some(t); }
+            }
+        }
+        let pending: Vec<usize> = joints.iter().copied().filter(|i| !failed.contains(i)).collect();
+        let expected: Vec<(usize, bool, u8)> = pending.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
+        self.await_replies_after(&expected, sent);
+        let ack_seq: Vec<Option<u64>> = pending.iter().map(|&i| {
+            let (id, want) = (self.motor_ids[i], Self::mode_value(modes[i]));
+            self.register_reply_log.iter().rev()
+                .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE && *seq > sent && r.as_u32() == want)
+                .map(|(_, _, _, seq, _)| *seq)
+        }).collect();
+        if ack_seq.iter().any(Option::is_none) { why = "matching acknowledgement received after the mode write"; }
+        let unconfirmed = |d: &Self| -> Vec<usize> {
+            pending.iter().zip(&ack_seq)
+                .filter(|(&i, ack)| !ack.is_some_and(|a| d.last_feedback_seq[i] > a))
+                .map(|(&i, _)| i).collect()
+        };
+        let start = self.now();
+        let mut polled = false;
+        // a joint without a matching acknowledgement fails at once (nothing to wait for), so the
+        // rollback starts within the deadline
+        let acks_complete = ack_seq.iter().all(Option::is_some);
+        loop {
+            let missing = unconfirmed(self);
+            if missing.is_empty() || !acks_complete || self.since(start) >= REGISTER_REPLY_TIMEOUT { break; }
+            if !polled && ack_seq.iter().all(Option::is_some) {
+                for &i in &missing { let _ = self.tx_mit(&damiao::build_refresh_frame(self.motor_ids[i])); }
+                let _ = self.can.flush();
+                polled = true;
+            }
+            self.pause(Duration::from_micros(500));
+            let _ = self.read_joint_states();
+        }
+        let missing = unconfirmed(self);
+        if !missing.is_empty() && why == "mode write, hold or flush" { why = "fresh feedback after the mode acknowledgement"; }
+        failed.extend(missing);
+        for &i in joints {
+            self.joint_modes[i] = if failed.contains(&i) { None } else { Some(modes[i]) };
+        }
+        (failed, why)
+    }
+
+    /// `set_joint_modes_confirmed`: the strict switch, then fresh feedback from every switched
+    /// motor received after its mode acknowledgement (RX order, so samples queued before the
+    /// switch never count; a read-only status poll asks for it once). Anything missing switches
+    /// every changed joint back with dual holds; a rollback that is not confirmed leaves the
+    /// joint uncertain (`joint_modes_uncertain`).
+    fn switch_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let n = self.motor_ids.len();
+        if modes.len() != n || hold.len() != n {
+            return Err(ArmDriverError::JointCountMismatch { expected: n, actual: modes.len().min(hold.len()) });
+        }
+        if self.control_mode != DamiaoControlMode::PosVel {
+            return Err(ArmDriverError::Protocol("joint mode switching needs the POS_VEL base mode".into()));
+        }
+        // armed fence (hand back): the deadline holds for the switch too; tripped: refused
+        self.fence_check().map_err(|e| ArmDriverError::HardwareFault(format!("{e}; rearm first")))?;
+        let target: Vec<DamiaoControlMode> = modes.iter().map(|m| match m {
+            JointMode::Position => self.control_mode,
+            JointMode::Mit => DamiaoControlMode::Mit,
+        }).collect();
+        let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
+        if changing.is_empty() { return Ok(()); }
+        let to_mit: Vec<usize> = changing.iter().copied()
+            .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
+        for &i in &to_mit {
+            // bounded reads: PMAX / VMAX / TMAX replies received after the request
+            let v = self.read_registers_fresh(i, &[damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX])?;
+            let got = [f32::from_le_bytes(v[0].0), f32::from_le_bytes(v[1].0), f32::from_le_bytes(v[2].0)];
+            let want = [self.limits[i].p_max, self.limits[i].v_max, self.limits[i].t_max];
+            if !Self::ranges_match(&got, &want) {
+                return Err(ArmDriverError::HardwareFault(format!("Joint {} reports PMAX/VMAX/TMAX {got:?}; the driver maps MIT frames with {want:?}", i + 1)));
+            }
+            self.mit_limits_verified[i] = true;
+        }
+        let previous = self.joint_modes.clone();
+        let (failed, why) = self.write_modes_confirmed(&changing, &target, hold, false);
+        // the confirmation wait counts against the fence too: a trip there fails the switch
+        let fence_ok = !(self.mit_fence.is_some() || self.mit_fence_trip.is_some()) || self.fence_check().is_ok();
+        if failed.is_empty() && fence_ok {
+            tracing::info!("Damiao control mode switched and confirmed for joints {:?}", changing.iter().map(|i| i + 1).collect::<Vec<_>>());
+            return Ok(());
+        }
+        let failed = if failed.is_empty() { changing.clone() } else { failed };
+        for &i in &changing { self.joint_modes[i] = None; }
+        let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.control_mode)).collect();
+        // the rollback is confirmed like the forward switch (acknowledgement + fresh feedback)
+        let (unrecovered, _) = self.write_modes_confirmed(&changing, &back, hold, true);
+        Err(ArmDriverError::HardwareFault(format!(
+            "Control-mode switch not confirmed for joints {:?} (no {why}); switched back{}",
+            failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
+            if unrecovered.is_empty() { String::new() } else {
+                format!(", joints {:?} still unconfirmed", unrecovered.iter().map(|i| i + 1).collect::<Vec<_>>())
+            })))
+    }
+
+    /// One joint of `commission_motor_timeout`; `written` is set once the RAM write was sent.
+    fn commission_one(&mut self, i: usize, counts: u32, written: &mut bool) -> Result<crate::mit::TimeoutCommissioning, ArmDriverError> {
+        {
+            let id = self.motor_ids[i];
+            let before = self.identity_of(i)?;
+            if before.reply_id != before.mst_id {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: register replies on 0x{:X} but MST_ID {}", i + 1, before.reply_id, before.mst_id)));
+            }
+            // RAM write (0x55), checked acknowledgement
+            let sent = self.rx_boundary()?;
+            self.register_replies.clear();
+            self.register_reply_log.clear();
+            // uncertain from the moment the transport accepted the write (a write that never left,
+            // WouldBlock until the retries ran out, changed nothing)
+            self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
+            *written = true;
+            self.can.flush()?;
+            self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
+            let ack = self.register_reply_log.iter().rev()
+                .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *seq > sent).copied();
+            let Some((ack, ack_id, _, _, _)) = ack else {
+                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{id:X}) did not acknowledge the TIMEOUT write", i + 1)));
+            };
+            if ack_id != before.mst_id || ack.as_u32() != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT write acknowledged with {} on 0x{ack_id:X} (wrote {counts}, MST_ID {})",
+                    i + 1, ack.as_u32(), before.mst_id)));
+            }
+            // separate read: fresh motor ID, reply ID, opcode, RID and value
+            let readback = self.identity_of(i)?;
+            let same = readback.motor_id == before.motor_id && readback.reply_id == before.reply_id && readback.esc_id == before.esc_id
+                && readback.mst_id == before.mst_id && readback.sw_ver == before.sw_ver;
+            if !same || readback.timeout_raw != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT readback {} (wrote {counts}) or identity changed", i + 1, readback.timeout_raw)));
+            }
+            tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): TIMEOUT {} -> {counts} counts (RAM)", i + 1, before.timeout_raw);
+            Ok(crate::mit::TimeoutCommissioning { before, written_raw: counts, ack_raw: ack.as_u32(), readback,
+                unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED, unit_verified: false })
+        }
     }
 
     pub fn with_vlim(mut self, vlim: f32) -> Self {
@@ -2466,9 +2878,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// A command acknowledgement must be separated from buffered pre-command telemetry.
     fn drain_rx_before_command(&mut self) -> bool {
-        let start = Instant::now();
+        let start = self.now();
         for _ in 0..128 {
-            if start.elapsed() >= Duration::from_millis(5) { return false; }
+            if self.since(start) >= Duration::from_millis(5) { return false; }
             match self.can.receive() {
                 Ok(_) => {},
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => return true,
@@ -2485,7 +2897,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 Ok(()) => return Ok(()),
                 Err(TransportError::WouldBlock) if retries < 3 => {
                     retries += 1;
-                    std::thread::sleep(Duration::from_micros(100));
+                    self.pause(Duration::from_micros(100));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -2538,7 +2950,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+        self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))).collect()
     }
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
@@ -2589,6 +3001,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        // MIT tracking owns the joints (fence armed) or lost them (tripped): only the fenced,
+        // confirmed switch may touch the modes
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            return Err(ArmDriverError::HardwareFault("MIT tracking holds the deadline fence: plain mode switch refused".into()));
+        }
         let n = self.motor_ids.len();
         if modes.len() != n || hold.len() != n {
             return Err(ArmDriverError::JointCountMismatch { expected: n, actual: modes.len().min(hold.len()) });
@@ -2624,6 +3041,75 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             })))
     }
 
+    fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.switch_joint_modes_confirmed(modes, hold)
+    }
+
+    fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) {
+        if deadline.is_some() { self.mit_tracking_used = true; }
+        self.mit_fence = deadline;
+        self.mit_fence_holdoff = holdoff;
+        let now = self.now();
+        self.mit_fence_last_cmd.fill(deadline.map(|_| now));
+    }
+
+    fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
+
+    fn clock_now(&self) -> Instant { self.now() }
+
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+        // after a trip the poll obeys the same clearance + quiet-period gate as every other poll
+        if let Some((_, at)) = &self.mit_fence_trip {
+            if !self.poll_tx_allowed() {
+                let remaining = self.mit_fence_holdoff.saturating_sub(self.since(*at));
+                return Err(format!("{}: the motors' command timeout may still be running; no frame is sent for {} ms more after the loss",
+                    crate::mit::QUIET_PERIOD_CODE, remaining.as_millis().max(1)));
+            }
+        }
+        let pre = self.rx_boundary().map_err(|e| e.to_string())?;
+        for &id in &self.motor_ids.clone() {
+            self.can.transmit(&damiao::build_refresh_frame(id)).map_err(|e| format!("status poll not sent: {e}"))?;
+        }
+        self.can.flush().map_err(|e| format!("flush: {e}"))?;
+        let start = self.now();
+        loop {
+            let _ = self.read_joint_states();
+            let stale: Vec<String> = (0..self.motor_ids.len()).filter(|&i| self.last_feedback_seq[i] <= pre).map(|i| format!("J{}", i + 1)).collect();
+            if stale.is_empty() { return Ok(self.motor_status.clone()); }
+            if self.since(start) >= REGISTER_REPLY_TIMEOUT {
+                return Err(format!("no fresh feedback from {}", stale.join(", ")));
+            }
+            self.pause(Duration::from_micros(500));
+        }
+    }
+
+    fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
+        let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
+        for &i in &faulted {
+            if let Err(e) = self.can.transmit(&damiao::build_clear_faults_frame(self.motor_ids[i])) {
+                return Err(format!("clear-error to J{} not sent: {e}", i + 1));
+            }
+        }
+        if !faulted.is_empty() { self.can.flush().map_err(|e| format!("flush: {e}"))?; }
+        // 2. no cached frame may ever be replayed; then the disable of every motor
+        self.last_target_frames.fill(None);
+        let res = self.set_torque(false);
+        let cmd = self.last_enable_command;
+        let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
+            !(self.last_feedback_instant[i].is_some_and(|t| cmd.is_some_and(|c| t >= c)) && self.motor_status[i] == 0)
+        }).map(|i| format!("J{}", i + 1)).collect();
+        if res.is_err() || !unconfirmed.is_empty() {
+            return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
+        }
+        self.mit_fence = None;
+        Ok(())
+    }
+
+    fn acknowledge_mit_fence_trip(&mut self) {
+        if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }
+    }
+
     fn joint_modes_uncertain(&self) -> bool {
         self.joint_modes.iter().any(Option::is_none)
     }
@@ -2637,6 +3123,45 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn set_strict_mode_handover(&mut self, strict: bool) {
         self.strict_mode_handover = strict;
     }
+
+    fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> {
+        let n = self.motor_ids.len();
+        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 }); }
+        joints.iter().map(|&i| self.identity_of(i)).collect()
+    }
+
+    fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
+        let none_attempted = |e: ArmDriverError| crate::mit::TimeoutBatchError { not_attempted: joints.to_vec(), ..e.into() };
+        let n = self.motor_ids.len();
+        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(none_attempted(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 })); }
+        if counts == 0 || counts > crate::mit::MAX_TIMEOUT_COUNTS {
+            return Err(none_attempted(ArmDriverError::Protocol(format!("TIMEOUT counts must be in 1..={}", crate::mit::MAX_TIMEOUT_COUNTS))));
+        }
+        if self.is_enabled || self.is_enabling {
+            return Err(none_attempted(ArmDriverError::Protocol("the TIMEOUT commissioning needs torque off".into())));
+        }
+        for &i in joints {
+            // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
+            let fresh = self.last_feedback_instant[i].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE
+                && self.last_enable_command.is_none_or(|c| t >= c));
+            if self.awaiting_rx_boundary || !fresh || self.motor_status[i] != 0 {
+                return Err(none_attempted(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
+                    i + 1, self.motor_ids[i], self.motor_status[i]))));
+            }
+        }
+        let mut out = Vec::with_capacity(joints.len());
+        for (k, &i) in joints.iter().enumerate() {
+            let mut written = false;
+            let res = self.commission_one(i, counts, &mut written);
+            match res {
+                Ok(c) => out.push(c),
+                Err(error) => return Err(crate::mit::TimeoutBatchError { applied: out, uncertain: if written { vec![i] } else { Vec::new() },
+                    not_attempted: joints[k + 1..].to_vec(), error }),
+            }
+        }
+        Ok(out)
+    }
+
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("motor_flash", false, vec![
@@ -2656,12 +3181,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::Protocol(format!("joint {} (CAN ID 0x{id:X}): set-zero needs torque off", joint + 1)));
         }
         // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
-        let fresh = self.last_feedback_instant[joint].is_some_and(|t| t.elapsed() <= ZERO_FEEDBACK_MAX_AGE
+        let fresh = self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE
             && self.last_enable_command.is_none_or(|c| t >= c));
         if self.awaiting_rx_boundary || !fresh || self.motor_status[joint] != 0 {
             return Err(ArmDriverError::HardwareFault(format!(
                 "joint {} (CAN ID 0x{id:X}) is not confirmed disabled (state {}, feedback age {:?})",
-                joint + 1, self.motor_status[joint], self.last_feedback_instant[joint].map(|t| t.elapsed()))));
+                joint + 1, self.motor_status[joint], self.last_feedback_instant[joint].map(|t| self.since(t)))));
         }
         self.transmit_with_retry(&damiao::build_set_zero_frame(id))?;
         self.can.flush()?;
@@ -2682,7 +3207,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let should_warn = now_sec.saturating_sub(last_warn) >= 3;
 
         for (i, opt) in self.last_feedback_instant.iter().enumerate() {
-            let ok = opt.is_some_and(|instant| instant.elapsed() <= limit);
+            let ok = opt.is_some_and(|instant| self.since(instant) <= limit);
             if !ok {
                 all_valid = false;
                 if should_warn && (self.is_enabled || self.is_enabling) {
@@ -2690,7 +3215,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         "Damiao Joint {} (CAN ID 0x{:X}) feedback stale or missing: elapsed={:?} > {:?}",
                         i,
                         self.motor_ids.get(i).copied().unwrap_or(0),
-                        opt.map(|t| t.elapsed()),
+                        opt.map(|t| self.since(t)),
                         limit
                     );
                 }
@@ -2733,10 +3258,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
+            // MIT tracking: before the first disable frame, discard every cached target so no
+            // later recovery can replay one, whatever the disable's outcome (the fence stays
+            // armed until the disable is confirmed).
+            if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                self.last_target_frames.fill(None);
+            }
             // Still send disable if draining times out: thermal protection must not
             // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
             self.awaiting_rx_boundary = !self.drain_rx_before_command();
-            let cmd_start = Instant::now();
+            let cmd_start = self.now();
             self.last_enable_command = Some(cmd_start);
             let mut last_err = None;
             for &id in &self.motor_ids {
@@ -2755,21 +3286,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.is_enabled = false;
             self.pending_rearm = true;
             self.last_target_frames.fill(None);
-            self.last_query_instant = Some(Instant::now());
+            // MIT tracking: the fence stays until every motor is confirmed disabled
+            let mit_fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
+            self.last_query_instant = Some(self.now());
             // Poll for responses confirming disable for DAMIAO_DISABLE_CONFIRM, bounded by time only
             // (a cap of 10 checks with 2 ms sleeps ended it after ~20 ms, before a late motor
             // answered), and resend the disable frame to unconfirmed motors like the enable does.
-            let poll_start = Instant::now();
+            let poll_start = self.now();
             let mut retries = 0usize;
             let confirmed = |d: &Self, i: usize| d.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| t >= cmd_start)
                 && d.motor_status.get(i).copied() == Some(0);
-            while poll_start.elapsed() < DAMIAO_DISABLE_CONFIRM {
+            while self.since(poll_start) < DAMIAO_DISABLE_CONFIRM {
                 let _ = self.read_joint_states();
                 if !self.motor_ids.is_empty() && (0..self.motor_ids.len()).all(|i| confirmed(self, i)) {
-                    tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", poll_start.elapsed());
-                    break;
+                    tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(poll_start));
+                    if mit_fenced { self.mit_fence = None; }
+                    return Ok(());
                 }
-                if DAMIAO_ENABLE_RETRY_AT.get(retries).is_some_and(|t| poll_start.elapsed() >= *t) {
+                if DAMIAO_ENABLE_RETRY_AT.get(retries).is_some_and(|t| self.since(poll_start) >= *t) {
                     for i in 0..self.motor_ids.len() {
                         if !confirmed(self, i) {
                             let id = self.motor_ids[i];
@@ -2782,12 +3316,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if let Err(e) = self.can.flush() { tracing::warn!("Retry flush failed: {:?}", e); }
                     retries += 1;
                 }
-                std::thread::sleep(Duration::from_micros(500));
+                self.pause(Duration::from_micros(500));
+            }
+            if mit_fenced {
+                // unconfirmed: the motors may still be energized in MIT; keep the fence (no recovery,
+                // no poll) and report the failure
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "Disable not confirmed by fresh state-0 feedback from every motor within {} ms; the MIT fence stays",
+                    DAMIAO_DISABLE_CONFIRM.as_millis())));
             }
             Ok(())
         } else {
             // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1
-            if !self.pending_rearm
+            // (never after an MIT deadline trip: the rearm restores the modes and re-enables)
+            if self.mit_fence_trip.is_none()
+                && !self.pending_rearm
                 && self.is_enabled
                 && self.is_feedback_valid()
                 && self.motor_status.iter().all(|&st| st == 1)
@@ -2823,7 +3366,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if !stray.is_empty() {
                 let base = vec![self.control_mode; self.motor_ids.len()];
                 let hold: Vec<JointTarget> = self.cached_states.iter().map(|s| JointTarget::position(s.position)).collect();
-                let failed = self.write_modes(&stray, &base, &hold, true);
+                // after MIT tracking (fence armed, tripped or used since the last confirmed enable)
+                // the base mode is restored with POS_VEL frames only: no MIT frame from cached
+                // positions before the mode is confirmed (a new handover is the only way back)
+                let dual = !self.mit_tracking_used;
+                let failed = self.write_modes(&stray, &base, &hold, dual);
                 if !failed.is_empty() {
                     self.is_enabling = false;
                     self.is_enabled = false;
@@ -2834,7 +3381,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
 
-            let handshake_start = Instant::now();
+            let handshake_start = self.now();
             self.last_enable_command = Some(handshake_start);
             self.last_feedback_instant.fill(None);
 
@@ -2857,10 +3404,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             // Wait and poll for responses for DAMIAO_ENABLE_CONFIRM. The window is bounded by time only: a
             // check-count cap (30 checks at ~0.5 ms) used to end it after ~28 ms, and a motor answering
             // ~30 ms late (seen on a B601-DM J3 after a set-zero) failed the enable every time.
-            let poll_start = Instant::now();
+            let poll_start = self.now();
             let mut retries = 0u32;
             let mut all_enabled = false;
-            while poll_start.elapsed() < DAMIAO_ENABLE_CONFIRM {
+            while self.since(poll_start) < DAMIAO_ENABLE_CONFIRM {
                 let _ = self.read_joint_states();
                 let all_fresh = !self.last_feedback_instant.is_empty()
                     && self.last_feedback_instant.iter().all(|opt| {
@@ -2878,13 +3425,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     // Check if all motors report enabled (state == 1)
                     if self.motor_status.iter().all(|&st| st == 1) {
                         all_enabled = true;
-                        tracing::info!("All Damiao motors confirmed enabled (state=1) in {:?}", poll_start.elapsed());
+                        tracing::info!("All Damiao motors confirmed enabled (state=1) in {:?}", self.since(poll_start));
                         break;
                     }
                 }
 
                 // Resend the enable frame to motors not yet confirmed at 25 ms and at 75 ms
-                let due = DAMIAO_ENABLE_RETRY_AT.get(retries as usize).is_some_and(|t| poll_start.elapsed() >= *t);
+                let due = DAMIAO_ENABLE_RETRY_AT.get(retries as usize).is_some_and(|t| self.since(poll_start) >= *t);
                 if due {
                     for (i, &id) in self.motor_ids.iter().enumerate() {
                         let motor_fresh_and_enabled = self.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| t >= handshake_start)
@@ -2903,7 +3450,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     retries += 1;
                 }
 
-                std::thread::sleep(Duration::from_micros(500));
+                self.pause(Duration::from_micros(500));
             }
 
             self.is_enabling = false;
@@ -2918,6 +3465,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             self.is_enabled = true;
             self.pending_rearm = false;
+            // confirmed enable with the base modes restored: a new MIT handover arms a new fence
+            self.mit_fence = None;
+            self.mit_fence_trip = None;
+            self.mit_fence_acked = false;
+            self.mit_tracking_used = false;
+            self.mit_fence_last_cmd.fill(None);
             Ok(())
         }
     }
@@ -2931,6 +3484,32 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
 
         match self.control_mode {
+            DamiaoControlMode::PosVel if self.mit_fence.is_some() || self.mit_fence_trip.is_some() => {
+                // MIT tracking owns joints: the fence is checked before every transmit; a failed
+                // or partial batch (or flush) trips it and discards every cached frame.
+                self.fence_check()?;
+                // Each joint's command is dated by its first frame: flush (SocketCAN: queued in the
+                // kernel) does not bound when the frames reach the wire, so the earlier stamp is safe.
+                let mut started: Vec<Option<Instant>> = vec![None; targets.len()];
+                for (i, target) in targets.iter().enumerate() {
+                    for frame in self.target_frames(i, target) {
+                        if started[i].is_none() { started[i] = Some(self.now()); }
+                        if let Err(e) = self.transmit_fenced(&frame) {
+                            self.trip_fence(format!("transmit to joint {} failed after {} of {} joints: {e}", i + 1, i, targets.len()));
+                            return Err(e);
+                        }
+                        self.last_target_frames[i] = Some(frame);
+                    }
+                }
+                if let Err(e) = self.can.flush() {
+                    self.trip_fence(format!("flush failed: {e}"));
+                    return Err(e.into());
+                }
+                // a batch completing past the deadline trips and never resets it
+                self.fence_check()?;
+                for (i, t) in started.into_iter().enumerate() { if t.is_some() { self.mit_fence_last_cmd[i] = t; } }
+                return Ok(());
+            }
             DamiaoControlMode::PosVel => {
                 // Per joint: POS_VEL, MIT for joints switched by set_joint_modes, both when unconfirmed.
                 for (i, target) in targets.iter().enumerate() {
@@ -2970,17 +3549,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         const MAX_RX_DURATION: Duration = Duration::from_millis(5);
-        let t0 = Instant::now();
+        let t0 = self.now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
-        while frames_processed < 64 && t0.elapsed() < MAX_RX_DURATION {
+        self.last_read_drained = false;
+        while frames_processed < 64 && self.since(t0) < MAX_RX_DURATION {
             // Taken before the receive: an empty result means the queue was empty after it.
-            let attempt = Instant::now();
+            let attempt = self.now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
+                    self.rx_seq += 1;
                     if self.awaiting_rx_boundary {
-                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION { break; }
+                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
                         continue;
                     }
                     // Ignore transmit commands: on SocketCAN with local echo enabled,
@@ -2996,14 +3577,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         || frame.data == damiao::CMD_CLEAR_FAULTS
                         || frame.data == damiao::CMD_SET_ZERO
                     {
-                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
+                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
                             break;
                         }
                         continue;
                     }
                     // Local echo of an MIT command (same ID as some feedback paths).
                     if self.last_target_frames.iter().flatten().any(|f| f.id == frame.id && f.data == frame.data) {
-                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION { break; }
+                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
                         continue;
                     }
                     if let Some(reply) = damiao::parse_register_reply(&frame)
@@ -3011,7 +3592,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     {
                         // A register reply is not feedback: byte 0 would decode as state 0.
                         if self.register_replies.len() < 64 { self.register_replies.push(reply); }
-                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION { break; }
+                        if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, self.now(), self.rx_seq, self.rx_empty_seq)); }
+                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
                         continue;
                     }
                     if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
@@ -3024,7 +3606,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 .iter()
                                 .any(|&m| frame.id == m as u32 || frame.id == (0x10 + m as u32));
                         if !is_valid_feedback_id {
-                            if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
+                            if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
                                 break;
                             }
                             continue;
@@ -3040,23 +3622,27 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 torque: feedback.torque,
                                 temperature: feedback.t_mos.max(feedback.t_rotor),
                             };
-                            self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.last_feedback_instant[idx] = Some(self.now());
                             self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
+                            self.last_feedback_seq[idx] = self.rx_seq;
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
-                    if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
+                    if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
                         break;
                     }
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
                     self.rx_empty_instant = Some(attempt);
+                    self.last_read_drained = true;
+                    self.rx_seq += 1;
+                    self.rx_empty_seq = self.rx_seq;
                     if self.awaiting_rx_boundary {
                         self.awaiting_rx_boundary = false;
                         self.last_feedback_instant.fill(None);
-                        self.last_enable_command = Some(Instant::now());
+                        self.last_enable_command = Some(self.now());
                     }
                     break;
                 }
@@ -3067,14 +3653,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // Evaluate feedback age only after receive() explicitly reports an empty
         // queue. If the bounded budget expires first, defer recovery to the next
         // tick so a frame beyond the budget cannot be mistaken for a bus timeout.
-        if rx_drained && self.is_enabled && !self.is_enabling
+        // MIT tracking fence: a stale joint trips it; no recovery frame of any kind is sent
+        // (no cached MIT replay, no invented POS_VEL hold) while it is armed or tripped.
+        if self.mit_fence.is_some() {
+            if rx_drained {
+                let _ = self.fence_check();
+            } else {
+                // the bounded read (64 frames or 5 ms) could not reach the newest sample: the
+                // queued latency is unknown and nothing dequeued counts as fresh
+                self.trip_fence(format!("RX backlog: queue not drained after {frames_processed} frames"));
+            }
+        }
+        if rx_drained && self.is_enabled && !self.is_enabling && self.recovery_tx_allowed()
             && self.enable_state() == EnableState::Enabled {
             for (i, &id) in self.motor_ids.iter().enumerate() {
                 let stale = self
                     .last_feedback_instant
                     .get(i)
                     .and_then(|&opt| opt)
-                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(45));
+                    .is_none_or(|t| self.since(t) >= Duration::from_millis(45));
                 if !stale {
                     continue;
                 }
@@ -3126,18 +3723,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // fault could never be cleared. Poll stale motors with the read-only 0xCC
         // refresh; it does not change enable state or targets.
         const REFRESH_AFTER: Duration = Duration::from_millis(100);
-        if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling
-            && self.last_refresh_instant.is_none_or(|t| t.elapsed() >= REFRESH_AFTER)
+        if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling && self.poll_tx_allowed()
+            && self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER)
         {
             let stale: Vec<u16> = self.motor_ids.iter().zip(&self.last_feedback_instant)
-                .filter(|(_, t)| t.is_none_or(|t| t.elapsed() >= REFRESH_AFTER))
+                .filter(|(_, t)| t.is_none_or(|t| self.since(t) >= REFRESH_AFTER))
                 .map(|(&id, _)| id).collect();
             if !stale.is_empty() {
                 for id in stale {
                     let _ = self.can.transmit(&damiao::build_refresh_frame(id));
                 }
                 let _ = self.can.flush();
-                self.last_refresh_instant = Some(Instant::now());
+                self.last_refresh_instant = Some(self.now());
             }
         }
         Ok(self.cached_states.clone())

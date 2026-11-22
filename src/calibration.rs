@@ -86,6 +86,13 @@ pub struct CalibrationFile {
     /// Automatic hover acceptance of this calibration; None = unknown (legacy or not run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<AcceptanceRecord>,
+    /// Device qualification of MIT joints (`src/mit.rs`), bound to the profile, joint zero and
+    /// motor identity; rechecked against a fresh readback on every arm. A file may hold only
+    /// this. Not part of a camera apply or restore (the live record is kept). Kept unparsed:
+    /// an invalid record never invalidates the rest of the file; it is flagged at load and
+    /// refuses MIT ([`CalibrationFile::mit_record`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mit_qualification: Option<Value>,
 }
 
 /// `calibration.json` `tool`: the fingertip measured with the 4-dot sticker. `tip_end = X · tip_cam`
@@ -389,11 +396,32 @@ impl CalibrationFile {
     /// The file holds a camera calibration (`camera_mount.q_end_cam`).
     pub fn has_camera(&self) -> bool { self.camera_mount.q_end_cam.is_some() }
 
+    /// The MIT qualification record, parsed and validated.
+    pub fn mit_record(&self) -> Result<Option<crate::mit::MitQualificationFile>, String> {
+        let Some(v) = &self.mit_qualification else { return Ok(None) };
+        let rec: crate::mit::MitQualificationFile = serde_json::from_value(v.clone()).map_err(|e| format!("mit_qualification: {e}"))?;
+        rec.validate()?;
+        Ok(Some(rec))
+    }
+
+    /// 1-based joints listed by the MIT record, also when it does not validate (None when the
+    /// list cannot be read).
+    pub fn mit_record_raw_joints(&self) -> Option<Vec<usize>> {
+        self.mit_qualification.as_ref()?.get("joints")?.as_array()?.iter()
+            .map(|j| j.get("joint").and_then(Value::as_u64).map(|n| n as usize)).collect()
+    }
+
+    /// Store `rec` as the MIT qualification record.
+    pub fn set_mit_record(&mut self, rec: &crate::mit::MitQualificationFile) {
+        self.mit_qualification = serde_json::to_value(rec).ok();
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if let Some(z) = &self.joint_zero { z.validate(None).map_err(|e| format!("calibration.json: {e}"))?; }
         let m = &self.camera_mount;
-        if m.q_end_cam.is_none() && m.offset_m.is_none() && self.intrinsics.is_none() && self.joint_zero.is_some() {
-            // joint zero only
+        if m.q_end_cam.is_none() && m.offset_m.is_none() && self.intrinsics.is_none()
+            && (self.joint_zero.is_some() || self.mit_qualification.is_some()) {
+            // joint zero and / or MIT qualification only
             if let Some(k) = &self.kinematics { k.validate().map_err(|e| format!("calibration.json: {e}"))?; }
             return Ok(());
         }
@@ -513,6 +541,11 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
     match loaded {
         crate::persist::Loaded::Loaded(mut file) => {
             strip_mismatched_tool_records(&mut file, &inner.config.active_tool);
+            if let Err(e) = file.mit_record() {
+                // the record alone is refused (MIT stays refused); the rest of the file is used
+                tracing::warn!("Ignoring the MIT qualification in {}: {e}; MIT tracking is refused", path.display());
+                inner.calibration_load_error = Some(format!("calibration.json: mit_qualification ignored ({e}); MIT tracking is refused"));
+            }
             let mut pending_jz_err: Option<String> = None;
             let pending_joint_zero = if let Some(z) = &file.joint_zero {
                 match z.validate(Some(inner.config.dof)) {
@@ -1077,6 +1110,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         table_z_source: Some(req.table_z_source.clone()),
         tool,
         acceptance: None,
+        mit_qualification: inner.calibration.as_ref().and_then(|c| c.mit_qualification.clone()),
     };
     let (_, fp) = file_fingerprints(
         Some(&file),
@@ -1358,6 +1392,12 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
             }
         }
         let mut file_changes = removed.is_some() || camera_stale;
+        // an MIT qualification of a zeroed joint was measured with the old zero
+        if let Some(c) = file.as_mut() {
+            if crate::mit::invalidate_record(c, joints, &format!("{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero"), &at) {
+                file_changes = true;
+            }
+        }
         if let Some(z) = new_zero {
             if file.as_ref().and_then(|c| c.joint_zero.as_ref()) != z.as_ref() { file_changes = true; }
             match file.as_mut() {
@@ -1367,7 +1407,7 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
             }
         }
         // nothing left in the file (no camera, no joint zero): remove it
-        if file.as_ref().is_some_and(|c| !c.has_camera() && c.joint_zero.is_none() && c.kinematics.is_none()) { file = None; }
+        if file.as_ref().is_some_and(|c| !c.has_camera() && c.joint_zero.is_none() && c.kinematics.is_none() && c.mit_qualification.is_none()) { file = None; }
         (file, removed, inner.config.arm_model.correction().is_some(), camera_stale, file_changes)
     };
     let mut error = None;
@@ -1828,9 +1868,12 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     // the joint zero is not part of a camera restore: the live one stays (it has its own restore,
     // `/api/v1/calibration/joint_zero/restore`)
     let live_zero = before.calibration.as_ref().and_then(|c| c.joint_zero.clone());
+    // nor is the MIT qualification: the live record stays
+    let live_mit = before.calibration.as_ref().and_then(|c| c.mit_qualification.clone());
     match target.calibration.as_mut() {
-        Some(c) => c.joint_zero = live_zero,
-        None if live_zero.is_some() => target.calibration = Some(CalibrationFile { joint_zero: live_zero, ..Default::default() }),
+        Some(c) => { c.joint_zero = live_zero; c.mit_qualification = live_mit; }
+        None if live_zero.is_some() || live_mit.is_some() =>
+            target.calibration = Some(CalibrationFile { joint_zero: live_zero, mit_qualification: live_mit, ..Default::default() }),
         None => {}
     }
     let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
@@ -1920,6 +1963,26 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "backups": list_backups(deps)})
 }
 
+/// Before a zero of `joints` (1-based) is written: mark an MIT qualification record that holds
+/// one of them invalidated and persist that first (atomic write), then publish it live. A failed
+/// write refuses the zero (nothing changed), so a crash or write error never leaves a valid
+/// record next to a changed physical zero. Nothing to do without such a record.
+pub async fn invalidate_mit_before_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize], method: &str) -> Result<(), CalibError> {
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let file = {
+        let inner = sup.inner().read().await;
+        let Some(mut c) = inner.calibration.clone() else { return Ok(()) };
+        let reason = format!("{method} zero of joints {joints:?}; the MIT qualification was measured with the old zero");
+        if !crate::mit::invalidate_record(&mut c, joints, &reason, &at) { return Ok(()); }
+        c
+    };
+    let text = serde_json::to_string_pretty(&file).map_err(|e| CalibError::new(500, "INTERNAL", e.to_string()))?;
+    put_file(deps.path.clone(), Some(text)).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED",
+        format!("the MIT qualification could not be invalidated in {} ({e}); the zero was refused, nothing was changed", deps.path.display())))?;
+    sup.inner().write().await.set_calibration(Some(file));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1954,3 +2017,4 @@ mod tests {
         }
     }
 }
+

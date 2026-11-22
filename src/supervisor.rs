@@ -359,6 +359,11 @@ pub struct SupervisorInner {
     /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
     /// profile's camera mount.
     pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
+    /// MIT not requested.
+    pub mit_gate_error: Option<String>,
+    /// MIT tracking output owner and history (`src/mit.rs`).
+    pub mit: crate::mit::MitRuntime,
     /// The profile's `workspace.floor_z_m` (None without a workspace). `config.workspace.floor_z_m`
     /// holds the effective floor ([`crate::calibration::effective_floor`]), recomputed by
     /// [`refresh_effective_floor`](Self::refresh_effective_floor) whenever its inputs change.
@@ -661,6 +666,8 @@ impl SupervisorInner {
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
+            mit_gate_error: None,
+            mit: Default::default(),
             profile_floor_z_m,
             floor_source: "profile",
             hover_jobs: Vec::new(),
@@ -1664,6 +1671,12 @@ impl SupervisorInner {
 
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
+        // a STOP cancels a park deferred behind the MIT hand back
+        if std::mem::take(&mut self.mit.park_after_hand_back) {
+            if let Some(id) = self.mit.deferred_park_action.take() {
+                self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+            }
+        }
         #[cfg(feature = "policy-runtime")]
         self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         self.servo_target = None;
@@ -1678,6 +1691,7 @@ impl SupervisorInner {
 
     /// A successful transport write is not confirmation that torque was removed.
     fn request_disable(&mut self) -> Result<(), SafetyError> {
+        self.mit_torque_off();
         self.disable_pending = true;
         self.tracking.invalidate();
         self.tracking.clear_recovery_suspension();
@@ -2051,6 +2065,35 @@ impl SupervisorInner {
                 return Err(SafetyError::EStopActive);
             }
 
+            // MIT tracking (Phase 2): every arm and rearm rechecks the qualification against a fresh
+            // register readback (nonzero TIMEOUT, identity, ranges); unqualified hardware refuses
+            // MIT before any motion. MIT not requested: no readback, no change.
+            // A rearm while MIT owns joints hands them back first (at rest), so neither the
+            // register readback below nor the driver's enable runs under an active MIT owner
+            // (no dynamic output during the reads, no silent mode restore).
+            if self.mit_active() {
+                self.mit.armed_ok = false;
+                if let Err(e) = self.mit_hand_back("rearm") {
+                    // not at rest: the authorization is gone, so the motion brakes to rest and MIT
+                    // hands back there (the tick); no motion starts meanwhile
+                    if self.mit_active() {
+                        self.active_trajectory = None;
+                        self.servo_target = None;
+                        self.mit.revoke_pending = true;
+                    }
+                    return Err(SafetyError::ClearFaultRejected(e));
+                }
+            }
+            if let Err(e) = self.mit_gate() {
+                // revoked before returning: no handover until a later arm passes the gate
+                self.mit.armed_ok = false;
+                let msg = format!("MIT_UNQUALIFIED: MIT tracking refused: {e}");
+                tracing::error!("{msg}");
+                self.mit_gate_error = Some(msg.clone());
+                return Err(SafetyError::ClearFaultRejected(msg));
+            }
+            self.mit_gate_error = None;
+
             // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback
             let any_driver_enabled = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));
             let was_torqued = self.is_torqued || any_driver_enabled;
@@ -2211,6 +2254,8 @@ impl SupervisorInner {
             self.is_torqued = true;
             self.pending_rearm = false;
             self.disable_pending = false;
+            self.mit.armed_ok = !crate::mit::mit_joints(&self.config).is_empty();
+            self.mit.handover_error = None;
             let now = Instant::now();
             self.last_heartbeat = now;
             self.last_motion_frame = now;
@@ -2320,6 +2365,17 @@ impl SupervisorInner {
                     return;
                 }
 
+                // MIT tracking hands back to confirmed stationary position control before the
+                // park. Moving: brake to rest first (the reference stops; the tick ramps the
+                // velocity down), hand back at rest, then this park is requested again.
+                if self.mit_active() && self.mit_hand_back("park").is_err() {
+                    if self.mit_active() && !self.safety.state().is_stopped() {
+                        tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
+                        self.active_trajectory = None;
+                        self.mit.park_after_hand_back = true;
+                    }
+                    return;
+                }
                 // Return to home position cleanly, then disable torque.
                 // Allow unload from Operational or Idle.
                 let can_unload = self.is_torqued && !self.pending_rearm && (
@@ -2449,6 +2505,7 @@ impl SupervisorInner {
                     self.measured_velocities = vec![0.0; self.config.dof];
                 }
                 let _ = self.safety.set_torque(false);
+                self.mit_torque_off();
                 if let Some(ref d) = self.driver {
                     if let Ok(mut driver) = d.lock() {
                         let _ = driver.set_torque(false);
@@ -2586,6 +2643,31 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
         }
         if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // the operator's clearance lets the driver poll again (fresh feedback for the checks
+            // below); writes stay refused until the rearm's confirmed enable
+            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) { drv.acknowledge_mit_fence_trip(); }
+        }
+        if self.mit.owner == crate::mit::MitOwner::Lost
+            && self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.joint_modes_uncertain())) {
+            return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
+                check the arm and power-cycle the motors".into()));
+        }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // decided from feedback read for this request, never from the cache
+            let fresh = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+                Some(mut drv) => drv.mit_fresh_status(),
+                None => Err("no driver".into()),
+            };
+            let st = fresh.map_err(|e| SafetyError::ClearFaultRejected(format!(
+                "MIT tracking: fresh feedback is required before clearing ({e}); nothing was sent")))?;
+            if st.iter().any(|&c| c >= 8) || (st.contains(&0) && st.contains(&1)) {
+                if !std::mem::take(&mut self.mit.recovery_confirmed) {
+                    return Err(SafetyError::ClearFaultRejected(format!("{}: {}", crate::mit::RECOVERY_CONFIRM_CODE, crate::mit::RECOVERY_WARNING)));
+                }
+                return self.mit_expiry_recovery();
+            }
+        }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
@@ -2685,6 +2767,12 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
         }
         self.pending_rearm = true;
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // cleared: a rearm (fresh readback, base modes restored) and a fresh handover follow
+            self.mit.owner = crate::mit::MitOwner::Off;
+            self.mit.joints.clear();
+            self.mit.armed_ok = false;
+        }
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();
@@ -3144,6 +3232,7 @@ impl SupervisorInner {
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
+        if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
         self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
@@ -3251,6 +3340,8 @@ impl SupervisorInner {
     ) -> Result<(u64, u64, f64), ArmError> {
         let mut target_positions = target_positions;
         self.gravity_comp_motion_busy()?;
+        // jog, home, move_to_pose, backlash approach: MIT must own its joints when requested
+        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         #[cfg(feature = "policy-runtime")]
         if self.policy_loading {
             return Err(MotionError::MotionBusy("a policy is loading".into()).into());
@@ -3535,6 +3626,12 @@ impl SupervisorInner {
         }
         self.execute_stop(StopPolicy::NormalUnload);
         if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
+        if self.mit.park_after_hand_back && !self.pending_normal_unload {
+            // deferred behind the MIT brake and hand back: the action runs from now on
+            let id = self.begin_action("park", None);
+            self.mit.deferred_park_action = Some(id);
+            return Ok(Some(id));
+        }
         if !self.pending_normal_unload { return Ok(None); }
         let id = self.begin_action("park", None);
         if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
@@ -3555,6 +3652,7 @@ impl SupervisorInner {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
         self.collision_hold_check()?;
+        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
         Ok(())
     }
@@ -4463,6 +4561,7 @@ impl SupervisorInner {
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
         if kind == "park" {
+            if self.mit.deferred_park_action == Some(id) { return; }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
                 if let Some(a) = self.last_action.as_mut() { a.progress = progress; }
@@ -4710,11 +4809,7 @@ impl SupervisorInner {
                         kd: None,
                     })
                     .collect();
-                let write_res = self
-                    .driver
-                    .as_ref()
-                    .and_then(|d| d.lock().ok())
-                    .map(|mut driver| driver.write_joint_targets(&targets));
+                let write_res = self.write_output(targets, 1.0 / f64::from(self.config.control_frequency_hz.max(1)));
                 match write_res {
                     Some(Ok(())) => {
                         let done = fb.done;
@@ -6059,6 +6154,41 @@ impl SupervisorInner {
                 }
             }
         }
+        // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.
+        // No-ops while MIT is not requested.
+        self.mit_supervise();
+        if self.mit.revoke_pending {
+            // a refused rearm revoked MIT: hand back once the brake reached rest
+            let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
+            if !self.mit_active() || self.safety.state().is_stopped()
+                || (at_rest && self.mit_hand_back("authorization revoked").is_ok()) {
+                self.mit.revoke_pending = false;
+            }
+        }
+        if self.mit.park_after_hand_back {
+            // a park waits for rest and the confirmed hand back, then starts
+            let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
+            if !self.mit_active() || self.safety.state().is_stopped() {
+                self.mit.park_after_hand_back = false;
+                if let Some(id) = self.mit.deferred_park_action.take() {
+                    self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park cancelled: MIT tracking lost or a fault".into()), None, None, None);
+                }
+            } else if at_rest && self.mit_hand_back("park").is_ok() {
+                self.mit.park_after_hand_back = false;
+                self.apply_stop_policy(StopPolicy::NormalUnload);
+                if let Some(id) = self.mit.deferred_park_action.take() {
+                    if self.pending_normal_unload {
+                        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+                    } else {
+                        self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park could not start after the MIT hand back".into()), None, None, None);
+                    }
+                }
+            }
+        }
+        if self.pending_normal_unload && self.mit_active() {
+            let _ = self.mit_hand_back("park");
+        }
+        self.mit_maybe_activate();
         let gravity_output_enabled = self.gravity_output_enabled();
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
@@ -6187,11 +6317,7 @@ impl SupervisorInner {
                                     kd: None,
                                 })
                                 .collect();
-                            let write_res = self
-                                .driver
-                                .as_ref()
-                                .and_then(|d| d.lock().ok())
-                                .map(|mut driver| driver.write_joint_targets(&targets));
+                            let write_res = self.write_output(targets, servo_dt);
                             match write_res {
                                 Some(Ok(())) => {
                                     let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
@@ -6259,29 +6385,28 @@ impl SupervisorInner {
                     if tracking_active {
                         self.tracking.invalidate();
                     }
-                    if let Some(ref d) = self.driver {
-                        if let Ok(mut driver) = d.lock() {
-                            let targets: Vec<JointTarget> = self
-                                .commanded_positions
-                                .iter()
-                                .zip(self.commanded_velocities.iter())
-                                .enumerate()
-                                .map(|(i, (&p, &v))| JointTarget {
-                                    position: p,
-                                    velocity: Some(v),
-                                    torque: if gravity_output_enabled {
-                                        self.gravity_torques_ramped.get(i).copied()
-                                    } else {
-                                        Some(0.0)
-                                    },
-                                    kp: None,
-                                    kd: None,
-                                })
-                                .collect();
-                            match driver.write_joint_targets(&targets) {
-                                Ok(()) => tick_output_accepted = true,
-                                Err(e) => output_error = Some(e.to_string()),
-                            }
+                    if self.driver.is_some() {
+                        let targets: Vec<JointTarget> = self
+                            .commanded_positions
+                            .iter()
+                            .zip(self.commanded_velocities.iter())
+                            .enumerate()
+                            .map(|(i, (&p, &v))| JointTarget {
+                                position: p,
+                                velocity: Some(v),
+                                torque: if gravity_output_enabled {
+                                    self.gravity_torques_ramped.get(i).copied()
+                                } else {
+                                    Some(0.0)
+                                },
+                                kp: None,
+                                kd: None,
+                            })
+                            .collect();
+                        match self.write_output(targets, servo_dt) {
+                            Some(Ok(())) => tick_output_accepted = true,
+                            Some(Err(e)) => output_error = Some(e),
+                            None => {}
                         }
                     } else {
                         tick_output_accepted = true;
@@ -6582,6 +6707,9 @@ impl SupervisorInner {
             _ => {}
         }
         if mode == PolicyMode::Live {
+            if let Some(reason) = self.mit_motion_blocker() {
+                return Err(MotionError::MotionBusy(reason).into());
+            }
             if !self.policy_live_allowed() && !i_am_at_the_arm {
                 return Err(ArmError::Rejected {
                     status: 403,

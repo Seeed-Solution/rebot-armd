@@ -2613,7 +2613,9 @@ const I18N = {
     'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
     'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
-    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障', 'en.on_unconfirmed': '控制已开启 · 未确认',
+    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障',
+    'mit.recovery.confirm': '电机指令超时已到期。清除故障会关闭所有关节的力矩，机械臂会像收纳断电一样下落。请先托住机械臂或让它处于支撑位，再在提示消失前点一次确认。',
+    'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
@@ -2827,7 +2829,9 @@ const I18N = {
     'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
     'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
-    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.on_unconfirmed': 'On · unconfirmed',
+    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault',
+    'mit.recovery.confirm': 'A motor command timeout expired. Clearing turns torque off on every joint and the arm drops like a park torque-off. Support the arm or bring it to rest, then tap again while this warning is shown to confirm.',
+    'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
@@ -3631,6 +3635,7 @@ function toast(msg, kind = '', code = '') {
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
+  return el;
 }
 function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) {} return null; }
@@ -3865,6 +3870,7 @@ function connectWS() {
     }
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
+    mitRecoveryObserve();
     detHoldOnObs(o);
     depthOnObs(o);
     gcOnObs(o);
@@ -9150,10 +9156,35 @@ $('mode-seg').addEventListener('click', (e) => { const b = e.target.closest('but
 $('input-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setMode(S.ctl, b.dataset.input); });
 
 /* clear E-stop / fault (shared by the enable button and the status bar) */
+/* MIT expiry recovery: armd refuses the first clear with MIT_RECOVERY_CONFIRM_REQUIRED (torque goes off
+   on every joint). The second tap confirms only while that warning toast is still shown and only for
+   the same fault instance (code, message, epoch); any state change removes the warning and disarms. */
+let mitRecovery = null; // { el, key }
+function mitFaultKey() {
+  const f = S.obs && S.obs.fault;
+  return f ? f.code + '|' + f.message + '|' + S.epoch : null;
+}
+function mitRecoveryObserve() {
+  if (mitRecovery && (!mitRecovery.el.isConnected || mitRecovery.key !== mitFaultKey())) {
+    mitRecovery.el.remove();
+    mitRecovery = null;
+  }
+}
 function clearFault() {
-  return api('/api/v1/safety/clear_fault')
-    .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : 'toast.reset_ok'), 'ok'))
-    .catch(() => {}); // api() already toasted
+  // the fault this tap is about, read now: a later observation may already show another fault
+  const tapKey = mitFaultKey();
+  const confirmed = !!tapKey && !!mitRecovery && mitRecovery.el.isConnected && mitRecovery.key === tapKey;
+  if (mitRecovery) { mitRecovery.el.remove(); mitRecovery = null; }
+  return api('/api/v1/safety/clear_fault', confirmed ? { mit_recovery: 'torque_off_all' } : undefined, { quiet: true })
+    .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : (confirmed ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok'))
+    .catch((e) => {
+      if (e && e.code === 'MIT_RECOVERY_CONFIRM_REQUIRED') {
+        // arm only if the fault is still the one this tap was sent for (else drop the late reply)
+        if (tapKey && mitFaultKey() === tapKey) mitRecovery = { el: toast(t('mit.recovery.confirm'), 'err', e.code), key: tapKey };
+        return;
+      }
+      toast(e && e.message ? e.message : String(e), 'err', e && e.code);
+    });
 }
 
 /* Controlled stow: return to safe resting pose, wait until the arm settles,
