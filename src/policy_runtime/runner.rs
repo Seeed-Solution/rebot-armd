@@ -821,16 +821,16 @@ impl InferenceTicket {
                 actual: live.invalidation_generation,
             });
         }
-        if live.clock_handshake_generation != self.clock_handshake_generation {
-            return Err(TicketViolation::ClockHandshakeGenerationMismatch {
-                expected: self.clock_handshake_generation,
-                actual: live.clock_handshake_generation,
-            });
-        }
         if live.now_armd_ms > self.clock_handshake_expires_at_ms {
             return Err(TicketViolation::ClockHandshakeExpired {
                 now_ms: live.now_armd_ms,
                 expires_at_ms: self.clock_handshake_expires_at_ms,
+            });
+        }
+        if live.clock_handshake_generation != self.clock_handshake_generation {
+            return Err(TicketViolation::ClockHandshakeGenerationMismatch {
+                expected: self.clock_handshake_generation,
+                actual: live.clock_handshake_generation,
             });
         }
         if live.now_armd_ms > self.window_newest_deadline_ms {
@@ -1346,9 +1346,16 @@ pub fn spawn_policy_runner(
             // calibration hashing / release-gate / deployment checks, and immediately commit
             // `policy_step_with_vision` with zero intervening work.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
+            let mut hold_on_unbroken_renewal = false;
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
                     Ok(now_ms) => Some(now_ms),
+                    Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual })
+                        if actual != 0 && guard.is_unbroken_active_renewal(expected) =>
+                    {
+                        hold_on_unbroken_renewal = true;
+                        None
+                    }
                     Err(violation) => {
                         inner.fail_policy_run(action_id, violation.code(), violation.message());
                         break;
@@ -1357,6 +1364,10 @@ pub fn spawn_policy_runner(
             } else {
                 None
             };
+            if hold_on_unbroken_renewal {
+                inner.hold_policy_run(action_id);
+                continue;
+            }
             let post_vision_age_ms = if let (Some(now_ms), Some((mapped_ms, unc_ms))) =
                 (emb_commit_now_ms, emb_mapped_and_unc_ms)
             {

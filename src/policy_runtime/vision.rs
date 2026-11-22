@@ -529,6 +529,7 @@ pub struct LiveEmbeddingTicketState {
     pub invalidation_generation: u64,
     pub clock_handshake_generation: u64,
     pub clock_handshake_expires_at_ms: u64,
+    pub continuous_renewal_floor_gen: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -555,6 +556,8 @@ struct EmbeddingHubInner {
     default_handshake_ttl_ms: u64,
     handshake_generation: u64,
     handshake: Option<ClockHandshakeState>,
+    refill_started_at_ms: Option<u64>,
+    continuous_renewal_floor_gen: u64,
     pending_challenges: VecDeque<PendingClockChallenge>,
     next_challenge_seq: u64,
     bound: Option<BoundEmbeddingPolicy>,
@@ -576,6 +579,8 @@ impl Default for EmbeddingHubInner {
             default_handshake_ttl_ms: DEFAULT_HANDSHAKE_TTL_MS,
             handshake_generation: 0,
             handshake: None,
+            refill_started_at_ms: None,
+            continuous_renewal_floor_gen: 0,
             pending_challenges: VecDeque::new(),
             next_challenge_seq: 0,
             bound: None,
@@ -648,6 +653,7 @@ impl EmbeddingHubInner {
             invalidation_generation: self.invalidation_generation,
             clock_handshake_generation,
             clock_handshake_expires_at_ms,
+            continuous_renewal_floor_gen: self.continuous_renewal_floor_gen,
         }
     }
 }
@@ -661,6 +667,18 @@ pub struct HubCommitGuard<'a> {
 impl<'a> HubCommitGuard<'a> {
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
         self.inner.live_ticket_state()
+    }
+
+    pub fn is_unbroken_active_renewal(&self, ticket_hs_gen: u64) -> bool {
+        let Some(ref live_hs) = self.inner.handshake else {
+            return false;
+        };
+        let now_ms = self.inner.now_ms();
+        live_hs.handshake_generation != 0
+            && now_ms <= live_hs.handshake_expires_at_ms
+            && self.inner.continuous_renewal_floor_gen != 0
+            && ticket_hs_gen >= self.inner.continuous_renewal_floor_gen
+            && live_hs.handshake_generation == self.inner.handshake_generation
     }
 }
 
@@ -738,6 +756,7 @@ impl VideoEmbeddingHub {
     pub fn set_model_generation(&self, gen: Option<u64>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.model_generation = gen;
+        inner.continuous_renewal_floor_gen = inner.handshake_generation;
     }
 
     pub fn set_producer_epoch(&self, epoch: u64) {
@@ -748,6 +767,8 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+            inner.refill_started_at_ms = None;
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.recompute_deadlines();
             inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
         }
@@ -790,6 +811,8 @@ impl VideoEmbeddingHub {
             spec,
             effective_staleness_ms,
         });
+        inner.refill_started_at_ms = None;
+        inner.continuous_renewal_floor_gen = inner.handshake_generation;
         inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
         inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
         inner.recompute_deadlines();
@@ -803,6 +826,7 @@ impl VideoEmbeddingHub {
             .is_some_and(|b| b.policy_instance_id == policy_instance_id)
         {
             inner.bound = None;
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
             inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
         }
@@ -1042,6 +1066,12 @@ impl VideoEmbeddingHub {
             });
         }
 
+        let unbroken_renewal = inner.handshake.as_ref().is_some_and(|prev_hs| {
+            inner.producer_epoch == Some(req.producer_epoch)
+                && prev_hs.producer_epoch == req.producer_epoch
+                && s2 <= prev_hs.handshake_expires_at_ms
+        });
+
         inner.handshake_generation = inner.handshake_generation.saturating_add(1);
         let gen = inner.handshake_generation;
         let expires_at = s2.saturating_add(ttl_ms);
@@ -1055,6 +1085,18 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+        }
+
+        if unbroken_renewal {
+            if inner.continuous_renewal_floor_gen == 0 {
+                inner.continuous_renewal_floor_gen = gen;
+            }
+            if inner.refill_started_at_ms.is_none() {
+                inner.refill_started_at_ms = Some(s2);
+            }
+        } else {
+            inner.continuous_renewal_floor_gen = gen;
+            inner.refill_started_at_ms = None;
         }
 
         inner.handshake = Some(ClockHandshakeState {
@@ -1308,6 +1350,7 @@ impl VideoEmbeddingHub {
             inner.frames.clear();
             inner.last_frame_model_generation = req.model_generation;
             inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
         }
 
         while let Some(front) = inner.frames.front() {
@@ -1366,14 +1409,14 @@ impl VideoEmbeddingHub {
         spec: &VideoEmbeddingSpec,
         run_started_ms: u64,
     ) -> EmbeddingSampleDecision {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now_ms = inner.now_ms();
         let eff_staleness = inner
             .bound
             .as_ref()
             .map_or_else(|| spec.effective_staleness_ms(), |b| b.effective_staleness_ms);
 
-        let Some(ref hs) = inner.handshake else {
+        let Some(hs) = inner.handshake.clone() else {
             if now_ms.saturating_sub(run_started_ms) <= eff_staleness {
                 return EmbeddingSampleDecision::Hold;
             }
@@ -1394,7 +1437,8 @@ impl VideoEmbeddingHub {
         }
 
         if inner.frames.len() < spec.history_len {
-            if now_ms.saturating_sub(run_started_ms) <= spec.max_window_span_ms {
+            let refill_anchor = inner.refill_started_at_ms.unwrap_or(run_started_ms);
+            if now_ms.saturating_sub(refill_anchor) <= spec.max_window_span_ms {
                 return EmbeddingSampleDecision::Hold;
             }
             return match spec.on_stale {
@@ -1472,7 +1516,7 @@ impl VideoEmbeddingHub {
             }
         };
 
-        EmbeddingSampleDecision::Ready(EmbeddingWindowSnapshot {
+        let snapshot = EmbeddingWindowSnapshot {
             features,
             newest_frame_id: newest_frame.frame_id,
             newest_mapped_at_ms: newest_frame.mapped_at_ms,
@@ -1486,7 +1530,9 @@ impl VideoEmbeddingHub {
             window_newest_deadline_ms: newest_dl,
             window_oldest_deadline_ms: oldest_dl,
             policy_instance_id: inner.bound.as_ref().map(|b| b.policy_instance_id),
-        })
+        };
+        inner.refill_started_at_ms = None;
+        EmbeddingSampleDecision::Ready(snapshot)
     }
 
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {

@@ -2235,3 +2235,408 @@ async fn b2_mid_inference_temporal_clip_oldest_endpoint_expires_blocks_commit() 
     assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
     assert_eq!(pol.steps, 0);
 }
+
+#[tokio::test]
+async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
+    let mut weights = vec![0.0f32; 6 * 8];
+    weights[6] = 0.05;
+    weights[7] = 0.05;
+    let layers = make_linear_layers(8, 6, weights);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 20.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 300,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 300,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs1 = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs1.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: None,
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 20);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        20.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-m3").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-m3".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_m3".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        20.0,
+        compute_policy_deadline(Some(0.35)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    // Unbroken same-epoch renewal while prior handshake is still valid (1_000_020 <= 1_060_000)
+    hub.set_test_now_ms(Some(1_000_020));
+    let hs2 = hub_two_step_handshake(&hub, 1, 1_000_020, 1, true);
+    assert!(hs2.handshake_generation > hs1.handshake_generation);
+
+    // Allow step 1 (and subsequent steps) to proceed
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    // Step 1's target must be discarded and policy held while waiting for frames under hs2
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    sup.tick(0.02).await;
+    let mid_obs = sup.get_observation().await;
+    let mid_pol = mid_obs.policy.expect("policy still running in hold");
+    assert!(mid_pol.active, "policy must remain active during unbroken renewal hold");
+    assert_eq!(mid_pol.steps, 0, "in-flight target from old handshake must be discarded");
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+
+    // Refill under hs2 and let the runner commit
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs2.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 2,
+        captured_at_ms: 1_000_020,
+        oldest_captured_at_ms: None,
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        sup.tick(0.02).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    let end_obs = sup.get_observation().await;
+    let end_pol = end_obs.policy.expect("policy obs");
+    assert_eq!(end_pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+    assert!(end_pol.steps >= 1);
+    assert_eq!(end_pol.vision_frame_id, Some(2));
+    assert!(non_home_writes.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn m3_repeated_renewal_without_frames_times_out_after_max_window_span() {
+    let hub = VideoEmbeddingHub::new();
+    let spec = VideoEmbeddingSpec {
+        embedding_dim: 2,
+        history_len: 1,
+        max_staleness_ms: 200,
+        max_window_span_ms: 250,
+        fps_staleness_budget_ms: Some(200),
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        embedding_norm: None,
+        on_stale: armd::policy_runtime::VisionStalePolicy::Stop,
+    };
+    hub.set_test_now_ms(Some(1_000_000));
+    hub.bind_policy(1, spec.clone(), 20.0);
+    let hs1 = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs1.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: None,
+        embedding: vec![1.0, 2.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        hub.sample_window(&spec, 1_000_000),
+        armd::policy_runtime::vision::EmbeddingSampleDecision::Ready(_)
+    ));
+
+    // Unbroken renewal at 1_000_050 starts refill timer at 1_000_050
+    hub.set_test_now_ms(Some(1_000_050));
+    let _hs2 = hub_two_step_handshake(&hub, 1, 1_000_050, 1, true);
+    assert!(matches!(
+        hub.sample_window(&spec, 1_000_000),
+        armd::policy_runtime::vision::EmbeddingSampleDecision::Hold
+    ));
+
+    // Repeated renewal at 1_000_200 without frames MUST NOT reset refill_started_at_ms
+    hub.set_test_now_ms(Some(1_000_200));
+    let _hs3 = hub_two_step_handshake(&hub, 1, 1_000_200, 1, true);
+    assert!(matches!(
+        hub.sample_window(&spec, 1_000_000),
+        armd::policy_runtime::vision::EmbeddingSampleDecision::Hold
+    ));
+
+    // At 1_000_300 (elapsed 250 <= 250): still Hold
+    hub.set_test_now_ms(Some(1_000_300));
+    assert!(matches!(
+        hub.sample_window(&spec, 1_000_000),
+        armd::policy_runtime::vision::EmbeddingSampleDecision::Hold
+    ));
+
+    // At 1_000_301 (elapsed 251 > 250): bounded refill hold expires -> VISION_STALE
+    hub.set_test_now_ms(Some(1_000_301));
+    assert!(matches!(
+        hub.sample_window(&spec, 1_000_000),
+        armd::policy_runtime::vision::EmbeddingSampleDecision::Stop { reason: "VISION_STALE", .. }
+    ));
+}
+
+async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
+    let layers = make_linear_layers(8, 6, vec![0.05; 48]);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 10.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 300,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 300,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    if case == "late_after_expiry" {
+        hub.set_default_handshake_ttl_ms(50);
+    }
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs1 = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs1.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: None,
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 10);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        10.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-m3-fc").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-m3-fc".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_m3_fc".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        10.0,
+        compute_policy_deadline(Some(2.0)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    match case {
+        "late_after_expiry" => {
+            hub.set_test_now_ms(Some(1_000_051));
+            let _ = hub_two_step_handshake(&hub, 1, 1_000_051, 1, true);
+        }
+        "with_lease_loss" => {
+            let _ = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+            let _ = sup.preempt_lease("conn-hijack", "hijack").await.unwrap();
+        }
+        "with_model_change" => {
+            let _ = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+            hub.set_model_generation(Some(999));
+        }
+        _ => unreachable!(),
+    }
+
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    let obs = sup.get_observation().await;
+    let pol = obs.policy.expect("policy obs");
+    (
+        pol.stop_reason.unwrap_or_default(),
+        writes.load(Ordering::SeqCst),
+        non_home_writes.load(Ordering::SeqCst),
+        pol.steps,
+    )
+}
+
+#[tokio::test]
+async fn m3_late_renewal_and_coincident_lease_or_model_change_fail_closed() {
+    let (r1, w1, nh1, s1) = run_m3_fail_closed_case("late_after_expiry").await;
+    assert_eq!(r1, "HANDSHAKE_EXPIRED");
+    assert_eq!((w1, nh1, s1), (0, 0, 0));
+
+    let (r2, w2, nh2, s2) = run_m3_fail_closed_case("with_lease_loss").await;
+    assert_eq!(r2, "LEASE_LOST");
+    assert_eq!((w2, nh2, s2), (0, 0, 0));
+
+    let (r3, w3, nh3, s3) = run_m3_fail_closed_case("with_model_change").await;
+    assert_eq!(r3, "VISION_GENERATION_CHANGED");
+    assert_eq!((w3, nh3, s3), (0, 0, 0));
+}
