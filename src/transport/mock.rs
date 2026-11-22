@@ -1,5 +1,109 @@
 use std::collections::VecDeque;
-use crate::transport::{AsyncTransport, CanFrame, CanTransport, Transport, TransportError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::transport::{AsyncTransport, CanFrame, CanTransport, DriverClock, Transport, TransportError};
+
+static NEXT_MOCK_CLOCK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct MockClockInner {
+    id: u64,
+    base: Instant,
+    elapsed_ns: AtomicU64,
+    idle_read_step_ns: AtomicU64,
+}
+
+/// Deterministic virtual clock for mock transports.
+#[derive(Clone, Debug)]
+pub struct MockClock {
+    inner: Arc<MockClockInner>,
+}
+
+impl Default for MockClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockClock {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(MockClockInner {
+                id: NEXT_MOCK_CLOCK_ID.fetch_add(1, Ordering::Relaxed),
+                base: Instant::now(),
+                elapsed_ns: AtomicU64::new(0),
+                idle_read_step_ns: AtomicU64::new(1_000_000),
+            }),
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.inner.elapsed_ns.load(Ordering::Acquire))
+    }
+
+    pub fn now(&self) -> Instant {
+        self.inner
+            .base
+            .checked_add(self.elapsed())
+            .expect("MockClock virtual time exceeded representable Instant")
+    }
+
+    pub fn advance(&self, duration: Duration) {
+        let delta_ns = u64::try_from(duration.as_nanos())
+            .expect("MockClock advance duration exceeds representable u64 nanoseconds");
+        self.inner
+            .elapsed_ns
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.checked_add(delta_ns)?;
+                self.inner.base.checked_add(Duration::from_nanos(next))?;
+                Some(next)
+            })
+            .expect("MockClock virtual time exhausted / overflowed representable Instant");
+    }
+
+    pub fn set_idle_read_step(&self, step: Duration) {
+        assert!(
+            !step.is_zero(),
+            "MockClock idle_read_step must be non-zero to guarantee polling termination"
+        );
+        let step_ns = u64::try_from(step.as_nanos())
+            .expect("MockClock idle_read_step exceeds u64 nanoseconds");
+        assert!(
+            self.inner
+                .base
+                .checked_add(Duration::from_nanos(step_ns))
+                .is_some(),
+            "MockClock idle_read_step exceeds representable Instant"
+        );
+        self.inner.idle_read_step_ns.store(step_ns, Ordering::Release);
+    }
+
+    pub fn idle_read_step(&self) -> Duration {
+        Duration::from_nanos(self.inner.idle_read_step_ns.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn advance_idle_read(&self) {
+        self.advance(self.idle_read_step());
+    }
+}
+
+impl DriverClock for MockClock {
+    fn clock_id(&self) -> u64 {
+        self.inner.id
+    }
+
+    fn now(&self) -> Instant {
+        MockClock::now(self)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        self.advance(duration);
+    }
+
+    fn yield_now(&self) {}
+}
 
 /// Mock byte stream transport for unit testing and loopback verification
 #[derive(Debug, Clone, Default)]
@@ -14,11 +118,29 @@ pub struct MockTransport {
     staged_reads: VecDeque<Vec<u8>>,
     clear_input_count: usize,
     preserve_on_clear: bool,
+    clock: MockClock,
 }
 
 impl MockTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn clock(&self) -> MockClock {
+        self.clock.clone()
+    }
+
+    pub fn with_clock(mut self, clock: MockClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub fn advance_clock(&self, duration: Duration) {
+        self.clock.advance(duration);
+    }
+
+    pub fn set_idle_read_step(&self, step: Duration) {
+        self.clock.set_idle_read_step(step);
     }
 
     pub fn new_preserving() -> Self {
@@ -105,8 +227,15 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        Some(Arc::new(self.clock.clone()))
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         if let Some(err_msg) = self.error_on_next_read.take() {
+            if !buf.is_empty() {
+                self.clock.advance_idle_read();
+            }
             return Err(TransportError::Io(std::io::Error::other(
                 err_msg,
             )));
@@ -128,6 +257,9 @@ impl Transport for MockTransport {
                 chunk.drain(..n);
                 self.staged_reads.push_front(chunk);
             }
+            if n == 0 {
+                self.clock.advance_idle_read();
+            }
             return Ok(n);
         }
 
@@ -139,6 +271,7 @@ impl Transport for MockTransport {
 
         let available = self.rx_buffer.len().min(max_read);
         if available == 0 {
+            self.clock.advance_idle_read();
             return Ok(0);
         }
 

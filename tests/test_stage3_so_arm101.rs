@@ -1459,6 +1459,9 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
     // Custom MockTransport wrapper for FeetechArmDriver
     struct SharedTransport(Arc<Mutex<MockTransport>>);
     impl Transport for SharedTransport {
+        fn clock(&self) -> Option<Arc<dyn armd::transport::DriverClock>> {
+            Transport::clock(&*self.0.lock().unwrap())
+        }
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
             self.0.lock().unwrap().read(buf)
         }
@@ -1533,8 +1536,18 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
     assert_eq!(obs.safety_state, SafetyState::Armed);
 
     // Stale period: ticks pass without new packets
-    std::thread::sleep(Duration::from_millis(5));
+    mock.lock().unwrap().clear_write_responses();
+    mock.lock().unwrap().advance_clock(Duration::from_millis(5));
     supervisor.tick(0.02).await;
+    let obs_stale = supervisor.get_observation().await;
+    assert_eq!(obs_stale.safety_state, SafetyState::Armed);
+    assert!(obs_stale.fault.is_none());
+    assert_eq!(obs.feedback_age_ms.len(), 6);
+    assert_eq!(obs_stale.feedback_age_ms.len(), 6);
+    assert!(obs_stale.feedback_age_ms.iter().enumerate().all(|(i, age)| {
+        age.zip(obs.feedback_age_ms[i])
+            .is_some_and(|(after, before)| after >= before + 5)
+    }));
 
     // Rising edge: Arm joint 1 (servo ID 1) reports 0x20 Overload
     let mut rx_c0_overload = Vec::new();
