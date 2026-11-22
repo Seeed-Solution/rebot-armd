@@ -1536,6 +1536,13 @@ impl ArmConfig {
         let mut config: Self = serde_json::from_reader(std::io::BufReader::new(file))
             .map_err(|e| format!("profile {}: {e}", path.display()))?;
         config.load_arm_model(path.parent())?;
+        crate::tool::validate_tcp_offset(&config.tcp_offset)?;
+        if let Some(pc) = &config.physical_contact_end_m {
+            crate::tool::validate_physical_contact_end_m(pc, "physical_contact_end_m")?;
+        }
+        if let Some(co) = config.contact_opening_m {
+            crate::tool::validate_contact_opening_m(f64::from(co), "contact_opening_m")?;
+        }
         config.active_tool = crate::tool::stock_active_tool_info(&config);
         config.dynamics_qualified = true;
         Ok(config)
@@ -1902,6 +1909,12 @@ impl ArmConfig {
             return Err("Home positions must be finite and within joint limits".into());
         }
         crate::tool::validate_tcp_offset(&self.tcp_offset)?;
+        if let Some(pc) = &self.physical_contact_end_m {
+            crate::tool::validate_physical_contact_end_m(pc, "physical_contact_end_m")?;
+        }
+        if let Some(co) = self.contact_opening_m {
+            crate::tool::validate_contact_opening_m(f64::from(co), "contact_opening_m")?;
+        }
         if self.workspace.is_some()
             || !self.base_check_points_end_m.is_empty()
             || !self.permanent_tool_check_points_end_m.is_empty()

@@ -4452,14 +4452,12 @@ pub async fn activate(
         &scene_manifest,
         &tool_manifest,
     )?;
-    if tool_manifest.armd.is_some() {
-        crate::mjcf_compose::validate_tool_manifest_for_robot(
-            &tool_manifest,
-            Some(&tool_xml),
-            &running_robot,
-        )
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
-    }
+    crate::mjcf_compose::validate_tool_manifest_for_robot(
+        &tool_manifest,
+        Some(&tool_xml),
+        &running_robot,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
 
     // M21: Validate policy completely BEFORE prepare (never run fallible disk checks after remote commit).
     let policy_id = match payload.policy {
@@ -5210,14 +5208,12 @@ pub async fn get_bundle(
         &scene_manifest,
         &tool_manifest,
     )?;
-    if tool_manifest.armd.is_some() {
-        crate::mjcf_compose::validate_tool_manifest_for_robot(
-            &tool_manifest,
-            Some(&tw),
-            &running_robot,
-        )
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
-    }
+    crate::mjcf_compose::validate_tool_manifest_for_robot(
+        &tool_manifest,
+        Some(&tw),
+        &running_robot,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e, "code": "INVALID_PACK"}))))?;
 
     let policy_manifest = if let Some(ref p) = current.active_policy {
         let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;

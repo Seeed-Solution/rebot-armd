@@ -784,6 +784,9 @@ body.offline .banner { display: block; }
 .gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
 .gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
 .gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+.tool-comm-banner { display: grid; gap: 3px; padding: 10px 12px; border-radius: var(--sc-radius-md); border: 1px solid #f59e0b; background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.4; }
+.tool-comm-banner[hidden] { display: none; }
+.tool-comm-banner b { font-size: 13px; font-weight: 600; }
 /* ---------- external control: banner (#ext-banner), HUD chip, task drawer (#task) ---------- */
 .ext-banner { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-lg); border: 1px solid var(--sc-color-border-neutral); border-left: 4px solid var(--sc-color-primary);
   background: rgba(255,255,255,0.82); backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: var(--sc-shadow); }
@@ -1748,6 +1751,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
+      <span class="sc-status-badge plain" id="tool-badge" hidden></span>
       <span class="sc-status-badge" id="link-badge">-- Hz</span>
       <span class="sc-status-badge" id="state-badge" data-i18n="st.Offline">离线</span>
     </div>
@@ -2013,6 +2017,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span id="lock-txt" data-i18n="lock.offline">遥测断开，控制已锁定</span>
+        </div>
+        <div class="tool-comm-banner" id="tool-comm-banner" role="status" aria-live="polite" hidden>
+          <b id="tool-comm-title"></b>
+          <small id="tool-comm-sub" data-i18n="tool.comm.hint">需先完成工具调试/标定后再执行常规运动。</small>
         </div>
         <button class="btn btn-preempt" id="btn-preempt" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
@@ -3257,7 +3265,8 @@ Object.assign(I18N.zh, {
   'task.empty': '还没有记录。外部程序发起动作或取得控制权时会显示在这里。', 'task.lease.acquire': '取得控制权', 'task.lease.release': '释放控制权',
   'task.env.hint': '只读。打开本面板时每 2 秒刷新一次。', 'task.open_poses': '打开点位管理',
   'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
-  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
+  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.tool_comm': '工具调试', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
+  'tool.badge.comm': '{id} · 待调试', 'tool.comm.title': '工具「{id}」未完成调试', 'tool.comm.hint': '请先完成工具调试/标定后再执行常规运动。',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
   'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
@@ -3274,7 +3283,8 @@ Object.assign(I18N.en, {
   'task.empty': 'Nothing yet. Actions started by external clients and lease changes appear here.', 'task.lease.acquire': 'took control', 'task.lease.release': 'released control',
   'task.env.hint': 'Read-only. Refreshes every 2 s while this panel is open.', 'task.open_poses': 'Open Poses',
   'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
-  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
+  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.tool_comm': 'Tool commissioning', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
+  'tool.badge.comm': '{id} · needs commissioning', 'tool.comm.title': 'Tool "{id}" needs commissioning', 'tool.comm.hint': 'Complete tool commissioning / calibration before running normal motions.',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
   'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
@@ -7541,6 +7551,31 @@ function applyJointMap(map) {
   camMountNow();
   V3.key = ''; PCARD.key = '';
 }
+function renderToolStatus() {
+  const tool = S.activeTool;
+  const badge = $('tool-badge');
+  const banner = $('tool-comm-banner');
+  if (!tool || !tool.id) {
+    if (badge) badge.hidden = true;
+    if (banner) banner.hidden = true;
+    return;
+  }
+  const req = tool.commissioning_required === true;
+  if (badge) {
+    badge.hidden = false;
+    setText(badge, req ? t('tool.badge.comm', { id: tool.id }) : tool.id);
+    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? '' : 'is-ok'));
+    badge.title = req ? t('tool.comm.hint') : tool.id;
+  }
+  if (banner) {
+    banner.hidden = !req;
+    if (req) {
+      setText($('tool-comm-title'), t('tool.comm.title', { id: tool.id }));
+      setText($('tool-comm-sub'), t('tool.comm.hint'));
+    }
+  }
+}
+i18nHooks.push(renderToolStatus);
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
@@ -7561,6 +7596,7 @@ async function loadSchema() {
       S.wsPolicy = sc.workspace || null;
       S.wsCheckPoints = (sc.workspace && Array.isArray(sc.workspace.check_points_end_m)) ? sc.workspace.check_points_end_m : null;
       S.activeTool = sc.active_tool || null;
+      renderToolStatus();
       S.tcpOffset = (sc.active_tool && Array.isArray(sc.active_tool.tcp_offset_m)) ? sc.active_tool.tcp_offset_m.map(Number) : [0, 0, 0];
       S.physicalContactEnd = Array.isArray(sc.physical_contact_end_m) && sc.physical_contact_end_m.length === 3 && sc.physical_contact_end_m.every(Number.isFinite)
         ? sc.physical_contact_end_m.map(Number)
@@ -12503,12 +12539,18 @@ function tkEnvRows() {
   const val = (x) => (x == null || x === '' ? none : String(x));
   const rows = [['h', t('task.env.sec.sandbox')]];
   const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
+  const activeToolId = (S.activeTool && S.activeTool.id) || (sb && sb.active_tool);
+  const toolCommReq = !!(S.activeTool && S.activeTool.commissioning_required === true);
   if (!E) rows.push(['r', t('task.env.mode'), t('task.env.loading')]);
-  else if (!sb) rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
-  else {
+  else if (!sb) {
+    rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
+    if (activeToolId) rows.push(['r', t('task.env.tool'), val(activeToolId)]);
+    if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
+  } else {
     rows.push(['r', t('task.env.mode'), sb.mode && sb.mode !== 'none' ? String(sb.mode) : none]);
     rows.push(['r', t('task.env.scene'), val(sb.active_scene)]);
-    rows.push(['r', t('task.env.tool'), val(sb.active_tool)]);
+    rows.push(['r', t('task.env.tool'), val(activeToolId)]);
+    if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
     rows.push(['r', t('task.env.policy'), val(sb.active_policy)]);
     const ps = sb.policy_status ?? (sb.telemetry && typeof sb.telemetry === 'object' ? sb.telemetry.policy_status : undefined);
     rows.push(['r', t('task.env.pstatus'), ps && typeof ps === 'object' ? JSON.stringify(ps) : val(ps)]);

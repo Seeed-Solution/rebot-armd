@@ -1348,3 +1348,55 @@ fn r2_b05_replay_rejects_embedded_parquet_sidecar_conflict_and_m12_so101_manifes
     })).unwrap();
     assert!(armd::mjcf_compose::validate_tool_manifest(&bad_so101, None).is_err());
 }
+
+#[tokio::test]
+async fn m6_stream_contact_speed_invalidates_commissioning_and_m8_rejects_non_string_parquet_meta() {
+    // M6: Changing base profile stream_contact_speed_rad_s invalidates prior commissioning.
+    let comm_dir = tempfile::tempdir().unwrap();
+    let comm_file = comm_dir.path().join("tool_commissioning.json");
+    let pack: ToolPackConfig = serde_json::from_str(FINRAY_PACK_JSON).unwrap();
+    let base1 = ArmConfig::rebot_dm();
+    let mut base2 = base1.clone();
+    base2.gripper_policy.as_mut().unwrap().stream_contact_speed_rad_s = Some(0.15);
+    let cfg1 = tool::apply_tool_overlay(&base1, &pack).unwrap();
+    let cfg2 = tool::apply_tool_overlay(&base2, &pack).unwrap();
+    assert_ne!(cfg1.active_tool.config_digest, cfg2.active_tool.config_digest);
+    let sup1 = Arc::new(ArmSupervisor::new(cfg1.clone()));
+    {
+        let mut inner = sup1.inner().write().await;
+        inner.tool_commissioning_path = Some(comm_file.clone());
+    }
+    let prep = {
+        let inner = sup1.inner().read().await;
+        tool::prepare_commissioning_confirm(
+            &inner,
+            &json!({
+                "confirm": true,
+                "tool_id": cfg1.active_tool.id,
+                "tool_config_digest": cfg1.active_tool.config_digest
+            }),
+            false,
+        )
+        .unwrap()
+    };
+    prep.write.unwrap().run().await.unwrap();
+    let sup2 = Arc::new(ArmSupervisor::new(cfg2));
+    tool::load_commissioning_into(&sup2, &comm_file).await;
+    assert!(
+        sup2.inner().read().await.config.active_tool.commissioning_required,
+        "changing stream_contact_speed_rad_s must invalidate old commissioning"
+    );
+
+    // M8: Non-string tool_id / tool_config_digest in Parquet rebot.episode metadata must be rejected.
+    let mut kv_bad_tid = std::collections::HashMap::new();
+    kv_bad_tid.insert("rebot.episode".to_string(), r#"{"tool_id": 42}"#.to_string());
+    assert!(armd::recording::import::extract_embedded_provenance(&kv_bad_tid)
+        .unwrap_err()
+        .contains("tool_id"));
+
+    let mut kv_bad_dig = std::collections::HashMap::new();
+    kv_bad_dig.insert("rebot.episode".to_string(), r#"{"tool_config_digest": []}"#.to_string());
+    assert!(armd::recording::import::extract_embedded_provenance(&kv_bad_dig)
+        .unwrap_err()
+        .contains("tool_config_digest"));
+}

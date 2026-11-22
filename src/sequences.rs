@@ -515,6 +515,18 @@ pub fn prepare_run(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<
                 let p = inner.poses.by_id(pose_id).ok_or_else(|| missing(format!("no pose with id '{pose_id}'")))?;
                 if p.stale.is_some() { stale.push(i); }
                 if p.positions.len() != inner.config.dof { return Err(invalid(format!("step {i}: pose '{}' has {} joints", p.name, p.positions.len()))); }
+                if *gripper == PoseGripper::Pose
+                    && inner.config.gripper_index().is_some()
+                    && !inner
+                        .config
+                        .active_tool
+                        .matches_record(p.tool_id.as_deref(), p.tool_config_digest.as_deref())
+                {
+                    return Err(rejected(409, "TOOL_MISMATCH", format!(
+                        "step {i}: pose '{}' gripper position was saved with tool {:?} ({:?}), which does not match active tool '{}' ({})",
+                        p.name, p.tool_id, p.tool_config_digest, inner.config.active_tool.id, inner.config.active_tool.config_digest
+                    )));
+                }
                 PinnedStep::Pose { positions: p.positions.clone(), speed_scale: *speed_scale, gripper: *gripper, pose_id: pose_id.clone() }
             }
             Step::Gripper { action, fraction } => PinnedStep::Gripper { action: *action, fraction: *fraction },

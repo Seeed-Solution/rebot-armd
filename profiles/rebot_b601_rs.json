@@ -1,5 +1,6 @@
 {
   "_note": "reBot B601-RS (RobStride, --follower rebot-rs), 6 arm joints, no gripper joint. NOT VERIFIED ON HARDWARE: joint signs / zero offsets against the motors, joint limits, the workspace check points (copied from the B601-DM gripper envelope) and the URDF inertials (rs_arm.xml lists different link masses) need checking on a real arm before use.",
+  "profile_id": "rebot_b601_rs",
   "profile_version": 1,
   "dof": 6,
   "joint_names": [

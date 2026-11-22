@@ -1503,7 +1503,7 @@ mod tests {
         assert_eq!(res["tcp_offset_m"], json!([0.0288, 0.0, 0.0]));
         assert_eq!(
             res["config_digest"],
-            "v1:f9c8d5027b44c3a8083d8975e3e2bedd7e17cf06fb31f6dd887fc31931797289"
+            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776"
         );
         assert!(res["canonical_json"].as_str().unwrap().contains("\"tool_id\":\"soft_finray_gripper\""));
 
@@ -1515,7 +1515,7 @@ mod tests {
         assert_eq!(stock_so101["is_stock"], true);
         assert_eq!(
             stock_so101["config_digest"],
-            "v1:84a3e85c85c3fcd06a3a279eaf37607054832fec3be46bc1bdf010dbe5fe4abd"
+            "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42"
         );
 
         let missing_tcp = call(json!({

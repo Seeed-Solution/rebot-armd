@@ -267,11 +267,23 @@ fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<
 }
 
 fn apply_cli_tool(config: ArmConfig, cli_tool: Option<&str>) -> Result<ArmConfig, String> {
-    let env_tool = std::env::var("ARMD_TOOL").ok().filter(|s| !s.is_empty());
-    let Some(path) = cli_tool.or(env_tool.as_deref()) else {
-        return Ok(config);
+    let env_tool = std::env::var_os("ARMD_TOOL").filter(|s| !s.is_empty());
+    apply_cli_tool_with_env(config, cli_tool, env_tool.as_deref())
+}
+
+fn apply_cli_tool_with_env(
+    config: ArmConfig,
+    cli_tool: Option<&str>,
+    env_tool: Option<&std::ffi::OsStr>,
+) -> Result<ArmConfig, String> {
+    let path: std::path::PathBuf = match cli_tool {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match env_tool {
+            Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+            _ => return Ok(config),
+        },
     };
-    let pack = armd::tool::load_tool_file(path)?;
+    let pack = armd::tool::load_tool_file(&path)?;
     armd::tool::validate_reserved_stock_pack(&pack, None)?;
     let updated = armd::tool::apply_tool_overlay(&config, &pack)?;
     info!(
@@ -279,7 +291,7 @@ fn apply_cli_tool(config: ArmConfig, cli_tool: Option<&str>) -> Result<ArmConfig
         updated.active_tool.id,
         updated.active_tool.config_digest,
         updated.dynamics_qualified,
-        path
+        path.display()
     );
     Ok(updated)
 }
@@ -715,5 +727,20 @@ mod shutdown_tests {
         assert_eq!(parsed["id"], "soft_finray_gripper");
         assert_eq!(parsed["robot_id"], "b601dm");
         assert_eq!(parsed["tcp_offset_m"], serde_json::json!([0.0288, 0.0, 0.0]));
+
+        // B1: Non-UTF-8 ARMD_TOOL path must not be silently swallowed into stock fallback.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let base = ArmConfig::rebot_dm();
+            let non_utf8_missing = std::ffi::OsStr::from_bytes(b"/nonexistent_\xff/tool.json");
+            assert!(apply_cli_tool_with_env(base.clone(), None, Some(non_utf8_missing)).is_err());
+
+            let non_utf8_path = dir.path().join(std::ffi::OsStr::from_bytes(b"tool_\xff.json"));
+            std::fs::copy(&valid_path, &non_utf8_path).unwrap();
+            let loaded = apply_cli_tool_with_env(base, None, Some(non_utf8_path.as_os_str())).unwrap();
+            assert_eq!(loaded.active_tool.id, "soft_finray_gripper");
+            assert!(loaded.active_tool.commissioning_required);
+        }
     }
 }

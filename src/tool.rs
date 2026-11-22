@@ -20,8 +20,12 @@ pub const MAX_CHECK_POINT_NORM_M: f64 = 0.50;
 pub const MAX_EFFECTIVE_CHECK_POINTS: usize = 32;
 /// Maximum allowed payload mass delta (kg) without a tool-matched dynamics model.
 pub const DYNAMICS_MAX_MASS_DELTA_KG: f64 = 0.15;
+/// Maximum allowed payload mass delta in micro-kg (mg), quantized identically to the digest.
+pub const DYNAMICS_MAX_MASS_DELTA_MG: i64 = 150_000;
 /// Maximum allowed worst-case horizontal CoM pitch torque delta (N·m) without a tool-matched dynamics model.
 pub const DYNAMICS_MAX_COM_MOMENT_DELTA_NM: f64 = 0.05;
+/// Maximum allowed worst-case horizontal CoM pitch torque delta in micro-N·m (uN·m), quantized identically to the digest.
+pub const DYNAMICS_MAX_COM_MOMENT_DELTA_UNM: i64 = 50_000;
 
 fn default_kind_gripper() -> String {
     "gripper".to_string()
@@ -383,7 +387,8 @@ pub struct ToolDynamics {
 }
 
 impl ToolDynamics {
-    /// Whether the dynamics delta is explicitly declared, finite, and within stock-model limits.
+    /// Whether the dynamics delta is explicitly declared, finite, within micro-unit range,
+    /// and within stock-model limits (evaluated on the same micro-unit quantized values as the digest).
     pub fn is_qualified(dyn_opt: Option<&Self>) -> bool {
         let Some(d) = dyn_opt else {
             return false;
@@ -394,10 +399,14 @@ impl ToolDynamics {
         let Some(c) = d.com_moment_delta_nm else {
             return false;
         };
-        m.is_finite()
-            && c.is_finite()
-            && m.abs() <= DYNAMICS_MAX_MASS_DELTA_KG
-            && c.abs() <= DYNAMICS_MAX_COM_MOMENT_DELTA_NM
+        let Ok(m_mg) = checked_to_micro_f64(m, "mass_delta_kg") else {
+            return false;
+        };
+        let Ok(c_unm) = checked_to_micro_f64(c, "com_moment_delta_nm") else {
+            return false;
+        };
+        m_mg.abs() <= DYNAMICS_MAX_MASS_DELTA_MG
+            && c_unm.abs() <= DYNAMICS_MAX_COM_MOMENT_DELTA_UNM
     }
 }
 
@@ -474,6 +483,7 @@ pub struct ArmdToolOverlay {
 
 /// Canonical tool pack manifest (`tool.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolPackConfig {
     pub id: String,
     #[serde(default)]
@@ -569,9 +579,6 @@ pub fn baseline_arm_config_for_robot(robot_id: &str) -> Result<ArmConfig, String
         "b601rs" => {
             let mut c: ArmConfig = serde_json::from_str(include_str!("../profiles/rebot_b601_rs.json"))
                 .map_err(|e| format!("embedded rebot_b601_rs profile: {e}"))?;
-            if c.profile_id.is_none() {
-                c.profile_id = Some("rebot_b601_rs".to_string());
-            }
             c.init_arm_model_in_memory(Some(include_str!("../assets/ReBot_Arm_RS.urdf")))?;
             c
         }
@@ -621,6 +628,7 @@ struct CanonicalGripperPolicy {
     max_lead_urad: Option<i64>,
     open_urad: i64,
     squeeze_urad: i64,
+    stream_contact_speed_urad_s: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -654,6 +662,7 @@ pub struct CanonicalGripperInput {
     pub max_lead_rad: Option<f64>,
     pub squeeze_rad: f64,
     pub max_close_torque_nm: Option<f64>,
+    pub stream_contact_speed_rad_s: Option<f64>,
 }
 
 impl From<&GripperPolicy> for CanonicalGripperInput {
@@ -675,6 +684,7 @@ impl From<&GripperPolicy> for CanonicalGripperInput {
             max_lead_rad: gp.max_lead_rad.map(f64::from),
             squeeze_rad: f64::from(gp.squeeze_rad),
             max_close_torque_nm: gp.max_close_torque_nm.map(f64::from),
+            stream_contact_speed_rad_s: gp.stream_contact_speed_rad_s.map(f64::from),
         }
     }
 }
@@ -729,6 +739,7 @@ pub fn canonical_tool_payload_json_f64(
             max_lead_urad: gp.max_lead_rad.map(to_micro_f64),
             open_urad: to_micro_f64(gp.open_rad),
             squeeze_urad: to_micro_f64(gp.squeeze_rad),
+            stream_contact_speed_urad_s: gp.stream_contact_speed_rad_s.map(to_micro_f64),
         }
     });
 
@@ -928,6 +939,31 @@ pub fn load_tool_file(path: impl AsRef<std::path::Path>) -> Result<ToolPackConfi
         .map_err(|e| format!("tool file {}: {e}", path.display()))?;
     serde_json::from_str(&text)
         .map_err(|e| format!("tool file {}: {e}", path.display()))
+}
+
+/// Validate `physical_contact_end_m` (finite, micro-unit range, norm <= [`MAX_CHECK_POINT_NORM_M`]).
+pub fn validate_physical_contact_end_m(pc: &[f64; 3], label: &str) -> Result<(), String> {
+    for (ax, &v) in pc.iter().enumerate() {
+        checked_to_micro_f64(v, &format!("{label}[{ax}]"))?;
+    }
+    let norm = (pc[0] * pc[0] + pc[1] * pc[1] + pc[2] * pc[2]).sqrt();
+    if norm > MAX_CHECK_POINT_NORM_M {
+        return Err(format!(
+            "{label} norm {norm:.4} m exceeds limit {MAX_CHECK_POINT_NORM_M:.2} m"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `contact_opening_m` (finite, micro-unit range, in `[0.0, 0.20]` m).
+pub fn validate_contact_opening_m(co: f64, label: &str) -> Result<(), String> {
+    checked_to_micro_f64(co, label)?;
+    if !(0.0..=0.20).contains(&co) {
+        return Err(format!(
+            "{label} {co} must be finite and in [0.0, 0.20] m"
+        ));
+    }
+    Ok(())
 }
 
 /// Validate `tcp_offset` (finite, norm <= [`MAX_TCP_OFFSET_NORM_M`]).
@@ -1194,23 +1230,10 @@ fn apply_tool_overlay_with_details(
     if let Some(a) = armd {
         validate_check_points_f64(&a.extra_check_points_end_m, "armd.extra_check_points_end_m")?;
         if let Some(pc) = &a.physical_contact_end_m {
-            for (ax, &v) in pc.iter().enumerate() {
-                checked_to_micro_f64(v, &format!("armd.physical_contact_end_m[{ax}]"))?;
-            }
-            let norm = (pc[0] * pc[0] + pc[1] * pc[1] + pc[2] * pc[2]).sqrt();
-            if norm > MAX_CHECK_POINT_NORM_M {
-                return Err(format!(
-                    "armd.physical_contact_end_m norm {norm:.4} m exceeds limit {MAX_CHECK_POINT_NORM_M:.2} m"
-                ));
-            }
+            validate_physical_contact_end_m(pc, "armd.physical_contact_end_m")?;
         }
         if let Some(co) = a.contact_opening_m {
-            checked_to_micro_f64(co, "armd.contact_opening_m")?;
-            if !(0.0..=0.20).contains(&co) {
-                return Err(format!(
-                    "armd.contact_opening_m {co} must be finite and in [0.0, 0.20] m"
-                ));
-            }
+            validate_contact_opening_m(co, "armd.contact_opening_m")?;
         }
         if let Some(d) = &a.dynamics {
             if let Some(m) = d.mass_delta_kg {
@@ -1526,7 +1549,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[[0,-82000,-22000],[0,-82000,22000],[0,82000,-22000],[0,82000,22000],[32000,-82000,-22000],[32000,-82000,22000],[32000,0,-22000],[32000,0,22000],[32000,82000,-22000],[32000,82000,22000]],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":[[-5700000,88600],[0,3600]],"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":[[-5700000,88600],[0,3600]],"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":75000,"#,
             r#""physical_contact_um":[28800,0,0],"#,
@@ -1536,7 +1559,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_FINRAY_DIGEST: &str =
-            "v1:f9c8d5027b44c3a8083d8975e3e2bedd7e17cf06fb31f6dd887fc31931797289";
+            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776";
         eprintln!("CANONICAL_FINRAY_JSON={finray_json}");
         eprintln!("CANONICAL_FINRAY_DIGEST={}", applied.active_tool.config_digest);
         assert_eq!(finray_json, expected_finray_json);
@@ -1569,7 +1592,7 @@ mod tests {
             r#""edge_to_low_um":2300,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":null,"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":600000,"holding_gap_urad":300000,"holding_load_fraction_um":null,"holding_mode":"torque_and_gap","holding_torque_unm":66700,"jaw_opening_nominal":null,"max_close_torque_unm":1000000,"max_lead_urad":350000,"open_urad":-5700000,"squeeze_urad":150000,"stream_contact_speed_urad_s":300000},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":75000,"#,
             r#""physical_contact_um":[0,0,0],"#,
@@ -1587,7 +1610,7 @@ mod tests {
         assert!(schema.active_tool.config_digest.starts_with("v1:"));
         assert_eq!(schema.active_tool.config_digest.len(), 3 + 64);
         const EXPECTED_DEFAULT_DIGEST: &str =
-            "v1:97ff8001c17e21a10f0c931edc1eebfdb436e80287cb4e87694cb31469febe73";
+            "v1:ac4d69ae16085196687d381a4dbfa89a1940a08522dd088f2459645fd91d1064";
         eprintln!("CANONICAL_DEFAULT_JSON={default_json}");
         eprintln!("CANONICAL_DEFAULT_DIGEST={}", schema.active_tool.config_digest);
         assert_eq!(schema.active_tool.config_digest, EXPECTED_DEFAULT_DIGEST);
@@ -1614,7 +1637,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,65000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,65000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":65000,"#,
             r#""physical_contact_um":[0,0,0],"#,
@@ -1624,7 +1647,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_SO101_DIGEST: &str =
-            "v1:84a3e85c85c3fcd06a3a279eaf37607054832fec3be46bc1bdf010dbe5fe4abd";
+            "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42";
         eprintln!("CANONICAL_SO101_JSON={so101_json}");
         eprintln!("CANONICAL_SO101_DIGEST={}", so101_schema.active_tool.config_digest);
         assert_eq!(so101_json, expected_so101_json);
@@ -1649,7 +1672,7 @@ mod tests {
         );
         let expected_so100_json = expected_so101_json.replace(r#""robot_id":"so101""#, r#""robot_id":"so100""#);
         const EXPECTED_SO100_DIGEST: &str =
-            "v1:1089ccb85e2418e52abf935a55a953542364deacf44d2cba2fbc57d2f226373b";
+            "v1:efbb9e76729b3b748959c032a789412e0ef0224d197079d16f688a32f82463d4";
         eprintln!("CANONICAL_SO100_JSON={so100_json}");
         eprintln!("CANONICAL_SO100_DIGEST={}", so100_schema.active_tool.config_digest);
         assert_eq!(so100_json, expected_so100_json);
@@ -1688,7 +1711,7 @@ mod tests {
             r#""edge_to_low_um":null,"#,
             r#""extra_points_um":[],"#,
             r#""grasp_height_um":15000,"#,
-            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,70000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000},"#,
+            r#""gripper_policy":{"closed_urad":0,"contact_torque_unm":null,"holding_gap_urad":80000,"holding_load_fraction_um":180000,"holding_mode":"load_and_gap","holding_torque_unm":0,"jaw_opening_nominal":[[0,0],[1500000,70000]],"max_close_torque_unm":null,"max_lead_urad":null,"open_urad":1500000,"squeeze_urad":50000,"stream_contact_speed_urad_s":null},"#,
             r#""kind":"gripper","#,
             r#""max_grasp_width_um":65000,"#,
             r#""physical_contact_um":null,"#,
@@ -1698,7 +1721,7 @@ mod tests {
             r#""v":1}"#
         );
         const EXPECTED_SO101_INHERITED_DIGEST: &str =
-            "v1:8ad2e63f9b81f691dcf2be4ba98594264c42ece4ec44046be4cb24bc3ff2f1a8";
+            "v1:6f50d92eb5709a880819d6ddcce4e2c78dad34986929319cb444db6265087d39";
         eprintln!("CANONICAL_SO101_INHERITED_JSON={so101_inherited_json}");
         eprintln!("CANONICAL_SO101_INHERITED_DIGEST={}", so101_inherited.active_tool.config_digest);
         assert_eq!(so101_inherited_json, expected_so101_inherited_json);
@@ -2062,7 +2085,7 @@ mod tests {
         assert_eq!(fin_sum.tcp_offset_m, [0.0288, 0.0, 0.0]);
         assert_eq!(
             fin_sum.config_digest,
-            "v1:f9c8d5027b44c3a8083d8975e3e2bedd7e17cf06fb31f6dd887fc31931797289"
+            "v1:bc4e643de8bf65ec9537c2b22ddbb1ae230e14a091a169cd4d199b955af49776"
         );
         assert_eq!(
             format!("v1:{}", crate::gravity::compute_sha256(fin_sum.canonical_json.as_bytes())),
@@ -2079,9 +2102,9 @@ mod tests {
         assert!(err.contains("--robot"), "{err}");
 
         for (robot, expected_digest) in [
-            ("b601dm", "v1:97ff8001c17e21a10f0c931edc1eebfdb436e80287cb4e87694cb31469febe73"),
-            ("so101", "v1:84a3e85c85c3fcd06a3a279eaf37607054832fec3be46bc1bdf010dbe5fe4abd"),
-            ("so100", "v1:1089ccb85e2418e52abf935a55a953542364deacf44d2cba2fbc57d2f226373b"),
+            ("b601dm", "v1:ac4d69ae16085196687d381a4dbfa89a1940a08522dd088f2459645fd91d1064"),
+            ("so101", "v1:71cfcf4dafaa5a52c2366c3ace757f714628321b761f195f4456a7ae2ba26a42"),
+            ("so100", "v1:efbb9e76729b3b748959c032a789412e0ef0224d197079d16f688a32f82463d4"),
             ("b601rs", "v1:940a10d6d0dadaa2c6d2fdf7771cb8e226805c3300233dff9661fc5b8cf89636"),
         ] {
             let s = resolve_tool_config_summary(&stock, Some(robot)).unwrap();
@@ -2096,5 +2119,85 @@ mod tests {
         missing_tcp.tcp_offset = None;
         let err = resolve_tool_config_summary(&missing_tcp, Some("b601dm")).unwrap_err();
         assert!(err.contains("tcp_offset"), "{err}");
+    }
+
+    #[test]
+    fn regression_fixes_m2_m5_m6_m7_m1() {
+        // M6: Changing stream_contact_speed_rad_s on base profile changes canonical digest.
+        let base = ArmConfig::rebot_dm();
+        let pack: ToolPackConfig = serde_json::from_str(SOFT_FINRAY_TOOL_JSON).unwrap();
+        let d1 = apply_tool_overlay(&base, &pack).unwrap().active_tool.config_digest;
+        let mut base_mod = base.clone();
+        base_mod.gripper_policy.as_mut().unwrap().stream_contact_speed_rad_s = Some(0.15);
+        let d2 = apply_tool_overlay(&base_mod, &pack).unwrap().active_tool.config_digest;
+        assert_ne!(d1, d2, "stream_contact_speed_rad_s must affect config_digest");
+        assert_ne!(
+            stock_active_tool_info(&base).config_digest,
+            stock_active_tool_info(&base_mod).config_digest
+        );
+
+        // M7: Dynamics qualification matches micro-unit digest quantization (0.15 == 0.1500004, 0.1500005 fails).
+        let mut p_exact = pack.clone();
+        p_exact.armd.as_mut().unwrap().dynamics = Some(ToolDynamics {
+            mass_delta_kg: Some(0.15),
+            com_moment_delta_nm: Some(0.05),
+        });
+        let mut p_round_down = pack.clone();
+        p_round_down.armd.as_mut().unwrap().dynamics = Some(ToolDynamics {
+            mass_delta_kg: Some(0.1500004),
+            com_moment_delta_nm: Some(0.0500004),
+        });
+        let mut p_round_up = pack.clone();
+        p_round_up.armd.as_mut().unwrap().dynamics = Some(ToolDynamics {
+            mass_delta_kg: Some(0.1500005),
+            com_moment_delta_nm: Some(0.05),
+        });
+        let r_exact = apply_tool_overlay(&base, &p_exact).unwrap();
+        let r_down = apply_tool_overlay(&base, &p_round_down).unwrap();
+        let r_up = apply_tool_overlay(&base, &p_round_up).unwrap();
+        assert_eq!(r_exact.active_tool.config_digest, r_down.active_tool.config_digest);
+        assert_eq!(r_exact.dynamics_qualified, r_down.dynamics_qualified);
+        assert!(r_exact.dynamics_qualified);
+        assert_ne!(r_exact.active_tool.config_digest, r_up.active_tool.config_digest);
+        assert!(!r_up.dynamics_qualified);
+
+        // M5: Stock profile with invalid physical_contact_end_m is rejected in validate() and from_profile_file().
+        let mut bad_stock = ArmConfig::rebot_dm();
+        bad_stock.physical_contact_end_m = Some([1.0, 0.0, 0.0]);
+        assert!(bad_stock.validate().unwrap_err().contains("physical_contact_end_m"));
+        let dir = tempfile::tempdir().unwrap();
+        let bad_profile_path = dir.path().join("bad_profile.json");
+        let mut raw_profile = serde_json::to_value(ArmConfig::rebot_dm()).unwrap();
+        raw_profile["physical_contact_end_m"] = serde_json::json!([1.0, 0.0, 0.0]);
+        std::fs::write(&bad_profile_path, serde_json::to_string(&raw_profile).unwrap()).unwrap();
+        assert!(ArmConfig::from_profile_file(&bad_profile_path).unwrap_err().contains("physical_contact_end_m"));
+
+        // M2: Shipped profiles/rebot_b601_rs.json matches baseline_arm_config_for_robot("b601rs") and loads suction.
+        let rs_file = ArmConfig::from_profile_file(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/rebot_b601_rs.json"
+        ))
+        .unwrap();
+        let rs_baseline = baseline_arm_config_for_robot("b601rs").unwrap();
+        assert_eq!(rs_file.profile_id.as_deref(), Some("rebot_b601_rs"));
+        assert_eq!(rs_file.profile_id, rs_baseline.profile_id);
+        assert_eq!(
+            rs_file.active_tool.config_digest,
+            rs_baseline.active_tool.config_digest
+        );
+        let rs_suction: ToolPackConfig = serde_json::from_value(serde_json::json!({
+            "id": "rs_suction",
+            "kind": "suction",
+            "robots": ["b601rs"],
+            "tcp_offset": [0.0, 0.0, 0.0]
+        }))
+        .unwrap();
+        let rs_applied = apply_tool_overlay(&rs_file, &rs_suction).unwrap();
+        let rs_summary = resolve_tool_config_summary(&rs_suction, Some("b601rs")).unwrap();
+        assert_eq!(rs_applied.active_tool.config_digest, rs_summary.config_digest);
+
+        // m1: ToolPackConfig rejects unknown top-level fields (e.g. "armd_").
+        let bad_top = r#"{"id":"bad","kind":"gripper","robots":["b601dm"],"tcp_offset":[0,0,0],"armd_":{"dynamics":{}}}"#;
+        assert!(serde_json::from_str::<ToolPackConfig>(bad_top).is_err());
     }
 }

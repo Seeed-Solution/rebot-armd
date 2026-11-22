@@ -340,8 +340,26 @@ impl SupervisorInner {
             }
         }
         check_positions(&pose.positions, &self.config).map_err(invalid)?;
-        let mut target = self.commanded_positions.clone();
         let gripper_idx = self.config.gripper_index();
+        if include_gripper && gripper_idx.is_some()
+            && !self
+                .config
+                .active_tool
+                .matches_record(pose.tool_id.as_deref(), pose.tool_config_digest.as_deref())
+        {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "TOOL_MISMATCH".into(),
+                message: format!(
+                    "Pose '{name}' gripper position was saved with tool {:?} ({:?}), which does not match active tool '{}' ({}); pass include_gripper: false to move arm joints only",
+                    pose.tool_id,
+                    pose.tool_config_digest,
+                    self.config.active_tool.id,
+                    self.config.active_tool.config_digest
+                ),
+            });
+        }
+        let mut target = self.commanded_positions.clone();
         for i in (0..self.config.dof).filter(|i| Some(*i) != gripper_idx) { target[i] = pose.positions[i]; }
         if let (true, Some(g)) = (include_gripper, gripper_idx) { target[g] = pose.positions[g]; }
         self.action_preconditions()?;

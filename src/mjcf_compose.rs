@@ -889,6 +889,7 @@ pub struct SceneManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolManifest {
     pub id: String,
     #[serde(default)]
@@ -1126,11 +1127,28 @@ pub fn validate_tool_manifest_for_robot(
     robot_id: &str,
 ) -> Result<[f64; 3], String> {
     let resolved_tcp = validate_tool_manifest_independent(manifest, tool_xml)?;
-    if manifest.armd.is_some() {
-        let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
-        let pack = manifest_to_tool_pack(manifest, resolved_tcp);
-        crate::tool::apply_tool_overlay(&base, &pack)?;
+    let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
+    if manifest.id == crate::tool::STOCK_TOOL_ID {
+        if !manifest.robots.is_empty() {
+            let norm_target = crate::tool::normalize_robot_id(robot_id)
+                .ok_or_else(|| format!("unknown robot profile '{robot_id}'"))?;
+            let mut allowed = Vec::with_capacity(manifest.robots.len());
+            for raw in &manifest.robots {
+                let norm = crate::tool::normalize_robot_id(raw)
+                    .ok_or_else(|| format!("tool '{}': unknown robot target '{raw}'", manifest.id))?;
+                allowed.push(norm);
+            }
+            if !allowed.contains(&norm_target) {
+                return Err(format!(
+                    "tool '{}': robot '{norm_target}' is not in supported robots {:?}",
+                    manifest.id, allowed
+                ));
+            }
+        }
+        return Ok(resolved_tcp);
     }
+    let pack = manifest_to_tool_pack(manifest, resolved_tcp);
+    crate::tool::apply_tool_overlay(&base, &pack)?;
     Ok(resolved_tcp)
 }
 
@@ -1184,24 +1202,10 @@ fn validate_tool_manifest_independent(
             "armd.extra_check_points_end_m",
         )?;
         if let Some(pc) = &a.physical_contact_end_m {
-            for (ax, &v) in pc.iter().enumerate() {
-                crate::tool::checked_to_micro_f64(v, &format!("armd.physical_contact_end_m[{ax}]"))?;
-            }
-            let norm = (pc[0] * pc[0] + pc[1] * pc[1] + pc[2] * pc[2]).sqrt();
-            if norm > crate::tool::MAX_CHECK_POINT_NORM_M {
-                return Err(format!(
-                    "armd.physical_contact_end_m norm {norm:.4} m exceeds limit {:.2} m",
-                    crate::tool::MAX_CHECK_POINT_NORM_M
-                ));
-            }
+            crate::tool::validate_physical_contact_end_m(pc, "armd.physical_contact_end_m")?;
         }
         if let Some(co) = a.contact_opening_m {
-            crate::tool::checked_to_micro_f64(co, "armd.contact_opening_m")?;
-            if !(0.0..=0.20).contains(&co) {
-                return Err(format!(
-                    "armd.contact_opening_m {co} must be finite and in [0.0, 0.20] m"
-                ));
-            }
+            crate::tool::validate_contact_opening_m(co, "armd.contact_opening_m")?;
         }
         if let Some(gr) = &a.grasp {
             if let Some(e) = gr.edge_to_low_m {
@@ -1236,38 +1240,101 @@ pub fn validate_tool_manifest(
 ) -> Result<[f64; 3], String> {
     let resolved_tcp = validate_tool_manifest_independent(manifest, tool_xml)?;
 
-    if manifest.armd.is_some() {
-        let pack = manifest_to_tool_pack(manifest, resolved_tcp);
-        if manifest.robots.is_empty() {
-            const SUPPORTED_ROBOTS: [&str; 4] = ["b601dm", "so101", "so100", "b601rs"];
-            let mut last_err = None;
-            let mut any_ok = false;
-            for robot_id in SUPPORTED_ROBOTS {
-                let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
-                match crate::tool::apply_tool_overlay(&base, &pack) {
-                    Ok(_) => {
-                        any_ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        if last_err.is_none() {
-                            last_err = Some(e);
-                        }
+    if manifest.id == crate::tool::STOCK_TOOL_ID {
+        for raw in &manifest.robots {
+            crate::tool::baseline_arm_config_for_robot(raw)?;
+        }
+        return Ok(resolved_tcp);
+    }
+
+    let pack = manifest_to_tool_pack(manifest, resolved_tcp);
+    if manifest.robots.is_empty() {
+        const SUPPORTED_ROBOTS: [&str; 4] = ["b601dm", "so101", "so100", "b601rs"];
+        let mut last_err = None;
+        let mut any_ok = false;
+        for robot_id in SUPPORTED_ROBOTS {
+            let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
+            match crate::tool::apply_tool_overlay(&base, &pack) {
+                Ok(_) => {
+                    any_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    if last_err.is_none() {
+                        last_err = Some(e);
                     }
                 }
             }
-            if !any_ok {
-                return Err(last_err.unwrap_or_else(|| "tool overlay failed on all robot baselines".into()));
-            }
-        } else {
-            for raw in &manifest.robots {
-                let base = crate::tool::baseline_arm_config_for_robot(raw)?;
-                crate::tool::apply_tool_overlay(&base, &pack)?;
-            }
+        }
+        if !any_ok {
+            return Err(last_err.unwrap_or_else(|| "tool overlay failed on all robot baselines".into()));
+        }
+    } else {
+        for raw in &manifest.robots {
+            let base = crate::tool::baseline_arm_config_for_robot(raw)?;
+            crate::tool::apply_tool_overlay(&base, &pack)?;
         }
     }
 
     Ok(resolved_tcp)
+}
+
+fn find_xml_attr_value_span(tag_xml: &str, attr_name: &str) -> Option<(usize, usize)> {
+    let bytes = tag_xml.as_bytes();
+    let mut i = 0;
+    if bytes.get(i) != Some(&b'<') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/' {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' || bytes[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &tag_xml[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let Some(&quote) = bytes.get(i) else { break };
+        if quote != b'"' && quote != b'\'' {
+            break;
+        }
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let val_end = i;
+        i += 1;
+        if name == attr_name {
+            return Some((val_start, val_end));
+        }
+    }
+    None
 }
 
 fn extract_children_xml(
@@ -1470,32 +1537,39 @@ pub fn compose_mjcf(
         // Update base TCP site pos: explicit Some([0,0,0]) forces 0 0 0; None inherits resolved XML site.
         if should_override_tcp_site {
             let pos_val = format!("{} {} {}", resolved_tcp[0], resolved_tcp[1], resolved_tcp[2]);
+            let mut tcp_site_updated = false;
             for node in base_doc.descendants() {
                 if node.is_element() && node.tag_name().name() == "site" && node.attribute("name") == Some("tcp") {
                     let range = node.range();
+                    let overlaps_delete = edits.iter().any(|e| {
+                        e.replacement.is_empty() && range.start >= e.start && range.end <= e.end
+                    });
+                    if overlaps_delete {
+                        continue;
+                    }
                     let site_str = &base_xml[range.clone()];
-                    if let Some(pos_idx) = site_str.find("pos=\"") {
-                        let after = &site_str[pos_idx + 5..];
-                        if let Some(end_quote) = after.find('"') {
-                            let start = range.start + pos_idx + 5;
-                            let end = start + end_quote;
-                            edits.push(XmlEdit {
-                                start,
-                                end,
-                                replacement: pos_val,
-                            });
-                            break;
-                        }
-                    } else if let Some(name_idx) = site_str.find("name=\"tcp\"") {
-                        let insert_pos = range.start + name_idx + "name=\"tcp\"".len();
+                    if let Some((val_start, val_end)) = find_xml_attr_value_span(site_str, "pos") {
+                        edits.push(XmlEdit {
+                            start: range.start + val_start,
+                            end: range.start + val_end,
+                            replacement: pos_val,
+                        });
+                        tcp_site_updated = true;
+                        break;
+                    } else if let Some((_name_start, name_end)) = find_xml_attr_value_span(site_str, "name") {
+                        let insert_pos = range.start + name_end + 1;
                         edits.push(XmlEdit {
                             start: insert_pos,
                             end: insert_pos,
                             replacement: format!(" pos=\"{pos_val}\""),
                         });
+                        tcp_site_updated = true;
                         break;
                     }
                 }
+            }
+            if !tcp_site_updated {
+                return Err("Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".into());
             }
         }
     }
@@ -1934,5 +2008,71 @@ mod tests {
         assert!(validate_tool_manifest_for_robot(&so101_only_overlay, None, "so101").is_ok());
         assert!(validate_tool_manifest(&so101_only_overlay, None).is_ok());
         assert!(validate_tool_manifest_for_robot(&so101_only_overlay, None, "b601dm").is_err());
+
+        // 6. M3: Without `armd` overlay, robot compatibility and gripper capability are still enforced.
+        let gripper_no_armd_rs: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "cup_gripper_no_armd",
+            "kind": "gripper",
+            "robots": ["b601rs"],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest(&gripper_no_armd_rs, None).is_err());
+        assert!(validate_tool_manifest_for_robot(&gripper_no_armd_rs, None, "b601rs").is_err());
+        let gripper_no_armd_any: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "cup_gripper_any",
+            "kind": "gripper",
+            "robots": [],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest_for_robot(&gripper_no_armd_any, None, "b601rs").is_err());
+        let unknown_robot_no_armd: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "suction_unknown_bot",
+            "kind": "suction",
+            "robots": ["mystery_bot"],
+            "tcp_offset": [0.0, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest(&unknown_robot_no_armd, None).is_err());
+
+        // 7. M4: Single-quoted <site name='tcp' pos='0 0 0'/> updates properly; missing tcp site errors.
+        let single_quote_base = r#"<mujoco model="sq">
+          <worldbody>
+            <body name="end_link">
+              <site name='tcp' pos='0 0 0'/>
+            </body>
+          </worldbody>
+        </mujoco>"#;
+        let sq_tool_xml = r#"<mujoco><worldbody><body name="t"><geom type="box" size="0.01 0.01 0.01"/></body></worldbody></mujoco>"#;
+        let sq_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "sq_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.025, 0.0, 0.0]
+        })).unwrap();
+        let sq_composed = compose_mjcf(single_quote_base, None, Some(&sq_manifest), Some(sq_tool_xml)).unwrap();
+        let sq_doc = roxmltree::Document::parse(&sq_composed).unwrap();
+        let sq_site = sq_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        assert_eq!(sq_site.attribute("pos"), Some("0.025 0 0"));
+
+        let missing_tcp_base = r#"<mujoco model="no_tcp">
+          <worldbody>
+            <body name="end_link">
+              <geom type="box" size="0.01 0.01 0.01"/>
+            </body>
+          </worldbody>
+        </mujoco>"#;
+        let missing_err = compose_mjcf(missing_tcp_base, None, Some(&sq_manifest), Some(sq_tool_xml)).unwrap_err();
+        assert!(missing_err.contains("tcp"), "{missing_err}");
+
+        // 8. m1: ToolManifest rejects unknown top-level fields (e.g. "armd_").
+        assert!(serde_json::from_value::<ToolManifest>(serde_json::json!({
+            "id": "typo_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.02, 0.0, 0.0],
+            "armd_": {}
+        })).is_err());
     }
 }
