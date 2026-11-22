@@ -250,10 +250,14 @@ impl TrackingRuntime {
             let prev_v = self
                 .last_issued_velocities
                 .get_or_insert_with(|| vec![0.0; dof]);
-            prev_v.fill(0.0);
+            // Only the recovered joints were reseeded at rest by the driver's hold; every
+            // other joint keeps its real issued velocity for the next acceleration check.
             for &(j, q) in recovered_positions {
                 if j < dof && q.is_finite() {
                     prev_q[j] = q;
+                    if let Some(v) = prev_v.get_mut(j) {
+                        *v = 0.0;
+                    }
                 }
             }
         } else {

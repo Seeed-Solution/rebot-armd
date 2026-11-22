@@ -2870,6 +2870,10 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
         lease_timeout_ms: 600_000,
         workspace: None,
         joint_tracking: Some(jt),
+        // The fake bus encodes zero raw torque (-18 N·m); keep the torque guard out of this test.
+        torque_guard: None,
+        // ...and the power governor (it would time-scale the reference from that torque).
+        power_budget: None,
         ..ArmConfig::rebot_dm()
     };
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(damiao_drv));
@@ -2888,16 +2892,24 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
     let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &goal, &[0.0; 7], Some(4.0), &inner.config.limits).unwrap();
     let _ = inner.safety.mark_motion_started();
     inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
-    for _ in 0..55 {
-        inner.tick(DT);
-        // J2 trails its nominal position by ~0.04 rad while moving cleanly.
+    // J2's plant follows its transmitted POS_VEL target with a first-order lag (tau 3 s),
+    // so the unaffected joint keeps moving and lagging behind its issued output.
+    let alpha_j2 = 1.0 - (-DT / 3.0_f64).exp();
+    for k in 0..75 {
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational(), "tick {k} before recovery: {:?} {:?}", obs.safety_state, obs.fault);
+        let issued_j2 = inner.tracking.last_issued_positions.as_ref().map_or(inner.commanded_positions[1], |v| v[1]);
         let mut s = bus_state.lock().unwrap();
-        s.q_meas[1] = inner.commanded_positions[1] - 0.04;
+        s.q_meas[1] = (f64::from(s.q_meas[1]) + (f64::from(issued_j2) - f64::from(s.q_meas[1])) * alpha_j2) as f32;
         for i in 0..7 {
+            if i != 1 {
+                s.q_meas[i] = inner.commanded_positions[i];
+            }
             s.push_feedback(i);
         }
     }
     let j2_issued_before = inner.tracking.last_issued_positions.as_ref().unwrap()[1];
+    let j2_issued_v_before = inner.tracking.last_issued_velocities.as_ref().unwrap()[1];
     let j2_nom_before = inner.commanded_positions[1];
     let j2_meas_before = bus_state.lock().unwrap().q_meas[1];
     assert!(
@@ -2962,6 +2974,20 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
     assert!(
         (j2_resumed - j2_meas_before).abs() > 0.020,
         "unaffected J2 must NOT have been reseeded straight to lagging measured pose"
+    );
+    // Review 3 B1: the first resumed acceleration check must use J2's real issued velocity,
+    // not a fabricated zero: the issued J2 output may change velocity by at most a_max * dt.
+    assert!(
+        j2_issued_v_before.abs() > 0.02,
+        "J2 must be moving before J1's recovery (issued v={j2_issued_v_before:.4})"
+    );
+    let j2_v_resumed = (f64::from(j2_resumed) - f64::from(j2_issued_before)) / DT;
+    let j2_a_resumed = (j2_v_resumed - f64::from(j2_issued_v_before)) / DT;
+    let max_a_j2 = f64::from(inner.active_tracking_limits(DT, 1.0)[1].max_acceleration);
+    assert!(
+        j2_a_resumed.abs() <= max_a_j2 + 1e-2,
+        "unaffected J2 acceleration across J1 recovery {j2_a_resumed:.3} rad/s^2 exceeds {max_a_j2:.3} \
+         (issued v {j2_issued_v_before:.4} -> {j2_v_resumed:.4} rad/s)"
     );
 }
 
