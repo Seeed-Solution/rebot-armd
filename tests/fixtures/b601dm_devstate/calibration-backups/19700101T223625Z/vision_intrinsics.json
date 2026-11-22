@@ -1,0 +1,18 @@
+{
+  "api_version": 2,
+  "config_path": "/userdata/rebot-teleop/vision.json",
+  "cx": 320.4257478810317,
+  "cy": 184.86272217707705,
+  "fx": 803.844739372464,
+  "fy": 802.1144666949867,
+  "height": 360,
+  "k1": 0.12152512531175422,
+  "k2": -0.3107702780821175,
+  "k3": 0.0,
+  "marker_size": 0.025,
+  "overridden_by_cli": false,
+  "p1": 0.0,
+  "p2": 0.0,
+  "revision": 2,
+  "width": 640
+}

@@ -255,6 +255,13 @@ pub struct SupervisorInner {
     pub last_disable_attempt: Option<Instant>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
+    pub(crate) sim_time_s: f64,
+    pub(crate) last_still_since_s: Option<f64>,
+    pub(crate) still_anchor_positions: Vec<f32>,
+    pub(crate) still_window_ever_moved: bool,
+    pub(crate) table_still_first_rx_instants: Vec<Instant>,
+    pub(crate) table_still_last_rx_instants: Vec<Instant>,
+    pub(crate) table_still_anchor_positions: Vec<f32>,
     pub torques: Vec<f32>,
     pub loads: Vec<f32>,
     pub temperatures: Vec<f32>,
@@ -470,6 +477,9 @@ pub struct SupervisorInner {
     pub gripper_calib_revision: u64,
     /// Monotonic revision for grasp setup (starts at 1).
     pub grasp_setup_revision: u64,
+    /// True when startup `grasp::load_into` fell back to tool defaults (missing/rejected
+    /// `grasp_setup.json`) and should adopt shared camera fields from `calibration.json`.
+    pub grasp_setup_needs_camera_sync: bool,
     /// When true (inside ArmSupervisor::tick), zero_check(store_offset=true) defers disk persist
     /// and memory commit until after the lock is released.
     pub defer_zero_check_persist: bool,
@@ -479,6 +489,12 @@ pub struct SupervisorInner {
     pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
     /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
     pub operator_auth_enforced: bool,
+    /// Path to persisted tool commissioning confirmations (`tool_commissioning.json`).
+    pub tool_commissioning_path: Option<PathBuf>,
+    /// Timestamp when the active tool's commissioning was confirmed (if any).
+    pub tool_commissioning_confirmed_at: Option<String>,
+    /// Monotonic revision for tool commissioning state.
+    pub tool_commissioning_revision: u64,
 }
 
 /// Complete validated gripper calibration snapshot ready for infallible commit after disk rename.
@@ -580,6 +596,13 @@ impl SupervisorInner {
             last_disable_attempt: None,
             output_suspended: false,
             feedback_numeric_valid: true,
+            sim_time_s: 0.0,
+            last_still_since_s: None,
+            still_anchor_positions: Vec::new(),
+            still_window_ever_moved: false,
+            table_still_first_rx_instants: Vec::new(),
+            table_still_last_rx_instants: Vec::new(),
+            table_still_anchor_positions: Vec::new(),
             torques: vec![0.0; dof],
             loads: vec![0.0; dof],
             temperatures: vec![25.0; dof],
@@ -699,11 +722,32 @@ impl SupervisorInner {
             zero_check_params: None,
             gripper_calib_revision: 1,
             grasp_setup_revision: 1,
+            grasp_setup_needs_camera_sync: false,
             defer_zero_check_persist: false,
             zero_check_persisting: None,
             pending_zero_check_persist: None,
             operator_auth_enforced: false,
+            tool_commissioning_path: None,
+            tool_commissioning_confirmed_at: None,
+            tool_commissioning_revision: 1,
         }
+    }
+
+    /// Reject ordinary motion/action dispatch while a newly installed non-stock tool awaits commissioning.
+    pub fn check_commissioning_for_ordinary_motion(&self, op: &str) -> Result<(), ArmError> {
+        if self.config.active_tool.commissioning_required {
+            return Err(SafetyError::CommissioningRequired(op.to_string()).into());
+        }
+        Ok(())
+    }
+
+    pub fn tool_commissioning_response(&self) -> serde_json::Value {
+        serde_json::json!({
+            "active_tool": self.config.active_tool,
+            "commissioning_required": self.config.active_tool.commissioning_required,
+            "confirmed_at": self.tool_commissioning_confirmed_at,
+            "revision": self.tool_commissioning_revision,
+        })
     }
 
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
@@ -1239,7 +1283,12 @@ impl SupervisorInner {
     /// Full workspace sweep check for a servo streaming or braking tick.
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        let eval = crate::chain::WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(
+            &self.config.arm_model,
+            ws,
+            cam,
+            self.config.tcp_offset,
+        );
         let mut c0 = eval.alloc_buf();
         eval.eval_into(&self.commanded_positions, &mut c0, phase)
             .map_err(SafetyError::from_workspace)?;
@@ -1285,7 +1334,20 @@ impl SupervisorInner {
         knots: &[f64],
         budget: usize,
     ) -> Result<Vec<Vec<f32>>, SafetyError> {
-        keepout_sweep_with(&self.config.arm_model, ws, cam, at, travel, knots, budget)
+        keepout_sweep_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, crate::kinematics::WORKSPACE_EPS, at, travel, knots, budget)
+    }
+
+    pub fn keepout_sweep_with_tol(
+        &self,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        escape_tol: f64,
+        at: &dyn Fn(f64) -> Vec<f32>,
+        travel: &dyn Fn(f64, f64) -> Vec<f64>,
+        knots: &[f64],
+        budget: usize,
+    ) -> Result<Vec<Vec<f32>>, SafetyError> {
+        keepout_sweep_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, at, travel, knots, budget)
     }
 
     fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
@@ -1346,6 +1408,17 @@ impl SupervisorInner {
         self.check_path_against(ws, cam, start, samples)
     }
 
+    /// [`check_workspace_path`](Self::check_workspace_path) with explicit escape jitter tolerance.
+    pub fn check_workspace_path_with_tol<'a>(
+        &self,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+        escape_tol: f64,
+    ) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        check_path_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, escape_tol, start, samples)
+    }
+
     /// [`check_workspace_path`](Self::check_workspace_path) against the keep-out boxes only
     /// (no floor / box / reach): the part of the rule park may not bypass.
     pub fn check_keepout_path<'a>(
@@ -1366,7 +1439,7 @@ impl SupervisorInner {
         start: &[f32],
         samples: impl IntoIterator<Item = &'a [f32]>,
     ) -> Result<(), SafetyError> {
-        check_path_with(&self.config.arm_model, ws, cam, start, samples)
+        check_path_with_tcp_tol(&self.config.arm_model, ws, cam, self.config.tcp_offset, crate::kinematics::WORKSPACE_EPS, start, samples)
     }
 
     /// The planner's 21 verification points of a trajectory.
@@ -1389,15 +1462,24 @@ impl SupervisorInner {
 
     /// [`workspace_samples`](Self::workspace_samples) with `budget` added FK evaluations.
     pub fn workspace_samples_with_budget(&self, traj: &MultiJointQuinticTrajectory, budget: usize) -> Result<Vec<Vec<f32>>, SafetyError> {
+        self.workspace_samples_with_budget_tol(traj, budget, crate::kinematics::WORKSPACE_EPS)
+    }
+
+    /// [`workspace_samples`](Self::workspace_samples) with explicit escape jitter tolerance.
+    pub fn workspace_samples_with_tol(&self, traj: &MultiJointQuinticTrajectory, escape_tol: f64) -> Result<Vec<Vec<f32>>, SafetyError> {
+        self.workspace_samples_with_budget_tol(traj, MAX_KEEPOUT_EVALS_PER_PLAN, escape_tol)
+    }
+
+    fn workspace_samples_with_budget_tol(&self, traj: &MultiJointQuinticTrajectory, budget: usize, escape_tol: f64) -> Result<Vec<Vec<f32>>, SafetyError> {
         let Some((ws, cam)) = self.workspace_policy()
             else { return Ok(Self::trajectory_samples(traj)); };
         let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
         let at = |t: f64| traj.sample(t).positions;
         let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
-        self.keepout_sweep(ws, cam, &at, &travel, &knots, budget)
+        self.keepout_sweep_with_tol(ws, cam, escape_tol, &at, &travel, &knots, budget)
     }
 
-    /// Keepout-only sweep samples for `park` (exempt from floor / outer box / reach, still enforces keep-out boxes).
+    /// Keepout-only sweep samples.
     pub fn keepout_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
         let Some((ws, cam)) = self.workspace_policy().filter(|(ws, _)| !ws.keepout_boxes.is_empty())
             else { return Ok(Self::trajectory_samples(traj)); };
@@ -1409,8 +1491,12 @@ impl SupervisorInner {
     }
 
     fn gravity_output_enabled(&self) -> bool {
-        self.gravity_compensated && self.config.gravity_model.is_some() && self.config.dof >= self.config.arm_dof() && self.driver.as_ref().is_none_or(|d|
-            d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
+        self.gravity_compensated
+            && self.config.dynamics_qualified
+            && self.config.gravity_model.is_some()
+            && self.config.dof >= self.config.arm_dof()
+            && self.driver.as_ref().is_none_or(|d|
+                d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
     }
 
     fn states_valid(
@@ -1501,6 +1587,81 @@ impl SupervisorInner {
         (self.measured_positions.clone(), vels, instants, seqs)
     }
 
+    /// True on a real/physical driver (non-sim, non-mock) where missing jaw calibration
+    /// curves must not fall back to `JawOpening::sim_default()`.
+    pub fn requires_real_jaw_curve(&self) -> bool {
+        self.driver.is_some()
+            && matches!(self.follower.as_deref(), Some(f) if f != "sim" && f != "mock")
+    }
+
+    /// `max_w` (a grasp setup's `max_grasp_width_m`) against the gripper's jaw curve; None
+    /// without a gripper policy.
+    pub fn grasp_width_check(&self, max_w: f64) -> Option<crate::model::GraspWidthCheck> {
+        let gp = self.config.gripper_policy.as_ref()?;
+        Some(crate::model::check_grasp_width(gp, max_w, self.requires_real_jaw_curve()))
+    }
+
+    pub(crate) fn reset_table_stillness(&mut self) {
+        self.table_still_first_rx_instants.clear();
+        self.table_still_last_rx_instants.clear();
+        self.table_still_anchor_positions.clear();
+    }
+
+    pub fn check_table_capture_stillness(&self) -> Result<(), ArmError> {
+        if !self.feedback_numeric_valid {
+            return Err(MotionError::InvalidCommand(
+                "table_z_from_tcp requires valid joint feedback".into(),
+            ).into());
+        }
+        if self.driver.is_some() && !self.hardware_feedback_fresh(Duration::from_millis(250)) {
+            return Err(MotionError::InvalidCommand(
+                "table_z_from_tcp requires fresh joint feedback".into(),
+            ).into());
+        }
+        if self.active_trajectory.is_some()
+            || self.servo_target.is_some()
+            || self.commanded_velocities.iter().any(|v| v.abs() > 1e-3)
+        {
+            return Err(MotionError::InvalidCommand(
+                "table_z_from_tcp requires the arm to be stationary".into(),
+            ).into());
+        }
+        if self.measured_velocities.len() != self.config.dof
+            || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > 0.02)
+        {
+            return Err(MotionError::InvalidCommand(
+                "table_z_from_tcp requires measured joint velocities <= 0.02 rad/s".into(),
+            ).into());
+        }
+        if self.driver.is_some() || self.still_window_ever_moved {
+            let settled = if self.driver.is_some() {
+                self.table_still_first_rx_instants.len() == self.config.dof
+                    && self.table_still_last_rx_instants.len() == self.config.dof
+                    && self.table_still_first_rx_instants
+                        .iter()
+                        .zip(&self.table_still_last_rx_instants)
+                        .all(|(first, last)| {
+                            last.checked_duration_since(*first)
+                                .is_some_and(|d| d >= Duration::from_millis(200))
+                        })
+                    && self.table_still_anchor_positions.len() == self.measured_positions.len()
+                    && self.measured_positions.iter().zip(&self.table_still_anchor_positions)
+                        .all(|(m, a)| m.is_finite() && (m - a).abs() <= UNLOAD_STILL_POSITION_SPAN_RAD)
+            } else {
+                self.last_still_since_s.is_some_and(|t0| self.sim_time_s - t0 >= 0.20)
+                    && self.still_anchor_positions.len() == self.measured_positions.len()
+                    && self.measured_positions.iter().zip(&self.still_anchor_positions)
+                        .all(|(m, a)| m.is_finite() && (m - a).abs() <= UNLOAD_STILL_POSITION_SPAN_RAD)
+            };
+            if !settled {
+                return Err(MotionError::InvalidCommand(
+                    "table_z_from_tcp requires the arm to remain still for at least 0.2 s with fresh distinct hardware samples".into(),
+                ).into());
+            }
+        }
+        Ok(())
+    }
+
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
         #[cfg(feature = "policy-runtime")]
@@ -1545,7 +1706,7 @@ impl SupervisorInner {
     pub fn current_observation(&self) -> ArmObservation {
         let timestamp = self.start_time.elapsed().as_secs_f64();
         let tcp = if self.config.kinematics.is_some() {
-            self.config.arm_model.fk_f32(&self.measured_positions).map(|pose| {
+            self.config.tcp_pose_f32(&self.measured_positions).map(|pose| {
                 let rpy = crate::kinematics::r_to_rpy(&pose.r);
                 let quat = crate::kinematics::r_to_quat(&pose.r);
                 crate::model::TcpState {
@@ -1701,7 +1862,48 @@ impl SupervisorInner {
                 }
             }
         }
+        if let Some(msg) = self.measured_workspace_violation("park_release") {
+            failures.push(msg);
+        }
         (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
+    /// Evaluate the active workspace policy (including `tcp_offset`, keep-outs, floor,
+    /// max reach, and link capsules) at `self.measured_positions`.
+    fn measured_workspace_violation(&self, phase: &str) -> Option<String> {
+        let (ws, cam) = self.workspace_policy()?;
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(
+            &self.config.arm_model,
+            ws,
+            cam,
+            self.config.tcp_offset,
+        );
+        let mut buf = eval.alloc_buf();
+        match eval.eval_into(&self.measured_positions, &mut buf, phase) {
+            Err(f) => Some(format!(
+                "measured pose workspace evaluation failed ({}): {}",
+                f.limit,
+                f.detail.reason.as_deref().unwrap_or("invalid joint positions")
+            )),
+            Ok(()) => {
+                if let Some((slot, &clr)) = buf
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
+                {
+                    let f = eval.describe_failure(slot, clr, -clr, 0.0, phase);
+                    let detail = f.detail.reason.as_deref().unwrap_or(f.limit.as_str());
+                    let geom = f.detail.geometry_id.as_deref().unwrap_or("end_link");
+                    Some(format!(
+                        "measured pose violates workspace constraint '{}' (point {} [{}]: {detail}, value {:.4} m vs bound {:.4} m)",
+                        f.limit, f.point, geom, f.value, f.bound
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
     }
 
     /// Resting-pose position tolerances and support torque/load limits without requiring
@@ -1776,6 +1978,9 @@ impl SupervisorInner {
                     failures.push(format!("joint {} load {load:.2} (limit {max_load})", i + 1));
                 }
             }
+        }
+        if let Some(msg) = self.measured_workspace_violation("clear_fault") {
+            failures.push(msg);
         }
         (!failures.is_empty()).then(|| failures.join("; "))
     }
@@ -2031,6 +2236,7 @@ impl SupervisorInner {
             return Err(SafetyError::ArmNotAtRestingPose {
                 current: self.measured_positions.clone(),
                 expected: self.config.resting_positions().to_vec(),
+                reason: Some(reason),
             });
         }
 
@@ -2148,13 +2354,48 @@ impl SupervisorInner {
                             Ok((t, _)) => t,
                             Err(e) => { tracing::warn!("Park power planning failed ({e}); parking as planned"); traj }
                         };
-                        // Park is exempt from the floor / box / reach limits (it must remain
-                        // possible from a violating pose) but not from the keep-out boxes.
-                        let samples = match self.keepout_samples(&traj) {
+                        // Park checks all enabled workspace constraints: destination resting pose
+                        // must be valid, and path must not violate new constraints or worsen
+                        // existing violations (monotonic escape with 1 mm jitter tolerance).
+                        if let Some((ws, cam)) = self.workspace_policy() {
+                            let rest_v = self.config.arm_model.workspace_violation_with_tcp(&home, ws, cam, self.config.tcp_offset);
+                            if rest_v.total > crate::kinematics::WORKSPACE_EPS {
+                                let e = rest_v.worst.map_or_else(
+                                    || SafetyError::from_workspace(crate::chain::WorkspaceFailure::invalid("park", "resting pose violates workspace")),
+                                    |w| {
+                                        let mut detail = crate::kinematics::WorkspaceViolationDetail {
+                                            constraint_id: Some(w.label(ws)),
+                                            geometry_id: Some(if w.point == 0 { "end_origin".into() } else { format!("end_point:{}", w.point) }),
+                                            violation_phase: Some("park".into()),
+                                            reason: Some(format!("resting pose violates workspace ({})", w.label(ws))),
+                                        };
+                                        if let Some(bi) = w.keepout {
+                                            if let Some(kb) = ws.keepout_boxes.get(bi) {
+                                                detail.constraint_id = Some(format!("keepout:{}", kb.name));
+                                            }
+                                        }
+                                        SafetyError::WorkspaceViolation {
+                                            limit: w.label(ws),
+                                            value: w.value as f32,
+                                            bound: w.bound as f32,
+                                            point: w.point,
+                                            detail: Box::new(detail),
+                                        }
+                                    },
+                                );
+                                tracing::warn!("Park resting pose violates workspace ({e}); maintaining safe hold");
+                                self.park_rejection = Some(e);
+                                self.pending_normal_unload = false;
+                                self.unload_settle = None;
+                                self.active_trajectory = None;
+                                return;
+                            }
+                        }
+                        let samples = match self.workspace_samples_with_tol(&traj, crate::kinematics::WORKSPACE_PARK_ESCAPE_EPS) {
                             Ok(s) => s,
                             Err(e) => {
                                 let e = e.with_workspace_phase("park");
-                                tracing::warn!("Park path cannot be verified against the keep-out boxes ({e}); not parking");
+                                tracing::warn!("Park path cannot be verified against the workspace ({e}); maintaining safe hold");
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
                                 self.unload_settle = None;
@@ -2162,17 +2403,14 @@ impl SupervisorInner {
                                 return;
                             }
                         };
-                        if let Err(e) = self.check_keepout_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
+                        if let Err(e) = self.check_workspace_path_with_tol(&clamped_start, samples.iter().map(Vec::as_slice), crate::kinematics::WORKSPACE_PARK_ESCAPE_EPS) {
                             let e = e.with_workspace_phase("park");
-                            tracing::warn!("Park path enters a keep-out box ({e}); not parking");
+                            tracing::warn!("Park path violates workspace ({e}); maintaining safe hold");
                             self.park_rejection = Some(e);
                             self.pending_normal_unload = false;
                             self.unload_settle = None;
                             self.active_trajectory = None;
                             return;
-                        }
-                        if let Err(e) = self.check_workspace_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
-                            tracing::warn!("Park path leaves the workspace ({e}); parking anyway");
                         }
                         let _ = self.safety.set_torque(true);
                         let _ = self.safety.mark_motion_started();
@@ -2830,6 +3068,9 @@ impl SupervisorInner {
         targets: &mut [f32],
         epoch_id: u64,
     ) -> Result<(), SafetyError> {
+        if self.config.active_tool.commissioning_required {
+            return Err(SafetyError::CommissioningRequired("servo".into()));
+        }
         self.gravity_comp_servo_busy()?;
         self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
@@ -2945,7 +3186,55 @@ impl SupervisorInner {
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
-        let limits = self.planning_limits();
+        self.jog_action_with_speed_scale(target_positions, duration_secs, epoch_id, kind, None)
+    }
+
+    pub fn jog_action_with_speed_scale(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+        kind: &str,
+        speed_scale: Option<f64>,
+    ) -> Result<(u64, u64, f64), ArmError> {
+        if let Some(s) = speed_scale {
+            if !s.is_finite() || !(0.05..=1.0).contains(&s) {
+                return Err(MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into());
+            }
+        }
+        if self.config.active_tool.commissioning_required {
+            match speed_scale {
+                Some(s) if s <= 0.2 + 1e-6 && kind != "home" => {}
+                _ => return Err(SafetyError::CommissioningRequired(format!("{kind} (requires speed_scale <= 0.2)")).into()),
+            }
+        }
+        let mut limits = self.planning_limits();
+        if let Some(s) = speed_scale {
+            let gripper_idx = self.config.gripper_index();
+            let commissioning = self.config.active_tool.commissioning_required;
+            for (i, l) in limits.iter_mut().enumerate() {
+                if Some(i) != gripper_idx || commissioning {
+                    l.max_velocity *= s as f32;
+                }
+            }
+        }
+        if self.config.active_tool.commissioning_required {
+            if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
+                if let (Some(&target_g), Some(&cur_g)) = (target_positions.get(g_idx), self.commanded_positions.get(g_idx)) {
+                    let close_dir = if policy.closed_rad >= policy.open_rad { 1.0_f32 } else { -1.0_f32 };
+                    if (target_g - cur_g) * close_dir > 1e-4 && policy.max_close_torque_nm.is_some() {
+                        if let Some(ref d) = self.driver {
+                            let has_torque_fb = d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback);
+                            if !has_torque_fb {
+                                return Err(MotionError::Unsupported(
+                                    "Gripper close during commissioning jog requires torque_feedback when max_close_torque_nm is configured".into(),
+                                ).into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.start_quintic(target_positions, duration_secs, epoch_id, kind, None, &limits)
     }
 
@@ -3147,6 +3436,8 @@ impl SupervisorInner {
                         jaw_opening: candidate_jaw.clone(),
                         ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
                         stale: self.gripper_calib_stale.clone(),
+                        tool_id: Some(self.config.active_tool.id.clone()),
+                        tool_config_digest: Some(self.config.active_tool.config_digest.clone()),
                     };
                     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
                     if self.defer_zero_check_persist {
@@ -3289,8 +3580,18 @@ impl SupervisorInner {
         None
     }
 
-    /// Snapshot for planning a Cartesian action outside the lock.
+    /// Snapshot for planning a Cartesian action outside the lock (default [`crate::motion::GoalFrame::EndLink`]).
     pub fn plan_input(&self) -> Result<PlanInput, ArmError> {
+        self.plan_input_in(crate::motion::GoalFrame::EndLink)
+    }
+
+    /// Snapshot for planning a public TCP Cartesian action (`move_to`, `move_relative`, `place`).
+    pub fn plan_input_tcp(&self) -> Result<PlanInput, ArmError> {
+        self.plan_input_in(crate::motion::GoalFrame::Tcp)
+    }
+
+    /// Snapshot for planning a Cartesian action in `goal_frame`.
+    pub fn plan_input_in(&self, goal_frame: crate::motion::GoalFrame) -> Result<PlanInput, ArmError> {
         if self.config.kinematics.is_none() || !self.config.has_cartesian_with_gripper() {
             return Err(MotionError::Unsupported("Cartesian actions need a kinematics model and an arm with gripper".into()).into());
         }
@@ -3309,6 +3610,8 @@ impl SupervisorInner {
             epoch: self.safety.epoch_id(),
             workspace_revision: self.workspace_revision,
             power: self.power_budget().cloned(),
+            tcp_offset: self.config.tcp_offset,
+            goal_frame,
         })
     }
 
@@ -3455,7 +3758,18 @@ impl SupervisorInner {
     pub fn refresh_effective_floor(&mut self) {
         let Some(profile) = self.profile_floor_z_m else { return; };
         let (_, fp) = crate::calibration::live_fingerprints(self);
-        let (floor, source, _) = crate::calibration::effective_floor(profile, self.calibration.as_ref(), &fp);
+        let legacy_fp = crate::calibration::legacy_file_fingerprint(
+            self.calibration.as_ref(),
+            &self.config.camera_mount,
+            &self.joint_zero_offsets,
+        );
+        let (floor, source, _) = crate::calibration::effective_floor_for_with_legacy(
+            profile,
+            self.calibration.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &self.config.active_tool,
+        );
         self.floor_source = source;
         let Some(ws) = self.config.workspace.as_mut() else { return; };
         if ws.floor_z_m != floor {
@@ -3656,6 +3970,33 @@ impl SupervisorInner {
         Ok(duration + 0.5)
     }
 
+    fn check_gripper_close_torque_feedback(&self, request: &GripperRequest, policy: &crate::model::GripperPolicy, gripper_idx: usize) -> Result<(), ArmError> {
+        if policy.max_close_torque_nm.is_none() {
+            return Ok(());
+        }
+        let close_dir = if policy.closed_rad >= policy.open_rad { 1.0_f32 } else { -1.0_f32 };
+        let cur = self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0);
+        let target = match request.command {
+            GripperCommand::Open => policy.open_rad,
+            GripperCommand::Close => policy.closed_rad,
+            GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
+            GripperCommand::Seek => policy.closed_rad + close_dir * 0.6,
+        };
+        let is_closing = matches!(request.command, GripperCommand::Close | GripperCommand::Seek)
+            || (target - cur) * close_dir > 1e-4;
+        if is_closing {
+            if let Some(ref d) = self.driver {
+                let has_torque_fb = d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback);
+                if !has_torque_fb {
+                    return Err(MotionError::Unsupported(
+                        "Gripper close requires torque_feedback when max_close_torque_nm is configured".into(),
+                    ).into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
@@ -3667,6 +4008,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
+        self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
@@ -3756,7 +4098,14 @@ impl SupervisorInner {
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
+        if self.config.active_tool.commissioning_required && request.speed > 0.4 + 1e-6 {
+            return Err(SafetyError::CommissioningRequired(format!(
+                "gripper (speed {:.2} rad/s > 0.40 rad/s)",
+                request.speed
+            )).into());
+        }
         self.action_preconditions()?;
+        self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
@@ -3823,6 +4172,7 @@ impl SupervisorInner {
             timeout_s: None,
             tag: None,
         };
+        self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         self.servo_target = None;
@@ -3896,13 +4246,33 @@ impl SupervisorInner {
             .or_else(|| base.jaw_opening.clone());
         // The table is checked against the limits before the offset shift: the shift can move
         // its open end past a limit, like open_rad, and those points are never reached.
-        let mut jo = candidate_jo.unwrap_or_else(crate::model::JawOpening::sim_default);
+        let mut jo = match candidate_jo {
+            Some(jo) => jo,
+            None if self.config.active_tool.is_stock => crate::model::JawOpening::sim_default(),
+            None => return Err("Non-stock tool requires an explicit jaw_opening calibration curve".into()),
+        };
         jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
         for pt in &mut jo.points {
             pt[0] += offset;
         }
         jo.validate(None).map_err(|e| format!("Invalid jaw_opening calibration: {e}"))?;
         policy.jaw_opening = Some(jo);
+        #[cfg(not(target_arch = "wasm32"))]
+        let max_w = self.config.grasp.as_ref().map(|g| g.max_grasp_width_m);
+        #[cfg(target_arch = "wasm32")]
+        let max_w: Option<f64> = None;
+        // the jaw curve is not checked against max_grasp_width_m: a narrower curve keeps the
+        // calibration and clamps the grasp width (`grasp_width_check`)
+        crate::model::validate_effective_gripper_policy_ex(&policy, lim, None, false)?;
+        if let Some(max_w) = max_w {
+            if let crate::model::GraspWidthCheck::Clamped { curve_max_m } =
+                crate::model::check_grasp_width(&policy, max_w, false)
+            {
+                tracing::warn!(
+                    "Gripper jaw curve opens {curve_max_m:.4} m, less than max_grasp_width_m {max_w:.4} m; grasps use {curve_max_m:.4} m"
+                );
+            }
+        }
 
         self.config.gripper_policy = Some(policy);
         self.gripper_calib_offset = offset_rad;
@@ -4614,51 +4984,76 @@ impl SupervisorInner {
         let mut driver_torque_lost = false;
         let mut recovered_joints = Vec::new();
         let mut recovery_ages: Option<Vec<Option<Duration>>> = None;
+        let mut hw_rx: Option<Vec<Instant>> = None;
+        let mut reset_stillness_on_read_err = false;
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
-            if let Ok(mut driver) = d.lock() {
-                if let Ok(states) = driver.read_joint_states() {
-                    recovered_joints = driver.take_recovery_writes();
-                    let loads = driver.joint_loads();
-                    self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref());
-                    invalid_feedback = !self.feedback_numeric_valid;
-                    let ages = driver.feedback_ages();
-                    if !recovered_joints.is_empty() || self.tracking.recovery_suspended {
-                        recovery_ages = Some(ages.clone());
+            match d.lock() {
+                Ok(mut driver) => {
+                    match driver.read_joint_states() {
+                        Ok(states) => {
+                            recovered_joints = driver.take_recovery_writes();
+                            let loads = driver.joint_loads();
+                            self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref());
+                            invalid_feedback = !self.feedback_numeric_valid;
+                            let ages = driver.feedback_ages();
+                            if !recovered_joints.is_empty() || self.tracking.recovery_suspended {
+                                recovery_ages = Some(ages.clone());
+                            }
+                            let driver_valid = driver.is_feedback_valid();
+                            let all_fresh_age = ages.len() == self.config.dof
+                                && ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
+                            if self.feedback_numeric_valid && ages.len() == self.config.dof && driver_valid {
+                                self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
+                                    .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+                            } else {
+                                self.last_can_feedback_instant = None;
+                            }
+                            if self.feedback_numeric_valid {
+                                Self::record_driver_feedback_timing(
+                                    &mut self.joint_feedback_instants,
+                                    &mut self.joint_feedback_seqs,
+                                    &mut self.joint_feedback_queue_bounds,
+                                    self.config.dof,
+                                    driver.as_ref(),
+                                );
+                                Self::apply_feedback(
+                                    &mut self.measured_positions,
+                                    &mut self.measured_velocities,
+                                    &mut self.torques,
+                                    &mut self.temperatures,
+                                    &mut self.loads,
+                                    self.config.dof,
+                                    &states,
+                                    loads.as_deref(),
+                                );
+                            }
+                            if self.feedback_numeric_valid && all_fresh_age && driver_valid {
+                                let rx = driver.feedback_receive_instants();
+                                if rx.len() == self.config.dof && rx.iter().all(Option::is_some) {
+                                    hw_rx = Some(rx.into_iter().map(Option::unwrap).collect());
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.last_can_feedback_instant = None;
+                            reset_stillness_on_read_err = true;
+                        }
                     }
-                    if self.feedback_numeric_valid && ages.len() == self.config.dof && driver.is_feedback_valid() {
-                        self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
-                            .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                    } else { self.last_can_feedback_instant = None; }
-                    if self.feedback_numeric_valid {
-                        Self::record_driver_feedback_timing(
-                    &mut self.joint_feedback_instants,
-                    &mut self.joint_feedback_seqs,
-                    &mut self.joint_feedback_queue_bounds,
-                    self.config.dof,
-                    driver.as_ref(),
-                );
-                        Self::apply_feedback(
-                            &mut self.measured_positions,
-                            &mut self.measured_velocities,
-                            &mut self.torques,
-                            &mut self.temperatures,
-                            &mut self.loads,
-                            self.config.dof,
-                            &states,
-                            loads.as_deref(),
-                        );
+                    if let Some(status) = driver.motor_status() {
+                        motor_errors = Some(status.into_iter().map(|code| {
+                            driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
+                        }).collect());
+                    }
+                    if self.is_torqued && !self.disable_pending && self.gravity_comp.is_none() && self.safety.state().is_operational()
+                        && driver.capabilities().enable_feedback && driver.is_feedback_valid() && driver.enable_state() != EnableState::Enabled
+                        && !(self.pending_rearm && driver.has_known_partial_enable()) {
+                        driver_torque_lost = true;
                     }
                 }
-                if let Some(status) = driver.motor_status() {
-                    motor_errors = Some(status.into_iter().map(|code| {
-                        driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
-                    }).collect());
-                }
-                if self.is_torqued && !self.disable_pending && self.gravity_comp.is_none() && self.safety.state().is_operational()
-                    && driver.capabilities().enable_feedback && driver.is_feedback_valid() && driver.enable_state() != EnableState::Enabled
-                    && !(self.pending_rearm && driver.has_known_partial_enable()) {
-                    driver_torque_lost = true;
+                Err(_) => {
+                    self.last_can_feedback_instant = None;
+                    reset_stillness_on_read_err = true;
                 }
             }
         } else {
@@ -4671,6 +5066,9 @@ impl SupervisorInner {
             for seq in &mut self.joint_feedback_seqs {
                 *seq = seq.wrapping_add(1);
             }
+        }
+        if reset_stillness_on_read_err {
+            self.reset_table_stillness();
         }
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);
@@ -4760,7 +5158,54 @@ impl SupervisorInner {
             self.safety.trigger_fault_coded(FaultCode::ControlDeadline, FaultReason::Other("Control loop deadline exceeded".into()));
         }
         self.step_zero_convention();
+        let dt_raw = dt;
         let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
+        self.sim_time_s += dt;
+        if !dt_raw.is_finite() || dt_raw <= 0.0 || dt_raw > 0.25 {
+            self.reset_table_stillness();
+        }
+        let is_still_sample = self.feedback_numeric_valid
+            && (self.driver.is_none() || (self.hardware_feedback_fresh(Duration::from_millis(250)) && hw_rx.is_some()))
+            && self.active_trajectory.is_none()
+            && self.servo_target.is_none()
+            && self.commanded_velocities.iter().all(|v| v.abs() <= 1e-3)
+            && self.measured_velocities.len() == self.config.dof
+            && self.measured_velocities.iter().all(|v| v.is_finite() && v.abs() <= 0.02);
+        if !is_still_sample {
+            self.last_still_since_s = None;
+            self.still_anchor_positions.clear();
+            self.still_window_ever_moved = true;
+            self.reset_table_stillness();
+        } else {
+            if self.still_anchor_positions.len() != self.measured_positions.len()
+                || self.measured_positions.iter().zip(&self.still_anchor_positions)
+                    .any(|(m, a)| !m.is_finite() || (m - a).abs() > UNLOAD_STILL_POSITION_SPAN_RAD)
+            {
+                if !self.still_anchor_positions.is_empty() {
+                    self.still_window_ever_moved = true;
+                }
+                self.still_anchor_positions = self.measured_positions.clone();
+                self.last_still_since_s = Some(self.sim_time_s);
+            }
+            if let Some(rx_vals) = hw_rx {
+                let drifted = self.table_still_anchor_positions.len() != self.measured_positions.len()
+                    || self.table_still_first_rx_instants.len() != self.config.dof
+                    || self.table_still_last_rx_instants.len() != self.config.dof
+                    || self.measured_positions.iter().zip(&self.table_still_anchor_positions)
+                        .any(|(m, a)| !m.is_finite() || (m - a).abs() > UNLOAD_STILL_POSITION_SPAN_RAD);
+                if drifted {
+                    self.table_still_anchor_positions = self.measured_positions.clone();
+                    self.table_still_first_rx_instants = rx_vals.clone();
+                    self.table_still_last_rx_instants = rx_vals;
+                } else {
+                    for (last, rx) in self.table_still_last_rx_instants.iter_mut().zip(rx_vals) {
+                        if rx > *last {
+                            *last = rx;
+                        }
+                    }
+                }
+            }
+        }
         let before_velocities = self.commanded_velocities.clone();
 
         // 0.1 Gripper stall protection state machine
@@ -4771,7 +5216,9 @@ impl SupervisorInner {
         if let Some(g_idx) = self.config.gripper_index() {
             let (is_bus_fresh, has_torque_feedback, has_load_feedback) = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
-                    let fresh = self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid();
+                    let fresh = self.feedback_numeric_valid
+                        && self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50))
+                        && driver.is_feedback_valid();
                     let caps = driver.capabilities();
                     (fresh, caps.torque_feedback, caps.load_feedback)
                 } else {
@@ -4874,7 +5321,37 @@ impl SupervisorInner {
             let over_cap = is_bus_fresh && has_torque_feedback && closing && force_cap.is_some_and(|cap| tau_g.abs() > cap);
             self.gripper_force_ticks = if over_cap { self.gripper_force_ticks.saturating_add(1) } else { 0 };
 
-            if !is_bus_fresh {
+            if force_cap.is_some() && closing && self.is_torqued && (!is_bus_fresh || !has_torque_feedback) {
+                if !(self.gripper_stalled && self.gripper_force_capped) {
+                    tracing::warn!(
+                        "Gripper close stopped: feedback_fresh={is_bus_fresh} torque_feedback={has_torque_feedback} while max_close_torque_nm is active; holding"
+                    );
+                }
+                self.gripper_stalled = true;
+                self.gripper_force_capped = true;
+                self.gripper_force_ticks = 0;
+                self.gripper_stall_sign = close_dir;
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
+                self.gripper_stream_target = None;
+                let hold_q = if p_meas.is_finite() {
+                    if let Some(lim) = self.config.limits.get(g_idx) {
+                        p_meas.clamp(lim.min_position, lim.max_position)
+                    } else {
+                        p_meas
+                    }
+                } else {
+                    p_cmd
+                };
+                if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold_q; }
+                if g_idx < self.commanded_velocities.len() { self.commanded_velocities[g_idx] = 0.0; }
+                if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold_q; }
+                if let Some(ref mut st) = self.servo_target {
+                    if st.len() > g_idx { st[g_idx] = hold_q; }
+                }
+                self.gripper_motion_hold = Some((hold_q, close_dir));
+                self.note_motion_limit(MotionLimitReason::GripperForce, Some(g_idx));
+            } else if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
             } else if self.gripper_force_ticks >= GRIPPER_FORCE_CAP_TICKS {
@@ -6075,6 +6552,7 @@ impl SupervisorInner {
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
+        self.check_commissioning_for_ordinary_motion("policy/start")?;
         if self.estop_pending() {
             return Err(SafetyError::EStopActive.into());
         }
@@ -6720,7 +7198,23 @@ pub fn keepout_sweep_with(
     knots: &[f64],
     budget: usize,
 ) -> Result<Vec<Vec<f32>>, SafetyError> {
-    crate::chain::WorkspaceEvaluator::new(model, ws, cam)
+    keepout_sweep_with_tcp_tol(model, ws, cam, [0.0; 3], crate::kinematics::WORKSPACE_EPS, at, travel, knots, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn keepout_sweep_with_tcp_tol(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    escape_tol: f64,
+    at: &dyn Fn(f64) -> Vec<f32>,
+    travel: &dyn Fn(f64, f64) -> Vec<f64>,
+    knots: &[f64],
+    budget: usize,
+) -> Result<Vec<Vec<f32>>, SafetyError> {
+    crate::chain::WorkspaceEvaluator::new_with_tcp(model, ws, cam, tcp_offset)
+        .with_escape_tol(escape_tol)
         .sweep_knots(at, travel, knots, budget, "sweep")
         .map_err(SafetyError::from_workspace)
 }
@@ -6735,7 +7229,20 @@ pub fn check_path_with<'a>(
     start: &[f32],
     samples: impl IntoIterator<Item = &'a [f32]>,
 ) -> Result<(), SafetyError> {
-    let eval = crate::chain::WorkspaceEvaluator::new(model, ws, cam);
+    check_path_with_tcp_tol(model, ws, cam, [0.0; 3], crate::kinematics::WORKSPACE_EPS, start, samples)
+}
+
+pub fn check_path_with_tcp_tol<'a>(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    escape_tol: f64,
+    start: &[f32],
+    samples: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<(), SafetyError> {
+    let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(model, ws, cam, tcp_offset)
+        .with_escape_tol(escape_tol);
     let mut c0 = eval.alloc_buf();
     eval.eval_into(start, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
     let mut min_depths = eval.init_min_depths(&c0);

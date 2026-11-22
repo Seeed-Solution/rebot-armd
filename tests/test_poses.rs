@@ -40,13 +40,21 @@ async fn poses_file_round_trips_and_corrupt_file_is_not_overwritten_on_start() {
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&supervisor, &path).await;
     let loaded = supervisor.inner().read().await.poses.list.clone();
-    // a pose saved before ids gets one on load, written back to the file
+    // a pose saved before ids gets one on load, written back to the file; M16: valid joints always refresh TCP
     assert!(armd::recording::is_ulid(&loaded.poses[0].id));
+    assert!(loaded.poses[0].tcp.is_some(), "M16: load_locked recomputes TCP when positions are valid");
     let mut no_ids = loaded.clone();
     no_ids.poses[0].id.clear();
+    no_ids.poses[0].tcp = None;
     assert_eq!(no_ids, list);
     let on_disk: PoseList = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(on_disk, loaded);
+    assert_eq!(on_disk.poses.len(), loaded.poses.len());
+    assert_eq!(on_disk.poses[0].id, loaded.poses[0].id);
+    assert_eq!(on_disk.poses[0].positions, loaded.poses[0].positions);
+    let dt = on_disk.poses[0].tcp.as_ref().unwrap();
+    let lt = loaded.poses[0].tcp.as_ref().unwrap();
+    assert!(dt.position.iter().zip(&lt.position).all(|(a, b)| (a - b).abs() < 1e-12));
+    assert!(dt.rpy.iter().zip(&lt.rpy).all(|(a, b)| (a - b).abs() < 1e-12));
     let again = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&again, &path).await;
     assert_eq!(again.inner().read().await.poses.list.poses[0].id, loaded.poses[0].id, "ids are stable across restarts");
@@ -195,4 +203,108 @@ async fn at_most_64_poses() {
     // Overwriting an existing name is allowed at the limit.
     assert!(armd::poses::save(&mut inner, &json!({"name": "p3", "positions": READY})).is_ok());
     assert_eq!(inner.poses.list.poses.len(), 64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_to_pose_include_gripper_enforces_tool_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let poses_path = dir.path().join("poses.json");
+
+    let pack_a: armd::tool::ToolPackConfig = serde_json::from_value(json!({
+        "id": "tool_a",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.02, 0.0, 0.0]
+    }))
+    .unwrap();
+    let pack_b: armd::tool::ToolPackConfig = serde_json::from_value(json!({
+        "id": "tool_b",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.04, 0.0, 0.0]
+    }))
+    .unwrap();
+
+    // 1. Save a pose under tool A (commissioned).
+    let mut cfg_a = armd::tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack_a).unwrap();
+    cfg_a.active_tool.commissioning_required = false;
+    let sup_a = Arc::new(ArmSupervisor::new(cfg_a));
+    armd::poses::load_into(&sup_a, &poses_path).await;
+    let write = {
+        let mut inner = sup_a.inner().write().await;
+        armd::poses::save(&mut inner, &json!({"name": "pick_a", "positions": READY}))
+            .unwrap()
+            .1
+            .unwrap()
+    };
+    write.run().await.unwrap();
+
+    // 2. Switch to tool B and commission it, loading the saved poses file.
+    let mut cfg_b = armd::tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &pack_b).unwrap();
+    cfg_b.active_tool.commissioning_required = false;
+    let sup_b = Arc::new(ArmSupervisor::new(cfg_b));
+    armd::poses::load_into(&sup_b, &poses_path).await;
+    let (mut ws, generation, epoch, sup_b, _addr) = common::torqued_rig(sup_b, &INSPECT).await;
+
+    // 3. move_to_pose with include_gripper: true MUST be rejected with TOOL_MISMATCH.
+    let rej = common::rpc(
+        &mut ws,
+        generation,
+        epoch,
+        "/api/v1/action/move_to_pose",
+        json!({"name": "pick_a", "include_gripper": true}),
+    )
+    .await;
+    assert_eq!(rej["type"], "command_reject", "{rej}");
+    assert_eq!(rej["code"], "TOOL_MISMATCH", "{rej}");
+
+    // 4. move_to_pose with include_gripper: false (arm-only) MUST succeed.
+    let ack = common::rpc(
+        &mut ws,
+        generation,
+        epoch,
+        "/api/v1/action/move_to_pose",
+        json!({"name": "pick_a", "include_gripper": false}),
+    )
+    .await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let id = ack["action_id"].as_u64().unwrap();
+    let act = wait_action(&mut ws, &sup_b, generation, epoch, id).await;
+    assert_eq!(act.state, "done", "{act:?}");
+
+    // 5. Sequence Pose step with gripper: "pose" MUST also be rejected with TOOL_MISMATCH.
+    let pose_id = sup_b
+        .inner()
+        .read()
+        .await
+        .poses
+        .list
+        .poses
+        .iter()
+        .find(|p| p.name == "pick_a")
+        .unwrap()
+        .id
+        .clone();
+    let seq_ack = common::rpc(
+        &mut ws,
+        generation,
+        epoch,
+        "/api/v1/sequences/save",
+        json!({
+            "name": "seq_pick_a",
+            "steps": [{"type": "pose", "pose_id": pose_id, "speed_scale": 0.3, "gripper": "pose"}]
+        }),
+    )
+    .await;
+    assert_eq!(seq_ack["type"], "command_ack", "{seq_ack}");
+    let seq_rej = common::rpc(
+        &mut ws,
+        generation,
+        epoch,
+        "/api/v1/action/run_sequence",
+        json!({"id": seq_ack["sequence"]["id"]}),
+    )
+    .await;
+    assert_eq!(seq_rej["type"], "command_reject", "{seq_rej}");
+    assert_eq!(seq_rej["code"], "TOOL_MISMATCH", "{seq_rej}");
 }

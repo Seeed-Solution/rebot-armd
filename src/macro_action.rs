@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::rest::ApiError;
 use crate::kinematics::Pose;
-use crate::motion::{self, GoalSpec, GripperCommand, GripperRequest, Speed};
+use crate::motion::{self, GoalFrame, GoalSpec, GripperCommand, GripperRequest, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor};
 
 /// Poll period of the orchestrator while a sub-motion runs.
@@ -108,11 +108,19 @@ impl MacroCtx {
         Ok(())
     }
 
-    /// FK of the commanded J1..J6.
+    /// FK of the commanded J1..J6 in `end_link` frame.
     pub async fn pose(&self) -> Pose {
         let inner = self.sup.inner().read().await;
         let arm = &inner.config.arm_model;
         arm.fk_f32(&inner.commanded_positions).unwrap_or_else(|| arm.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
+    }
+
+    /// FK of the commanded J1..J6 in the active TCP frame.
+    pub async fn tcp_pose(&self) -> Pose {
+        let inner = self.sup.inner().read().await;
+        inner.config.tcp_pose_f32(&inner.commanded_positions).unwrap_or_else(|| {
+            inner.config.end_to_tcp(&inner.config.arm_model.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
+        })
     }
 
     /// Wait for the installed sub-motion; stop it on a timeout.
@@ -158,19 +166,59 @@ impl MacroCtx {
     /// planning or install refused, the arm did not move) from a failure after the sub-motion
     /// was installed (`true`).
     pub async fn move_arm_staged(&self, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, (Stop, bool)> {
+        self.move_arm_staged_in(GoalFrame::EndLink, phase, spec, speed, approach).await
+    }
+
+    /// [`move_arm_with`](Self::move_arm_with) in an explicit [`GoalFrame`] (`EndLink` or `Tcp`).
+    pub async fn move_arm_with_in(&self, frame: GoalFrame, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, Stop> {
+        self.move_arm_staged_in(frame, phase, spec, speed, approach).await.map_err(|(stop, _)| stop)
+    }
+
+    /// [`move_arm`](Self::move_arm) in an explicit [`GoalFrame`] (`EndLink` or `Tcp`).
+    pub async fn move_arm_in(&self, frame: GoalFrame, phase: &str, spec: GoalSpec, speed: Speed) -> Result<SubDone, Stop> {
+        self.move_arm_with_in(frame, phase, spec, speed, None).await
+    }
+
+    /// [`move_arm_staged`](Self::move_arm_staged) in an explicit [`GoalFrame`].
+    pub async fn move_arm_staged_in(&self, frame: GoalFrame, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, (Stop, bool)> {
+        self.move_arm_staged_in_with_table(frame, phase, spec, speed, approach, None).await
+    }
+
+    /// [`move_arm_staged_in`](Self::move_arm_staged_in) with an optional table-clearance bound
+    /// enforced on the actually installed joint path (including direct fallbacks).
+    pub async fn move_arm_staged_in_with_table(
+        &self,
+        frame: GoalFrame,
+        phase: &str,
+        spec: GoalSpec,
+        speed: Speed,
+        approach: Option<FinalApproach>,
+        table_clearance: Option<(Vec<crate::kinematics::Vec3>, f64)>,
+    ) -> Result<SubDone, (Stop, bool)> {
         let before = |s: Stop| (s, false);
         let (input, plan) = {
             let inner = self.sup.inner().read().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
             let plan = approach.as_ref().map(|a| inner.approach_plan(a.use_, a.request));
-            (inner.plan_input().map_err(arm_fail).map_err(before)?, plan)
+            (inner.plan_input_in(frame).map_err(arm_fail).map_err(before)?, plan)
+        };
+        let effective_rules: Option<crate::backlash::DescentRules> = match (&approach, &table_clearance) {
+            (Some(a), Some(t)) => {
+                let mut r = a.rules.clone();
+                if r.table.is_none() { r.table = Some(t.clone()); }
+                Some(r)
+            }
+            (Some(a), None) => Some(a.rules.clone()),
+            (None, Some(t)) => Some(crate::backlash::DescentRules { table: Some(t.clone()), ..Default::default() }),
+            (None, None) => None,
         };
         let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
+        let rules_for_pre = effective_rules.clone();
         let (input, planned) = tokio::task::spawn_blocking(move || {
             let p = motion::plan_cartesian_opts(&input, goal, speed, opts).map(|direct| {
                 let pre = match &plan {
                     Some(Ok(plan)) => crate::backlash::plan_cartesian_pre(&input, &direct, plan,
-                        approach.as_ref().map(|a| &a.rules), speed, opts),
+                        rules_for_pre.as_ref(), speed, opts),
                     Some(Err(Some(r))) => crate::backlash::Pre::Direct((*r).to_string()),
                     _ => crate::backlash::Pre::Off,
                 };
@@ -191,7 +239,7 @@ impl MacroCtx {
         let limit = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
-            match inner.install_macro_path_same_side(self.id, &input, path, pre, plan.as_ref()) {
+            match inner.install_macro_path_same_side_with_rules(self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
                 Ok(l) => l,
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
@@ -206,9 +254,8 @@ impl MacroCtx {
         let ms = t0.elapsed().as_millis() as u32;
         {
             let mut inner = self.sup.inner().write().await;
-            let arm_model = inner.config.arm_model.clone();
-            let meas_opt = arm_model.fk_f32(&inner.measured_positions);
-            let cmd_opt = arm_model.fk_f32(&inner.commanded_positions);
+            let meas_opt = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| motion::end_to_frame(&p, &input));
+            let cmd_opt = inner.config.arm_model.fk_f32(&inner.commanded_positions).map(|p| motion::end_to_frame(&p, &input));
             if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
                 let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
                 let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;

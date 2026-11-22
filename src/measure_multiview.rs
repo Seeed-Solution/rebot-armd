@@ -425,6 +425,7 @@ pub struct Plan {
     pub calibration_revision: u64,
     pub setup: GraspSetup,
     pub cam: CamModel,
+    pub tcp_offset: [f64; 3],
     /// Commanded joints at the start (all joints).
     pub start: Vec<f32>,
     pub arm_dof: usize,
@@ -433,6 +434,7 @@ pub struct Plan {
 
 /// Check the run under the lock.
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan, ArmError> {
+    inner.check_commissioning_for_ordinary_motion("measure_multiview")?;
     let request = parse_request(body)?;
     if epoch != inner.safety.epoch_id() {
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
@@ -455,7 +457,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
         request, epoch, workspace_revision: inner.workspace_revision, calibration_revision: inner.calibration_revision,
-        setup, cam, start: inner.commanded_positions.clone(), arm_dof: inner.config.arm_dof(), deadline_s,
+        setup, cam, tcp_offset: inner.config.tcp_offset, start: inner.commanded_positions.clone(), arm_dof: inner.config.arm_dof(), deadline_s,
     })
 }
 
@@ -980,8 +982,11 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
     table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, ncc_backend: &mview_stereo::BackendDiagnostics, fallbacks: &[Value], compute_ms: f64) -> Value {
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
-    let views: Vec<Value> = caps.iter().map(|c| json!({
-        "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
+    let views: Vec<Value> = caps.iter().map(|c| {
+        let tcp_pose = crate::motion::end_to_tcp(&c.pose, &plan.tcp_offset);
+        json!({
+        "end_pose": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
+        "tcp": {"xyz_m": tcp_pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&tcp_pose.r)},
         "frame_source": c.frame_source.name(),
         "instance_id": c.instance_id,
         "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
@@ -1000,7 +1005,8 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "feedback_age_b_ms": c.feedback_age_b_ms.map(r2),
         "settle_s": r2(c.settle_s),
         "trigger_ms": c.trigger_ms.round(), "snapshot_wait_ms": c.snapshot_wait_ms.round(), "snapshot_polls": c.snapshot_polls,
-    })).collect();
+        })
+    }).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
             "label": target.label, "score": target.score,
@@ -1434,6 +1440,7 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
             FrameSource::Gray => ("pgm", "pgm"),
             FrameSource::Snapshot => ("jpg", "jpeg"),
         };
+        let tcp_pose = crate::motion::end_to_tcp(&v.pose, &plan.tcp_offset);
         json!({
             "file": format!("view_{k}.{ext}"), "encoding": encoding,
             "frame_source": v.frame_source.name(), "instance_id": v.instance_id,
@@ -1448,7 +1455,8 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
             "settle_s": v.settle_s, "trigger_ms": v.trigger_ms,
             "frame_fetch_ms": v.frame_fetch_ms, "gray_convert_ms": v.gray_convert_ms, "parse_ms": v.parse_ms,
             "snapshot_wait_ms": v.snapshot_wait_ms, "snapshot_polls": v.snapshot_polls,
-            "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
+            "end_pose": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
+            "tcp": {"xyz_m": tcp_pose.p, "r": mat_json(&tcp_pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
             "markers": v.markers.iter().map(|m| json!({"id": m.id, "corners": m.corners})).collect::<Vec<_>>(),
@@ -2087,6 +2095,7 @@ mod tests {
             calibration_revision: 1,
             setup,
             cam,
+            tcp_offset: [0.0; 3],
             start: vec![0.0; 6],
             arm_dof: 6,
             deadline_s: 30.0,

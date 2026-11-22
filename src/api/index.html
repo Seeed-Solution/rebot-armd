@@ -803,6 +803,9 @@ body.offline .banner { display: block; }
 .gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
 .gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
 .gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+.tool-comm-banner { display: grid; gap: 3px; padding: 10px 12px; border-radius: var(--sc-radius-md); border: 1px solid #f59e0b; background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; line-height: 1.4; }
+.tool-comm-banner[hidden] { display: none; }
+.tool-comm-banner b { font-size: 13px; font-weight: 600; }
 /* ---------- external control: banner (#ext-banner), HUD chip, task drawer (#task) ---------- */
 .ext-banner { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-lg); border: 1px solid var(--sc-color-border-neutral); border-left: 4px solid var(--sc-color-primary);
   background: rgba(255,255,255,0.82); backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: var(--sc-shadow); }
@@ -1789,6 +1792,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
     <div class="head-stats">
       <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
+      <span class="sc-status-badge plain" id="tool-badge" hidden></span>
       <span class="sc-status-badge" id="link-badge">-- Hz</span>
       <span class="sc-status-badge" id="state-badge" data-i18n="st.Offline">离线</span>
     </div>
@@ -2058,6 +2062,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span id="lock-txt" data-i18n="lock.offline">遥测断开，控制已锁定</span>
+        </div>
+        <div class="tool-comm-banner" id="tool-comm-banner" role="status" aria-live="polite" hidden>
+          <b id="tool-comm-title"></b>
+          <small id="tool-comm-sub" data-i18n="tool.comm.hint">需先完成工具调试/标定后再执行常规运动。</small>
         </div>
         <button class="btn btn-preempt" id="btn-preempt" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
@@ -3305,7 +3313,8 @@ Object.assign(I18N.zh, {
   'task.empty': '还没有记录。外部程序发起动作或取得控制权时会显示在这里。', 'task.lease.acquire': '取得控制权', 'task.lease.release': '释放控制权',
   'task.env.hint': '只读。打开本面板时每 2 秒刷新一次。', 'task.open_poses': '打开点位管理',
   'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
-  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
+  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.daemon_tool': '臂端工具', 'task.env.tool_comm': '工具调试', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
+  'tool.badge.comm': '{id} · 待调试', 'tool.comm.title': '工具「{id}」未完成调试', 'tool.comm.hint': '请先完成工具调试/标定后再执行常规运动。',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
   'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
@@ -3322,7 +3331,8 @@ Object.assign(I18N.en, {
   'task.empty': 'Nothing yet. Actions started by external clients and lease changes appear here.', 'task.lease.acquire': 'took control', 'task.lease.release': 'released control',
   'task.env.hint': 'Read-only. Refreshes every 2 s while this panel is open.', 'task.open_poses': 'Open Poses',
   'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
-  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
+  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.daemon_tool': 'Daemon tool', 'task.env.tool_comm': 'Tool commissioning', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
+  'tool.badge.comm': '{id} · needs commissioning', 'tool.comm.title': 'Tool "{id}" needs commissioning', 'tool.comm.hint': 'Complete tool commissioning / calibration before running normal motions.',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
   'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
@@ -6043,14 +6053,16 @@ async function cwGuardedWait(cond, timeoutMs) {
     await cwSleep(50);
   }
 }
-// move_to the end pose T (4x4) and wait for the action record; throws { code, phase } on failure:
+// move_to the end pose T (4x4 EndLink) and wait for the action record; converts once to TCP at the
+// public action boundary. throws { code, phase } on failure:
 // phase 'reject' (command_reject / no ack, nothing started) or 'action' (the started action failed)
 async function cwMove(T) {
   const CW = CWZ.CW;
+  const off = S.tcpOffset || [0, 0, 0];
   let ack;
   try {
     ack = await commandRPC('/api/v1/action/move_to', {
-      position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
+      position: CW.apply(T, off), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
   } catch (e) { throw Object.assign(e, { phase: 'reject' }); }
   const id = ack && ack.action_id;
   if (id == null) throw Object.assign(new Error('move_to ack without action_id'), { code: 'NO_ACTION_ID', phase: 'reject' });
@@ -6097,7 +6109,7 @@ async function cwNominalMount() {
 }
 function cwPlan(est, q0, n, exclude = []) {
   const { lo, hi } = modelLimits6();
-  return CWZ.CW.generatePoses({ ...(cwFine() ? CWF.gen : {}), Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude })
+  return CWZ.CW.generatePoses({ ...(cwFine() ? CWF.gen : {}), Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude, extraEndPoints: S.wsCheckPoints })
     .poses.map((p) => ({ ...p, state: 'pending' }));
 }
 async function cwBootstrap() {
@@ -6151,7 +6163,7 @@ const cwAccepted = () => CWZ.views.filter((v) => !v.err && CWZ.CW.boardMarkers(v
 // clearance / IK continuity from the arm's current pose to T (same check as the pose generator)
 function cwCheckFromHere(T) {
   const { lo, hi } = modelLimits6(), q = cwModelQ(S.obs.positions);
-  return CWZ.CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X: CWZ.est.X, plane: CWZ.CW.boardPlane(CWZ.est.Tbb), clearance: 0.10, lo, hi });
+  return CWZ.CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X: CWZ.est.X, plane: CWZ.CW.boardPlane(CWZ.est.Tbb), clearance: 0.10, lo, hi, extraEndPoints: S.wsCheckPoints });
 }
 // visit poses from CWZ.idx: one (confirm mode) or all (run all); CW.runPoses decides skip / abort
 async function cwRun() {
@@ -6231,6 +6243,7 @@ self.onmessage = (e) => {
       M.CALM.setCorrection(data.correction);
       const lo = data.lo, hi = data.hi;
       const g = CW.generatePoses({ ...data.opts, Tbb: data.Tbb, board: CW.makeBoard({ markerSide: data.markerSide }), K: data.K, X: data.X, q0: data.q0, lo, hi, n: data.n, exclude: data.exclude,
+        extraEndPoints: data.extraEndPoints || null,
         fk: M.CALM.fk, ik: (T, seed) => M.VIK.solve(T, seed, { lo, hi, iters: 60 }) });
       r = { poses: g.poses, stats: g.stats };
     } else throw new Error('op ' + op);
@@ -6256,12 +6269,12 @@ self.onmessage = (e) => {
 // fine-mode plan (CWF.gen options): worker, else sliced on this thread
 async function cwPlanFine(est, q0, n, exclude = []) {
   const CW = CWZ.CW, { lo, hi } = modelLimits6();
-  const data = { opts: CWF.gen, Tbb: est.Tbb, markerSide: CWZ.board.markerSide, K: est.K, X: est.X, q0, lo, hi, n, exclude, correction: CALM.correctionJoints() };
+  const data = { opts: CWF.gen, Tbb: est.Tbb, markerSide: CWZ.board.markerSide, K: est.K, X: est.X, q0, lo, hi, n, exclude, correction: CALM.correctionJoints(), extraEndPoints: S.wsCheckPoints || null };
   let g = null, worker = true;
   try { const p = cwWorkerCall('plan', data); if (p) g = await p; } catch (e) { g = null; }
   if (!g) {
     worker = false;
-    g = await CW.runSliced(CW.generatePosesSteps({ ...CWF.gen, Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude }));
+    g = await CW.runSliced(CW.generatePosesSteps({ ...CWF.gen, Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude, extraEndPoints: S.wsCheckPoints }));
   }
   CWZ.planWorker = worker;
   return g.poses.map((p) => ({ ...p, state: 'pending' }));
@@ -6282,13 +6295,13 @@ function cwFinePre(q) {
   });
   return toModel6(m);
 }
-// joint-space segment qa -> qb at 20 steps: limits, tool points above the board plane and the base plane
+// joint-space segment qa -> qb at 20 steps: limits, full effective envelope points above the board plane and the base plane
 function cwFineSegment(qa, qb) {
   const CW = CWZ.CW, { lo, hi } = modelLimits6(), plane = CW.boardPlane(CWZ.est.Tbb), X = CWZ.est.X;
   for (let k = 0; k <= 20; k++) {
     const q = qa.map((v, i) => v + (qb[i] - v) * k / 20);
     if (q.some((v, i) => v < lo[i] - 1e-6 || v > hi[i] + 1e-6)) return 'limits';
-    const pts = CW.toolPoints(CALM.fk(q), X);
+    const pts = CW.toolPoints(CALM.fk(q), X, S.wsCheckPoints);
     if (pts.some((p) => (p[0] - plane.p[0]) * plane.n[0] + (p[1] - plane.p[1]) * plane.n[1] + (p[2] - plane.p[2]) * plane.n[2] < CWF.clear)) return 'clearance';
     if (pts.some((p) => p[2] < 0.02)) return 'base';
   }
@@ -6529,7 +6542,7 @@ async function cwSearch() {
     let found = null;
     const io = {
       abortReason: cwAbortReason,
-      check: (T) => { const q = cwModelQ(S.obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X, plane, clearance: CW_SEARCH.clearance, lo, hi }); },
+      check: (T) => { const q = cwModelQ(S.obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X, plane, clearance: CW_SEARCH.clearance, lo, hi, extraEndPoints: S.wsCheckPoints }); },
       move: (T, i) => { if (se.phase === 'scan') se.k = i + 1; cwRender(); return cwMove(T); },
       settle: cwSettle,
       capture: () => cwCapture(),
@@ -6859,6 +6872,23 @@ async function cwvTipMeasure() {
   CWV.tipBusy = true; CWV.tip = null; CWV.roi = null; CWV.frames = 0; cwSetStatus(t('cw.tip.busy'));
   const want = 16, frames = [];
   let last = null, lastDet = null, tries = 0;
+  let capToolId = null, capToolDigest = null;
+  try {
+    const r0 = await fetch('/api/v1/calibration', { cache: 'no-store' });
+    if (!r0.ok) throw new Error('HTTP ' + r0.status);
+    const st0 = await r0.json();
+    if (!st0 || !st0.active_tool || !st0.active_tool.id) throw new Error('active_tool unavailable');
+    S.activeTool = st0.active_tool;
+    capToolId = !st0.active_tool.is_stock
+      ? st0.active_tool.id
+      : ((st0.calibration_tool && st0.calibration_tool.tool_id) || st0.active_tool.id);
+    capToolDigest = st0.active_tool.config_digest || null;
+  } catch (e) {
+    CWV.tipBusy = false;
+    cwSetStatus(t('cw.err', { m: 'active tool check failed: ' + (e && e.message ? e.message : e) }), 'warn');
+    cwRender();
+    return;
+  }
   try {
     const pos0 = o.positions.slice();
     while (frames.length < want && tries++ < 60) {
@@ -6888,9 +6918,9 @@ async function cwvTipMeasure() {
     const base = { ...CWZ.solve.apply, dry_run: true };
     const d1 = await commandRPC('/api/v1/calibration/apply', base, true, 15000);
     CWV.xfp = d1.after && d1.after.x_fingerprint;
-    let toolId = 'unknown_tool';
-    try { const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(); if (st.calibration_tool && st.calibration_tool.tool_id) toolId = st.calibration_tool.tool_id; } catch (_) {}
-    const tool = { tool_id: toolId, tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
+    const toolId = capToolId;
+    const toolDigest = capToolDigest;
+    const tool = { tool_id: toolId, ...(toolDigest ? { tool_config_digest: toolDigest } : {}), tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
       fit: { frames: res.frames, reproj_px: +res.reprojPx.toFixed(3), gap_px: +res.gapPx.toFixed(3), std_mm: +res.stdMm.toFixed(3) } };
     const d2 = await commandRPC('/api/v1/calibration/apply', { ...base, tool }, true, 15000);
     CWV.fp = d2.after && d2.after.fingerprint;
@@ -6918,7 +6948,7 @@ async function cwvPlan() {
     const b = await cwvBoardNow();
     const { K, X, kCand, kLive, ch } = cwvCand();
     const { lo, hi } = modelLimits6();
-    const plan = CW.planHover({ Tbb: b.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: b.q, K, board: cwBoard(), lo, hi });
+    const plan = CW.planHover({ Tbb: b.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: b.q, K, board: cwBoard(), lo, hi, physicalContactEnd: S.physicalContactEnd, thickness: CWZ.thickMm / 1000 });
     CWV.plan = { ...plan, Tbb: b.Tbb, at: Date.now() };
     CWV.base = b;
     cwSetStatus(plan.ok ? t('cw.hov.planned', { n: plan.points.length }) : t('cw.hov.why.' + plan.why), plan.ok ? 'ok' : 'warn');
@@ -6936,8 +6966,12 @@ async function cwvStart(confirm = false, resume = null) {
     cwvGripCheck();
     let body;
     if (resume) {
-      // resume: back to the pose the plan looked at the board from (torque on first, e.g. after the watchdog park),
-      // the board must still be where the plan saw it and the candidate unchanged
+      // resume: check candidate fingerprint BEFORE moving or torquing on, then return to view pose and re-check board
+      if (CWV.job && CWV.job.candidate_fingerprint && CWV.job.candidate_fingerprint !== CWV.fp) {
+        throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
+      }
+      const dr = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, tool: CWV.tool, dry_run: true }, true, 15000);
+      if (!dr.after || dr.after.fingerprint !== CWV.fp) throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
       if (!(S.obs && S.obs.is_torqued)) { await commandRPC('/api/v1/torque', { enable: true }, true, 5000); await cwSleep(800); }
       const { kLive, ch } = cwvCand();
       CWV.phase = 'view';
@@ -6947,12 +6981,13 @@ async function cwvStart(confirm = false, resume = null) {
       const b = await cwvBoardNow();
       const d = Math.hypot(...[0, 1, 2].map((k) => b.Tbb[k][3] - CWV.plan.Tbb[k][3]));
       if (d > 0.003) throw Object.assign(new Error(t('cw.hov.moved', { mm: (d * 1000).toFixed(1) })), { code: 'BOARD_MOVED' });
-      const dr = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, tool: CWV.tool, dry_run: true }, true, 15000);
-      if (!dr.after || dr.after.fingerprint !== CWV.fp) throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
-      body = { resume };
+      body = { resume, candidate_fingerprint: CWV.fp };
     } else if (confirm) {
+      if (!Array.isArray(S.physicalContactEnd) || S.physicalContactEnd.length !== 3) {
+        throw Object.assign(new Error(t('cw.hov.noedge')), { code: 'CONTACT_UNKNOWN' });
+      }
       const { K, X, kCand, kLive, ch } = cwvCand(), { lo, hi } = modelLimits6();
-      const cp = CWZ.CW.planHover({ Tbb: CWV.plan.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: CWV.base.q, K, board: cwBoard(), lo, hi, tableZ: CWV.eval.table_z_m, plan: { ...CWZ.CW.HOVER_PLAN, count: 2, minCount: 1 } });
+      const cp = CWZ.CW.planHover({ Tbb: CWV.plan.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: CWV.base.q, K, board: cwBoard(), lo, hi, tableZ: CWV.eval.table_z_m, physicalContactEnd: S.physicalContactEnd, thickness: CWZ.thickMm / 1000, plan: { ...CWZ.CW.HOVER_PLAN, count: 2, minCount: 1 } });
       if (!cp.points.length) throw Object.assign(new Error(t('cw.hov.why.reach')), { code: 'PLAN' });
       CWV.confirmPlan = cp;
       body = cwvBody(cp.points);
@@ -6991,12 +7026,12 @@ function cwvEvaluate(which) {
     const pl = plan.points.find((x) => x.id === p.id);
     if (p.state !== 'done') return { id: p.id, ok: false, skipped: p.state, code: p.code };
     const q = cwModelQ(p.settled_joints || p.observations[p.observations.length - 1].joints);
-    const r = CW.hoverPoint({ observations: p.observations, board, K, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, target: pl && pl.corner, Tend: CW.kinPose(ch, q, kCand), X });
+    const r = CW.hoverPoint({ observations: p.observations, board, K, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, target: pl && pl.corner, Tend: CW.kinPose(ch, q, kCand), X, physicalContactEnd: S.physicalContactEnd });
     return { id: p.id, ...r };
   });
   if (which === 'confirmJob') { CWV.confirm = { ...CW.confirmHovers(pts, CW.HOVER_PLAN.clearanceM), pts }; cwSetStatus(t(CWV.confirm.ok ? 'cw.hov.conf.ok' : 'cw.hov.conf.bad', { mm: cwFmt(CWV.confirm.worst_m * 1000, 1) }), CWV.confirm.ok ? 'ok' : 'warn'); return; }
   CWV.pts = pts;
-  CWV.eval = CW.evaluateHovers(pts, { edgeToLow: CWV.edge });
+  CWV.eval = CW.evaluateHovers(pts, { edgeToLow: CWV.edge, physicalContactEnd: S.physicalContactEnd, thickness: CWZ.thickMm / 1000 });
   const ended = job.state === 'done' ? '' : t('cw.hov.ended', { s: job.state, c: job.code || '' });
   cwSetStatus(ended || t(CWV.eval.ok ? 'cw.hov.pass' : 'cw.hov.fail'), !ended && CWV.eval.ok ? 'ok' : 'warn');
 }
@@ -7058,7 +7093,7 @@ function cwRenderHover(body, p, acts) {
   const CW = CWZ.CW, job = CWV.job, running = !!(job && job.state === 'running') || !!(CWV.confirmJob && CWV.confirmJob.state === 'running');
   p(t('cw.hov.lead'), 'cwiz-lead');
   p(t('cw.hov.hint'));
-  if (CWV.edge == null) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.noedge')));
+  if (CWV.edge == null || !Array.isArray(S.physicalContactEnd)) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.noedge')));
   const off = cwvGripOff();
   if (off) cwvGripBox(body, t('cw.hov.grip', { now: off.now.toFixed(2), then: off.then.toFixed(2) }));
   if (CWV.plan && CWV.plan.points.length) {
@@ -7093,7 +7128,7 @@ function cwRenderHover(body, p, acts) {
   }
   const ended = job && job.state && job.state !== 'running' && job.state !== 'done';
   if (ended && job.arm) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.armstate', { tq: t(job.arm.is_torqued ? 'cw.hov.tq.on' : 'cw.hov.tq.off'), f: job.arm.fault ? (job.arm.fault.code || 'fault') : '--' })));
-  const canConfirm = ev && ev.ok && ev.table_z_m != null && !CWV.confirm && !running;
+  const canConfirm = ev && ev.ok && ev.table_z_m != null && Array.isArray(S.physicalContactEnd) && !CWV.confirm && !running;
   acts(cwBtn(t('cw.back'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'act-back', disabled: running || CWZ.busy }),
     cwBtn(t('cw.hov.plan'), cwvPlan, { disabled: running || CWZ.busy, id: 'cwiz-hov-plan', cls: CWV.plan ? '' : 'btn-primary' }),
     CWV.plan && CWV.plan.ok && !ev && !ended ? cwBtn(t('cw.hov.start'), () => cwvStart(false), { cls: 'btn-primary', disabled: running || CWZ.busy, id: 'cwiz-hov-start' }) : null,
@@ -7581,6 +7616,31 @@ function applyJointMap(map) {
   camMountNow();
   V3.key = ''; PCARD.key = '';
 }
+function renderToolStatus() {
+  const tool = S.activeTool;
+  const badge = $('tool-badge');
+  const banner = $('tool-comm-banner');
+  if (!tool || !tool.id) {
+    if (badge) badge.hidden = true;
+    if (banner) banner.hidden = true;
+    return;
+  }
+  const req = tool.commissioning_required === true;
+  if (badge) {
+    badge.hidden = false;
+    setText(badge, req ? t('tool.badge.comm', { id: tool.id }) : tool.id);
+    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? '' : 'is-ok'));
+    badge.title = req ? t('tool.comm.hint') : tool.id;
+  }
+  if (banner) {
+    banner.hidden = !req;
+    if (req) {
+      setText($('tool-comm-title'), t('tool.comm.title', { id: tool.id }));
+      setText($('tool-comm-sub'), t('tool.comm.hint'));
+    }
+  }
+}
+i18nHooks.push(renderToolStatus);
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
@@ -7599,6 +7659,13 @@ async function loadSchema() {
       S.powerGov = (sc.power_budget && sc.power_budget.governor) || null;
       PWR.key = '';
       S.wsPolicy = sc.workspace || null;
+      S.wsCheckPoints = (sc.workspace && Array.isArray(sc.workspace.check_points_end_m)) ? sc.workspace.check_points_end_m : null;
+      S.activeTool = sc.active_tool || null;
+      renderToolStatus();
+      S.tcpOffset = (sc.active_tool && Array.isArray(sc.active_tool.tcp_offset_m)) ? sc.active_tool.tcp_offset_m.map(Number) : [0, 0, 0];
+      S.physicalContactEnd = Array.isArray(sc.physical_contact_end_m) && sc.physical_contact_end_m.length === 3 && sc.physical_contact_end_m.every(Number.isFinite)
+        ? sc.physical_contact_end_m.map(Number)
+        : (sc.physical_contact_end_m === null || (sc.active_tool && sc.active_tool.is_stock === false) ? null : [0, 0, 0]);
       // calibrated mount (camera calibration wizard): q_end_cam replaces camFlip / camRotDeg
       const qEnd = sc.camera_mount && Array.isArray(sc.camera_mount.q_end_cam) ? sc.camera_mount.q_end_cam : null;
       if (JSON.stringify(qEnd) !== JSON.stringify(CFG.view.qEndCam || null)) { CFG.view.qEndCam = qEnd; camMountNow(); V3.key = ''; }
@@ -12565,12 +12632,20 @@ function tkEnvRows() {
   const val = (x) => (x == null || x === '' ? none : String(x));
   const rows = [['h', t('task.env.sec.sandbox')]];
   const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
+  const daemonToolId = S.activeTool && S.activeTool.id;
+  const sbToolId = sb && sb.active_tool;
+  const toolCommReq = !!(S.activeTool && S.activeTool.commissioning_required === true);
   if (!E) rows.push(['r', t('task.env.mode'), t('task.env.loading')]);
-  else if (!sb) rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
-  else {
+  else if (!sb) {
+    rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
+    if (daemonToolId) rows.push(['r', t('task.env.daemon_tool'), val(daemonToolId)]);
+    if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
+  } else {
     rows.push(['r', t('task.env.mode'), sb.mode && sb.mode !== 'none' ? String(sb.mode) : none]);
     rows.push(['r', t('task.env.scene'), val(sb.active_scene)]);
-    rows.push(['r', t('task.env.tool'), val(sb.active_tool)]);
+    rows.push(['r', t('task.env.tool'), val(sbToolId)]);
+    if (daemonToolId && daemonToolId !== sbToolId) rows.push(['r', t('task.env.daemon_tool'), val(daemonToolId)]);
+    if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
     rows.push(['r', t('task.env.policy'), val(sb.active_policy)]);
     const ps = sb.policy_status ?? (sb.telemetry && typeof sb.telemetry === 'object' ? sb.telemetry.policy_status : undefined);
     rows.push(['r', t('task.env.pstatus'), ps && typeof ps === 'object' ? JSON.stringify(ps) : val(ps)]);
@@ -13466,18 +13541,28 @@ function renderSimple(live, op) {
 }
 
 function renderCart(live, op) {
-  // readouts from the full FK of the commanded joints: view = solved pose, base = IK J1..J4 + J5 + measured J6
+  // readouts from daemon obs.tcp for measured state; local targets apply active_tool.tcp_offset_m once
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
   const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
   const isCoupledYaw = S.orientationDof === 2 || isSoArm;
+  const hasObsTcp = S.obs && S.obs.tcp && Array.isArray(S.obs.tcp.xyz_m) && Array.isArray(S.obs.tcp.rpy_rad);
   let p = null;
-  if (isSoArm && S.obs && S.obs.tcp && Array.isArray(S.obs.tcp.xyz_m) && Array.isArray(S.obs.tcp.rpy_rad)) {
+  if ((isSoArm || !C.sending) && hasObsTcp) {
     const tcp = S.obs.tcp;
     p = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad[1], yaw: tcp.rpy_rad[2] };
   } else {
     const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
-    p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
+    if (T) {
+      const off = S.tcpOffset || [0, 0, 0];
+      const px = T[0][3] + T[0][0] * off[0] + T[0][1] * off[1] + T[0][2] * off[2];
+      const py = T[1][3] + T[1][0] * off[0] + T[1][1] * off[1] + T[1][2] * off[2];
+      const pz = T[2][3] + T[2][0] * off[0] + T[2][1] * off[1] + T[2][2] * off[2];
+      p = { x: px, y: py, z: pz, pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) };
+    } else if (hasObsTcp) {
+      const tcp = S.obs.tcp;
+      p = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad[1], yaw: tcp.rpy_rad[2] };
+    }
   }
   const mm = (m) => (m >= 0 ? '+' : '−') + Math.abs(m * 1000).toFixed(1);
   setText($('c-x'), p ? mm(p.x) : '--'); setText($('c-y'), p ? mm(p.y) : '--');

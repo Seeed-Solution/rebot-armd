@@ -102,6 +102,33 @@ fn is_han(c: char) -> bool {
     matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF | 0x2A700..=0x2EBEF | 0x30000..=0x3134F | 0x2F800..=0x2FA1F | 0x3005 | 0x3007 | 0x3021..=0x3029)
 }
 
+/// Return true when recorded frames command or observe movement on `gripper_joint`.
+pub fn episode_has_gripper_motion(frames: &[RecordFrame], gripper_joint: Option<usize>) -> bool {
+    let Some(g) = gripper_joint else { return false; };
+    let mut obs_min = f32::INFINITY;
+    let mut obs_max = f32::NEG_INFINITY;
+    let mut act_min = f32::INFINITY;
+    let mut act_max = f32::NEG_INFINITY;
+    for f in frames {
+        let obs = f.observation_state.get(g).copied().filter(|v| v.is_finite());
+        let act = f.action.get(g).copied().filter(|v| v.is_finite());
+        if let Some(v) = obs {
+            obs_min = obs_min.min(v);
+            obs_max = obs_max.max(v);
+        }
+        if let Some(v) = act {
+            act_min = act_min.min(v);
+            act_max = act_max.max(v);
+        }
+        if let (Some(o), Some(a)) = (obs, act) {
+            if (a - o).abs() > 1e-3 {
+                return true;
+            }
+        }
+    }
+    (obs_max - obs_min) > 1e-3 || (act_max - act_min) > 1e-3
+}
+
 /// `sidecar.joint_zero`: the joint zero in effect at capture.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct JointZeroStamp {
@@ -168,11 +195,25 @@ pub struct EpisodeSidecar {
     pub first_state: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_state: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_config_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_gripper_motion: Option<bool>,
 }
 
 impl EpisodeSidecar {
     pub fn metadata(&self) -> EpisodeMetadata {
-        EpisodeMetadata { profile_id: self.profile_id.clone(), arm_dof: self.arm_dof, gripper_joint: self.gripper_joint, joint_names: Some(self.joint_names.clone()) }
+        EpisodeMetadata {
+            profile_id: self.profile_id.clone(),
+            arm_dof: self.arm_dof,
+            gripper_joint: self.gripper_joint,
+            joint_names: Some(self.joint_names.clone()),
+            tool_id: self.tool_id.clone(),
+            tool_config_digest: self.tool_config_digest.clone(),
+            has_gripper_motion: self.has_gripper_motion,
+        }
     }
 }
 
@@ -841,6 +882,9 @@ fn adopt_legacy(path: &Path, id: &str, offsets: &[f32], joint_names: &[String], 
         armd_version: "legacy".into(), fps_nominal: fps, truncated: false, stopped_by: None,
         arm_dof: meta.arm_dof, gripper_joint: meta.gripper_joint, recovered: Some("legacy".into()),
         first_state: Some(first.observation_state.clone()), last_state: Some(last.observation_state.clone()),
+        tool_id: meta.tool_id,
+        tool_config_digest: meta.tool_config_digest,
+        has_gripper_motion: Some(meta.has_gripper_motion.unwrap_or_else(|| episode_has_gripper_motion(&frames, meta.gripper_joint))),
     })
 }
 
@@ -910,6 +954,7 @@ mod tests {
             units: "rad".into(), joint_zero: JointZeroStamp::of(&[0.0, 0.0]), profile_id: None, armd_version: "x".into(),
             fps_nominal: 50.0, truncated: false, stopped_by: None, arm_dof: None, gripper_joint: None, recovered: None,
             first_state: None, last_state: None,
+            tool_id: None, tool_config_digest: None, has_gripper_motion: None,
         }
     }
 

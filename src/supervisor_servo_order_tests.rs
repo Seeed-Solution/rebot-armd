@@ -586,3 +586,26 @@ fn policy_stream_30fps() {
         assert_invariants(&config, &w);
     }
 }
+
+#[test]
+fn gravity_comp_rejected_and_output_disabled_when_dynamics_unqualified() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.dynamics_qualified = false;
+    let (inner, _rig) = armed(cfg, rig_default());
+    assert!(inner.gravity_comp_support().is_err());
+    assert!(!inner.schema().capabilities.gravity_comp);
+    assert!(!inner.gravity_output_enabled());
+    let err = inner.gravity_comp_blocker().expect("unqualified dynamics must block gravity_comp");
+    assert_eq!(err.code, "UNSUPPORTED");
+}
+
+#[test]
+fn park_enters_safe_hold_when_destination_violates_workspace() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.workspace.as_mut().unwrap().max_reach_m = Some(0.15);
+    let (mut inner, _rig) = armed(cfg, rig_default());
+    inner.execute_stop(crate::StopPolicy::NormalUnload);
+    assert!(!inner.pending_normal_unload, "must not enter unload when resting pose is illegal");
+    assert!(inner.active_trajectory.is_none(), "must not install unsafe park trajectory");
+    assert!(inner.is_torqued, "must keep safe hold with torque on");
+}

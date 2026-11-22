@@ -933,8 +933,6 @@ fn default_replace_geoms() -> Vec<String> { vec!["palm".into(), "motor_housing".
 fn default_replace_equalities() -> Vec<String> { vec!["jaw_coupling".into()] }
 fn default_replace_actuators() -> Vec<String> { vec!["m7".into()] }
 fn default_scale_one() -> f64 { 1.0 }
-fn default_tcp_site() -> String { "tcp".into() }
-fn default_tcp_offset() -> [f64; 3] { [0.0, 0.0, 0.0] }
 fn default_suction_range() -> f64 { 0.030 }
 fn default_robot_name() -> String { "b601dm".into() }
 fn default_unit_mode() -> String { "rad".into() }
@@ -975,6 +973,7 @@ pub struct SceneManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolManifest {
     pub id: String,
     #[serde(default)]
@@ -1009,16 +1008,18 @@ pub struct ToolManifest {
     pub motor_to_joint_scale: f64,
     #[serde(default)]
     pub finger_geoms: Vec<String>,
-    #[serde(default = "default_tcp_site")]
-    pub tcp_site: String,
-    #[serde(default = "default_tcp_offset")]
-    pub tcp_offset: [f64; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_offset: Option<[f64; 3]>,
     #[serde(default = "default_suction_range")]
     pub suction_range_m: f64,
     #[serde(default)]
     pub io: Vec<serde_json::Value>,
     #[serde(default)]
     pub assets: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armd: Option<crate::tool::ArmdToolOverlay>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1154,24 +1155,493 @@ struct XmlEdit {
     replacement: String,
 }
 
-fn extract_children_xml(node: roxmltree::Node, raw_xml: &str, skip_site: Option<&str>) -> (String, Option<String>) {
+/// Resolve effective `tcp_offset` for `manifest`: stock `"default"` defaults to `[0, 0, 0]`,
+/// while any non-stock tool must explicitly declare `tcp_offset: [x, y, z]`.
+pub fn resolve_tool_tcp_offset(
+    manifest: &ToolManifest,
+    _tool_xml: Option<&str>,
+) -> Result<[f64; 3], String> {
+    let resolved = if manifest.id == crate::tool::STOCK_TOOL_ID {
+        manifest.tcp_offset.unwrap_or([0.0; 3])
+    } else {
+        manifest.tcp_offset.ok_or_else(|| {
+            format!(
+                "non-stock tool '{}' must declare explicit tcp_offset: [x, y, z]",
+                manifest.id
+            )
+        })?
+    };
+    crate::tool::validate_tcp_offset(&resolved)?;
+    Ok(resolved)
+}
+
+fn manifest_to_tool_pack(manifest: &ToolManifest, resolved_tcp: [f64; 3]) -> crate::tool::ToolPackConfig {
+    crate::tool::ToolPackConfig {
+        id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        kind: manifest.kind.clone(),
+        version: manifest.version.clone(),
+        description: manifest.description.clone(),
+        tool_xml: String::new(),
+        robots: manifest.robots.clone(),
+        attach_body: manifest.attach_body.clone(),
+        replace_bodies: manifest.replace_bodies.clone(),
+        replace_geoms: manifest.replace_geoms.clone(),
+        replace_equalities: manifest.replace_equalities.clone(),
+        replace_actuators: manifest.replace_actuators.clone(),
+        driven_joint: manifest.driven_joint.clone(),
+        coupled_joint: manifest.coupled_joint.clone(),
+        actuator: manifest.actuator.clone(),
+        motor_to_joint_scale: Some(manifest.motor_to_joint_scale),
+        finger_geoms: manifest.finger_geoms.clone(),
+        tcp_site: None,
+        tcp_offset: Some(resolved_tcp),
+        suction_range_m: Some(manifest.suction_range_m),
+        io: manifest.io.clone(),
+        assets: manifest.assets.clone(),
+        armd: manifest.armd.clone(),
+    }
+}
+
+/// Validate a [`ToolManifest`] against a specific robot profile using the same hardware merge
+/// rules as `armd --tool`.
+pub fn validate_tool_manifest_for_robot(
+    manifest: &ToolManifest,
+    tool_xml: Option<&str>,
+    robot_id: &str,
+) -> Result<[f64; 3], String> {
+    let resolved_tcp = validate_tool_manifest_independent(manifest, tool_xml)?;
+    let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
+    if manifest.id == crate::tool::STOCK_TOOL_ID {
+        if !manifest.robots.is_empty() {
+            let norm_target = crate::tool::normalize_robot_id(robot_id)
+                .ok_or_else(|| format!("unknown robot profile '{robot_id}'"))?;
+            let allowed = crate::tool::normalize_robot_list(&manifest.id, &manifest.robots)?;
+            if !allowed.contains(&norm_target) {
+                return Err(format!(
+                    "tool '{}': robot '{norm_target}' is not in supported robots {:?}",
+                    manifest.id, allowed
+                ));
+            }
+        }
+        return Ok(resolved_tcp);
+    }
+    let pack = manifest_to_tool_pack(manifest, resolved_tcp);
+    crate::tool::apply_tool_overlay(&base, &pack)?;
+    Ok(resolved_tcp)
+}
+
+fn validate_tool_manifest_independent(
+    manifest: &ToolManifest,
+    tool_xml: Option<&str>,
+) -> Result<[f64; 3], String> {
+    if !crate::model::valid_tool_id(&manifest.id) {
+        return Err("tool id must be 1..64 characters of A-Z, a-z, 0-9, _, -, .".into());
+    }
+    if !crate::tool::is_valid_tool_kind(&manifest.kind) {
+        return Err(format!(
+            "tool '{}' has unsupported kind '{}': must be one of gripper, suction, screwdriver",
+            manifest.id, manifest.kind
+        ));
+    }
+    crate::tool::validate_attach_body(&manifest.attach_body)?;
+
+    if manifest.id == crate::tool::STOCK_TOOL_ID {
+        if manifest.kind != "gripper" {
+            return Err("reserved tool id 'default' must have kind 'gripper'".into());
+        }
+        if tool_xml.is_some_and(|x| !x.trim().is_empty()) {
+            return Err("reserved tool id 'default' cannot carry custom tool_xml".into());
+        }
+        if manifest.tcp_offset.is_some_and(|o| o != [0.0; 3]) {
+            return Err("reserved tool id 'default' cannot override tcp_offset".into());
+        }
+        if manifest.tcp_site.as_deref().is_some_and(|s| s.trim() != "tcp") {
+            return Err("reserved tool id 'default' cannot override tcp_site".into());
+        }
+        if manifest.armd.is_some() {
+            return Err("reserved tool id 'default' cannot carry an 'armd' overlay block".into());
+        }
+    }
+
+    let resolved_tcp = resolve_tool_tcp_offset(manifest, tool_xml)?;
+    if manifest.id == crate::tool::STOCK_TOOL_ID && resolved_tcp != [0.0; 3] {
+        return Err("reserved tool id 'default' cannot resolve a non-zero tcp_offset".into());
+    }
+
+    if let Some(a) = manifest.armd.as_ref() {
+        if manifest.kind != "gripper" && (a.gripper_policy.is_some() || a.grasp.is_some()) {
+            return Err(format!(
+                "tool '{}' with kind '{}' cannot specify armd.gripper_policy or armd.grasp",
+                manifest.id, manifest.kind
+            ));
+        }
+        crate::tool::validate_check_points_f64(
+            &a.extra_check_points_end_m,
+            "armd.extra_check_points_end_m",
+        )?;
+        if let Some(pc) = &a.physical_contact_end_m {
+            crate::tool::validate_physical_contact_end_m(pc, "armd.physical_contact_end_m")?;
+        }
+        if let Some(co) = a.contact_opening_m {
+            crate::tool::validate_contact_opening_m(co, "armd.contact_opening_m")?;
+        }
+        if let Some(gr) = &a.grasp {
+            gr.validate()?;
+        }
+    }
+
+    Ok(resolved_tcp)
+}
+
+/// Validate a [`ToolManifest`] (and optional `tool_xml`) for kind, attachment body, reserved
+/// `"default"` identity, TCP resolution, and typed `armd` overlay bounds.
+pub fn validate_tool_manifest(
+    manifest: &ToolManifest,
+    tool_xml: Option<&str>,
+) -> Result<[f64; 3], String> {
+    let resolved_tcp = validate_tool_manifest_independent(manifest, tool_xml)?;
+
+    if manifest.id == crate::tool::STOCK_TOOL_ID {
+        for raw in &manifest.robots {
+            crate::tool::baseline_arm_config_for_robot(raw)?;
+        }
+        return Ok(resolved_tcp);
+    }
+
+    let pack = manifest_to_tool_pack(manifest, resolved_tcp);
+    if manifest.robots.is_empty() {
+        const SUPPORTED_ROBOTS: [&str; 4] = ["b601dm", "so101", "so100", "b601rs"];
+        let mut last_err = None;
+        let mut any_ok = false;
+        for robot_id in SUPPORTED_ROBOTS {
+            let base = crate::tool::baseline_arm_config_for_robot(robot_id)?;
+            match crate::tool::apply_tool_overlay(&base, &pack) {
+                Ok(_) => {
+                    any_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    if last_err.is_none() {
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        if !any_ok {
+            return Err(last_err.unwrap_or_else(|| "tool overlay failed on all robot baselines".into()));
+        }
+    } else {
+        for raw in &manifest.robots {
+            let base = crate::tool::baseline_arm_config_for_robot(raw)?;
+            crate::tool::apply_tool_overlay(&base, &pack)?;
+        }
+    }
+
+    Ok(resolved_tcp)
+}
+
+fn parse_mjcf_floats<const N: usize>(raw: &str, err_msg: &str, float_label: &str) -> Result<[f64; N], String> {
+    let vals: Vec<f64> = raw
+        .split_whitespace()
+        .map(|s| s.parse::<f64>().map_err(|e| format!("invalid {float_label} float '{s}': {e}")))
+        .collect::<Result<_, _>>()?;
+    if vals.len() != N || !vals.iter().all(|v| v.is_finite()) {
+        return Err(err_msg.to_string());
+    }
+    Ok(vals.try_into().expect("checked length"))
+}
+
+fn parse_mjcf_vec3(raw: &str, label: &str) -> Result<[f64; 3], String> {
+    parse_mjcf_floats::<3>(
+        raw,
+        &format!("base MJCF <site name=\"tcp\"> {label} must have 3 finite numbers"),
+        label,
+    )
+}
+
+fn fmt_mjcf_num(v: f64) -> f64 {
+    if v == 0.0 { 0.0 } else { v }
+}
+
+fn parse_mjcf_compiler_euler(doc: &roxmltree::Document) -> Result<(f64, String), String> {
+    let mut angle_scale = std::f64::consts::PI / 180.0; // MuJoCo default: degree
+    let mut eulerseq = "xyz".to_string(); // MuJoCo default: xyz (intrinsic)
+    for node in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "compiler") {
+        if let Some(a) = node.attribute("angle") {
+            match a.trim() {
+                "degree" => angle_scale = std::f64::consts::PI / 180.0,
+                "radian" => angle_scale = 1.0,
+                other => return Err(format!("base MJCF <compiler> uses unsupported angle unit '{other}'")),
+            }
+        }
+        if let Some(seq) = node.attribute("eulerseq") {
+            eulerseq = seq.trim().to_string();
+        }
+    }
+    let bytes = eulerseq.as_bytes();
+    let all_lower = bytes.len() == 3 && bytes.iter().all(|b| matches!(b, b'x' | b'y' | b'z'));
+    let all_upper = bytes.len() == 3 && bytes.iter().all(|b| matches!(b, b'X' | b'Y' | b'Z'));
+    if !(all_lower || all_upper) || bytes[0] == bytes[1] || bytes[1] == bytes[2] {
+        return Err(format!("base MJCF <compiler> uses unsupported eulerseq '{eulerseq}'"));
+    }
+    Ok((angle_scale, eulerseq))
+}
+
+fn axis_rot(axis: u8, angle_rad: f64) -> crate::kinematics::Mat3 {
+    let (c, s) = (angle_rad.cos(), angle_rad.sin());
+    match axis.to_ascii_lowercase() {
+        b'x' => [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+        b'y' => [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+        b'z' => [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+        _ => crate::kinematics::IDENTITY,
+    }
+}
+
+fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<crate::kinematics::Mat3, String> {
+    if let Some(q_raw) = node.attribute("quat") {
+        let vals = parse_mjcf_floats::<4>(
+            q_raw,
+            "base MJCF <site name=\"tcp\"> quat must have 4 finite numbers",
+            "tcp site quat",
+        )?;
+        let norm = (vals[0] * vals[0] + vals[1] * vals[1] + vals[2] * vals[2] + vals[3] * vals[3]).sqrt();
+        if norm <= 1e-12 {
+            return Err("base MJCF <site name=\"tcp\"> quat has zero norm".into());
+        }
+        let (w, x, y, z) = (vals[0] / norm, vals[1] / norm, vals[2] / norm, vals[3] / norm);
+        return Ok([
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]);
+    }
+    if let Some(e_raw) = node.attribute("euler") {
+        let vals = parse_mjcf_vec3(e_raw, "euler")?;
+        let (scale, seq) = parse_mjcf_compiler_euler(doc)?;
+        let b = seq.as_bytes();
+        let r0 = axis_rot(b[0], vals[0] * scale);
+        let r1 = axis_rot(b[1], vals[1] * scale);
+        let r2 = axis_rot(b[2], vals[2] * scale);
+        // MuJoCo convention: lowercase = intrinsic (R0 * R1 * R2), uppercase = extrinsic (R2 * R1 * R0).
+        return Ok(if b[0].is_ascii_lowercase() {
+            crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r0, &r1), &r2)
+        } else {
+            crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r2, &r1), &r0)
+        });
+    }
+    for unsupported in ["axisangle", "xyaxes", "zaxis"] {
+        if node.attribute(unsupported).is_some() {
+            return Err(format!(
+                "base MJCF <site name=\"tcp\"> uses unsupported orientation attribute '{unsupported}'"
+            ));
+        }
+    }
+    Ok(crate::kinematics::IDENTITY)
+}
+
+fn trimmed_attr<'a>(node: roxmltree::Node<'a, 'a>, attr: &str) -> Option<&'a str> {
+    node.attribute(attr).map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn non_main_class<'a>(node: roxmltree::Node<'a, 'a>, attr: &str) -> Option<&'a str> {
+    trimmed_attr(node, attr).filter(|s| *s != "main")
+}
+
+fn tcp_site_host_body_name<'a>(node: roxmltree::Node<'a, 'a>) -> Result<&'a str, String> {
+    if node
+        .ancestors()
+        .skip(1)
+        .any(|a| a.is_element() && a.tag_name().name() == "frame")
+    {
+        return Err(
+            "base MJCF <site name=\"tcp\"> inside unsupported <frame> ancestor; declare <site name=\"tcp\"> directly inside its host <body>"
+                .into(),
+        );
+    }
+    let host_body = node
+        .ancestors()
+        .skip(1)
+        .find(|a| a.is_element() && a.tag_name().name() == "body")
+        .ok_or_else(|| {
+            "base MJCF <site name=\"tcp\"> has no host <body> ancestor; declare <site name=\"tcp\"> directly inside a named host <body>".to_string()
+        })?;
+    trimmed_attr(host_body, "name").ok_or_else(|| {
+        "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
+            .to_string()
+    })
+}
+
+fn check_tcp_site_supported<'a>(
+    doc: &'a roxmltree::Document,
+    node: roxmltree::Node<'a, 'a>,
+) -> Result<&'a str, String> {
+    let host_name = tcp_site_host_body_name(node)?;
+    if node.attribute("fromto").is_some() {
+        return Err("base MJCF <site name=\"tcp\"> uses unsupported 'fromto' attribute".into());
+    }
+    let raw_explicit_class = trimmed_attr(node, "class");
+    if let Some(cls) = raw_explicit_class.filter(|s| *s != "main") {
+        return Err(format!(
+            "base MJCF <site name=\"tcp\"> uses unsupported class '{cls}'"
+        ));
+    }
+    // Explicit class="main" on <site name="tcp"> overrides any ancestor childclass;
+    // otherwise take the nearest ancestor's childclass (stopping at childclass="main").
+    let effective_class = if raw_explicit_class == Some("main") {
+        None
+    } else {
+        node.ancestors()
+            .skip(1)
+            .find_map(|a| a.is_element().then(|| trimmed_attr(a, "childclass")).flatten())
+            .filter(|s| *s != "main")
+    };
+    const TRANSFORM_ATTRS: [&str; 7] =
+        ["pos", "quat", "euler", "axisangle", "xyaxes", "zaxis", "fromto"];
+    for def in doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "default")
+    {
+        let has_site_transform = def.children().any(|c| {
+            c.is_element()
+                && c.tag_name().name() == "site"
+                && TRANSFORM_ATTRS.iter().any(|k| c.attribute(*k).is_some())
+        });
+        if !has_site_transform {
+            continue;
+        }
+        let def_class = non_main_class(def, "class");
+        let is_unscoped_default = def_class.is_none()
+            && !def.ancestors().skip(1).any(|a| {
+                a.is_element()
+                    && a.tag_name().name() == "default"
+                    && non_main_class(a, "class").is_some()
+            });
+        let matches_effective = effective_class.is_some_and(|ec| {
+            def.descendants().any(|d| {
+                d.is_element()
+                    && d.tag_name().name() == "default"
+                    && non_main_class(d, "class") == Some(ec)
+            })
+        });
+        if is_unscoped_default || matches_effective {
+            return Err(format!(
+                "base MJCF <site name=\"tcp\"> inherits unsupported <default> <site> transform (class {:?})",
+                def_class.unwrap_or("main")
+            ));
+        }
+    }
+    Ok(host_name)
+}
+
+fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
+    let req = requested.trim();
+    if req.is_empty() || req == "end_link" {
+        if let Some(site) = base_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+        {
+            return Ok(tcp_site_host_body_name(site)?.to_string());
+        }
+        if base_doc
+            .descendants()
+            .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some("end_link"))
+        {
+            return Ok("end_link".to_string());
+        }
+    } else if base_doc
+        .descendants()
+        .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(req))
+    {
+        return Ok(req.to_string());
+    }
+    let label = if req.is_empty() { "end_link" } else { req };
+    Err(format!("Could not find attach body <body name=\"{label}\"> in base XML"))
+}
+
+fn find_xml_attr_value_span(tag_xml: &str, attr_name: &str) -> Option<(usize, usize)> {
+    let bytes = tag_xml.as_bytes();
+    let mut i = 0;
+    if bytes.get(i) != Some(&b'<') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/' {
+        i += 1;
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'>' || bytes[i] == b'/' {
+            break;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &tag_xml[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let Some(&quote) = bytes.get(i) else { break };
+        if quote != b'"' && quote != b'\'' {
+            break;
+        }
+        i += 1;
+        let val_start = i;
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let val_end = i;
+        i += 1;
+        if name == attr_name {
+            return Some((val_start, val_end));
+        }
+    }
+    None
+}
+
+fn extract_children_xml(
+    node: roxmltree::Node,
+    raw_xml: &str,
+    skip_range: Option<std::ops::Range<usize>>,
+) -> String {
     let mut out = String::new();
-    let mut site_pos = None;
     for child in node.children() {
         if child.is_element() {
-            if let Some(sname) = skip_site {
-                if child.tag_name().name() == "site" && child.attribute("name") == Some(sname) {
-                    if let Some(pos) = child.attribute("pos") {
-                        site_pos = Some(pos.to_string());
+            let r = child.range();
+            if let Some(ref sr) = skip_range {
+                if sr.start >= r.start && sr.end <= r.end {
+                    if sr.start == r.start && sr.end == r.end {
+                        continue;
                     }
+                    out.push_str(&raw_xml[r.start..sr.start]);
+                    out.push_str(&raw_xml[sr.end..r.end]);
+                    out.push('\n');
                     continue;
                 }
             }
-            out.push_str(&raw_xml[child.range()]);
+            out.push_str(&raw_xml[r]);
             out.push('\n');
         }
     }
-    (out, site_pos)
+    out
 }
 
 fn find_free_body_names(doc: &roxmltree::Document) -> Vec<String> {
@@ -1205,52 +1675,100 @@ fn count_doc_elements_and_check_forbidden(
     Ok(counts)
 }
 
-pub fn compose_mjcf_checked(
+#[derive(Default)]
+struct MjcfSections {
+    worldbody: String,
+    asset: String,
+    equality: String,
+    actuator: String,
+    tendon: String,
+}
+
+fn extract_mjcf_sections(
+    doc: &roxmltree::Document,
+    raw_xml: &str,
+    worldbody_skip: Option<std::ops::Range<usize>>,
+) -> MjcfSections {
+    let mut sections = MjcfSections::default();
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "worldbody" => sections
+                .worldbody
+                .push_str(&extract_children_xml(node, raw_xml, worldbody_skip.clone())),
+            "asset" => sections
+                .asset
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "equality" => sections
+                .equality
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "actuator" => sections
+                .actuator
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "tendon" => sections
+                .tendon
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            _ => {}
+        }
+    }
+    sections
+}
+
+fn find_active_tcp_site<'a>(
+    doc: &'a roxmltree::Document,
+    edits: &[XmlEdit],
+) -> Option<roxmltree::Node<'a, 'a>> {
+    doc.descendants().find(|n| {
+        n.is_element()
+            && n.tag_name().name() == "site"
+            && n.attribute("name") == Some("tcp")
+            && !edits
+                .iter()
+                .any(|e| e.replacement.is_empty() && n.range().start >= e.start && n.range().end <= e.end)
+    })
+}
+
+fn parse_site_pos_and_rot(
+    doc: &roxmltree::Document,
+    node: roxmltree::Node,
+) -> Result<([f64; 3], crate::kinematics::Mat3), String> {
+    let base_pos = match node.attribute("pos") {
+        Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+        None => [0.0; 3],
+    };
+    let r_site = parse_mjcf_site_rotation(doc, node)?;
+    Ok((base_pos, r_site))
+}
+
+pub fn compose_mjcf(
     base_xml: &str,
     scene_world_xml: Option<&str>,
     tool_manifest: Option<&ToolManifest>,
     tool_xml: Option<&str>,
-) -> Result<String, PackValidationError> {
+) -> Result<String, String> {
     let base_doc = roxmltree::Document::parse(base_xml)
-        .map_err(|e| PackValidationError::InvalidPack(format!("Base MJCF is invalid XML: {e}")))?;
+        .map_err(|e| format!("Base MJCF is invalid XML: {e}"))?;
 
-    let scene_doc = if let Some(s) = scene_world_xml {
-        if !s.trim().is_empty() {
-            Some(
-                roxmltree::Document::parse(s)
-                    .map_err(|e| PackValidationError::InvalidPack(format!("Scene world XML is invalid: {e}")))?,
-            )
-        } else {
-            None
-        }
-    } else {
-        None
+    let scene_doc = match scene_world_xml.filter(|s| !s.trim().is_empty()) {
+        Some(s) => Some(roxmltree::Document::parse(s).map_err(|e| format!("Scene world XML is invalid: {e}"))?),
+        None => None,
     };
 
-    let tool_doc = if let Some(t) = tool_xml {
-        if !t.trim().is_empty() {
-            Some(
-                roxmltree::Document::parse(t)
-                    .map_err(|e| PackValidationError::InvalidPack(format!("Tool XML is invalid: {e}")))?,
-            )
-        } else {
-            None
-        }
-    } else {
-        None
+    let tool_doc = match tool_xml.filter(|t| !t.trim().is_empty()) {
+        Some(t) => Some(roxmltree::Document::parse(t).map_err(|e| format!("Tool XML is invalid: {e}"))?),
+        None => None,
     };
 
     let scene_counts = if let Some(ref sd) = scene_doc {
-        count_doc_elements_and_check_forbidden(sd, "scene XML")?
+        count_doc_elements_and_check_forbidden(sd, "scene XML").map_err(|e| e.to_string())?
     } else {
         XmlElementCounts::default()
     };
     let tool_counts = if let Some(ref td) = tool_doc {
-        count_doc_elements_and_check_forbidden(td, "tool XML")?
+        count_doc_elements_and_check_forbidden(td, "tool XML").map_err(|e| e.to_string())?
     } else {
         XmlElementCounts::default()
     };
-    check_element_budgets(scene_counts.add(tool_counts), "combined scene + tool packs")?;
+    check_element_budgets(scene_counts.add(tool_counts), "combined scene + tool packs").map_err(|e| e.to_string())?;
 
     let mut edits: Vec<XmlEdit> = Vec::new();
 
@@ -1267,168 +1785,181 @@ pub fn compose_mjcf_checked(
         }
     }
 
+    if let Some(tm) = tool_manifest {
+        validate_tool_manifest(tm, tool_xml)?;
+    }
+
     // 2. Tool elements to remove & inject
-    let is_tool_active = tool_manifest.is_some()
-        && tool_manifest.map(|m| m.id.as_str()) != Some("default")
-        && tool_doc.is_some();
+    let is_non_stock_tool = tool_manifest.is_some_and(|m| m.id.as_str() != crate::tool::STOCK_TOOL_ID);
+    let is_tool_active = is_non_stock_tool && tool_doc.is_some();
 
-    let mut tool_worldbody_xml = String::new();
-    let mut tool_asset_xml = String::new();
-    let mut tool_equality_xml = String::new();
-    let mut tool_actuator_xml = String::new();
-    let mut tool_tendon_xml = String::new();
-    let mut tool_tcp_pos = None;
+    let mut tool_sections = MjcfSections::default();
+    let mut resolved_attach_body: Option<String> = None;
 
-    if is_tool_active {
-        let tm = tool_manifest.unwrap();
-        let td = tool_doc.as_ref().unwrap();
+    if let Some(tm) = tool_manifest.filter(|_| is_non_stock_tool) {
+        let resolved_tcp = resolve_tool_tcp_offset(tm, tool_xml)?;
+        let mut skip_range = None;
+        let mut cached_tcp_site: Option<(roxmltree::Node, &str, [f64; 3], crate::kinematics::Mat3)> = None;
 
-        // Extract tool sections
-        for node in td.descendants() {
-            if node.is_element() {
-                match node.tag_name().name() {
-                    "worldbody" => {
-                        let (wb, pos) = extract_children_xml(node, tool_xml.unwrap(), Some(&tm.tcp_site));
-                        tool_worldbody_xml.push_str(&wb);
-                        if pos.is_some() {
-                            tool_tcp_pos = pos;
-                        }
-                    }
-                    "asset" => {
-                        let (a, _) = extract_children_xml(node, tool_xml.unwrap(), None);
-                        tool_asset_xml.push_str(&a);
-                    }
-                    "equality" => {
-                        let (eq, _) = extract_children_xml(node, tool_xml.unwrap(), None);
-                        tool_equality_xml.push_str(&eq);
-                    }
-                    "actuator" => {
-                        let (act, _) = extract_children_xml(node, tool_xml.unwrap(), None);
-                        tool_actuator_xml.push_str(&act);
-                    }
-                    "tendon" => {
-                        let (ten, _) = extract_children_xml(node, tool_xml.unwrap(), None);
-                        tool_tendon_xml.push_str(&ten);
-                    }
-                    _ => {}
+        if let (Some(td), Some(raw_tool_xml)) = (tool_doc.as_ref(), tool_xml) {
+            let site_name = tm.tcp_site.as_deref().unwrap_or("tcp");
+            skip_range = if site_name.trim().is_empty() {
+                None
+            } else {
+                td.descendants()
+                    .find(|n| {
+                        n.is_element()
+                            && n.tag_name().name() == "site"
+                            && n.attribute("name") == Some(site_name)
+                    })
+                    .map(|n| n.range())
+            };
+            tool_sections = extract_mjcf_sections(td, raw_tool_xml, skip_range.clone());
+
+            // Delete replaced bodies, geoms, equalities, actuators
+            for node in base_doc.descendants().filter(|n| n.is_element()) {
+                let tag = node.tag_name().name();
+                let name = node.attribute("name").unwrap_or("");
+                let should_delete = (tag == "body" && tm.replace_bodies.iter().any(|b| b == name))
+                    || (tag == "geom" && tm.replace_geoms.iter().any(|g| g == name))
+                    || (node.parent().map(|p| p.tag_name().name()) == Some("equality")
+                        && tm.replace_equalities.iter().any(|eq| eq == name))
+                    || (node.parent().map(|p| p.tag_name().name()) == Some("actuator")
+                        && tm.replace_actuators.iter().any(|act| act == name));
+
+                if should_delete {
+                    edits.push(XmlEdit {
+                        start: node.range().start,
+                        end: node.range().end,
+                        replacement: String::new(),
+                    });
                 }
             }
-        }
 
-        // Delete replaced bodies, geoms, equalities, actuators
-        for node in base_doc.descendants() {
-            if !node.is_element() {
-                continue;
-            }
-            let tag = node.tag_name().name();
-            let name = node.attribute("name").unwrap_or("");
-            let should_delete = (tag == "body" && tm.replace_bodies.iter().any(|b| b == name))
-                || (tag == "geom" && tm.replace_geoms.iter().any(|g| g == name))
-                || (node.parent().map(|p| p.tag_name().name()) == Some("equality")
-                    && tm.replace_equalities.iter().any(|eq| eq == name))
-                || (node.parent().map(|p| p.tag_name().name()) == Some("actuator")
-                    && tm.replace_actuators.iter().any(|act| act == name));
-
-            if should_delete {
+            // Insert tool worldbody children inside resolved attach_body (e.g. `end_link` or SO-101's `gripper`).
+            // If the attach body's `<site name="tcp">` has a non-zero zero-offset pos or non-identity orientation,
+            // wrap the tool worldbody XML in `<body name="__tool_mount_frame" pos="..." quat="...">` so tool
+            // geometries declared relative to tool mount origin keep their exact pose relative to `<site name="tcp">`.
+            if !tool_sections.worldbody.is_empty() {
+                let attach_name = resolve_attach_body_name(&base_doc, &tm.attach_body)?;
+                resolved_attach_body = Some(attach_name.clone());
+                let mount_wrapped_xml = if let Some(site_node) = find_active_tcp_site(&base_doc, &edits) {
+                    let site_host = check_tcp_site_supported(&base_doc, site_node)?;
+                    if site_host == attach_name {
+                        let (base_pos, r_site) = parse_site_pos_and_rot(&base_doc, site_node)?;
+                        cached_tcp_site = Some((site_node, site_host, base_pos, r_site));
+                        let has_pos = base_pos.iter().any(|v| v.abs() > 1e-12);
+                        let has_rot = (0..3).any(|r| {
+                            (0..3).any(|c| (r_site[r][c] - crate::kinematics::IDENTITY[r][c]).abs() > 1e-9)
+                        });
+                        if has_pos || has_rot {
+                            let q = crate::kinematics::r_to_quat(&r_site);
+                            format!(
+                                "<body name=\"__tool_mount_frame\" pos=\"{} {} {}\" quat=\"{} {} {} {}\">\n{}</body>",
+                                fmt_mjcf_num(base_pos[0]),
+                                fmt_mjcf_num(base_pos[1]),
+                                fmt_mjcf_num(base_pos[2]),
+                                fmt_mjcf_num(q[0]),
+                                fmt_mjcf_num(q[1]),
+                                fmt_mjcf_num(q[2]),
+                                fmt_mjcf_num(q[3]),
+                                tool_sections.worldbody
+                            )
+                        } else {
+                            tool_sections.worldbody.clone()
+                        }
+                    } else {
+                        tool_sections.worldbody.clone()
+                    }
+                } else {
+                    tool_sections.worldbody.clone()
+                };
+                let attach_node = base_doc
+                    .descendants()
+                    .find(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(attach_name.as_str()));
+                let insert_pos = attach_node.and_then(|node| {
+                    let range = node.range();
+                    base_xml[range.clone()].rfind("</body").map(|idx| range.start + idx)
+                });
+                let Some(insert_pos) = insert_pos else {
+                    return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
+                };
                 edits.push(XmlEdit {
-                    start: node.range().start,
-                    end: node.range().end,
-                    replacement: String::new(),
+                    start: insert_pos,
+                    end: insert_pos,
+                    replacement: format!("\n{}\n", mount_wrapped_xml),
                 });
             }
         }
 
-        // Insert tool worldbody children inside <body name="{attach_body}">
-        let attach_name = &tm.attach_body;
-        let mut attached = false;
-        for node in base_doc.descendants() {
-            if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name) {
-                let range = node.range();
-                let slice = &base_xml[range.clone()];
-                if let Some(close_idx) = slice.rfind("</body") {
-                    let insert_pos = range.start + close_idx;
-                    edits.push(XmlEdit {
-                        start: insert_pos,
-                        end: insert_pos,
-                        replacement: format!("\n{}\n", tool_worldbody_xml),
-                    });
-                    attached = true;
-                    break;
-                }
-            }
-        }
-        if !attached && !tool_worldbody_xml.is_empty() {
-            return Err(PackValidationError::InvalidPack(format!(
-                "Could not find attach body <body name=\"{attach_name}\"> in base XML"
-            )));
-        }
-
-        // Update TCP site pos if specified
-        let tcp_override = if tm.tcp_offset != [0.0, 0.0, 0.0] {
-            Some(format!("{} {} {}", tm.tcp_offset[0], tm.tcp_offset[1], tm.tcp_offset[2]))
-        } else {
-            tool_tcp_pos
-        };
-
-        if let Some(pos_val) = tcp_override {
-            for node in base_doc.descendants() {
-                if node.is_element() && node.tag_name().name() == "site" && node.attribute("name") == Some("tcp") {
-                    let range = node.range();
-                    let site_str = &base_xml[range.clone()];
-                    if let Some(pos_idx) = site_str.find("pos=\"") {
-                        let after = &site_str[pos_idx + 5..];
-                        if let Some(end_quote) = after.find('"') {
-                            let start = range.start + pos_idx + 5;
-                            let end = start + end_quote;
-                            edits.push(XmlEdit {
-                                start,
-                                end,
-                                replacement: pos_val,
-                            });
-                            break;
-                        }
-                    }
-                }
+        // Update base TCP site pos relative to the base site's zero-offset pose
+        // (p_tcp = p_base_site + R_base_site * tcp_offset), preserving base pose for [0, 0, 0].
+        if tm.tcp_offset.is_some() || skip_range.is_some() {
+            let (site_node, composed_pos) = if let Some((node, _, base_pos, r_site)) = cached_tcp_site {
+                let pos = if resolved_tcp == [0.0; 3] {
+                    base_pos
+                } else {
+                    crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+                };
+                (node, pos)
+            } else {
+                let node = find_active_tcp_site(&base_doc, &edits).ok_or_else(|| {
+                    "Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".to_string()
+                })?;
+                check_tcp_site_supported(&base_doc, node)?;
+                let base_pos = match node.attribute("pos") {
+                    Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+                    None => [0.0; 3],
+                };
+                let pos = if resolved_tcp == [0.0; 3] {
+                    base_pos
+                } else {
+                    let r_site = parse_mjcf_site_rotation(&base_doc, node)?;
+                    crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+                };
+                (node, pos)
+            };
+            let pos_val = format!(
+                "{} {} {}",
+                fmt_mjcf_num(composed_pos[0]),
+                fmt_mjcf_num(composed_pos[1]),
+                fmt_mjcf_num(composed_pos[2])
+            );
+            let range = site_node.range();
+            let site_str = &base_xml[range.clone()];
+            if let Some((val_start, val_end)) = find_xml_attr_value_span(site_str, "pos") {
+                edits.push(XmlEdit {
+                    start: range.start + val_start,
+                    end: range.start + val_end,
+                    replacement: pos_val,
+                });
+            } else if let Some((_, name_end)) = find_xml_attr_value_span(site_str, "name") {
+                let insert_pos = range.start + name_end + 1;
+                edits.push(XmlEdit {
+                    start: insert_pos,
+                    end: insert_pos,
+                    replacement: format!(" pos=\"{pos_val}\""),
+                });
+            } else {
+                return Err("Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".into());
             }
         }
     }
 
     // 3. Extract scene sections
-    let mut scene_worldbody_xml = String::new();
-    let mut scene_asset_xml = String::new();
-    let mut scene_equality_xml = String::new();
-    let mut scene_actuator_xml = String::new();
-    let mut scene_tendon_xml = String::new();
-
-    if let Some(sd) = scene_doc.as_ref() {
-        for node in sd.descendants() {
-            if node.is_element() {
-                match node.tag_name().name() {
-                    "worldbody" => {
-                        let (wb, _) = extract_children_xml(node, scene_world_xml.unwrap(), None);
-                        scene_worldbody_xml.push_str(&wb);
-                    }
-                    "asset" => {
-                        let (a, _) = extract_children_xml(node, scene_world_xml.unwrap(), None);
-                        scene_asset_xml.push_str(&a);
-                    }
-                    "equality" => {
-                        let (eq, _) = extract_children_xml(node, scene_world_xml.unwrap(), None);
-                        scene_equality_xml.push_str(&eq);
-                    }
-                    "actuator" => {
-                        let (act, _) = extract_children_xml(node, scene_world_xml.unwrap(), None);
-                        scene_actuator_xml.push_str(&act);
-                    }
-                    "tendon" => {
-                        let (ten, _) = extract_children_xml(node, scene_world_xml.unwrap(), None);
-                        scene_tendon_xml.push_str(&ten);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
+    let scene_sections = scene_doc
+        .as_ref()
+        .map(|sd| extract_mjcf_sections(sd, scene_world_xml.unwrap(), None))
+        .unwrap_or_default();
+    let scene_worldbody_xml = scene_sections.worldbody;
+    let scene_asset_xml = scene_sections.asset;
+    let scene_equality_xml = scene_sections.equality;
+    let scene_actuator_xml = scene_sections.actuator;
+    let scene_tendon_xml = scene_sections.tendon;
+    let tool_asset_xml = tool_sections.asset;
+    let tool_equality_xml = tool_sections.equality;
+    let tool_actuator_xml = tool_sections.actuator;
+    let tool_tendon_xml = tool_sections.tendon;
 
     // 4. Inject scene worldbody before </worldbody>
     if !scene_worldbody_xml.is_empty() {
@@ -1452,17 +1983,22 @@ pub fn compose_mjcf_checked(
     // 5. Suction tool weld injection
     let mut suction_welds_xml = String::new();
     if is_tool_active && tool_manifest.unwrap().kind == "suction" {
-        let attach_name = &tool_manifest.unwrap().attach_body;
         let mut free_bodies = Vec::new();
         if let Some(sd) = scene_doc.as_ref() {
             free_bodies.extend(find_free_body_names(sd));
         } else {
             free_bodies.extend(find_free_body_names(&base_doc));
         }
-        for (i, bname) in free_bodies.iter().enumerate() {
-            suction_welds_xml.push_str(&format!(
-                "    <weld name=\"suction_weld_{i}_{bname}\" body1=\"{attach_name}\" body2=\"{bname}\" active=\"false\" solref=\"0.02 1\" solimp=\"0.9 0.95 0.001 0.5 2\"/>\n"
-            ));
+        if !free_bodies.is_empty() {
+            let attach_name = match resolved_attach_body.as_deref() {
+                Some(name) => name.to_string(),
+                None => resolve_attach_body_name(&base_doc, &tool_manifest.unwrap().attach_body)?,
+            };
+            for (i, bname) in free_bodies.iter().enumerate() {
+                suction_welds_xml.push_str(&format!(
+                    "    <weld name=\"suction_weld_{i}_{bname}\" body1=\"{attach_name}\" body2=\"{bname}\" active=\"false\" solref=\"0.02 1\" solimp=\"0.9 0.95 0.001 0.5 2\"/>\n"
+                ));
+            }
         }
     }
 
@@ -1620,19 +2156,20 @@ pub fn compose_mjcf_checked(
 
     // Validation: verify valid XML document
     roxmltree::Document::parse(&composed)
-        .map_err(|e| PackValidationError::InvalidPack(format!("Composed MJCF failed XML validation: {e}")))?;
+        .map_err(|e| format!("Composed MJCF failed XML validation: {e}"))?;
 
     Ok(composed)
 }
 
-pub fn compose_mjcf(
+/// [`compose_mjcf`] with its errors (forbidden constructs, element budgets, composition
+/// failures) reported as [`PackValidationError::InvalidPack`].
+pub fn compose_mjcf_checked(
     base_xml: &str,
     scene_world_xml: Option<&str>,
     tool_manifest: Option<&ToolManifest>,
     tool_xml: Option<&str>,
-) -> Result<String, String> {
-    compose_mjcf_checked(base_xml, scene_world_xml, tool_manifest, tool_xml)
-        .map_err(|e| e.to_string())
+) -> Result<String, PackValidationError> {
+    compose_mjcf(base_xml, scene_world_xml, tool_manifest, tool_xml).map_err(PackValidationError::InvalidPack)
 }
 
 pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {
@@ -1658,11 +2195,12 @@ pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {
             actuator: Some("m7".into()),
             motor_to_joint_scale: 1.0,
             finger_geoms: vec!["left_front".into(), "right_front".into()],
-            tcp_site: "tcp".into(),
-            tcp_offset: [0.0, 0.0, 0.0],
+            tcp_site: None,
+            tcp_offset: None,
             suction_range_m: 0.030,
             io: vec![],
             assets: vec![],
+            armd: None,
         };
         return Some((manifest, ""));
     }
@@ -1686,14 +2224,15 @@ pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {
             actuator: Some("m7_suction".into()),
             motor_to_joint_scale: -0.007456140350877194,
             finger_geoms: vec![],
-            tcp_site: "tcp".into(),
-            tcp_offset: [0.0, 0.0, 0.0],
+            tcp_site: None,
+            tcp_offset: Some([0.0, 0.0, 0.0]),
             suction_range_m: 0.030,
             io: vec![
                 serde_json::json!({"name": "vacuum", "kind": "bool", "direction": "output", "default": false}),
                 serde_json::json!({"name": "vacuum_engaged", "kind": "bool", "direction": "input", "default": false}),
             ],
             assets: vec![],
+            armd: None,
         };
         return Some((manifest, PRESET_SUCTION_XML));
     }
@@ -1717,13 +2256,14 @@ pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {
             actuator: Some("m7_spindle".into()),
             motor_to_joint_scale: 1.0,
             finger_geoms: vec![],
-            tcp_site: "tcp".into(),
-            tcp_offset: [0.0, 0.0, 0.0],
+            tcp_site: None,
+            tcp_offset: Some([0.0, 0.0, 0.0]),
             suction_range_m: 0.030,
             io: vec![
                 serde_json::json!({"name": "spindle_rpm", "kind": "float", "direction": "output", "default": 0.0}),
             ],
             assets: vec![],
+            armd: None,
         };
         return Some((manifest, PRESET_SCREWDRIVER_XML));
     }
@@ -1733,4 +2273,483 @@ pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {
 
 pub fn default_tool_manifest() -> ToolManifest {
     builtin_tool_preset("default").expect("built-in default tool").0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_manifest_preserves_armd_block_across_roundtrip() {
+        let json = serde_json::json!({
+            "id": "soft_finray_gripper",
+            "name": "Soft FinRay",
+            "kind": "gripper",
+            "version": "1.0.0",
+            "tool_xml": "tool.xml",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.0288, 0.0, 0.0],
+            "armd": {
+                "physical_contact_end_m": [0.0288, 0.0, 0.0],
+                "contact_opening_m": 0.0036
+            }
+        });
+        let manifest: ToolManifest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(manifest.armd.as_ref().unwrap().physical_contact_end_m, Some([0.0288, 0.0, 0.0]));
+        assert_eq!(manifest.armd.as_ref().unwrap().contact_opening_m, Some(0.0036));
+        let rt = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(rt["armd"]["physical_contact_end_m"], json["armd"]["physical_contact_end_m"]);
+        assert_eq!(rt["armd"]["contact_opening_m"], json["armd"]["contact_opening_m"]);
+        assert_eq!(rt["tcp_offset"], json["tcp_offset"]);
+    }
+
+    #[test]
+    fn non_stock_requires_explicit_tcp_offset_and_writes_tcp_site() {
+        let xml_tool = r#"<mujoco model="finray_tool">
+          <worldbody>
+            <site name="finray_tcp" pos="0.0288 0.0 0.0"/>
+            <body name="tip" pos="0.02 0 0"><geom type="box" size="0.01 0.01 0.01"/></body>
+          </worldbody>
+        </mujoco>"#;
+
+        // 1. Omitted tcp_offset on non-stock tool MUST be rejected even if tool.xml has a tcp_site
+        let mut manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "finray_test",
+            "kind": "gripper",
+            "tcp_site": "finray_tcp"
+        })).unwrap();
+        assert!(manifest.tcp_offset.is_none());
+        let err_resolve = resolve_tool_tcp_offset(&manifest, Some(xml_tool)).unwrap_err();
+        assert!(err_resolve.contains("tcp_offset"), "{err_resolve}");
+        let err_validate = validate_tool_manifest(&manifest, Some(xml_tool)).unwrap_err();
+        assert!(err_validate.contains("tcp_offset"), "{err_validate}");
+        let err_compose = compose_mjcf(FALLBACK_BASE_XML, None, Some(&manifest), Some(xml_tool)).unwrap_err();
+        assert!(err_compose.contains("tcp_offset"), "{err_compose}");
+
+        // 2. Explicit tcp_offset writes <site name="tcp" pos="..."/> and strips declared tcp_site
+        manifest.tcp_offset = Some([0.0288, 0.0, 0.0]);
+        let composed = compose_mjcf(FALLBACK_BASE_XML, None, Some(&manifest), Some(xml_tool)).unwrap();
+        let doc = roxmltree::Document::parse(&composed).unwrap();
+        let tcp_site = doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        assert_eq!(tcp_site.attribute("pos"), Some("0.0288 0 0"));
+        assert!(!composed.contains("finray_tcp"), "tool tcp_site must be stripped");
+
+        // 3. Explicit [0,0,0] forces <site name="tcp" pos="0 0 0"/> even when XML site has nonzero pos
+        manifest.tcp_offset = Some([0.0, 0.0, 0.0]);
+        let composed_zero = compose_mjcf(FALLBACK_BASE_XML, None, Some(&manifest), Some(xml_tool)).unwrap();
+        let doc_zero = roxmltree::Document::parse(&composed_zero).unwrap();
+        let tcp_zero = doc_zero
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        assert_eq!(tcp_zero.attribute("pos"), Some("0 0 0"));
+
+        // 4. M12: Sandbox manifest validation merges armd.gripper_policy & armd.grasp using hardware rules
+        let bad_gp_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "bad_gp_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.0288, 0.0, 0.0],
+            "armd": {
+                "gripper_policy": {
+                    "max_close_torque_nm": -0.5
+                }
+            }
+        })).unwrap();
+        assert!(validate_tool_manifest(&bad_gp_manifest, None).is_err());
+
+        // 5. M12 (R3): Empty `robots: []` valid only under SO-101 positive-open jaw bounds must
+        // pass `validate_tool_manifest_for_robot(..., "so101")` without B601-DM false rejection.
+        let so101_only_overlay: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_positive_jaw",
+            "kind": "gripper",
+            "robots": [],
+            "tcp_offset": [0.02, 0.0, 0.0],
+            "armd": {
+                "gripper_policy": {
+                    "closed_rad": 0.0,
+                    "open_rad": 1.4,
+                    "jaw_opening_nominal": [[0.0, 0.0], [1.4, 0.065]]
+                }
+            }
+        })).unwrap();
+        assert!(validate_tool_manifest_for_robot(&so101_only_overlay, None, "so101").is_ok());
+        assert!(validate_tool_manifest(&so101_only_overlay, None).is_ok());
+        assert!(validate_tool_manifest_for_robot(&so101_only_overlay, None, "b601dm").is_err());
+
+        // 6. M3: Without `armd` overlay, robot compatibility and gripper capability are still enforced.
+        let gripper_no_armd_rs: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "cup_gripper_no_armd",
+            "kind": "gripper",
+            "robots": ["b601rs"],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest(&gripper_no_armd_rs, None).is_err());
+        assert!(validate_tool_manifest_for_robot(&gripper_no_armd_rs, None, "b601rs").is_err());
+        let gripper_no_armd_any: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "cup_gripper_any",
+            "kind": "gripper",
+            "robots": [],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest_for_robot(&gripper_no_armd_any, None, "b601rs").is_err());
+        let unknown_robot_no_armd: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "suction_unknown_bot",
+            "kind": "suction",
+            "robots": ["mystery_bot"],
+            "tcp_offset": [0.0, 0.0, 0.0]
+        })).unwrap();
+        assert!(validate_tool_manifest(&unknown_robot_no_armd, None).is_err());
+
+        // 7. M4: Single-quoted <site name='tcp' pos='0 0 0'/> updates properly; missing tcp site errors.
+        let single_quote_base = r#"<mujoco model="sq">
+          <worldbody>
+            <body name="end_link">
+              <site name='tcp' pos='0 0 0'/>
+            </body>
+          </worldbody>
+        </mujoco>"#;
+        let sq_tool_xml = r#"<mujoco><worldbody><body name="t"><geom type="box" size="0.01 0.01 0.01"/></body></worldbody></mujoco>"#;
+        let sq_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "sq_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.025, 0.0, 0.0]
+        })).unwrap();
+        let sq_composed = compose_mjcf(single_quote_base, None, Some(&sq_manifest), Some(sq_tool_xml)).unwrap();
+        let sq_doc = roxmltree::Document::parse(&sq_composed).unwrap();
+        let sq_site = sq_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        assert_eq!(sq_site.attribute("pos"), Some("0.025 0 0"));
+
+        let missing_tcp_base = r#"<mujoco model="no_tcp">
+          <worldbody>
+            <body name="end_link">
+              <geom type="box" size="0.01 0.01 0.01"/>
+            </body>
+          </worldbody>
+        </mujoco>"#;
+        let missing_err = compose_mjcf(missing_tcp_base, None, Some(&sq_manifest), Some(sq_tool_xml)).unwrap_err();
+        assert!(missing_err.contains("tcp"), "{missing_err}");
+
+        // 8. m1: ToolManifest rejects unknown top-level fields (e.g. "armd_").
+        assert!(serde_json::from_value::<ToolManifest>(serde_json::json!({
+            "id": "typo_tool",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.02, 0.0, 0.0],
+            "armd_": {}
+        })).is_err());
+
+        // 9. R2 M3: Non-stock manifest with empty/whitespace/None tool_xml STILL updates base tcp site
+        // and fails closed if base MJCF lacks <site name="tcp">.
+        for empty_xml in [None, Some(""), Some("   \n\t ")] {
+            let composed_empty = compose_mjcf(single_quote_base, None, Some(&sq_manifest), empty_xml).unwrap();
+            let doc_empty = roxmltree::Document::parse(&composed_empty).unwrap();
+            let site_empty = doc_empty
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+                .unwrap();
+            assert_eq!(site_empty.attribute("pos"), Some("0.025 0 0"), "tool_xml={empty_xml:?}");
+
+            let missing_err_empty = compose_mjcf(missing_tcp_base, None, Some(&sq_manifest), empty_xml).unwrap_err();
+            assert!(missing_err_empty.contains("tcp"), "{missing_err_empty}");
+        }
+
+        // 10. R3 M3: SO-101 base MJCF TCP site preserves its non-zero zero-offset pos for [0,0,0]
+        // and rotates non-zero tcp_offset through the site quat matching ArmConfig::end_to_tcp.
+        let so101_base_xml = include_str!("../sim/mujoco/models/so_arm101_scene.xml");
+        let so101_zero_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_zero_offset",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "tcp_offset": [0.0, 0.0, 0.0],
+            "armd": {
+                "gripper_policy": {
+                    "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]]
+                }
+            }
+        })).unwrap();
+        let so101_zero_xml = compose_mjcf(so101_base_xml, None, Some(&so101_zero_manifest), None).unwrap();
+        let so101_zero_doc = roxmltree::Document::parse(&so101_zero_xml).unwrap();
+        let so101_zero_site = so101_zero_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let zero_pos = parse_mjcf_vec3(so101_zero_site.attribute("pos").unwrap(), "pos").unwrap();
+        assert!((zero_pos[0] - (-0.0079)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+        assert!((zero_pos[1] - (-0.000218121)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+        assert!((zero_pos[2] - (-0.0981274)).abs() < 1e-9, "zero_pos={zero_pos:?}");
+
+        let so101_offset_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_offset_tool",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "tcp_offset": [0.025, 0.010, -0.005],
+            "armd": {
+                "gripper_policy": {
+                    "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]]
+                }
+            }
+        })).unwrap();
+        let so101_offset_xml = compose_mjcf(so101_base_xml, None, Some(&so101_offset_manifest), None).unwrap();
+        let so101_offset_doc = roxmltree::Document::parse(&so101_offset_xml).unwrap();
+        let so101_offset_site = so101_offset_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let offset_pos = parse_mjcf_vec3(so101_offset_site.attribute("pos").unwrap(), "pos").unwrap();
+        let r_site = parse_mjcf_site_rotation(&so101_zero_doc, so101_zero_site).unwrap();
+        let expected_offset_pos = crate::kinematics::add(
+            &zero_pos,
+            &crate::kinematics::mat_vec(&r_site, &[0.025, 0.010, -0.005]),
+        );
+        for axis in 0..3 {
+            assert!(
+                (offset_pos[axis] - expected_offset_pos[axis]).abs() < 1e-6,
+                "axis={axis} offset_pos={offset_pos:?} expected={expected_offset_pos:?}"
+            );
+        }
+        // Site x-axis in SO-101 gripper body points along -Z (0, 0, -1), y along -X (-1, 0, 0), z along +Y (0, 1, 0).
+        assert!((offset_pos[0] - (-0.0079 - 0.010)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+        assert!((offset_pos[1] - (-0.000218121 - 0.005)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+        assert!((offset_pos[2] - (-0.0981274 - 0.025)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+
+        // 11. R4 M5 + m2 & R5 M6: Shipped SO-101 (no `end_link`, tcp site inside `gripper` with non-zero pos+quat)
+        // resolves attach_body="end_link" (or empty) to `gripper`, wraps tool worldbody children in
+        // `<body name="__tool_mount_frame">` matching base TCP site pos+quat so tool geom pose relative to
+        // updated `<site name="tcp">` matches declared `tcp_offset`, and sets suction weld body1="gripper".
+        let so101_geom_tool = r#"<mujoco><worldbody><geom name="custom_pad" type="box" size="0.01 0.01 0.01" pos="0 0 0"/></worldbody></mujoco>"#;
+        let so101_geom_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_custom_pad",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "attach_body": "end_link",
+            "tcp_offset": [0.01, 0.0, 0.0],
+            "armd": { "gripper_policy": { "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]] } }
+        })).unwrap();
+        let so101_with_geom = compose_mjcf(so101_base_xml, None, Some(&so101_geom_manifest), Some(so101_geom_tool)).unwrap();
+        let so101_geom_doc = roxmltree::Document::parse(&so101_with_geom).unwrap();
+        let pad_geom = so101_geom_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "geom" && n.attribute("name") == Some("custom_pad"))
+            .expect("custom_pad geom inserted");
+        let mount_frame = pad_geom.parent().expect("mount frame parent");
+        assert_eq!(mount_frame.attribute("name"), Some("__tool_mount_frame"));
+        assert_eq!(
+            mount_frame.parent().and_then(|p| p.attribute("name")),
+            Some("gripper"),
+            "SO-101 attach_body='end_link' must attach under `gripper`"
+        );
+        let mf_pos = parse_mjcf_vec3(mount_frame.attribute("pos").unwrap(), "pos").unwrap();
+        for axis in 0..3 {
+            assert!((mf_pos[axis] - zero_pos[axis]).abs() < 1e-6);
+        }
+        let mf_r = parse_mjcf_site_rotation(&so101_geom_doc, mount_frame).unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!((mf_r[r][c] - r_site[r][c]).abs() < 1e-6);
+            }
+        }
+        let pad_tcp = so101_geom_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let pad_tcp_pos = parse_mjcf_vec3(pad_tcp.attribute("pos").unwrap(), "pos").unwrap();
+        // Relative vector (pad_tcp_pos - mf_pos) transformed into mount_frame local frame equals [0.01, 0, 0].
+        let rel_gripper = crate::kinematics::sub(&pad_tcp_pos, &mf_pos);
+        let rel_local = crate::kinematics::mat_vec(&crate::kinematics::transpose(&mf_r), &rel_gripper);
+        assert!(
+            (rel_local[0] - 0.01).abs() < 1e-6 && rel_local[1].abs() < 1e-6 && rel_local[2].abs() < 1e-6,
+            "rel_local={rel_local:?}"
+        );
+
+        let so101_suction_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_suction_cup",
+            "kind": "suction",
+            "robots": ["so-arm101"],
+            "attach_body": "end_link",
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        let prop_scene = r#"<mujoco><worldbody><body name="chip" pos="0.2 0 0.02"><freejoint/><geom type="box" size="0.01 0.01 0.01"/></body></worldbody></mujoco>"#;
+        let so101_suction_xml = compose_mjcf(so101_base_xml, Some(prop_scene), Some(&so101_suction_manifest), Some(so101_geom_tool)).unwrap();
+        let so101_suction_doc = roxmltree::Document::parse(&so101_suction_xml).unwrap();
+        let weld = so101_suction_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "weld" && n.attribute("body2") == Some("chip"))
+            .expect("suction weld inserted");
+        assert_eq!(weld.attribute("body1"), Some("gripper"));
+
+        // 12. R4 m1 & R5 m5: `euler` respects <compiler angle="degree|radian" eulerseq="..."/>,
+        // verifies multi-axis intrinsic xyz vs extrinsic XYZ rotations, and fails closed on unsupported eulerseq.
+        let deg_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0 0 90"/></body></worldbody></mujoco>"#;
+        let deg_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "deg_tool", "kind": "suction", "robots": ["b601dm"], "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        let deg_out = compose_mjcf(deg_base, None, Some(&deg_manifest), None).unwrap();
+        let deg_doc = roxmltree::Document::parse(&deg_out).unwrap();
+        let deg_pos = parse_mjcf_vec3(
+            deg_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        // Default degree + xyz: 90 deg about z maps +x -> +y: [0, 0.02, 0]
+        assert!(deg_pos[0].abs() < 1e-6 && (deg_pos[1] - 0.02).abs() < 1e-6 && deg_pos[2].abs() < 1e-6, "deg_pos={deg_pos:?}");
+
+        // Multi-axis intrinsic xyz with explicit angle="radian": R = Rx(pi/2) * Ry(pi/2) * Rz(0)
+        // [0.02, 0, 0] -> Ry(pi/2)*[0.02,0,0]=[0,0,-0.02] -> Rx(pi/2)*[0,0,-0.02]=[0,0.02,0]
+        let rad_xyz_base = r#"<mujoco><compiler angle="radian" eulerseq="xyz"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="1.5707963267948966 1.5707963267948966 0"/></body></worldbody></mujoco>"#;
+        let rad_xyz_out = compose_mjcf(rad_xyz_base, None, Some(&deg_manifest), None).unwrap();
+        let rad_xyz_doc = roxmltree::Document::parse(&rad_xyz_out).unwrap();
+        let rad_xyz_pos = parse_mjcf_vec3(
+            rad_xyz_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        assert!(
+            rad_xyz_pos[0].abs() < 1e-6 && (rad_xyz_pos[1] - 0.02).abs() < 1e-6 && rad_xyz_pos[2].abs() < 1e-6,
+            "rad_xyz_pos={rad_xyz_pos:?}"
+        );
+
+        // Multi-axis extrinsic XYZ with explicit angle="radian": R = Rz(0) * Ry(pi/2) * Rx(pi/2)
+        // Rx(pi/2)*[0.02,0,0]=[0.02,0,0] -> Ry(pi/2)*[0.02,0,0]=[0,0,-0.02]
+        let rad_ext_base = r#"<mujoco><compiler angle="radian" eulerseq="XYZ"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="1.5707963267948966 1.5707963267948966 0"/></body></worldbody></mujoco>"#;
+        let rad_ext_out = compose_mjcf(rad_ext_base, None, Some(&deg_manifest), None).unwrap();
+        let rad_ext_doc = roxmltree::Document::parse(&rad_ext_out).unwrap();
+        let rad_ext_pos = parse_mjcf_vec3(
+            rad_ext_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        assert!(
+            rad_ext_pos[0].abs() < 1e-6 && rad_ext_pos[1].abs() < 1e-6 && (rad_ext_pos[2] + 0.02).abs() < 1e-6,
+            "rad_ext_pos={rad_ext_pos:?}"
+        );
+
+        let bad_seq_base = r#"<mujoco><compiler angle="radian" eulerseq="xYz"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0.1 0.2 0.3"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(bad_seq_base, None, Some(&deg_manifest), None).unwrap_err().contains("eulerseq"));
+
+        // 13. R5 M7: When base MJCF has BOTH <body name="end_link"> and another TCP-hosting body <body name="gripper">,
+        // both attach_body="" and attach_body="end_link" unify on the TCP-hosting body (`gripper`).
+        let dual_body_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <body name="gripper"><site name="tcp" pos="0 0 0"/></body>
+          </body>
+        </worldbody></mujoco>"#;
+        for attach_val in ["", "end_link"] {
+            let m: ToolManifest = serde_json::from_value(serde_json::json!({
+                "id": "dual_body_tool",
+                "kind": "suction",
+                "robots": ["b601dm"],
+                "attach_body": attach_val,
+                "tcp_offset": [0.01, 0.0, 0.0]
+            })).unwrap();
+            let composed = compose_mjcf(dual_body_base, Some(prop_scene), Some(&m), Some(so101_geom_tool)).unwrap();
+            let doc = roxmltree::Document::parse(&composed).unwrap();
+            let pad = doc.descendants().find(|n| n.attribute("name") == Some("custom_pad")).unwrap();
+            assert_eq!(pad.parent().and_then(|p| p.attribute("name")), Some("gripper"), "attach_body={attach_val:?}");
+            let w = doc.descendants().find(|n| n.attribute("name") == Some("suction_weld_0_chip")).unwrap();
+            assert_eq!(w.attribute("body1"), Some("gripper"), "attach_body={attach_val:?}");
+        }
+
+        // 14. R6 M3: Base <site name="tcp"> nested inside <frame> fails closed instead of silently losing
+        // the <frame> transform on composed tool geometries.
+        let framed_tcp_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <frame pos="0 0 0.10"><site name="tcp" pos="0 0 0"/></frame>
+          </body>
+        </worldbody></mujoco>"#;
+        let framed_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "framed_tool",
+            "kind": "suction",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(framed_tcp_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("frame"), "expected <frame> rejection, got: {err}");
+        }
+
+        // 15. R7 M9: Base <site name="tcp"> with explicit class, fromto, or <default> transform fails closed.
+        let class_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" class="jaw" pos="0 0 0"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(class_base, None, Some(&framed_manifest), None).unwrap_err().contains("class"));
+
+        let fromto_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" fromto="0 0 0 0.1 0 0"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(fromto_base, None, Some(&framed_manifest), None).unwrap_err().contains("fromto"));
+
+        let childclass_default_base = r#"<mujoco>
+          <default><default class="tool_cls"><site pos="0 0 0.05"/></default></default>
+          <worldbody><body name="end_link" childclass="tool_cls"><site name="tcp"/></body></worldbody>
+        </mujoco>"#;
+        assert!(compose_mjcf(childclass_default_base, None, Some(&framed_manifest), None).unwrap_err().contains("default"));
+
+        // 16. R8 M3 & m3:
+        // (a) Nested <default> inheritance chain (<default class="parent"><site .../><default class="leaf">...)
+        //     propagates parent's <site> transform to childclass="leaf" and fails closed.
+        let nested_default_base = r#"<mujoco>
+          <default>
+            <default class="parent">
+              <site quat="0 1 0 0"/>
+              <default class="leaf">
+                <geom rgba="1 0 0 1"/>
+              </default>
+            </default>
+          </default>
+          <worldbody><body name="end_link" childclass="leaf"><site name="tcp" pos="0 0 0"/></body></worldbody>
+        </mujoco>"#;
+        assert!(compose_mjcf(nested_default_base, None, Some(&framed_manifest), None).unwrap_err().contains("default"));
+
+        // (b) Explicit class="main" on <site name="tcp"> overrides ancestor childclass="painted".
+        let explicit_main_base = r#"<mujoco>
+          <default>
+            <default class="painted"><site pos="0 0 0.05" quat="0 1 0 0"/></default>
+          </default>
+          <worldbody><body name="end_link" childclass="painted"><site name="tcp" class="main" pos="0 0 0"/></body></worldbody>
+        </mujoco>"#;
+        let main_ok = compose_mjcf(explicit_main_base, None, Some(&framed_manifest), Some(so101_geom_tool))
+            .expect("explicit class=\"main\" must override ancestor childclass");
+        assert!(main_ok.contains("0.02 0 0"), "expected tcp_offset 0.02 applied: {main_ok}");
+
+        // 17. R8 M4: <site name="tcp"> directly inside an unnamed child <body> fails closed instead of
+        // silently skipping to a named grandparent body.
+        let unnamed_body_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <body pos="0 0 0.10"><site name="tcp" pos="0 0 0"/></body>
+          </body>
+        </worldbody></mujoco>"#;
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(unnamed_body_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("unnamed <body>"), "expected unnamed <body> rejection, got: {err}");
+        }
+
+        // 18. R9 M4: <site name="tcp"> directly under <worldbody> (no host <body>) fails closed
+        // instead of attaching tool geometries onto another <body name="end_link">.
+        let world_tcp_base = r#"<mujoco><worldbody>
+          <site name="tcp" pos="0 0 0"/>
+          <body name="end_link"><geom type="box" size="0.01 0.01 0.01"/></body>
+        </worldbody></mujoco>"#;
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(world_tcp_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("no host <body>"), "expected missing host <body> rejection, got: {err}");
+        }
+
+        // 19. R9 m2: Nearest ancestor childclass="main" stops lookup instead of skipping outward
+        // to an outer childclass="painted".
+        let inner_main_childclass_base = r#"<mujoco>
+          <default><default class="painted"><site pos="0 0 0.05" quat="0 1 0 0"/></default></default>
+          <worldbody childclass="painted">
+            <body name="end_link" childclass="main"><site name="tcp" pos="0 0 0"/></body>
+          </worldbody>
+        </mujoco>"#;
+        let inner_main_ok = compose_mjcf(
+            inner_main_childclass_base,
+            None,
+            Some(&framed_manifest),
+            Some(so101_geom_tool),
+        )
+        .expect("nearest ancestor childclass=\"main\" must stop inheritance from outer childclass");
+        assert!(inner_main_ok.contains("0.02 0 0"), "{inner_main_ok}");
+    }
 }

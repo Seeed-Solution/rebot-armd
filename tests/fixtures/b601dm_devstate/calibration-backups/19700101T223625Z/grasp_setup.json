@@ -1,0 +1,81 @@
+{
+  "table_z_m": 0.024100084051181775,
+  "approach_height_m": 0.15,
+  "grasp_height_m": 0.015,
+  "lift_height_m": 0.12,
+  "grip_pixel_norm": [
+    0.5,
+    0.5
+  ],
+  "camera_tilt_deg": -36.995338439941406,
+  "image_size_px": [
+    640.0,
+    360.0
+  ],
+  "fx_px": 803.844739372464,
+  "fy_px": 802.1144666949867,
+  "cx_px": 320.4257478810317,
+  "cy_px": 184.86272217707705,
+  "centre_tol_px": 10.0,
+  "stable_frames": 3,
+  "median_frames": 3,
+  "max_iterations": 10,
+  "servo_gain": 0.6,
+  "max_step_m": 0.03,
+  "match_dist_px": 35.0,
+  "match_iou": 0.45,
+  "acquire_dist_px": 160.0,
+  "lost_timeout_s": 1.0,
+  "lost_frames": 5,
+  "settle_delay_s": 0.1,
+  "align_min_aspect": 1.2,
+  "align_j6": true,
+  "align_min_angle_conf": 0.3,
+  "align_max_angle_spread_deg": 15.0,
+  "approach_speed_mps": 0.05,
+  "descend_speed_mps": 0.03,
+  "phase_timeout_s": 25.0,
+  "timeout_s": 120.0,
+  "acquire_camera_down": "auto",
+  "height_probe_m": 0.1,
+  "height_probe_mode": "up",
+  "lateral_probe_m": 0.04,
+  "height_grasp_fraction": 0.5,
+  "max_grasp_height_m": 0.06,
+  "recentre_height_m": 0.0,
+  "recentre_max_iterations": 3,
+  "descend_contact_stop_nm": null,
+  "post_lift_settle_ms": 300,
+  "recheck_tol_px": 40.0,
+  "max_grasp_width_m": 0.075,
+  "spill_safe_labels": [
+    "cup",
+    "bottle",
+    "wine glass",
+    "bowl",
+    "vase"
+  ],
+  "spill_max_tilt_deg": 8.0,
+  "pre_open": "auto",
+  "pre_open_margin_m": 0.015,
+  "height_sources": [
+    "probe"
+  ],
+  "height_record": [
+    "depth"
+  ],
+  "height_priors": {},
+  "yaw_sources": [
+    "mask",
+    "box"
+  ],
+  "yaw_record": [
+    "depth"
+  ],
+  "width_sources": [
+    "mask",
+    "depth"
+  ],
+  "width_record": [],
+  "tasks": {}
+}

@@ -124,6 +124,9 @@ pub trait ArmDriver: Send {
     /// callers then use [`Self::feedback_instants`].
     fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> { Vec::new() }
 
+    /// Hardware receive timestamps for each joint's latest feedback packet (if tracked).
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> { Vec::new() }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -1218,6 +1221,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.feedback_seq.clone()
     }
 
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -1951,6 +1958,10 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.feedback_seq.clone()
     }
 
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -2540,6 +2551,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
         self.feedback_queue_bound.clone()
+    }
+
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
     }
 
 
@@ -3204,6 +3219,10 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
         self.feedback_queue_bound.clone()
+    }
+
+    fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
     }
 
     fn is_feedback_valid(&self) -> bool {

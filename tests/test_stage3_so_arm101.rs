@@ -112,6 +112,8 @@ fn plan_input_at_home(config: &ArmConfig) -> PlanInput {
         ws: config.workspace.clone(),
         cam: config.camera_mount.clone(),
         power: None,
+        tcp_offset: config.tcp_offset,
+        goal_frame: armd::motion::GoalFrame::EndLink,
     }
 }
 
@@ -290,6 +292,7 @@ fn test_5dof_place_explicit_auto_yaw() {
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
     let planned_true = place::plan(pending_true).expect("place with explicit auto_yaw: true should succeed");
     assert!(planned_true.durations[1] > 0.0);
@@ -314,6 +317,7 @@ fn test_5dof_place_explicit_auto_yaw() {
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
     let res_false = place::plan(pending_false);
     assert!(res_false.is_err(), "place with explicit auto_yaw: false should fail");
@@ -415,6 +419,7 @@ fn test_5dof_place_planning_lateral() {
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
 
     let planned = place::plan(pending).expect("lateral place planning on 5-DOF SO-101 should succeed");
@@ -448,6 +453,7 @@ fn test_5dof_place_planning() {
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
 
     let planned = place::plan(pending).expect("place planning on 5-DOF SO-101 should succeed");
@@ -926,6 +932,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
         lens_known: false,
         depth_available: false,
         generation: None,
+        tcp_offset: [0.0; 3],
     };
     let dummy_det = grasp::Detection {
         label: "cup".into(),
@@ -1002,6 +1009,7 @@ fn test_5dof_place_plan_slightly_past_vertical_pose_succeeds_cleanly() {
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
     let planned = place::plan(pending).expect("place::plan must succeed cleanly without pi flip");
     assert!(planned.durations.iter().any(|&d| d > 0.0));
@@ -1204,6 +1212,7 @@ fn test_vertical_pose_translation_preserves_roll_for_move_to_relative_and_place(
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
     let planned = place::plan(pending).expect("place::plan must succeed from vertical pose");
     assert!(planned.durations.iter().any(|&d| d > 0.0));
@@ -1378,6 +1387,7 @@ fn test_place_plan_orientation_none_preserves_start_pitch_roll_and_updates_yaw()
         open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
         held_spill_safe: false,
         spill_max_tilt_deg: 8.0,
+        table_clearance: None,
     };
 
     let planned = place::plan(pending).expect("place::plan with orientation: None should succeed");

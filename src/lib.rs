@@ -42,6 +42,7 @@ pub mod safety;
 #[cfg(not(target_arch = "wasm32"))] pub mod teach;
 pub mod torque_guard;
 pub mod tracking;
+pub mod tool;
 pub mod trajectory;
 pub mod urdf;
 #[cfg(not(target_arch = "wasm32"))] pub mod transport;

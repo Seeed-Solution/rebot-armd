@@ -167,6 +167,15 @@ impl Default for Speed {
 
 // ---- planning ----
 
+/// Frame of Cartesian planning goals and `start_pose`: raw `end_link` vs active `tcp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalFrame {
+    #[default]
+    EndLink,
+    Tcp,
+}
+
 /// Snapshot of the supervisor state a plan is made from.
 #[derive(Debug, Clone)]
 pub struct PlanInput {
@@ -185,6 +194,112 @@ pub struct PlanInput {
     pub workspace_revision: u64,
     /// Power budget whose `planning` section time-scales the path; None = none.
     pub power: Option<crate::power::PowerBudget>,
+    /// Active tool TCP offset in `end_link` frame (m).
+    pub tcp_offset: [f64; 3],
+    /// Coordinate frame of `goal` and `resolve_goal*` outputs (`EndLink` or `Tcp`).
+    pub goal_frame: GoalFrame,
+}
+
+/// Convert an `end_link` pose into the TCP frame (`p_tcp = p_end + R_end * tcp_offset`).
+pub fn end_to_tcp(end: &Pose, tcp_offset: &[f64; 3]) -> Pose {
+    if *tcp_offset == [0.0; 3] {
+        return *end;
+    }
+    Pose::new(
+        end.r,
+        kinematics::add(&end.p, &kinematics::mat_vec(&end.r, tcp_offset)),
+    )
+}
+
+/// Convert a TCP pose into the `end_link` frame (`p_end = p_tcp - R_tcp * tcp_offset`).
+pub fn tcp_to_end(tcp: &Pose, tcp_offset: &[f64; 3]) -> Pose {
+    if *tcp_offset == [0.0; 3] {
+        return *tcp;
+    }
+    Pose::new(
+        tcp.r,
+        kinematics::sub(&tcp.p, &kinematics::mat_vec(&tcp.r, tcp_offset)),
+    )
+}
+
+/// Convert a raw `end_link` pose into `input.goal_frame`.
+pub fn end_to_frame(end: &Pose, input: &PlanInput) -> Pose {
+    match input.goal_frame {
+        GoalFrame::EndLink => *end,
+        GoalFrame::Tcp => end_to_tcp(end, &input.tcp_offset),
+    }
+}
+
+/// Convert a pose expressed in `input.goal_frame` into `end_link`.
+pub fn goal_to_end(goal: &Pose, input: &PlanInput) -> Pose {
+    match input.goal_frame {
+        GoalFrame::EndLink => *goal,
+        GoalFrame::Tcp => tcp_to_end(goal, &input.tcp_offset),
+    }
+}
+
+/// Start pose of `input.q0` in `input.goal_frame`.
+pub fn start_pose(input: &PlanInput) -> Pose {
+    end_to_frame(&input.arm.fk(&input.q0), input)
+}
+
+fn solve_ik_in_frame(
+    input: &PlanInput,
+    goal_in_frame: &Pose,
+    q_seed: &[f64; 6],
+    lo: &[f64; 6],
+    hi: &[f64; 6],
+    yaw_free: bool,
+) -> kinematics::IkResult {
+    if input.goal_frame == GoalFrame::EndLink || input.tcp_offset == [0.0; 3] {
+        let target_end = goal_to_end(goal_in_frame, input);
+        return input
+            .arm
+            .solve_dls_ex(&target_end, q_seed, lo, hi, kinematics::PAR.w, yaw_free);
+    }
+    if !yaw_free {
+        let target_end = tcp_to_end(goal_in_frame, &input.tcp_offset);
+        let mut sol = input
+            .arm
+            .solve_dls_ex(&target_end, q_seed, lo, hi, kinematics::PAR.w, false);
+        let ach_tcp = end_to_tcp(&input.arm.fk(&sol.q), &input.tcp_offset);
+        let tcp_ep = kinematics::norm(&kinematics::sub(&goal_in_frame.p, &ach_tcp.p));
+        sol.ep = sol.ep.max(tcp_ep);
+        sol.ok = sol.ok && tcp_ep <= kinematics::PAR.tol_pos;
+        return sol;
+    }
+    // 5-DOF auto_yaw: yaw is coupled to J1, so refine target_end using achieved R_end(q)
+    // and verify the achieved TCP residual <= tol_pos.
+    let mut r_est = goal_in_frame.r;
+    let mut q_cur = *q_seed;
+    let mut best_sol: Option<kinematics::IkResult> = None;
+    let mut total_iters = 0usize;
+    for _ in 0..6 {
+        let target_end = Pose::new(
+            goal_in_frame.r,
+            kinematics::sub(
+                &goal_in_frame.p,
+                &kinematics::mat_vec(&r_est, &input.tcp_offset),
+            ),
+        );
+        let mut sol = input
+            .arm
+            .solve_dls_ex(&target_end, &q_cur, lo, hi, kinematics::PAR.w, true);
+        total_iters += sol.iterations;
+        let ach_end = input.arm.fk(&sol.q);
+        let ach_tcp = end_to_tcp(&ach_end, &input.tcp_offset);
+        let tcp_ep = kinematics::norm(&kinematics::sub(&goal_in_frame.p, &ach_tcp.p));
+        sol.ep = sol.ep.max(tcp_ep);
+        sol.ok = sol.ok && tcp_ep <= kinematics::PAR.tol_pos;
+        sol.iterations = total_iters;
+        if sol.ok {
+            return sol;
+        }
+        q_cur = sol.q;
+        r_est = ach_end.r;
+        best_sol = Some(sol);
+    }
+    best_sol.expect("at least one IK iteration")
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -270,7 +385,7 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         },
         None => speed,
     };
-    let start = input.arm.fk(&input.q0);
+    let start = start_pose(input);
     let dp = kinematics::sub(&goal.p, &start.p);
     let length = kinematics::norm(&dp);
     // outward: (ψ(0), Δψ over the path, Rrel(0)); rotations below are then in the outward frame
@@ -311,7 +426,7 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         }
     });
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
-    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new(&input.arm, ws, &input.cam));
+    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset));
     let mut ws_state = match &ws_eval {
         Some(ev) => {
             let mut c0 = ev.alloc_buf();
@@ -350,7 +465,7 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
         if let Some(off) = outward_hint(arm_dof, opts, &p, &r) {
             yaw_off_deg = Some(yaw_off_deg.map_or(off, |m| m.max(off)));
         }
-        let sol = input.arm.solve_dls_ex(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w, yaw_free);
+        let sol = solve_ik_in_frame(input, &Pose::new(r, p), &prev, &lo, &hi, yaw_free);
         if !sol.ok {
             return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er, yaw_off_deg });
         }
@@ -452,7 +567,7 @@ pub const GOAL_IK_ROUNDS: usize = 40;
 /// rest) with J1 turned by the azimuth change from its own TCP to the goal.
 pub fn goal_seeds(input: &PlanInput, goal: &Pose, extra: &[[f64; 6]]) -> Vec<[f64; 6]> {
     let turned = |q: &[f64; 6]| -> [f64; 6] {
-        let p = input.arm.fk(q).p;
+        let p = end_to_frame(&input.arm.fk(q), input).p;
         let mut s = *q;
         if p[0].hypot(p[1]) >= OUTWARD_MIN_RADIUS_M && goal.p[0].hypot(goal.p[1]) >= OUTWARD_MIN_RADIUS_M {
             s[0] = wrap_pi(q[0] + azimuth_delta(&p, &goal.p));
@@ -487,7 +602,7 @@ pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: 
     let lo: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(-std::f64::consts::PI, |l| f64::from(l.min_position) + IK_LIMIT_MARGIN));
     let hi: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(std::f64::consts::PI, |l| f64::from(l.max_position) - IK_LIMIT_MARGIN));
     // workspace rule at the goal as for a path sample: no constraint deeper than at the start
-    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new(&input.arm, ws, &input.cam));
+    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new_with_tcp(&input.arm, ws, &input.cam, input.tcp_offset));
     let mut ws_state = match &ws_eval {
         Some(ev) => {
             let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
@@ -510,12 +625,12 @@ pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: 
     for seed in seeds {
         // the seed itself within the search limits (a seed past them would widen them)
         let mut q: [f64; 6] = std::array::from_fn(|i| if i < arm_dof { seed[i].clamp(lo[i], hi[i]) } else { seed[i] });
-        let mut sol = input.arm.solve_dls_ex(goal, &q, &lo, &hi, kinematics::PAR.w, opts.yaw_free);
+        let mut sol = solve_ik_in_frame(input, goal, &q, &lo, &hi, opts.yaw_free);
         for _ in 1..GOAL_IK_ROUNDS {
             if sol.ok { break; }
             let before = sol.ep + kinematics::PAR.w * sol.er;
             q = sol.q;
-            let next = input.arm.solve_dls_ex(goal, &q, &lo, &hi, kinematics::PAR.w, opts.yaw_free);
+            let next = solve_ik_in_frame(input, goal, &q, &lo, &hi, opts.yaw_free);
             let stalled = next.ep + kinematics::PAR.w * next.er > before - 1e-9;
             sol = next;
             if stalled && !sol.ok { break; }
@@ -609,7 +724,8 @@ pub fn resolve_goal_opts(input: &PlanInput, spec: &GoalSpec) -> (Pose, PathOpts)
 }
 
 fn resolve_goal_base(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
-    let start = input.arm.fk(&input.q0);
+    let start_end = input.arm.fk(&input.q0);
+    let start = end_to_frame(&start_end, input);
     match spec {
         GoalSpec::YawOutward(_) => unreachable!("handled by resolve_goal_opts"),
         GoalSpec::Absolute { p, r } => {
@@ -657,9 +773,9 @@ fn resolve_goal_base(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
                 }
                 RelFrame::Camera => {
                     let rec = input.arm.r_end_cam(&input.cam, f64::from(input.cam.tilt_deg));
-                    let rc = kinematics::cam_rotation(&start, &rec);
+                    let rc = kinematics::cam_rotation(&start_end, &rec);
                     let p = kinematics::add(&start.p, &kinematics::mat_vec(&rc, d));
-                    let mut r = start.r;
+                    let mut r = start_end.r;
                     // signs as VIK.integrate: look down (+dpitch) = -dpitch about x_cam,
                     // look right (+dyaw) = -dyaw about world Z
                     if *dpitch != 0.0 { r = kinematics::mat_mul(&kinematics::axis_r(&kinematics::column(&rc, 0), -dpitch), &r); }
@@ -1129,6 +1245,24 @@ impl GripperMotion {
         let done = |holding: Option<bool>, gap: Option<f32>| StepStatus::Done { settled: None, holding, gripper_gap_rad: gap };
 
         let dir = self.close_dir();
+        let stop = self.contact_stop();
+        let active_target = stop.unwrap_or(self.target);
+        let closing_phase = matches!(self.phase, GripPhase::Squeeze { .. }) || (active_target - q_g) * dir > 1e-4;
+        if self.policy.max_close_torque_nm.is_some() && closing_phase && (!ctx.torque_feedback || !ctx.feedback_fresh) {
+            let hold = if m_g.is_finite() { m_g } else { q_g };
+            if idx < positions.len() { positions[idx] = hold; }
+            if idx < velocities.len() { velocities[idx] = 0.0; }
+            return StepOut {
+                positions,
+                velocities,
+                progress: progress_of(hold),
+                clear_gripper_stall: false,
+                status: StepStatus::Failed {
+                    code: "FEEDBACK_UNAVAILABLE",
+                    message: "Gripper close stopped: torque feedback unavailable or stale while max_close_torque_nm is configured".into(),
+                },
+            };
+        }
         let force_cap = self.policy.max_close_torque_nm.filter(|_| ctx.torque_feedback && ctx.feedback_fresh);
         let squeeze_rad = self.policy.squeeze_rad;
         let ramp_rate = 2.0 * f64::from(squeeze_rad) / (self.policy.settle_ms as f64 / 1000.0);
@@ -1628,4 +1762,122 @@ pub struct EstimateEntry {
     pub record_only: bool,
     /// Reject reason or veto code.
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kinematics;
+    use crate::model::ArmConfig;
+
+    fn inspect_input_with_tcp(tcp_offset: [f64; 3]) -> PlanInput {
+        let mut config = ArmConfig::rebot_dm();
+        config.tcp_offset = tcp_offset;
+        config.rebuild_effective_check_points().unwrap();
+        let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
+        PlanInput {
+            epoch: 1,
+            workspace_revision: 0,
+            q0,
+            j7: 0.0,
+            limits: config.limits.clone(),
+            speed_cap: config.speed_cap,
+            arm: config.arm_model.clone(),
+            ws: config.workspace.clone(),
+            cam: config.camera_mount.clone(),
+            power: None,
+            tcp_offset,
+            goal_frame: GoalFrame::Tcp,
+        }
+    }
+
+    #[test]
+    fn stationary_tcp_pitch_rotation_keeps_tcp_position_invariant() {
+        let tcp_offset = [0.04, 0.0, 0.0];
+        let input = inspect_input_with_tcp(tcp_offset);
+        let start_tcp = start_pose(&input);
+        let start_end = input.arm.fk(&input.q0);
+        let dr = kinematics::rpy_to_r(0.0, 0.25, 0.0);
+        let goal_tcp = Pose::new(kinematics::mat_mul(&start_tcp.r, &dr), start_tcp.p);
+        let path = plan_cartesian_opts(
+            &input,
+            goal_tcp,
+            Speed::default(),
+            PathOpts::default(),
+        )
+        .expect("stationary TCP pitch rotation must succeed");
+        assert!(path.q.len() >= 3);
+        for (i, q_f32) in path.q.iter().enumerate() {
+            let q: [f64; 6] = std::array::from_fn(|j| f64::from(q_f32[j]));
+            let p_tcp = end_to_tcp(&input.arm.fk(&q), &tcp_offset).p;
+            let err = kinematics::norm(&kinematics::sub(&p_tcp, &start_tcp.p));
+            assert!(
+                err < kinematics::PAR.tol_pos,
+                "sample {i} TCP drifted by {err:.6} m >= tol_pos"
+            );
+        }
+        let final_q: [f64; 6] = std::array::from_fn(|j| f64::from(path.last()[j]));
+        let end_disp = kinematics::norm(&kinematics::sub(&input.arm.fk(&final_q).p, &start_end.p));
+        assert!(
+            end_disp > 0.005,
+            "end_link must orbit around TCP pivot, moved only {end_disp:.5} m"
+        );
+    }
+
+    #[test]
+    fn move_relative_camera_frame_keeps_raw_end_link_camera_axes() {
+        let mut input = inspect_input_with_tcp([0.05, 0.0, 0.0]);
+        input.cam.rot_deg = 90.0;
+        input.cam.tilt_deg = 0.0;
+        let start_end = input.arm.fk(&input.q0);
+        let start_tcp = end_to_tcp(&start_end, &input.tcp_offset);
+        let rec = input.arm.r_end_cam(&input.cam, f64::from(input.cam.tilt_deg));
+        let rc = kinematics::cam_rotation(&start_end, &rec);
+        let dz_cam = 0.02;
+        let spec = GoalSpec::Relative {
+            frame: RelFrame::Camera,
+            d: [0.0, 0.0, dz_cam],
+            dyaw: 0.0,
+            dpitch: 0.0,
+            droll: 0.0,
+            level: false,
+            auto_yaw: None,
+        };
+        let (goal, opts) = resolve_goal_opts(&input, &spec);
+        let path = plan_cartesian_opts(&input, goal, Speed::default(), opts)
+            .expect("camera-frame relative move with TCP offset must succeed");
+        let final_q: [f64; 6] = std::array::from_fn(|j| f64::from(path.last()[j]));
+        let actual_delta = kinematics::sub(
+            &end_to_tcp(&input.arm.fk(&final_q), &input.tcp_offset).p,
+            &start_tcp.p,
+        );
+        let z_cam = kinematics::column(&rc, 2);
+        let expected_delta = [z_cam[0] * dz_cam, z_cam[1] * dz_cam, z_cam[2] * dz_cam];
+        let diff = kinematics::norm(&kinematics::sub(&actual_delta, &expected_delta));
+        assert!(diff < 1e-3, "camera-axis displacement diff={diff:.6}");
+    }
+
+    #[test]
+    fn max_reach_checks_tcp_offset_when_nonzero() {
+        let mut input = inspect_input_with_tcp([0.05, 0.0, 0.0]);
+        // At q = [0; 6] (HOME), end_link +X points radially forward (+X_base), so tcp_offset increases reach.
+        input.q0 = [0.0; 6];
+        let end_pose = input.arm.fk(&input.q0);
+        let end_r = kinematics::shoulder_reach_from(&end_pose.p, &kinematics::SHOULDER_RZ);
+        let tcp_p = end_to_tcp(&end_pose, &input.tcp_offset).p;
+        let tcp_r = kinematics::shoulder_reach_from(&tcp_p, &kinematics::SHOULDER_RZ);
+        assert!(tcp_r > end_r + 0.04, "end_r={end_r:.4}, tcp_r={tcp_r:.4}");
+        let mut ws = input.ws.unwrap();
+        ws.max_reach_m = Some(((end_r + tcp_r) * 0.5) as f32);
+        let viol = kinematics::workspace_violation_pose_at_tcp(
+            &end_pose,
+            &ws,
+            &input.cam,
+            kinematics::SHOULDER_RZ,
+            &input.tcp_offset,
+        );
+        let w = viol.worst.expect("tcp_origin must trigger reach violation");
+        assert_eq!(w.limit, "reach");
+        assert!((w.value - tcp_r).abs() < 1e-6);
+    }
 }

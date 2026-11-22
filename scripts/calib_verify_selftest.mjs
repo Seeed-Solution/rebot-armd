@@ -175,8 +175,16 @@ const synth = (R, t, Kx = K) => CW.stickerObject().map((X) => CW.project(Kx, R, 
   const moved = p2 ? Math.hypot(...p2.hover_m.map((v, k) => v - p1.hover_m[k])) : 0;
   check('g. live target = live FK of the candidate joints', !!p2 && Math.hypot(...live.map((v, k) => v - p2.hover_m[k])) < 1e-9 && moved > 5e-4
     && Math.abs(p2.approach_m[0] - p2.hover_m[0]) < 1e-12 && p2.approach_m[2] - p2.hover_m[2] >= 0.02, `target moved ${(moved * 1000).toFixed(2)} mm`);
-  const cp = CW.planHover({ Tbb, X, tipCam: tip, edgeToLow: 0.0023, ch, kCand: zero, kLive: zero, q0, K: F.intrinsics, board, lo, hi, tableZ: 0.0098, plan: { ...CW.HOVER_PLAN, count: 2, minCount: 1 } });
+  const cp = CW.planHover({ Tbb, X, tipCam: tip, edgeToLow: 0.0023, ch, kCand: zero, kLive: zero, q0, K: F.intrinsics, board, lo, hi, tableZ: 0.0098, physicalContactEnd: [0, 0, 0], plan: { ...CW.HOVER_PLAN, count: 2, minCount: 1 } });
   check('g. confirmation plan: end_link at table_z + 12 mm', cp.ok && cp.points.length === 2 && cp.points.every((p) => Math.abs(p.hover_m[2] - 0.0218) < 1e-6), cp.points.map((p) => (p.hover_m[2] * 1000).toFixed(2)).join(' / ') + ' mm');
+
+  // B10: Unknown physicalContactEnd (null) preserves null contact & blocks table_z / confirmation hover, keeping optical measurement
+  const hpUnknown = CW.hoverPoint({ observations: [{ markers: F.hover.points.h1.markers }], board, K, tipCam: tip, edgeToLow: 0.0023, Tend: CW.kinPose(ch, q0, zero), X, physicalContactEnd: null });
+  check('g. B10 unknown physicalContactEnd keeps z_contact_m === null and optical_board_z_m finite', hpUnknown.ok && hpUnknown.z_contact_m === null && Number.isFinite(hpUnknown.optical_board_z_m), '');
+  const evUnknown = CW.evaluateHovers([hpUnknown, hpUnknown, hpUnknown, hpUnknown].map((h, i) => ({ ...h, xy_err_m: [0, 0], edge_height_m: 0.012, height_m: 0.0097, z_end_m: 0.02 + i * 0.0001 })), { edgeToLow: 0.0023, physicalContactEnd: null });
+  check('g. B10 unknown physicalContactEnd sets table_z_m === null while keeping optical_table_z_m', evUnknown.table_z_m === null && Number.isFinite(evUnknown.optical_table_z_m), '');
+  const cpUnknown = CW.planHover({ Tbb, X, tipCam: tip, edgeToLow: 0.0023, ch, kCand: zero, kLive: zero, q0, K: F.intrinsics, board, lo, hi, tableZ: 0.0098, physicalContactEnd: null, plan: { ...CW.HOVER_PLAN, count: 2, minCount: 1 } });
+  check('g. B10 confirmation plan with null physicalContactEnd fails closed', !cpUnknown.ok && cpUnknown.why === 'contact' && cpUnknown.points.length === 0, '');
   const body = CW.verifiedApplyBody({ intrinsics: { fx: 1 }, camera_mount: {}, table_z_m: 0.024, kinematics: null }, {
     tool: { tool_id: 'b601dm_gripper', tip_cam_m: tip, x_fingerprint: 'xf' }, fingerprint: 'fp', jobId: 'hv-1', board,
     evaluation: { ok: true, table_z_m: 0.0098, optical_table_z_m: 0.022, height_spread_m: 0.0013, max_xy_m: 0.002, gates: [] }, points: [{ id: 'a', ok: true, height_m: 0.0099 }] });

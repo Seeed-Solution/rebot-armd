@@ -59,7 +59,7 @@ fn so_arm101_config() -> ArmConfig {
         holding_torque_nm: 0.1,
         squeeze_rad: 0.02,
         settle_ms: 100,
-        jaw_opening: None,
+        jaw_opening: Some(armd::model::JawOpening { points: vec![[0.0, 0.0], [1.0, 0.075]], calibrated: false }),
         zero_check_supported: false,
         holding_mode: HoldingMode::LoadAndGap,
         holding_load_fraction: Some(0.25),
@@ -230,6 +230,8 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
         stale: None,
+        tool_id: None,
+        tool_config_digest: None,
     };
 
     let list_51 = PoseList {
@@ -268,6 +270,9 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+        tool_id: None,
+        tool_config_digest: None,
+        has_gripper_motion: None,
     };
     write_frames_to_parquet_with_meta(&ep_path, &frames, Some(&meta_51)).unwrap();
 
@@ -290,6 +295,8 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
 
     let replay_err = plan(replay_input_60).unwrap_err();
@@ -323,6 +330,8 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let plan_res = plan(replay_input_legacy);
     assert!(plan_res.is_ok(), "expected legacy replay to succeed, got: {plan_res:?}");
@@ -345,6 +354,8 @@ fn test_profile_id_pose_and_replay_rejection() {
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
         stale: None,
+        tool_id: None,
+        tool_config_digest: None,
     };
     let list_100 = PoseList {
         profile_id: Some("so_arm100".into()),
@@ -381,6 +392,9 @@ fn test_profile_id_pose_and_replay_rejection() {
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+        tool_id: None,
+        tool_config_digest: None,
+        has_gripper_motion: None,
     };
     write_frames_to_parquet_with_meta(&ep_path, &frames, Some(&meta_100)).unwrap();
 
@@ -403,6 +417,8 @@ fn test_profile_id_pose_and_replay_rejection() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let replay_err = plan(replay_input).unwrap_err();
     match replay_err {
@@ -436,6 +452,8 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         gripper_joint: None,
         joint_names: None,
         stale: None,
+        tool_id: None,
+        tool_config_digest: None,
     };
     let legacy_list_6 = PoseList {
         profile_id: None,
@@ -504,6 +522,8 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let rep_err_5d = plan(replay_5d).unwrap_err();
     match rep_err_5d {
@@ -534,6 +554,8 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     assert!(plan(replay_60).is_ok());
 }
@@ -562,6 +584,8 @@ fn test_parquet_metadata_error_propagation() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let err = plan(input_nonexistent).unwrap_err();
     match err {
@@ -597,6 +621,8 @@ fn test_parquet_metadata_error_propagation() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let err = plan(input_corrupt_json).unwrap_err();
     match err {
@@ -629,6 +655,8 @@ fn test_parquet_metadata_error_propagation() {
         power: None,
         store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
         zero_offsets: vec![0.0; 6],
+        tcp_offset: [0.0; 3],
+        active_tool: Default::default(),
     };
     let err = plan(input_corrupt_bin).unwrap_err();
     match err {

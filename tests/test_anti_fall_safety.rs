@@ -99,6 +99,7 @@ async fn test_safety_error_enum_variants_and_traits() {
     let err1 = SafetyError::ArmNotAtRestingPose {
         current: vec![0.1, 0.2],
         expected: vec![0.0, 0.0],
+        reason: None,
     };
     let err2 = SafetyError::MotionForbiddenInFaultState("test fault".to_string());
 
@@ -289,7 +290,7 @@ async fn test_set_torque_false_safety_gates() {
     let res_midair = supervisor.set_torque(false).await;
     assert!(matches!(
         res_midair,
-        Err(ArmError::Safety(SafetyError::ArmNotAtRestingPose { ref current, ref expected }))
+        Err(ArmError::Safety(SafetyError::ArmNotAtRestingPose { ref current, ref expected, .. }))
             if current == &vec![0.5, -0.3] && expected == &vec![0.0, 0.0]
     ));
     assert!(supervisor.get_observation().await.is_torqued, "Torque must NOT be cut in mid-air");

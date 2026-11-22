@@ -323,10 +323,19 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
             }
             let (path, frames) = inner.recorder.begin_save()?;
             inner.recording = None;
-            let base = (inner.joint_names(), inner.config.profile_id.clone(), inner.config.arm_dof(), inner.config.gripper_index(), f64::from(inner.config.control_frequency_hz));
+            let base = (
+                inner.joint_names(),
+                inner.config.profile_id.clone(),
+                inner.config.arm_dof(),
+                inner.config.gripper_index(),
+                f64::from(inner.config.control_frequency_hz),
+                inner.config.active_tool.id.clone(),
+                inner.config.active_tool.config_digest.clone(),
+            );
             (r, path, frames, base)
         };
-        let (joint_names, profile_id, arm_dof, gripper_joint, fps) = sidecar_base;
+        let (joint_names, profile_id, arm_dof, gripper_joint, fps, tool_id, tool_config_digest) = sidecar_base;
+        let has_gripper_motion = store::episode_has_gripper_motion(&frames, gripper_joint);
         let duration = match (frames.first(), frames.last()) { (Some(a), Some(b)) => (b.timestamp - a.timestamp).max(0.0), _ => 0.0 };
         let (truncated, stopped_by) = match by { Stopper::Monitor { reason } => (reason == "max_duration", Some(reason.to_string())), _ => (false, None) };
         let sidecar = EpisodeSidecar {
@@ -336,6 +345,7 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
             joint_zero: rec.joint_zero.clone(), profile_id, armd_version: env!("CARGO_PKG_VERSION").into(), fps_nominal: fps,
             truncated, stopped_by, arm_dof: Some(arm_dof), gripper_joint, recovered: None,
             first_state: frames.first().map(|f| f.observation_state.clone()), last_state: frames.last().map(|f| f.observation_state.clone()),
+            tool_id: Some(tool_id), tool_config_digest: Some(tool_config_digest), has_gripper_motion: Some(has_gripper_motion),
         };
         let sc = sidecar.clone();
         let (frames, result) = tokio::task::spawn_blocking(move || {

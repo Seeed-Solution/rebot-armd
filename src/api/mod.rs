@@ -254,6 +254,11 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/action/policy/stop", post(rest::action_requires_lease));
     let router = router
         .route("/api/v1/gripper/calibration", get(rest::get_gripper_calibration))
+        .route("/api/v1/tool/commissioning", get(rest::get_tool_commissioning))
+        .route(
+            "/api/v1/tool/commissioning/confirm",
+            post(rest::post_tool_commissioning_confirm).layer(middleware::from_fn(require_operator)),
+        )
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route(crate::depth_measure::PATH, post(rest::post_grasp_measure).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/workspace/keepout", get(rest::get_keepout))
