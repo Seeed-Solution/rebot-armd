@@ -5517,10 +5517,10 @@ impl SupervisorInner {
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
                 } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
+                    // The rejected motion's caps (`FallbackRamp::limits`) stay in force.
                     let ramp = self.tracking.fallback_ramp.clone().expect("checked above");
-                    let active_limits = self.active_tracking_limits(servo_dt, time_scale);
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let pending = self.tracking_fallback_compute(ramp, servo_dt, &active_limits, &mut tick_sweep_budget);
+                    let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
                     output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
@@ -5607,9 +5607,9 @@ impl SupervisorInner {
                             let ramp = crate::tracking::FallbackRamp {
                                 hold: self.measured_hold_pose(),
                                 keepout_only: self.pending_normal_unload,
+                                limits: active_limits.clone(),
                             };
-                            let pending =
-                                self.tracking_fallback_compute(ramp, servo_dt, &active_limits, &mut tick_sweep_budget);
+                            let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
                             match reject {
                                 crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
                                     self.enter_servo_keepout_hold(&ws_err);

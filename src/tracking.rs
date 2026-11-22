@@ -217,6 +217,9 @@ pub struct FallbackRamp {
     /// The rejection happened during park (`NormalUnload`): validate against the park
     /// keep-out-only workspace and its escape depths.
     pub keepout_only: bool,
+    /// Output limits in force when the motion was rejected (its speed_scale / servo caps);
+    /// every braking tick uses them, also after the hold has cleared the motion.
+    pub limits: Vec<crate::model::JointLimit>,
 }
 
 /// A fallback step evaluated before any hold or fault changes the tracking state, with the
@@ -1225,16 +1228,12 @@ impl crate::supervisor::SupervisorInner {
         Err(last_err)
     }
 
-    /// Evaluate the rejection fallback toward `ramp.hold` from the current tracking state,
-    /// using the escape depths of the workspace `ramp.keepout_only` selects. Read-only:
+    /// Evaluate the rejection fallback toward `ramp.hold` from the current tracking state
+    /// within `ramp.limits`, using the escape depths of the workspace `ramp.keepout_only`
+    /// selects. Read-only:
     /// call it before any hold or fault invalidates the history.
-    pub fn tracking_fallback_compute(
-        &self,
-        ramp: FallbackRamp,
-        dt: f64,
-        active_limits: &[crate::model::JointLimit],
-        budget: &mut usize,
-    ) -> PendingFallback {
+    pub fn tracking_fallback_compute(&self, ramp: FallbackRamp, dt: f64, budget: &mut usize) -> PendingFallback {
+        let active_limits = ramp.limits.as_slice();
         let fresh_meas = self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
             && self.measured_positions.len() == self.config.dof
             && self.measured_positions.iter().all(|q| q.is_finite());

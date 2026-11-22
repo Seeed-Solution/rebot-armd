@@ -3977,3 +3977,50 @@ fn tracking_keeps_motion_caps_through_final_tick_and_settling() {
         assert!(v.abs() <= f64::from(scaled_v) + 1e-3, "frame {k}: J1 issued {v:.4} rad/s above the scaled cap {scaled_v}");
     }
 }
+
+/// Review 4 #2: a rejection in the middle of a speed_scale-capped motion brakes with that
+/// motion's scaled caps on every fallback tick, also after the hold has cleared the
+/// trajectory (never with the higher generic planning caps).
+#[test]
+fn tracking_braking_fallback_keeps_rejected_motion_caps() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.workspace = None;
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]);
+    let scaled_v = f64::from(inner.planning_limits()[0].max_velocity * 0.25);
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 {
+        goal[i] = f64::from(q0[i]);
+    }
+    goal[0] += 0.20;
+    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+    for _ in 0..60 {
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational());
+    }
+    // Force a rejection: the last issued J1 output is 30 mrad ahead of where it was.
+    let mut prev = inner.tracking.last_issued_positions.clone().unwrap();
+    let prev_v = inner.tracking.last_issued_velocities.clone().unwrap();
+    prev[0] += 0.030;
+    inner.tracking.record_issued(prev.clone(), prev_v.clone());
+    let idx0 = drv.with(|s| s.written.len());
+    let obs = inner.tick(DT);
+    assert!(
+        obs.fault.as_ref().is_some_and(|f| f.message.contains("Joint tracking output rejected")),
+        "expected a tracking rejection, got {:?}",
+        obs.fault
+    );
+    for _ in 0..60 {
+        inner.tick(DT);
+    }
+    let frames = drv.with(|s| s.written[idx0..].to_vec());
+    let steps = issued_velocity_steps(&frames, 0, prev[0], prev_v[0]);
+    let peak = steps.iter().map(|(v, _)| v.abs()).fold(0.0, f64::max);
+    assert!(peak > 0.0, "the fallback must move J1 toward the hold");
+    for (k, (v, _)) in steps.iter().enumerate() {
+        assert!(v.abs() <= scaled_v + 1e-3, "fallback frame {k}: J1 {v:.4} rad/s above the motion's scaled cap {scaled_v:.4}");
+    }
+}
