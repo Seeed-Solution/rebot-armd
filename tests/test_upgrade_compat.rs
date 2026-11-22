@@ -103,3 +103,23 @@ async fn narrower_jaw_curve_keeps_calibration_and_setup_and_clamps_the_width() {
     drop(inner);
     assert!(calib_path.exists() && setup_path.exists(), "neither file is discarded");
 }
+
+#[tokio::test]
+async fn legacy_intrinsics_with_cx_zero_and_no_grasp_setup_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (setup_path, cal_path) = devstate_copy(dir.path());
+    std::fs::remove_file(&setup_path).unwrap();
+    let mut cal: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cal_path).unwrap()).unwrap();
+    cal["intrinsics"]["cx"] = json!(0.0);
+    std::fs::write(&cal_path, cal.to_string()).unwrap();
+    let sup = real_supervisor().await;
+    grasp::load_into(&sup, &setup_path).await;
+    calibration::load_into(&sup, &cal_path, Some(&setup_path)).await.expect("a legacy cx 0 does not stop the start");
+    let inner = sup.inner().read().await;
+    assert!(inner.camera_calibrated());
+    let g = inner.grasp_setup().unwrap();
+    assert!(g.validate().is_ok());
+    assert_ne!(g.cx_px, Some(0.0), "the invalid intrinsics are not synced");
+    assert_eq!(g.table_z_m, 0.0098, "the rest of the camera sync is applied");
+    assert!((g.camera_tilt_deg + 37.0).abs() < 0.01);
+}

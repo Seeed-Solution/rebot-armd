@@ -570,6 +570,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                 if let Some(mut setup) = inner.config.grasp.clone() {
                     let arm_ref = candidate_arm_model.as_ref().unwrap_or(&inner.config.arm_model);
                     let tcp_offset = inner.config.tcp_offset;
+                    let base = setup.clone();
                     refresh_grasp_setup_camera_fields(
                         &mut setup,
                         file.intrinsics.as_ref(),
@@ -578,12 +579,23 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                         arm_ref,
                         &tcp_offset,
                     );
-                    if let Err(e) = setup.validate() {
-                        let msg = format!("calibration.json: synced grasp setup invalid: {e}");
-                        inner.calibration_load_error = Some(msg.clone());
-                        return Err(msg);
+                    // persisted intrinsics an older armd accepted (cx 0, ...) must not stop the
+                    // start: sync without them, else keep the setup as it is
+                    match setup.validate() {
+                        Ok(()) => Some(setup),
+                        Err(e) => {
+                            tracing::warn!("calibration.json: grasp setup synced with its intrinsics is invalid ({e}); syncing without the intrinsics");
+                            let mut setup = base;
+                            refresh_grasp_setup_camera_fields(&mut setup, None, &mount, file.table_z_m, arm_ref, &tcp_offset);
+                            match setup.validate() {
+                                Ok(()) => Some(setup),
+                                Err(e) => {
+                                    tracing::warn!("calibration.json: grasp setup camera sync skipped ({e})");
+                                    None
+                                }
+                            }
+                        }
                     }
-                    Some(setup)
                 } else {
                     None
                 }

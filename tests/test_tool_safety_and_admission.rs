@@ -2232,8 +2232,8 @@ async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint(
     let cal_path = dir.path().join("calibration.json");
     let gs_path = dir.path().join("grasp_setup.json");
 
-    // M6: Invalid intrinsics (fx=0) during startup grasp_setup_needs_camera_sync must fail BEFORE
-    // installing camera_mount or clearing grasp_setup_needs_camera_sync.
+    // M6: Invalid persisted intrinsics (fx=0) during the startup camera sync do not stop the
+    // start: the setup is synced without them and stays valid.
     let q_tilt15 = kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0));
     let bad_cal: CalibrationFile = serde_json::from_value(json!({
         "camera_mount": {
@@ -2258,14 +2258,16 @@ async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint(
     let orig_dof = tool_b.dof;
     let sup_bad = Arc::new(ArmSupervisor::new(tool_b));
     grasp::load_into(&sup_bad, &gs_path).await; // Missing -> sets grasp_setup_needs_camera_sync=true
-    let err = calibration::load_into(&sup_bad, &cal_path, Some(&gs_path)).await.unwrap_err();
-    assert!(err.contains("fx_px") || err.contains("synced grasp setup invalid"), "{err}");
+    calibration::load_into(&sup_bad, &cal_path, Some(&gs_path)).await.expect("invalid intrinsics must not stop the start");
     {
         let inner = sup_bad.inner().read().await;
-        assert_eq!(inner.config.camera_mount, orig_mount, "M6: failed sync must not install partial camera_mount");
-        assert_eq!(inner.joint_zero_offsets, vec![0.0; orig_dof], "m1: failed load_into must not mutate joint_zero_offsets");
-        assert!(inner.grasp_setup_needs_camera_sync, "M6: failed sync must retain grasp_setup_needs_camera_sync");
-        assert!(inner.calibration.is_none());
+        assert_ne!(inner.config.camera_mount, orig_mount, "M6: the calibrated mount is installed");
+        assert_eq!(inner.joint_zero_offsets.len(), orig_dof);
+        assert!(!inner.grasp_setup_needs_camera_sync);
+        assert!(inner.calibration.is_some());
+        let g = inner.grasp_setup().unwrap();
+        assert!(g.validate().is_ok() && g.fx_px > 10.0, "fx 0 is not synced: {}", g.fx_px);
+        assert_eq!(g.table_z_m, 0.014, "the rest of the sync is applied");
     }
 
     // M7: Legacy unkeyed stock AcceptanceRecord (no tool_id/tool_config_digest, pre-tool-pack fingerprint)
