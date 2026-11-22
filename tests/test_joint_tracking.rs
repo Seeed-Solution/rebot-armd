@@ -3530,3 +3530,110 @@ fn tracking_action_done_not_published_when_output_skipped_by_disable_or_torque_o
         assert_ne!(act.state, "done", "skipped output while untorqued must NOT publish done");
     }
 }
+
+/// Issued arm velocities of consecutive frames, starting from `(p0, v0)` on `joint`.
+fn issued_velocity_steps(frames: &[Vec<JointTarget>], joint: usize, p0: f32, v0: f32) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let (mut p_prev, mut v_prev) = (f64::from(p0), f64::from(v0));
+    for f in frames {
+        let p = f64::from(f[joint].position);
+        let v = (p - p_prev) / DT;
+        out.push((v, (v - v_prev) / DT));
+        p_prev = p;
+        v_prev = v;
+    }
+    out
+}
+
+/// Review 3 B2: when the rejection fallback cannot reach the hold in one tick, it brakes
+/// over several ticks within a_max (also while the tracking fault is latched) and never
+/// drops the issued velocity to zero in one tick. When no braking step is feasible it
+/// latches the fault without sending a frame.
+#[test]
+fn tracking_rejection_fallback_brakes_over_ticks_within_acceleration() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+
+    // 1. Feasible: multi-tick braking ramp, every issued frame within a_max.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.workspace = None;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let limits = inner.active_tracking_limits(DT, 1.0);
+        let (max_v, max_a) = (f64::from(limits[0].max_velocity), f64::from(limits[0].max_acceleration));
+        // Issued J1 output 0.030 rad ahead of the nominal hold and still moving away at 0.40 rad/s.
+        let mut prev = q0.to_vec();
+        prev[0] = 0.030;
+        let mut prev_v = vec![0.0; 7];
+        prev_v[0] = 0.40;
+        assert!(f64::from(prev_v[0]) <= max_v && f64::from(prev_v[0]) > 2.0 * max_a * DT, "test needs a multi-tick brake");
+        inner.tracking.record_issued(prev.clone(), prev_v.clone());
+        let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &q0, &[0.0; 7], Some(0.2), &inner.config.limits).unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        let idx0 = drv.with(|s| s.written.len());
+        let obs = inner.tick(DT);
+        assert!(
+            obs.fault.as_ref().is_some_and(|f| f.message.contains("Joint tracking output rejected")),
+            "expected tracking rejection fault, got {:?}",
+            obs.fault
+        );
+        for _ in 0..80 {
+            inner.tick(DT);
+        }
+        let frames = drv.with(|s| s.written[idx0..].to_vec());
+        assert!(frames.len() >= 60, "fault hold must keep writing frames ({})", frames.len());
+        let steps = issued_velocity_steps(&frames, 0, prev[0], prev_v[0]);
+        for (k, (v, a)) in steps.iter().enumerate() {
+            assert!(
+                v.abs() <= max_v + 1e-2 && a.abs() <= max_a + 1e-2,
+                "fallback frame {k}: J1 v={v:.4} rad/s a={a:.3} rad/s^2 exceeds ({max_v:.3}, {max_a:.3}); positions {:?}",
+                frames.iter().take(k + 2).map(|f| f[0].position).collect::<Vec<_>>()
+            );
+        }
+        let (v_end, _) = steps.last().copied().unwrap();
+        assert!(v_end.abs() < 1e-6, "braking ramp must end at rest, last v={v_end}");
+        let p_end = frames.last().unwrap()[0].position;
+        assert!((p_end - q0[0]).abs() < 1e-4, "braking ramp must end at the measured hold, got {p_end}");
+        assert!(matches!(inner.safety.state(), SafetyState::Fault(_)), "tracking rejection stays latched");
+    }
+
+    // 2. Infeasible: the workspace refuses every braking step -> latch a fault, send no frame
+    //    on the rejection tick, then keep holding exactly the last issued output.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let mut prev = q0.to_vec();
+        prev[0] = 0.010;
+        let mut prev_v = vec![0.0; 7];
+        prev_v[0] = 0.40;
+        inner.tracking.record_issued(prev.clone(), prev_v);
+        let mut ws = inner.config.workspace.clone().unwrap();
+        ws.floor_z_m = 5.0;
+        inner.config.workspace = Some(ws);
+        inner.workspace_revision += 1;
+        let idx0 = drv.with(|s| s.written.len());
+        let obs = inner.tick(DT);
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "infeasible fallback must latch a fault");
+        assert_eq!(
+            drv.with(|s| s.written.len()),
+            idx0,
+            "no frame may be sent when no braking step satisfies the limits"
+        );
+        for _ in 0..5 {
+            inner.tick(DT);
+        }
+        let frames = drv.with(|s| s.written[idx0..].to_vec());
+        assert!(!frames.is_empty(), "the fault hold keeps writing frames");
+        for (k, f) in frames.iter().enumerate() {
+            assert_eq!(
+                f[0].position.to_bits(),
+                prev[0].to_bits(),
+                "fault hold frame {k} must repeat the last issued J1 output, not step to measured"
+            );
+        }
+    }
+}
