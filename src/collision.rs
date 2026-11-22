@@ -403,6 +403,7 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
+        self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];

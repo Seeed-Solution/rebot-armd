@@ -244,6 +244,7 @@ impl SupervisorInner {
             }
         }
         self.stop_motion();
+        self.tracking.invalidate();
         for i in 0..ARM {
             self.commanded_positions[i] = pose[i];
             self.commanded_velocities[i] = 0.0;
@@ -293,6 +294,7 @@ impl SupervisorInner {
             self.commanded_positions[i] = hold[i];
             self.commanded_velocities[i] = 0.0;
         }
+        self.tracking.invalidate();
         self.target_positions = self.commanded_positions.clone();
         let at = self.start_time.elapsed().as_secs_f64();
         if code == "REQUESTED" || code == "STOPPED" {
@@ -472,6 +474,7 @@ impl SupervisorInner {
         match result {
             Ok(()) => {
                 self.gravity_comp = None;
+                self.tracking.invalidate();
                 for i in 0..ARM {
                     self.commanded_positions[i] = hold[i];
                     self.commanded_velocities[i] = 0.0;

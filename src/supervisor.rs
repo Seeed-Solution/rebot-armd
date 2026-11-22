@@ -771,6 +771,7 @@ impl SupervisorInner {
             return Err(format!("joint zero needs {} finite offsets", self.config.dof));
         }
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
+        self.tracking.invalidate();
         if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
         if let Some(d) = self.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
@@ -1273,6 +1274,7 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
+        self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
@@ -1419,6 +1421,7 @@ impl SupervisorInner {
     /// A successful transport write is not confirmation that torque was removed.
     fn request_disable(&mut self) -> Result<(), SafetyError> {
         self.disable_pending = true;
+        self.tracking.invalidate();
         self.last_disable_attempt = Some(Instant::now());
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
@@ -1853,6 +1856,7 @@ impl SupervisorInner {
             }
             self.commanded_velocities = vec![0.0; self.config.dof];
             self.commanded_accelerations.fill(0.0);
+            self.tracking.seed(&self.commanded_positions);
             if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             self.active_trajectory = None;
             self.pending_normal_unload = false;
@@ -1949,6 +1953,7 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.tracking.invalidate();
         match policy {
             StopPolicy::NormalUnload => {
                 if self.handover_settling_since.is_some() {
@@ -2156,6 +2161,7 @@ impl SupervisorInner {
         self.gripper_stall_sign = 0.0;
         self.gripper_prev_hw_overload = false;
         self.stop_motion();
+        self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             self.commanded_positions = self.measured_positions.clone();
             self.target_positions = self.measured_positions.clone();
@@ -2284,6 +2290,7 @@ impl SupervisorInner {
         }
         self.pending_rearm = true;
         self.stop_motion();
+        self.tracking.invalidate();
         // Reset at the measured position; never retain a residual old trajectory target.
         self.commanded_positions = self.measured_positions.clone();
         self.target_positions = self.measured_positions.clone();
@@ -2559,6 +2566,7 @@ impl SupervisorInner {
         self.active_trajectory = None;
         self.servo_target = None; self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.tracking.invalidate();
         self.target_positions = hold_pos.clone();
         self.commanded_positions = hold_pos;
         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -3979,6 +3987,7 @@ impl SupervisorInner {
             StepStatus::Failed { code, message } => {
                 if code == "TRACKING_STALL" {
                     self.stop_motion();
+                    self.tracking.invalidate();
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
                         self.commanded_positions = self.measured_positions.clone();
                     }
@@ -4118,6 +4127,7 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.tracking.invalidate();
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
         self.target_positions = self.commanded_positions.clone();
@@ -4358,10 +4368,12 @@ impl SupervisorInner {
         }
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
+            self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             self.safety.trigger_fault_coded(FaultCode::InvalidTelemetry, FaultReason::Other("Invalid hardware telemetry".into()));
         } else if driver_torque_lost && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
+            self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
@@ -4380,6 +4392,7 @@ impl SupervisorInner {
         if (!dt.is_finite() || dt <= 0.0 || dt > CONTROL_DEADLINE.as_secs_f64())
             && self.is_torqued && self.safety.state().is_operational() {
             self.stop_motion();
+            self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
@@ -4703,6 +4716,7 @@ impl SupervisorInner {
                         self.active_trajectory = None;
                         self.servo_target = None; self.servo_settled_ticks.fill(0);
                         self.servo_ws_min_depths = None;
+                        self.tracking.invalidate();
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -4791,6 +4805,7 @@ impl SupervisorInner {
                     self.enter_servo_blocked_hold(joint, "tracking error above the bound");
                 } else if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
                     self.stop_motion();
+                    self.tracking.invalidate();
                     self.commanded_positions = self.measured_positions.clone();
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
@@ -5155,9 +5170,12 @@ impl SupervisorInner {
 
         let feedback_fresh = self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
         if self.driver.is_some() && self.is_torqued {
-            if !feedback_fresh { self.output_suspended = true; }
-            else if self.output_suspended {
+            if !feedback_fresh {
+                self.output_suspended = true;
+                self.tracking.invalidate();
+            } else if self.output_suspended {
                 self.stop_motion();
+                self.tracking.invalidate();
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
                 self.commanded_velocities.fill(0.0);
@@ -5310,11 +5328,16 @@ impl SupervisorInner {
                         }
                     }
                 }
+            } else {
+                self.tracking.invalidate();
             }
+        } else {
+            self.tracking.invalidate();
         }
 
         if let Some(error) = output_error {
             self.stop_motion();
+            self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             if self.measured_positions.iter().all(|q| q.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
