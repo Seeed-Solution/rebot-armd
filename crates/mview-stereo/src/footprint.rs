@@ -623,23 +623,33 @@ fn trace_component(m: &[u8], w: usize, h: usize) -> Vec<[f64; 2]> {
     out
 }
 
-/// Douglas-Peucker simplification of a closed polygon to at most `max_vertices` vertices: the
-/// tolerance starts at `eps` and doubles until it fits. The extreme vertices are kept.
-pub fn simplify_closed(poly: &[[f64; 2]], eps: f64, max_vertices: usize) -> Vec<[f64; 2]> {
-    if poly.len() <= 3 || max_vertices < 3 { return poly.to_vec(); }
+/// Every k-th vertex so that at most `n` remain (the first kept).
+fn subsample(poly: &[[f64; 2]], n: usize) -> Vec<[f64; 2]> {
+    if poly.len() <= n || n == 0 { return poly.to_vec(); }
+    (0..n).map(|k| poly[k * poly.len() / n]).collect()
+}
+
+/// Longest outline Douglas-Peucker runs on (it is O(n^2) on a jagged boundary).
+const MAX_SIMPLIFY_INPUT: usize = 2048;
+
+/// Simplification of a closed polygon with bounded work: an outline over 2048 vertices is first
+/// subsampled to 2048, then one Douglas-Peucker pass at `eps` (the extreme vertices kept), then a
+/// result over `max_vertices` is subsampled to it. Never fewer than min(3, input) vertices.
+pub fn simplify_closed(input: &[[f64; 2]], eps: f64, max_vertices: usize) -> Vec<[f64; 2]> {
+    let cap = max_vertices.max(3);
+    let poly = subsample(input, MAX_SIMPLIFY_INPUT);
+    if poly.len() <= 3 { return poly; }
     // split at the vertex farthest from the first one
     let far = (1..poly.len()).max_by(|&a, &b| d2(poly[0], poly[a]).total_cmp(&d2(poly[0], poly[b]))).unwrap_or(1);
-    let mut e = eps.max(1e-9);
-    loop {
-        let mut keep = vec![false; poly.len()];
-        keep[0] = true;
-        keep[far] = true;
-        dp(poly, 0, far, e, &mut keep);
-        dp_wrap(poly, far, e, &mut keep);
-        let out: Vec<[f64; 2]> = poly.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
-        if out.len() <= max_vertices { return out; }
-        e *= 2.0;
-    }
+    let e = eps.max(1e-9);
+    let mut keep = vec![false; poly.len()];
+    keep[0] = true;
+    keep[far] = true;
+    dp(&poly, 0, far, e, &mut keep);
+    dp_wrap(&poly, far, e, &mut keep);
+    let mut out: Vec<[f64; 2]> = poly.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+    if out.len() < 3 { out = poly; }
+    subsample(&out, cap)
 }
 
 fn d2(a: [f64; 2], b: [f64; 2]) -> f64 { (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) }
@@ -1012,7 +1022,14 @@ mod tests {
         let a = polygon_area2(&s).abs() * 0.5;
         assert!((a - std::f64::consts::PI * 45.0 * 45.0).abs() < 0.03 * a, "{a}");
         let s = simplify_closed(&c, 0.7, 16);
-        assert!(s.len() <= 16);
+        assert!(s.len() <= 16 && s.len() >= 3);
+        // a comb (1-cell teeth every 2 columns under a 3-row spine): capped, never collapsed
+        let (w, h) = (160, 15);
+        let comb: Vec<u8> = (0..w * h).map(|k| u8::from(k / w < 3 || (k % w) % 2 == 0)).collect();
+        let c = trace_exterior(&comb, w, h);
+        assert!(c.len() > 128);
+        let s = simplify_closed(&c, 0.7, 128);
+        assert!(s.len() >= 3 && s.len() <= 128 && polygon_area2(&s).abs() * 0.5 > 0.3 * 480.0, "{}", s.len());
         assert!(validate_polygon(&s, 128).is_ok());
         assert_eq!(validate_polygon(&s[..2], 128), Err("contour_too_few_vertices"));
         assert_eq!(validate_polygon(&c, 128), Err("contour_too_many_vertices"));

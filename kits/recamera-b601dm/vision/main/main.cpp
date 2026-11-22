@@ -19,6 +19,7 @@
 #include <deque>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -525,19 +526,28 @@ int main(int argc, char** argv) {
 
     // YOLO: the model stays loaded in every mode, so switching to yolo/both needs no load.
     std::string model = g_cfg.model_path;
-    if (model.empty()) {
-        for (const char* p : kDefaultModels) {
-            if (file_exists(p)) {
-                model = p;
-                break;
-            }
-        }
-    }
     // the frame thread owns both slots; a swap replaces them with fresh objects
     std::unique_ptr<yolo::Detector> detector;
     std::unique_ptr<rv::DepthStage> depth_stage;
     rv::ModelSet resident;
-    if (!file_exists(model)) {
+    if (model.empty()) {
+        // automatic: the first default that exists and loads (a corrupt seg384 does not hide the
+        // detect model behind it); an explicitly configured model is loaded alone, below
+        const std::vector<std::string> candidates(std::begin(kDefaultModels), std::end(kDefaultModels));
+        const int k = rv::first_loadable(
+            candidates, [](const std::string& p) { return file_exists(p); },
+            [&](const std::string& p) {
+                detector = load_detector(p, kind_hint_of(g_cfg.model_kind_str), startup_classes(g_cfg.catalogue, p));
+                if (!detector) MA_LOGE(TAG, "YOLO model %s failed to load; trying the next default", p.c_str());
+                return detector != nullptr;
+            });
+        if (k >= 0) {
+            model = candidates[static_cast<size_t>(k)];
+            set_detector(resident, detector.get(), rv::register_startup(g_cfg.catalogue, model, kind_name(detector->getKind())), model);
+        } else {
+            MA_LOGW(TAG, "No default YOLO model loaded; yolo/both unavailable, aruco works");
+        }
+    } else if (!file_exists(model)) {
         MA_LOGW(TAG, "No YOLO model found (%s); yolo/both unavailable, aruco works",
                 model.empty() ? "default paths" : model.c_str());
     } else if ((detector = load_detector(model, kind_hint_of(g_cfg.model_kind_str), startup_classes(g_cfg.catalogue, model)))) {

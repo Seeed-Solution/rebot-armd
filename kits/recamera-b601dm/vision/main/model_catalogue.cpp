@@ -213,4 +213,14 @@ bool parse_swap_request(const std::string& text, const Catalogue& cat, SwapReque
     return true;
 }
 
+int first_loadable(const std::vector<std::string>& candidates, const std::function<bool(const std::string&)>& exists,
+                   const std::function<bool(const std::string&)>& load, std::vector<std::string>* failed) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (!exists(candidates[i])) continue;
+        if (load(candidates[i])) return static_cast<int>(i);
+        if (failed) failed->push_back(candidates[i]);
+    }
+    return -1;
+}
+
 }  // namespace rv
