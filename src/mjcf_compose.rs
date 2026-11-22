@@ -1132,12 +1132,7 @@ pub fn validate_tool_manifest_for_robot(
         if !manifest.robots.is_empty() {
             let norm_target = crate::tool::normalize_robot_id(robot_id)
                 .ok_or_else(|| format!("unknown robot profile '{robot_id}'"))?;
-            let mut allowed = Vec::with_capacity(manifest.robots.len());
-            for raw in &manifest.robots {
-                let norm = crate::tool::normalize_robot_id(raw)
-                    .ok_or_else(|| format!("tool '{}': unknown robot target '{raw}'", manifest.id))?;
-                allowed.push(norm);
-            }
+            let allowed = crate::tool::normalize_robot_list(&manifest.id, &manifest.robots)?;
             if !allowed.contains(&norm_target) {
                 return Err(format!(
                     "tool '{}': robot '{norm_target}' is not in supported robots {:?}",
@@ -1208,24 +1203,7 @@ fn validate_tool_manifest_independent(
             crate::tool::validate_contact_opening_m(co, "armd.contact_opening_m")?;
         }
         if let Some(gr) = &a.grasp {
-            if let Some(e) = gr.edge_to_low_m {
-                crate::tool::checked_to_micro_f64(e, "armd.grasp.edge_to_low_m")?;
-                if !(-0.10..=0.10).contains(&e) {
-                    return Err("armd.grasp.edge_to_low_m must be finite and in [-0.10, 0.10] m".into());
-                }
-            }
-            if let Some(w) = gr.max_grasp_width_m {
-                crate::tool::checked_to_micro_f64(w, "armd.grasp.max_grasp_width_m")?;
-                if !(0.0..=0.2).contains(&w) {
-                    return Err("armd.grasp.max_grasp_width_m must be in [0, 0.2] m".into());
-                }
-            }
-            if let Some(h) = gr.grasp_height_m {
-                crate::tool::checked_to_micro_f64(h, "armd.grasp.grasp_height_m")?;
-                if !(0.005..=0.2).contains(&h) {
-                    return Err("armd.grasp.grasp_height_m must be in [0.005, 0.2] m".into());
-                }
-            }
+            gr.validate()?;
         }
     }
 
@@ -1279,32 +1257,42 @@ pub fn validate_tool_manifest(
     Ok(resolved_tcp)
 }
 
-fn parse_mjcf_vec3(raw: &str, label: &str) -> Result<[f64; 3], String> {
+fn parse_mjcf_floats<const N: usize>(raw: &str, err_msg: &str, float_label: &str) -> Result<[f64; N], String> {
     let vals: Vec<f64> = raw
         .split_whitespace()
-        .map(|s| s.parse::<f64>().map_err(|e| format!("invalid {label} float '{s}': {e}")))
+        .map(|s| s.parse::<f64>().map_err(|e| format!("invalid {float_label} float '{s}': {e}")))
         .collect::<Result<_, _>>()?;
-    if vals.len() != 3 || !vals.iter().all(|v| v.is_finite()) {
-        return Err(format!("base MJCF <site name=\"tcp\"> {label} must have 3 finite numbers"));
+    if vals.len() != N || !vals.iter().all(|v| v.is_finite()) {
+        return Err(err_msg.to_string());
     }
-    Ok([vals[0], vals[1], vals[2]])
+    Ok(vals.try_into().expect("checked length"))
+}
+
+fn parse_mjcf_vec3(raw: &str, label: &str) -> Result<[f64; 3], String> {
+    parse_mjcf_floats::<3>(
+        raw,
+        &format!("base MJCF <site name=\"tcp\"> {label} must have 3 finite numbers"),
+        label,
+    )
+}
+
+fn fmt_mjcf_num(v: f64) -> f64 {
+    if v == 0.0 { 0.0 } else { v }
 }
 
 fn parse_mjcf_compiler_euler(doc: &roxmltree::Document) -> Result<(f64, String), String> {
     let mut angle_scale = std::f64::consts::PI / 180.0; // MuJoCo default: degree
     let mut eulerseq = "xyz".to_string(); // MuJoCo default: xyz (intrinsic)
-    for node in doc.descendants() {
-        if node.is_element() && node.tag_name().name() == "compiler" {
-            if let Some(a) = node.attribute("angle") {
-                match a.trim() {
-                    "degree" => angle_scale = std::f64::consts::PI / 180.0,
-                    "radian" => angle_scale = 1.0,
-                    other => return Err(format!("base MJCF <compiler> uses unsupported angle unit '{other}'")),
-                }
+    for node in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "compiler") {
+        if let Some(a) = node.attribute("angle") {
+            match a.trim() {
+                "degree" => angle_scale = std::f64::consts::PI / 180.0,
+                "radian" => angle_scale = 1.0,
+                other => return Err(format!("base MJCF <compiler> uses unsupported angle unit '{other}'")),
             }
-            if let Some(seq) = node.attribute("eulerseq") {
-                eulerseq = seq.trim().to_string();
-            }
+        }
+        if let Some(seq) = node.attribute("eulerseq") {
+            eulerseq = seq.trim().to_string();
         }
     }
     let bytes = eulerseq.as_bytes();
@@ -1328,13 +1316,11 @@ fn axis_rot(axis: u8, angle_rad: f64) -> crate::kinematics::Mat3 {
 
 fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<crate::kinematics::Mat3, String> {
     if let Some(q_raw) = node.attribute("quat") {
-        let vals: Vec<f64> = q_raw
-            .split_whitespace()
-            .map(|s| s.parse::<f64>().map_err(|e| format!("invalid tcp site quat float '{s}': {e}")))
-            .collect::<Result<_, _>>()?;
-        if vals.len() != 4 || !vals.iter().all(|v| v.is_finite()) {
-            return Err("base MJCF <site name=\"tcp\"> quat must have 4 finite numbers".into());
-        }
+        let vals = parse_mjcf_floats::<4>(
+            q_raw,
+            "base MJCF <site name=\"tcp\"> quat must have 4 finite numbers",
+            "tcp site quat",
+        )?;
         let norm = (vals[0] * vals[0] + vals[1] * vals[1] + vals[2] * vals[2] + vals[3] * vals[3]).sqrt();
         if norm <= 1e-12 {
             return Err("base MJCF <site name=\"tcp\"> quat has zero norm".into());
@@ -1349,18 +1335,16 @@ fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) ->
     if let Some(e_raw) = node.attribute("euler") {
         let vals = parse_mjcf_vec3(e_raw, "euler")?;
         let (scale, seq) = parse_mjcf_compiler_euler(doc)?;
-        let ang = [vals[0] * scale, vals[1] * scale, vals[2] * scale];
         let b = seq.as_bytes();
-        let r0 = axis_rot(b[0], ang[0]);
-        let r1 = axis_rot(b[1], ang[1]);
-        let r2 = axis_rot(b[2], ang[2]);
+        let r0 = axis_rot(b[0], vals[0] * scale);
+        let r1 = axis_rot(b[1], vals[1] * scale);
+        let r2 = axis_rot(b[2], vals[2] * scale);
         // MuJoCo convention: lowercase = intrinsic (R0 * R1 * R2), uppercase = extrinsic (R2 * R1 * R0).
-        let rot = if b[0].is_ascii_lowercase() {
+        return Ok(if b[0].is_ascii_lowercase() {
             crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r0, &r1), &r2)
         } else {
             crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r2, &r1), &r0)
-        };
-        return Ok(rot);
+        });
     }
     for unsupported in ["axisangle", "xyaxes", "zaxis"] {
         if node.attribute(unsupported).is_some() {
@@ -1372,7 +1356,15 @@ fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) ->
     Ok(crate::kinematics::IDENTITY)
 }
 
-fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
+fn trimmed_attr<'a>(node: roxmltree::Node<'a, 'a>, attr: &str) -> Option<&'a str> {
+    node.attribute(attr).map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn non_main_class<'a>(node: roxmltree::Node<'a, 'a>, attr: &str) -> Option<&'a str> {
+    trimmed_attr(node, attr).filter(|s| *s != "main")
+}
+
+fn tcp_site_host_body_name<'a>(node: roxmltree::Node<'a, 'a>) -> Result<&'a str, String> {
     if node
         .ancestors()
         .skip(1)
@@ -1383,11 +1375,6 @@ fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
                 .into(),
         );
     }
-    Ok(())
-}
-
-fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<(), String> {
-    check_tcp_site_not_in_frame(node)?;
     let host_body = node
         .ancestors()
         .skip(1)
@@ -1395,24 +1382,21 @@ fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) ->
         .ok_or_else(|| {
             "base MJCF <site name=\"tcp\"> has no host <body> ancestor; declare <site name=\"tcp\"> directly inside a named host <body>".to_string()
         })?;
-    if host_body
-        .attribute("name")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        return Err(
-            "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
-                .into(),
-        );
-    }
+    trimmed_attr(host_body, "name").ok_or_else(|| {
+        "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
+            .to_string()
+    })
+}
+
+fn check_tcp_site_supported<'a>(
+    doc: &'a roxmltree::Document,
+    node: roxmltree::Node<'a, 'a>,
+) -> Result<&'a str, String> {
+    let host_name = tcp_site_host_body_name(node)?;
     if node.attribute("fromto").is_some() {
         return Err("base MJCF <site name=\"tcp\"> uses unsupported 'fromto' attribute".into());
     }
-    let raw_explicit_class = node
-        .attribute("class")
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let raw_explicit_class = trimmed_attr(node, "class");
     if let Some(cls) = raw_explicit_class.filter(|s| *s != "main") {
         return Err(format!(
             "base MJCF <site name=\"tcp\"> uses unsupported class '{cls}'"
@@ -1425,87 +1409,55 @@ fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) ->
     } else {
         node.ancestors()
             .skip(1)
-            .find_map(|a| {
-                a.is_element()
-                    .then(|| a.attribute("childclass").map(str::trim).filter(|s| !s.is_empty()))
-                    .flatten()
-            })
+            .find_map(|a| a.is_element().then(|| trimmed_attr(a, "childclass")).flatten())
             .filter(|s| *s != "main")
     };
     const TRANSFORM_ATTRS: [&str; 7] =
         ["pos", "quat", "euler", "axisangle", "xyaxes", "zaxis", "fromto"];
-    let mut active_defaults: Vec<roxmltree::Node> = Vec::new();
-    for def in doc.descendants() {
-        if !def.is_element() || def.tag_name().name() != "default" {
+    for def in doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "default")
+    {
+        let has_site_transform = def.children().any(|c| {
+            c.is_element()
+                && c.tag_name().name() == "site"
+                && TRANSFORM_ATTRS.iter().any(|k| c.attribute(*k).is_some())
+        });
+        if !has_site_transform {
             continue;
         }
-        let def_class = def
-            .attribute("class")
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "main");
-        let has_named_default_ancestor = def.ancestors().skip(1).any(|a| {
-            a.is_element()
-                && a.tag_name().name() == "default"
-                && a.attribute("class")
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "main")
-                    .is_some()
+        let def_class = non_main_class(def, "class");
+        let is_unscoped_default = def_class.is_none()
+            && !def.ancestors().skip(1).any(|a| {
+                a.is_element()
+                    && a.tag_name().name() == "default"
+                    && non_main_class(a, "class").is_some()
+            });
+        let matches_effective = effective_class.is_some_and(|ec| {
+            def.descendants().any(|d| {
+                d.is_element()
+                    && d.tag_name().name() == "default"
+                    && non_main_class(d, "class") == Some(ec)
+            })
         });
-        if def_class.is_none() && !has_named_default_ancestor {
-            active_defaults.push(def);
-        }
-        if let Some(ec) = effective_class {
-            if def_class == Some(ec) {
-                for anc in def.ancestors() {
-                    if anc.is_element() && anc.tag_name().name() == "default" {
-                        active_defaults.push(anc);
-                    }
-                }
-            }
+        if is_unscoped_default || matches_effective {
+            return Err(format!(
+                "base MJCF <site name=\"tcp\"> inherits unsupported <default> <site> transform (class {:?})",
+                def_class.unwrap_or("main")
+            ));
         }
     }
-    for def in active_defaults {
-        let def_class = def
-            .attribute("class")
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "main");
-        for child in def.children() {
-            if child.is_element()
-                && child.tag_name().name() == "site"
-                && TRANSFORM_ATTRS.iter().any(|k| child.attribute(*k).is_some())
-            {
-                return Err(format!(
-                    "base MJCF <site name=\"tcp\"> inherits unsupported <default> <site> transform (class {:?})",
-                    def_class.unwrap_or("main")
-                ));
-            }
-        }
-    }
-    Ok(())
+    Ok(host_name)
 }
 
 fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
     let req = requested.trim();
     if req.is_empty() || req == "end_link" {
-        for site in base_doc.descendants() {
-            if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
-                check_tcp_site_not_in_frame(site)?;
-                let direct_body = site
-                    .ancestors()
-                    .skip(1)
-                    .find(|anc| anc.is_element() && anc.tag_name().name() == "body")
-                    .ok_or_else(|| {
-                        "base MJCF <site name=\"tcp\"> has no host <body> ancestor; declare <site name=\"tcp\"> directly inside a named host <body>".to_string()
-                    })?;
-                let bname = direct_body
-                    .attribute("name")
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name".to_string()
-                    })?;
-                return Ok(bname.to_string());
-            }
+        if let Some(site) = base_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+        {
+            return Ok(tcp_site_host_body_name(site)?.to_string());
         }
         if base_doc
             .descendants()
@@ -1629,6 +1581,70 @@ fn find_free_body_names(doc: &roxmltree::Document) -> Vec<String> {
     names
 }
 
+#[derive(Default)]
+struct MjcfSections {
+    worldbody: String,
+    asset: String,
+    equality: String,
+    actuator: String,
+    tendon: String,
+}
+
+fn extract_mjcf_sections(
+    doc: &roxmltree::Document,
+    raw_xml: &str,
+    worldbody_skip: Option<std::ops::Range<usize>>,
+) -> MjcfSections {
+    let mut sections = MjcfSections::default();
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "worldbody" => sections
+                .worldbody
+                .push_str(&extract_children_xml(node, raw_xml, worldbody_skip.clone())),
+            "asset" => sections
+                .asset
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "equality" => sections
+                .equality
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "actuator" => sections
+                .actuator
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            "tendon" => sections
+                .tendon
+                .push_str(&extract_children_xml(node, raw_xml, None)),
+            _ => {}
+        }
+    }
+    sections
+}
+
+fn find_active_tcp_site<'a>(
+    doc: &'a roxmltree::Document,
+    edits: &[XmlEdit],
+) -> Option<roxmltree::Node<'a, 'a>> {
+    doc.descendants().find(|n| {
+        n.is_element()
+            && n.tag_name().name() == "site"
+            && n.attribute("name") == Some("tcp")
+            && !edits
+                .iter()
+                .any(|e| e.replacement.is_empty() && n.range().start >= e.start && n.range().end <= e.end)
+    })
+}
+
+fn parse_site_pos_and_rot(
+    doc: &roxmltree::Document,
+    node: roxmltree::Node,
+) -> Result<([f64; 3], crate::kinematics::Mat3), String> {
+    let base_pos = match node.attribute("pos") {
+        Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+        None => [0.0; 3],
+    };
+    let r_site = parse_mjcf_site_rotation(doc, node)?;
+    Ok((base_pos, r_site))
+}
+
 pub fn compose_mjcf(
     base_xml: &str,
     scene_world_xml: Option<&str>,
@@ -1638,24 +1654,14 @@ pub fn compose_mjcf(
     let base_doc = roxmltree::Document::parse(base_xml)
         .map_err(|e| format!("Base MJCF is invalid XML: {e}"))?;
 
-    let scene_doc = if let Some(s) = scene_world_xml {
-        if !s.trim().is_empty() {
-            Some(roxmltree::Document::parse(s).map_err(|e| format!("Scene world XML is invalid: {e}"))?)
-        } else {
-            None
-        }
-    } else {
-        None
+    let scene_doc = match scene_world_xml.filter(|s| !s.trim().is_empty()) {
+        Some(s) => Some(roxmltree::Document::parse(s).map_err(|e| format!("Scene world XML is invalid: {e}"))?),
+        None => None,
     };
 
-    let tool_doc = if let Some(t) = tool_xml {
-        if !t.trim().is_empty() {
-            Some(roxmltree::Document::parse(t).map_err(|e| format!("Tool XML is invalid: {e}"))?)
-        } else {
-            None
-        }
-    } else {
-        None
+    let tool_doc = match tool_xml.filter(|t| !t.trim().is_empty()) {
+        Some(t) => Some(roxmltree::Document::parse(t).map_err(|e| format!("Tool XML is invalid: {e}"))?),
+        None => None,
     };
 
     let mut edits: Vec<XmlEdit> = Vec::new();
@@ -1681,19 +1687,17 @@ pub fn compose_mjcf(
     let is_non_stock_tool = tool_manifest.is_some_and(|m| m.id.as_str() != crate::tool::STOCK_TOOL_ID);
     let is_tool_active = is_non_stock_tool && tool_doc.is_some();
 
-    let mut tool_worldbody_xml = String::new();
-    let mut tool_asset_xml = String::new();
-    let mut tool_equality_xml = String::new();
-    let mut tool_actuator_xml = String::new();
-    let mut tool_tendon_xml = String::new();
+    let mut tool_sections = MjcfSections::default();
     let mut resolved_attach_body: Option<String> = None;
 
-    if is_non_stock_tool {
-        let tm = tool_manifest.unwrap();
+    if let Some(tm) = tool_manifest.filter(|_| is_non_stock_tool) {
         let resolved_tcp = resolve_tool_tcp_offset(tm, tool_xml)?;
-        let skip_range = if let (Some(td), Some(raw_tool_xml)) = (tool_doc.as_ref(), tool_xml) {
+        let mut skip_range = None;
+        let mut cached_tcp_site: Option<(roxmltree::Node, &str, [f64; 3], crate::kinematics::Mat3)> = None;
+
+        if let (Some(td), Some(raw_tool_xml)) = (tool_doc.as_ref(), tool_xml) {
             let site_name = tm.tcp_site.as_deref().unwrap_or("tcp");
-            let skip_range = if site_name.trim().is_empty() {
+            skip_range = if site_name.trim().is_empty() {
                 None
             } else {
                 td.descendants()
@@ -1704,37 +1708,10 @@ pub fn compose_mjcf(
                     })
                     .map(|n| n.range())
             };
-
-            // Extract tool sections
-            for node in td.descendants() {
-                if node.is_element() {
-                    match node.tag_name().name() {
-                        "worldbody" => {
-                            let wb = extract_children_xml(node, raw_tool_xml, skip_range.clone());
-                            tool_worldbody_xml.push_str(&wb);
-                        }
-                        "asset" => {
-                            tool_asset_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                        }
-                        "equality" => {
-                            tool_equality_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                        }
-                        "actuator" => {
-                            tool_actuator_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                        }
-                        "tendon" => {
-                            tool_tendon_xml.push_str(&extract_children_xml(node, raw_tool_xml, None));
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            tool_sections = extract_mjcf_sections(td, raw_tool_xml, skip_range.clone());
 
             // Delete replaced bodies, geoms, equalities, actuators
-            for node in base_doc.descendants() {
-                if !node.is_element() {
-                    continue;
-                }
+            for node in base_doc.descendants().filter(|n| n.is_element()) {
                 let tag = node.tag_name().name();
                 let name = node.attribute("name").unwrap_or("");
                 let should_delete = (tag == "body" && tm.replace_bodies.iter().any(|b| b == name))
@@ -1757,181 +1734,117 @@ pub fn compose_mjcf(
             // If the attach body's `<site name="tcp">` has a non-zero zero-offset pos or non-identity orientation,
             // wrap the tool worldbody XML in `<body name="__tool_mount_frame" pos="..." quat="...">` so tool
             // geometries declared relative to tool mount origin keep their exact pose relative to `<site name="tcp">`.
-            if !tool_worldbody_xml.is_empty() {
+            if !tool_sections.worldbody.is_empty() {
                 let attach_name = resolve_attach_body_name(&base_doc, &tm.attach_body)?;
                 resolved_attach_body = Some(attach_name.clone());
-                let mount_wrapped_xml = {
-                    let tcp_node = base_doc.descendants().find(|n| {
-                        n.is_element()
-                            && n.tag_name().name() == "site"
-                            && n.attribute("name") == Some("tcp")
-                            && !edits.iter().any(|e| {
-                                e.replacement.is_empty()
-                                    && n.range().start >= e.start
-                                    && n.range().end <= e.end
-                            })
-                    });
-                    if let Some(site_node) = tcp_node {
-                        check_tcp_site_supported(&base_doc, site_node)?;
-                        let site_host = site_node
-                            .ancestors()
-                            .skip(1)
-                            .find(|a| a.is_element() && a.tag_name().name() == "body")
-                            .and_then(|b| b.attribute("name").map(str::trim));
-                        if site_host == Some(attach_name.as_str()) {
-                            let base_pos = match site_node.attribute("pos") {
-                                Some(raw) => parse_mjcf_vec3(raw, "pos")?,
-                                None => [0.0; 3],
-                            };
-                            let r_site = parse_mjcf_site_rotation(&base_doc, site_node)?;
-                            let has_pos = base_pos.iter().any(|v| v.abs() > 1e-12);
-                            let has_rot = (0..3).any(|r| {
-                                (0..3).any(|c| (r_site[r][c] - crate::kinematics::IDENTITY[r][c]).abs() > 1e-9)
-                            });
-                            if has_pos || has_rot {
-                                let q = crate::kinematics::r_to_quat(&r_site);
-                                let fmt = |v: f64| if v == 0.0 { 0.0 } else { v };
-                                format!(
-                                    "<body name=\"__tool_mount_frame\" pos=\"{} {} {}\" quat=\"{} {} {} {}\">\n{}</body>",
-                                    fmt(base_pos[0]),
-                                    fmt(base_pos[1]),
-                                    fmt(base_pos[2]),
-                                    fmt(q[0]),
-                                    fmt(q[1]),
-                                    fmt(q[2]),
-                                    fmt(q[3]),
-                                    tool_worldbody_xml
-                                )
-                            } else {
-                                tool_worldbody_xml.clone()
-                            }
+                let mount_wrapped_xml = if let Some(site_node) = find_active_tcp_site(&base_doc, &edits) {
+                    let site_host = check_tcp_site_supported(&base_doc, site_node)?;
+                    if site_host == attach_name {
+                        let (base_pos, r_site) = parse_site_pos_and_rot(&base_doc, site_node)?;
+                        cached_tcp_site = Some((site_node, site_host, base_pos, r_site));
+                        let has_pos = base_pos.iter().any(|v| v.abs() > 1e-12);
+                        let has_rot = (0..3).any(|r| {
+                            (0..3).any(|c| (r_site[r][c] - crate::kinematics::IDENTITY[r][c]).abs() > 1e-9)
+                        });
+                        if has_pos || has_rot {
+                            let q = crate::kinematics::r_to_quat(&r_site);
+                            format!(
+                                "<body name=\"__tool_mount_frame\" pos=\"{} {} {}\" quat=\"{} {} {} {}\">\n{}</body>",
+                                fmt_mjcf_num(base_pos[0]),
+                                fmt_mjcf_num(base_pos[1]),
+                                fmt_mjcf_num(base_pos[2]),
+                                fmt_mjcf_num(q[0]),
+                                fmt_mjcf_num(q[1]),
+                                fmt_mjcf_num(q[2]),
+                                fmt_mjcf_num(q[3]),
+                                tool_sections.worldbody
+                            )
                         } else {
-                            tool_worldbody_xml.clone()
+                            tool_sections.worldbody.clone()
                         }
                     } else {
-                        tool_worldbody_xml.clone()
+                        tool_sections.worldbody.clone()
                     }
+                } else {
+                    tool_sections.worldbody.clone()
                 };
-                let mut attached = false;
-                for node in base_doc.descendants() {
-                    if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name.as_str()) {
-                        let range = node.range();
-                        let slice = &base_xml[range.clone()];
-                        if let Some(close_idx) = slice.rfind("</body") {
-                            let insert_pos = range.start + close_idx;
-                            edits.push(XmlEdit {
-                                start: insert_pos,
-                                end: insert_pos,
-                                replacement: format!("\n{}\n", mount_wrapped_xml),
-                            });
-                            attached = true;
-                            break;
-                        }
-                    }
-                }
-                if !attached {
+                let attach_node = base_doc
+                    .descendants()
+                    .find(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(attach_name.as_str()));
+                let insert_pos = attach_node.and_then(|node| {
+                    let range = node.range();
+                    base_xml[range.clone()].rfind("</body").map(|idx| range.start + idx)
+                });
+                let Some(insert_pos) = insert_pos else {
                     return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
-                }
+                };
+                edits.push(XmlEdit {
+                    start: insert_pos,
+                    end: insert_pos,
+                    replacement: format!("\n{}\n", mount_wrapped_xml),
+                });
             }
-
-            skip_range
-        } else {
-            None
-        };
+        }
 
         // Update base TCP site pos relative to the base site's zero-offset pose
         // (p_tcp = p_base_site + R_base_site * tcp_offset), preserving base pose for [0, 0, 0].
-        let should_override_tcp_site = tm.tcp_offset.is_some() || skip_range.is_some();
-        if should_override_tcp_site {
-            let mut tcp_site_updated = false;
-            for node in base_doc.descendants() {
-                if node.is_element() && node.tag_name().name() == "site" && node.attribute("name") == Some("tcp") {
-                    let range = node.range();
-                    let overlaps_delete = edits.iter().any(|e| {
-                        e.replacement.is_empty() && range.start >= e.start && range.end <= e.end
-                    });
-                    if overlaps_delete {
-                        continue;
-                    }
-                    check_tcp_site_supported(&base_doc, node)?;
-                    let base_pos = match node.attribute("pos") {
-                        Some(raw) => parse_mjcf_vec3(raw, "pos")?,
-                        None => [0.0; 3],
-                    };
-                    let composed_pos = if resolved_tcp == [0.0; 3] {
-                        base_pos
-                    } else {
-                        let r_site = parse_mjcf_site_rotation(&base_doc, node)?;
-                        crate::kinematics::add(
-                            &base_pos,
-                            &crate::kinematics::mat_vec(&r_site, &resolved_tcp),
-                        )
-                    };
-                    let fmt = |v: f64| if v == 0.0 { 0.0 } else { v };
-                    let pos_val = format!(
-                        "{} {} {}",
-                        fmt(composed_pos[0]),
-                        fmt(composed_pos[1]),
-                        fmt(composed_pos[2])
-                    );
-                    let site_str = &base_xml[range.clone()];
-                    if let Some((val_start, val_end)) = find_xml_attr_value_span(site_str, "pos") {
-                        edits.push(XmlEdit {
-                            start: range.start + val_start,
-                            end: range.start + val_end,
-                            replacement: pos_val,
-                        });
-                        tcp_site_updated = true;
-                        break;
-                    } else if let Some((_name_start, name_end)) = find_xml_attr_value_span(site_str, "name") {
-                        let insert_pos = range.start + name_end + 1;
-                        edits.push(XmlEdit {
-                            start: insert_pos,
-                            end: insert_pos,
-                            replacement: format!(" pos=\"{pos_val}\""),
-                        });
-                        tcp_site_updated = true;
-                        break;
-                    }
-                }
-            }
-            if !tcp_site_updated {
+        if tm.tcp_offset.is_some() || skip_range.is_some() {
+            let (site_node, base_pos, r_site) = if let Some((node, _, pos, rot)) = cached_tcp_site {
+                (node, pos, rot)
+            } else {
+                let node = find_active_tcp_site(&base_doc, &edits).ok_or_else(|| {
+                    "Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".to_string()
+                })?;
+                check_tcp_site_supported(&base_doc, node)?;
+                let (pos, rot) = parse_site_pos_and_rot(&base_doc, node)?;
+                (node, pos, rot)
+            };
+            let composed_pos = if resolved_tcp == [0.0; 3] {
+                base_pos
+            } else {
+                crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+            };
+            let pos_val = format!(
+                "{} {} {}",
+                fmt_mjcf_num(composed_pos[0]),
+                fmt_mjcf_num(composed_pos[1]),
+                fmt_mjcf_num(composed_pos[2])
+            );
+            let range = site_node.range();
+            let site_str = &base_xml[range.clone()];
+            if let Some((val_start, val_end)) = find_xml_attr_value_span(site_str, "pos") {
+                edits.push(XmlEdit {
+                    start: range.start + val_start,
+                    end: range.start + val_end,
+                    replacement: pos_val,
+                });
+            } else if let Some((_, name_end)) = find_xml_attr_value_span(site_str, "name") {
+                let insert_pos = range.start + name_end + 1;
+                edits.push(XmlEdit {
+                    start: insert_pos,
+                    end: insert_pos,
+                    replacement: format!(" pos=\"{pos_val}\""),
+                });
+            } else {
                 return Err("Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".into());
             }
         }
     }
 
     // 3. Extract scene sections
-    let mut scene_worldbody_xml = String::new();
-    let mut scene_asset_xml = String::new();
-    let mut scene_equality_xml = String::new();
-    let mut scene_actuator_xml = String::new();
-    let mut scene_tendon_xml = String::new();
-
-    if let Some(sd) = scene_doc.as_ref() {
-        for node in sd.descendants() {
-            if node.is_element() {
-                match node.tag_name().name() {
-                    "worldbody" => {
-                        scene_worldbody_xml.push_str(&extract_children_xml(node, scene_world_xml.unwrap(), None));
-                    }
-                    "asset" => {
-                        scene_asset_xml.push_str(&extract_children_xml(node, scene_world_xml.unwrap(), None));
-                    }
-                    "equality" => {
-                        scene_equality_xml.push_str(&extract_children_xml(node, scene_world_xml.unwrap(), None));
-                    }
-                    "actuator" => {
-                        scene_actuator_xml.push_str(&extract_children_xml(node, scene_world_xml.unwrap(), None));
-                    }
-                    "tendon" => {
-                        scene_tendon_xml.push_str(&extract_children_xml(node, scene_world_xml.unwrap(), None));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
+    let scene_sections = scene_doc
+        .as_ref()
+        .map(|sd| extract_mjcf_sections(sd, scene_world_xml.unwrap(), None))
+        .unwrap_or_default();
+    let scene_worldbody_xml = scene_sections.worldbody;
+    let scene_asset_xml = scene_sections.asset;
+    let scene_equality_xml = scene_sections.equality;
+    let scene_actuator_xml = scene_sections.actuator;
+    let scene_tendon_xml = scene_sections.tendon;
+    let tool_asset_xml = tool_sections.asset;
+    let tool_equality_xml = tool_sections.equality;
+    let tool_actuator_xml = tool_sections.actuator;
+    let tool_tendon_xml = tool_sections.tendon;
 
     // 4. Inject scene worldbody before </worldbody>
     if !scene_worldbody_xml.is_empty() {

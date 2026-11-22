@@ -284,29 +284,38 @@ pub fn prepare_commissioning_confirm(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn precheck_commissioning_confirm(
+fn check_commissioning_fresh(
     inner: &crate::supervisor::SupervisorInner,
     prepared: &PreparedToolCommissioning,
 ) -> Result<(), crate::supervisor::ArmError> {
-    use crate::motion::MotionError;
-    use crate::supervisor::ArmError;
     if inner.tool_commissioning_revision != prepared.base_revision {
-        return Err(ArmError::PolicyRevisionMismatch {
+        return Err(crate::supervisor::ArmError::PolicyRevisionMismatch {
             expected: prepared.base_revision,
             current: inner.tool_commissioning_revision,
-        });
-    }
-    if inner.calibration_busy {
-        return Err(ArmError::Rejected {
-            status: 409,
-            code: "CONFIG_BUSY".into(),
-            message: "a camera calibration apply or restore is running".into(),
         });
     }
     if inner.config.active_tool.id != prepared.tool_id
         || inner.config.active_tool.config_digest != prepared.tool_config_digest
     {
-        return Err(MotionError::PlanStale("active tool changed before commissioning confirm".into()).into());
+        return Err(
+            crate::motion::MotionError::PlanStale("active tool changed before commissioning confirm".into()).into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn precheck_commissioning_confirm(
+    inner: &crate::supervisor::SupervisorInner,
+    prepared: &PreparedToolCommissioning,
+) -> Result<(), crate::supervisor::ArmError> {
+    check_commissioning_fresh(inner, prepared)?;
+    if inner.calibration_busy {
+        return Err(crate::supervisor::ArmError::Rejected {
+            status: 409,
+            code: "CONFIG_BUSY".into(),
+            message: "a camera calibration apply or restore is running".into(),
+        });
     }
     Ok(())
 }
@@ -316,19 +325,7 @@ pub fn commit_commissioning_confirm(
     inner: &mut crate::supervisor::SupervisorInner,
     prepared: PreparedToolCommissioning,
 ) -> Result<(ActiveToolInfo, u64), crate::supervisor::ArmError> {
-    use crate::motion::MotionError;
-    use crate::supervisor::ArmError;
-    if inner.tool_commissioning_revision != prepared.base_revision {
-        return Err(ArmError::PolicyRevisionMismatch {
-            expected: prepared.base_revision,
-            current: inner.tool_commissioning_revision,
-        });
-    }
-    if inner.config.active_tool.id != prepared.tool_id
-        || inner.config.active_tool.config_digest != prepared.tool_config_digest
-    {
-        return Err(MotionError::PlanStale("active tool changed before commissioning confirm".into()).into());
-    }
+    check_commissioning_fresh(inner, &prepared)?;
     inner.config.active_tool.commissioning_required = false;
     inner.tool_commissioning_confirmed_at = Some(prepared.confirmed_at);
     inner.tool_commissioning_revision += 1;
@@ -461,6 +458,31 @@ pub struct ArmdGraspOverlay {
     pub grasp_height_m: Option<f64>,
     #[serde(default)]
     pub edge_to_low_m: Option<f64>,
+}
+
+impl ArmdGraspOverlay {
+    /// Validate quantized bounds on declared grasp overrides.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if let Some(e) = self.edge_to_low_m {
+            checked_to_micro_f64(e, "armd.grasp.edge_to_low_m")?;
+            if !(-0.10..=0.10).contains(&e) {
+                return Err("armd.grasp.edge_to_low_m must be finite and in [-0.10, 0.10] m".into());
+            }
+        }
+        if let Some(w) = self.max_grasp_width_m {
+            checked_to_micro_f64(w, "armd.grasp.max_grasp_width_m")?;
+            if !(0.0..=0.2).contains(&w) {
+                return Err("armd.grasp.max_grasp_width_m must be in [0, 0.2] m".into());
+            }
+        }
+        if let Some(h) = self.grasp_height_m {
+            checked_to_micro_f64(h, "armd.grasp.grasp_height_m")?;
+            if !(0.005..=0.2).contains(&h) {
+                return Err("armd.grasp.grasp_height_m must be in [0.005, 0.2] m".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Daemon overlay block in `tool.json` (`armd`). Unknown fields are rejected.
@@ -802,39 +824,6 @@ pub fn canonical_tool_payload_json(
     )
 }
 
-/// Compute `v1:<sha256>` digest for a resolved `f64` tool configuration.
-#[allow(clippy::too_many_arguments)]
-pub fn compute_tool_config_digest_f64(
-    robot_id: &str,
-    tool_id: &str,
-    kind: &str,
-    tcp_offset_m: [f64; 3],
-    permanent_tool_check_points_end_m: &[[f64; 3]],
-    physical_contact_end_m: Option<[f64; 3]>,
-    contact_opening_m: Option<f64>,
-    dynamics: Option<&ToolDynamics>,
-    gripper_policy: Option<&CanonicalGripperInput>,
-    max_grasp_width_m: Option<f64>,
-    grasp_height_m: Option<f64>,
-    edge_to_low_m: Option<f64>,
-) -> String {
-    let json = canonical_tool_payload_json_f64(
-        robot_id,
-        tool_id,
-        kind,
-        tcp_offset_m,
-        permanent_tool_check_points_end_m,
-        physical_contact_end_m,
-        contact_opening_m,
-        dynamics,
-        gripper_policy,
-        max_grasp_width_m,
-        grasp_height_m,
-        edge_to_low_m,
-    );
-    format!("v1:{}", crate::gravity::compute_sha256(json.as_bytes()))
-}
-
 /// Compute `v1:<sha256>` digest for a resolved tool configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_tool_config_digest(
@@ -902,21 +891,15 @@ pub fn stock_active_tool_info(config: &ArmConfig) -> ActiveToolInfo {
         .and_then(normalize_robot_id)
         .unwrap_or_else(|| config.profile_id.as_deref().unwrap_or("unknown"));
     let (max_grasp_width_m, grasp_height_m) = baseline_grasp_limits(config);
-    let edge_to_low_m = config
-        .calibration_tool
-        .as_ref()
-        .and_then(|c| c.edge_to_low_m);
-
-    let physical_contact = config.physical_contact_end_m.or(Some([0.0; 3]));
-    let contact_opening = config.contact_opening_m.or(Some(0.0));
+    let edge_to_low_m = config.calibration_tool.as_ref().and_then(|c| c.edge_to_low_m);
     let digest = compute_tool_config_digest(
         robot_id,
         STOCK_TOOL_ID,
         "gripper",
         [0.0; 3],
         &[],
-        physical_contact,
-        contact_opening,
+        config.physical_contact_end_m.or(Some([0.0; 3])),
+        config.contact_opening_m.or(Some(0.0)),
         None,
         config.gripper_policy.as_ref(),
         max_grasp_width_m,
@@ -924,14 +907,8 @@ pub fn stock_active_tool_info(config: &ArmConfig) -> ActiveToolInfo {
         edge_to_low_m,
     );
     ActiveToolInfo {
-        schema_version: 1,
-        id: STOCK_TOOL_ID.to_string(),
-        is_stock: true,
-        kind: "gripper".to_string(),
-        tcp_offset_m: [0.0; 3],
         config_digest: digest,
-        pack_digest: None,
-        commissioning_required: false,
+        ..Default::default()
     }
 }
 
@@ -945,18 +922,22 @@ pub fn load_tool_file(path: impl AsRef<std::path::Path>) -> Result<ToolPackConfi
         .map_err(|e| format!("tool file {}: {e}", path.display()))
 }
 
-/// Validate `physical_contact_end_m` (finite, micro-unit range, norm <= [`MAX_CHECK_POINT_NORM_M`]).
-pub fn validate_physical_contact_end_m(pc: &[f64; 3], label: &str) -> Result<(), String> {
-    for (ax, &v) in pc.iter().enumerate() {
+fn validate_point_f64(p: &[f64; 3], label: &str) -> Result<(), String> {
+    for (ax, &v) in p.iter().enumerate() {
         checked_to_micro_f64(v, &format!("{label}[{ax}]"))?;
     }
-    let norm = (pc[0] * pc[0] + pc[1] * pc[1] + pc[2] * pc[2]).sqrt();
+    let norm = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
     if norm > MAX_CHECK_POINT_NORM_M {
         return Err(format!(
             "{label} norm {norm:.4} m exceeds limit {MAX_CHECK_POINT_NORM_M:.2} m"
         ));
     }
     Ok(())
+}
+
+/// Validate `physical_contact_end_m` (finite, micro-unit range, norm <= [`MAX_CHECK_POINT_NORM_M`]).
+pub fn validate_physical_contact_end_m(pc: &[f64; 3], label: &str) -> Result<(), String> {
+    validate_point_f64(pc, label)
 }
 
 /// Validate `contact_opening_m` (finite, micro-unit range, in `[0.0, 0.20]` m).
@@ -1007,17 +988,19 @@ pub fn validate_check_points(points: &[[f32; 3]], label: &str) -> Result<(), Str
 /// Validate `f64` check points in `end_link` frame (finite, norm <= [`MAX_CHECK_POINT_NORM_M`], safe micro range).
 pub fn validate_check_points_f64(points: &[[f64; 3]], label: &str) -> Result<(), String> {
     for (i, p) in points.iter().enumerate() {
-        for (ax, &v) in p.iter().enumerate() {
-            checked_to_micro_f64(v, &format!("{label}[{i}][{ax}]"))?;
-        }
-        let norm = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-        if norm > MAX_CHECK_POINT_NORM_M {
-            return Err(format!(
-                "{label}[{i}] norm {norm:.4} m exceeds limit {MAX_CHECK_POINT_NORM_M:.2} m"
-            ));
-        }
+        validate_point_f64(p, &format!("{label}[{i}]"))?;
     }
     Ok(())
+}
+
+pub(crate) fn normalize_robot_list(tool_id: &str, robots: &[String]) -> Result<Vec<&'static str>, String> {
+    robots
+        .iter()
+        .map(|raw| {
+            normalize_robot_id(raw)
+                .ok_or_else(|| format!("tool '{tool_id}': unknown robot target '{raw}'"))
+        })
+        .collect()
 }
 
 /// Apply a [`ToolPackConfig`] onto a cloned copy of `base`, validating all invariants before
@@ -1054,16 +1037,9 @@ pub fn resolve_robot_target_for_pack(
             pack.id
         ));
     }
-    if pack.robots.len() == 1 {
-        let raw = &pack.robots[0];
-        return normalize_robot_id(raw)
-            .ok_or_else(|| format!("tool '{}': unknown robot target '{raw}'", pack.id));
-    }
-    let mut norms = Vec::with_capacity(pack.robots.len());
-    for raw in &pack.robots {
-        let norm = normalize_robot_id(raw)
-            .ok_or_else(|| format!("tool '{}': unknown robot target '{raw}'", pack.id))?;
-        norms.push(norm);
+    let norms = normalize_robot_list(&pack.id, &pack.robots)?;
+    if norms.len() == 1 {
+        return Ok(norms[0]);
     }
     if norms.contains(&"b601dm") {
         Ok("b601dm")
@@ -1180,12 +1156,7 @@ fn apply_tool_overlay_with_details(
         .as_deref()
         .and_then(normalize_robot_id);
     if !pack.robots.is_empty() {
-        let mut allowed_robots = Vec::with_capacity(pack.robots.len());
-        for raw in &pack.robots {
-            let norm = normalize_robot_id(raw)
-                .ok_or_else(|| format!("tool '{}': unknown robot target '{raw}'", pack.id))?;
-            allowed_robots.push(norm);
-        }
+        let allowed_robots = normalize_robot_list(&pack.id, &pack.robots)?;
         let target_robot = base_robot_id.ok_or_else(|| {
             format!(
                 "tool '{}': base profile_id {:?} cannot be resolved for restricted robots {:?}",
@@ -1257,11 +1228,11 @@ fn apply_tool_overlay_with_details(
         .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
         .collect();
 
-    let has_physical_contact = armd.is_some_and(|a| a.physical_contact_end_m.is_some())
-        || candidate.physical_contact_end_m.is_some();
-
     // 4. Non-zero offset, extra check points, or physical contact point require kinematics and workspace on the profile.
-    if (tcp_offset != [0.0; 3] || !extra_points.is_empty() || has_physical_contact)
+    if (tcp_offset != [0.0; 3]
+        || !extra_points.is_empty()
+        || armd.is_some_and(|a| a.physical_contact_end_m.is_some())
+        || candidate.physical_contact_end_m.is_some())
         && (candidate.kinematics.is_none() || candidate.workspace.is_none())
     {
         return Err(format!(
@@ -1275,7 +1246,6 @@ fn apply_tool_overlay_with_details(
     let (base_max_w, base_grasp_h) = baseline_grasp_limits(&candidate);
     let mut effective_max_grasp_width_m: Option<f64> = None;
     let mut effective_grasp_height_m: Option<f64> = None;
-    let effective_edge_to_low_m: Option<f64>;
 
     if !is_gripper {
         if armd.is_some_and(|a| a.gripper_policy.is_some() || a.grasp.is_some()) {
@@ -1298,40 +1268,28 @@ fn apply_tool_overlay_with_details(
                 )
             })?;
             let mut gp_f64 = CanonicalGripperInput::from(&gp);
-            if let Some(v) = gp_ov.closed_rad {
-                checked_to_micro_f64(v, "armd.gripper_policy.closed_rad")?;
-                gp.closed_rad = v as f32;
-                gp_f64.closed_rad = v;
+            for (ov, gp_dst, f64_dst, label) in [
+                (gp_ov.closed_rad, &mut gp.closed_rad, &mut gp_f64.closed_rad, "armd.gripper_policy.closed_rad"),
+                (gp_ov.open_rad, &mut gp.open_rad, &mut gp_f64.open_rad, "armd.gripper_policy.open_rad"),
+                (gp_ov.holding_gap_rad, &mut gp.holding_gap_rad, &mut gp_f64.holding_gap_rad, "armd.gripper_policy.holding_gap_rad"),
+                (gp_ov.holding_torque_nm, &mut gp.holding_torque_nm, &mut gp_f64.holding_torque_nm, "armd.gripper_policy.holding_torque_nm"),
+                (gp_ov.squeeze_rad, &mut gp.squeeze_rad, &mut gp_f64.squeeze_rad, "armd.gripper_policy.squeeze_rad"),
+            ] {
+                if let Some(v) = ov {
+                    checked_to_micro_f64(v, label)?;
+                    *gp_dst = v as f32;
+                    *f64_dst = v;
+                }
             }
-            if let Some(v) = gp_ov.open_rad {
-                checked_to_micro_f64(v, "armd.gripper_policy.open_rad")?;
-                gp.open_rad = v as f32;
-                gp_f64.open_rad = v;
-            }
-            if let Some(v) = gp_ov.holding_gap_rad {
-                checked_to_micro_f64(v, "armd.gripper_policy.holding_gap_rad")?;
-                gp.holding_gap_rad = v as f32;
-                gp_f64.holding_gap_rad = v;
-            }
-            if let Some(v) = gp_ov.holding_torque_nm {
-                checked_to_micro_f64(v, "armd.gripper_policy.holding_torque_nm")?;
-                gp.holding_torque_nm = v as f32;
-                gp_f64.holding_torque_nm = v;
-            }
-            if let Some(v) = gp_ov.squeeze_rad {
-                checked_to_micro_f64(v, "armd.gripper_policy.squeeze_rad")?;
-                gp.squeeze_rad = v as f32;
-                gp_f64.squeeze_rad = v;
-            }
-            if let Some(v) = gp_ov.max_close_torque_nm {
-                checked_to_micro_f64(v, "armd.gripper_policy.max_close_torque_nm")?;
-                gp.max_close_torque_nm = Some(v as f32);
-                gp_f64.max_close_torque_nm = Some(v);
-            }
-            if let Some(v) = gp_ov.contact_torque_nm {
-                checked_to_micro_f64(v, "armd.gripper_policy.contact_torque_nm")?;
-                gp.contact_torque_nm = Some(v as f32);
-                gp_f64.contact_torque_nm = Some(v);
+            for (ov, gp_dst, f64_dst, label) in [
+                (gp_ov.max_close_torque_nm, &mut gp.max_close_torque_nm, &mut gp_f64.max_close_torque_nm, "armd.gripper_policy.max_close_torque_nm"),
+                (gp_ov.contact_torque_nm, &mut gp.contact_torque_nm, &mut gp_f64.contact_torque_nm, "armd.gripper_policy.contact_torque_nm"),
+            ] {
+                if let Some(v) = ov {
+                    checked_to_micro_f64(v, label)?;
+                    *gp_dst = Some(v as f32);
+                    *f64_dst = Some(v);
+                }
             }
             if let Some(pts) = &gp_ov.jaw_opening_nominal {
                 for (i, p) in pts.iter().enumerate() {
@@ -1362,24 +1320,11 @@ fn apply_tool_overlay_with_details(
         effective_grasp_height_m = base_grasp_h;
 
         if let Some(gr_ov) = armd.and_then(|a| a.grasp.as_ref()) {
-            if let Some(e) = gr_ov.edge_to_low_m {
-                checked_to_micro_f64(e, "armd.grasp.edge_to_low_m")?;
-                if !(-0.10..=0.10).contains(&e) {
-                    return Err("armd.grasp.edge_to_low_m must be finite and in [-0.10, 0.10] m".into());
-                }
-            }
+            gr_ov.validate()?;
             if let Some(w) = gr_ov.max_grasp_width_m {
-                checked_to_micro_f64(w, "armd.grasp.max_grasp_width_m")?;
-                if !(0.0..=0.2).contains(&w) {
-                    return Err("armd.grasp.max_grasp_width_m must be in [0, 0.2] m".into());
-                }
                 effective_max_grasp_width_m = Some(w);
             }
             if let Some(h) = gr_ov.grasp_height_m {
-                checked_to_micro_f64(h, "armd.grasp.grasp_height_m")?;
-                if !(0.005..=0.2).contains(&h) {
-                    return Err("armd.grasp.grasp_height_m must be in [0.005, 0.2] m".into());
-                }
                 effective_grasp_height_m = Some(h);
             }
             #[cfg(not(target_arch = "wasm32"))]
@@ -1390,20 +1335,16 @@ fn apply_tool_overlay_with_details(
         }
     }
 
-    if !is_stock {
-        effective_edge_to_low_m = armd
-            .and_then(|a| a.grasp.as_ref())
-            .and_then(|g| g.edge_to_low_m);
+    let effective_edge_to_low_m = if !is_stock {
+        let edge = armd.and_then(|a| a.grasp.as_ref()).and_then(|g| g.edge_to_low_m);
         candidate.calibration_tool = Some(CalibrationToolSpec {
             tool_id: pack.id.clone(),
-            edge_to_low_m: effective_edge_to_low_m,
+            edge_to_low_m: edge,
         });
+        edge
     } else {
-        effective_edge_to_low_m = candidate
-            .calibration_tool
-            .as_ref()
-            .and_then(|c| c.edge_to_low_m);
-    }
+        candidate.calibration_tool.as_ref().and_then(|c| c.edge_to_low_m)
+    };
 
     // 6. Initialize layer 1 if needed, then update layers 2 & 3 and rebuild the 4-layer union.
     if candidate.base_check_points_end_m.is_empty() {

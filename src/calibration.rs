@@ -478,6 +478,28 @@ fn calibrated_mount(inner: &SupervisorInner, offset: [f32; 3], q: [f64; 4]) -> C
     m
 }
 
+fn apply_pending_joint_zero(
+    inner: &mut SupervisorInner,
+    path: &Path,
+    file: &mut CalibrationFile,
+    offsets: Option<&[f32]>,
+) {
+    let Some(offsets) = offsets else { return; };
+    if let Err(e) = inner.set_joint_zero_offsets(offsets) {
+        tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
+        inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
+        file.joint_zero = None;
+    } else if let Some(z) = &file.joint_zero {
+        tracing::info!(
+            "Joint zero loaded from {} (method {}, set {}): offsets {:?} rad",
+            path.display(),
+            z.method,
+            z.set_at.as_deref().unwrap_or("?"),
+            z.offsets()
+        );
+    }
+}
+
 /// Read `calibration.json` at startup (after the grasp setup) and install its camera mount.
 /// A malformed or invalid file is moved aside and the profile mount stays; the grasp setup's
 /// camera model (fx_px, fy_px, cx_px, cy_px, image_size_px, camera_tilt_deg, grip_pixel_norm),
@@ -515,21 +537,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                 if let Some(err) = pending_jz_err.take() {
                     inner.calibration_load_error = Some(err);
                 }
-                if let Some(ref offsets) = pending_joint_zero {
-                    if let Err(e) = inner.set_joint_zero_offsets(offsets) {
-                        tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
-                        inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
-                        file.joint_zero = None;
-                    } else if let Some(z) = &file.joint_zero {
-                        tracing::info!(
-                            "Joint zero loaded from {} (method {}, set {}): offsets {:?} rad",
-                            path.display(),
-                            z.method,
-                            z.set_at.as_deref().unwrap_or("?"),
-                            z.offsets()
-                        );
-                    }
-                }
+                apply_pending_joint_zero(&mut inner, path, &mut file, pending_joint_zero.as_deref());
                 if let Some(k) = &file.kinematics {
                     if let Err(e) = inner.set_kinematics_correction(Some(&k.joints)) {
                         tracing::warn!("Ignoring the kinematic correction in {}: {e}", path.display());
@@ -586,31 +594,15 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             if let Some(err) = pending_jz_err.or(pending_kin_err) {
                 inner.calibration_load_error = Some(err);
             }
-            if let Some(ref offsets) = pending_joint_zero {
-                if let Err(e) = inner.set_joint_zero_offsets(offsets) {
-                    tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
-                    inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
-                    file.joint_zero = None;
-                } else if let Some(z) = &file.joint_zero {
-                    tracing::info!(
-                        "Joint zero loaded from {} (method {}, set {}): offsets {:?} rad",
-                        path.display(),
-                        z.method,
-                        z.set_at.as_deref().unwrap_or("?"),
-                        z.offsets()
-                    );
-                }
-            }
+            apply_pending_joint_zero(&mut inner, path, &mut file, pending_joint_zero.as_deref());
 
             tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
                 path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
             inner.set_camera_mount(mount);
-            if file.kinematics.is_some() {
-                if let Some(ref k) = file.kinematics {
-                    if let Ok(()) = inner.set_kinematics_correction(Some(&k.joints)) {
-                        let fit = k.fit.as_ref().map_or_else(|| "none".to_string(), |f| f.to_string());
-                        tracing::info!("Kinematic correction loaded from {} (fit {fit})", path.display());
-                    }
+            if let Some(ref k) = file.kinematics {
+                if let Ok(()) = inner.set_kinematics_correction(Some(&k.joints)) {
+                    let fit = k.fit.as_ref().map_or_else(|| "none".to_string(), |f| f.to_string());
+                    tracing::info!("Kinematic correction loaded from {} (fit {fit})", path.display());
                 }
             }
             if inner.grasp_setup_needs_camera_sync {
@@ -629,41 +621,35 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
         crate::persist::Loaded::Invalid(e) => {
             tracing::warn!("Ignoring camera calibration file: {e}; using the profile camera mount");
             let mut msg = e;
-            let candidate = compute_reset_camera_model(&inner);
-            if let Some(setup) = candidate {
-                if let Some(p) = setup_path {
-                    match persist_reset_setup_rename(p, &setup, &inner.config.active_tool) {
-                        Ok(dir_sync) => {
-                            let prof_mount = inner.profile_camera_mount.clone();
-                            inner.set_camera_mount(prof_mount);
-                            inner.set_grasp_setup(setup);
-                            inner.grasp_setup_revision += 1;
-                            msg.push_str("; grasp setup camera model reset to the profile values");
-                            inner.calibration_load_error = Some(msg);
-                            tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
-                            drop(inner);
-                            if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = dir_sync.sync_parent_dir() {
-                                let mut inner = supervisor.inner().write().await;
-                                if let Some(ref mut cur_err) = inner.calibration_load_error {
-                                    cur_err.push_str(&format!(" (durability unconfirmed: {w})"));
-                                }
-                            }
-                            return Ok(());
-                        }
+            if let Some(setup) = compute_reset_camera_model(&inner) {
+                let dir_sync = match setup_path {
+                    Some(p) => match persist_reset_setup_rename(p, &setup, &inner.config.active_tool) {
+                        Ok(ds) => Some(ds),
                         Err(persist_err) => {
                             tracing::error!("Aborting startup grasp setup reset (persist failed: {persist_err})");
                             msg.push_str(&format!("; grasp setup reset aborted (not saved: {persist_err})"));
                             inner.calibration_load_error = Some(msg.clone());
                             return Err(msg);
                         }
+                    },
+                    None => None,
+                };
+                let prof_mount = inner.profile_camera_mount.clone();
+                inner.set_camera_mount(prof_mount);
+                inner.set_grasp_setup(setup);
+                inner.grasp_setup_revision += 1;
+                msg.push_str("; grasp setup camera model reset to the profile values");
+                tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+                if let Some(ds) = dir_sync {
+                    inner.calibration_load_error = Some(msg);
+                    drop(inner);
+                    if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = ds.sync_parent_dir() {
+                        let mut inner = supervisor.inner().write().await;
+                        if let Some(ref mut cur_err) = inner.calibration_load_error {
+                            cur_err.push_str(&format!(" (durability unconfirmed: {w})"));
+                        }
                     }
-                } else {
-                    let prof_mount = inner.profile_camera_mount.clone();
-                    inner.set_camera_mount(prof_mount);
-                    inner.set_grasp_setup(setup);
-                    inner.grasp_setup_revision += 1;
-                    msg.push_str("; grasp setup camera model reset to the profile values");
-                    tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+                    return Ok(());
                 }
             }
             inner.calibration_load_error = Some(msg);
@@ -1042,11 +1028,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
             if t.x_fingerprint != x_fp {
                 return Err(CalibError::new(409, "TOOL_STALE", "tool.x_fingerprint does not match this calibration (intrinsics or camera mount changed since the fingertip was measured); measure the fingertip again"));
             }
-            let tool_matches = match t.tool_config_digest.as_deref() {
-                Some(dig) => inner.config.active_tool.matches_tool_calib(&t.tool_id, Some(dig)),
-                None => inner.config.active_tool.is_stock,
-            };
-            if !tool_matches {
+            if !inner.config.active_tool.matches_tool_calib(&t.tool_id, t.tool_config_digest.as_deref()) {
                 return Err(CalibError::new(
                     409,
                     "TOOL_STALE",
@@ -1492,6 +1474,22 @@ impl Txn<'_> {
         }
     }
 
+    fn commit_live_calibration(
+        &mut self,
+        inner: &mut SupervisorInner,
+        after: &ArmdState,
+        kin: Option<&Correction>,
+    ) -> Result<(), CalibError> {
+        self.file_written = true;
+        inner
+            .set_kinematics_correction(kin)
+            .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
+        inner.set_camera_mount(after.camera_mount.clone());
+        inner.set_calibration(after.calibration.clone());
+        self.live_written = true;
+        Ok(())
+    }
+
     /// calibration.json, then the live mount and calibration.
     /// Stages outside the supervisor lock, re-checks auth/lease/epoch + renames inside the lock,
     /// and syncs the parent directory outside the lock (recording `file_written = true` as soon
@@ -1517,12 +1515,7 @@ impl Txn<'_> {
                 }
                 let dir_sync = staged.rename_only()
                     .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
-                self.file_written = true;
-                inner.set_kinematics_correction(kin.as_ref())
-                    .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
-                inner.set_camera_mount(after.camera_mount.clone());
-                inner.set_calibration(after.calibration.clone());
-                self.live_written = true;
+                self.commit_live_calibration(&mut inner, after, kin.as_ref())?;
                 Some(dir_sync)
             }
             None => {
@@ -1537,17 +1530,8 @@ impl Txn<'_> {
                         return Err(CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"));
                     }
                 }
-                self.file_written = true;
-                inner.set_kinematics_correction(kin.as_ref())
-                    .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
-                inner.set_camera_mount(after.camera_mount.clone());
-                inner.set_calibration(after.calibration.clone());
-                self.live_written = true;
-                if removed {
-                    Some(crate::persist::PendingDirSync::for_path(&self.deps.path))
-                } else {
-                    None
-                }
+                self.commit_live_calibration(&mut inner, after, kin.as_ref())?;
+                removed.then(|| crate::persist::PendingDirSync::for_path(&self.deps.path))
             }
         };
         if let Some(dir_sync) = dir_sync_opt {
@@ -1557,6 +1541,20 @@ impl Txn<'_> {
             if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
                 self.durability_warnings.push(format!("calibration_file: {w}"));
             }
+        }
+        Ok(())
+    }
+
+    fn precheck_grasp_commit(&self, inner: &mut SupervisorInner, base_rev: u64) -> Result<(), CalibError> {
+        (self.check)(inner).map_err(|e| e.at("grasp_setup"))?;
+        if inner.grasp_setup_revision != base_rev {
+            let mut err = CalibError::new(
+                409,
+                "POLICY_REVISION_MISMATCH",
+                format!("Policy revision mismatch: expected {base_rev}, current {}", inner.grasp_setup_revision),
+            ).at("grasp_setup");
+            err.extra.insert("current_revision".into(), json!(inner.grasp_setup_revision));
+            return Err(err);
         }
         Ok(())
     }
@@ -1582,18 +1580,8 @@ impl Txn<'_> {
                 .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup file: {e}")).at("grasp_setup"))?;
             let dir_sync = {
                 let mut inner = self.sup.inner().write().await;
-                if let Err(e) = (self.check)(&mut inner) {
+                if let Err(err) = self.precheck_grasp_commit(&mut inner, base_rev) {
                     staged.abort();
-                    return Err(e.at("grasp_setup"));
-                }
-                if inner.grasp_setup_revision != base_rev {
-                    staged.abort();
-                    let mut err = CalibError::new(
-                        409,
-                        "POLICY_REVISION_MISMATCH",
-                        format!("Policy revision mismatch: expected {base_rev}, current {}", inner.grasp_setup_revision),
-                    ).at("grasp_setup");
-                    err.extra.insert("current_revision".into(), json!(inner.grasp_setup_revision));
                     return Err(err);
                 }
                 let dir_sync = staged.rename_only()
@@ -1610,16 +1598,7 @@ impl Txn<'_> {
             }
         } else {
             let mut inner = self.sup.inner().write().await;
-            (self.check)(&mut inner).map_err(|e| e.at("grasp_setup"))?;
-            if inner.grasp_setup_revision != base_rev {
-                let mut err = CalibError::new(
-                    409,
-                    "POLICY_REVISION_MISMATCH",
-                    format!("Policy revision mismatch: expected {base_rev}, current {}", inner.grasp_setup_revision),
-                ).at("grasp_setup");
-                err.extra.insert("current_revision".into(), json!(inner.grasp_setup_revision));
-                return Err(err);
-            }
+            self.precheck_grasp_commit(&mut inner, base_rev)?;
             inner.set_grasp_setup(setup);
             inner.grasp_setup_revision += 1;
         }
@@ -1859,19 +1838,13 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     Ok(out)
 }
 
-/// `{profile_floor_z_m, effective_floor_z_m, source, table_z_m}` of the floor rule.
-pub fn floor_view(profile: f32, c: Option<&CalibrationFile>, fp: &str) -> Value {
-    let (eff, src, z) = effective_floor(profile, c, fp);
+fn floor_json(profile: f32, (eff, src, z): (f32, &'static str, Option<f64>)) -> Value {
     json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
 }
 
-pub fn floor_view_for(
-    profile: f32,
-    c: Option<&CalibrationFile>,
-    fp: &str,
-    active_tool: &crate::tool::ActiveToolInfo,
-) -> Value {
-    floor_view_for_with_legacy(profile, c, fp, None, active_tool)
+/// `{profile_floor_z_m, effective_floor_z_m, source, table_z_m}` of the floor rule.
+pub fn floor_view(profile: f32, c: Option<&CalibrationFile>, fp: &str) -> Value {
+    floor_json(profile, effective_floor(profile, c, fp))
 }
 
 pub fn floor_view_for_with_legacy(
@@ -1881,8 +1854,7 @@ pub fn floor_view_for_with_legacy(
     legacy_fp: Option<&str>,
     active_tool: &crate::tool::ActiveToolInfo,
 ) -> Value {
-    let (eff, src, z) = effective_floor_for_with_legacy(profile, c, fp, legacy_fp, active_tool);
-    json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
+    floor_json(profile, effective_floor_for_with_legacy(profile, c, fp, legacy_fp, active_tool))
 }
 
 /// `{x_fingerprint, fingerprint, tool_valid, acceptance_valid, tip_end_m?}` of the calibration in effect.
