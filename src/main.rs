@@ -165,7 +165,9 @@ fn request_shutdown(inner: &mut SupervisorInner) -> bool {
     false
 }
 
-fn set_realtime_priority() {
+/// Requests SCHED_FIFO 50 for the calling thread and reads the policy back
+/// (`control_thread` in `GET /api/v1/diagnostics/tick`).
+fn set_realtime_priority() -> Option<armd::diagnostics::tick::ControlThreadSched> {
     #[cfg(target_os = "linux")]
     {
         // musl adds sporadic-server fields; zero them and set only the priority.
@@ -180,7 +182,23 @@ fn set_realtime_priority() {
         } else {
             warn!("Control loop real-time priority unavailable ({}); using normal scheduling", std::io::Error::from_raw_os_error(rc));
         }
+        let mut policy: libc::c_int = 0;
+        // SAFETY: as above; both out-pointers are valid for the call.
+        let mut now: libc::sched_param = unsafe { std::mem::zeroed() };
+        let rc_get = unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut now) };
+        if rc_get != 0 {
+            return None;
+        }
+        let name = match policy {
+            libc::SCHED_FIFO => "fifo".to_string(),
+            libc::SCHED_RR => "rr".to_string(),
+            libc::SCHED_OTHER => "other".to_string(),
+            p => p.to_string(),
+        };
+        Some(armd::diagnostics::tick::ControlThreadSched { policy: name, priority: now.sched_priority, realtime: rc == 0 && policy == libc::SCHED_FIFO })
     }
+    #[cfg(not(target_os = "linux"))]
+    None
 }
 
 /// Boot record, then the black box; any failure leaves armd running without them.
@@ -479,7 +497,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let control_stop_flag = control_stop.clone();
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new().name("armd-control".into()).spawn(move || {
-        set_realtime_priority();
+        if let Some(sched) = set_realtime_priority() {
+            control_supervisor.set_control_thread_sched(sched);
+        }
         let mut next = std::time::Instant::now() + period;
         let mut last_tick = std::time::Instant::now();
         let mut last_late_log: Option<std::time::Instant> = None;

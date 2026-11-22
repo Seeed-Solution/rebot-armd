@@ -7392,6 +7392,7 @@ pub struct ArmSupervisor {
     tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
     /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
     tick_stats_wait_us: AtomicU64,
+    control_sched: std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -7410,6 +7411,7 @@ impl ArmSupervisor {
             requested_estop_count,
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
             tick_stats_wait_us: AtomicU64::new(0),
+            control_sched: std::sync::Mutex::new(None),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7434,6 +7436,11 @@ impl ArmSupervisor {
     pub async fn get_observation(&self) -> ArmObservation {
         let inner = self.inner.read().await;
         inner.current_observation()
+    }
+
+    /// Scheduling of the control thread, reported by it after its real-time request.
+    pub fn set_control_thread_sched(&self, sched: crate::diagnostics::tick::ControlThreadSched) {
+        *self.control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(sched);
     }
 
     pub async fn get_schema(&self) -> ObservationSchema {
@@ -7940,7 +7947,9 @@ impl ArmSupervisor {
     /// the stats mutex and sorted after it is released, so this route does not delay a tick.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
         let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
-        window.snapshot()
+        let mut snap = window.snapshot();
+        snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        snap
     }
 
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {

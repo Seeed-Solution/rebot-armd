@@ -69,6 +69,16 @@ pub struct TickBreakdown {
     pub ticks_ago: usize,
 }
 
+/// Scheduling of the control thread as read back after the real-time request.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ControlThreadSched {
+    /// `"fifo"`, `"rr"`, `"other"` or the raw policy number.
+    pub policy: String,
+    pub priority: i32,
+    /// Whether the SCHED_FIFO request succeeded.
+    pub realtime: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TickSnapshot {
     /// Ticks in the window (at most [`TICK_WINDOW`]).
@@ -98,6 +108,8 @@ pub struct TickSnapshot {
     pub writer_acquire_us: Percentiles,
     /// Phases of the slowest tick in the window.
     pub max_tick: Option<TickBreakdown>,
+    /// Control thread scheduling; None until the control thread reported it (tests).
+    pub control_thread: Option<ControlThreadSched>,
 }
 
 impl Default for TickStats {
@@ -174,6 +186,7 @@ impl TickWindow {
             reader_acquire_us: col(8),
             writer_acquire_us: col(9),
             max_tick,
+            control_thread: None,
         }
     }
 }
