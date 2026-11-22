@@ -3035,3 +3035,80 @@ fn tracking_rejection_fallback_validates_dynamics_and_ramps() {
         fb_frame[0].position
     );
 }
+
+/// Review 2 M1: Re-enabling an already-torqued arm must NOT replace issued history with
+/// a `Stationary` seed while moving or holding residual lead; if unknown and moving, it
+/// must remain `Unknown`.
+#[test]
+fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history() {
+    use armd::tracking::TrackingHistoryState;
+
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+
+    // 1. Already torqued and moving with active lead: re-enable preserves issued history
+    //    and ramps smoothly without an unchecked velocity jump.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]);
+        let mut goal = q0.to_vec();
+        goal[0] += 0.20;
+        let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &goal, &[0.0; 7], Some(4.0), &inner.config.limits).unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        for _ in 0..60 {
+            inner.tick(DT);
+        }
+        let issued_before = inner.tracking.last_issued_positions.as_ref().unwrap()[0];
+        let meas_before = inner.measured_positions[0];
+        assert!(issued_before - meas_before >= 0.020, "must have active lead before re-enable");
+
+        // Call set_torque(true) while already torqued and moving!
+        inner.set_torque(true).unwrap();
+        assert_eq!(
+            inner.tracking.last_issued_positions.as_ref().map(|v| v[0]),
+            Some(issued_before),
+            "re-enabling an already-torqued moving arm must preserve real issued history"
+        );
+        assert_ne!(
+            inner.tracking.history_state,
+            TrackingHistoryState::Stationary,
+            "moving re-enable must not claim Stationary"
+        );
+
+        let idx_before = drv.with(|s| s.written.len());
+        let max_v = inner.config.limits[0].max_velocity as f64;
+        let mut prev_pos = issued_before;
+        for k in 0..20 {
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "re-enable ramp tick {k} faulted: {:?}", obs.fault);
+            let pos = drv.with(|s| s.written[idx_before + k][0].position);
+            let step_v = ((pos - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "re-enable ramp tick {k} exceeded velocity cap: {step_v:.3}");
+            prev_pos = pos;
+        }
+    }
+
+    // 2. Unknown history while arm is moving: set_torque(true) must stay Unknown, not Stationary.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        inner.tracking.invalidate();
+        drv.with(|s| s.v[0] = 0.25);
+        inner.set_torque(true).unwrap();
+        assert_eq!(
+            inner.tracking.history_state,
+            TrackingHistoryState::Unknown,
+            "re-enabling a moving arm with unknown history must NOT seed Stationary"
+        );
+    }
+}

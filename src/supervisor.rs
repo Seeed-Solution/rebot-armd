@@ -1874,7 +1874,32 @@ impl SupervisorInner {
             self.commanded_velocities = vec![0.0; self.config.dof];
             self.commanded_accelerations.fill(0.0);
             if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
-                self.tracking.seed(&self.commanded_positions);
+                let arm_indices = self.config.arm_joint_indices();
+                let has_vel_fb = self.driver.as_ref().is_none_or(|d| {
+                    d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback)
+                });
+                let arm_stationary = !has_vel_fb
+                    || arm_indices.iter().all(|&j| {
+                        self.measured_velocities
+                            .get(j)
+                            .is_some_and(|v| v.is_finite() && v.abs() <= 0.05)
+                    });
+                let aligned_with_issued = !self
+                    .tracking
+                    .has_residual_lead(&self.commanded_positions, &arm_indices);
+                if was_torqued && self.tracking.last_issued_positions.is_some() {
+                    if arm_stationary && aligned_with_issued {
+                        self.tracking.seed(&self.commanded_positions);
+                    } else {
+                        // Already torqued and moving or holding active lead: preserve real
+                        // issued history so the next tick ramps smoothly instead of jumping.
+                        self.tracking.ws_min_depths = None;
+                    }
+                } else if arm_stationary {
+                    self.tracking.seed(&self.commanded_positions);
+                } else {
+                    self.tracking.invalidate();
+                }
             } else {
                 self.tracking.invalidate();
             }
