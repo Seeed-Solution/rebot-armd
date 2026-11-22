@@ -849,6 +849,66 @@ pub fn validate_effective_gripper_policy_with_mode(
     Ok(())
 }
 
+/// How a grasp setup's `max_grasp_width_m` relates to the gripper's jaw curve. Never an
+/// error: persisted setups and gripper calibrations stay valid whatever the result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraspWidthCheck {
+    /// `max_grasp_width_m` is 0 (width check off).
+    Off,
+    /// The jaw curve opens at least `max_grasp_width_m`.
+    Verified { curve_max_m: f64 },
+    /// No jaw curve on a physical follower: `max_grasp_width_m` is unverified and used as set.
+    Unverified,
+    /// The jaw curve opens less than `max_grasp_width_m`: grasps use `curve_max_m`.
+    Clamped { curve_max_m: f64 },
+}
+
+impl GraspWidthCheck {
+    /// Status name for the API (`off`, `verified`, `unverified`, `clamped`).
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Verified { .. } => "verified",
+            Self::Unverified => "unverified",
+            Self::Clamped { .. } => "clamped",
+        }
+    }
+
+    /// The max grasp width grasps use for a setup value `max_w`.
+    pub fn effective_max_m(&self, max_w: f64) -> f64 {
+        match self {
+            Self::Clamped { curve_max_m } => max_w.min(*curve_max_m),
+            _ => max_w,
+        }
+    }
+
+    /// The curve's open width (None without a curve or with the check off).
+    pub fn curve_max_m(&self) -> Option<f64> {
+        match self {
+            Self::Verified { curve_max_m } | Self::Clamped { curve_max_m } => Some(*curve_max_m),
+            _ => None,
+        }
+    }
+}
+
+/// Compare `max_w` with the open width of `g`'s jaw curve. `require_real_curve` (physical
+/// follower): a missing curve gives [`GraspWidthCheck::Unverified`] instead of comparing against
+/// `JawOpening::sim_default()`.
+pub fn check_grasp_width(g: &GripperPolicy, max_w: f64, require_real_curve: bool) -> GraspWidthCheck {
+    if max_w <= 0.0 {
+        return GraspWidthCheck::Off;
+    }
+    if require_real_curve && g.jaw_opening.is_none() {
+        return GraspWidthCheck::Unverified;
+    }
+    let curve_max_m = f64::from(g.opening_m(g.open_rad));
+    if curve_max_m + 1e-6 < max_w {
+        GraspWidthCheck::Clamped { curve_max_m }
+    } else {
+        GraspWidthCheck::Verified { curve_max_m }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

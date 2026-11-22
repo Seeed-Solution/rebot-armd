@@ -1492,6 +1492,13 @@ impl SupervisorInner {
             && matches!(self.follower.as_deref(), Some(f) if f != "sim" && f != "mock")
     }
 
+    /// `max_w` (a grasp setup's `max_grasp_width_m`) against the gripper's jaw curve; None
+    /// without a gripper policy.
+    pub fn grasp_width_check(&self, max_w: f64) -> Option<crate::model::GraspWidthCheck> {
+        let gp = self.config.gripper_policy.as_ref()?;
+        Some(crate::model::check_grasp_width(gp, max_w, self.requires_real_jaw_curve()))
+    }
+
     pub(crate) fn reset_table_stillness(&mut self) {
         self.table_still_first_rx_instants.clear();
         self.table_still_last_rx_instants.clear();

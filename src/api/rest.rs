@@ -766,21 +766,24 @@ pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Resul
 /// GET /api/v1/grasp/setup: the runtime grasp setup (change it with the WS command
 /// `/api/v1/grasp/setup`). `camera_down` says whether a grasp on the current mount acquires
 /// camera-down (`crate::grasp::camera_down_mode`; then `grip_pixel_norm` is not the centring
-/// aim); null with `camera_down_error` when the setting cannot be served.
+/// aim); null with `camera_down_error` when the setting cannot be served. `width_check` compares
+/// `max_grasp_width_m` with the jaw curve (`crate::grasp::grasp_width_check_json`).
 pub async fn get_grasp_setup(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
 ) -> Response {
-    let (setup, revision, camera_down) = {
+    let (setup, revision, camera_down, width_check) = {
         let inner = supervisor.inner().read().await;
         let setup = inner.grasp_setup();
         let camera_down = setup.as_ref().map(|s| crate::grasp::camera_down_mode(s, &inner.config.camera_mount));
-        (setup, inner.grasp_setup_revision, camera_down)
+        let width_check = setup.as_ref().map(|s| crate::grasp::grasp_width_check_json(&inner, s.max_grasp_width_m));
+        (setup, inner.grasp_setup_revision, camera_down, width_check)
     };
     let path = deps.setup_path.as_ref().map(|p| p.display().to_string());
     match setup {
         Some(s) => {
-            let mut v = serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision});
+            let mut v = serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision,
+                "width_check": width_check});
             match camera_down {
                 Some(Ok(b)) => { v["camera_down"] = serde_json::json!(b); }
                 Some(Err(e)) => { v["camera_down"] = serde_json::Value::Null; v["camera_down_error"] = serde_json::json!(e); }

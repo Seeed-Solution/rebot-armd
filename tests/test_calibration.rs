@@ -220,6 +220,10 @@ struct Rig {
 async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig { rig_cfg(ArmConfig::rebot_dm(), paths).await }
 
 async fn rig_cfg(config: ArmConfig, paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
+    rig_sup(Arc::new(ArmSupervisor::new(config)), paths).await
+}
+
+async fn rig_sup(sup: Arc<ArmSupervisor>, paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let (url, mock) = spawn_mock().await;
     let up = armd::api::proxy::DetectorUpstream::parse(&url).unwrap();
@@ -227,7 +231,6 @@ async fn rig_cfg(config: ArmConfig, paths: impl FnOnce(&Path) -> (PathBuf, PathB
     let mut deps = CalibrationDeps::new(cal, Some(setup.clone()), up.clone());
     deps.backup_dir = dir.path().join("backups");
     deps.vision_timeout = Duration::from_millis(1500);
-    let sup = Arc::new(ArmSupervisor::new(config));
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), GraspDeps::http(up, Some(setup)),
         armd::diagnostics::DiagnosticsState::global(), deps.clone(), armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -375,6 +378,31 @@ async fn restore_puts_a_backup_back() {
     assert_eq!(rej["code"], "BACKUP_NOT_FOUND", "{rej}");
     let rej = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": "../x"})).await;
     assert_eq!(rej["code"], "INVALID_COMMAND", "{rej}");
+}
+
+/// A device backup (B601-DM, tests/fixtures/b601dm_devstate) restores on a real follower without
+/// a gripper jaw curve: its grasp setup's max_grasp_width_m stays unverified, not a refusal.
+#[tokio::test]
+async fn device_backup_restores_on_a_real_follower_without_jaw_curve() {
+    const PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json");
+    const BACKUP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/b601dm_devstate/calibration-backups/19700101T223625Z");
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::from_profile_file(PROFILE).unwrap()).with_driver(Box::new(common::TestArm::new())));
+    sup.set_follower("rebot-dm").await;
+    assert!(sup.inner().read().await.requires_real_jaw_curve());
+    let mut r = rig_sup(sup, |d| (d.join("calibration.json"), d.join("grasp_setup.json"))).await;
+    let name = "19700101T223625Z";
+    let dst = r.deps.backup_dir.join(name);
+    std::fs::create_dir_all(&dst).unwrap();
+    for f in ["manifest.json", "vision_intrinsics.json", "calibration.json", "grasp_setup.json"] {
+        std::fs::copy(Path::new(BACKUP).join(f), dst.join(f)).unwrap();
+    }
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": name})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    let inner = r.sup.inner().read().await;
+    assert!(inner.camera_calibrated());
+    let g = inner.grasp_setup().unwrap();
+    assert_eq!(g.max_grasp_width_m, 0.075);
+    assert!((g.table_z_m - 0.0241).abs() < 1e-4 && (g.camera_tilt_deg + 37.0).abs() < 0.01, "{} {}", g.table_z_m, g.camera_tilt_deg);
 }
 
 async fn assert_unchanged(r: &Rig) {

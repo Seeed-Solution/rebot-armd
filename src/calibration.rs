@@ -1809,18 +1809,9 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
             target.tool_config_digest = Some(active_tool.config_digest.clone());
         }
     } else if let Some(g) = &target.grasp_setup {
-        let inner = sup.inner().read().await;
-        if let Some(gp) = inner.config.gripper_policy.as_ref() {
-            let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
-            crate::model::validate_effective_gripper_policy_with_mode(
-                gp,
-                lim,
-                Some(g.max_grasp_width_m),
-                true,
-                !inner.requires_real_jaw_curve(),
-            )
-            .map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup incompatible with gripper_policy: {e}")))?;
-        }
+        // a missing or narrower jaw curve does not block the restore: the width is unverified or
+        // clamped to the curve (`grasp_width_check`)
+        crate::grasp::log_grasp_width_check(&*sup.inner().read().await, g.max_grasp_width_m);
     }
     // the joint zero is not part of a camera restore: the live one stays (it has its own restore,
     // `/api/v1/calibration/joint_zero/restore`)

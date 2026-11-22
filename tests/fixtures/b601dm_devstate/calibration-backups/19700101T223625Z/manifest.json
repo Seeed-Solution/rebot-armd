@@ -1,0 +1,354 @@
+{
+  "calibration": {
+    "camera_mount": {
+      "flip": false,
+      "offset_m": [
+        -0.076939657330513,
+        0.0050158146768808365,
+        0.06891869008541107
+      ],
+      "q_end_cam": [
+        0.3046742640999801,
+        -0.6364661370609692,
+        0.6289449528719083,
+        -0.32636282788757687
+      ],
+      "rot_deg": 0.0,
+      "tilt_deg": -36.995338439941406
+    },
+    "intrinsics": {
+      "cx": 320.4257478810317,
+      "cy": 184.86272217707705,
+      "fx": 803.844739372464,
+      "fy": 802.1144666949867,
+      "height": 360,
+      "k1": 0.12152512531175422,
+      "k2": -0.3107702780821175,
+      "k3": 0.0,
+      "marker_size": 0.025,
+      "p1": 0.0,
+      "p2": 0.0,
+      "width": 640
+    },
+    "joint_zero": {
+      "joints": [
+        {
+          "offset_rad": -0.00019073486328125
+        },
+        {
+          "offset_rad": -0.00209808349609375
+        },
+        {
+          "offset_rad": -0.00400543212890625
+        },
+        {
+          "offset_rad": -0.00057220458984375
+        },
+        {
+          "offset_rad": 0.00705718994140625
+        },
+        {
+          "offset_rad": 0.00019073486328125
+        },
+        {
+          "offset_rad": -0.00019073486328125
+        }
+      ],
+      "method": "software",
+      "reference": "rest",
+      "set_at": "1970-01-01T00:19:21Z"
+    },
+    "kinematics": {
+      "fit": {
+        "heldout_mm": [
+          2.1180184178094748,
+          2.865217446060557
+        ],
+        "heldout_uncorrected_mm": [
+          3.3929291966757713,
+          3.95097848356843
+        ],
+        "level": "L2",
+        "levels": [
+          {
+            "chosen": false,
+            "heldout_mm": [
+              3.3929291966757713,
+              3.95097848356843
+            ],
+            "level": "L0"
+          },
+          {
+            "chosen": false,
+            "heldout_mm": [
+              2.4316495906317193,
+              3.1384993099053404
+            ],
+            "level": "L1"
+          },
+          {
+            "chosen": true,
+            "heldout_mm": [
+              2.1180184178094748,
+              2.865217446060557
+            ],
+            "level": "L2"
+          },
+          {
+            "chosen": false,
+            "heldout_mm": [
+              3.05100133945047,
+              2.677847806152627
+            ],
+            "level": "L3"
+          }
+        ],
+        "solved_at": "2026-11-19T13:20:51.551Z",
+        "train_mm": 2.1685892231731043,
+        "views": 119
+      },
+      "joints": [
+        {
+          "offset_rad": 0.0,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.0,
+          "tilt_rad": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "offset_rad": 0.022640218347280937,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.018909738512459664,
+          "tilt_rad": [
+            -0.013246711113889306,
+            0.0
+          ]
+        },
+        {
+          "offset_rad": 0.010016918929479549,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.0,
+          "tilt_rad": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "offset_rad": 0.02470332291804993,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.0,
+          "tilt_rad": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "offset_rad": -0.04584914474685318,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.0,
+          "tilt_rad": [
+            0.0,
+            0.0
+          ]
+        },
+        {
+          "offset_rad": 0.0,
+          "origin_m": [
+            0.0,
+            0.0,
+            0.0
+          ],
+          "scale": 0.0,
+          "tilt_rad": [
+            0.0,
+            0.0
+          ]
+        }
+      ]
+    },
+    "rms": {
+      "cond": 173.84227920433332,
+      "held_out_px": 0.3295250505458185,
+      "kin_heldout_mm": [
+        2.1180184178094748,
+        2.865217446060557
+      ],
+      "kin_level": "L2",
+      "kin_levels": [
+        {
+          "chosen": false,
+          "heldout_mm": [
+            3.3929291966757713,
+            3.95097848356843
+          ],
+          "level": "L0"
+        },
+        {
+          "chosen": false,
+          "heldout_mm": [
+            2.4316495906317193,
+            3.1384993099053404
+          ],
+          "level": "L1"
+        },
+        {
+          "chosen": true,
+          "heldout_mm": [
+            2.1180184178094748,
+            2.865217446060557
+          ],
+          "level": "L2"
+        },
+        {
+          "chosen": false,
+          "heldout_mm": [
+            3.05100133945047,
+            2.677847806152627
+          ],
+          "level": "L3"
+        }
+      ],
+      "kin_train_mm": 2.1685892231731043,
+      "kin_train_px": 5.330854414530518,
+      "reproj_px": 0.31367868278759575,
+      "sigma": {
+        "cx": 0.31701518161853093,
+        "cy": 0.3369151960813155,
+        "fx": 0.7122278742086504,
+        "fy": 0.6950673880734378,
+        "k1": 0.002785347703365662,
+        "k2": 0.014742734175974468
+      },
+      "views": 107
+    },
+    "solved_at": "2026-11-19T13:20:51.551Z",
+    "table_z_m": 0.024100084051181775
+  },
+  "camera_mount": {
+    "flip": false,
+    "offset_m": [
+      -0.076939657330513,
+      0.0050158146768808365,
+      0.06891869008541107
+    ],
+    "q_end_cam": [
+      0.3046742640999801,
+      -0.6364661370609692,
+      0.6289449528719083,
+      -0.32636282788757687
+    ],
+    "rot_deg": 0.0,
+    "tilt_deg": -36.995338439941406
+  },
+  "created_at": "1970-01-01T22:36:25Z",
+  "files": [
+    "vision_intrinsics.json",
+    "manifest.json",
+    "calibration.json",
+    "grasp_setup.json"
+  ],
+  "grasp_setup": {
+    "acquire_camera_down": "auto",
+    "acquire_dist_px": 160.0,
+    "align_j6": true,
+    "align_max_angle_spread_deg": 15.0,
+    "align_min_angle_conf": 0.3,
+    "align_min_aspect": 1.2,
+    "approach_height_m": 0.15,
+    "approach_speed_mps": 0.05,
+    "camera_tilt_deg": -36.995338439941406,
+    "centre_tol_px": 10.0,
+    "cx_px": 320.4257478810317,
+    "cy_px": 184.86272217707705,
+    "descend_contact_stop_nm": null,
+    "descend_speed_mps": 0.03,
+    "fx_px": 803.844739372464,
+    "fy_px": 802.1144666949867,
+    "grasp_height_m": 0.015,
+    "grip_pixel_norm": [
+      0.5,
+      0.5
+    ],
+    "height_grasp_fraction": 0.5,
+    "height_priors": {},
+    "height_probe_m": 0.1,
+    "height_probe_mode": "up",
+    "height_record": [
+      "depth"
+    ],
+    "height_sources": [
+      "probe"
+    ],
+    "image_size_px": [
+      640.0,
+      360.0
+    ],
+    "lateral_probe_m": 0.04,
+    "lift_height_m": 0.12,
+    "lost_frames": 5,
+    "lost_timeout_s": 1.0,
+    "match_dist_px": 35.0,
+    "match_iou": 0.45,
+    "max_grasp_height_m": 0.06,
+    "max_grasp_width_m": 0.075,
+    "max_iterations": 10,
+    "max_step_m": 0.03,
+    "median_frames": 3,
+    "phase_timeout_s": 25.0,
+    "post_lift_settle_ms": 300,
+    "pre_open": "auto",
+    "pre_open_margin_m": 0.015,
+    "recentre_height_m": 0.0,
+    "recentre_max_iterations": 3,
+    "recheck_tol_px": 40.0,
+    "servo_gain": 0.6,
+    "settle_delay_s": 0.1,
+    "spill_max_tilt_deg": 8.0,
+    "spill_safe_labels": [
+      "cup",
+      "bottle",
+      "wine glass",
+      "bowl",
+      "vase"
+    ],
+    "stable_frames": 3,
+    "table_z_m": 0.024100084051181775,
+    "tasks": {},
+    "timeout_s": 120.0,
+    "width_record": [],
+    "width_sources": [
+      "mask",
+      "depth"
+    ],
+    "yaw_record": [
+      "depth"
+    ],
+    "yaw_sources": [
+      "mask",
+      "box"
+    ]
+  },
+  "reason": "apply"
+}

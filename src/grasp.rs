@@ -647,28 +647,12 @@ pub fn load_setup_for_tool(path: &Path, base: &GraspSetup, active_tool: &crate::
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
     let Some(base) = inner.grasp_setup() else { return; };
-    let (mut setup, outcome) = load_setup_for_tool(path, &base, &inner.config.active_tool);
+    let (setup, outcome) = load_setup_for_tool(path, &base, &inner.config.active_tool);
     let mut needs_camera_sync = false;
     match &outcome {
         LoadOutcome::Loaded => {
-            if let Some(gp) = inner.config.gripper_policy.as_ref() {
-                let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
-                if let Err(e) = crate::model::validate_effective_gripper_policy_with_mode(
-                    gp,
-                    lim,
-                    Some(setup.max_grasp_width_m),
-                    true,
-                    !inner.requires_real_jaw_curve(),
-                ) {
-                    tracing::warn!("Ignoring grasp setup from {}: {e}; using defaults", path.display());
-                    setup = base;
-                    needs_camera_sync = true;
-                } else {
-                    tracing::info!("Grasp setup loaded from {}", path.display());
-                }
-            } else {
-                tracing::info!("Grasp setup loaded from {}", path.display());
-            }
+            tracing::info!("Grasp setup loaded from {}", path.display());
+            log_grasp_width_check(&inner, setup.max_grasp_width_m);
         }
         LoadOutcome::Missing => {
             tracing::info!("No grasp setup at {}; using defaults", path.display());
@@ -681,6 +665,38 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     }
     inner.grasp_setup_needs_camera_sync = needs_camera_sync;
     inner.set_grasp_setup(setup);
+}
+
+/// Warn when `max_w` cannot be verified (no jaw curve on a physical follower) or exceeds the jaw
+/// curve's open width (grasps are clamped to it). The setup stays in effect either way.
+pub(crate) fn log_grasp_width_check(inner: &SupervisorInner, max_w: f64) {
+    match inner.grasp_width_check(max_w) {
+        Some(crate::model::GraspWidthCheck::Unverified) => tracing::warn!(
+            "Grasp setup max_grasp_width_m {max_w:.4} m is unverified: no gripper jaw_opening calibration curve"
+        ),
+        Some(crate::model::GraspWidthCheck::Clamped { curve_max_m }) => tracing::warn!(
+            "Grasp setup max_grasp_width_m {max_w:.4} m exceeds the jaw curve's open width {curve_max_m:.4} m; grasps use {curve_max_m:.4} m"
+        ),
+        _ => {}
+    }
+}
+
+/// `GET /api/v1/grasp/setup` `width_check`: `max_grasp_width_m` against the jaw curve
+/// (`status` off / verified / unverified / clamped, `jaw_curve` present / missing).
+pub fn grasp_width_check_json(inner: &SupervisorInner, max_w: f64) -> Value {
+    match inner.grasp_width_check(max_w) {
+        Some(c) => {
+            let has_curve = inner.config.gripper_policy.as_ref().is_some_and(|g| g.jaw_opening.is_some());
+            serde_json::json!({
+                "status": c.status(),
+                "jaw_curve": if has_curve { "present" } else { "missing" },
+                "max_grasp_width_m": max_w,
+                "effective_max_grasp_width_m": c.effective_max_m(max_w),
+                "curve_max_opening_m": c.curve_max_m(),
+            })
+        }
+        None => Value::Null,
+    }
 }
 
 /// What the WS / REST handlers need for grasps: the detection source and the setup file.
@@ -778,17 +794,18 @@ pub fn prepare_setup_update(
     if inner.camera_calibrated() {
         refuse_calibrated_fields(&base, &patch, "")?;
     }
+    let width_patched = patch.contains_key("max_grasp_width_m");
     let setup = base.patched(&Value::Object(patch)).map_err(MotionError::InvalidCommand)?;
-    if let Some(gp) = inner.config.gripper_policy.as_ref() {
-        let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
-        crate::model::validate_effective_gripper_policy_with_mode(
-            gp,
-            lim,
-            Some(setup.max_grasp_width_m),
-            true,
-            !inner.requires_real_jaw_curve(),
-        )
-        .map_err(MotionError::InvalidCommand)?;
+    // a new max_grasp_width_m beyond the jaw curve is refused; other edits keep a stored width
+    // (grasps are clamped to the curve), and without a curve the width stays unverified
+    match inner.grasp_width_check(setup.max_grasp_width_m) {
+        Some(crate::model::GraspWidthCheck::Clamped { curve_max_m }) if width_patched => {
+            return Err(MotionError::InvalidCommand(format!(
+                "max_grasp_width_m {:.4} m exceeds the jaw curve's open width {curve_max_m:.4} m",
+                setup.max_grasp_width_m
+            )).into());
+        }
+        _ => log_grasp_width_check(inner, setup.max_grasp_width_m),
     }
     // the camera tilt is workspace geometry (camera check point): it cannot change under an
     // accepted motion; other setup fields can

@@ -1246,7 +1246,8 @@ fn r2_m05_m06_hover_resume_requires_fp_and_physical_jaw_curve_required() {
     let err_missing_fp = armd::calib_hover::prepare(&inner, &json!({"resume": job_id}), inner.safety.epoch_id()).unwrap_err();
     assert!(err_missing_fp.to_string().contains("candidate_fingerprint"), "{err_missing_fp}");
 
-    // M06: physical non-sim driver with missing jaw_opening curve refuses sim_default() bypass on setup update
+    // M06: physical non-sim driver with missing jaw_opening curve: no sim_default() verification;
+    // the width is unverified and the setup update is accepted (existing arms have no curve)
     let mut no_curve_cfg = ArmConfig::rebot_dm();
     no_curve_cfg.gripper_policy.as_mut().unwrap().jaw_opening = None;
     let drv = MockFbArm::new(INSPECT, true);
@@ -1254,8 +1255,8 @@ fn r2_m05_m06_hover_resume_requires_fp_and_physical_jaw_curve_required() {
     phys_inner.driver = Some(Mutex::new(Box::new(drv)));
     phys_inner.follower = Some("rebot-dm".into());
     assert!(phys_inner.requires_real_jaw_curve());
-    let err_no_curve = grasp::prepare_setup_update(&phys_inner, &json!({"max_grasp_width_m": 0.05}), None, false).unwrap_err();
-    assert!(format!("{err_no_curve:?}").contains("jaw_opening"), "{err_no_curve:?}");
+    assert!(grasp::prepare_setup_update(&phys_inner, &json!({"max_grasp_width_m": 0.12}), None, false).is_ok());
+    assert_eq!(phys_inner.grasp_width_check(0.12), Some(armd::model::GraspWidthCheck::Unverified));
 }
 
 #[test]
