@@ -11,15 +11,16 @@
 //! - Mid-height is a shape hypothesis: it bounds the height mismatch of a boundary anywhere in
 //!   [0, h] by h / 2; the lateral error of a ray at angle theta from the normal is |dh| tan(theta).
 //! - Occlusion: each view may carry image rectangles it cannot see through (the gripper jaws);
-//!   grid cells under them are not observed by that view and do not vote there.
+//!   grid cells under them are not observed by that view and do not vote there (a cell no view
+//!   observes takes the majority of all views).
 //! - Agreement: pairwise IoU over the cells both views observe; the largest group of at least
 //!   `min_views` views with every pair at `min_iou` or more is kept (ties: the higher mean IoU).
 //! - Fusion: a cell is occupied when more than half of the kept views that observe it see it
 //!   (both of two views).
 //! - Grades ([`Grade`]): a dimension is `Medium` when the spread of the kept views' own spans along
-//!   the rectangle's axis is at most `tolerance` of their median and the change of the dimension
-//!   with the projection plane at 0 or h (instead of h / 2) is at most `tolerance` of it; else
-//!   `Low`. Quality grades, not calibrated probabilities.
+//!   the rectangle's axis is at most `tolerance` of their median and the height sensitivity (a
+//!   boundary anywhere in [0, h]: h / 2 tan(theta) along the side at each end, per view, largest)
+//!   is at most `tolerance` of it; else `Low`. Quality grades, not calibrated probabilities.
 //! - Yaw: the long side's direction in the base frame, modulo 180 deg in [-90, 90); indeterminate
 //!   (`yaw_determinate` false) when the sides differ by less than `square_ratio`.
 use crate::kinematics::{self, Vec3};
@@ -98,7 +99,8 @@ pub struct Footprint {
     pub width_confidence: Grade,
     /// Spans of each fused view's own projection along the long and short side (m).
     pub view_spans_m: Vec<[f64; 2]>,
-    /// Largest change of length and width with the projection plane at 0 or h (m).
+    /// Largest error of length and width (m) of a boundary anywhere in [0, h] instead of at h / 2:
+    /// h / 2 tan(theta) along the side at each end, of the fused view with the largest.
     pub height_sensitivity_m: [f64; 2],
     /// Largest ray angle from the plane normal of the fused views' vertices (deg).
     pub max_ray_angle_deg: f64,
@@ -405,14 +407,17 @@ fn iou(m: &Masks, a: usize, b: usize) -> f64 {
     if uni == 0 { 0.0 } else { inter as f64 / uni as f64 }
 }
 
-/// Strict-majority fusion of the views `keep` over the views that observe each cell.
+/// Strict-majority fusion of the views `keep` over the views that observe each cell; a cell no
+/// view observes (inside every view's occluder rectangle) takes the majority of all of them: the
+/// rectangle is coarser than the occluder, and a mask stops at the occluder's real edge.
 fn fuse(m: &Masks, keep: &[usize]) -> Vec<bool> {
     (0..m.grid.nu * m.grid.nv).map(|k| {
-        let (mut votes, mut seen) = (0usize, 0usize);
+        let (mut votes, mut seen, mut all) = (0usize, 0usize, 0usize);
         for &i in keep {
+            all += usize::from(m.occ[i][k]);
             if m.obs[i][k] { seen += 1; votes += usize::from(m.occ[i][k]); }
         }
-        seen > 0 && 2 * votes > seen
+        if seen > 0 { 2 * votes > seen } else { 2 * all > keep.len() }
     }).collect()
 }
 
@@ -439,15 +444,6 @@ fn agreeing_group(ious: &[Vec<f64>], min_views: usize, min_iou: f64) -> Option<V
         if better { best = Some((idx.len(), mean, idx)); }
     }
     best.map(|b| b.2)
-}
-
-/// The fused rectangle of views `keep` (indices into `proj`) at one plane height.
-fn fused_rect(proj: &[&Projected], keep: &[usize], p: &FootprintParams) -> Option<Rect> {
-    let sub: Vec<&Projected> = keep.iter().map(|&i| proj[i]).collect();
-    let m = rasterize_all(&sub, p)?;
-    let all: Vec<usize> = (0..sub.len()).collect();
-    let f = fuse(&m, &all);
-    mask_rect(&m.grid, &f)
 }
 
 /// The footprint from `sils` (cameras by view index; table plane [n, d] with height = n . x + d)
@@ -491,18 +487,25 @@ pub fn footprint(cams: &[Camera], sils: &[Silhouette], plane: [f64; 4], height_m
         };
         [span(a_long), span(a_short)]
     }).collect();
-    // height sensitivity: the same views projected at 0 and h
-    let mut sens = [0.0f64; 2];
+    // height sensitivity: a boundary point anywhere in [0, h] lands up to h/2 tan(theta) from its
+    // mid-height projection along the ray's in-plane direction; per side the rays at both ends
     let kept_sils: Vec<&Silhouette> = keep.iter().map(|&k| ok_sils[k]).collect();
-    for hp in [0.0, height_m] {
-        let pr: Vec<Projected> = project_all(cams, &kept_sils, &frame, hp, p).into_iter().filter_map(Result::ok).collect();
-        let r = if pr.len() == kept_sils.len() {
-            let rr: Vec<&Projected> = pr.iter().collect();
-            fused_rect(&rr, &(0..rr.len()).collect::<Vec<_>>(), p)
-        } else { None };
-        match r {
-            Some(r) => { sens[0] = sens[0].max((r.long - rect.long).abs()); sens[1] = sens[1].max((r.short - rect.short).abs()); }
-            None => { sens = [f64::INFINITY; 2]; }
+    let mut sens = [0.0f64; 2];
+    for s in &kept_sils {
+        let Some(cam) = cams.get(s.view) else { continue };
+        for (k, (ax, half)) in [(a_long, 0.5 * rect.long), (a_short, 0.5 * rect.short)].into_iter().enumerate() {
+            let mut e = 0.0;
+            for sign in [-1.0, 1.0] {
+                let uv = [rect.centre[0] + sign * half * ax[0], rect.centre[1] + sign * half * ax[1]];
+                let x = frame.point(uv, 0.5 * height_m);
+                let r = kinematics::sub(&x, &cam.c);
+                let down = -kinematics::dot(&r, &frame.n);
+                if down <= 1e-9 { e = f64::INFINITY; break; }
+                // in-plane displacement per unit height along the ray
+                let g = [kinematics::dot(&r, &frame.e1) / down, kinematics::dot(&r, &frame.e2) / down];
+                e += 0.5 * height_m * (g[0] * ax[0] + g[1] * ax[1]).abs();
+            }
+            sens[k] = sens[k].max(e);
         }
     }
     let grade = |k: usize, dim: f64| {
@@ -966,7 +969,7 @@ mod tests {
 
     #[test]
     fn grades_follow_view_spread_and_height_sensitivity() {
-        let h = 0.02;
+        let h = 0.01;
         let out: Vec<Vec3> = box_corners([0.3, 0.0], 0.06, 0.03, 0.0, 0.0)[..4].iter().map(|x| [x[0], x[1], 0.5 * h]).collect();
         let cams = views([0.3, 0.0, 0.0], 3, 0.3, 10.0);
         let sils: Vec<Silhouette> = cams.iter().enumerate().map(|(k, c)| silhouette(c, &out, k)).collect();
