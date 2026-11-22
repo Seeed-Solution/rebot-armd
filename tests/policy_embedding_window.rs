@@ -25,8 +25,8 @@ use armd::policy_runtime::runner::{
     PreparedPolicy, TicketVerificationContext, TicketViolation,
 };
 use armd::policy_runtime::vision::{
-    embedding_hub_for_supervisor, ClockHandshakeRequest, EmbeddingIngestRequest,
-    DEFAULT_HANDSHAKE_TTL_MS,
+    embedding_hub_for_supervisor, ClockHandshakeRequest, ClockHandshakeResponse,
+    EmbeddingIngestRequest, VideoEmbeddingHub, DEFAULT_HANDSHAKE_TTL_MS,
 };
 use armd::policy_runtime::{
     compute_release_digest, encode_rmlp_bytes, load_backend, Activation, ActiveDeploymentContext,
@@ -261,6 +261,93 @@ async fn spawn_http_server(sup: Arc<ArmSupervisor>, auth: OperatorAuth) -> Socke
     addr
 }
 
+fn hub_two_step_handshake(
+    hub: &VideoEmbeddingHub,
+    producer_epoch: u64,
+    producer_monotonic_ms: i64,
+    producer_uncertainty_ms: u64,
+    socket_same_host: bool,
+) -> ClockHandshakeResponse {
+    let chal = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch,
+                producer_monotonic_ms: Some(producer_monotonic_ms),
+                ..Default::default()
+            },
+            socket_same_host,
+        )
+        .unwrap();
+    assert_eq!(chal.phase, "challenge");
+    hub.clock_handshake(
+        ClockHandshakeRequest {
+            phase: Some("confirm".into()),
+            challenge_id: chal.challenge_id,
+            producer_epoch,
+            producer_monotonic_ms: Some(producer_monotonic_ms),
+            producer_uncertainty_ms: Some(producer_uncertainty_ms),
+            ..Default::default()
+        },
+        socket_same_host,
+    )
+    .unwrap()
+}
+
+async fn http_two_step_handshake(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    token: Option<&str>,
+    forwarded_for: Option<&str>,
+    producer_epoch: u64,
+    producer_monotonic_ms: i64,
+    producer_uncertainty_ms: u64,
+    server_uncertainty_ms: Option<u64>,
+    ttl_ms: Option<u64>,
+) -> reqwest::Response {
+    let url = format!("http://{addr}/api/v1/vision/clock-handshake");
+    let mut init_req = client.post(&url).json(&serde_json::json!({
+        "phase": "init",
+        "producer_epoch": producer_epoch,
+        "producer_monotonic_ms": producer_monotonic_ms,
+    }));
+    if let Some(t) = token {
+        init_req = init_req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(xff) = forwarded_for {
+        init_req = init_req.header("X-Forwarded-For", xff);
+    }
+    let init_resp = init_req.send().await.unwrap();
+    if !init_resp.status().is_success() {
+        return init_resp;
+    }
+    let init_json: serde_json::Value = init_resp.json().await.unwrap();
+    assert_eq!(init_json["phase"], "challenge");
+    let challenge_id = init_json["challenge_id"].as_str().unwrap().to_string();
+
+    let mut confirm_body = serde_json::json!({
+        "phase": "confirm",
+        "challenge_id": challenge_id,
+        "producer_epoch": producer_epoch,
+        "producer_monotonic_ms": producer_monotonic_ms,
+        "producer_uncertainty_ms": producer_uncertainty_ms,
+    });
+    if let Some(su) = server_uncertainty_ms {
+        confirm_body["server_uncertainty_ms"] = serde_json::json!(su);
+    }
+    if let Some(ttl) = ttl_ms {
+        confirm_body["ttl_ms"] = serde_json::json!(ttl);
+    }
+    let mut confirm_req = client.post(&url).json(&confirm_body);
+    if let Some(t) = token {
+        confirm_req = confirm_req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(xff) = forwarded_for {
+        confirm_req = confirm_req.header("X-Forwarded-For", xff);
+    }
+    confirm_req.send().await.unwrap()
+}
+
 fn make_linear_layers(in_dim: usize, out_dim: usize, weights: Vec<f32>) -> Vec<MlpLayerSpec> {
     vec![MlpLayerSpec::new(
         in_dim,
@@ -485,24 +572,24 @@ async fn positive_m1_t4_http_ingestion_concat_norm_and_live_commit() {
         .unwrap();
     assert_eq!(unauth_resp.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // Valid same-host clock handshake (now=1_000_000, producer_monotonic_ms=999_950 -> offset=+50 ms)
+    // Valid same-host 2-step clock handshake (now=1_000_000, producer_monotonic_ms=999_950 -> offset=+50 ms)
     // Also pass oversized ttl_ms=999_999 to verify server caps TTL <= 60_000 ms (A5).
-    let hs_resp = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("Authorization", format!("Bearer {token}"))
-        .json(&serde_json::json!({
-            "producer_epoch": 1,
-            "producer_monotonic_ms": 999_950,
-            "producer_uncertainty_ms": 3,
-            "server_uncertainty_ms": 2,
-            "ttl_ms": 999_999
-        }))
-        .send()
-        .await
-        .unwrap();
+    let hs_resp = http_two_step_handshake(
+        &client,
+        addr,
+        Some(&token),
+        None,
+        1,
+        999_950,
+        3,
+        Some(2),
+        Some(999_999),
+    )
+    .await;
     assert_eq!(hs_resp.status(), reqwest::StatusCode::OK);
     let hs_json: serde_json::Value = hs_resp.json().await.unwrap();
     let hs_gen = hs_json["handshake_generation"].as_u64().unwrap();
+    assert_eq!(hs_json["phase"], "confirmed");
     assert_eq!(hs_json["clock_offset_ms"], 50);
     assert_eq!(hs_json["same_host"], true);
     assert_eq!(hs_json["ttl_ms"], DEFAULT_HANDSHAKE_TTL_MS);
@@ -640,17 +727,7 @@ async fn positive_t1_video_model_commits_cleanly() {
 
     let hub = embedding_hub_for_supervisor(&sup);
     hub.set_test_now_ms(Some(500_000));
-    let hs = hub
-        .clock_handshake(
-            ClockHandshakeRequest {
-                producer_epoch: 1,
-                producer_monotonic_ms: Some(500_000),
-                producer_uncertainty_ms: Some(1),
-                ..Default::default()
-            },
-            true,
-        )
-        .unwrap();
+    let hs = hub_two_step_handshake(&hub, 1, 500_000, 1, true);
     hub.ingest_embedding(EmbeddingIngestRequest {
         handshake_generation: hs.handshake_generation,
         producer_epoch: 1,
@@ -752,10 +829,23 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
         "MISSING_PRODUCER_TIMESTAMP"
     );
 
-    // A4: missing producer_uncertainty_ms rejected 400
+    // A4: missing producer_uncertainty_ms on confirm rejected 400
+    let init_for_missing_unc: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+        .json(&serde_json::json!({"phase": "init", "producer_monotonic_ms": 10_000}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let missing_unc = client
         .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .json(&serde_json::json!({"producer_monotonic_ms": 10_000}))
+        .json(&serde_json::json!({
+            "phase": "confirm",
+            "challenge_id": init_for_missing_unc["challenge_id"],
+            "producer_monotonic_ms": 10_000
+        }))
         .send()
         .await
         .unwrap();
@@ -766,9 +856,24 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
     );
 
     // C1: Loopback connection (127.0.0.1) enforces <= 5 ms even if caller passes same_host=false
+    let bad_local_init: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+        .json(&serde_json::json!({
+            "phase": "init",
+            "producer_monotonic_ms": 10_000,
+            "same_host": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let bad_local = client
         .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
         .json(&serde_json::json!({
+            "phase": "confirm",
+            "challenge_id": bad_local_init["challenge_id"],
             "producer_monotonic_ms": 10_000,
             "producer_uncertainty_ms": 6,
             "same_host": false
@@ -778,14 +883,30 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
         .unwrap();
     assert_eq!(bad_local.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    // Remote IP via X-Forwarded-For enforces <= 25 ms (20 ms allowed, 26 ms rejected)
+    // Remote IP via X-Forwarded-For enforces <= 25 ms (10 ms allowed, 26 ms rejected)
+    let ok_remote_init: serde_json::Value = client
+        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+        .header("X-Forwarded-For", "192.168.1.50")
+        .json(&serde_json::json!({
+            "phase": "init",
+            "producer_epoch": 1,
+            "client_monotonic_ms": 9_900
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let ok_remote = client
         .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
         .header("X-Forwarded-For", "192.168.1.50")
         .json(&serde_json::json!({
+            "phase": "confirm",
+            "challenge_id": ok_remote_init["challenge_id"],
             "producer_epoch": 1,
             "client_monotonic_ms": 9_900,
-            "producer_uncertainty_ms": 10,
+            "producer_uncertainty_ms": 6,
             "server_uncertainty_ms": 4
         }))
         .send()
@@ -795,19 +916,21 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
     let hs_json: serde_json::Value = ok_remote.json().await.unwrap();
     assert_eq!(hs_json["same_host"], false);
     assert_eq!(hs_json["clock_offset_ms"], 100);
+    assert_eq!(hs_json["effective_uncertainty_ms"], 10);
     let hs_gen = hs_json["handshake_generation"].as_u64().unwrap();
 
-    let bad_remote = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .header("X-Forwarded-For", "192.168.1.50")
-        .json(&serde_json::json!({
-            "producer_epoch": 1,
-            "producer_monotonic_ms": 9_900,
-            "producer_uncertainty_ms": 26
-        }))
-        .send()
-        .await
-        .unwrap();
+    let bad_remote = http_two_step_handshake(
+        &client,
+        addr,
+        None,
+        Some("192.168.1.50"),
+        1,
+        9_900,
+        26,
+        None,
+        None,
+    )
+    .await;
     assert_eq!(bad_remote.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // A13: Pre-bind width budget rejects > 1024 embedding length
@@ -982,16 +1105,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
     assert_eq!(r11.status(), reqwest::StatusCode::OK);
     assert_eq!(hub.window_len(), 1);
 
-    let renew = client
-        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
-        .json(&serde_json::json!({
-            "producer_epoch": 1,
-            "producer_monotonic_ms": 9_800,
-            "producer_uncertainty_ms": 2
-        }))
-        .send()
-        .await
-        .unwrap();
+    let renew = http_two_step_handshake(&client, addr, None, None, 1, 9_800, 2, None, None).await;
     assert_eq!(renew.status(), reqwest::StatusCode::OK);
     let renew_gen = renew.json::<serde_json::Value>().await.unwrap()["handshake_generation"]
         .as_u64()
@@ -1105,17 +1219,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
     hub.set_default_handshake_ttl_ms(ttl_ms);
 
     hub.set_test_now_ms(Some(1_000_000));
-    let hs = hub
-        .clock_handshake(
-            ClockHandshakeRequest {
-                producer_epoch: 1,
-                producer_monotonic_ms: Some(1_000_000),
-                producer_uncertainty_ms: Some(1),
-                ..Default::default()
-            },
-            true,
-        )
-        .unwrap();
+    let hs = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
 
     hub.ingest_embedding(EmbeddingIngestRequest {
         handshake_generation: hs.handshake_generation,
@@ -1403,4 +1507,484 @@ fn release_gate_rejects_missing_or_mismatched_encoder_and_preprocess_sha256() {
         ReleaseGate::parse_and_verify(&bad_prep, &digest, &cfg, prepared.contract(), 10.0, &deployment),
         Err(PolicyError::ReleaseGate(_))
     ));
+}
+
+#[tokio::test]
+async fn b1_single_step_init_returns_challenge_without_activating_handshake() {
+    let sup = Arc::new(ArmSupervisor::new(make_6dof_config()));
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(50_000));
+    let addr = spawn_http_server(sup.clone(), OperatorAuth::disabled()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{addr}/api/v1/vision/clock-handshake"))
+        .json(&serde_json::json!({
+            "producer_epoch": 1,
+            "producer_monotonic_ms": 49_950
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["phase"], "challenge");
+    assert!(body["challenge_id"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(body["handshake_generation"], 0);
+    assert_eq!(body["measured_rtt_ms"], serde_json::Value::Null);
+    assert!(hub.handshake_state().is_none(), "init must not activate handshake");
+
+    let ing = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": 0,
+            "producer_epoch": 1,
+            "frame_id": 1,
+            "captured_at_ms": 49_950,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ing.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        ing.json::<serde_json::Value>().await.unwrap()["code"],
+        "HANDSHAKE_MISMATCH"
+    );
+}
+
+#[test]
+fn b1_server_measured_rtt_sets_midpoint_offset_and_bounds_uncertainty() {
+    let hub = VideoEmbeddingHub::new();
+    hub.set_test_now_ms(Some(100_000));
+
+    let init = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(99_900),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(init.phase, "challenge");
+
+    // Advance server clock by 10 ms between init and confirm.
+    hub.set_test_now_ms(Some(100_010));
+    let confirm = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(99_910),
+                producer_uncertainty_ms: Some(2),
+                server_uncertainty_ms: None,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(confirm.phase, "confirmed");
+    assert_eq!(confirm.measured_rtt_ms, Some(10));
+    // midpoint = 100_000 + 10 / 2 = 100_005; offset = 100_005 - 99_910 = 95
+    assert_eq!(confirm.clock_offset_ms, 95);
+    assert_eq!(confirm.server_uncertainty_ms, 5);
+    assert_eq!(confirm.effective_uncertainty_ms, 7);
+
+    // Zero-RTT confirm still enforces server_uncertainty_ms >= 1 (never 0).
+    let init2 = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(99_910),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    let confirm2 = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init2.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(99_910),
+                producer_uncertainty_ms: Some(0),
+                server_uncertainty_ms: Some(0),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(confirm2.measured_rtt_ms, Some(0));
+    assert_eq!(confirm2.server_uncertainty_ms, 1);
+    assert_eq!(confirm2.effective_uncertainty_ms, 1);
+}
+
+#[test]
+fn b1_excessive_server_measured_rtt_rejected_without_clobbering_active_state() {
+    let hub = VideoEmbeddingHub::new();
+    hub.set_test_now_ms(Some(200_000));
+    let hs = hub_two_step_handshake(&hub, 1, 200_000, 1, true);
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 200_000,
+        embedding: vec![1.0, 2.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: None,
+    })
+    .unwrap();
+    let prev_hs = hub.handshake_state().unwrap();
+
+    // Same-host: 10 ms RTT -> server_unc=5 + producer_unc=1 = 6 > 5 -> UNCERTAINTY_EXCEEDED
+    let init_local = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(200_000),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    hub.set_test_now_ms(Some(200_010));
+    let err_local = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init_local.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(200_010),
+                producer_uncertainty_ms: Some(1),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(err_local.code, "UNCERTAINTY_EXCEEDED");
+    assert_eq!(hub.handshake_state().unwrap(), prev_hs);
+    assert_eq!(hub.frame_ids(), vec![1]);
+
+    // Remote: 50 ms RTT -> server_unc=25 + producer_unc=1 = 26 > 25 -> UNCERTAINTY_EXCEEDED
+    let init_remote = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(200_010),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    hub.set_test_now_ms(Some(200_060));
+    let err_remote = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init_remote.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(200_060),
+                producer_uncertainty_ms: Some(1),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+    assert_eq!(err_remote.code, "UNCERTAINTY_EXCEEDED");
+    assert_eq!(hub.handshake_state().unwrap(), prev_hs);
+    assert_eq!(hub.frame_ids(), vec![1]);
+}
+
+#[test]
+fn b1_replayed_expired_and_stale_challenge_rejected() {
+    let hub = VideoEmbeddingHub::new();
+    hub.set_test_now_ms(Some(300_000));
+
+    // Replay check
+    let init1 = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(300_000),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    let cid1 = init1.challenge_id.clone().unwrap();
+    hub.clock_handshake(
+        ClockHandshakeRequest {
+            phase: Some("confirm".into()),
+            challenge_id: Some(cid1.clone()),
+            producer_epoch: 1,
+            producer_monotonic_ms: Some(300_000),
+            producer_uncertainty_ms: Some(1),
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+    let replay = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: Some(cid1),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(300_000),
+                producer_uncertainty_ms: Some(1),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(replay.code, "INVALID_CHALLENGE");
+
+    // Expired challenge check (> 5_000 ms)
+    let init2 = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(300_000),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    hub.set_test_now_ms(Some(305_001));
+    let expired = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init2.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(305_001),
+                producer_uncertainty_ms: Some(1),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(expired.code, "CHALLENGE_EXPIRED");
+
+    // Stale challenge check (superseded by a newer confirmed handshake generation)
+    let init_a = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(305_001),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    let _hs_b = hub_two_step_handshake(&hub, 1, 305_001, 1, true);
+    let stale = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init_a.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(305_001),
+                producer_uncertainty_ms: Some(1),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(stale.code, "CHALLENGE_STALE");
+}
+
+#[tokio::test]
+async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
+    let layers = make_linear_layers(8, 6, vec![0.05; 48]);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 10.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 50,
+                "max_window_span_ms": 200,
+                "fps_staleness_budget_ms": 50,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(1_000_000));
+    let init = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("init".into()),
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(1_000_000),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    let hs = hub
+        .clock_handshake(
+            ClockHandshakeRequest {
+                phase: Some("confirm".into()),
+                challenge_id: init.challenge_id,
+                producer_epoch: 1,
+                producer_monotonic_ms: Some(1_000_000),
+                producer_uncertainty_ms: Some(3),
+                server_uncertainty_ms: Some(2),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(hs.effective_uncertainty_ms, 5);
+
+    let spec = prepared.contract().video_embedding.clone().unwrap();
+    hub.bind_policy(99, spec, 10.0);
+
+    // At ingest: nominal age 46 <= 50, but 46 + 5 = 51 > 50 -> STALE_FRAME
+    let err_ingest = hub
+        .ingest_embedding(EmbeddingIngestRequest {
+            handshake_generation: hs.handshake_generation,
+            producer_epoch: 1,
+            frame_id: 1,
+            captured_at_ms: 1_000_000 - 46,
+            embedding: vec![1.0, 1.0],
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            model_generation: Some(1),
+        })
+        .unwrap_err();
+    assert_eq!(err_ingest.code, "STALE_FRAME");
+
+    // Ingest at nominal age 40 (40 + 5 = 45 <= 50 -> accepted)
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 2,
+        captured_at_ms: 1_000_000 - 40,
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 10);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        10.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-b1").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-b1".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_b1".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        10.0,
+        compute_policy_deadline(Some(2.0)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    // Advance by 6 ms: nominal age = 46 <= 50, but 46 + 5 = 51 > 50 -> pre-commit rejects!
+    hub.advance_test_now_ms(6);
+
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+    let obs = sup.get_observation().await;
+    let pol = obs.policy.expect("policy obs");
+    assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
+    assert_eq!(pol.steps, 0);
 }

@@ -1098,7 +1098,7 @@ pub fn spawn_policy_runner(
             };
             let base_input_age_ms = prop_age_range_ms.map(|(_, max_prop)| max_prop);
 
-            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_ms) =
+            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_and_unc_ms) =
                 if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
                     let Some(lease_gen) = snap_lease_gen else {
                         let mut inner = supervisor.inner().write().await;
@@ -1127,7 +1127,7 @@ pub fn spawn_policy_runner(
                                 None,
                                 Some(win.newest_frame_id),
                                 Some(ticket),
-                                Some(win.newest_mapped_at_ms),
+                                Some((win.newest_mapped_at_ms, win.effective_uncertainty_ms)),
                             )
                         }
                         EmbeddingSampleDecision::Hold => {
@@ -1357,8 +1357,10 @@ pub fn spawn_policy_runner(
             } else {
                 None
             };
-            let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) = (emb_commit_now_ms, emb_mapped_ms) {
-                Some(now_ms.saturating_sub(mapped_ms))
+            let post_vision_age_ms = if let (Some(now_ms), Some((mapped_ms, unc_ms))) =
+                (emb_commit_now_ms, emb_mapped_and_unc_ms)
+            {
+                Some(now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
             } else {
                 detector_post_vision_age_ms
             };
