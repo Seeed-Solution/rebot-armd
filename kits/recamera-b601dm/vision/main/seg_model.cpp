@@ -184,6 +184,16 @@ ma_err_t SegModel::postprocess() {
                 det.angle_conf = static_cast<float>(cs.conf);
                 det.grasp_width_px = static_cast<float>(cs.width_px);
             }
+            // the outline before mask_buf_ is reused: crop cells -> input pixels -> normalised input
+            det.contour = rv::mask_exterior_contour(mask_buf_.data(), crop_w, crop_h, crop_w);
+            rv::CellToFrame map;
+            map.cell_w = iw / static_cast<float>(proto_w);
+            map.cell_h = ih / static_cast<float>(proto_h);
+            map.crop_x = x0;
+            map.crop_y = y0;
+            map.frame_w = iw;
+            map.frame_h = ih;
+            rv::contour_to_frame_norm(det.contour, map);
 
             auto t1 = std::chrono::steady_clock::now();
             total_mask_time += std::chrono::duration<float, std::milli>(t1 - t0).count();

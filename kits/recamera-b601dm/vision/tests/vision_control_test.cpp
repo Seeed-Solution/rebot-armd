@@ -452,6 +452,23 @@ static void test_result_json() {
     CHECK(std::abs(j[0]["angle_conf"].get<double>() - 0.952) < 1e-3);
     CHECK(std::abs(j[0]["grasp_width_px"].get<double>() - 32.50) < 1e-2);
 
+    // mask contour: normalised to the content like the box, clamped, absent without a mask
+    CHECK(!j[0].contains("contour"));
+    d[0].contour = {{0.25f, 140.0f / 640}, {0.5f, 0.5f}, {0.25f, 600.0f / 640}};
+    j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
+    CHECK(j[0]["contour"].size() == 3);
+    CHECK(std::abs(j[0]["contour"][0][0].get<double>() - 0.25) < 1e-3 && std::abs(j[0]["contour"][0][1].get<double>()) < 1e-3);
+    CHECK(std::abs(j[0]["contour"][1][1].get<double>() - 0.5) < 1e-3 && j[0]["contour"][2][1].get<double>() == 1.0);
+    // bounded payload: 128 vertices at most, about 2 KB
+    d[0].contour.assign(300, {0.123456f, 0.654321f});
+    const std::string big = detections_json(d, content_rect(640, 640, 1280, 720), 640, 640);
+    j = json::parse(big);
+    CHECK(j[0]["contour"].size() == 128 && big.size() < 3000);
+    d[0].contour = {{0.1f, 0.1f}, {0.2f, 0.2f}};  // fewer than 3: omitted
+    j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
+    CHECK(!j[0].contains("contour"));
+    d[0].contour.clear();
+
     // NAN angle and grasp width should be omitted from JSON
     d[0].angle_deg = NAN;
     d[0].angle_conf = NAN;

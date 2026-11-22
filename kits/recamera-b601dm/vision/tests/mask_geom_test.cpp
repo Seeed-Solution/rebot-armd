@@ -337,8 +337,95 @@ static void test_empty_and_null() {
     CHECK(!cs_null.ok && cs_null.angle_deg == 0.0 && cs_null.conf == 0.0 && cs_null.width_px == 0.0);
 }
 
+static double contour_area(const Contour& c) {
+    double a = 0;
+    for (size_t i = 0; i < c.size(); ++i) {
+        const auto& p = c[i];
+        const auto& q = c[(i + 1) % c.size()];
+        a += static_cast<double>(p[0]) * q[1] - static_cast<double>(q[0]) * p[1];
+    }
+    return std::abs(a) * 0.5;
+}
+
+static void test_contour_trace() {
+    // an L shape (3x3 block + 1x2 tail) and a separate cell: the largest component, corners only
+    const int w = 6, h = 5;
+    std::vector<uint8_t> m(w * h, 0);
+    for (int y = 0; y < 3; ++y)
+        for (int x = 0; x < 3; ++x) m[y * w + x] = 1;
+    m[3 * w] = 1;
+    m[4 * w] = 1;
+    m[4 * w + 5] = 255;
+    Contour c = mask_exterior_contour(m.data(), w, h, w);
+    const Contour want = {{0, 0}, {3, 0}, {3, 3}, {1, 3}, {1, 5}, {0, 5}};
+    CHECK(c == want);
+    // stride larger than the width
+    std::vector<uint8_t> padded(w * 2 * h, 7);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) padded[y * w * 2 + x] = m[y * w + x];
+    CHECK(mask_exterior_contour(padded.data(), w, h, w * 2) == want);
+    // absent masks
+    std::vector<uint8_t> empty(16, 0);
+    CHECK(mask_exterior_contour(empty.data(), 4, 4, 4).empty());
+    CHECK(mask_exterior_contour(nullptr, 4, 4, 4).empty());
+    CHECK(mask_exterior_contour(empty.data(), 0, 4, 4).empty());
+}
+
+static void test_contour_bounded() {
+    // a noisy disk on a 160x160 grid: the staircase outline is simplified to <= 128 vertices
+    const int n = 160;
+    std::vector<uint8_t> m(n * n, 0);
+    unsigned seed = 12345;
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            seed = seed * 1103515245u + 12345u;
+            const double r = std::hypot(x - 80.0, y - 80.0) + ((seed >> 16) % 3) - 1.0;
+            m[y * n + x] = r < 70.0;
+        }
+    Contour c = mask_exterior_contour(m.data(), n, n, n);
+    CHECK(c.size() >= 8 && c.size() <= static_cast<size_t>(kMaxContourVertices));
+    CHECK(std::abs(contour_area(c) - M_PI * 70 * 70) < 0.05 * M_PI * 70 * 70);
+    Contour c16 = mask_exterior_contour(m.data(), n, n, n, 16);
+    CHECK(c16.size() <= 16 && c16.size() >= 4);
+}
+
+static void test_contour_mapping() {
+    // 640-square model: crop at cell (10, 40), 4 input px per cell, frame = input
+    Contour c = {{0, 0}, {2, 0}, {2, 3}};
+    CellToFrame t;
+    t.crop_x = 10;
+    t.crop_y = 40;
+    contour_to_frame_norm(c, t);
+    CHECK(std::abs(c[0][0] - 40.0f / 640) < 1e-6 && std::abs(c[0][1] - 160.0f / 640) < 1e-6);
+    CHECK(std::abs(c[2][0] - 48.0f / 640) < 1e-6 && std::abs(c[2][1] - 172.0f / 640) < 1e-6);
+    // seg384: 640x384 input, the 640x360 content of a 640x640 frame at y 140, 12 rows of padding
+    Contour d = {{0, 3}, {1, 93}};
+    CellToFrame s;
+    s.crop_x = 5;
+    s.crop_y = 0;
+    s.pad_y = 12;
+    s.src_y = 140;
+    contour_to_frame_norm(d, s);
+    // input y 12 -> content row 0 -> frame row 140; input y 372 -> content 360 -> frame 500
+    CHECK(std::abs(d[0][0] - 20.0f / 640) < 1e-6 && std::abs(d[0][1] - 140.0f / 640) < 1e-6);
+    CHECK(std::abs(d[1][1] - 500.0f / 640) < 1e-6);
+    // a scaled letterbox: input = (frame - src) * 0.5 + pad
+    Contour e = {{10, 10}};
+    CellToFrame k;
+    k.scale = 0.5f;
+    k.pad_x = 8;
+    k.src_x = 100;
+    k.frame_w = 1280;
+    k.frame_h = 720;
+    contour_to_frame_norm(e, k);
+    CHECK(std::abs(e[0][0] - ((40.0f - 8) / 0.5f + 100) / 1280) < 1e-6 && std::abs(e[0][1] - (40.0f / 0.5f) / 720) < 1e-6);
+}
+
 int main() {
     std::printf("Running mask_geom tests...\n");
+    test_contour_trace();
+    test_contour_bounded();
+    test_contour_mapping();
     auto cases = load_vectors();
     CHECK_MSG(!cases.empty(), "No test vector cases loaded");
 

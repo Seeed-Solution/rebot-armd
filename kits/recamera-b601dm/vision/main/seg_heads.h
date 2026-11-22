@@ -11,7 +11,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "obb_geom.h"  // ObbTensorSpec
+#include "mask_geom.h"  // CellToFrame
+#include "obb_geom.h"   // ObbTensorSpec
 
 namespace rv {
 
@@ -108,6 +109,10 @@ struct SegBoxOut {
 };
 SegBoxOut seg_box_to_frame(const SegCandidate& c, const SegHeadsInfo& info, const LetterboxGeom& g, float frame_w,
                            float frame_h);
+
+/** The mapping of a box's mask crop cells to the frame (mask_geom.h CellToFrame). */
+CellToFrame seg_cells_to_frame(const SegHeadsInfo& info, const LetterboxGeom& g, const SegBoxOut& b, float frame_w,
+                               float frame_h);
 
 }  // namespace rv
 

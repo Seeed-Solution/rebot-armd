@@ -31,6 +31,8 @@ struct Detection {
     float length_px = NAN;
     bool has_obb = false;
     std::array<std::array<float, 2>, 4> obb_corners{};
+    /** Exterior contour of the decoded mask, normalised like x, y (empty: no mask decoded). */
+    rv::Contour contour{};
 };
 
 class SegModel;

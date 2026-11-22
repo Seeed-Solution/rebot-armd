@@ -79,7 +79,10 @@ struct Config {
     bool verbose = false;
 } g_cfg;
 
+// seg384 first: a resident segmentation model gives masks (grasp angle, measure_multiview
+// contours) without a model swap; then detect, OBB and the 640x640 segment model
 const char* kDefaultModels[] = {
+    "/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
     "/userdata/rebot-teleop/models/yolo11n.cvimodel",
     "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
@@ -90,7 +93,6 @@ const char* kDefaultModels[] = {
     "/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel",
     "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel",
-    "/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
 };
 
 const char* kDefaultDepthModels[] = {
@@ -828,6 +830,7 @@ int main(int argc, char** argv) {
                     det.length_px = d.length_px;
                     det.has_obb = d.has_obb;
                     det.obb_corners = d.obb_corners;
+                    det.contour = d.contour;
                     dets.push_back(det);
                     af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
                     b.x = d.x * frame.width;
