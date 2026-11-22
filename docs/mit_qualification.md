@@ -2,8 +2,25 @@
 
 MIT impedance tracking (joint tracking Phase 2, `src/mit.rs`) is disabled by default and is
 refused at arm time until the joint is qualified on the device. This page lists what armd checks,
-what the operator measures, and the record that ties the two together. Nothing here has been run
-on the arm yet; every value marked "needs device verification" is an open item.
+what the operator measures, and the record that ties the two together. The motor command timeout
+of J4 has been measured on the arm (see [Current status](#current-status)); the comparison runs and
+the gates have not been run.
+
+## Current status
+
+MIT tracking is off by default and is not enabled on the real arm.
+
+Measured on J4 of a B601-DM (motor ID 4, sw_ver 942747703, 2026-11-22):
+
+- The motor replies on MST_ID 0x14.
+- TIMEOUT 2000 counts expired 96-98 ms after the last command, which matches 50 µs per count.
+- 0xCC status polls do not refresh the timer.
+- On expiry the motor reports state 0xD and disables itself (torque about 0). A clear-error command
+  followed by a disable returns state 0.
+
+Control tick on the device (rc6, joint moves with 20 Hz observation polling and vision running): the
+worst tick was 42 ms. The arm gate needs control period + `worst_latency_ms` + 5 ms < 45 ms, that is
+a worst latency below 20 ms at the 20 ms control period, so MIT is not enabled on the real arm.
 
 ## What armd enforces
 
@@ -48,8 +65,9 @@ Operator session, torque off, load mechanically supported, operator at the power
    readback (IDs, sw_ver, CTRL_MODE, ranges, original TIMEOUT; 0 on the B601-DM on 2026-11-22).
 2. Write: `{"joints": [4], "timeout_counts": 2000}`. armd writes RID 9 with the RAM opcode 0x55 (never
    0xAA), checks the acknowledgement value and reply ID, and confirms with a separate 0x33 read.
-3. The count is configurable (1..20000). 2000 counts = 100 ms only if the documented unit of
-   50 µs per count holds on this firmware; this needs device verification (step 2 below).
+3. The count is configurable (1..20000). 2000 counts = 100 ms with the documented unit of
+   50 µs per count; on J4 (sw_ver 942747703) the timeout expired 96-98 ms after the last command
+   (see [Current status](#current-status)). Other joints and firmware versions are not measured.
 
 ## Device qualification (one joint at a time)
 
