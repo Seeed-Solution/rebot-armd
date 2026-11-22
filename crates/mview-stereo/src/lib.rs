@@ -491,6 +491,82 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
     Some(if var > 1e-3 * sw { dot / var.sqrt() as f32 } else { 0.0 })
 }
 
+const HALF_GRID_MAX_R: usize = 16;
+
+#[inline(always)]
+fn half_grid_accum<const N: usize, const PHASE: u8>(img: &Gray, t: &Tmpl, base: usize) -> (u32, u32, f32) {
+    let n = if N > 0 { N } else { 2 * t.r + 1 };
+    let (mut is1, mut is2, mut dot) = (0u32, 0u32, 0.0f32);
+    for j in 0..n {
+        let row0 = base + j * img.w;
+        let r0 = &img.px[row0..][..n + 1];
+        let r1 = if PHASE >= 2 { &img.px[row0 + img.w..][..n + 1] } else { r0 };
+        let a = &t.a[j * n..][..n];
+        for i in 0..n {
+            let (s, sample) = match PHASE {
+                0 => {
+                    let s = u32::from(r0[i]);
+                    (s, s as f32)
+                }
+                1 => {
+                    let s = u32::from(r0[i]) + u32::from(r0[i + 1]);
+                    (s, 0.5 * s as f32)
+                }
+                2 => {
+                    let s = u32::from(r0[i]) + u32::from(r1[i]);
+                    (s, 0.5 * s as f32)
+                }
+                _ => {
+                    let s = u32::from(r0[i]) + u32::from(r0[i + 1]) + u32::from(r1[i]) + u32::from(r1[i + 1]);
+                    (s, 0.25 * s as f32)
+                }
+            };
+            is1 += s;
+            is2 += s * s;
+            dot += a[i] * sample;
+        }
+    }
+    (is1, is2, dot)
+}
+
+#[inline]
+fn half_grid_dispatch<const PHASE: u8>(img: &Gray, t: &Tmpl, base: usize, r: usize) -> (u32, u32, f32) {
+    const PATCH_N: usize = 2 * PATCH_R + 1;
+    if r == PATCH_R {
+        half_grid_accum::<PATCH_N, PHASE>(img, t, base)
+    } else {
+        half_grid_accum::<0, PHASE>(img, t, base)
+    }
+}
+
+/// Unweighted half-pixel-grid specialization of bilinear `ncc`, falling back to generic `ncc`
+/// for weighted templates, unsupported radii (`r > HALF_GRID_MAX_R`), or arbitrary phases.
+#[inline]
+fn ncc_half_grid(img: &Gray, t: &Tmpl, x: f64, y: f64) -> Option<f32> {
+    let r = t.r;
+    if t.w.is_some() || r > HALF_GRID_MAX_R {
+        return ncc(img, t, x, y, true);
+    }
+    if !img.inside(x, y, r, 1.0) {
+        return None;
+    }
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
+    let base = || (y0 as usize - r) * img.w + x0 as usize - r;
+    let ((is1, is2, dot), s1_scale, s2_scale) = match (fx, fy) {
+        (0.0, 0.0) => (half_grid_dispatch::<0>(img, t, base(), r), 1.0f64, 1.0f64),
+        (0.5, 0.0) => (half_grid_dispatch::<1>(img, t, base(), r), 0.5f64, 0.25f64),
+        (0.0, 0.5) => (half_grid_dispatch::<2>(img, t, base(), r), 0.5f64, 0.25f64),
+        (0.5, 0.5) => (half_grid_dispatch::<3>(img, t, base(), r), 0.25f64, 0.0625f64),
+        _ => return ncc(img, t, x, y, true),
+    };
+    let s1 = f64::from(is1) * s1_scale;
+    let s2 = f64::from(is2) * s2_scale;
+    let sw = f64::from(t.sw);
+    let var = s2 - s1 * s1 / sw;
+    Some(if var > 1e-3 * sw { dot / var.sqrt() as f32 } else { 0.0 })
+}
+
 // ---- features ----
 
 /// A feature of the reference view: integer pixel, edge normal (unit gradient direction) for an
@@ -884,7 +960,7 @@ fn refine_2d_cached(mut q: [f64; 2], mut eval: impl FnMut([f64; 2]) -> Option<f3
 }
 
 pub(crate) fn refine_2d_pose(img: &Gray, t: &Tmpl, q: [f64; 2]) -> Option<([f64; 2], f64)> {
-    refine_2d_cached(q, |p| ncc(img, t, p[0], p[1], true))
+    refine_2d_cached(q, |p| ncc_half_grid(img, t, p[0], p[1]))
 }
 
 /// Match of `t` near `q` along the unit image direction `e` only (an edge point): NCC at
@@ -1545,5 +1621,156 @@ mod tests {
         });
         assert_eq!(out, None);
         assert_eq!(calls, 10);
+    }
+
+    fn assert_ncc_eq(a: Option<f32>, b: Option<f32>) {
+        match (a, b) {
+            (None, None) => {}
+            (Some(sa), Some(sb)) => assert_eq!(sa.to_bits(), sb.to_bits(), "ncc mismatch: {sa} vs {sb}"),
+            _ => panic!("option mismatch: {a:?} vs {b:?}"),
+        }
+    }
+
+    #[test]
+    fn ncc_half_grid_matches_generic_across_all_four_phases() {
+        let (w, h) = (32, 32);
+        let px: Vec<u8> = (0..w * h).map(|k| {
+            let (x, y) = ((k % w) as f64, (k / w) as f64);
+            (128.0 + 50.0 * (0.47 * x + 0.19 * y).sin() + 45.0 * (0.31 * x - 0.53 * y).cos() + 20.0 * (0.11 * x * y).sin())
+                .round().clamp(0.0, 255.0) as u8
+        }).collect();
+        let img = Gray::new(w, h, px).unwrap();
+
+        for r in [PATCH_R, 2usize, 6usize] {
+            let t_int = make_tmpl(sample_int(&img, 14, 14, r), r, None, 0.0).unwrap();
+            let t_half = make_tmpl(sample_bilinear(&img, 14.5, 14.5, r).unwrap(), r, None, 0.0).unwrap();
+            for t in [&t_int, &t_half] {
+                for (x, y) in [
+                    (14.0, 14.0),
+                    (14.5, 14.0),
+                    (14.0, 14.5),
+                    (14.5, 14.5),
+                    (12.0, 17.5),
+                    (16.5, 13.0),
+                ] {
+                    let got = ncc_half_grid(&img, t, x, y);
+                    let exp = ncc(&img, t, x, y, true);
+                    assert!(got.is_some(), "expected Some for r={r} at ({x}, {y})");
+                    assert_ncc_eq(got, exp);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ncc_half_grid_bright_nearly_flat_and_max_accumulator_bounds() {
+        // Bright nearly-flat region (250..=255) and all-255 flat region: verifies exact f64 variance without f32 cancellation.
+        let (w, h) = (32, 32);
+        let mut px = vec![255u8; w * h];
+        // Texture at [6..15] x [6..15] for building a valid template, and bright nearly-flat texture around (16, 16).
+        for y in 0..h {
+            for x in 0..w {
+                if (11..=21).contains(&x) && (11..=21).contains(&y) {
+                    px[y * w + x] = 250 + (((x * 7 + y * 13) % 6) as u8);
+                }
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let t_src: Vec<f32> = (0usize..81).map(|k| if (k % 9 + k / 9).is_multiple_of(2) { 255.0 } else { 245.0 }).collect();
+        let t = make_tmpl(t_src, PATCH_R, None, 0.0).unwrap();
+        for (x, y) in [(16.0, 16.0), (16.5, 16.0), (16.0, 16.5), (16.5, 16.5)] {
+            let got = ncc_half_grid(&img, &t, x, y);
+            let exp = ncc(&img, &t, x, y, true);
+            assert!(got.is_some() && got.unwrap().abs() > 0.0);
+            assert_ncc_eq(got, exp);
+        }
+        let flat_255 = Gray::new(w, h, vec![255u8; w * h]).unwrap();
+        for (x, y) in [(16.0, 16.0), (16.5, 16.0), (16.0, 16.5), (16.5, 16.5)] {
+            let got = ncc_half_grid(&flat_255, &t, x, y);
+            assert_eq!(got, Some(0.0));
+            assert_ncc_eq(got, ncc(&flat_255, &t, x, y, true));
+        }
+
+        // Max supported radius (HALF_GRID_MAX_R = 16) with max-brightness (255/254 and all-255) pixels:
+        // exercises u32 accumulator upper bound (1089 * 1020^2 = 1_132_995_600 < u32::MAX) without overflow.
+        let (bw, bh) = (40usize, 40usize);
+        let max_px: Vec<u8> = (0..bw * bh).map(|k| if ((k % bw) + (k / bw)).is_multiple_of(2) { 255 } else { 254 }).collect();
+        let max_img = Gray::new(bw, bh, max_px).unwrap();
+        let all_255_big = Gray::new(bw, bh, vec![255u8; bw * bh]).unwrap();
+        let n16 = 2 * HALF_GRID_MAX_R + 1;
+        let t16_src: Vec<f32> = (0..n16 * n16).map(|k| if (k % n16 + k / n16).is_multiple_of(2) { 255.0 } else { 245.0 }).collect();
+        let t16 = make_tmpl(t16_src, HALF_GRID_MAX_R, None, 0.0).unwrap();
+        for (x, y) in [(18.0, 18.0), (18.5, 18.0), (18.0, 18.5), (18.5, 18.5)] {
+            assert_ncc_eq(ncc_half_grid(&max_img, &t16, x, y), ncc(&max_img, &t16, x, y, true));
+            let flat_got = ncc_half_grid(&all_255_big, &t16, x, y);
+            assert_eq!(flat_got, Some(0.0));
+            assert_ncc_eq(flat_got, ncc(&all_255_big, &t16, x, y, true));
+        }
+
+        // Unsupported radius (HALF_GRID_MAX_R + 1 = 17) falls back to generic NCC.
+        let r17 = HALF_GRID_MAX_R + 1;
+        let n17 = 2 * r17 + 1;
+        let t17_src: Vec<f32> = (0..n17 * n17).map(|k| if (k % n17 + k / n17).is_multiple_of(2) { 255.0 } else { 245.0 }).collect();
+        let t17 = make_tmpl(t17_src, r17, None, 0.0).unwrap();
+        for (x, y) in [(18.0, 18.0), (18.5, 18.0), (18.0, 18.5), (18.5, 18.5)] {
+            assert_ncc_eq(ncc_half_grid(&max_img, &t17, x, y), ncc(&max_img, &t17, x, y, true));
+        }
+    }
+
+    #[test]
+    fn ncc_half_grid_borders_weighted_and_arbitrary_phase_fallback() {
+        let (w, h) = (24, 24);
+        let px: Vec<u8> = (0..w * h).map(|k| {
+            let (x, y) = ((k % w) as f64, (k / w) as f64);
+            (120.0 + 60.0 * (0.51 * x + 0.23 * y).sin() + 40.0 * (0.37 * x - 0.41 * y).cos())
+                .round().clamp(0.0, 255.0) as u8
+        }).collect();
+        let img = Gray::new(w, h, px).unwrap();
+        let t = make_tmpl(sample_int(&img, 10, 10, PATCH_R), PATCH_R, None, 0.0).unwrap();
+
+        // Margin is 1.0: for w=h=24 and r=4, valid range is [5.0, 18.0].
+        // Integer (x, y) at r + 0.0 (= 4.0) must return None.
+        for (x, y) in [
+            (4.0, 10.0),
+            (4.5, 10.0),
+            (10.0, 4.0),
+            (10.0, 4.5),
+            (18.5, 10.0),
+            (19.0, 10.0),
+            (10.0, 18.5),
+            (10.0, 19.0),
+            (f64::NAN, 10.0),
+        ] {
+            assert_eq!(ncc_half_grid(&img, &t, x, y), None, "expected None at ({x}, {y})");
+            assert_ncc_eq(ncc_half_grid(&img, &t, x, y), ncc(&img, &t, x, y, true));
+        }
+
+        // Just inside margin 1.0 across all four half-grid phases.
+        for (x, y) in [
+            (5.0, 5.0),
+            (5.5, 5.0),
+            (5.0, 5.5),
+            (5.5, 5.5),
+            (18.0, 18.0),
+            (17.5, 18.0),
+            (18.0, 17.5),
+            (17.5, 17.5),
+        ] {
+            let got = ncc_half_grid(&img, &t, x, y);
+            assert!(got.is_some(), "expected Some at ({x}, {y})");
+            assert_ncc_eq(got, ncc(&img, &t, x, y, true));
+        }
+
+        // Weighted template fallback (`normal: Some(...)`).
+        let tw = make_tmpl(sample_int(&img, 10, 10, PATCH_R), PATCH_R, Some([1.0, 0.0]), 1.0).unwrap();
+        assert!(tw.w.is_some());
+        for (x, y) in [(10.0, 10.0), (10.5, 10.0), (10.0, 10.5), (10.5, 10.5)] {
+            assert_ncc_eq(ncc_half_grid(&img, &tw, x, y), ncc(&img, &tw, x, y, true));
+        }
+
+        // Arbitrary fractional coordinate fallback.
+        for (x, y) in [(10.25, 11.75), (10.5, 11.3), (11.1, 10.0), (10.0, 11.9)] {
+            assert_ncc_eq(ncc_half_grid(&img, &t, x, y), ncc(&img, &t, x, y, true));
+        }
     }
 }
