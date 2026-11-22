@@ -293,6 +293,11 @@ public:
     bool take_swap(SwapRequest& out);
     /** Frame thread: publish the set after a swap (generation +1); `error` empty = idle, else failed. */
     uint64_t finish_swap(ModelSet now, const std::string& error);
+    /**
+     * End a Running swap that threw: clears the slots the caller unloaded, marks the swap Failed
+     * ("SWAP_FAILED") and returns the new generation. Does not allocate.
+     */
+    uint64_t fail_swap(bool detector_cleared, bool depth_cleared) noexcept;
     /** Swap state, its error and the generation it publishes (pending / running) or published. */
     SwapState swap_state(std::string* error = nullptr, uint64_t* generation = nullptr) const;
 

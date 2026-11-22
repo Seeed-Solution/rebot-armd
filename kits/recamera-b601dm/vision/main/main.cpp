@@ -41,6 +41,7 @@
 #include "http_control.h"
 #include "json.hpp"
 #include "model_catalogue.h"
+#include "model_swap.h"
 #include "result_json.h"
 #include "version.h"
 #include "vision_control.h"
@@ -686,28 +687,27 @@ int main(int argc, char** argv) {
     // A swap (POST /api/models) on the frame thread, the only user of the slots: the changed
     // slots are unloaded first, then loaded into fresh objects, so the ION peak stays within the
     // new set. A failed load leaves its slot empty; the other slot keeps its new state.
-    auto apply_swap = [&](const rv::SwapRequest& s) {
+    // rv::run_model_swap prepares every name copy before a model is installed and unloads the
+    // changed slots again when anything throws, ending the swap Failed (never left Running).
+    auto apply_swap = [&](const rv::SwapRequest& s) noexcept {
         const auto t0 = std::chrono::steady_clock::now();
-        if (s.detector.change) {
-            detector.reset();
-            set_detector(resident, nullptr, "", "");
-        }
-        if (s.depth.change) {
-            depth_stage.reset();
-            set_depth(resident, nullptr, nullptr);
-        }
         std::string failed;
-        if (const rv::ModelEntry* m = ctl.catalogue().find(s.detector.name)) {
-            detector = load_detector(m->path, kind_hint_of(m->kind), m->classes);
-            set_detector(resident, detector.get(), m->name, m->path);
-            if (!detector) failed = "detector";
-        }
-        if (const rv::ModelEntry* m = ctl.catalogue().find(s.depth.name)) {
-            depth_stage = load_depth(m->path);
-            set_depth(resident, depth_stage.get(), m);
-            if (!depth_stage) failed += failed.empty() ? "depth" : ",depth";
-        }
-        model_generation = ctl.finish_swap(resident, failed.empty() ? "" : "LOAD_FAILED:" + failed);
+        model_generation = rv::run_model_swap(
+            ctl, s, resident,
+            [&](const rv::ModelEntry& m, const char*& kind, bool& mask) {
+                detector = load_detector(m.path, kind_hint_of(m.kind), m.classes);
+                if (!detector) return false;
+                kind = kind_name(detector->getKind());
+                mask = g_cfg.mask_enabled && detector->getKind() == yolo::Kind::Segment;
+                return true;
+            },
+            [&](const rv::ModelEntry& m) {
+                depth_stage = load_depth(m.path);
+                return depth_stage != nullptr;
+            },
+            [&]() noexcept { detector.reset(); },
+            [&]() noexcept { depth_stage.reset(); },
+            &failed);
         MA_LOGI(TAG, "Model swap to generation %llu in %.0f ms: detector %s, depth %s%s%s",
                 static_cast<unsigned long long>(model_generation), ms_since(t0),
                 resident.model_name.empty() ? "-" : resident.model_name.c_str(),
@@ -721,18 +721,11 @@ int main(int argc, char** argv) {
         const uint64_t grab_ms = rv::mono_ms();
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
-        // A model swap that throws (a copy, a load) is ended as failed instead of staying Running.
-        bool swap_taken = false;
+        // take_swap leaves the swap Pending when its copy throws; apply_swap does not throw.
         rv::contain_frame([&] {
             rv::SwapRequest swap;
-            if (ctl.take_swap(swap)) {
-                swap_taken = true;
-                apply_swap(swap);
-            }
-        }, [&](const char* what) {
-            MA_LOGE(TAG, "Model swap failed: %s", what);
-            if (swap_taken) model_generation = ctl.finish_swap(resident, "SWAP_FAILED");
-        });
+            if (ctl.take_swap(swap)) apply_swap(swap);
+        }, [&](const char* what) { MA_LOGE(TAG, "Model swap not taken: %s", what); });
         // PUT /api/calibration/intrinsics: applied before this frame's pipelines run
         rv::Intrinsics intr;
         uint64_t intr_rev = 0;

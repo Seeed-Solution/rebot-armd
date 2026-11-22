@@ -23,6 +23,7 @@
 #include "http_control.h"
 #include "json.hpp"
 #include "model_catalogue.h"
+#include "model_swap.h"
 #include "vision_control.h"
 
 using namespace rv;
@@ -1126,6 +1127,78 @@ static void test_swap_take_allocation_failure_keeps_pending() {
     CHECK(got.detector.change && got.detector.name == det_name);
 }
 
+
+// run_model_swap under allocation failure: whichever allocation fails, the swap ends (never
+// Running), and every slot that holds a model is named in both the frame thread's resident set
+// and VisionControl::models() (a model without its name would escape the ION budget).
+static void test_model_swap_transaction_under_allocation_failure() {
+    const std::string det_name(32, 'd');
+    const std::string dep_name(32, 'p');
+    VisionControl::Options o;
+    o.mode = Mode::Yolo;
+    o.yolo_available = true;
+    o.model_name = "small";
+    o.model_path = "/m/small.cvimodel";
+    std::vector<std::string> warn;
+    parse_catalogue(std::string(R"({"models": {
+        "small": {"path": "/m/small.cvimodel", "kind": "detect", "ion_mb": 4},
+        ")") + det_name + R"(": {"path": "/m/a_long_detector_model_path.cvimodel", "kind": "segment", "ion_mb": 5},
+        ")" + dep_name + R"(": {"path": "/m/a_long_depth_model_path.cvimodel", "kind": "depth", "ion_mb": 6}}})",
+                    o.catalogue, warn);
+    VisionControl ctl(o, nullptr);
+    ModelSet resident = ctl.models();
+    std::unique_ptr<int> det(new int(1));  // stand-ins for the loaded models (ION holders)
+    std::unique_ptr<int> dep;
+    auto load_det = [&](const ModelEntry& m, const char*& kind, bool& mask) {
+        det.reset(new int(static_cast<int>(m.ion_mb)));
+        kind = "segment";
+        mask = true;
+        return true;
+    };
+    auto load_dep = [&](const ModelEntry& m) {
+        dep.reset(new int(static_cast<int>(m.ion_mb)));
+        return true;
+    };
+    auto unload_det = [&]() noexcept { det.reset(); };
+    auto unload_dep = [&]() noexcept { dep.reset(); };
+
+    int failed_runs = 0;
+    bool done = false;
+    for (long k = 1; k <= 200 && !done; ++k) {
+        SwapRequest req;
+        req.detector.change = true;
+        req.detector.name = det_name;
+        req.depth.change = true;
+        req.depth.name = dep_name;
+        uint64_t gen = 0;
+        BudgetCheck budget;
+        CHECK(ctl.request_swap(req, gen, budget) == VisionControl::Status::Ok);
+        SwapRequest taken;
+        CHECK(ctl.take_swap(taken));
+        t_alloc_countdown = k;
+        run_model_swap(ctl, taken, resident, load_det, load_dep, unload_det, unload_dep);
+        t_alloc_countdown = 0;
+        std::string err;
+        const SwapState st = ctl.swap_state(&err);
+        CHECK(st == SwapState::Idle || st == SwapState::Failed);
+        const ModelSet m = ctl.models();
+        CHECK((det != nullptr) == m.yolo_available && (det != nullptr) == !m.model_name.empty());
+        CHECK((dep != nullptr) == m.depth_available && (dep != nullptr) == !m.depth_model_name.empty());
+        CHECK(m.model_name == resident.model_name && m.depth_model_name == resident.depth_model_name);
+        // a failure before the slots were touched keeps the startup detector
+        CHECK(!det || m.model_name == "small" || (m.model_name == det_name && m.model_kind == "segment" && m.mask));
+        CHECK(!dep || m.depth_model_name == dep_name);
+        if (st == SwapState::Failed) {
+            ++failed_runs;
+            CHECK(err == "SWAP_FAILED");
+        } else {
+            done = true;
+        }
+    }
+    CHECK(done && failed_runs >= 1);
+    CHECK(det && dep && *det == 5 && *dep == 6);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -1150,6 +1223,7 @@ int main(int argc, char** argv) {
     test_frame_boundary_contains_allocation_failures();
     test_rollover_allocation_failure_is_all_or_nothing();
     test_swap_take_allocation_failure_keeps_pending();
+    test_model_swap_transaction_under_allocation_failure();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

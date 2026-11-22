@@ -117,6 +117,9 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       intrinsics_(opt.intrinsics),
       max_gray_sends_(opt.max_gray_sends > 0 ? opt.max_gray_sends : 1),
       active_gray_sends_(std::make_shared<std::atomic<int>>(0)) {
+    // swap error texts (SWAP_FAILED, LOAD_FAILED:detector,depth, ...) then never reallocate, so
+    // finish_swap() and fail_swap() do not allocate
+    swap_error_.reserve(64);
     for (int i = 0; i < 4; ++i) gray_crop_[i] = opt.gray_crop[i];
     for (int i = 0; i < 2; ++i) frame_size_[i] = opt.frame_size[i];
     Mode m = opt.mode;
@@ -719,6 +722,27 @@ uint64_t VisionControl::finish_swap(ModelSet now, const std::string& error) {
     models_ = std::move(now);
     swap_ = error.empty() ? SwapState::Idle : SwapState::Failed;
     swap_error_ = error;
+    return models_.generation;
+}
+
+uint64_t VisionControl::fail_swap(bool detector_cleared, bool depth_cleared) noexcept {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (detector_cleared) {
+        models_.yolo_available = false;
+        models_.model_name.clear();
+        models_.model_path.clear();
+        models_.model_kind.clear();
+        models_.mask = false;
+    }
+    if (depth_cleared) {
+        models_.depth_available = false;
+        models_.depth_model_name.clear();
+        models_.depth_model_path.clear();
+        models_.depth_metric = false;
+    }
+    ++models_.generation;
+    swap_ = SwapState::Failed;
+    swap_error_.assign("SWAP_FAILED");  // within the capacity reserved by the constructor
     return models_.generation;
 }
 
