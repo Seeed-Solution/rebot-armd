@@ -1194,6 +1194,10 @@ pub struct ActiveState {
     pub updated_at_ms: u64,
     #[serde(skip)]
     pub cached_mjcf: String,
+    #[serde(skip)]
+    pub committed_scene_digest: Option<String>,
+    #[serde(skip)]
+    pub committed_tool_digest: Option<String>,
 }
 
 impl Default for ActiveState {
@@ -1214,6 +1218,8 @@ impl Default for ActiveState {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             cached_mjcf: String::new(),
+            committed_scene_digest: None,
+            committed_tool_digest: None,
         }
     }
 }
@@ -1328,12 +1334,170 @@ impl ActivationTxState {
     }
 }
 
+const MAX_CACHED_BUNDLES: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatEntry {
+    path: PathBuf,
+    is_dir: bool,
+    len: u64,
+    mtime_nanos: i128,
+    ino: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackStatFingerprint {
+    roots: Vec<PathBuf>,
+    absent_watch_dirs: Vec<PathBuf>,
+    entries: Vec<StatEntry>,
+    dir_listing_count: usize,
+}
+
+#[cfg(unix)]
+fn metadata_ino(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+
+#[cfg(not(unix))]
+fn metadata_ino(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
+fn metadata_mtime_nanos(meta: &std::fs::Metadata) -> i128 {
+    meta.modified()
+        .ok()
+        .and_then(|t| match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => i128::try_from(d.as_nanos()).ok(),
+            Err(e) => i128::try_from(e.duration().as_nanos()).ok().map(|v| -v),
+        })
+        .unwrap_or(0)
+}
+
+impl PackStatFingerprint {
+    fn collect_entries(roots: &[PathBuf]) -> Option<(Vec<StatEntry>, usize)> {
+        fn walk(
+            dir: &Path,
+            visited: &mut HashSet<PathBuf>,
+            entries: &mut Vec<StatEntry>,
+            listing_count: &mut usize,
+        ) -> Option<()> {
+            let dir_meta = std::fs::symlink_metadata(dir).ok()?;
+            if !dir_meta.is_dir() {
+                return None;
+            }
+            let canon = dir.canonicalize().ok()?;
+            if !visited.insert(canon) {
+                return Some(());
+            }
+            entries.push(StatEntry {
+                path: dir.to_path_buf(),
+                is_dir: true,
+                len: dir_meta.len(),
+                mtime_nanos: metadata_mtime_nanos(&dir_meta),
+                ino: metadata_ino(&dir_meta),
+            });
+            let rd = std::fs::read_dir(dir).ok()?;
+            for entry_res in rd {
+                let entry = entry_res.ok()?;
+                *listing_count = listing_count.saturating_add(1);
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).ok()?;
+                let is_dir = meta.is_dir();
+                entries.push(StatEntry {
+                    path: path.clone(),
+                    is_dir,
+                    len: meta.len(),
+                    mtime_nanos: metadata_mtime_nanos(&meta),
+                    ino: metadata_ino(&meta),
+                });
+                if is_dir {
+                    walk(&path, visited, entries, listing_count)?;
+                }
+            }
+            Some(())
+        }
+
+        let mut visited = HashSet::new();
+        let mut entries = Vec::new();
+        let mut listing_count = 0usize;
+        for root in roots {
+            walk(root, &mut visited, &mut entries, &mut listing_count)?;
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Some((entries, listing_count))
+    }
+
+    fn collect(roots: Vec<PathBuf>, absent_watch_dirs: Vec<PathBuf>) -> Self {
+        let (entries, dir_listing_count) = Self::collect_entries(&roots).unwrap_or_default();
+        Self {
+            roots,
+            absent_watch_dirs,
+            entries,
+            dir_listing_count,
+        }
+    }
+
+    fn matches_disk(&self) -> bool {
+        for p in &self.absent_watch_dirs {
+            if std::fs::symlink_metadata(p).is_ok() {
+                return false;
+            }
+        }
+        let Some((entries, dir_listing_count)) = Self::collect_entries(&self.roots) else {
+            return false;
+        };
+        entries == self.entries && dir_listing_count == self.dir_listing_count
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedBundle {
+    pub robot: String,
+    pub active_scene: String,
+    pub active_tool: String,
+    pub active_policy: Option<String>,
+    pub scene_digest: Option<String>,
+    pub tool_digest: Option<String>,
+    pub composed_xml: String,
+    pub composed_xml_sha256: String,
+    pub scene_manifest: SceneManifest,
+    pub tool_manifest: ToolManifest,
+    pub policy_manifest: Option<PolicyManifest>,
+    pub policy_model_url: Option<String>,
+    pub base_meshdir: Option<String>,
+    pub base_assets: Vec<serde_json::Value>,
+    pub missing_base_assets: Vec<String>,
+    pub base_assets_note: Option<String>,
+    stat_fingerprint: PackStatFingerprint,
+}
+
+impl CachedBundle {
+    fn matches_key(&self, robot: &str, active: &ActiveState) -> bool {
+        self.robot == robot
+            && self.active_scene == active.active_scene
+            && self.active_tool == active.active_tool
+            && self.active_policy == active.active_policy
+            && match &active.committed_scene_digest {
+                Some(d) => self.scene_digest.as_deref() == Some(d.as_str()),
+                None => true,
+            }
+            && match &active.committed_tool_digest {
+                Some(d) => self.tool_digest.as_deref() == Some(d.as_str()),
+                None => true,
+            }
+    }
+}
+
 pub struct SandboxState {
     pub root: PathBuf,
     pub active: RwLock<ActiveState>,
     pub tx_state: RwLock<ActivationTxState>,
     pub activate_lock: tokio::sync::Mutex<()>,
     pub sim_timeouts: SimTxTimeouts,
+    bundle_cache: RwLock<Vec<Arc<CachedBundle>>>,
+    bundle_rebuild_sem: Arc<Semaphore>,
+    bundle_rebuild_count: Arc<AtomicU64>,
     builtin_roots: Option<Vec<PathBuf>>,
     #[cfg(feature = "policy-runtime")]
     policy_load_delay_ms: AtomicU64,
@@ -1360,12 +1524,79 @@ impl SandboxState {
             tx_state: RwLock::new(ActivationTxState::Idle),
             activate_lock: tokio::sync::Mutex::new(()),
             sim_timeouts: SimTxTimeouts::default(),
+            bundle_cache: RwLock::new(Vec::new()),
+            bundle_rebuild_sem: Arc::new(Semaphore::new(1)),
+            bundle_rebuild_count: Arc::new(AtomicU64::new(0)),
             builtin_roots: None,
             #[cfg(feature = "policy-runtime")]
             policy_load_delay_ms: AtomicU64::new(0),
             #[cfg(feature = "policy-runtime")]
             policy_infer_delay_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Number of full disk reread/validate/hash/compose bundle rebuilds performed by `get_bundle`.
+    pub fn bundle_rebuild_count(&self) -> u64 {
+        self.bundle_rebuild_count.load(Ordering::Relaxed)
+    }
+
+    async fn lookup_cached_bundle(&self, robot: &str, active: &ActiveState) -> Option<Arc<CachedBundle>> {
+        let cache = self.bundle_cache.read().await;
+        cache
+            .iter()
+            .rev()
+            .find(|b| b.matches_key(robot, active))
+            .cloned()
+    }
+
+    async fn insert_cached_bundle(&self, bundle: Arc<CachedBundle>) {
+        let mut cache = self.bundle_cache.write().await;
+        Self::insert_cached_bundle_into(&mut cache, bundle);
+    }
+
+    fn insert_cached_bundle_blocking(&self, bundle: Arc<CachedBundle>) {
+        let mut cache = self.bundle_cache.blocking_write();
+        Self::insert_cached_bundle_into(&mut cache, bundle);
+    }
+
+    fn insert_cached_bundle_into(cache: &mut Vec<Arc<CachedBundle>>, bundle: Arc<CachedBundle>) {
+        cache.retain(|b| {
+            !(b.robot == bundle.robot
+                && b.active_scene == bundle.active_scene
+                && b.active_tool == bundle.active_tool
+                && b.active_policy == bundle.active_policy
+                && b.scene_digest == bundle.scene_digest
+                && b.tool_digest == bundle.tool_digest)
+        });
+        while cache.len() >= MAX_CACHED_BUNDLES {
+            cache.remove(0);
+        }
+        cache.push(bundle);
+    }
+
+    async fn invalidate_bundle_cache_all(&self) {
+        self.bundle_cache.write().await.clear();
+    }
+
+    async fn invalidate_bundle_cache_for_scene(&self, scene_id: &str) {
+        self.bundle_cache
+            .write()
+            .await
+            .retain(|b| b.active_scene != scene_id);
+    }
+
+    async fn invalidate_bundle_cache_for_tool(&self, tool_id: &str) {
+        self.bundle_cache
+            .write()
+            .await
+            .retain(|b| b.active_tool != tool_id);
+    }
+
+    async fn invalidate_bundle_cache_for_policy(&self, policy_id: &str) {
+        self.bundle_cache
+            .write()
+            .await
+            .retain(|b| b.active_policy.as_deref() != Some(policy_id));
     }
 
     /// Override builtin scene/tool search roots (useful in tests without mutating env vars).
@@ -2405,7 +2636,13 @@ pub async fn upload_scene(
         let mut st = state.active.write().await;
         if payload.id.as_ref().is_none_or(|id| id == &st.active_scene) {
             st.cached_mjcf.clear();
+            st.committed_scene_digest = None;
         }
+    }
+    if let Some(ref id) = payload.id {
+        state.invalidate_bundle_cache_for_scene(id).await;
+    } else {
+        state.invalidate_bundle_cache_all().await;
     }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
@@ -2433,10 +2670,14 @@ pub async fn upload_scene(
 
     match res {
         Ok((pack_id, val)) => {
-            let mut st = state.active.write().await;
-            if st.active_scene == pack_id {
-                st.cached_mjcf.clear();
+            {
+                let mut st = state.active.write().await;
+                if st.active_scene == pack_id {
+                    st.cached_mjcf.clear();
+                    st.committed_scene_digest = None;
+                }
             }
+            state.invalidate_bundle_cache_for_scene(&pack_id).await;
             Ok(Json(val))
         }
         Err((sc, code, msg)) => Err((sc, Json(serde_json::json!({"error": msg, "code": code})))),
@@ -2463,7 +2704,13 @@ pub async fn upload_tool(
         let mut st = state.active.write().await;
         if payload.id.as_ref().is_none_or(|id| id == &st.active_tool) {
             st.cached_mjcf.clear();
+            st.committed_tool_digest = None;
         }
+    }
+    if let Some(ref id) = payload.id {
+        state.invalidate_bundle_cache_for_tool(id).await;
+    } else {
+        state.invalidate_bundle_cache_all().await;
     }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
@@ -2491,10 +2738,14 @@ pub async fn upload_tool(
 
     match res {
         Ok((pack_id, val)) => {
-            let mut st = state.active.write().await;
-            if st.active_tool == pack_id {
-                st.cached_mjcf.clear();
+            {
+                let mut st = state.active.write().await;
+                if st.active_tool == pack_id {
+                    st.cached_mjcf.clear();
+                    st.committed_tool_digest = None;
+                }
             }
+            state.invalidate_bundle_cache_for_tool(&pack_id).await;
             Ok(Json(val))
         }
         Err((sc, code, msg)) => Err((sc, Json(serde_json::json!({"error": msg, "code": code})))),
@@ -2615,7 +2866,14 @@ pub async fn upload_policy(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Blocking task failed: {e}")}))))?;
 
     match res {
-        Ok(val) => Ok(Json(val)),
+        Ok(val) => {
+            if let Some(pack_id) = val.get("id").and_then(|v| v.as_str()) {
+                state.invalidate_bundle_cache_for_policy(pack_id).await;
+            } else {
+                state.invalidate_bundle_cache_all().await;
+            }
+            Ok(Json(val))
+        }
         Err((sc, msg)) => Err((sc, Json(serde_json::json!({"error": msg})))),
     }
 }
@@ -2698,6 +2956,7 @@ pub async fn delete_policy(
     })?;
     drop(active);
     drop(inner);
+    state.invalidate_bundle_cache_for_policy(&id).await;
     Ok(Json(serde_json::json!({"id": id, "deleted": true})))
 }
 
@@ -3107,6 +3366,7 @@ fn validate_policy_robot_compatibility(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
 struct BaseMeshInspection {
     meshdir: Option<String>,
     base_assets: Vec<serde_json::Value>,
@@ -3665,6 +3925,195 @@ fn degraded_split_http_error(tx_id: &str, detail: &str) -> (StatusCode, Json<ser
 }
 
 #[derive(Clone)]
+struct ActivationBundleSnapshot {
+    robot: String,
+    scene_id: String,
+    scene_dir: Option<PathBuf>,
+    scene_manifest: SceneManifest,
+    scene_digest: Option<String>,
+    scene_files: Option<BTreeMap<String, Vec<u8>>>,
+    tool_id: String,
+    tool_dir: Option<PathBuf>,
+    tool_manifest: ToolManifest,
+    tool_digest: Option<String>,
+    tool_files: Option<BTreeMap<String, Vec<u8>>>,
+    policy_id: Option<String>,
+    policy_dir: Option<PathBuf>,
+    policy_manifest: Option<PolicyManifest>,
+    base_xml: String,
+    composed_xml: String,
+}
+
+fn build_cached_bundle_from_snapshot(
+    sandbox_root: &Path,
+    mut snap: ActivationBundleSnapshot,
+) -> Arc<CachedBundle> {
+    snap.scene_manifest.assets = normalize_manifest_assets(
+        snap.scene_files.as_ref(),
+        Some(&snap.scene_manifest.world_xml),
+        snap.scene_manifest.assets,
+    );
+    snap.tool_manifest.assets = normalize_manifest_assets(
+        snap.tool_files.as_ref(),
+        Some(&snap.tool_manifest.tool_xml),
+        snap.tool_manifest.assets,
+    );
+    let composed_xml_sha256 = sha256_hex(snap.composed_xml.as_bytes());
+    let mesh_info = inspect_base_mesh_assets(&snap.base_xml);
+    let policy_model_url = snap
+        .policy_manifest
+        .as_ref()
+        .map(|pm| format!("/api/v1/sandbox/policies/{}/files/{}", pm.id, pm.model_file));
+
+    let mut roots = Vec::new();
+    if let Some(d) = snap.scene_dir {
+        roots.push(d);
+    }
+    if let Some(d) = snap.tool_dir {
+        roots.push(d);
+    }
+    if let Some(d) = snap.policy_dir {
+        roots.push(d);
+    }
+    let mut absent_watch_dirs = Vec::new();
+    if is_reserved_builtin_id("scene", &snap.scene_id) {
+        absent_watch_dirs.push(sandbox_root.join("scenes").join(&snap.scene_id));
+    }
+    if is_reserved_builtin_id("tool", &snap.tool_id) {
+        absent_watch_dirs.push(sandbox_root.join("tools").join(&snap.tool_id));
+    }
+    let stat_fingerprint = PackStatFingerprint::collect(roots, absent_watch_dirs);
+
+    Arc::new(CachedBundle {
+        robot: snap.robot,
+        active_scene: snap.scene_id,
+        active_tool: snap.tool_id,
+        active_policy: snap.policy_id,
+        scene_digest: snap.scene_digest,
+        tool_digest: snap.tool_digest,
+        composed_xml: snap.composed_xml,
+        composed_xml_sha256,
+        scene_manifest: snap.scene_manifest,
+        tool_manifest: snap.tool_manifest,
+        policy_manifest: snap.policy_manifest,
+        policy_model_url,
+        base_meshdir: mesh_info.meshdir,
+        base_assets: mesh_info.base_assets,
+        missing_base_assets: mesh_info.missing_base_assets,
+        base_assets_note: mesh_info.note,
+        stat_fingerprint,
+    })
+}
+
+fn build_bundle_from_disk(
+    state: &SandboxState,
+    running_robot: &str,
+    requested_robot: Option<&str>,
+    current: &ActiveState,
+) -> Result<Arc<CachedBundle>, (StatusCode, Json<serde_json::Value>)> {
+    let ResolvedPack {
+        canon_dir: scene_dir,
+        manifest: scene_manifest,
+        xml: sw,
+        digest: scene_digest,
+        files: scene_files,
+    } = state.resolve_scene_checked_full(&current.active_scene)?;
+    let ResolvedPack {
+        canon_dir: tool_dir,
+        manifest: tool_manifest,
+        xml: tw,
+        digest: tool_digest,
+        files: tool_files,
+    } = state.resolve_tool_checked_full(&current.active_tool)?;
+
+    validate_robot_compatibility(running_robot, requested_robot, &scene_manifest, &tool_manifest)?;
+
+    if let Some(ref expected) = current.committed_scene_digest {
+        if scene_digest.as_deref() != Some(expected.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Active scene pack digest changed on disk after activation",
+                    "code": "INVALID_PACK",
+                })),
+            ));
+        }
+    }
+    if let Some(ref expected) = current.committed_tool_digest {
+        if tool_digest.as_deref() != Some(expected.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Active tool pack digest changed on disk after activation",
+                    "code": "INVALID_PACK",
+                })),
+            ));
+        }
+    }
+
+    let (policy_manifest, policy_dir) = if let Some(ref p) = current.active_policy {
+        let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
+        validate_policy_robot_compatibility(running_robot, &pm)?;
+        (Some(pm), state.policy_dir(p))
+    } else {
+        (None, None)
+    };
+
+    let base_xml = get_base_robot_xml_for_robot(running_robot)?;
+    let composed_xml = compose_mjcf(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+
+    Ok(build_cached_bundle_from_snapshot(
+        &state.root,
+        ActivationBundleSnapshot {
+            robot: running_robot.to_string(),
+            scene_id: current.active_scene.clone(),
+            scene_dir,
+            scene_manifest,
+            scene_digest,
+            scene_files,
+            tool_id: current.active_tool.clone(),
+            tool_dir,
+            tool_manifest,
+            tool_digest,
+            tool_files,
+            policy_id: current.active_policy.clone(),
+            policy_dir,
+            policy_manifest,
+            base_xml,
+            composed_xml,
+        },
+    ))
+}
+
+fn render_bundle_json(cached: &CachedBundle, current: &ActiveState) -> serde_json::Value {
+    serde_json::json!({
+        "mode": current.mode,
+        "robot": cached.robot,
+        "active_scene": current.active_scene,
+        "active_tool": current.active_tool,
+        "active_policy": current.active_policy,
+        "auto_start_policy": current.auto_start_policy,
+        "seed": current.seed,
+        "reset_seq": current.reset_seq,
+        "io_seq": current.io_seq,
+        "scene_digest": cached.scene_digest,
+        "tool_digest": cached.tool_digest,
+        "composed_xml": cached.composed_xml,
+        "composed_xml_sha256": cached.composed_xml_sha256,
+        "base_meshdir": cached.base_meshdir,
+        "base_assets": cached.base_assets,
+        "missing_base_assets": cached.missing_base_assets,
+        "base_assets_note": cached.base_assets_note,
+        "scene_manifest": cached.scene_manifest,
+        "tool_manifest": cached.tool_manifest,
+        "policy_manifest": cached.policy_manifest,
+        "policy_model_url": cached.policy_model_url,
+        "desired_io": current.desired_io,
+    })
+}
+
+#[derive(Clone)]
 struct TxSnapshot {
     tx_id: String,
     prev_tx_id: Option<String>,
@@ -3685,6 +4134,7 @@ struct TxSnapshot {
     target_composed_mjcf: String,
     target_scene_digest: Option<String>,
     target_tool_digest: Option<String>,
+    bundle_snapshot: Option<ActivationBundleSnapshot>,
 }
 
 impl TxSnapshot {
@@ -3761,6 +4211,7 @@ async fn restore_tx_state_after_rollback(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_local_active_state(
     state: &SandboxState,
     mode: &str,
@@ -3773,6 +4224,7 @@ async fn commit_local_active_state(
     tx_id: &str,
     scene_digest: Option<String>,
     tool_digest: Option<String>,
+    bundle_snapshot: Option<ActivationBundleSnapshot>,
 ) -> (bool, u64, u64, u64) {
     let (final_auto_start, final_seed, final_reset_seq, final_io_seq) = {
         let mut st_write = state.active.write().await;
@@ -3791,6 +4243,8 @@ async fn commit_local_active_state(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         st_write.cached_mjcf = composed;
+        st_write.committed_scene_digest = scene_digest.clone();
+        st_write.committed_tool_digest = tool_digest.clone();
 
         (
             st_write.auto_start_policy,
@@ -3808,6 +4262,16 @@ async fn commit_local_active_state(
         };
     }
     state.persist().await;
+    if let Some(snap) = bundle_snapshot {
+        let root = state.root.clone();
+        if let Ok(cached) =
+            tokio::task::spawn_blocking(move || build_cached_bundle_from_snapshot(&root, snap)).await
+        {
+            state.insert_cached_bundle(cached).await;
+        }
+    } else {
+        state.invalidate_bundle_cache_all().await;
+    }
     (final_auto_start, final_seed, final_reset_seq, final_io_seq)
 }
 
@@ -3954,6 +4418,7 @@ async fn converge_degraded_split(
                 &split_tx_id,
                 snap.target_scene_digest.clone(),
                 snap.target_tool_digest.clone(),
+                snap.bundle_snapshot.clone(),
             )
             .await;
             return Ok(committed);
@@ -4103,6 +4568,7 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
                     tx_id,
                     target_scene_digest.clone(),
                     target_tool_digest.clone(),
+                    None,
                 )
                 .await;
                 return Ok(());
@@ -4128,6 +4594,7 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
                     target_composed_mjcf: target_composed_mjcf.clone(),
                     target_scene_digest: target_scene_digest.clone(),
                     target_tool_digest: target_tool_digest.clone(),
+                    bundle_snapshot: None,
                 };
                 if remote_tx == Some(tx_id.as_str()) {
                     let detail = String::from_utf8_lossy(&resp.body).to_string();
@@ -4424,14 +4891,14 @@ pub async fn activate(
         manifest: scene_manifest,
         xml: scene_world_xml,
         digest: scene_digest,
-        files: _,
+        files: scene_files,
     } = state.resolve_scene_checked_full(&scene_id)?;
     let ResolvedPack {
         canon_dir: tool_dir,
         manifest: tool_manifest,
         xml: tool_xml,
         digest: tool_digest,
-        files: _,
+        files: tool_files,
     } = state.resolve_tool_checked_full(&tool_id)?;
 
     validate_robot_compatibility(
@@ -4442,22 +4909,24 @@ pub async fn activate(
     )?;
 
     // M21: Validate policy completely BEFORE prepare (never run fallible disk checks after remote commit).
-    let policy_id = match payload.policy {
+    let (policy_id, policy_manifest, policy_dir) = match payload.policy {
         Some(Some(ref pid)) => {
             if !validate_pack_id(pid) {
                 return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid policy pack id '{pid}'")}))));
             }
             let pm = state.resolve_policy_checked(pid, StatusCode::NOT_FOUND, "POLICY_NOT_FOUND")?;
             validate_policy_robot_compatibility(&running_robot, &pm)?;
-            Some(pid.clone())
+            (Some(pid.clone()), Some(pm), state.policy_dir(pid))
         }
-        Some(None) => None,
+        Some(None) => (None, None, None),
         None => {
             if let Some(ref pid) = prev_active.active_policy {
                 let pm = state.resolve_policy_checked(pid, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
                 validate_policy_robot_compatibility(&running_robot, &pm)?;
+                (Some(pid.clone()), Some(pm), state.policy_dir(pid))
+            } else {
+                (None, None, None)
             }
-            prev_active.active_policy.clone()
         }
     };
 
@@ -4468,6 +4937,25 @@ pub async fn activate(
         Some(&tool_manifest),
         Some(&tool_xml),
     ).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("MJCF composition failed: {e}")}))))?;
+
+    let bundle_snapshot = ActivationBundleSnapshot {
+        robot: running_robot.clone(),
+        scene_id: scene_id.clone(),
+        scene_dir: scene_dir.clone(),
+        scene_manifest: scene_manifest.clone(),
+        scene_digest: scene_digest.clone(),
+        scene_files,
+        tool_id: tool_id.clone(),
+        tool_dir: tool_dir.clone(),
+        tool_manifest: tool_manifest.clone(),
+        tool_digest: tool_digest.clone(),
+        tool_files,
+        policy_id: policy_id.clone(),
+        policy_dir,
+        policy_manifest,
+        base_xml,
+        composed_xml: composed.clone(),
+    };
 
     let target_seed = payload.seed.unwrap_or(prev_active.seed);
     let target_auto_start = payload.auto_start_policy.unwrap_or(prev_active.auto_start_policy);
@@ -4498,6 +4986,7 @@ pub async fn activate(
             target_composed_mjcf: composed.clone(),
             target_scene_digest: scene_digest.clone(),
             target_tool_digest: tool_digest.clone(),
+            bundle_snapshot: Some(bundle_snapshot.clone()),
         };
 
         {
@@ -4799,6 +5288,7 @@ pub async fn activate(
         &tx_id,
         scene_digest.clone(),
         tool_digest.clone(),
+        Some(bundle_snapshot),
     )
     .await;
 
@@ -5055,8 +5545,19 @@ pub async fn recover_split(
                     &tx_id,
                     target_scene_digest,
                     target_tool_digest,
+                    None,
                 )
                 .await;
+            let state_c = state.clone();
+            let robot_c = running_robot.clone();
+            let active_snap = state.active.read().await.clone();
+            if let Ok(Ok(cached)) = tokio::task::spawn_blocking(move || {
+                build_bundle_from_disk(&state_c, &robot_c, None, &active_snap)
+            })
+            .await
+            {
+                state.insert_cached_bundle(cached).await;
+            }
             Ok(Json(serde_json::json!({
                 "ok": true,
                 "state": "COMMITTED",
@@ -5168,85 +5669,69 @@ pub async fn get_bundle(
     ensure_requested_robot_matches(&running_robot, requested_robot.as_deref())?;
 
     let current = state.active.read().await.clone();
+    if let Some(cached) = state.lookup_cached_bundle(&running_robot, &current).await {
+        let fp = cached.stat_fingerprint.clone();
+        let fresh = tokio::task::spawn_blocking(move || fp.matches_disk())
+            .await
+            .unwrap_or(false);
+        if fresh {
+            return Ok(Json(render_bundle_json(&cached, &current)));
+        }
+    }
 
-    let ResolvedPack {
-        canon_dir: _,
-        manifest: mut scene_manifest,
-        xml: sw,
-        digest: scene_digest,
-        files: scene_files,
-    } = state.resolve_scene_checked_full(&current.active_scene)?;
-    let ResolvedPack {
-        canon_dir: _,
-        manifest: mut tool_manifest,
-        xml: tw,
-        digest: tool_digest,
-        files: tool_files,
-    } = state.resolve_tool_checked_full(&current.active_tool)?;
+    let permit = state
+        .bundle_rebuild_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Bundle rebuild semaphore closed"})),
+            )
+        })?;
 
-    validate_robot_compatibility(
-        &running_robot,
-        requested_robot.as_deref(),
-        &scene_manifest,
-        &tool_manifest,
-    )?;
+    let current = state.active.read().await.clone();
+    if let Some(cached) = state.lookup_cached_bundle(&running_robot, &current).await {
+        let fp = cached.stat_fingerprint.clone();
+        let fresh = tokio::task::spawn_blocking(move || fp.matches_disk())
+            .await
+            .unwrap_or(false);
+        if fresh {
+            return Ok(Json(render_bundle_json(&cached, &current)));
+        }
+    }
 
-    let policy_manifest = if let Some(ref p) = current.active_policy {
-        let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
-        validate_policy_robot_compatibility(&running_robot, &pm)?;
-        Some(pm)
-    } else {
-        None
-    };
+    let state_c = state.clone();
+    let robot_c = running_robot.clone();
+    let req_robot_c = requested_robot.clone();
+    let current_c = current.clone();
+    let (new_bundle, render_state) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        state_c.bundle_rebuild_count.fetch_add(1, Ordering::Relaxed);
+        let new_bundle =
+            build_bundle_from_disk(&state_c, &robot_c, req_robot_c.as_deref(), &current_c)?;
+        let latest = state_c.active.blocking_read().clone();
+        let same_identity = latest.active_scene == current_c.active_scene
+            && latest.active_tool == current_c.active_tool
+            && latest.active_policy == current_c.active_policy
+            && latest.committed_scene_digest == current_c.committed_scene_digest
+            && latest.committed_tool_digest == current_c.committed_tool_digest;
+        if same_identity && latest.updated_at_ms == current_c.updated_at_ms {
+            state_c.insert_cached_bundle_blocking(new_bundle.clone());
+        }
+        let render_state = if same_identity { latest } else { current_c };
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>((new_bundle, render_state))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Bundle rebuild task failed: {e}")})),
+        )
+    })??;
 
-    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
-    let use_cached = !current.cached_mjcf.is_empty() && !state.active.read().await.cached_mjcf.is_empty();
-    let composed_xml = if use_cached {
-        current.cached_mjcf
-    } else {
-        compose_mjcf(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?
-    };
-    let composed_xml_sha256 = sha256_hex(composed_xml.as_bytes());
-
-    scene_manifest.assets = normalize_manifest_assets(
-        scene_files.as_ref(),
-        Some(&scene_manifest.world_xml),
-        scene_manifest.assets,
-    );
-    tool_manifest.assets = normalize_manifest_assets(
-        tool_files.as_ref(),
-        Some(&tool_manifest.tool_xml),
-        tool_manifest.assets,
-    );
-
-    let mesh_info = inspect_base_mesh_assets(&base_xml);
-    let policy_model_url = policy_manifest.as_ref().map(|pm| format!("/api/v1/sandbox/policies/{}/files/{}", pm.id, pm.model_file));
-
-    Ok(Json(serde_json::json!({
-        "mode": current.mode,
-        "robot": running_robot,
-        "active_scene": current.active_scene,
-        "active_tool": current.active_tool,
-        "active_policy": current.active_policy,
-        "auto_start_policy": current.auto_start_policy,
-        "seed": current.seed,
-        "reset_seq": current.reset_seq,
-        "io_seq": current.io_seq,
-        "scene_digest": scene_digest,
-        "tool_digest": tool_digest,
-        "composed_xml": composed_xml,
-        "composed_xml_sha256": composed_xml_sha256,
-        "base_meshdir": mesh_info.meshdir,
-        "base_assets": mesh_info.base_assets,
-        "missing_base_assets": mesh_info.missing_base_assets,
-        "base_assets_note": mesh_info.note,
-        "scene_manifest": scene_manifest,
-        "tool_manifest": tool_manifest,
-        "policy_manifest": policy_manifest,
-        "policy_model_url": policy_model_url,
-        "desired_io": current.desired_io,
-    })))
+    Ok(Json(render_bundle_json(&new_bundle, &render_state)))
 }
 
 fn inject_tx_state_fields(obj: &mut serde_json::Value, tx_state: &ActivationTxState) {

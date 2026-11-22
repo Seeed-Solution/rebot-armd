@@ -2468,4 +2468,180 @@ async fn sandbox_m09_prepare_ack_rejects_202_missing_state_or_wrong_tx_id() {
     }
 }
 
+#[tokio::test]
+async fn sandbox_bundle_cache_hits_after_activate_and_reflects_live_mutable_fields() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="cached_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "cached_scene",
+            "scene_json": {"id": "cached_scene", "name": "Cached Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_bytes) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "cached_scene", "tool": "default", "seed": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let initial_rebuilds = state.bundle_rebuild_count();
+    assert_eq!(initial_rebuilds, 0, "activate must populate bundle cache without extra rebuild");
+
+    for _ in 0..5 {
+        let (st, bundle) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+        assert_eq!(st, StatusCode::OK, "{bundle}");
+        assert_eq!(bundle["seed"], 100);
+        assert_eq!(bundle["reset_seq"], 0);
+        assert!(bundle["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+    assert_eq!(
+        state.bundle_rebuild_count(),
+        initial_rebuilds,
+        "repeated GET /bundle calls must hit cache with 0 rebuilds"
+    );
+
+    // Mutate live fields (seed/reset_seq via reset, desired_io via io)
+    let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/reset", Some(json!({"seed": 777}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/io", Some(json!({"vacuum": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, bundle2) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::OK, "{bundle2}");
+    assert_eq!(bundle2["seed"], 777);
+    assert_eq!(bundle2["reset_seq"], 1);
+    assert_eq!(bundle2["desired_io"]["vacuum"], true);
+    assert_eq!(
+        state.bundle_rebuild_count(),
+        initial_rebuilds,
+        "live field updates must not invalidate immutable bundle cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_bundle_concurrent_cold_gets_coalesce_into_single_rebuild() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="cold_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/cold_scene"),
+        "cold_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    // Cold SandboxState with active_scene pointing to disk pack (no prior activate in memory)
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "cold_scene".to_string();
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app_c = app.clone();
+        handles.push(tokio::spawn(async move {
+            send_json(&app_c, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+    for h in handles {
+        let (st, body) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+    assert!(
+        state.bundle_rebuild_count() <= 1,
+        "concurrent cold GETs must coalesce into at most 1 rebuild, got {}",
+        state.bundle_rebuild_count()
+    );
+}
+
+#[tokio::test]
+async fn sandbox_bundle_rejects_same_byte_size_valid_replacement_tampering_on_disk() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_v1 = valid_asymmetric_stl();
+    let stl_v2 = make_binary_stl(&[
+        (
+            [0.0, 0.0, 1.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.0, 0.07, 0.02]],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.03, 0.0, 0.06]],
+        ),
+    ]);
+    assert_eq!(stl_v1.len(), stl_v2.len(), "test requires identical byte length");
+    assert_ne!(stl_v1, stl_v2);
+
+    let world_xml = r#"<mujoco model="tamper_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "tamper_scene",
+            "scene_json": {"id": "tamper_scene", "name": "Tamper Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_v1) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "tamper_scene", "tool": "default"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Replace STL via temp file + rename (same byte length, valid STL, different content & inode)
+    let target_stl = tmp.path().join("scenes/tamper_scene/meshes/asym.stl");
+    let tmp_stl = tmp.path().join("scenes/tamper_scene/meshes/.asym.stl.tmp");
+    std::fs::write(&tmp_stl, &stl_v2).unwrap();
+    std::fs::rename(&tmp_stl, &target_stl).unwrap();
+
+    let (st, err) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["code"], "INVALID_PACK", "{err}");
+}
+
 
