@@ -496,6 +496,7 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 - 跟踪误差故障：跟随误差超过 0.5 rad 持续 500 ms 时锁存故障，信息中包含关节号；动作会更早以 `TRACKING_STALL` 结束。
 - 重力补偿：进入要求已使能、静止、持有租约且反馈新鲜。所有退出都先在实测位姿保持（力矩不断），再切回 POS_VEL；租约看门狗收纳在此之后才开始。例外：过温保护仍会断力矩；CAN 总线完全中断时，电机继续执行最后一条 MIT 指令（重力前馈加阻尼），直到总线恢复。详见 [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。
 - 默认热点密码（`12345678`）和未鉴权的 HTTP/WebSocket API 使该网络上的任何人都能控制机械臂和开始录制。请修改密码，并只在可信网络上运行。
+- 关闭（SIGTERM 或 Ctrl+C，例如 `/etc/init.d/K92rebot-teleop restart`）：只有力矩已关闭且电机确认失能时 armd 才退出。此时它锁存急停，使控制循环在退出前停止；日志中出现 `Idle -> EStop` 状态切换，之前有一行说明该急停只在内存中、不会持久化，下次启动为 Idle。力矩开启或失能未确认时，armd 拒绝退出，锁存急停并继续运行；之后须先清除急停并重新使能才能运动（`src/main.rs`）。
 
 以上数值是源码中的软件默认值（`src/model.rs`、`src/supervisor.rs`），不是经过认证的安全功能。
 

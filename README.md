@@ -901,6 +901,12 @@ own risk; the MIT License comes without warranty.
 - The default access point password (`12345678`) and the unauthenticated HTTP/WebSocket API
   let anyone on that network control the arm and start recordings. Change the password and
   run the arm on a network you trust.
+- Shutdown (SIGTERM or Ctrl+C, for example `/etc/init.d/K92rebot-teleop restart`): armd exits only
+  when torque is off and the motors confirm the disable. It then latches the E-stop so the control
+  loop stops before the exit; the log shows an `Idle -> EStop` transition, preceded by a line saying
+  that this E-stop is in memory only and not persisted, and the next start is Idle. With torque on
+  or the disable not confirmed, armd refuses to exit, latches the E-stop and keeps running; clearing it and
+  re-arming are then needed before any motion (`src/main.rs`).
 
 The values above are software defaults from the source (`src/model.rs`, `src/supervisor.rs`),
 not certified safety functions.
