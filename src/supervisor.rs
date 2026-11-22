@@ -4036,8 +4036,9 @@ impl SupervisorInner {
     }
 
     /// Apply one executor step of a Path / Gripper / Replay reference.
-    /// Returns a deferred completion payload on `StepStatus::Done` so `"done"` is only
-    /// published after that tick's output has been validated and written to the driver.
+    /// With tracking enabled, returns a deferred completion payload on `StepStatus::Done` so
+    /// `"done"` is only published after that tick's output has been validated and written
+    /// to the driver; with tracking off it publishes at once (e4f72b6) and returns None.
     fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) -> Option<DeferredActionDone> {
         self.commanded_positions = out.positions;
         self.commanded_velocities = out.velocities;
@@ -4053,6 +4054,24 @@ impl SupervisorInner {
         match out.status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
+                if !self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                    // Tracking off: publish completion now, before this tick's driver write,
+                    // exactly as before joint tracking (e4f72b6).
+                    if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
+                        self.releasing = false;
+                        self.held = None;
+                    }
+                    self.active_trajectory = None;
+                    self.commanded_velocities.fill(0.0);
+                    self.target_positions = self.commanded_positions.clone();
+                    if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
+                    if macro_sub {
+                        if let Some(m) = self.macro_run.as_mut() {
+                            m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
+                        }
+                    } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+                    return None;
+                }
                 let clear_releasing = self.releasing
                     && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
                 self.active_trajectory = None;
@@ -5811,7 +5830,8 @@ impl SupervisorInner {
             }
         }
 
-        self.reconcile_action(servo_dt, tick_output_accepted);
+        // Tracking off: settle completion does not wait for an accepted output (e4f72b6).
+        self.reconcile_action(servo_dt, tick_output_accepted || !tracking_enabled);
         self.expire_motion_limit();
         let obs = self.current_observation();
 

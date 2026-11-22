@@ -4070,3 +4070,52 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     inner.tick(DT);
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
+
+/// Review 4 #4: with tracking off (absent or disabled) a Path/Gripper/Replay action's
+/// `done` is published during stepping, before that tick's driver write, as in e4f72b6:
+/// a write failure on the final tick leaves the action `done` and latches
+/// DriverWriteFailed. Earlier ticks report `running`.
+#[test]
+fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
+    for jt in [None, Some(JointTrackingConfig::rebot_dm())] {
+        let label = if jt.is_some() { "tracking disabled" } else { "tracking none" };
+        let make_rig = || {
+            let cfg = ArmConfig { lease_timeout_ms: 600_000, workspace: None, joint_tracking: jt.clone(), ..ArmConfig::rebot_dm() };
+            let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+            let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+            let epoch = inner.safety.epoch_id();
+            let policy = inner.config.gripper_policy.clone().unwrap();
+            let frac = f64::from(((q0[6] - policy.closed_rad) / (policy.open_rad - policy.closed_rad)).clamp(0.0, 1.0));
+            let (id, _) = inner
+                .start_gripper(
+                    GripperRequest {
+                        command: GripperCommand::Move,
+                        fraction: Some(frac),
+                        grasp: false,
+                        speed: 1.0,
+                        timeout_s: Some(5.0),
+                        tag: None,
+                    },
+                    epoch,
+                )
+                .unwrap();
+            (inner, drv, id)
+        };
+        let done_tick = {
+            let (mut inner, _drv, _id) = make_rig();
+            (1..=30)
+                .find(|_| inner.tick(DT).action.is_some_and(|a| a.state == "done"))
+                .expect("control action reaches done")
+        };
+        let (mut inner, drv, id) = make_rig();
+        for k in 1..done_tick {
+            assert_eq!(inner.tick(DT).action.unwrap().state, "running", "{label}: tick {k}");
+        }
+        drv.with(|s| s.fail_next_write = true);
+        let obs = inner.tick(DT);
+        let act = obs.action.expect("action status");
+        assert_eq!(act.id, id);
+        assert_eq!(act.state, "done", "{label}: e4f72b6 publishes done before the failed final-tick write");
+        assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::DriverWriteFailed), "{label}: {:?}", obs.fault);
+    }
+}
