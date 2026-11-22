@@ -221,7 +221,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 ./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
+# -> dist/armd-lite_1.5.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
 ```
 
 `--flavor recamera`（deb 包）还需要 `rebot-vision`（基于 SG2002 SDK 构建的 C++ 程序）。最简单的方式是使用 [GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.4.0) 中的预编译二进制：
@@ -281,7 +281,7 @@ v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 工具栏按钮 **相机标定** 打开标定向导：用一张打印的 ArUco 标定板一次完成腕部相机的标定，并把结果交给 armd 应用（需要 `capabilities.calibration_apply`，旧版 armd 显示更新提示；仅支持 6 轴 B601）。手动手眼标定抽屉在 **高级** 中仍可使用。
 
 1. **标定板**：以 100% 比例打印 GridBoard（4 列 × 3 行，ArUco `aruco4x4_50`，id 0–11 按阅读顺序，标记边长 25 mm，间距为边长的 1/5，整板约 115 × 85 mm；可打印 SVG 带 100 mm 刻度尺和 "up" 箭头），量出标记边长，与标定板厚度（默认 0.5 mm）一起填入。平放在桌面上，箭头指向远离机械臂的方向。
-2. **摆放**：用摇杆把相机移到标定板上方约 0.3 m，画面中至少有 6 个完整标记，采集起始视图。向导用名义值（640x360 下 fx 824 px、当前 `camera_mount`）估计标定板位姿，生成约 20 个朝向标定板的位姿：相机距标定板 0.18–0.35 m（候选距离 0.18、0.20、0.23、0.26、0.30、0.35 m；v8 安装下 0.18 m 的候选被离板高度规则排除，自测实际使用 0.20–0.35 m），视线倾角 0–30°、多个方位，绕光轴转动 ±15°，预测可见标记不少于 6 个，工具上各点高于标定板平面至少 0.10 m，每段移动按 1 cm / 3° 间隔用驾驶舱 IK 检查（无构型翻转、不超关节限位）。
+2. **摆放**：用摇杆把相机移到标定板上方约 0.3 m，画面中至少有 6 个完整标记，采集起始视图。向导用名义值（640x360 下 fx 824 px、当前 `camera_mount`）估计标定板位姿，生成约 20 个朝向标定板的位姿：相机距标定板 0.18–0.35 m（候选距离 0.18、0.20、0.23、0.26、0.30、0.35 m；v8 安装下 0.18 m 的候选被离板高度规则排除，自测实际使用 0.20–0.35 m），视线倾角 0–30°、多个方位，绕光轴转动 ±15°，预测可见标记不少于 6 个，工具上各点高于标定板平面至少 0.10 m，每段移动按 1 cm / 3° 间隔用驾驶舱 IK 检查（无构型翻转、不超关节限位）。重新求解使标定板平面移动后，机械臂当前所在位姿可能低于离板高度；此时若目标高于离板高度、且途中工具上各点不低于起点的最低点，允许从该位姿移出（加入此规则前重新规划得到 0 个位姿，运行以 `nopose: clearance` 停止；仿真端到端运行：之前 15 次中 1 次失败，之后 10 次全部通过）。
 3. **采集**：每个位姿以 0.03 m/s、0.3 rad/s 执行 `move_to`，静止后再等 0.3 s，触发一次 `["aruco"]` 识别。未勾选 **连续运行** 时每次移动都要点击确认。**停止** 固定在底栏；页面切到后台、遥测中断、租约丢失、急停或故障都会中止运行，不会自动继续。标记少于 6 个的位姿跳过并计数。累计 8 个有效视图后求解一次，并用该估计重新生成剩余位姿。
 4. **求解**（在浏览器中，`/assets/calib_wizard.js`）：640x360 下的内参 fx、fy、cx、cy、k1、k2（由各视图单应矩阵得到 Zhang 闭式解，再与各视图标定板位姿一起做 Levenberg-Marquardt 优化）；用该内参对每个视图做平面 PnP 得到标定板位姿；用抽屉中的同一个求解器解手眼 AX = XB；拟合标定板平面。之后对全部角点观测做一次 Levenberg-Marquardt 联合优化：内参（fx、fy、cx、cy、k1、k2）、安装 X = T_end_cam 与标定板在基座中的位姿一起优化，FK 位姿固定；求解页显示优化前后的重投影 RMS。写入的是优化后的值，手眼与桌面检查项也用优化后的值计算（各视图标定板在基座中的位姿与优化后的位姿比较）；桌面高度 = 优化后的标定板 z 减去板厚。检查项全部显示且必须全部通过：视图不少于 15 个、每个视图不少于 6 个标记、角点覆盖画面全部 3 × 3 区域、重投影 RMS ≤ 0.5 px（按角点，内参求解）、单视图 RMS ≤ 1.0 px（超出的视图剔除一次）、留出视图 RMS ≤ 1.0 px（每 5 个视图留出 1 个）、fx、fy、cx、cy 的 1σ ≤ 2%、手眼 RMS ≤ 3 mm 且 ≤ 1°、转动轴不全平行、标定板法向偏离竖直 ≤ 5°、标定板高度极差 ≤ 4 mm。
 5. **确认**：armd 预演（`/api/v1/calibration/apply`，`dry_run: true`）列出 rebot-vision 内参、`camera_mount` 和抓取设置字段的修改前后值。
@@ -367,9 +367,10 @@ WebSocket 时序：
 
 参考文档：
 
-- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码；
+- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码，深度测量与多视角测量（`measure_multiview`）；
 - [docs/control_safety_contract.md](docs/control_safety_contract.md)：租约、epoch、驱动能力、时序默认值、限速、工作空间；
-- [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例。
+- [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例；
+- [docs/mit_qualification.md](docs/mit_qualification.md)：B601-DM 上 MIT 跟踪的资格验证（默认关闭）及当前状态。
 
 ---
 
@@ -495,6 +496,7 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 - 跟踪误差故障：跟随误差超过 0.5 rad 持续 500 ms 时锁存故障，信息中包含关节号；动作会更早以 `TRACKING_STALL` 结束。
 - 重力补偿：进入要求已使能、静止、持有租约且反馈新鲜。所有退出都先在实测位姿保持（力矩不断），再切回 POS_VEL；租约看门狗收纳在此之后才开始。例外：过温保护仍会断力矩；CAN 总线完全中断时，电机继续执行最后一条 MIT 指令（重力前馈加阻尼），直到总线恢复。详见 [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。
 - 默认热点密码（`12345678`）和未鉴权的 HTTP/WebSocket API 使该网络上的任何人都能控制机械臂和开始录制。请修改密码，并只在可信网络上运行。
+- 关闭（SIGTERM 或 Ctrl+C，例如 `/etc/init.d/K92rebot-teleop restart`）：只有力矩已关闭且电机确认失能时 armd 才退出。此时它锁存急停，使控制循环在退出前停止；日志中出现 `Idle -> EStop` 状态切换，之前有一行说明该急停只在内存中、不会持久化，下次启动为 Idle。力矩开启或失能未确认时，armd 拒绝退出，锁存急停并继续运行；之后须先清除急停并重新使能才能运动（`src/main.rs`）。
 
 以上数值是源码中的软件默认值（`src/model.rs`、`src/supervisor.rs`），不是经过认证的安全功能。
 

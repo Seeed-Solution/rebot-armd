@@ -361,7 +361,8 @@ next frame. `GET /api/calibration/intrinsics` and `/api/mode` `intrinsics` repor
 `revision` (1 at process start, not persisted). Intrinsics given on the command line refuse the PUT
 (409 `CLI_OVERRIDE`). See [detection_api.md](../../../docs/detection_api.md#camera-intrinsics--相机内参).
 
-YOLO model: not in the repository or the deb. The first existing file of `vision.json` `model`,
+YOLO model: not in the repository or the deb. A `vision.json` `model` is loaded alone. Without it, the first of these
+files that exists and loads (a file that fails to load is logged and the next one is tried):
 `/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel` (seg384 first: its masks give the grasp
 angle and the `measure_multiview` contours without a model swap),
 `/userdata/rebot-teleop/models/yolo11n.cvimodel`,
@@ -373,7 +374,7 @@ angle and the `measure_multiview` contours without a model swap),
 `/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel`,
-`/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
+`/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel`. Without a model `yolo` and `both`
 answer 409 and ArUco works.
 
 Model downloads: the official `yolo11n` detect and segment models ship with reCamera OS in
@@ -388,7 +389,7 @@ its model catalogue at startup from the model files present on the unit: the reC
 and the `models.tsv` models in `/userdata/local/models/` (or `/userdata/rebot-teleop/models/`). Each entry is named
 by its file stem, for example `yolo11n_obb_cv181x_int8_fuse_qout`, carries the measured `ion_mb`, and the OBB entry
 carries the DOTAv1 class names. After downloading models, restart rebot-teleop with the arm idle and torque off
-(`/etc/init.d/K92rebot-teleop restart`, which also restarts armd) so the catalogue picks them up. The startup YOLO model is still the first existing default path above (the OS detect
+(`/etc/init.d/K92rebot-teleop restart`, which also restarts armd) so the catalogue picks them up. The startup YOLO model is the first default path above that exists and loads (the OS detect
 model on a stock unit, seg384 once it is in `/userdata/local/models/`). Switch with `POST /api/models` on `:8090`, for example
 `{"detector": "yolo11n_seg_384x640_cv181x_int8_fuse", "depth": "zipdepth_metric_384x224_bf16_rgb"}`, or a grasp
 task's `models`, or set `vision.json` `"model"` to the file path. A `models` object in `vision.json` replaces the

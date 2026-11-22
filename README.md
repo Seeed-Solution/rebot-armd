@@ -322,7 +322,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 ./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
+# -> dist/armd-lite_1.5.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
 ```
 
 `--flavor recamera` (the deb) also needs `rebot-vision`, a C++ program built against the
@@ -500,7 +500,12 @@ available under **Advanced**.
    0.18–0.35 m from the board (candidates at 0.18, 0.20, 0.23, 0.26, 0.30, 0.35 m; with the v8 mount
    the clearance rule removes the 0.18 m ones, the self-test uses 0.20–0.35 m), view tilt 0–30° in several azimuths, roll ±15°, at least 6
    predicted visible markers, tool points at least 0.10 m above the board plane, each transition
-   checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits).
+   checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits). After a
+   re-solve moves the board plane, the pose the arm is at can read below the clearance; a move out
+   of it is then allowed when the target is above the clearance and no tool point on the way goes
+   lower than the start's lowest point (before this rule the re-plan returned 0 poses and the run
+   stopped with `nopose: clearance`; simulated end-to-end runs: 1 of 15 failed before, 10 of 10
+   passed after).
 3. **Capture**: each pose is a `move_to` at 0.03 m/s and 0.3 rad/s, then still for 0.3 s, then one
    `["aruco"]` trigger. Every move needs a tap unless **Run all** is ticked. **Stop** stays in the
    footer; a hidden page, stale telemetry, lease loss, E-stop or fault aborts the run, which does
@@ -677,10 +682,13 @@ Reference documents:
 
 - [docs/agent_action_api.md](docs/agent_action_api.md): `move_to`, `move_relative` (base,
   tool and camera frames), `gripper`, `grasp`, `move_to_pose` and named poses, keep-out boxes,
-  the gravity-compensation mode command, action status, fault codes and error codes;
+  the gravity-compensation mode command, action status, fault codes and error codes, depth and
+  multi-view measurement (`measure_multiview`);
 - [docs/control_safety_contract.md](docs/control_safety_contract.md): lease, epochs, driver
   capabilities, timing defaults, speed caps, workspace;
-- [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example.
+- [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example;
+- [docs/mit_qualification.md](docs/mit_qualification.md): MIT tracking qualification on the
+  B601-DM (off by default) and its current status.
 
 ---
 
@@ -898,6 +906,12 @@ own risk; the MIT License comes without warranty.
 - The default access point password (`12345678`) and the unauthenticated HTTP/WebSocket API
   let anyone on that network control the arm and start recordings. Change the password and
   run the arm on a network you trust.
+- Shutdown (SIGTERM or Ctrl+C, for example `/etc/init.d/K92rebot-teleop restart`): armd exits only
+  when torque is off and the motors confirm the disable. It then latches the E-stop so the control
+  loop stops before the exit; the log shows an `Idle -> EStop` transition, preceded by a line saying
+  that this E-stop is in memory only and not persisted, and the next start is Idle. With torque on
+  or the disable not confirmed, armd refuses to exit, latches the E-stop and keeps running; clearing it and
+  re-arming are then needed before any motion (`src/main.rs`).
 
 The values above are software defaults from the source (`src/model.rs`, `src/supervisor.rs`),
 not certified safety functions.
