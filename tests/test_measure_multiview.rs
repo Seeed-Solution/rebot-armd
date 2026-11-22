@@ -75,6 +75,12 @@ struct FakeVision {
     on_gray_fetch: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     gray_trigger_timeouts: AtomicU64,
     on_gray_trigger_timeout: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Camera hold (rebot-vision subscription without pipelines): supported (default true), the
+    /// hold requests (first and refreshes) and the releases, and whether a hold is active.
+    hold_supported: AtomicBool,
+    holds: AtomicU64,
+    releases: Mutex<Vec<String>>,
+    held: AtomicBool,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -262,6 +268,23 @@ impl DetectionSource for FakeVision {
     fn next_frame(&self, _a: Option<u64>, _w: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move { Ok(Some(self.frame_now().await)) })
     }
+    fn camera_hold(&self, client: &str, ttl_ms: u64) -> BoxFuture<'_, Result<Option<String>, String>> {
+        assert_eq!((client, ttl_ms), (mm::CAMERA_HOLD_CLIENT, mm::CAMERA_HOLD_TTL_MS));
+        Box::pin(async move {
+            if !self.hold_supported.load(Ordering::SeqCst) { return Ok(None); }
+            self.holds.fetch_add(1, Ordering::SeqCst);
+            self.held.store(true, Ordering::SeqCst);
+            Ok(Some("s7".to_string()))
+        })
+    }
+    fn camera_release(&self, id: &str) -> BoxFuture<'_, Result<(), String>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            self.held.store(false, Ordering::SeqCst);
+            self.releases.lock().unwrap().push(id);
+            Ok(())
+        })
+    }
     fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
         Box::pin(async move {
             self.snapshots.fetch_add(1, Ordering::SeqCst);
@@ -321,7 +344,8 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
         gray: AtomicBool::new(false), instance_id: Mutex::new("rv-fake-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
-        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -978,7 +1002,88 @@ async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
     let settle: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["timing"]["settle_ms"].as_f64().unwrap()).collect();
     assert!(settle[0] < 1000.0 && settle[0] >= (mm::STILL_WINDOW as f64 - 1.0) * 20.0, "{settle:?}");
     assert!(settle[1..].iter().all(|s| *s >= mm::MIN_SETTLE_S * 1000.0), "{settle:?}");
+    // the camera was held for the run (refreshed: the run lasts several refresh periods) and released
+    assert_eq!(m["camera_hold"], "held", "{m}");
+    assert!(r.vision.holds.load(Ordering::SeqCst) >= 3, "{}", r.vision.holds.load(Ordering::SeqCst));
+    assert!(!r.vision.held.load(Ordering::SeqCst) && *r.vision.releases.lock().unwrap() == vec!["s7".to_string()]);
 }
+
+/// After the action ended: the camera hold is released once and no longer refreshed.
+async fn assert_released(r: &Rig) {
+    let t = Instant::now();
+    while r.vision.held.load(Ordering::SeqCst) {
+        assert!(t.elapsed() < Duration::from_secs(3), "the camera hold was not released");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let n = r.vision.holds.load(Ordering::SeqCst);
+    tokio::time::sleep(mm::CAMERA_HOLD_REFRESH + Duration::from_millis(300)).await;
+    assert_eq!(r.vision.holds.load(Ordering::SeqCst), n, "refreshed after the release");
+    assert!(!r.vision.held.load(Ordering::SeqCst));
+    assert_eq!(*r.vision.releases.lock().unwrap(), vec!["s7".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_camera_hold_is_released_on_failure_and_on_lease_loss() {
+    // failure after motion: TARGET_LOST in the first side view, the arm returns, the hold ends
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.hide_after_start.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}")), 90.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("TARGET_LOST")), "{a}");
+    assert!(r.vision.holds.load(Ordering::SeqCst) >= 1);
+    assert_released(&r).await;
+    // lease loss during a view motion: the action ends cancelled, the hold ends
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"speed_scale": 0.1})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(Instant::now() < until, "no view motion");
+        common::send(&mut r.ws, json!({"type":"heartbeat", "generation": r.generation, "epoch_id": r.epoch})).await;
+        common::drain(&mut r.ws, 5).await;
+        let moving = r.sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase.clone()).is_some_and(|p| p.starts_with("move:"));
+        if moving { break; }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(r.vision.held.load(Ordering::SeqCst), "held during the views");
+    let reply = common::ws_reply(&mut r.ws, json!({"type":"release_lease", "generation": r.generation}), &["lease_released"]).await;
+    assert_eq!(reply["success"], true);
+    let t = Instant::now();
+    loop {
+        let obs = r.sup.get_observation().await;
+        if let Some(a) = [obs.action, obs.previous_action].into_iter().flatten().find(|a| a.id == id && !a.is_running()) {
+            assert_eq!(a.code.as_deref(), Some("LEASE_LOST"), "{a:?}");
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(3), "the action did not end");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_released(&r).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_camera_hold_the_run_is_unchanged_and_snapshots_never_hold() {
+    // an older provider (no camera hold): the gray run measures as before
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.hold_supported.store(false, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(a["measurement"]["camera_hold"], "unsupported");
+    assert!((a["measurement"]["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003);
+    assert!(r.vision.releases.lock().unwrap().is_empty());
+    // snapshot source: the hold is never requested (the snapshot would refresh with frames that
+    // are not the trigger's)
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 150.0).await;
+    assert_eq!((a["state"].as_str(), a["measurement"]["camera_hold"].as_str()), (Some("done"), Some("off")), "{a}");
+    assert_eq!(r.vision.holds.load(Ordering::SeqCst), 0);
+}
+
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_arm_moving_at_the_start_fails_not_settled_before_any_trigger() {
@@ -1186,7 +1291,8 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
         gray: AtomicBool::new(true), instance_id: Mutex::new("rv-fb-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
-        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

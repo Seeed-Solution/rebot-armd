@@ -541,7 +541,9 @@ static void test_subscription_union() {
     // errors
     req(c, "POST", "/api/subscribe", R"({"pipelines":["yolo"]})", &st);
     CHECK(st == 400);
-    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":[]})", &st);
+    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":{}})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":"yolo"})", &st);
     CHECK(st == 400);
     req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":["video"]})", &st);
     CHECK(st == 400);
@@ -607,6 +609,51 @@ static void test_subscription_expiry() {
     CHECK(l["continuous"]["pipelines"] == json({"aruco"}));
     req(h, "POST", "/api/subscribe/" + a["id"].get<std::string>() + "/keepalive", "{}", &st);
     CHECK(st == 404);
+}
+
+static void test_camera_hold() {
+    // "pipelines": [] = camera hold: no inference, the camera gate open like a pending trigger
+    Calls calls;
+    VisionControl c(opts(Mode::Yolo, false, 5), calls.fn());
+    int st = 0;
+    json m = req(c, "GET", "/api/mode");
+    CHECK(m["camera_hold"] == true && m["continuous"]["holds"] == 0);
+    json h = req(c, "POST", "/api/subscribe", R"({"client":"armd-mview","pipelines":[],"ttl_ms":5000})", &st);
+    CHECK(st == 200 && h["hold"] == true && h["pipelines"] == json::array() && h["ttl_ms"] == 5000);
+    CHECK(h["continuous"]["active"] == false && h["continuous"]["holds"] == 1 && h["continuous"]["subscriptions"] == 0);
+    CHECK(!c.processing() && c.current_fps() == VisionControl::kIdleFps);
+    CHECK(c.camera_fps() == VisionControl::kOpenGateFps && calls.v.back() == std::make_pair(false, VisionControl::kOpenGateFps));
+    for (uint64_t t = mono_ms(); t < mono_ms() + 1000; t += 67) CHECK(!c.frame_plan(t).any());  // frames pass, nothing runs
+    // a trigger during the hold runs on the first frame not older than the request
+    {
+        const uint64_t req_ms = mono_ms() + 10;
+        auto scope = c.trigger_scope(req_ms, Pipelines{true, false});
+        CHECK(c.processing() && c.camera_fps() == VisionControl::kOpenGateFps);
+        CHECK(!c.frame_plan(req_ms - 1).any() && c.frame_plan(req_ms) == (Pipelines{true, false}));
+    }
+    CHECK(!c.processing() && c.camera_fps() == VisionControl::kOpenGateFps);
+    // a slow continuous subscription next to the hold: the gate stays open (not 2 x 2 fps)
+    json s = req(c, "POST", "/api/subscribe", sub_body("overlay", R"(["aruco"])", 2), &st);
+    CHECK(st == 200 && c.processing() && c.camera_fps() == VisionControl::kOpenGateFps);
+    CHECK(c.continuous().fps == 2 && c.continuous().subscriptions == 1 && c.continuous().holds == 1);
+    json l = req(c, "GET", "/api/subscriptions");
+    CHECK(l["subscriptions"].size() == 2 && l["continuous"]["holds"] == 1 && l["continuous"]["pipelines"] == json({"aruco"}));
+    // deleting the hold restores the state before it: the subscription's gate, then idle
+    req(c, "DELETE", "/api/subscribe/" + h["id"].get<std::string>(), "", &st);
+    CHECK(st == 200 && c.camera_fps() == 4 && calls.v.back() == std::make_pair(true, 4));
+    req(c, "DELETE", "/api/subscribe/" + s["id"].get<std::string>(), "", &st);
+    CHECK(st == 200 && c.camera_fps() == VisionControl::kIdleFps && calls.v.back() == std::make_pair(false, 1));
+    // a hold that is not kept alive expires: the gate goes back to idle; a keep-alive extends it
+    Subscription k;
+    CHECK(c.subscribe("armd-mview", "", Pipelines{}, 0, 1000, 1000, k) == VisionControl::Status::Ok && k.hold());
+    CHECK(c.camera_fps() == VisionControl::kOpenGateFps);
+    CHECK(c.keepalive(k.id, 1800, k) == VisionControl::Status::Ok && k.expires_ms == 2800);
+    c.expire(2700);
+    CHECK(c.camera_fps() == VisionControl::kOpenGateFps);
+    c.expire(2800);
+    CHECK(c.camera_fps() == VisionControl::kIdleFps && !c.processing() && calls.v.back() == std::make_pair(false, 1));
+    // a hold does not change what a trigger without pipelines runs
+    CHECK(c.default_trigger_pipelines() == (Pipelines{true, false}));
 }
 
 static void test_trigger_pipelines() {
@@ -1216,6 +1263,7 @@ int main() {
     test_standby();
     test_subscription_union();
     test_subscription_expiry();
+    test_camera_hold();
     test_trigger_pipelines();
     test_mode_endpoint_compat();
     test_mask_focus_control();

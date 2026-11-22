@@ -1499,6 +1499,18 @@ pub trait DetectionSource: Send + Sync {
     fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
         Box::pin(async { Err("camera snapshots not supported by this detection source".to_string()) })
     }
+    /// Keep the camera gate open without inference for `ttl_ms` (rebot-vision camera hold:
+    /// `POST /api/subscribe {"client", "pipelines": [], "ttl_ms"}`), so a trigger is served by the
+    /// next camera frame. Calling it again with the same `client` refreshes the same hold.
+    /// `Ok(Some(id))` = held; `Ok(None)` = the provider has no camera hold (older rebot-vision
+    /// answers 400, a provider without subscriptions 404). Default: no camera hold.
+    fn camera_hold(&self, _client: &str, _ttl_ms: u64) -> BoxFuture<'_, Result<Option<String>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// End the camera hold `id` (`DELETE /api/subscribe/<id>`).
+    fn camera_release(&self, _id: &str) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The camera app's detection API (the same upstream armd proxies under /api/v1/detection).
@@ -1628,6 +1640,25 @@ pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
 }
 
 impl DetectionSource for HttpDetectionSource {
+    fn camera_hold(&self, client: &str, ttl_ms: u64) -> BoxFuture<'_, Result<Option<String>, String>> {
+        let body = serde_json::json!({"client": client, "pipelines": [], "ttl_ms": ttl_ms}).to_string();
+        Box::pin(async move {
+            let (status, v) = crate::api::proxy::request_status_json(&self.upstream, "POST", "/api/subscribe", Some(body.as_bytes()), Duration::from_secs(2)).await?;
+            if status == axum::http::StatusCode::BAD_REQUEST || status == axum::http::StatusCode::NOT_FOUND { return Ok(None); }
+            if !status.is_success() { return Err(format!("camera hold: detector returned {status}")); }
+            // an older provider that took [] as an ordinary subscription does not report a hold
+            if v.get("hold").and_then(Value::as_bool) != Some(true) { return Ok(None); }
+            v.get("id").and_then(Value::as_str).map(|id| Some(id.to_string())).ok_or_else(|| "camera hold: reply without id".to_string())
+        })
+    }
+    fn camera_release(&self, id: &str) -> BoxFuture<'_, Result<(), String>> {
+        let path = format!("/api/subscribe/{id}");
+        Box::pin(async move {
+            let (status, _) = crate::api::proxy::request_status_json(&self.upstream, "DELETE", &path, None, Duration::from_secs(2)).await?;
+            // 404: already expired
+            if status.is_success() || status == axum::http::StatusCode::NOT_FOUND { Ok(()) } else { Err(format!("camera release: detector returned {status}")) }
+        })
+    }
     fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
         Box::pin(async move {
             let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;

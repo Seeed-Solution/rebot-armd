@@ -58,6 +58,10 @@
 //!   MAD of the table residuals). Without a usable fit the calibrated table z stays
 //!   (`table_plane` null).
 //! - The image computation runs in `spawn_blocking`, while the arm returns to the start pose.
+//! - Camera hold ([`CameraHold`], gray frames only): for the run armd holds the provider's camera
+//!   gate open (rebot-vision `POST /api/subscribe` without pipelines, refreshed every
+//!   [`CAMERA_HOLD_REFRESH`], deleted at the end of every outcome), so a trigger does not wait for
+//!   the 1 fps idle gate. A provider without it (`measurement.camera_hold` "unsupported") runs as before.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -151,6 +155,77 @@ const YOLO_GRAY: &[&str] = &["yolo", "gray"];
 const YOLO_ARUCO_GRAY: &[&str] = &["yolo", "aruco", "gray"];
 /// `pose_refine` `"aruco"`: marker corners each view must share with the reference view.
 pub const MIN_MARKER_CORNERS: usize = 8;
+/// Camera hold during a gray-frame run ([`CameraHold`]): the provider's subscription client, its
+/// time to live and how often armd refreshes it. The hold ends at most this TTL after armd stops
+/// refreshing it (a crash included).
+pub const CAMERA_HOLD_CLIENT: &str = "armd-measure-multiview";
+pub const CAMERA_HOLD_TTL_MS: u64 = 5000;
+pub const CAMERA_HOLD_REFRESH: Duration = Duration::from_millis(1500);
+const CAMERA_RELEASE_WAIT: Duration = Duration::from_secs(1);
+
+/// The camera gate held open during one run (rebot-vision camera hold, a subscription without
+/// pipelines): with inference idle the gate runs at 1 fps and a trigger waits for the gate; held,
+/// the trigger is served by the next frame. Only for [`FrameSource::Gray`]: there the frame is
+/// fetched by its id, while `/snapshot.jpg` would refresh with frames that are not the trigger's.
+/// [`CameraHold::release`] at the end of the run (every outcome); on a panic `Drop` stops the
+/// refresh and the hold expires after [`CAMERA_HOLD_TTL_MS`].
+pub struct CameraHold {
+    src: Arc<dyn DetectionSource>,
+    id: Option<String>,
+    refresh: Option<tokio::task::JoinHandle<()>>,
+    /// `measurement.camera_hold`: "held", "unsupported" (the provider has none), "failed" (the
+    /// request failed; the run goes on without), "off" (snapshot source).
+    pub status: &'static str,
+}
+
+impl CameraHold {
+    pub async fn start(src: Arc<dyn DetectionSource>, wanted: bool) -> Self {
+        let mut h = Self { src, id: None, refresh: None, status: "off" };
+        if !wanted { return h; }
+        match h.src.camera_hold(CAMERA_HOLD_CLIENT, CAMERA_HOLD_TTL_MS).await {
+            Ok(Some(id)) => {
+                let src = h.src.clone();
+                h.refresh = Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(CAMERA_HOLD_REFRESH).await;
+                        if let Err(e) = src.camera_hold(CAMERA_HOLD_CLIENT, CAMERA_HOLD_TTL_MS).await {
+                            tracing::warn!("measure_multiview: camera hold refresh failed: {e}");
+                        }
+                    }
+                }));
+                h.id = Some(id);
+                h.status = "held";
+            }
+            Ok(None) => h.status = "unsupported",
+            Err(e) => {
+                tracing::warn!("measure_multiview: camera hold not taken ({e}); triggers wait for the idle camera gate");
+                h.status = "failed";
+            }
+        }
+        h
+    }
+
+    /// Stop refreshing (waiting for a refresh in flight) and end the hold.
+    pub async fn release(mut self) {
+        if let Some(r) = self.refresh.take() {
+            r.abort();
+            let _ = r.await;
+        }
+        if let Some(id) = self.id.take() {
+            match tokio::time::timeout(CAMERA_RELEASE_WAIT, self.src.camera_release(&id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("measure_multiview: camera hold {id} not released ({e}); it expires in {CAMERA_HOLD_TTL_MS} ms"),
+                Err(_) => tracing::warn!("measure_multiview: camera hold {id} release timed out; it expires in {CAMERA_HOLD_TTL_MS} ms"),
+            }
+        }
+    }
+}
+
+impl Drop for CameraHold {
+    fn drop(&mut self) {
+        if let Some(r) = self.refresh.take() { r.abort(); }
+    }
+}
 
 /// Negotiated image transport for one `measure_multiview` run (selected once, never switched mid-run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1677,7 +1752,10 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn Detectio
         timeout_code: "MEASURE_TIMEOUT",
         timeout_message: "the measurement did not finish within its time bound".into(),
     };
-    let outcome = measure_run(&ctx, &plan, src.as_ref()).await;
+    let mut hold = None;
+    let outcome = measure_run(&ctx, &plan, &src, &mut hold).await;
+    // the camera gate goes back to the provider's state before the run, whatever the outcome
+    if let Some(h) = hold { h.release().await; }
     let mut inner = sup.inner().write().await;
     match outcome {
         Ok(None) => inner.finish_macro(id, "done", None, None, None, None),
@@ -1712,14 +1790,14 @@ async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
 
 /// The run; Ok(Some((code, message))): a measurement failure after the views (the action fails
 /// with it, after the return to the start pose).
-async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> Result<Option<(String, String)>, Stop> {
+async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSource>, hold: &mut Option<CameraHold>) -> Result<Option<(String, String)>, Stop> {
+    let src: &dyn DetectionSource = src_arc.as_ref();
     let t_run = Instant::now();
     let mut timing = RunTiming::default();
     recheck(ctx, plan).await?;
     // Negotiate capabilities and image source ONCE for the whole run (never switch mid-run).
     let t_neg = Instant::now();
     let mode = src.mode_info().await.map_err(|e| source_fail(format!("cannot reach the vision provider: {e}")))?;
-    timing.negotiate_ms = t_neg.elapsed().as_secs_f64() * 1000.0;
     if !mode.per_request_pipelines {
         return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)"));
     }
@@ -1740,6 +1818,9 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
         (Ok(fmt), FrameSource::Gray) => fmt.clone(),
         _ => None,
     };
+    let held = hold.insert(CameraHold::start(src_arc.clone(), frame_source == FrameSource::Gray).await);
+    let camera_hold = held.status;
+    timing.negotiate_ms = t_neg.elapsed().as_secs_f64() * 1000.0;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
     let t_detect = Instant::now();
     // the start view: no minimum wait (the arm was not moved by this action), still windows only
@@ -1828,6 +1909,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     timing.total_ms = t_run.elapsed().as_secs_f64() * 1000.0;
     let view_timing: Vec<ViewTiming> = caps.iter().map(|c| c.timing).collect();
     value["timing"] = timing_value(&timing, &view_timing);
+    value["camera_hold"] = json!(camera_hold);
     let (mut pose, per_view) = pose_value(mode, &c.pose);
     pose["markers_requested"] = json!(markers);
     value["pose_refine"] = pose;

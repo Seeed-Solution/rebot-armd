@@ -50,6 +50,8 @@ struct Pipelines {
 /**
  * A caller's continuous inference: these pipelines at `fps` (clamped to the configured rate)
  * until `expires_ms` (mono_ms()); refreshed by a keep-alive or by subscribing again.
+ * Without pipelines it is a camera hold: no inference, the camera gate stays open (every frame
+ * passes), so a trigger is served by the next frame instead of waiting for the idle 1 fps gate.
  */
 struct Subscription {
     std::string id;
@@ -58,13 +60,15 @@ struct Subscription {
     int fps = 0;  ///< requested rate; runs at min(fps, configured rate)
     int ttl_ms = 3000;
     uint64_t expires_ms = 0;
+    bool hold() const noexcept { return !pipelines.any(); }
 };
 
 /** What runs continuously: the union of the active subscriptions (and the default one). */
 struct Continuous {
     Pipelines pipelines;
     int fps = 0;  ///< max requested rate, clamped to the configured rate; 0 when nothing runs
-    int subscriptions = 0;  ///< active subscriptions, the default one not counted
+    int subscriptions = 0;  ///< active subscriptions, the default one and camera holds not counted
+    int holds = 0;          ///< active camera holds (subscriptions without pipelines)
     bool active() const noexcept { return pipelines.any(); }
 };
 
@@ -190,7 +194,8 @@ public:
      * 180 ms, three frames are 200 ms) and cannot give 8..14 fps at all (one frame is too
      * early, two give 7.5 fps). So the gate only bounds the CPU copies, RateGate picks the
      * frames: idle 1 fps; a pending trigger opens it fully (next frame); up to 7 fps it passes
-     * at least every other frame (>= 7.5 fps), above that every frame.
+     * at least every other frame (>= 7.5 fps), above that every frame. A camera hold opens it
+     * like a pending trigger (gate_locked()).
      */
     static int camera_gate_fps(bool processing, bool trigger_pending, int fps) noexcept;
 
@@ -532,7 +537,9 @@ struct RequestPeer {
  *   GET  /api/frame/gray?instance_id=<id>&frame_id=<u32>  (loopback peer only; 403 otherwise)
  *        exact immediate lookup; 200 application/octet-stream (RGF1), 400 invalid/duplicate/overflow
  *        params, 404 FRAME_NOT_STORED, 410 FRAME_EXPIRED, 503 GRAY_BUSY + Retry-After
- *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}  ("gray" refused: 400)
+ *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}  ("gray" refused: 400;
+ *        "pipelines": [] is a camera hold: no inference, the camera gate open until it expires or
+ *        is deleted; GET /api/mode "camera_hold": true)
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
  *   GET  /api/depth[?wait_ms=<0..5000>]  one depth inference on a fresh frame; 200

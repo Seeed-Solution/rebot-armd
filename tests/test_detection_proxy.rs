@@ -123,9 +123,15 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                     }
                     ("POST", "/api/subscribe") => {
                         let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
-                        let body = serde_json::json!({"api_version": 2, "id": "s1", "client": v["client"], "pipelines": v["pipelines"],
-                            "fps": 5, "ttl_ms": 3000, "expires_in_ms": 3000});
-                        ("200 OK", body.to_string(), false)
+                        // "pipelines": [] = camera hold (client "pre-hold" plays an older rebot-vision: 400)
+                        let hold = v["pipelines"].as_array().is_some_and(|a| a.is_empty());
+                        if hold && v["client"] == "pre-hold" {
+                            ("400 Bad Request", r#"{"api_version":2,"error":"pipelines must be a non-empty list"}"#.to_string(), false)
+                        } else {
+                            let body = serde_json::json!({"api_version": 2, "id": "s1", "client": v["client"], "pipelines": v["pipelines"],
+                                "fps": 5, "ttl_ms": v.get("ttl_ms").cloned().unwrap_or(serde_json::json!(3000)), "expires_in_ms": 3000, "hold": hold});
+                            ("200 OK", body.to_string(), false)
+                        }
                     }
                     ("POST", "/api/subscribe/s1/keepalive") => ("200 OK", r#"{"api_version":2,"id":"s1","expires_in_ms":3000}"#.to_string(), false),
                     ("DELETE", "/api/subscribe/s1") => ("200 OK", r#"{"api_version":2,"deleted":"s1"}"#.to_string(), false),
@@ -440,6 +446,31 @@ async fn http_detection_source_reads_and_sets_vision_mode() {
     assert_eq!(old.vision_mode().await.unwrap(), None);
     let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
     assert!(down.vision_mode().await.is_err());
+}
+
+#[tokio::test]
+async fn http_detection_source_holds_and_releases_the_camera() {
+    use armd::grasp::{DetectionSource, HttpDetectionSource};
+    let (up, seen) = spawn_mock_upstream().await;
+    let src = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert_eq!(src.camera_hold("armd-measure-multiview", 5000).await.unwrap(), Some("s1".to_string()));
+    {
+        let s = seen.lock().unwrap();
+        let last = s.last().unwrap();
+        assert_eq!((last.method.as_str(), last.target.as_str()), ("POST", "/api/subscribe"));
+        let body: serde_json::Value = serde_json::from_str(&last.body).unwrap();
+        assert_eq!(body, serde_json::json!({"client": "armd-measure-multiview", "pipelines": [], "ttl_ms": 5000}));
+    }
+    src.camera_release("s1").await.unwrap();
+    assert_eq!(seen.lock().unwrap().last().map(|r| (r.method.clone(), r.target.clone())), Some(("DELETE".into(), "/api/subscribe/s1".into())));
+    // already expired: not an error
+    src.camera_release("s9").await.unwrap();
+    // older rebot-vision (400 for "pipelines": []) and a provider without subscriptions (404): no hold
+    assert_eq!(src.camera_hold("pre-hold", 5000).await.unwrap(), None);
+    let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert_eq!(old.camera_hold("armd-measure-multiview", 5000).await.unwrap(), None);
+    let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(down.camera_hold("armd-measure-multiview", 5000).await.is_err());
 }
 
 #[tokio::test]
