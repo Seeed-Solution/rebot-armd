@@ -2840,3 +2840,291 @@ async fn m4_server_counters_wrap_from_u64_max_to_0_and_still_invalidate_tickets(
     assert_eq!(r_inv, "WINDOW_INVALIDATED");
     assert_eq!((w2, nh2, s2), (0, 0, 0));
 }
+
+#[tokio::test]
+async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss_terminates() {
+    let mut weights = vec![0.0f32; 6 * 8];
+    weights[6] = 0.05;
+    weights[7] = 0.05;
+    let layers = make_linear_layers(8, 6, weights);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 20.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 50,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 50,
+                "on_stale": "hold",
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+
+    // Part 1: on_stale = "hold" discards stale target mid-inference, holds, and resumes on fresh frame
+    {
+        let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+        let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+        let inner_backend = load_backend(&snapshot, &contract).unwrap();
+        let infer_entered = Arc::new(Notify::new());
+        let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+        let barrier_backend = Box::new(BarrierBackend {
+            inner: inner_backend,
+            infer_entered: infer_entered.clone(),
+            allow_finish: allow_finish.clone(),
+        });
+        let prepared =
+            PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let non_home_writes = Arc::new(AtomicUsize::new(0));
+        let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+        sup.set_follower("so-arm101").await;
+
+        let hub = embedding_hub_for_supervisor(&sup);
+        hub.set_test_now_ms(Some(1_000_000));
+        let hs = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+        hub.ingest_embedding(EmbeddingIngestRequest {
+            handshake_generation: hs.handshake_generation,
+            producer_epoch: 1,
+            frame_id: 1,
+            captured_at_ms: 1_000_000,
+            oldest_captured_at_ms: None,
+            embedding: vec![1.0, 1.0],
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            model_generation: Some(1),
+        })
+        .unwrap();
+
+        let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 20);
+        let gate = ReleaseGate::parse_and_verify(
+            &raw_gate,
+            &digest,
+            &cfg,
+            prepared.contract(),
+            20.0,
+            &ActiveDeploymentContext {
+                scene_id: "pcb_suction".into(),
+                tool_id: "suction".into(),
+                calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+            },
+        )
+        .unwrap();
+
+        let lease_gen = sup.acquire_lease("conn-m1-hold").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-m1-hold".into(),
+                    lease_generation: lease_gen,
+                    policy_id: "vid_m1_hold".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(gate),
+                })
+                .unwrap()
+        };
+
+        writes.store(0, Ordering::SeqCst);
+        non_home_writes.store(0, Ordering::SeqCst);
+
+        let runner = spawn_policy_runner(
+            sup.clone(),
+            action_id,
+            prepared,
+            20.0,
+            compute_policy_deadline(Some(0.35)).unwrap(),
+            None,
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+            .await
+            .expect("timed out waiting for BarrierBackend::infer");
+
+        // Advance past frame 1 deadline (1_000_048 -> 1_000_049) while infer is running
+        hub.set_test_now_ms(Some(1_000_049));
+
+        {
+            let (lock, cvar) = &*allow_finish;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        sup.tick(0.02).await;
+        let mid_obs = sup.get_observation().await;
+        let mid_pol = mid_obs.policy.expect("policy still active in hold");
+        assert!(mid_pol.active, "on_stale=hold must keep policy active on expiry");
+        assert_eq!(mid_pol.steps, 0, "expired step target must be discarded");
+        assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+
+        // Ingest fresh frame 2 -> policy resumes and commits targets
+        hub.ingest_embedding(EmbeddingIngestRequest {
+            handshake_generation: hs.handshake_generation,
+            producer_epoch: 1,
+            frame_id: 2,
+            captured_at_ms: 1_000_049,
+            oldest_captured_at_ms: None,
+            embedding: vec![1.0, 1.0],
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            model_generation: Some(1),
+        })
+        .unwrap();
+
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            sup.tick(0.02).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("runner timeout")
+            .expect("runner panic");
+
+        let end_obs = sup.get_observation().await;
+        let end_pol = end_obs.policy.expect("policy obs");
+        assert_eq!(end_pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+        assert!(end_pol.steps >= 1);
+        assert_eq!(end_pol.vision_frame_id, Some(2));
+        assert!(non_home_writes.load(Ordering::SeqCst) >= 1);
+    }
+
+    // Part 2: lease loss with on_stale = "hold" STILL terminates immediately with LEASE_LOST
+    {
+        let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+        let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+        let inner_backend = load_backend(&snapshot, &contract).unwrap();
+        let infer_entered = Arc::new(Notify::new());
+        let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+        let barrier_backend = Box::new(BarrierBackend {
+            inner: inner_backend,
+            infer_entered: infer_entered.clone(),
+            allow_finish: allow_finish.clone(),
+        });
+        let prepared =
+            PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let non_home_writes = Arc::new(AtomicUsize::new(0));
+        let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+        sup.set_follower("so-arm101").await;
+
+        let hub = embedding_hub_for_supervisor(&sup);
+        hub.set_test_now_ms(Some(1_000_000));
+        let hs = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+        hub.ingest_embedding(EmbeddingIngestRequest {
+            handshake_generation: hs.handshake_generation,
+            producer_epoch: 1,
+            frame_id: 1,
+            captured_at_ms: 1_000_000,
+            oldest_captured_at_ms: None,
+            embedding: vec![1.0, 1.0],
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            model_generation: Some(1),
+        })
+        .unwrap();
+
+        let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 20);
+        let gate = ReleaseGate::parse_and_verify(
+            &raw_gate,
+            &digest,
+            &cfg,
+            prepared.contract(),
+            20.0,
+            &ActiveDeploymentContext {
+                scene_id: "pcb_suction".into(),
+                tool_id: "suction".into(),
+                calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+            },
+        )
+        .unwrap();
+
+        let lease_gen = sup.acquire_lease("conn-m1-lease").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-m1-lease".into(),
+                    lease_generation: lease_gen,
+                    policy_id: "vid_m1_lease".into(),
+                    artifact_digest: digest,
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(gate),
+                })
+                .unwrap()
+        };
+
+        writes.store(0, Ordering::SeqCst);
+        non_home_writes.store(0, Ordering::SeqCst);
+
+        let runner = spawn_policy_runner(
+            sup.clone(),
+            action_id,
+            prepared,
+            20.0,
+            compute_policy_deadline(Some(2.0)).unwrap(),
+            None,
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+            .await
+            .expect("timed out waiting for BarrierBackend::infer");
+
+        let _ = sup.preempt_lease("conn-hijack", "hijack").await.unwrap();
+
+        {
+            let (lock, cvar) = &*allow_finish;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("runner timeout")
+            .expect("runner panic");
+
+        let obs = sup.get_observation().await;
+        let pol = obs.policy.expect("policy obs");
+        assert_eq!(pol.stop_reason.as_deref(), Some("LEASE_LOST"));
+        assert_eq!(pol.steps, 0);
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+    }
+}

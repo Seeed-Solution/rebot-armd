@@ -454,26 +454,13 @@ fn infer_same_host(
     peer_addr: Option<std::net::SocketAddr>,
     headers: &axum::http::HeaderMap,
 ) -> bool {
-    if header_forwarded_non_loopback(headers) {
+    let Some(addr) = peer_addr else {
+        return false;
+    };
+    if !addr.ip().is_loopback() {
         return false;
     }
-    if let Some(addr) = peer_addr {
-        return addr.ip().is_loopback();
-    }
-    let Some(host) = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return true;
-    };
-    let hostname = host
-        .trim()
-        .strip_prefix('[')
-        .and_then(|s| s.split(']').next())
-        .unwrap_or_else(|| host.trim().split(':').next().unwrap_or(""));
-    hostname.eq_ignore_ascii_case("localhost")
-        || hostname == "127.0.0.1"
-        || hostname == "::1"
+    !header_forwarded_non_loopback(headers)
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -535,4 +522,32 @@ async fn post_vision_embedding(
     hub.ingest_embedding(req)
         .map(axum::Json)
         .map_err(embedding_err_to_api)
+}
+
+#[cfg(all(test, feature = "policy-runtime"))]
+mod tests {
+    use super::infer_same_host;
+    use axum::http::{header, HeaderMap, HeaderValue};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn infer_same_host_requires_loopback_peer_and_rejects_forwarded_or_missing_peer() {
+        let mut localhost_host_hdr = HeaderMap::new();
+        localhost_host_hdr.insert(header::HOST, HeaderValue::from_static("localhost:8765"));
+        assert!(!infer_same_host(None, &localhost_host_hdr));
+
+        let lo_v4 = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50000));
+        let lo_v6 = Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50000));
+        let empty = HeaderMap::new();
+        assert!(infer_same_host(lo_v4, &empty));
+        assert!(infer_same_host(lo_v6, &empty));
+
+        let mut xff = HeaderMap::new();
+        xff.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.50"));
+        assert!(!infer_same_host(lo_v4, &xff));
+
+        let remote = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 50000));
+        assert!(!infer_same_host(remote, &empty));
+        assert!(!infer_same_host(remote, &localhost_host_hdr));
+    }
 }

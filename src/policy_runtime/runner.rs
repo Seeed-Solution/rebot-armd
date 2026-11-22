@@ -1346,14 +1346,24 @@ pub fn spawn_policy_runner(
             // calibration hashing / release-gate / deployment checks, and immediately commit
             // `policy_step_with_vision` with zero intervening work.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
-            let mut hold_on_unbroken_renewal = false;
+            let mut hold_step = false;
+            let hold_on_stale = video_embedding_spec
+                .as_ref()
+                .is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
                     Ok(now_ms) => Some(now_ms),
                     Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual })
                         if actual != 0 && guard.is_unbroken_active_renewal(expected) =>
                     {
-                        hold_on_unbroken_renewal = true;
+                        hold_step = true;
+                        None
+                    }
+                    Err(
+                        TicketViolation::WindowNewestExpired { .. }
+                        | TicketViolation::WindowOldestExpired { .. },
+                    ) if hold_on_stale => {
+                        hold_step = true;
                         None
                     }
                     Err(violation) => {
@@ -1364,7 +1374,7 @@ pub fn spawn_policy_runner(
             } else {
                 None
             };
-            if hold_on_unbroken_renewal {
+            if hold_step {
                 inner.hold_policy_run(action_id);
                 continue;
             }

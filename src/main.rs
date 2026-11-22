@@ -434,7 +434,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         listener.local_addr()?
     );
     let router = create_router_with_auth(supervisor.clone(), operator_auth);
-    let mut server_handle = tokio::spawn(async move { axum::serve(listener, router).await });
+    let mut server_handle = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
     let mut server_finished = false;
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
