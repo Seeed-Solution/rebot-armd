@@ -182,6 +182,22 @@ impl DetectorUpstream {
         Ok(Self { host: host.to_string(), port, base_path: path.to_string() })
     }
 
+    /// True when the upstream host is a loopback address (`localhost`, `127.0.0.0/8`, `::1`,
+    /// or IPv4-mapped `::ffff:127.0.0.0/104`).
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+            return v4.is_loopback();
+        }
+        if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+            return v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback());
+        }
+        false
+    }
+
     /// `ARMD_DETECTOR_URL` if set and valid, else [`DEFAULT_DETECTOR_URL`].
     pub fn from_env() -> Self {
         match std::env::var("ARMD_DETECTOR_URL") {
@@ -538,6 +554,22 @@ pub(crate) async fn fetch_snapshot(up: &DetectorUpstream, timeout: Duration) -> 
         .map_err(|_| "snapshot timed out".to_string())??;
     if !r.status.is_success() { return Err(format!("snapshot returned {}", r.status)); }
     Ok(r.body)
+}
+
+/// One raw HTTP request to the detector control port returning `(status, content_type, body)`
+/// for armd's internal binary endpoints (e.g. `GET /api/frame/gray`).
+pub(crate) async fn request_status_bytes(
+    up: &DetectorUpstream,
+    method: &str,
+    path_and_query: &str,
+    timeout: Duration,
+) -> Result<(StatusCode, Option<String>, Vec<u8>), String> {
+    let method = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(timeout, upstream_request(up, method, path_and_query, None))
+        .await
+        .map_err(|_| "detector timed out".to_string())??;
+    let ct = r.content_type.and_then(|v| v.to_str().ok().map(str::to_string));
+    Ok((r.status, ct, r.body))
 }
 
 /// GET /api/v1/detection/mask_focus -> upstream GET /api/mask_focus
