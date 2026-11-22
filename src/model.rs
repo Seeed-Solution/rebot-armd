@@ -1397,12 +1397,66 @@ impl ArmConfig {
             .or_else(|| self.active_tool.is_stock.then_some([0.0; 3]))
     }
 
-    /// Recompute `workspace.check_points_end_m` as the deduplicated 4-layer union of
-    /// `base_check_points_end_m`, `tcp_offset` (if nonzero), `permanent_tool_check_points_end_m`,
+    /// Collect the deduplicated tool/workspace envelope check points in `end_link` frame (m):
+    /// `base_check_points_end_m` (or `workspace.check_points_end_m`), `tcp_offset` (if nonzero),
+    /// `physical_contact_end_m` (if non-stock or nonzero), `permanent_tool_check_points_end_m`,
     /// and `transient_payload_check_points_end_m`.
+    pub fn effective_tool_envelope_points_end_m(&self) -> Vec<[f32; 3]> {
+        let base_slice = if !self.base_check_points_end_m.is_empty() {
+            self.base_check_points_end_m.as_slice()
+        } else {
+            self.workspace
+                .as_ref()
+                .map(|w| w.check_points_end_m.as_slice())
+                .unwrap_or(&[])
+        };
+        let mut effective: Vec<[f32; 3]> = Vec::new();
+        let mut push_unique = |pt: [f32; 3]| {
+            if !effective.iter().any(|e| {
+                (e[0] - pt[0]).abs() <= 1e-6
+                    && (e[1] - pt[1]).abs() <= 1e-6
+                    && (e[2] - pt[2]).abs() <= 1e-6
+            }) {
+                effective.push(pt);
+            }
+        };
+        for &p in base_slice {
+            push_unique(p);
+        }
+        if self.tcp_offset != [0.0; 3] {
+            push_unique([
+                self.tcp_offset[0] as f32,
+                self.tcp_offset[1] as f32,
+                self.tcp_offset[2] as f32,
+            ]);
+        }
+        if let Some(pc) = self.physical_contact_end_m {
+            if !self.active_tool.is_stock || pc != [0.0; 3] {
+                push_unique([pc[0] as f32, pc[1] as f32, pc[2] as f32]);
+            }
+        }
+        for &p in &self.permanent_tool_check_points_end_m {
+            push_unique(p);
+        }
+        for &p in &self.transient_payload_check_points_end_m {
+            push_unique(p);
+        }
+        effective
+    }
+
+    /// Recompute `workspace.check_points_end_m` as the deduplicated 4-layer union of
+    /// `base_check_points_end_m`, `tcp_offset` (if nonzero), `physical_contact_end_m`,
+    /// `permanent_tool_check_points_end_m`, and `transient_payload_check_points_end_m`.
     pub fn rebuild_effective_check_points(&mut self) -> Result<(), String> {
         crate::tool::validate_tcp_offset(&self.tcp_offset)?;
+        if let Some(pc) = &self.physical_contact_end_m {
+            crate::tool::validate_physical_contact_end_m(pc, "physical_contact_end_m")?;
+        }
+        let has_pc_layer = self
+            .physical_contact_end_m
+            .is_some_and(|p| !self.active_tool.is_stock || p != [0.0; 3]);
         let no_extra_layers = self.tcp_offset == [0.0; 3]
+            && !has_pc_layer
             && self.permanent_tool_check_points_end_m.is_empty()
             && self.transient_payload_check_points_end_m.is_empty();
         if self.base_check_points_end_m.is_empty() && !no_extra_layers {
@@ -1438,32 +1492,7 @@ impl ArmConfig {
         if self.base_check_points_end_m.is_empty() && no_extra_layers {
             return Ok(());
         }
-        let mut effective: Vec<[f32; 3]> = Vec::new();
-        let mut push_unique = |pt: [f32; 3]| {
-            if !effective.iter().any(|e| {
-                (e[0] - pt[0]).abs() <= 1e-6
-                    && (e[1] - pt[1]).abs() <= 1e-6
-                    && (e[2] - pt[2]).abs() <= 1e-6
-            }) {
-                effective.push(pt);
-            }
-        };
-        for &p in &self.base_check_points_end_m {
-            push_unique(p);
-        }
-        if self.tcp_offset != [0.0; 3] {
-            push_unique([
-                self.tcp_offset[0] as f32,
-                self.tcp_offset[1] as f32,
-                self.tcp_offset[2] as f32,
-            ]);
-        }
-        for &p in &self.permanent_tool_check_points_end_m {
-            push_unique(p);
-        }
-        for &p in &self.transient_payload_check_points_end_m {
-            push_unique(p);
-        }
+        let effective = self.effective_tool_envelope_points_end_m();
         if effective.len() > crate::tool::MAX_EFFECTIVE_CHECK_POINTS {
             return Err(format!(
                 "effective check_points_end_m count {} exceeds limit {}",
@@ -1920,6 +1949,7 @@ impl ArmConfig {
             || !self.permanent_tool_check_points_end_m.is_empty()
             || !self.transient_payload_check_points_end_m.is_empty()
             || self.tcp_offset != [0.0; 3]
+            || self.physical_contact_end_m.is_some()
         {
             self.rebuild_effective_check_points()?;
         }

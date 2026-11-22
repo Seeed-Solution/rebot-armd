@@ -2076,6 +2076,27 @@ pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount, rec: &Mat3) -
     pts
 }
 
+/// [`envelope`] additionally ensuring any declared `physical_contact_end_m` is included
+/// (deduplicated within 1e-6 m) in table-clearance checks.
+pub fn envelope_with_contact(
+    ws: Option<&WorkspacePolicy>,
+    mount: &CameraMount,
+    rec: &Mat3,
+    physical_contact_end_m: Option<[f64; 3]>,
+) -> Vec<Vec3> {
+    let mut pts = envelope(ws, mount, rec);
+    if let Some(pc) = physical_contact_end_m {
+        if !pts.iter().any(|e| {
+            (e[0] - pc[0]).abs() <= 1e-6
+                && (e[1] - pc[1]).abs() <= 1e-6
+                && (e[2] - pc[2]).abs() <= 1e-6
+        }) {
+            pts.push(pc);
+        }
+    }
+    pts
+}
+
 /// Samples of the straight Cartesian path `from` → `to` as `motion::plan_cartesian`
 /// interpolates it (linear position, rotation along the geodesic): (s, pose), s in (0, 1].
 fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
@@ -4071,7 +4092,8 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
     };
-    let envelope = envelope(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec);
+    let contact_end_m = sup.inner().read().await.config.effective_physical_contact_end_m();
+    let envelope = envelope_with_contact(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec, contact_end_m);
     let lens_known = planned.input.cam.offset_m.is_some();
     let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, tcp_offset: planned.input.tcp_offset, triggered, lens_known, depth_available, generation };
     let result = if let Err(e) = per_request {

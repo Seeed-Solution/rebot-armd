@@ -636,7 +636,11 @@ impl SupervisorInner {
         let approach_moves_gripper = gripper_idx.is_some_and(|g| {
             input.request.gripper && (first[g] - self.commanded_positions[g]).abs() > 1e-3
         });
-        if input.request.gripper && (plan.has_gripper_motion || approach_moves_gripper) && !plan.tool_provenance_ok {
+        let tool_provenance_ok = self
+            .config
+            .active_tool
+            .matches_record(plan.recorded_tool_id.as_deref(), plan.recorded_tool_digest.as_deref());
+        if input.request.gripper && (plan.has_gripper_motion || approach_moves_gripper) && !tool_provenance_ok {
             return Err(rejected(409, "TOOL_MISMATCH", format!(
                 "Episode '{}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({})",
                 input.request.episode, plan.recorded_tool_id, plan.recorded_tool_digest, self.config.active_tool.id, self.config.active_tool.config_digest
@@ -769,5 +773,63 @@ mod tests {
         // 3. Stock active tool + gripper: true -> allowed (legacy provenance)
         let stock_plan = plan_frames(make_input(&cfg, true), &frames).unwrap();
         assert!(stock_plan.tool_provenance_ok);
+    }
+
+    #[test]
+    fn r4_m6_install_replay_rechecks_receiving_supervisor_active_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+        let mut stock_cfg = crate::model::ArmConfig::rebot_dm();
+        stock_cfg.validate().unwrap();
+        let finray_pack: crate::tool::ToolPackConfig = serde_json::from_value(serde_json::json!({
+            "id": "soft_finray_gripper",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.0288, 0.0, 0.0]
+        })).unwrap();
+        let mut non_stock_cfg = crate::tool::apply_tool_overlay(&stock_cfg, &finray_pack).unwrap();
+        non_stock_cfg.active_tool.commissioning_required = false;
+
+        let q0 = vec![0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -1.0];
+        let mut q1 = q0.clone();
+        q1[6] = -0.2;
+        let mut recv = SupervisorInner::new(non_stock_cfg);
+        recv.lease_enabled = false;
+        recv.set_torque(true).unwrap();
+        recv.commanded_positions = q0.clone();
+        recv.measured_positions = q0.clone();
+        recv.target_positions = q0.clone();
+        let recv_epoch = recv.safety.epoch_id();
+
+        let frames = vec![frame(0.0, &q0), frame(0.5, &q0), frame(1.0, &q1)];
+        let stock_plan = plan_frames(ReplayInput {
+            request: ReplayRequest { episode: "stock_mem".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false },
+            path: dir.path().join("unused.parquet"),
+            profile_id: stock_cfg.profile_id.clone(),
+            dof: stock_cfg.dof,
+            arm_dof: stock_cfg.arm_dof(),
+            gripper_idx: stock_cfg.gripper_index(),
+            joint_names: stock_cfg.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: stock_cfg.limits.clone(),
+            speed_limits: stock_cfg.limits.clone(),
+            ws: None,
+            arm: stock_cfg.arm_model.clone(),
+            start: q0,
+            control_hz: 50,
+            epoch: recv_epoch,
+            workspace_revision: 0,
+            power: None,
+            store,
+            zero_offsets: vec![0.0; stock_cfg.dof],
+            tcp_offset: stock_cfg.tcp_offset,
+            active_tool: stock_cfg.active_tool.clone(),
+        }, &frames).unwrap();
+        assert!(stock_plan.tool_provenance_ok);
+
+        let err = recv.install_replay(stock_plan).unwrap_err();
+        match err {
+            ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
+            other => panic!("expected 409 TOOL_MISMATCH on cross-tool install_replay, got {other:?}"),
+        }
     }
 }

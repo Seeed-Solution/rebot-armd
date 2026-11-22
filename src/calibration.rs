@@ -170,24 +170,42 @@ pub fn x_fingerprint(intrinsics: Option<&Value>, mount: &CameraMount) -> String 
 }
 
 /// Fingerprint of everything an acceptance depends on: [`x_fingerprint`], the kinematic
-/// correction, the joint zero (offsets, method, time) and the tool (id, tip, opening, edge).
-pub fn fingerprint(x_fp: &str, kin: Option<&Correction>, offsets: &[f32], zero: Option<&crate::joint_zero::JointZero>, tool: Option<&ToolCalibration>) -> String {
+/// correction, the joint zero (offsets, method, time), the measured tool record, and the active
+/// tool configuration digest.
+pub fn fingerprint(
+    x_fp: &str,
+    kin: Option<&Correction>,
+    offsets: &[f32],
+    zero: Option<&crate::joint_zero::JointZero>,
+    tool: Option<&ToolCalibration>,
+    active_tool_digest: Option<&str>,
+) -> String {
     let z = zero.map(|z| json!([z.method, z.set_at]));
-    let t = tool.map(|t| json!([t.tool_id, t.tip_cam_m, t.gripper_opening, t.edge_to_low_m]));
-    fnv64(&format!("f1|{x_fp}|{}|{}|{}|{}", json!(kin), json!(offsets), json!(z), json!(t)))
+    let t = tool.map(|t| json!([t.tool_id, t.tip_cam_m, t.gripper_opening, t.edge_to_low_m, t.tool_config_digest]));
+    fnv64(&format!("f1|{x_fp}|{}|{}|{}|{}|{}", json!(kin), json!(offsets), json!(z), json!(t), json!(active_tool_digest)))
 }
 
-/// (x_fingerprint, fingerprint) of a calibration file with the camera mount `mount` and the
-/// live joint zero offsets.
-pub fn file_fingerprints(c: Option<&CalibrationFile>, mount: &CameraMount, offsets: &[f32]) -> (String, String) {
+/// (x_fingerprint, fingerprint) of a calibration file with the camera mount `mount`, the live
+/// joint zero offsets, and the active tool digest.
+pub fn file_fingerprints(
+    c: Option<&CalibrationFile>,
+    mount: &CameraMount,
+    offsets: &[f32],
+    active_tool_digest: Option<&str>,
+) -> (String, String) {
     let x = x_fingerprint(c.and_then(|c| c.intrinsics.as_ref()), mount);
-    let f = fingerprint(&x, correction_of(c), offsets, c.and_then(|c| c.joint_zero.as_ref()), c.and_then(|c| c.tool.as_ref()));
+    let f = fingerprint(&x, correction_of(c), offsets, c.and_then(|c| c.joint_zero.as_ref()), c.and_then(|c| c.tool.as_ref()), active_tool_digest);
     (x, f)
 }
 
 /// (x_fingerprint, fingerprint) of the calibration in effect.
 pub fn live_fingerprints(inner: &SupervisorInner) -> (String, String) {
-    file_fingerprints(inner.calibration.as_ref(), &inner.config.camera_mount, &inner.joint_zero_offsets)
+    file_fingerprints(
+        inner.calibration.as_ref(),
+        &inner.config.camera_mount,
+        &inner.joint_zero_offsets,
+        Some(&inner.config.active_tool.config_digest),
+    )
 }
 
 /// The stored fingertip is valid: bound to the camera calibration whose x fingerprint is `x_fp`.
@@ -478,7 +496,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             let candidate = compute_reset_camera_model(&inner);
             if let Some(setup) = candidate {
                 if let Some(p) = setup_path {
-                    match persist_reset_setup_rename(p, &setup) {
+                    match persist_reset_setup_rename(p, &setup, &inner.config.active_tool) {
                         Ok(dir_sync) => {
                             let prof_mount = inner.profile_camera_mount.clone();
                             inner.set_camera_mount(prof_mount);
@@ -529,8 +547,13 @@ fn compute_reset_camera_model(inner: &SupervisorInner) -> Option<GraspSetup> {
 }
 
 /// Keep a copy of `grasp_setup.json`, then stage and atomically rename the reset setup
-/// returning `PendingDirSync` so directory `sync_all()` runs outside the supervisor lock.
-fn persist_reset_setup_rename(path: &Path, setup: &GraspSetup) -> Result<crate::persist::PendingDirSync, String> {
+/// stamped with active-tool provenance, returning `PendingDirSync` so directory `sync_all()` runs
+/// outside the supervisor lock.
+fn persist_reset_setup_rename(
+    path: &Path,
+    setup: &GraspSetup,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> Result<crate::persist::PendingDirSync, String> {
     if path.is_file() {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         std::fs::copy(path, path.with_file_name(format!("{name}.pre-reset-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))))
@@ -538,7 +561,7 @@ fn persist_reset_setup_rename(path: &Path, setup: &GraspSetup) -> Result<crate::
     }
     let staged = crate::persist::StagedWrite::stage(
         path.to_path_buf(),
-        serde_json::to_string_pretty(setup).unwrap_or_default(),
+        crate::grasp::serialize_setup_for_tool(setup, active_tool),
     )?;
     staged.rename_only()
 }
@@ -761,6 +784,10 @@ struct ArmdState {
     camera_mount: CameraMount,
     calibration: Option<CalibrationFile>,
     grasp_setup: Option<GraspSetup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_config_digest: Option<String>,
     /// Apply: the grip pixel of the new camera model ([`grip_pixel_norm`]), also when it is
     /// outside the image (then `grip_pixel_norm` is left as it was).
     #[serde(skip)]
@@ -768,7 +795,14 @@ struct ArmdState {
 }
 
 fn armd_state(inner: &SupervisorInner) -> ArmdState {
-    ArmdState { camera_mount: inner.config.camera_mount.clone(), calibration: inner.calibration.clone(), grasp_setup: inner.config.grasp.clone(), grip_pixel_model: None }
+    ArmdState {
+        camera_mount: inner.config.camera_mount.clone(),
+        calibration: inner.calibration.clone(),
+        grasp_setup: inner.config.grasp.clone(),
+        tool_id: Some(inner.config.active_tool.id.clone()),
+        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+        grip_pixel_model: None,
+    }
 }
 
 pub(crate) fn mount_summary(m: &CameraMount) -> Value {
@@ -848,7 +882,12 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         tool,
         acceptance: None,
     };
-    let (_, fp) = file_fingerprints(Some(&file), &mount, &inner.joint_zero_offsets);
+    let (_, fp) = file_fingerprints(
+        Some(&file),
+        &mount,
+        &inner.joint_zero_offsets,
+        Some(&inner.config.active_tool.config_digest),
+    );
     if let Some(a) = &req.acceptance {
         if a.fingerprint != fp {
             return Err(CalibError::new(409, "ACCEPTANCE_STALE", "acceptance.fingerprint does not match this calibration (camera, kinematics, joint zero or tool changed since the hovers); run the acceptance again"));
@@ -879,7 +918,14 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
             return Err(CalibError::invalid("table_z_source hover: table_z_m must equal acceptance.summary.table_z_m"));
         }
     }
-    Ok(ArmdState { camera_mount: mount, calibration: Some(file), grasp_setup: Some(setup), grip_pixel_model })
+    Ok(ArmdState {
+        camera_mount: mount,
+        calibration: Some(file),
+        grasp_setup: Some(setup),
+        tool_id: Some(inner.config.active_tool.id.clone()),
+        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+        grip_pixel_model,
+    })
 }
 
 // ---- rebot-vision ----
@@ -996,7 +1042,8 @@ async fn write_backup(deps: &CalibrationDeps, reason: &str, vision: &Value, stat
     let root = deps.backup_dir.clone();
     let (calib, setup) = (deps.path.clone(), deps.setup_path.clone());
     let manifest = json!({"created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "reason": reason,
-        "camera_mount": state.camera_mount, "calibration": state.calibration, "grasp_setup": state.grasp_setup});
+        "camera_mount": state.camera_mount, "calibration": state.calibration, "grasp_setup": state.grasp_setup,
+        "tool_id": state.tool_id, "tool_config_digest": state.tool_config_digest});
     let vision = vision.clone();
     blocking(move || {
         std::fs::create_dir_all(&root)?;
@@ -1466,14 +1513,19 @@ impl Txn<'_> {
 
 fn diff_view(vision: &Value, state: &ArmdState, inner: &SupervisorInner) -> Value {
     let c = state.calibration.as_ref();
-    let (x_fp, fp) = file_fingerprints(c, &state.camera_mount, &inner.joint_zero_offsets);
+    let (x_fp, fp) = file_fingerprints(
+        c,
+        &state.camera_mount,
+        &inner.joint_zero_offsets,
+        Some(&inner.config.active_tool.config_digest),
+    );
     let mut v = json!({"vision_intrinsics": vision, "camera_mount": mount_summary(&state.camera_mount),
         "kinematics": c.and_then(|c| c.kinematics.as_ref()),
         "grasp": state.grasp_setup.as_ref().map(grasp_fields),
         "x_fingerprint": x_fp, "fingerprint": fp,
         "table_z_m": c.and_then(|c| c.table_z_m), "table_z_source": c.and_then(|c| c.table_z_source.as_deref()),
         "tool": c.and_then(|c| c.tool.as_ref()), "acceptance": c.and_then(|c| c.acceptance.as_ref()).map(|a| json!({"passed": a.passed, "fingerprint": a.fingerprint, "job_id": a.job_id})),
-        "floor": inner.profile_floor_z_m.map(|p| floor_view(p, c, &fp))});
+        "floor": inner.profile_floor_z_m.map(|p| floor_view_for(p, c, &fp, &inner.config.active_tool))});
     if let Some(p) = state.grip_pixel_model { v["grip_pixel_model"] = json!(p); }
     v
 }
@@ -1520,25 +1572,46 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
     let (before, active_tool) = {
         let inner = sup.inner().read().await;
-        if let Some(g) = &target.grasp_setup {
-            if let Some(gp) = inner.config.gripper_policy.as_ref() {
-                let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
-                crate::model::validate_effective_gripper_policy_with_mode(
-                    gp,
-                    lim,
-                    Some(g.max_grasp_width_m),
-                    true,
-                    !inner.requires_real_jaw_curve(),
-                )
-                .map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup incompatible with gripper_policy: {e}")))?;
-            }
-        }
         if let Some(k) = target.calibration.as_ref().and_then(|c| c.kinematics.as_ref()) {
             inner.config.arm_model.with_correction(Some(&k.joints)).map_err(|e| CalibError::new(400, "UNSUPPORTED", format!("backup {name}: {e}")))?;
         }
         if correction_of(target.calibration.as_ref()) != correction_of(inner.calibration.as_ref()) { kinematics_armed(&inner)?; }
         (armd_state(&inner), inner.config.active_tool.clone())
     };
+    let (backup_tool_id, backup_tool_digest) = if target.tool_id.is_some() || target.tool_config_digest.is_some() {
+        (target.tool_id.clone(), target.tool_config_digest.clone())
+    } else if let Some(gs_val) = std::fs::read_to_string(dir.join("grasp_setup.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    {
+        (
+            gs_val.get("tool_id").and_then(Value::as_str).map(str::to_string),
+            gs_val.get("tool_config_digest").and_then(Value::as_str).map(str::to_string),
+        )
+    } else {
+        (None, None)
+    };
+    let tool_matches = active_tool.matches_record(backup_tool_id.as_deref(), backup_tool_digest.as_deref());
+    if !tool_matches && target.grasp_setup.is_some() {
+        tracing::warn!(
+            "Calibration restore {name}: stripping tool-scoped grasp_setup for {:?}/{:?} (active tool is '{}' / '{}')",
+            backup_tool_id, backup_tool_digest, active_tool.id, active_tool.config_digest
+        );
+        target.grasp_setup = None;
+    } else if let Some(g) = &target.grasp_setup {
+        let inner = sup.inner().read().await;
+        if let Some(gp) = inner.config.gripper_policy.as_ref() {
+            let lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
+            crate::model::validate_effective_gripper_policy_with_mode(
+                gp,
+                lim,
+                Some(g.max_grasp_width_m),
+                true,
+                !inner.requires_real_jaw_curve(),
+            )
+            .map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup incompatible with gripper_policy: {e}")))?;
+        }
+    }
     // Tool-dependent fingertip / hover acceptance records from another tool do not carry over across tool swaps.
     if let Some(c) = target.calibration.as_mut() {
         strip_mismatched_tool_records(c, &active_tool);

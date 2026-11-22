@@ -3830,21 +3830,15 @@ fn remote_target_matches_local(
     target_scene_digest: &Option<String>,
     target_tool_digest: &Option<String>,
 ) -> bool {
-    let scene_ok = match sim_val.get("scene").filter(|v| !v.is_null()) {
-        Some(v) => v.as_str() == Some(target_scene),
-        None => true,
+    let scene_ok = sim_val.get("scene").and_then(|v| v.as_str()) == Some(target_scene);
+    let tool_ok = sim_val.get("tool").and_then(|v| v.as_str()) == Some(target_tool);
+    let sd_ok = match target_scene_digest.as_deref() {
+        Some(expected) => sim_val.get("scene_digest").and_then(|v| v.as_str()) == Some(expected),
+        None => sim_val.get("scene_digest").is_none_or(serde_json::Value::is_null),
     };
-    let tool_ok = match sim_val.get("tool").filter(|v| !v.is_null()) {
-        Some(v) => v.as_str() == Some(target_tool),
-        None => true,
-    };
-    let sd_ok = match sim_val.get("scene_digest").filter(|v| !v.is_null()) {
-        Some(v) => v.as_str().is_some_and(|sd| target_scene_digest.as_deref() == Some(sd)),
-        None => true,
-    };
-    let td_ok = match sim_val.get("tool_digest").filter(|v| !v.is_null()) {
-        Some(v) => v.as_str().is_some_and(|td| target_tool_digest.as_deref() == Some(td)),
-        None => true,
+    let td_ok = match target_tool_digest.as_deref() {
+        Some(expected) => sim_val.get("tool_digest").and_then(|v| v.as_str()) == Some(expected),
+        None => sim_val.get("tool_digest").is_none_or(serde_json::Value::is_null),
     };
     scene_ok && tool_ok && sd_ok && td_ok
 }
@@ -4414,6 +4408,20 @@ async fn reconcile_lost_commit_ack(
     let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body).unwrap_or(serde_json::Value::Null);
     let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
     if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+        if !remote_target_matches_local(
+            &sim_val,
+            &snap.target_scene,
+            &snap.target_tool,
+            &snap.target_scene_digest,
+            &snap.target_tool_digest,
+        ) {
+            return Err(tx_json_err(
+                StatusCode::CONFLICT,
+                "SIM_RECOVERY_INCOMPATIBLE",
+                &tx_id,
+                "Remote /sim/state COMMITTED target does not match local transaction target",
+            ));
+        }
         return Ok(None);
     }
     if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
@@ -4799,10 +4807,17 @@ pub async fn activate(
                 ));
             }
             Ok(resp) if resp.status == StatusCode::SERVICE_UNAVAILABLE && is_degraded_response(&resp.body) => {
-                // M3: store the remote split owner tx_id (from response or GET /sim/state), NOT the newly requested tx_id
+                // M3: store the explicit remote split owner tx_id (from response or GET /sim/state),
+                // never substituting the newly requested tx_id for an unknown owner, and require explicit
+                // target verification before setting target_matches_tx=true.
                 let detail = String::from_utf8_lossy(&resp.body).to_string();
+                let mut sim_val = serde_json::from_slice::<serde_json::Value>(&resp.body)
+                    .unwrap_or(serde_json::Value::Null);
                 let mut owner_tx = extract_remote_tx_id(&resp.body);
-                if owner_tx.is_none() {
+                if owner_tx.is_none()
+                    || sim_val.get("scene").is_none_or(serde_json::Value::is_null)
+                    || sim_val.get("tool").is_none_or(serde_json::Value::is_null)
+                {
                     if let Ok(sresp) = sim_tx_call(
                         &upstream,
                         Method::GET,
@@ -4813,14 +4828,45 @@ pub async fn activate(
                     .await
                     {
                         if sresp.status.is_success() {
-                            owner_tx = extract_remote_tx_id(&sresp.body);
+                            if owner_tx.is_none() {
+                                owner_tx = extract_remote_tx_id(&sresp.body);
+                            }
+                            if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
+                                if sim_val.is_null() {
+                                    sim_val = sv;
+                                } else if let (Some(dst), Some(src)) = (sim_val.as_object_mut(), sv.as_object()) {
+                                    for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
+                                        if dst.get(k).is_none_or(serde_json::Value::is_null) {
+                                            if let Some(v) = src.get(k) {
+                                                dst.insert(k.to_string(), v.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                let owner_tx_id = owner_tx.unwrap_or_else(|| tx_id.clone());
-                let target_matches_tx = owner_tx_id == tx_id;
+                let (owner_tx_id, target_matches_tx) = match owner_tx {
+                    Some(remote_owner) if remote_owner == tx_id => {
+                        let matches = remote_target_matches_local(
+                            &sim_val,
+                            &snap.target_scene,
+                            &snap.target_tool,
+                            &snap.target_scene_digest,
+                            &snap.target_tool_digest,
+                        );
+                        (remote_owner, matches)
+                    }
+                    Some(remote_owner) => (remote_owner, false),
+                    None => (format!("unknown-split-{tx_id}"), false),
+                };
                 let mut tx_w = state.tx_state.write().await;
-                *tx_w = snap.into_degraded(owner_tx_id.clone(), target_matches_tx, detail.clone());
+                *tx_w = if target_matches_tx {
+                    snap.into_degraded(owner_tx_id.clone(), true, detail.clone())
+                } else {
+                    foreign_degraded_from_sim_val(&snap, owner_tx_id.clone(), &sim_val, detail.clone())
+                };
                 return Err(degraded_split_http_error(&owner_tx_id, &detail));
             }
             Ok(resp)
@@ -5045,13 +5091,15 @@ pub async fn recover_split(
             let r_scene = sim_val
                 .get("scene")
                 .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| prev_active.active_scene.clone());
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let r_tool = sim_val
                 .get("tool")
                 .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| prev_active.active_tool.clone());
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let r_sd = sim_val
                 .get("scene_digest")
                 .and_then(|v| v.as_str())
@@ -5105,38 +5153,51 @@ pub async fn recover_split(
                     } else {
                         (
                             false,
-                            r_scene.clone(),
-                            r_tool.clone(),
+                            r_scene.unwrap_or_default(),
+                            r_tool.unwrap_or_default(),
                             prev_active.active_policy.clone(),
                             prev_active.seed,
                             prev_active.auto_start_policy,
                             String::new(),
-                            r_sd.clone(),
-                            r_td.clone(),
+                            r_sd,
+                            r_td,
                         )
                     }
                 }
-                _ => {
-                    let (ok, mjcf, sd, td) = resolve_remote_target_locally(
-                        &state,
-                        &running_robot,
-                        &r_scene,
-                        &r_tool,
-                        r_sd,
-                        r_td,
-                    );
-                    (
-                        ok,
-                        r_scene,
-                        r_tool,
+                _ => match (r_scene, r_tool) {
+                    (Some(rs), Some(rt)) => {
+                        let (ok, mjcf, sd, td) = resolve_remote_target_locally(
+                            &state,
+                            &running_robot,
+                            &rs,
+                            &rt,
+                            r_sd,
+                            r_td,
+                        );
+                        (
+                            ok,
+                            rs,
+                            rt,
+                            prev_active.active_policy.clone(),
+                            prev_active.seed,
+                            prev_active.auto_start_policy,
+                            mjcf,
+                            sd,
+                            td,
+                        )
+                    }
+                    (rs_opt, rt_opt) => (
+                        false,
+                        rs_opt.unwrap_or_default(),
+                        rt_opt.unwrap_or_default(),
                         prev_active.active_policy.clone(),
                         prev_active.seed,
                         prev_active.auto_start_policy,
-                        mjcf,
-                        sd,
-                        td,
-                    )
-                }
+                        String::new(),
+                        r_sd,
+                        r_td,
+                    ),
+                },
             };
 
             let (eff_prev_tx, eff_prev_scene, eff_prev_tool, eff_prev_sd, eff_prev_td) = match &cur_tx {

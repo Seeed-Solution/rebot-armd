@@ -364,23 +364,6 @@ pub fn table_clear_iter<'a>(arm: &crate::chain::ArmModel, points: &[crate::kinem
     check_table_clear(arm, points, bound, qs).map_err(|v| v.message())
 }
 
-/// Convert a [`table_clear`] failure into a `WORKSPACE_VIOLATION` [`MotionError`].
-pub fn table_violation_from_clear(msg: String) -> MotionError {
-    MotionError::WorkspaceViolation {
-        s: 1.0,
-        point: 0,
-        limit: "table_z_m + 0.005".into(),
-        value: 0.0,
-        bound: 0.0,
-        detail: Box::new(crate::kinematics::WorkspaceViolationDetail {
-            constraint_id: Some("table_z".into()),
-            geometry_id: None,
-            violation_phase: Some("plan".into()),
-            reason: Some(msg),
-        }),
-    }
-}
-
 /// Same-side settings of one motion, taken under the supervisor lock.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -472,7 +455,16 @@ mod runtime {
             };
             let arm = self.config.arm_joint_indices();
             let joints = policy.joint_indices(&self.config.joint_names, &arm);
-            let seg_limits = segment_limits(&self.planning_limits(), &joints, policy.speed_rad_s);
+            let planning = self.planning_limits();
+            let mut seg_limits = segment_limits(&planning, &joints, policy.speed_rad_s);
+            if self.config.active_tool.commissioning_required {
+                let gripper_idx = self.config.gripper_index();
+                for (i, (seg, base)) in seg_limits.iter_mut().zip(&planning).enumerate() {
+                    if Some(i) != gripper_idx {
+                        seg.max_velocity = seg.max_velocity.min(base.max_velocity * 0.2);
+                    }
+                }
+            }
             Ok(Plan { policy, joints, seg_limits, joint_names: self.config.joint_names.clone(), arm_dof: arm.len() })
         }
 
@@ -518,7 +510,11 @@ mod runtime {
                 Ok(x) => x,
                 Err(r) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, format!("pre_target: {r}")),
             };
-            let (seg, seg_scale) = match self.approach_segment(&pre, &target, &plan.seg_limits) {
+            let mut seg_limits = plan.seg_limits.clone();
+            for (seg, lim) in seg_limits.iter_mut().zip(limits) {
+                seg.max_velocity = seg.max_velocity.min(lim.max_velocity);
+            }
+            let (seg, seg_scale) = match self.approach_segment(&pre, &target, &seg_limits) {
                 Ok(x) => x,
                 Err(r) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, r),
             };

@@ -157,7 +157,12 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         let rec = inner.grasp_setup()
             .map(|s| crate::grasp::CamModel::assumed(&inner.config.arm_model, &s, &inner.config.camera_mount).rec)
             .unwrap_or_else(|| crate::kinematics::rpy_to_r(0.0, 0.0, f64::from(inner.config.camera_mount.rot_deg).to_radians()));
-        let pts = crate::grasp::envelope(Some(w), &inner.config.camera_mount, &rec);
+        let pts = crate::grasp::envelope_with_contact(
+            Some(w),
+            &inner.config.camera_mount,
+            &rec,
+            inner.config.effective_physical_contact_end_m(),
+        );
         let bound = inner.grasp_setup()
             .map(|s| s.table_z_m + crate::grasp::TABLE_CLEARANCE_M)
             .unwrap_or_else(|| f64::from(w.floor_z_m));

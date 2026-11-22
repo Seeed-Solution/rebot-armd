@@ -1290,7 +1290,43 @@ fn parse_mjcf_vec3(raw: &str, label: &str) -> Result<[f64; 3], String> {
     Ok([vals[0], vals[1], vals[2]])
 }
 
-fn parse_mjcf_site_rotation(node: roxmltree::Node) -> Result<crate::kinematics::Mat3, String> {
+fn parse_mjcf_compiler_euler(doc: &roxmltree::Document) -> Result<(f64, String), String> {
+    let mut angle_scale = std::f64::consts::PI / 180.0; // MuJoCo default: degree
+    let mut eulerseq = "xyz".to_string(); // MuJoCo default: xyz (intrinsic)
+    for node in doc.descendants() {
+        if node.is_element() && node.tag_name().name() == "compiler" {
+            if let Some(a) = node.attribute("angle") {
+                match a.trim() {
+                    "degree" => angle_scale = std::f64::consts::PI / 180.0,
+                    "radian" => angle_scale = 1.0,
+                    other => return Err(format!("base MJCF <compiler> uses unsupported angle unit '{other}'")),
+                }
+            }
+            if let Some(seq) = node.attribute("eulerseq") {
+                eulerseq = seq.trim().to_string();
+            }
+        }
+    }
+    let bytes = eulerseq.as_bytes();
+    let all_lower = bytes.len() == 3 && bytes.iter().all(|b| matches!(b, b'x' | b'y' | b'z'));
+    let all_upper = bytes.len() == 3 && bytes.iter().all(|b| matches!(b, b'X' | b'Y' | b'Z'));
+    if !(all_lower || all_upper) || bytes[0] == bytes[1] || bytes[1] == bytes[2] {
+        return Err(format!("base MJCF <compiler> uses unsupported eulerseq '{eulerseq}'"));
+    }
+    Ok((angle_scale, eulerseq))
+}
+
+fn axis_rot(axis: u8, angle_rad: f64) -> crate::kinematics::Mat3 {
+    let (c, s) = (angle_rad.cos(), angle_rad.sin());
+    match axis.to_ascii_lowercase() {
+        b'x' => [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+        b'y' => [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+        b'z' => [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+        _ => crate::kinematics::IDENTITY,
+    }
+}
+
+fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<crate::kinematics::Mat3, String> {
     if let Some(q_raw) = node.attribute("quat") {
         let vals: Vec<f64> = q_raw
             .split_whitespace()
@@ -1311,8 +1347,20 @@ fn parse_mjcf_site_rotation(node: roxmltree::Node) -> Result<crate::kinematics::
         ]);
     }
     if let Some(e_raw) = node.attribute("euler") {
-        let r = parse_mjcf_vec3(e_raw, "euler")?;
-        return Ok(crate::kinematics::rpy_to_r(r[0], r[1], r[2]));
+        let vals = parse_mjcf_vec3(e_raw, "euler")?;
+        let (scale, seq) = parse_mjcf_compiler_euler(doc)?;
+        let ang = [vals[0] * scale, vals[1] * scale, vals[2] * scale];
+        let b = seq.as_bytes();
+        let r0 = axis_rot(b[0], ang[0]);
+        let r1 = axis_rot(b[1], ang[1]);
+        let r2 = axis_rot(b[2], ang[2]);
+        // MuJoCo convention: lowercase = intrinsic (R0 * R1 * R2), uppercase = extrinsic (R2 * R1 * R0).
+        let rot = if b[0].is_ascii_lowercase() {
+            crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r0, &r1), &r2)
+        } else {
+            crate::kinematics::mat_mul(&crate::kinematics::mat_mul(&r2, &r1), &r0)
+        };
+        return Ok(rot);
     }
     for unsupported in ["axisangle", "xyaxes", "zaxis"] {
         if node.attribute(unsupported).is_some() {
@@ -1322,6 +1370,32 @@ fn parse_mjcf_site_rotation(node: roxmltree::Node) -> Result<crate::kinematics::
         }
     }
     Ok(crate::kinematics::IDENTITY)
+}
+
+fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
+    let req = requested.trim();
+    if !req.is_empty()
+        && base_doc
+            .descendants()
+            .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(req))
+    {
+        return Ok(req.to_string());
+    }
+    if req.is_empty() || req == "end_link" {
+        for site in base_doc.descendants() {
+            if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
+                for anc in site.ancestors().skip(1) {
+                    if anc.is_element() && anc.tag_name().name() == "body" {
+                        if let Some(bname) = anc.attribute("name").map(str::trim).filter(|s| !s.is_empty()) {
+                            return Ok(bname.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let label = if req.is_empty() { "end_link" } else { req };
+    Err(format!("Could not find attach body <body name=\"{label}\"> in base XML"))
 }
 
 fn find_xml_attr_value_span(tag_xml: &str, attr_name: &str) -> Option<(usize, usize)> {
@@ -1487,6 +1561,7 @@ pub fn compose_mjcf(
     let mut tool_equality_xml = String::new();
     let mut tool_actuator_xml = String::new();
     let mut tool_tendon_xml = String::new();
+    let mut resolved_attach_body: Option<String> = None;
 
     if is_non_stock_tool {
         let tm = tool_manifest.unwrap();
@@ -1553,27 +1628,30 @@ pub fn compose_mjcf(
                 }
             }
 
-            // Insert tool worldbody children inside <body name="{attach_body}">
-            let attach_name = if tm.attach_body.trim().is_empty() { "end_link" } else { tm.attach_body.as_str() };
-            let mut attached = false;
-            for node in base_doc.descendants() {
-                if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name) {
-                    let range = node.range();
-                    let slice = &base_xml[range.clone()];
-                    if let Some(close_idx) = slice.rfind("</body") {
-                        let insert_pos = range.start + close_idx;
-                        edits.push(XmlEdit {
-                            start: insert_pos,
-                            end: insert_pos,
-                            replacement: format!("\n{}\n", tool_worldbody_xml),
-                        });
-                        attached = true;
-                        break;
+            // Insert tool worldbody children inside resolved attach_body (e.g. `end_link` or SO-101's `gripper`).
+            if !tool_worldbody_xml.is_empty() {
+                let attach_name = resolve_attach_body_name(&base_doc, &tm.attach_body)?;
+                resolved_attach_body = Some(attach_name.clone());
+                let mut attached = false;
+                for node in base_doc.descendants() {
+                    if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name.as_str()) {
+                        let range = node.range();
+                        let slice = &base_xml[range.clone()];
+                        if let Some(close_idx) = slice.rfind("</body") {
+                            let insert_pos = range.start + close_idx;
+                            edits.push(XmlEdit {
+                                start: insert_pos,
+                                end: insert_pos,
+                                replacement: format!("\n{}\n", tool_worldbody_xml),
+                            });
+                            attached = true;
+                            break;
+                        }
                     }
                 }
-            }
-            if !attached && !tool_worldbody_xml.is_empty() {
-                return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
+                if !attached {
+                    return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
+                }
             }
 
             skip_range
@@ -1602,7 +1680,7 @@ pub fn compose_mjcf(
                     let composed_pos = if resolved_tcp == [0.0; 3] {
                         base_pos
                     } else {
-                        let r_site = parse_mjcf_site_rotation(node)?;
+                        let r_site = parse_mjcf_site_rotation(&base_doc, node)?;
                         crate::kinematics::add(
                             &base_pos,
                             &crate::kinematics::mat_vec(&r_site, &resolved_tcp),
@@ -1696,17 +1774,22 @@ pub fn compose_mjcf(
     // 5. Suction tool weld injection
     let mut suction_welds_xml = String::new();
     if is_tool_active && tool_manifest.unwrap().kind == "suction" {
-        let attach_name = &tool_manifest.unwrap().attach_body;
         let mut free_bodies = Vec::new();
         if let Some(sd) = scene_doc.as_ref() {
             free_bodies.extend(find_free_body_names(sd));
         } else {
             free_bodies.extend(find_free_body_names(&base_doc));
         }
-        for (i, bname) in free_bodies.iter().enumerate() {
-            suction_welds_xml.push_str(&format!(
-                "    <weld name=\"suction_weld_{i}_{bname}\" body1=\"{attach_name}\" body2=\"{bname}\" active=\"false\" solref=\"0.02 1\" solimp=\"0.9 0.95 0.001 0.5 2\"/>\n"
-            ));
+        if !free_bodies.is_empty() {
+            let attach_name = match resolved_attach_body.as_deref() {
+                Some(name) => name.to_string(),
+                None => resolve_attach_body_name(&base_doc, &tool_manifest.unwrap().attach_body)?,
+            };
+            for (i, bname) in free_bodies.iter().enumerate() {
+                suction_welds_xml.push_str(&format!(
+                    "    <weld name=\"suction_weld_{i}_{bname}\" body1=\"{attach_name}\" body2=\"{bname}\" active=\"false\" solref=\"0.02 1\" solimp=\"0.9 0.95 0.001 0.5 2\"/>\n"
+                ));
+            }
         }
     }
 
@@ -2201,7 +2284,7 @@ mod tests {
             .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
             .unwrap();
         let offset_pos = parse_mjcf_vec3(so101_offset_site.attribute("pos").unwrap(), "pos").unwrap();
-        let r_site = parse_mjcf_site_rotation(so101_zero_site).unwrap();
+        let r_site = parse_mjcf_site_rotation(&so101_zero_doc, so101_zero_site).unwrap();
         let expected_offset_pos = crate::kinematics::add(
             &zero_pos,
             &crate::kinematics::mat_vec(&r_site, &[0.025, 0.010, -0.005]),
@@ -2216,5 +2299,61 @@ mod tests {
         assert!((offset_pos[0] - (-0.0079 - 0.010)).abs() < 1e-5, "offset_pos={offset_pos:?}");
         assert!((offset_pos[1] - (-0.000218121 - 0.005)).abs() < 1e-5, "offset_pos={offset_pos:?}");
         assert!((offset_pos[2] - (-0.0981274 - 0.025)).abs() < 1e-5, "offset_pos={offset_pos:?}");
+
+        // 11. R4 M5 + m2: Shipped SO-101 (no `end_link`, tcp site inside `gripper`) resolves
+        // attach_body="end_link" (or empty) to `gripper` for both worldbody geom insertion and suction welds.
+        let so101_geom_tool = r#"<mujoco><worldbody><geom name="custom_pad" type="box" size="0.01 0.01 0.01" pos="0 0 0"/></worldbody></mujoco>"#;
+        let so101_geom_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_custom_pad",
+            "kind": "gripper",
+            "robots": ["so-arm101"],
+            "attach_body": "end_link",
+            "tcp_offset": [0.01, 0.0, 0.0],
+            "armd": { "gripper_policy": { "jaw_opening_nominal": [[0.0, 0.0], [1.5, 0.065]] } }
+        })).unwrap();
+        let so101_with_geom = compose_mjcf(so101_base_xml, None, Some(&so101_geom_manifest), Some(so101_geom_tool)).unwrap();
+        let so101_geom_doc = roxmltree::Document::parse(&so101_with_geom).unwrap();
+        let pad_geom = so101_geom_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "geom" && n.attribute("name") == Some("custom_pad"))
+            .expect("custom_pad geom inserted");
+        assert_eq!(
+            pad_geom.parent().and_then(|p| p.attribute("name")),
+            Some("gripper"),
+            "SO-101 attach_body='end_link' must attach under `gripper`"
+        );
+
+        let so101_suction_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "so101_suction_cup",
+            "kind": "suction",
+            "robots": ["so-arm101"],
+            "attach_body": "end_link",
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        let prop_scene = r#"<mujoco><worldbody><body name="chip" pos="0.2 0 0.02"><freejoint/><geom type="box" size="0.01 0.01 0.01"/></body></worldbody></mujoco>"#;
+        let so101_suction_xml = compose_mjcf(so101_base_xml, Some(prop_scene), Some(&so101_suction_manifest), Some(so101_geom_tool)).unwrap();
+        let so101_suction_doc = roxmltree::Document::parse(&so101_suction_xml).unwrap();
+        let weld = so101_suction_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "weld" && n.attribute("body2") == Some("chip"))
+            .expect("suction weld inserted");
+        assert_eq!(weld.attribute("body1"), Some("gripper"));
+
+        // 12. R4 m1: `euler` respects <compiler angle="degree|radian" eulerseq="..."/> and fails closed on unsupported eulerseq.
+        let deg_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0 0 90"/></body></worldbody></mujoco>"#;
+        let deg_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "deg_tool", "kind": "suction", "robots": ["b601dm"], "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        let deg_out = compose_mjcf(deg_base, None, Some(&deg_manifest), None).unwrap();
+        let deg_doc = roxmltree::Document::parse(&deg_out).unwrap();
+        let deg_pos = parse_mjcf_vec3(
+            deg_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        // Default degree + xyz: 90 deg about z maps +x -> +y: [0, 0.02, 0]
+        assert!(deg_pos[0].abs() < 1e-6 && (deg_pos[1] - 0.02).abs() < 1e-6 && deg_pos[2].abs() < 1e-6, "deg_pos={deg_pos:?}");
+
+        let bad_seq_base = r#"<mujoco><compiler angle="radian" eulerseq="xYz"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0.1 0.2 0.3"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(bad_seq_base, None, Some(&deg_manifest), None).unwrap_err().contains("eulerseq"));
     }
 }
