@@ -275,8 +275,9 @@ pub trait ArmDriver: Send {
 
     /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
     /// acknowledgement and confirm it with a separate read. Torque off only.
-    fn commission_motor_timeout(&mut self, _joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
-        Err(ArmDriverError::Protocol("motor timeout commissioning is not supported by this driver".into()))
+    fn commission_motor_timeout(&mut self, joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
+        Err(crate::mit::TimeoutBatchError { not_attempted: joints.to_vec(),
+            ..ArmDriverError::Protocol("motor timeout commissioning is not supported by this driver".into()).into() })
     }
 }
 
@@ -2725,6 +2726,44 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             })))
     }
 
+    /// One joint of `commission_motor_timeout`; `written` is set once the RAM write was sent.
+    fn commission_one(&mut self, i: usize, counts: u32, written: &mut bool) -> Result<crate::mit::TimeoutCommissioning, ArmDriverError> {
+        {
+            let id = self.motor_ids[i];
+            let before = self.identity_of(i)?;
+            if before.reply_id != before.mst_id {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: register replies on 0x{:X} but MST_ID {}", i + 1, before.reply_id, before.mst_id)));
+            }
+            // RAM write (0x55), checked acknowledgement
+            self.register_replies.clear();
+            self.register_reply_log.clear();
+            *written = true;
+            self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
+            self.can.flush()?;
+            let sent = self.mark();
+            self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
+            let ack = self.register_reply_log.iter().rev()
+                .find(|(r, _, _, _, b)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *b > sent).copied();
+            let Some((ack, ack_id, _, _, _)) = ack else {
+                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{id:X}) did not acknowledge the TIMEOUT write", i + 1)));
+            };
+            if ack_id != before.mst_id || ack.as_u32() != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT write acknowledged with {} on 0x{ack_id:X} (wrote {counts}, MST_ID {})",
+                    i + 1, ack.as_u32(), before.mst_id)));
+            }
+            // separate read: fresh motor ID, reply ID, opcode, RID and value
+            let readback = self.identity_of(i)?;
+            let same = readback.motor_id == before.motor_id && readback.reply_id == before.reply_id && readback.esc_id == before.esc_id
+                && readback.mst_id == before.mst_id && readback.sw_ver == before.sw_ver;
+            if !same || readback.timeout_raw != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT readback {} (wrote {counts}) or identity changed", i + 1, readback.timeout_raw)));
+            }
+            tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): TIMEOUT {} -> {counts} counts (RAM)", i + 1, before.timeout_raw);
+            Ok(crate::mit::TimeoutCommissioning { before, written_raw: counts, ack_raw: ack.as_u32(), readback,
+                unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED, unit_verified: false })
+        }
+    }
+
     pub fn with_vlim(mut self, vlim: f32) -> Self {
         self.default_vlim = vlim;
         self
@@ -2922,60 +2961,38 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         joints.iter().map(|&i| self.identity_of(i)).collect()
     }
 
-    fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
+    fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {
+        let none_attempted = |e: ArmDriverError| crate::mit::TimeoutBatchError { not_attempted: joints.to_vec(), ..e.into() };
         let n = self.motor_ids.len();
-        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 }); }
+        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(none_attempted(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 })); }
         if counts == 0 || counts > crate::mit::MAX_TIMEOUT_COUNTS {
-            return Err(ArmDriverError::Protocol(format!("TIMEOUT counts must be in 1..={}", crate::mit::MAX_TIMEOUT_COUNTS)));
+            return Err(none_attempted(ArmDriverError::Protocol(format!("TIMEOUT counts must be in 1..={}", crate::mit::MAX_TIMEOUT_COUNTS))));
         }
         if self.is_enabled || self.is_enabling {
-            return Err(ArmDriverError::Protocol("the TIMEOUT commissioning needs torque off".into()));
+            return Err(none_attempted(ArmDriverError::Protocol("the TIMEOUT commissioning needs torque off".into())));
         }
         for &i in joints {
             // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
             let fresh = self.last_feedback_instant[i].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE
                 && self.last_enable_command.is_none_or(|c| t >= c));
             if self.awaiting_rx_boundary || !fresh || self.motor_status[i] != 0 {
-                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
-                    i + 1, self.motor_ids[i], self.motor_status[i])));
+                return Err(none_attempted(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
+                    i + 1, self.motor_ids[i], self.motor_status[i]))));
             }
         }
         let mut out = Vec::with_capacity(joints.len());
-        for &i in joints {
-            let id = self.motor_ids[i];
-            let before = self.identity_of(i)?;
-            if before.reply_id != before.mst_id {
-                return Err(ArmDriverError::HardwareFault(format!("joint {}: register replies on 0x{:X} but MST_ID {}", i + 1, before.reply_id, before.mst_id)));
+        for (k, &i) in joints.iter().enumerate() {
+            let mut written = false;
+            let res = self.commission_one(i, counts, &mut written);
+            match res {
+                Ok(c) => out.push(c),
+                Err(error) => return Err(crate::mit::TimeoutBatchError { applied: out, uncertain: if written { vec![i] } else { Vec::new() },
+                    not_attempted: joints[k + 1..].to_vec(), error }),
             }
-            // RAM write (0x55), checked acknowledgement
-            self.register_replies.clear();
-            self.register_reply_log.clear();
-            self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
-            self.can.flush()?;
-            let sent = self.mark();
-            self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
-            let ack = self.register_reply_log.iter().rev()
-                .find(|(r, _, _, _, b)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *b > sent).copied();
-            let Some((ack, ack_id, _, _, _)) = ack else {
-                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{id:X}) did not acknowledge the TIMEOUT write", i + 1)));
-            };
-            if ack_id != before.mst_id || ack.as_u32() != counts {
-                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT write acknowledged with {} on 0x{ack_id:X} (wrote {counts}, MST_ID {})",
-                    i + 1, ack.as_u32(), before.mst_id)));
-            }
-            // separate read: fresh motor ID, reply ID, opcode, RID and value
-            let readback = self.identity_of(i)?;
-            let same = readback.motor_id == before.motor_id && readback.reply_id == before.reply_id && readback.esc_id == before.esc_id
-                && readback.mst_id == before.mst_id && readback.sw_ver == before.sw_ver;
-            if !same || readback.timeout_raw != counts {
-                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT readback {} (wrote {counts}) or identity changed", i + 1, readback.timeout_raw)));
-            }
-            tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): TIMEOUT {} -> {counts} counts (RAM)", i + 1, before.timeout_raw);
-            out.push(crate::mit::TimeoutCommissioning { before, written_raw: counts, ack_raw: ack.as_u32(), readback,
-                unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED, unit_verified: false });
         }
         Ok(out)
     }
+
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("motor_flash", false, vec![

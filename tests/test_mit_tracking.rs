@@ -940,3 +940,33 @@ fn mit_moving_park_brakes_hands_back_then_parks() {
     assert!(h <= p, "park ({p}) before the hand back ({h})");
     assert!(!inner.mit_active());
 }
+
+/// Review #13: a batch TIMEOUT write that fails part way reports per joint what was applied,
+/// which joint is uncertain (write sent, not confirmed) and which were not attempted.
+#[test]
+fn mit_timeout_batch_failure_reports_applied_and_uncertain_joints() {
+    let bus = FakeBus::new(&b601_limits());
+    let d = disabled_driver(&bus);
+    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    bus.with(|s| s.motors[4].ignore_reg_writes = true); // J5 acknowledges, readback disagrees
+    let e = inner.mit_timeout_command(&json!({"joints": [4, 5, 6]})).unwrap_err();
+    assert_eq!(e.code, "MIT_TIMEOUT_FAILED");
+    let f = e.reply_fields();
+    assert_eq!(f["applied"], json!([4]), "{f:?}");
+    assert_eq!(f["uncertain"], json!([5]), "{f:?}");
+    assert_eq!(f["not_attempted"], json!([6]), "{f:?}");
+    assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 2000);
+    assert_eq!(bus.with(|s| s.motors[5].reg_u32(damiao::RID_TIMEOUT)), 0);
+    // a failure before any write: nothing applied, nothing uncertain
+    let bus = FakeBus::new(&b601_limits());
+    let d = disabled_driver(&bus);
+    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    bus.with(|s| s.motors[3].silent = true);
+    let e = inner.mit_timeout_command(&json!({"joints": [4, 5]})).unwrap_err();
+    let f = e.reply_fields();
+    assert_eq!((f["applied"].clone(), f["uncertain"].clone(), f["not_attempted"].clone()), (json!([]), json!([]), json!([5])), "{f:?}");
+}

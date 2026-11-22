@@ -83,6 +83,28 @@ pub struct TimeoutCommissioning {
     pub unit_verified: bool,
 }
 
+/// A TIMEOUT commissioning batch that stopped part way (0-based joints): what was applied and
+/// confirmed, the joint whose write went out unconfirmed (its RAM value is unknown), and the
+/// joints not attempted.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub struct TimeoutBatchError {
+    pub applied: Vec<TimeoutCommissioning>,
+    pub uncertain: Vec<usize>,
+    pub not_attempted: Vec<usize>,
+    pub error: crate::driver::ArmDriverError,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::fmt::Display for TimeoutBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.error) }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<crate::driver::ArmDriverError> for TimeoutBatchError {
+    fn from(error: crate::driver::ArmDriverError) -> Self { Self { applied: Vec::new(), uncertain: Vec::new(), not_attempted: Vec::new(), error } }
+}
+
 /// `calibration.json` `mit_qualification`: the device qualification of MIT joints.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -328,8 +350,16 @@ impl crate::supervisor::SupervisorInner {
             let rb = driver.read_motor_identity(&cmd.joints).map_err(|e| CalibError::new(502, "MIT_TIMEOUT_READ", e.to_string()))?;
             return Ok(json!({"dry_run": true, "readback": rb, "timeout_unit": unit}));
         }
-        let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts)
-            .map_err(|e| CalibError::new(502, "MIT_TIMEOUT_FAILED", e.to_string()))?;
+        let res = driver.commission_motor_timeout(&cmd.joints, cmd.timeout_counts).map_err(|e| {
+            let one = |v: &[usize]| v.iter().map(|j| j + 1).collect::<Vec<_>>();
+            let mut err = CalibError::new(502, "MIT_TIMEOUT_FAILED", format!("{}; applied {:?}, uncertain {:?} (write sent, not confirmed), not attempted {:?}",
+                e.error, e.applied.iter().map(|c| c.before.joint).collect::<Vec<_>>(), one(&e.uncertain), one(&e.not_attempted)));
+            err.extra.insert("applied".into(), json!(e.applied.iter().map(|c| c.before.joint).collect::<Vec<_>>()));
+            err.extra.insert("commissioning".into(), json!(e.applied));
+            err.extra.insert("uncertain".into(), json!(one(&e.uncertain)));
+            err.extra.insert("not_attempted".into(), json!(one(&e.not_attempted)));
+            err
+        })?;
         tracing::warn!("MIT TIMEOUT commissioned (RAM) for joints {:?}: {} counts", cmd.joints.iter().map(|j| j + 1).collect::<Vec<_>>(), cmd.timeout_counts);
         Ok(json!({"dry_run": false, "timeout_counts": cmd.timeout_counts, "commissioning": res, "timeout_unit": unit}))
     }
