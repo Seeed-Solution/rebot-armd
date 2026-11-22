@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::broadcast;
+use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -7384,12 +7385,30 @@ pub fn check_path_with_tcp_tol<'a>(
 
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
-    inner: Arc<RwLock<SupervisorInner>>,
+    inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
     tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
+    tick_stats_wait_us: AtomicU64,
+    control_sched: std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>,
+    /// The observation the last tick computed, served by [`Self::get_observation`].
+    obs_snapshot: std::sync::Mutex<Option<ObservationSnapshot>>,
+    obs_cache_hits: AtomicU64,
+    obs_cache_misses: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// An observation computed by the control tick under the write lock.
+struct ObservationSnapshot {
+    /// Lock generation of the tick's write guard: no other write guard was taken since
+    /// while [`SupervisorLock::generation`] still equals it.
+    generation: u64,
+    at: Instant,
+    /// Older than this, time-derived fields (feedback age, lease expiry) are recomputed.
+    max_age: Duration,
+    obs: Arc<ArmObservation>,
 }
 
 impl ArmSupervisor {
@@ -7401,11 +7420,16 @@ impl ArmSupervisor {
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         Self {
-            inner: Arc::new(RwLock::new(inner)),
+            inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
+            tick_stats_wait_us: AtomicU64::new(0),
+            control_sched: std::sync::Mutex::new(None),
+            obs_snapshot: std::sync::Mutex::new(None),
+            obs_cache_hits: AtomicU64::new(0),
+            obs_cache_misses: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7423,13 +7447,35 @@ impl ArmSupervisor {
     }
 
     #[doc(hidden)]
-    pub fn inner(&self) -> &Arc<RwLock<SupervisorInner>> {
+    pub fn inner(&self) -> &Arc<SupervisorLock<SupervisorInner>> {
         &self.inner
     }
 
+    /// The current observation. Served from the snapshot of the last tick while no write
+    /// guard was taken since and the snapshot is younger than two control periods, so a
+    /// polling client does not hold the read lock the real-time tick waits for; else
+    /// computed under the read lock.
     pub async fn get_observation(&self) -> ArmObservation {
+        if let Some(obs) = self.cached_observation() {
+            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return (*obs).clone();
+        }
+        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.read().await;
         inner.current_observation()
+    }
+
+    fn cached_observation(&self) -> Option<Arc<ArmObservation>> {
+        let generation = self.inner.generation();
+        let snap = self.obs_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.as_ref()
+            .filter(|s| s.generation == generation && s.at.elapsed() <= s.max_age)
+            .map(|s| Arc::clone(&s.obs))
+    }
+
+    /// Scheduling of the control thread, reported by it after its real-time request.
+    pub fn set_control_thread_sched(&self, sched: crate::diagnostics::tick::ControlThreadSched) {
+        *self.control_sched.lock().unwrap_or_else(|e| e.into_inner()) = Some(sched);
     }
 
     pub async fn get_schema(&self) -> ObservationSchema {
@@ -7681,16 +7727,32 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
+        Arc::unwrap_or_clone(self.tick_shared(dt).await)
+    }
+
+    /// [`Self::tick`] for the control loop, which does not use the observation: saves a copy.
+    pub async fn control_tick(&self, dt: f64) {
+        self.tick_shared(dt).await;
+    }
+
+    async fn tick_shared(&self, dt: f64) -> Arc<ArmObservation> {
         let started = Instant::now();
-        let (obs, lock_held, control_hz, pending_zc) = {
-            let mut inner = self.inner.write().await;
+        let (obs, wait, lock_held, control_hz, pending_zc) = {
+            let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             inner.defer_zero_check_persist = true;
-            let obs = inner.tick(dt);
+            let obs = Arc::new(inner.tick(dt));
             inner.defer_zero_check_persist = false;
             let pending_zc = inner.pending_zero_check_persist.take();
-            (obs, locked.elapsed(), inner.config.control_frequency_hz, pending_zc)
+            let control_hz = inner.config.control_frequency_hz;
+            // Published before the guard drops: no other write can come in between.
+            let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)));
+            *self.obs_snapshot.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
+            (obs, locked - started, locked.elapsed(), control_hz, pending_zc)
         };
+        let released = Instant::now();
+        let others = self.inner.take_maxima();
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
@@ -7907,15 +7969,40 @@ impl ArmSupervisor {
             });
         }
         // Broadcast observation to any active WebSocket listeners
-        let _ = self.telemetry_tx.send(obs.clone());
+        let _ = self.telemetry_tx.send((*obs).clone());
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).record(started.elapsed(), lock_held, late);
+        let done = Instant::now();
+        let sample = crate::diagnostics::tick::TickSample {
+            tick: done - started,
+            wait,
+            lock: lock_held,
+            post: done - released,
+            period: if dt.is_finite() && dt >= 0.0 { Duration::from_secs_f64(dt.min(4.0e3)) } else { Duration::ZERO },
+            reader_hold: others.reader_hold,
+            writer_hold: others.writer_hold,
+            reader_acquire: others.reader_acquire,
+            writer_acquire: others.writer_acquire,
+            stats_wait: Duration::from_micros(self.tick_stats_wait_us.load(Ordering::Relaxed)),
+            late,
+        };
+        let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
+        self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
+        stats.record(&sample);
+        drop(stats);
         obs
     }
 
-    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`).
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
+    /// the stats mutex and sorted after it is released, so this route does not delay a tick.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+        let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
+        let mut snap = window.snapshot();
+        snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
+            hits: self.obs_cache_hits.load(Ordering::Relaxed),
+            misses: self.obs_cache_misses.load(Ordering::Relaxed),
+        };
+        snap
     }
 
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {
