@@ -208,6 +208,8 @@ struct MatchScratch {
     matches: Vec<([f64; 2], f64)>,
     int_s1: Vec<u32>,
     int_s2: Vec<u64>,
+    coarse_dots: Vec<f32>,
+    coarse_vars: Vec<f64>,
 }
 
 struct CoarseRect {
@@ -335,17 +337,47 @@ impl PeakCache<'_> {
 }
 
 #[inline(always)]
-fn coarse_dot<const N: usize>(img: &Gray, a: &[f32], gx: usize, gy: usize, tr: usize) -> f32 {
-    let tn = if N > 0 { N } else { 2 * tr + 1 };
-    let mut dot = 0.0f32;
-    for pj in 0..tn {
-        let row = &img.px[(gy - tr + pj) * img.w + gx - tr..][..tn];
-        let ar = &a[pj * tn..][..tn];
-        for pi in 0..tn {
-            dot += ar[pi] * f32::from(row[pi]);
-        }
+#[allow(clippy::too_many_arguments)]
+fn flush_coarse_run(
+    backend: crate::ncc_backend::NccBackend,
+    img: &Gray,
+    a: &[f32],
+    tn: usize,
+    tr_i: i32,
+    gy: i32,
+    row_off: usize,
+    run_start_gx: i32,
+    run_start_i: usize,
+    run_len: usize,
+    coarse_dots: &mut [f32],
+    coarse_vars: &[f64],
+    scores: &mut [f32],
+    #[cfg(feature = "mview-profile")] prof: &mut Option<&mut PosePassProfile>,
+    #[cfg(feature = "mview-profile")] cells_dotted: &mut u64,
+) {
+    if run_len == 0 {
+        return;
     }
-    dot
+    backend
+        .coarse_dots(
+            img,
+            (run_start_gx - tr_i) as usize,
+            (gy - tr_i) as usize,
+            a,
+            tn,
+            &mut coarse_dots[..run_len],
+        )
+        .expect("coarse ROI bounds already validated");
+    for k in 0..run_len {
+        scores[row_off + run_start_i + k] = coarse_dots[k] / coarse_vars[k].sqrt() as f32;
+    }
+    #[cfg(feature = "mview-profile")]
+    {
+        if let Some(p) = prof.as_deref_mut() {
+            p.record_run(run_len as u64);
+        }
+        *cells_dotted += run_len as u64;
+    }
 }
 
 fn copy_cached_overlap(
@@ -389,6 +421,7 @@ fn copy_cached_overlap(
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn fill_coarse_scores<const N: usize>(
+    backend: crate::ncc_backend::NccBackend,
     img: &Gray,
     t: &Tmpl,
     cxi: i32,
@@ -402,18 +435,23 @@ fn fill_coarse_scores<const N: usize>(
     cached: Option<&CoarseRect>,
     s1: &[u32],
     s2: &[u64],
+    coarse_dots: &mut Vec<f32>,
+    coarse_vars: &mut Vec<f64>,
     scores: &mut [f32],
     #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
 ) {
     let tr = t.r;
+    let tr_i = tr as i32;
     let tn = if N > 0 { N } else { 2 * tr + 1 };
     let n = (2 * r + 1) as usize;
     let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
     let sw = f64::from(t.sw);
     let var_floor = 1e-3 * sw;
-    let mut dot_calls: u64 = 0;
+    let max_run = (vx1 - vx0 + 1) as usize;
+    coarse_dots.resize(max_run, 0.0);
+    coarse_vars.resize(max_run, 0.0);
     #[cfg(feature = "mview-profile")]
-    let (mut cells_cached, mut cells_flat) = (0u64, 0u64);
+    let (mut cells_cached, mut cells_flat, mut cells_dotted) = (0u64, 0u64, 0u64);
 
     for gy in vy0..=vy1 {
         let j = (gy - (cyi - r)) as usize;
@@ -425,22 +463,37 @@ fn fill_coarse_scores<const N: usize>(
             let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
             (0 <= cj && cj < cn as i64).then_some(cj as usize)
         });
-        #[cfg(feature = "mview-profile")]
-        let mut cur_run: u64 = 0;
+        let mut run_start_gx: i32 = 0;
+        let mut run_start_i: usize = 0;
+        let mut run_len: usize = 0;
         for gx in vx0..=vx1 {
             let i = (gx - (cxi - r)) as usize;
             if let (Some(cr), Some(cj)) = (cached, cj_opt) {
                 let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
                 if 0 <= ci && ci < cn as i64 {
+                    flush_coarse_run(
+                        backend,
+                        img,
+                        &t.a,
+                        tn,
+                        tr_i,
+                        gy,
+                        row_off,
+                        run_start_gx,
+                        run_start_i,
+                        run_len,
+                        coarse_dots,
+                        coarse_vars,
+                        scores,
+                        #[cfg(feature = "mview-profile")]
+                        &mut prof,
+                        #[cfg(feature = "mview-profile")]
+                        &mut cells_dotted,
+                    );
+                    run_len = 0;
                     scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
                     #[cfg(feature = "mview-profile")]
                     {
-                        if cur_run > 0 {
-                            if let Some(p) = prof.as_deref_mut() {
-                                p.record_run(cur_run);
-                            }
-                            cur_run = 0;
-                        }
                         cells_cached += 1;
                     }
                     continue;
@@ -452,50 +505,97 @@ fn fill_coarse_scores<const N: usize>(
             let sum2 = ((s2[bot_row + ox + tn] - s2[top_row + ox + tn])
                 - (s2[bot_row + ox] - s2[top_row + ox])) as f64;
             let var = sum2 - sum1 * sum1 / sw;
-            scores[row_off + i] = if var > var_floor {
-                dot_calls += 1;
-                #[cfg(feature = "mview-profile")]
-                {
-                    cur_run += 1;
+            if var > var_floor {
+                if run_len == 0 {
+                    run_start_gx = gx;
+                    run_start_i = i;
                 }
-                let dot = coarse_dot::<N>(img, &t.a, gx as usize, gy as usize, tr);
-                dot / var.sqrt() as f32
+                coarse_vars[run_len] = var;
+                run_len += 1;
             } else {
+                flush_coarse_run(
+                    backend,
+                    img,
+                    &t.a,
+                    tn,
+                    tr_i,
+                    gy,
+                    row_off,
+                    run_start_gx,
+                    run_start_i,
+                    run_len,
+                    coarse_dots,
+                    coarse_vars,
+                    scores,
+                    #[cfg(feature = "mview-profile")]
+                    &mut prof,
+                    #[cfg(feature = "mview-profile")]
+                    &mut cells_dotted,
+                );
+                run_len = 0;
+                scores[row_off + i] = 0.0;
                 #[cfg(feature = "mview-profile")]
                 {
-                    if cur_run > 0 {
-                        if let Some(p) = prof.as_deref_mut() {
-                            p.record_run(cur_run);
-                        }
-                        cur_run = 0;
-                    }
                     cells_flat += 1;
                 }
-                0.0
-            };
-        }
-        #[cfg(feature = "mview-profile")]
-        if cur_run > 0 {
-            if let Some(p) = prof.as_deref_mut() {
-                p.record_run(cur_run);
             }
         }
+        flush_coarse_run(
+            backend,
+            img,
+            &t.a,
+            tn,
+            tr_i,
+            gy,
+            row_off,
+            run_start_gx,
+            run_start_i,
+            run_len,
+            coarse_dots,
+            coarse_vars,
+            scores,
+            #[cfg(feature = "mview-profile")]
+            &mut prof,
+            #[cfg(feature = "mview-profile")]
+            &mut cells_dotted,
+        );
     }
 
-    crate::ncc_backend::record_coarse_dots_batch(
-        crate::ncc_backend::NccBackendKind::Scalar,
-        dot_calls,
-        dot_calls,
-    );
     #[cfg(feature = "mview-profile")]
     if let Some(p) = prof {
         p.cells_cached += cells_cached;
         p.cells_flat += cells_flat;
-        p.cells_dotted += dot_calls;
+        p.cells_dotted += cells_dotted;
     }
 }
 
+#[cfg(test)]
 fn fill_coarse_window_integral(
+    img: &Gray,
+    get_t: impl GetTmpl,
+    cxi: i32,
+    cyi: i32,
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] prof: Option<&mut PosePassProfile>,
+) {
+    fill_coarse_window_integral_with_backend(
+        crate::ncc_backend::NccBackend::active(),
+        img,
+        get_t,
+        cxi,
+        cyi,
+        r,
+        cached,
+        scratch,
+        #[cfg(feature = "mview-profile")]
+        prof,
+    );
+}
+
+fn fill_coarse_window_integral_with_backend(
+    backend: crate::ncc_backend::NccBackend,
     img: &Gray,
     mut get_t: impl GetTmpl,
     cxi: i32,
@@ -703,6 +803,7 @@ fn fill_coarse_window_integral(
     const COARSE_TN: usize = 2 * COARSE_R + 1;
     if tr == COARSE_R {
         fill_coarse_scores::<COARSE_TN>(
+            backend,
             img,
             t,
             cxi,
@@ -716,12 +817,15 @@ fn fill_coarse_window_integral(
             cached,
             &scratch.int_s1,
             &scratch.int_s2,
+            &mut scratch.coarse_dots,
+            &mut scratch.coarse_vars,
             &mut scratch.scores,
             #[cfg(feature = "mview-profile")]
             prof.as_deref_mut(),
         );
     } else {
         fill_coarse_scores::<0>(
+            backend,
             img,
             t,
             cxi,
@@ -735,6 +839,8 @@ fn fill_coarse_window_integral(
             cached,
             &scratch.int_s1,
             &scratch.int_s2,
+            &mut scratch.coarse_dots,
+            &mut scratch.coarse_vars,
             &mut scratch.scores,
             #[cfg(feature = "mview-profile")]
             prof.as_deref_mut(),
@@ -757,7 +863,29 @@ fn window_peaks_cached(
     cached: Option<&CoarseRect>,
     scratch: &mut MatchScratch,
 ) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
-    window_peaks_cached_profiled(
+    window_peaks_cached_with_backend(
+        crate::ncc_backend::NccBackend::active(),
+        img,
+        get_t,
+        c,
+        r,
+        cached,
+        scratch,
+    )
+}
+
+#[cfg(test)]
+fn window_peaks_cached_with_backend(
+    backend: crate::ncc_backend::NccBackend,
+    img: &Gray,
+    get_t: impl GetTmpl,
+    c: [f64; 2],
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
+    window_peaks_cached_profiled_with_backend(
+        backend,
         img,
         get_t,
         c,
@@ -770,6 +898,29 @@ fn window_peaks_cached(
 }
 
 fn window_peaks_cached_profiled(
+    img: &Gray,
+    get_t: impl GetTmpl,
+    c: [f64; 2],
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] prof: Option<&mut PosePassProfile>,
+) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
+    window_peaks_cached_profiled_with_backend(
+        crate::ncc_backend::NccBackend::active(),
+        img,
+        get_t,
+        c,
+        r,
+        cached,
+        scratch,
+        #[cfg(feature = "mview-profile")]
+        prof,
+    )
+}
+
+fn window_peaks_cached_profiled_with_backend(
+    backend: crate::ncc_backend::NccBackend,
     img: &Gray,
     mut get_t: impl GetTmpl,
     c: [f64; 2],
@@ -789,7 +940,8 @@ fn window_peaks_cached_profiled(
 
     let center = (cx.abs() < 1e7 && cy.abs() < 1e7 && r < 1_000_000).then_some((cx as i32, cy as i32));
     if let Some((cxi, cyi)) = center {
-        fill_coarse_window_integral(
+        fill_coarse_window_integral_with_backend(
+            backend,
             img,
             get_t,
             cxi,
@@ -2313,16 +2465,28 @@ mod tests {
         let object_box = [140.0, 75.0, 180.0, 105.0];
         let exclude = [[0.0, 0.0, 20.0, 20.0]];
 
+        let active = crate::ncc_backend::NccBackend::active();
         reset_kernel_counts();
         let res = refine_views(&views, 0, object_box, &exclude, 0.0, &[], true, &PoseParams::default());
         assert!(res.n_corrs > 0);
         let diag = backend_diagnostics();
-        assert_eq!(diag.backend, "scalar");
-        assert!(diag.counts.coarse_dots_scalar > 0);
-        assert_eq!(diag.counts.coarse_cells_scalar, diag.counts.coarse_dots_scalar);
+        assert_eq!(diag.backend, active.kind().as_str());
         assert!(diag.counts.half_moments_scalar > 0);
-        assert_eq!(diag.counts.coarse_dots_xthead071, 0);
         assert_eq!(diag.counts.half_moments_xthead071, 0);
+        match active {
+            crate::ncc_backend::NccBackend::Scalar => {
+                assert!(diag.counts.coarse_dots_scalar > 0);
+                assert!(diag.counts.coarse_cells_scalar >= diag.counts.coarse_dots_scalar);
+                assert_eq!(diag.counts.coarse_dots_xthead071, 0);
+                assert_eq!(diag.counts.coarse_cells_xthead071, 0);
+            }
+            crate::ncc_backend::NccBackend::Xthead071 => {
+                assert!(diag.counts.coarse_dots_xthead071 > 0);
+                assert!(diag.counts.coarse_cells_xthead071 >= diag.counts.coarse_dots_xthead071);
+                assert_eq!(diag.counts.coarse_dots_scalar, 0);
+                assert_eq!(diag.counts.coarse_cells_scalar, 0);
+            }
+        }
 
         reset_kernel_counts();
         assert_eq!(kernel_counts(), KernelCallCounts::default());
@@ -2409,5 +2573,139 @@ mod tests {
         assert!(wpeaks.iter().all(|p| *p == [0.0, 0.0]));
         assert!(window_peaks(&trunc, &tc, [20.0, 20.0], 6).is_empty());
         assert_eq!(kernel_counts(), KernelCallCounts::default());
+    }
+
+    #[test]
+    fn batched_coarse_runs_match_scalar_score_maps_sentinels_and_peaks_across_holes_flats_and_multi_vl() {
+        use crate::ncc_backend::NccBackend;
+
+        let (w, h) = (96usize, 64usize);
+        let mut px = vec![120u8; w * h];
+        // Textured background with deterministic pseudo-noise.
+        for y in 0..h {
+            for x in 0..w {
+                let v = (((x * 97 + y * 53) ^ (x * y * 13 + 29)).wrapping_mul(181) % 210) as u8;
+                px[y * w + x] = 20 + v;
+            }
+        }
+        // Carve flat bands so contiguous runs split into singletons, medium runs, and 0.0 flat gaps.
+        for y in 18..28 {
+            for x in 28..35 {
+                px[y * w + x] = 140;
+            }
+            for x in 46..54 {
+                px[y * w + x] = 200;
+            }
+        }
+        // Plant an exact copy of a 5x5 patch from (14, 14) at (60, 24) and a second copy at (22, 24).
+        let mut src = [[0u8; 5]; 5];
+        for dy in 0..5 {
+            for dx in 0..5 {
+                src[dy][dx] = px[(12 + dy) * w + (12 + dx)];
+                px[(22 + dy) * w + (58 + dx)] = src[dy][dx];
+                px[(22 + dy) * w + (20 + dx)] = src[dy][dx];
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let tc5 = make_tmpl(sample_int(&img, 14, 14, COARSE_R), COARSE_R, None, 0.0).unwrap();
+        let tc3 = make_tmpl(sample_int(&img, 14, 14, 1), 1, None, 0.0).unwrap();
+
+        let mut scalar_scratch = MatchScratch::default();
+        let mut cand_scratch = MatchScratch::default();
+        let active = NccBackend::active();
+
+        // Build a partial cache hole that overlaps the left-middle of a multi-VL window.
+        let (_, hole_center) = window_peaks_cached_with_backend(
+            NccBackend::scalar(),
+            &img,
+            &tc5,
+            [36.0, 24.0],
+            6,
+            None,
+            &mut scalar_scratch,
+        );
+        let (hcx, hcy) = hole_center.unwrap();
+        let cr_hole = CoarseRect { cx: hcx, cy: hcy, r: 6, scores: scalar_scratch.scores.clone() };
+
+        // Cases: multi-VL run (r=28 => 57-wide row > 32/48), cached hole + flat cells, straddling edge sentinel.
+        let cases: [(&str, &Tmpl, [f64; 2], i32, Option<&CoarseRect>); 4] = [
+            ("multi_vl_with_flats_and_hole", &tc5, [42.0, 24.0], 28, Some(&cr_hole)),
+            ("multi_vl_edge_sentinels", &tc5, [22.0, 4.0], 26, None),
+            ("short_runs_near_hole_and_flat", &tc5, [27.0, 22.0], 4, Some(&cr_hole)),
+            ("non5_odd_n3_multi_vl", &tc3, [44.0, 24.0], 24, None),
+        ];
+
+        for (label, tmpl, center, r, cached) in cases {
+            let ((exp_peaks, exp_len), _) = window_peaks_cached_with_backend(
+                NccBackend::scalar(),
+                &img,
+                tmpl,
+                center,
+                r,
+                cached,
+                &mut scalar_scratch,
+            );
+            let mut backends = vec![active];
+            if cfg!(not(mview_has_xthead071)) {
+                backends.push(NccBackend::Xthead071);
+            }
+            for backend in backends {
+                reset_kernel_counts();
+                let ((got_peaks, got_len), _) = window_peaks_cached_with_backend(
+                    backend,
+                    &img,
+                    tmpl,
+                    center,
+                    r,
+                    cached,
+                    &mut cand_scratch,
+                );
+                assert_eq!(got_len, exp_len, "{label}: peak count mismatch");
+                assert_eq!(&got_peaks[..got_len], &exp_peaks[..exp_len], "{label}: ordered peaks mismatch");
+                assert_eq!(cand_scratch.scores.len(), scalar_scratch.scores.len());
+                for (idx, (&g, &e)) in cand_scratch.scores.iter().zip(&scalar_scratch.scores).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        e.to_bits(),
+                        "{label}: score[{idx}] mismatch (got={g:?}, exp={e:?})"
+                    );
+                }
+                if label == "multi_vl_edge_sentinels" {
+                    assert!(cand_scratch.scores.contains(&f32::NEG_INFINITY));
+                    assert!(cand_scratch.scores.contains(&0.0));
+                }
+                if backend == active {
+                    let counts = kernel_counts();
+                    match active {
+                        NccBackend::Scalar => {
+                            assert!(counts.coarse_dots_scalar > 0, "{label}: expected scalar calls");
+                            assert!(
+                                counts.coarse_cells_scalar >= counts.coarse_dots_scalar,
+                                "{label}: expected cells >= calls ({counts:?})"
+                            );
+                            if label != "short_runs_near_hole_and_flat" {
+                                assert!(
+                                    counts.coarse_cells_scalar > counts.coarse_dots_scalar,
+                                    "{label}: expected batched multi-cell runs ({counts:?})"
+                                );
+                            }
+                        }
+                        NccBackend::Xthead071 => {
+                            assert!(counts.coarse_dots_xthead071 > 0, "{label}: expected xthead071 calls");
+                            assert!(
+                                counts.coarse_cells_xthead071 >= counts.coarse_dots_xthead071,
+                                "{label}: expected cells >= calls ({counts:?})"
+                            );
+                            if label != "short_runs_near_hole_and_flat" {
+                                assert!(
+                                    counts.coarse_cells_xthead071 > counts.coarse_dots_xthead071,
+                                    "{label}: expected batched multi-cell runs ({counts:?})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

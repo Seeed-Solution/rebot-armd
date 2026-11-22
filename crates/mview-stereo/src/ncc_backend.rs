@@ -9,8 +9,22 @@ use crate::{Gray, PATCH_R};
 /// Maximum patch radius supported by the half-grid integer-moment kernel (`33x33` patch).
 pub(crate) const HALF_GRID_MAX_R: usize = 16;
 
-/// Commit 2 compiles scalar-only; Commit 3 sets this via `build.rs` (`cfg!(mview_has_xthead071)`).
-const HAS_COMPILED_XTHEAD071: bool = false;
+/// Compiled-in RVV 0.7.1 archive availability (enabled by `build.rs` on `riscv64gc-unknown-linux-musl`).
+const HAS_COMPILED_XTHEAD071: bool = cfg!(mview_has_xthead071);
+
+#[cfg(mview_has_xthead071)]
+mod ffi {
+    extern "C" {
+        pub(crate) fn mvs071_coarse_dots(
+            p: *const u8,
+            stride: usize,
+            a: *const f32,
+            n: usize,
+            count: usize,
+            out: *mut f32,
+        );
+    }
+}
 
 /// Active implementation kind for the NCC kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -966,7 +980,6 @@ impl NccBackend {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn coarse_dots(
         self,
         img: &Gray,
@@ -979,8 +992,36 @@ impl NccBackend {
         let count = out.len();
         let view = validate_coarse_dots(img, x0, y0, a, n, count, out)?;
         match self {
-            Self::Scalar | Self::Xthead071 => {
-                // Commit 2 has no C archive yet; Xthead071 delegates to scalar.
+            #[cfg(mview_has_xthead071)]
+            Self::Xthead071 => {
+                // SAFETY: `validate_coarse_dots` verified `a.len() == n * n`,
+                // `out.len() == count > 0`, and `PatchView` bounds for `(n + count - 1) x n`
+                // bytes starting at `view.as_ptr()` with byte stride `view.stride()`,
+                // disjoint from `out`.
+                unsafe {
+                    ffi::mvs071_coarse_dots(
+                        view.as_ptr(),
+                        view.stride(),
+                        a.as_ptr(),
+                        n,
+                        count,
+                        out.as_mut_ptr(),
+                    );
+                }
+                record_coarse_dots(NccBackendKind::Xthead071, count as u64);
+                Ok(())
+            }
+            #[cfg(not(mview_has_xthead071))]
+            Self::Xthead071 => {
+                if n == 5 {
+                    coarse_dots_scalar::<5>(&view, a, n, out);
+                } else {
+                    coarse_dots_scalar::<0>(&view, a, n, out);
+                }
+                record_coarse_dots(NccBackendKind::Scalar, count as u64);
+                Ok(())
+            }
+            Self::Scalar => {
                 if n == 5 {
                     coarse_dots_scalar::<5>(&view, a, n, out);
                 } else {
@@ -1287,9 +1328,13 @@ mod tests {
     #[test]
     fn backend_diagnostics_reports_scalar_and_resets_counts() {
         reset_kernel_counts();
+        let active = NccBackend::active();
         let initial = backend_diagnostics();
-        assert_eq!(initial.backend, "scalar");
-        assert_eq!(initial.reason, "scalar-only");
+        assert_eq!(initial.backend, active.kind().as_str());
+        if !HAS_COMPILED_XTHEAD071 {
+            assert_eq!(initial.backend, "scalar");
+            assert_eq!(initial.reason, "scalar-only");
+        }
         assert_eq!(initial.counts, KernelCallCounts::default());
         assert_eq!(NccBackendKind::Scalar.as_str(), "scalar");
         assert_eq!(NccBackendKind::Xthead071.as_str(), "xthead071");
@@ -1301,7 +1346,7 @@ mod tests {
         record_patch_moments(NccBackendKind::Scalar);
 
         let mid = backend_diagnostics();
-        assert_eq!(mid.backend, "scalar");
+        assert_eq!(mid.backend, active.kind().as_str());
         assert_eq!(mid.counts.coarse_dots_scalar, 4);
         assert_eq!(mid.counts.coarse_cells_scalar, 17);
         assert_eq!(mid.counts.half_moments_scalar, 2);
@@ -1636,16 +1681,23 @@ mod tests {
             .map(|k| ((k * 37 + (k / w) * 53) % 210 + 20) as u8)
             .collect();
         let img = Gray::new(w, h, px).unwrap();
+        let active = NccBackend::active();
 
         let a5: Vec<f32> = (0..25).map(|i| (i as f32 - 12.0) * 0.05).collect();
-        assert_coarse_dots_match_scalar(NccBackend::Scalar, &img, 3, 4, &a5, 5, 11);
-        assert_coarse_dots_match_scalar(NccBackend::Xthead071, &img, 3, 4, &a5, 5, 11);
+        assert_coarse_dots_match_scalar(NccBackend::scalar(), &img, 3, 4, &a5, 5, 11);
+        assert_coarse_dots_match_scalar(active, &img, 3, 4, &a5, 5, 11);
+        if !HAS_COMPILED_XTHEAD071 {
+            assert_coarse_dots_match_scalar(NccBackend::Xthead071, &img, 3, 4, &a5, 5, 11);
+        }
 
         let a9: Vec<f32> = (0..81).map(|i| (i as f32 - 40.0) * 0.02).collect();
         let w9: Vec<f32> = (0..81).map(|i| 0.1 + (i % 9) as f32 * 0.1).collect();
         for phase in 0..=3 {
-            assert_half_moments_match_scalar(NccBackend::Scalar, &img, 5, 6, &a9, 9, phase);
-            assert_half_moments_match_scalar(NccBackend::Xthead071, &img, 5, 6, &a9, 9, phase);
+            assert_half_moments_match_scalar(NccBackend::scalar(), &img, 5, 6, &a9, 9, phase);
+            assert_half_moments_match_scalar(active, &img, 5, 6, &a9, 9, phase);
+            if !HAS_COMPILED_XTHEAD071 {
+                assert_half_moments_match_scalar(NccBackend::Xthead071, &img, 5, 6, &a9, 9, phase);
+            }
         }
         for (weights, bilerp) in [
             (None, None),
@@ -1653,9 +1705,8 @@ mod tests {
             (None, Some([0.21f32, 0.49, 0.09, 0.21])),
             (Some(w9.as_slice()), Some([0.21f32, 0.49, 0.09, 0.21])),
         ] {
-            assert_patch_moments_match_scalar(NccBackend::Scalar, &img, 5, 6, &a9, weights, 9, bilerp);
             assert_patch_moments_match_scalar(
-                NccBackend::Xthead071,
+                NccBackend::scalar(),
                 &img,
                 5,
                 6,
@@ -1664,6 +1715,103 @@ mod tests {
                 9,
                 bilerp,
             );
+            assert_patch_moments_match_scalar(active, &img, 5, 6, &a9, weights, 9, bilerp);
+            if !HAS_COMPILED_XTHEAD071 {
+                assert_patch_moments_match_scalar(
+                    NccBackend::Xthead071,
+                    &img,
+                    5,
+                    6,
+                    &a9,
+                    weights,
+                    9,
+                    bilerp,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_dots_matches_scalar_bit_exact_across_sizes_and_vector_lengths() {
+        let (w, h) = (97usize, 23usize);
+        let mut px: Vec<u8> = (0..w * h)
+            .map(|k| ((k * 73 + (k / w) * 139 + 17) % 256) as u8)
+            .collect();
+        // Include extreme 0 and 255 stripes across multiple rows.
+        for x in 1..40 {
+            px[5 * w + x] = 255;
+            px[6 * w + x] = 0;
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let active = NccBackend::active();
+
+        for n in [3usize, 5, 7] {
+            let mut a = Vec::with_capacity(n * n);
+            let mean = ((n * n - 1) as f32) * 0.5;
+            for i in 0..(n * n) {
+                let centered = i as f32 - mean;
+                a.push(centered * 0.0375 + if i % 2 == 0 { 0.01 } else { -0.015 });
+            }
+
+            for count in [1usize, 2, 4, 5, 15, 16, 17, 31, 32, 33, 48, 65] {
+                let x0 = (count % 5) + 1; // exercises unaligned byte offsets
+                let y0 = 3 + (n % 3);
+                assert_coarse_dots_match_scalar(active, &img, x0, y0, &a, n, count);
+                if !HAS_COMPILED_XTHEAD071 {
+                    assert_coarse_dots_match_scalar(
+                        NccBackend::Xthead071,
+                        &img,
+                        x0,
+                        y0,
+                        &a,
+                        n,
+                        count,
+                    );
+                }
+            }
+
+            // Right-margin boundary check for a multi-VL run.
+            let count = 33usize;
+            let right_x0 = w - (n + count - 1);
+            let bot_y0 = h - n;
+            assert_coarse_dots_match_scalar(active, &img, right_x0, bot_y0, &a, n, count);
+            if !HAS_COMPILED_XTHEAD071 {
+                assert_coarse_dots_match_scalar(
+                    NccBackend::Xthead071,
+                    &img,
+                    right_x0,
+                    bot_y0,
+                    &a,
+                    n,
+                    count,
+                );
+            }
+        }
+
+        // Verify per-kernel counter attribution for active backend.
+        reset_kernel_counts();
+        let a5 = vec![0.04f32; 25];
+        let mut out = vec![0.0f32; 17];
+        active.coarse_dots(&img, 2, 4, &a5, 5, &mut out).unwrap();
+        let counts = kernel_counts();
+        match active {
+            NccBackend::Scalar => {
+                assert_eq!(counts.coarse_dots_scalar, 1);
+                assert_eq!(counts.coarse_cells_scalar, 17);
+                assert_eq!(counts.coarse_dots_xthead071, 0);
+                assert_eq!(counts.coarse_cells_xthead071, 0);
+            }
+            NccBackend::Xthead071 => {
+                if HAS_COMPILED_XTHEAD071 {
+                    assert_eq!(counts.coarse_dots_xthead071, 1);
+                    assert_eq!(counts.coarse_cells_xthead071, 17);
+                    assert_eq!(counts.coarse_dots_scalar, 0);
+                    assert_eq!(counts.coarse_cells_scalar, 0);
+                } else {
+                    assert_eq!(counts.coarse_dots_scalar, 1);
+                    assert_eq!(counts.coarse_cells_scalar, 17);
+                }
+            }
         }
     }
 }
