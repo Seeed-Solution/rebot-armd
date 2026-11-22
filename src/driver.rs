@@ -2161,8 +2161,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_feedback_seq: Vec<u64>,
     /// MIT tracking deadline fence (`set_mit_deadline_fence`); None = off (unchanged behaviour).
     mit_fence: Option<Duration>,
-    /// Completion of the last complete target batch while the fence is armed.
-    mit_fence_last_tx: Option<Instant>,
+    /// Per joint: when its last confirmed command started out (the earliest frame of it, never
+    /// its completion), while the fence is armed. The output gap is measured from the oldest.
+    mit_fence_last_cmd: Vec<Option<Instant>>,
     /// Trip reason and instant; refuses writes until a confirmed enable.
     mit_fence_trip: Option<(String, Instant)>,
     /// No autonomous frame (recovery, status poll) this long after a trip.
@@ -2218,7 +2219,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             rx_empty_seq: 0,
             last_read_drained: false,
             mit_fence: None,
-            mit_fence_last_tx: None,
+            mit_fence_last_cmd: vec![None; dof],
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
@@ -2534,7 +2535,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if let Some(i) = (0..self.motor_ids.len()).find(|&i| self.last_feedback_instant[i].is_none_or(|t| past(now.saturating_duration_since(t)))) {
             let age = self.last_feedback_instant[i].map(|t| now.saturating_duration_since(t));
             self.trip_fence(format!("joint {} feedback age {age:?} reached {deadline:?}", i + 1));
-        } else if let Some(gap) = self.mit_fence_last_tx.map(|t| now.saturating_duration_since(t)).filter(|g| past(*g)) {
+        } else if let Some(gap) = self.mit_fence_last_cmd.iter().flatten().min().map(|t| now.saturating_duration_since(*t)).filter(|g| past(*g)) {
             self.trip_fence(format!("gap between dynamic outputs {gap:?} reached {deadline:?}"));
         }
         match &self.mit_fence_trip {
@@ -2628,6 +2629,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.register_replies.clear();
         self.register_reply_log.clear();
         let mut failed: Vec<usize> = Vec::new();
+        let mut hold_started: Vec<(usize, Instant)> = Vec::new();
         for &i in joints {
             let id = self.motor_ids[i];
             if self.tx_mit(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
@@ -2641,12 +2643,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             } else {
                 vec![self.pos_vel_frame(i, hold[i].position)]
             };
+            hold_started.push((i, self.now()));
             for frame in frames {
                 if self.tx_mit(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
             }
         }
         let mut why = "mode write, hold or flush";
-        let batch_start = self.now();
         if self.can.flush().is_err() { failed = joints.to_vec(); }
         if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
             // holds completing past the deadline trip it: the switch fails, nothing more is sent
@@ -2655,8 +2657,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return (joints.to_vec(), "deadline fence (holds completed past it)");
             }
             if failed.is_empty() {
-                // the holds are the switched joints' complete commands
-                self.mit_fence_last_tx = Some(batch_start);
+                // each switched joint's hold is its complete command, dated by its first frame
+                for (i, t) in hold_started { self.mit_fence_last_cmd[i] = Some(t); }
             }
         }
         let pending: Vec<usize> = joints.iter().copied().filter(|i| !failed.contains(i)).collect();
@@ -2964,7 +2966,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if deadline.is_some() { self.mit_tracking_used = true; }
         self.mit_fence = deadline;
         self.mit_fence_holdoff = holdoff;
-        self.mit_fence_last_tx = deadline.map(|_| self.now());
+        let now = self.now();
+        self.mit_fence_last_cmd.fill(deadline.map(|_| now));
     }
 
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
@@ -3335,7 +3338,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.mit_fence_trip = None;
             self.mit_fence_acked = false;
             self.mit_tracking_used = false;
-            self.mit_fence_last_tx = None;
+            self.mit_fence_last_cmd.fill(None);
             Ok(())
         }
     }
@@ -3353,11 +3356,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // MIT tracking owns joints: the fence is checked before every transmit; a failed
                 // or partial batch (or flush) trips it and discards every cached frame.
                 self.fence_check()?;
-                // The batch is dated by its start: flush (SocketCAN: queued in the kernel) does
-                // not bound when the frames reach the wire, so the earlier stamp is the safe one.
-                let batch_start = self.now();
+                // Each joint's command is dated by its first frame: flush (SocketCAN: queued in the
+                // kernel) does not bound when the frames reach the wire, so the earlier stamp is safe.
+                let mut started: Vec<Option<Instant>> = vec![None; targets.len()];
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
+                        if started[i].is_none() { started[i] = Some(self.now()); }
                         if let Err(e) = self.transmit_fenced(&frame) {
                             self.trip_fence(format!("transmit to joint {} failed after {} of {} joints: {e}", i + 1, i, targets.len()));
                             return Err(e);
@@ -3371,7 +3375,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 // a batch completing past the deadline trips and never resets it
                 self.fence_check()?;
-                self.mit_fence_last_tx = Some(batch_start);
+                for (i, t) in started.into_iter().enumerate() { if t.is_some() { self.mit_fence_last_cmd[i] = t; } }
                 return Ok(());
             }
             DamiaoControlMode::PosVel => {

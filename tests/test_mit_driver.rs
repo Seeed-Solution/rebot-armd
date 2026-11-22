@@ -502,3 +502,34 @@ fn mit_reenable_after_a_trip_sends_no_mit_frame() {
     assert!(mit.is_empty(), "MIT frames on the re-enable after a trip: {mit:?}");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x104), "POS_VEL hold with the base-mode restore");
 }
+
+/// Review round 4, #2: a switch whose holds go out staggered (slow controller) dates each joint's
+/// command by its own first frame, so the later hold never extends the earlier joint's deadline:
+/// 46 ms after the first hold the next batch is refused. Two-motor arm, both joints switched.
+#[test]
+fn mit_staggered_switch_holds_do_not_extend_the_deadline() {
+    let clock = MockClock::new();
+    let lim = b601_limits();
+    let bus = FakeBus::with_clock(&lim[3..5], clock.clone());
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2]).with_joint_limits(lim[3..5].to_vec()).unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges(); // ranges verified: the switch sends only mode writes and holds
+    d.set_torque(true).unwrap();
+    let q = d.read_joint_states().unwrap();
+    let hold: Vec<JointTarget> = q.iter().map(|s| JointTarget::mit(s.position, 0.0, 12.0, 0.4, 0.5)).collect();
+    d.set_mit_deadline_fence(Some(FENCE), HOLDOFF);
+    let t0 = clock.now();
+    bus.with(|s| s.tx_step = Duration::from_millis(8)); // J1 mode, J1 hold (from 8 ms), J2 mode, J2 hold (from 24 ms)
+    d.set_joint_modes_confirmed(&[JointMode::Mit, JointMode::Mit], &hold).expect("switch");
+    bus.with(|s| s.tx_step = Duration::ZERO);
+    let first_hold = t0 + Duration::from_millis(8);
+    let now = clock.now();
+    clock.advance(first_hold + Duration::from_millis(46) - now);
+    bus.with(|s| s.push_all_feedback());
+    let _ = d.read_joint_states();
+    let _ = d.read_joint_states();
+    let t: Vec<JointTarget> = d.read_joint_states().unwrap().iter().map(|s| JointTarget::mit(s.position, 0.0, 10.0, 0.3, 0.4)).collect();
+    assert!(d.write_joint_targets(&t).is_err(), "batch accepted 46 ms after the first hold");
+    assert!(d.mit_fence_trip().is_some_and(|r| r.contains("gap")), "{:?}", d.mit_fence_trip());
+}
