@@ -5115,8 +5115,8 @@ pub async fn activate(
                 } else {
                     (None, false)
                 };
-                if owner_tx.is_none() || split_metadata_incomplete(&sim_val, &snap) {
-                    if enrich_split_from_sim_state(
+                if (owner_tx.is_none() || split_metadata_incomplete(&sim_val, &snap))
+                    && enrich_split_from_sim_state(
                         &upstream,
                         state.sim_timeouts.reconcile,
                         &mut sim_val,
@@ -5124,9 +5124,8 @@ pub async fn activate(
                     )
                     .await
                     .is_err()
-                    {
-                        state_conflict = true;
-                    }
+                {
+                    state_conflict = true;
                 }
                 let (owner_tx_id, target_matches_tx) = match owner_tx {
                     Some(remote_owner) if !state_conflict && remote_owner == tx_id => {
