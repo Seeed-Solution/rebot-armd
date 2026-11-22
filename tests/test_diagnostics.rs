@@ -186,6 +186,7 @@ async fn tick_route_reports_timing_and_late_ticks() {
 async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     for _ in 0..3 { sup.tick(0.02).await; }
+    let reader_line = line!() + 1;
     let reader = sup.inner().read().await;
     let ticker = {
         let sup = sup.clone();
@@ -195,11 +196,20 @@ async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
     drop(reader);
     ticker.await.unwrap();
     let snap = sup.tick_stats();
-    let m = snap.max_tick.unwrap();
-    assert_eq!(m.ticks_ago, 0);
+    let b = snap.max_tick.unwrap();
+    assert_eq!(b.ticks_ago, 0);
+    let m = b.sample;
     assert!(m.wait_us >= 14_000, "{m:?}");
     assert!(m.reader_hold_us >= 14_000, "{m:?}");
     assert!(m.lock_us < m.wait_us, "{m:?}");
     assert!(m.tick_us >= m.wait_us + m.lock_us, "{m:?}");
     assert_eq!(m.period_us, 20_000);
+    // the guard waited for, with its source location
+    let w = m.waited_for.unwrap();
+    assert_eq!((w.kind, w.location.file(), w.location.line()), ("read", file!(), reader_line));
+    assert!(w.hold_us >= 14_000, "{w:?}");
+    assert!(w.acquired_before_wait_us > 0, "{w:?}");
+    assert!(w.released_before_lock_us >= 0, "{w:?}");
+    let json = serde_json::to_value(&snap).unwrap();
+    assert_eq!(json["max_tick"]["waited_for"]["kind"], "read");
 }

@@ -7781,12 +7781,13 @@ impl ArmSupervisor {
     }
 
     async fn tick_shared(&self, dt: f64) -> Arc<ArmObservation> {
+        use crate::diagnostics::tick::us;
         let started = Instant::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, others) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, log, locked) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             // No other guard exists now: the log is complete up to the guard waited for.
-            let log = self.inner.take_log().unwrap_or_default();
+            let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;
             let obs = Arc::new(inner.tick(dt));
             inner.defer_zero_check_persist = false;
@@ -7796,7 +7797,7 @@ impl ArmSupervisor {
             let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
                 .min(inner.observation_valid_for(&obs));
             self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
-            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, log)
+            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, log, locked)
         };
         let released = Instant::now();
         if let Some(job) = pending_zc {
@@ -8018,17 +8019,31 @@ impl ArmSupervisor {
         let _ = self.telemetry_tx.send((*obs).clone());
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
         let done = Instant::now();
+        let log = log.unwrap_or_default();
+        let holder = |r: crate::supervisor_lock::HoldRecord| {
+            let signed = |a: Instant, b: Instant| if a >= b { us(a - b) as i64 } else { -(us(b - a) as i64) };
+            crate::diagnostics::tick::Holder {
+                kind: r.kind.as_str(),
+                location: r.location,
+                hold_us: us(r.hold()),
+                acquire_us: us(r.acquire()),
+                acquired_before_wait_us: signed(started, r.acquired),
+                released_before_lock_us: signed(locked, r.released),
+            }
+        };
         let sample = crate::diagnostics::tick::TickSample {
-            tick: done - started,
-            wait,
-            lock: lock_held,
-            post: done - released,
-            period: if dt.is_finite() && dt >= 0.0 { Duration::from_secs_f64(dt.min(4.0e3)) } else { Duration::ZERO },
-            reader_hold: others.reader_hold,
-            writer_hold: others.writer_hold,
-            reader_acquire: others.reader_acquire,
-            writer_acquire: others.writer_acquire,
-            stats_wait: Duration::from_micros(self.tick_stats_wait_us.load(Ordering::Relaxed)),
+            tick_us: us(done - started),
+            wait_us: us(wait),
+            lock_us: us(lock_held),
+            post_us: us(done - released),
+            period_us: if dt.is_finite() && dt >= 0.0 { us(Duration::from_secs_f64(dt.min(4.0e3))) } else { 0 },
+            reader_hold_us: us(log.reader_hold),
+            writer_hold_us: us(log.writer_hold),
+            reader_acquire_us: us(log.reader_acquire),
+            writer_acquire_us: us(log.writer_acquire),
+            stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            waited_for: log.last_release.map(holder),
+            longest_hold: log.longest.map(holder),
             late,
         };
         let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
