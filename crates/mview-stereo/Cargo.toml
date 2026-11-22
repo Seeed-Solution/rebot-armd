@@ -6,6 +6,10 @@ description = "Motion-stereo geometry of armd's measure_multiview action (built 
 license = "MIT"
 publish = false
 
+[features]
+mview-profile = []
+xthead-ncc = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 

@@ -4,7 +4,7 @@ set -euo pipefail
 # ==============================================================================
 # build_deb.sh - RISC-V (reCamera SG2002) build of armd
 #
-# Usage: build_deb.sh [--flavor recamera|lite] [VERSION]
+# Usage: build_deb.sh [--flavor recamera|lite] [--dry-run] [VERSION]
 #
 #   --flavor recamera  (default) core + kits/recamera-b601dm: the rebot-teleop
 #                      deb (armd, rebot-vision, init script, Wi-Fi AP, CAN setup,
@@ -20,6 +20,7 @@ set -euo pipefail
 #                      THIRD_PARTY_NOTICES.md, no init script, no kit files
 #                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
 #                      VERSION default: Cargo.toml
+#   --dry-run          print the cargo build command for the selected flavor and exit 0
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,12 +29,14 @@ PACKAGING_DIR="${REPO_ROOT}/kits/recamera-b601dm/packaging"
 TARGET_TRIPLE="riscv64gc-unknown-linux-musl"
 
 FLAVOR="recamera"
+DRY_RUN=0
 CUSTOM_VERSION=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --flavor) FLAVOR="${2:-}"; shift 2 ;;
         --flavor=*) FLAVOR="${1#--flavor=}"; shift ;;
-        -h|--help) sed -n '4,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) sed -n '4,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "Error: unknown option $1" >&2; exit 1 ;;
         *) CUSTOM_VERSION="$1"; shift ;;
     esac
@@ -43,7 +46,7 @@ case "$FLAVOR" in
     *) echo "Error: --flavor must be recamera or lite (got '${FLAVOR}')" >&2; exit 1 ;;
 esac
 # The recamera deb runs user programs that import the rebot SDK; lite has no SDK.
-if [ "$FLAVOR" = "recamera" ] && { [ -z "${REBOT_SDK_DIR:-}" ] || [ ! -d "${REBOT_SDK_DIR}/rebot" ]; }; then
+if [ "$DRY_RUN" -eq 0 ] && [ "$FLAVOR" = "recamera" ] && { [ -z "${REBOT_SDK_DIR:-}" ] || [ ! -d "${REBOT_SDK_DIR}/rebot" ]; }; then
     echo "Error: the recamera flavor needs the rebot Python SDK: set REBOT_SDK_DIR=<rebot-companion checkout>" >&2
     echo "       (a directory with rebot/; got '${REBOT_SDK_DIR:-}')." >&2
     exit 1
@@ -71,48 +74,58 @@ else
 fi
 echo "====================================================================="
 
-# Check toolchain availability
-if ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: cargo is not installed or not in PATH" >&2
-    exit 1
-fi
-
-if [ "$FLAVOR" = "recamera" ] && ! command -v dpkg-deb >/dev/null 2>&1; then
-    echo "Error: dpkg-deb is not installed or not in PATH" >&2
-    exit 1
-fi
-
-if [ "$FLAVOR" = "recamera" ] && [ -z "${REBOT_VISION_BIN:-}" ] && [ -z "${RECAMERA_DOCKER:-}" ]; then
-    echo "Error: the recamera flavor needs rebot-vision: set RECAMERA_DOCKER=<tpuc_dev container>" >&2
-    echo "       to build it (scripts/build_vision.sh), or REBOT_VISION_BIN=<prebuilt binary>." >&2
-    exit 1
-fi
-
-# Linker flags: either RUSTFLAGS is set by the caller, or they are built from
-# RECAMERA_TOOLCHAIN. RUSTFLAGS replaces the rustflags in .cargo/config.toml,
-# so the full list is given here.
-if [ -z "${RUSTFLAGS:-}" ]; then
-    if [ -z "$TOOLCHAIN_ROOT" ] || [ ! -d "$TOOLCHAIN_ROOT" ]; then
-        echo "Error: set RECAMERA_TOOLCHAIN to the riscv64-linux-musl-x86_64 toolchain directory" >&2
-        echo "       (from https://github.com/sophgo/host-tools, gcc/riscv64-linux-musl-x86_64)," >&2
-        echo "       or set RUSTFLAGS with the linker search paths yourself." >&2
+if [ "$DRY_RUN" -eq 0 ]; then
+    # Check toolchain availability
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "Error: cargo is not installed or not in PATH" >&2
         exit 1
     fi
-    GCC_LIB_DIR="$(ls -d "${TOOLCHAIN_ROOT}"/lib/gcc/riscv64-unknown-linux-musl/*/lib64v0p7_xthead/lp64d 2>/dev/null | head -n1)"
-    if [ -z "$GCC_LIB_DIR" ]; then
-        echo "Error: no lib/gcc/riscv64-unknown-linux-musl/<version>/lib64v0p7_xthead/lp64d under ${TOOLCHAIN_ROOT}" >&2
+
+    if [ "$FLAVOR" = "recamera" ] && ! command -v dpkg-deb >/dev/null 2>&1; then
+        echo "Error: dpkg-deb is not installed or not in PATH" >&2
         exit 1
     fi
-    export RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static \
+
+    if [ "$FLAVOR" = "recamera" ] && [ -z "${REBOT_VISION_BIN:-}" ] && [ -z "${RECAMERA_DOCKER:-}" ]; then
+        echo "Error: the recamera flavor needs rebot-vision: set RECAMERA_DOCKER=<tpuc_dev container>" >&2
+        echo "       to build it (scripts/build_vision.sh), or REBOT_VISION_BIN=<prebuilt binary>." >&2
+        exit 1
+    fi
+
+    # Linker flags: either RUSTFLAGS is set by the caller, or they are built from
+    # RECAMERA_TOOLCHAIN. RUSTFLAGS replaces the rustflags in .cargo/config.toml,
+    # so the full list is given here.
+    if [ -z "${RUSTFLAGS:-}" ]; then
+        if [ -z "$TOOLCHAIN_ROOT" ] || [ ! -d "$TOOLCHAIN_ROOT" ]; then
+            echo "Error: set RECAMERA_TOOLCHAIN to the riscv64-linux-musl-x86_64 toolchain directory" >&2
+            echo "       (from https://github.com/sophgo/host-tools, gcc/riscv64-linux-musl-x86_64)," >&2
+            echo "       or set RUSTFLAGS with the linker search paths yourself." >&2
+            exit 1
+        fi
+        GCC_LIB_DIR="$(ls -d "${TOOLCHAIN_ROOT}"/lib/gcc/riscv64-unknown-linux-musl/*/lib64v0p7_xthead/lp64d 2>/dev/null | head -n1)"
+        if [ -z "$GCC_LIB_DIR" ]; then
+            echo "Error: no lib/gcc/riscv64-unknown-linux-musl/<version>/lib64v0p7_xthead/lp64d under ${TOOLCHAIN_ROOT}" >&2
+            exit 1
+        fi
+        export RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static \
 -L ${GCC_LIB_DIR} \
 -L ${TOOLCHAIN_ROOT}/sysroot/lib64v0p7_xthead/lp64d \
 -L ${TOOLCHAIN_ROOT}/sysroot/usr/lib64v0p7_xthead/lp64d"
+    fi
 fi
 
 # 1. Compile armd binary for RISC-V musl
 if [ "$FLAVOR" = "lite" ]; then echo "[1/3] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; else echo "[1/5] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; fi
 cd "${REPO_ROOT}"
-cargo build --release --target "${TARGET_TRIPLE}"
+CARGO_ARGS=(build --release --target "${TARGET_TRIPLE}")
+if [ "$FLAVOR" = "recamera" ]; then
+    CARGO_ARGS+=(--features xthead-ncc)
+fi
+echo "      + cargo ${CARGO_ARGS[*]}"
+if [ "$DRY_RUN" -eq 1 ]; then
+    exit 0
+fi
+cargo "${CARGO_ARGS[@]}"
 
 BIN_PATH="${REPO_ROOT}/target/${TARGET_TRIPLE}/release/armd"
 if [ ! -f "${BIN_PATH}" ]; then

@@ -977,7 +977,7 @@ fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
 
 /// The `measurement` value of the action (see docs/agent_action_api.md).
 fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
-    table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, fallbacks: &[Value], compute_ms: f64) -> Value {
+    table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, ncc_backend: &mview_stereo::BackendDiagnostics, fallbacks: &[Value], compute_ms: f64) -> Value {
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
     let views: Vec<Value> = caps.iter().map(|c| json!({
@@ -1022,6 +1022,8 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         if caps.iter().any(|c| c.gray_convert_ms.is_some()) {
             o.insert("gray_convert_ms".into(), json!(r2(conv_sum)));
         }
+        o.insert("ncc_backend".into(), json!(ncc_backend.backend));
+        o.insert("ncc_backend_reason".into(), json!(ncc_backend.reason));
     }
     let offsets: Vec<[f64; 2]> = caps.iter().map(|c| c.offset).collect();
     json!({
@@ -1037,6 +1039,7 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "baseline_m": r4(span(&offsets)),
         "fallbacks": fallbacks,
         "stats": st,
+        "ncc_backend": ncc_backend,
         "compute_ms": compute_ms.round(),
     })
 }
@@ -1146,6 +1149,8 @@ pub struct Computed {
     pub plane: Option<mview_stereo::TablePlane>,
     /// The object threshold used (m).
     pub object_min_h_m: f64,
+    /// Active NCC backend, selection reason, and kernel call counts for this run.
+    pub ncc_backend: mview_stereo::BackendDiagnostics,
     pub ms: f64,
 }
 
@@ -1187,6 +1192,7 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
     let region_px = feature_region(ref_box_px);
     let mut p = Params::new(table_z);
     p.exclude_px = views.get(reference).map(|v| gripper_region_px([v.img.w as f64, v.img.h as f64]));
+    mview_stereo::reset_kernel_counts();
     let pose = (mode != PoseRefine::Off).then(|| {
         let mut pp = mview_stereo::PoseParams::default();
         let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();
@@ -1201,6 +1207,7 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
         }
         None => mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p),
     };
+    let ncc_backend = mview_stereo::backend_diagnostics();
     // heights from the table plane fitted to the points outside the box (else z = table_z)
     let cam0 = views.get(reference).map(|v| v.cam);
     let centre = cam0.and_then(|c| {
@@ -1215,7 +1222,7 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
     }
     let measure = mview_stereo::measure(&rec.points, &pm);
     let table = mview_stereo::table_check(&rec.points, &p);
-    Computed { measure, table, rec, region_px, pose, plane, object_min_h_m: pm.object_min_h_m, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+    Computed { measure, table, rec, region_px, pose, plane, object_min_h_m: pm.object_min_h_m, ncc_backend, ms: t0.elapsed().as_secs_f64() * 1000.0 }
 }
 
 /// The `table_plane` value of the measurement: the fitted plane, or null (heights from table_z).
@@ -1465,7 +1472,7 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
         "intrinsics": {"fx": plan.cam.fx, "fy": plan.cam.fy, "cx": plan.cam.cx, "cy": plan.cam.cy, "size": plan.cam.size},
         "cam_mount": {"r_end_cam": mat_json(&plan.cam.rec), "offset_m": plan.cam.offset},
         "table_z_m": tz, "reference": reference, "ref_box_px": ref_box_px, "region_px": c.region_px,
-        "views": views, "stats": c.rec.stats, "points": points, "outcomes": outcomes, "measurement": measurement,
+        "views": views, "stats": c.rec.stats, "ncc_backend": c.ncc_backend, "points": points, "outcomes": outcomes, "measurement": measurement,
     })
 }
 
@@ -1698,9 +1705,17 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let back = back_to_start(ctx, plan).await;
     let (c, mut computed_views) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
     let stats = c.rec.stats;
-    tracing::info!("measure_multiview {}: {} views, {stats:?}, {:.0} ms, {:?}", ctx.id, caps.len(), c.ms, c.measure.as_ref().map(|m| m.height_m));
+    tracing::info!(
+        "measure_multiview {}: {} views, ncc_backend={} ({}), {stats:?}, {:.0} ms, {:?}",
+        ctx.id,
+        caps.len(),
+        c.ncc_backend.backend,
+        c.ncc_backend.reason,
+        c.ms,
+        c.measure.as_ref().map(|m| m.height_m)
+    );
     let in_box = box_heights(&c.rec.points, table_z);
-    let mut value = measurement_value(plan, frame_source, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
+    let mut value = measurement_value(plan, frame_source, &caps, &ref_det, &c.measure, &c.table, &stats, &c.ncc_backend, &fallbacks, c.ms);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
     value["table_plane"] = plane_value(&c.plane);
@@ -2004,5 +2019,142 @@ mod tests {
             std::fs::write(bad_dir.join("bundle.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
             assert!(read_bundle(&bad_dir).is_err());
         }
+    }
+
+    #[test]
+    fn ncc_backend_diagnostics_reported_in_compute_measurement_and_bundle() {
+        let (w, h) = (320usize, 240usize);
+        let (fx, fy, cx, cy) = (400.0, 400.0, 160.0, 120.0);
+        let r = [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]];
+        let tex = |wx: f64, wy: f64| -> u8 {
+            let cx_i = (wx * 80.0).floor() as i32;
+            let cy_i = (wy * 80.0).floor() as i32;
+            let checker = if (cx_i + cy_i) & 1 == 0 { 190.0 } else { 65.0 };
+            let fine = 25.0 * (wx * 310.0).sin() * (wy * 290.0).cos();
+            (checker + fine).clamp(0.0, 255.0) as u8
+        };
+        let offsets = [-0.04, 0.0, 0.04];
+        let views: Vec<View> = offsets.iter().map(|&ox| {
+            let c = [ox, 0.0, 0.40];
+            let mut px = vec![0u8; w * h];
+            for v in 0..h {
+                for u in 0..w {
+                    let wx = ox + 0.40 * (u as f64 - cx) / fx;
+                    let wy = -0.40 * (v as f64 - cy) / fy;
+                    px[v * w + u] = tex(wx, wy);
+                }
+            }
+            View {
+                cam: Camera { r, c, fx, fy, cx, cy },
+                img: Gray::new(w, h, px).unwrap(),
+            }
+        }).collect();
+
+        let ref_box_px = [100.0, 70.0, 220.0, 170.0];
+        let c = compute(&views, 1, ref_box_px, 0.0, PoseRefine::Off, &[]);
+
+        let expected_backend = mview_stereo::backend_diagnostics();
+        assert_eq!(c.ncc_backend.backend, expected_backend.backend);
+        assert_eq!(c.ncc_backend.reason, expected_backend.reason);
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            assert!(!c.ncc_backend.reason.is_empty(), "reason should be non-empty");
+            let total_kernel_calls = c.ncc_backend.counts.coarse_dots_scalar
+                + c.ncc_backend.counts.coarse_dots_xthead071
+                + c.ncc_backend.counts.patch_moments_scalar
+                + c.ncc_backend.counts.patch_moments_xthead071;
+            assert!(
+                total_kernel_calls > 0,
+                "expected NCC kernel counts > 0 across backends, got {:?}",
+                c.ncc_backend.counts
+            );
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(c.ncc_backend.reason, "scalar (built without xthead-ncc)");
+            assert_eq!(
+                c.ncc_backend.counts,
+                mview_stereo::KernelCallCounts::default(),
+                "expected zero kernel counts when built without xthead-ncc or mview-profile"
+            );
+        }
+
+        let arm = crate::chain::ArmModel::default();
+        let setup = GraspSetup { image_size_px: [w as f64, h as f64], fx_px: fx, fy_px: fy, cx_px: Some(cx), cy_px: Some(cy), ..GraspSetup::default() };
+        let cam = CamModel::assumed(&arm, &setup, &crate::model::CameraMount::default());
+        let plan = Plan {
+            request: parse_request(&Value::Null).unwrap(),
+            epoch: 1,
+            workspace_revision: 1,
+            calibration_revision: 1,
+            setup,
+            cam,
+            start: vec![0.0; 6],
+            arm_dof: 6,
+            deadline_s: 30.0,
+        };
+        let caps: Vec<Capture> = offsets.iter().enumerate().map(|(i, &ox)| Capture {
+            offset: [ox, 0.0],
+            pose: Pose::new(r, [ox, 0.0, 0.40]),
+            img: Gray { w: 0, h: 0, px: Vec::new() },
+            frame_source: FrameSource::Snapshot,
+            instance_id: None,
+            frame_id: i as u64 + 1,
+            detections: Vec::new(),
+            decode_ms: if i == 0 { 1.236 } else { 1.0 },
+            frame_fetch_ms: 0.0,
+            gray_convert_ms: None,
+            parse_ms: 0.0,
+            shift_px: [0.0, 0.0],
+            margin_px: 20.0,
+            joints: vec![0.0; 6],
+            bracket: [vec![0.0; 6], vec![0.0; 6]],
+            snapshot_tries: vec![0.0],
+            retry_reasons: Vec::new(),
+            bracket_duration_ms: 0.0,
+            feedback_wait_b_ms: 0.0,
+            feedback_age_a_ms: None,
+            feedback_age_b_ms: None,
+            settle_s: 2.0,
+            trigger_ms: 10.0,
+            snapshot_wait_ms: 50.0,
+            snapshot_polls: 1,
+            jpeg: None,
+            markers: Vec::new(),
+        }).collect();
+        let det = Detection {
+            label: "box".into(),
+            score: 0.9,
+            raw_score_valid: true,
+            box_norm: [100.0 / w as f64, 70.0 / h as f64, 220.0 / w as f64, 170.0 / h as f64],
+            angle_deg: None,
+            angle_conf: None,
+            grasp_width_px: None,
+            mask_focus: false,
+            disp_fg: None,
+            disp_bg: None,
+            depth_conf: None,
+            length_px: None,
+            jaw_clear: None,
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
+        };
+        let mut stats = c.rec.stats;
+        stats.sweep_ms = 12.346;
+        let val = measurement_value(&plan, FrameSource::Snapshot, &caps, &det, &c.measure, &c.table, &stats, &c.ncc_backend, &[], c.ms);
+        assert_eq!(val["stats"]["ncc_backend"], json!(c.ncc_backend.backend));
+        assert_eq!(val["stats"]["ncc_backend_reason"], json!(c.ncc_backend.reason));
+        assert_eq!(val["stats"]["sweep_ms"], json!(12.35));
+        assert_eq!(val["stats"]["decode_ms"], json!(3.24));
+        let expected_diag = serde_json::to_value(&c.ncc_backend).unwrap();
+        assert_eq!(val["ncc_backend"], expected_diag);
+        assert!(val["ncc_backend"]["counts"].is_object());
+
+        let bundle = bundle_doc(42, &plan, FrameSource::Snapshot, &caps, 1, ref_box_px, &c, &val);
+        assert_eq!(bundle["ncc_backend"], expected_diag);
+        assert_eq!(bundle["ncc_backend"]["backend"], json!(c.ncc_backend.backend));
+        assert_eq!(bundle["ncc_backend"]["reason"], json!(c.ncc_backend.reason));
+        assert_eq!(bundle["ncc_backend"]["counts"], serde_json::to_value(c.ncc_backend.counts).unwrap());
     }
 }

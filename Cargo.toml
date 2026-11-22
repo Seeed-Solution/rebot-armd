@@ -20,6 +20,8 @@ policy-tract = ["policy-runtime", "dep:tract-onnx"]
 # host / riscv replay of measure_multiview debug bundles (src/bin/mview_replay.rs); not in the
 # device package (scripts/build_deb.sh builds the default features)
 mview-replay = []
+mview-profile = ["mview-stereo/mview-profile"]
+xthead-ncc = ["mview-stereo/xthead-ncc"]
 
 [[bin]]
 name = "mview-replay"
