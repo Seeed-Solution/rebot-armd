@@ -89,8 +89,10 @@ pub const SPEED_SCALE: [f64; 2] = [0.1, 0.5];
 pub const DEFAULT_SPEED_SCALE: f64 = 0.3;
 /// Wait after a view motion settled, before the first snapshot (s). Real B601-DM, 2026-11-22: J1
 /// trails its POS_VEL command by up to 19 mrad at the end of a view move and the rest decays with
-/// tau ~0.7 s, so after 1 s the trigger-and-snapshot bracket still moved 2.7-5.7 mrad.
-pub const MIN_SETTLE_S: f64 = 2.0;
+/// tau ~0.7 s, so after 1 s the trigger-and-snapshot bracket still moved 2.7-5.7 mrad. With the
+/// stillness rule on new feedback samples and the bracket check, 1.0 s gave no `MOVED` in 2 orbit
+/// runs on 1.5.0-rc4 (settle 2.8 s instead of 4.7 s per run, same sizes); default 1.0 s since then.
+pub const MIN_SETTLE_S: f64 = 1.0;
 /// Bounds of the request's `settle_min_s` (the wait above at the view poses; default
 /// [`MIN_SETTLE_S`]), for tuning it on the real arm. The still windows and the bracket check apply
 /// whatever its value; a shorter wait trades time for more `MOVED` retries.
@@ -125,7 +127,7 @@ pub const STILL_WINDOW: usize = 10;
 pub const STILL_SAMPLE: Duration = Duration::from_millis(20);
 pub const STILL_VEL: f32 = 0.03;
 pub const STILL_RANGE_RAD: f32 = 0.003;
-pub const MAX_SETTLE_S: f64 = 4.0;
+pub const MAX_SETTLE_S: f64 = 3.0;
 
 /// The settle deadline after a view motion for a minimum wait `min_s` (the windows get
 /// [`MAX_SETTLE_S`] - [`MIN_SETTLE_S`] after it): [`MAX_SETTLE_S`] at the default, up to 5 s at
