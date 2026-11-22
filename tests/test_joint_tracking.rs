@@ -49,6 +49,8 @@ struct TrackingTestState {
     written: Vec<Vec<JointTarget>>,
     /// Include gravity model torque in reported torques when 6+ DOF arm.
     include_gravity_torque: bool,
+    /// When true, the next `write_joint_targets` call fails with a bus error (auto-clears).
+    fail_next_write: bool,
 }
 
 impl TrackingTestState {
@@ -67,6 +69,7 @@ impl TrackingTestState {
             feedback_age: Duration::ZERO,
             written: Vec::new(),
             include_gravity_torque: true,
+            fail_next_write: false,
         }
     }
 }
@@ -135,6 +138,10 @@ impl ArmDriver for TrackingTestDriver {
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut s = self.0.lock().unwrap();
+        if s.fail_next_write {
+            s.fail_next_write = false;
+            return Err(ArmDriverError::Protocol("simulated write failure".into()));
+        }
         s.written.push(targets.to_vec());
         if s.enabled != EnableState::Enabled {
             return Ok(());
@@ -1815,5 +1822,100 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         for i in 0..6 {
             assert!((issued[i] - q0[i]).abs() < 1e-4, "joint {i} handback target drifted: {} vs {}", issued[i], q0[i]);
         }
+    }
+}
+
+/// M6: Action completion ("done") is deferred until that tick's output passes tracking
+/// validation and is written to the driver. A rejected or failed final frame fails the action.
+#[test]
+fn tracking_defers_action_done_until_final_output_accepted() {
+    let cur_gripper_frac = |inner: &SupervisorInner, q_grip: f32| -> f64 {
+        let policy = inner.config.gripper_policy.as_ref().unwrap();
+        f64::from(((q_grip - policy.closed_rad) / (policy.open_rad - policy.closed_rad)).clamp(0.0, 1.0))
+    };
+    let make_rig = || {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let epoch = inner.safety.epoch_id();
+        let cur_frac = cur_gripper_frac(&inner, q0[6]);
+        let (id, _) = inner
+            .start_gripper(
+                GripperRequest {
+                    command: GripperCommand::Move,
+                    fraction: Some(cur_frac),
+                    grasp: false,
+                    speed: 1.0,
+                    timeout_s: Some(5.0),
+                    tag: None,
+                },
+                epoch,
+            )
+            .unwrap();
+        (inner, drv, id, q0)
+    };
+
+    // 1. Control: measure exact tick count `done_tick` until StepStatus::Done publishes "done".
+    let done_tick = {
+        let (mut inner, _drv, id, _q0) = make_rig();
+        let mut n = 0usize;
+        for k in 1..=30 {
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational());
+            let act = obs.action.expect("action status present");
+            assert_eq!(act.id, id);
+            if act.state == "done" {
+                n = k;
+                break;
+            }
+            assert_eq!(act.state, "running");
+        }
+        assert!(n >= 1, "control gripper action must reach done");
+        n
+    };
+
+    // 2. Final frame rejected by tracking validation on the EXACT `done_tick`.
+    {
+        let (mut inner, _drv, id, q0) = make_rig();
+        for _ in 1..done_tick {
+            let obs = inner.tick(DT);
+            assert_eq!(obs.action.as_ref().unwrap().state, "running");
+        }
+        assert!(inner.active_trajectory.is_some(), "trajectory must still be active right before done_tick");
+        // Tighten joint 1 limit so tracking rejects the final tick's output with JointLimit.
+        inner.config.limits[0].max_position = q0[0] - 0.05;
+        let obs = inner.tick(DT);
+        assert!(inner.active_trajectory.is_none(), "StepStatus::Done must have executed on done_tick");
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "rejected final frame must fault");
+        let act = obs.action.expect("action status present");
+        assert_eq!(act.id, id);
+        assert_eq!(act.state, "failed", "action must NOT report done when final frame is rejected by tracking");
+        assert!(
+            obs.fault.as_ref().is_some_and(|f| f.message.contains("Joint tracking output rejected")),
+            "fault must come from tracking rejection: {:?}",
+            obs.fault
+        );
+    }
+
+    // 3. Final frame accepted by tracking, but `driver.write_joint_targets` fails on `done_tick`.
+    {
+        let (mut inner, drv, id, _q0) = make_rig();
+        for _ in 1..done_tick {
+            let obs = inner.tick(DT);
+            assert_eq!(obs.action.as_ref().unwrap().state, "running");
+        }
+        assert!(inner.active_trajectory.is_some(), "trajectory must still be active right before done_tick");
+        drv.with(|s| s.fail_next_write = true);
+        let obs = inner.tick(DT);
+        assert!(inner.active_trajectory.is_none(), "StepStatus::Done must have executed on done_tick");
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "failed driver write must fault");
+        let act = obs.action.expect("action status present");
+        assert_eq!(act.id, id);
+        assert_eq!(act.state, "failed", "action must NOT report done when final frame fails driver write");
     }
 }

@@ -225,6 +225,17 @@ pub struct HeldObject {
     pub spill_safe: bool,
 }
 
+/// Action completion captured during trajectory stepping and published only after
+/// that tick's output passes tracking validation and is written to the driver.
+struct DeferredActionDone {
+    action_id: Option<u64>,
+    macro_sub: bool,
+    settled: Option<bool>,
+    holding: Option<bool>,
+    gripper_gap_rad: Option<f32>,
+    clear_releasing: bool,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
@@ -3887,7 +3898,7 @@ impl SupervisorInner {
     }
 
     /// Single place that ends a running action whose reference went away (spec 2.3).
-    fn reconcile_action(&mut self, dt: f64) {
+    fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, kind) = (action.id, action.kind.clone());
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
@@ -3933,6 +3944,7 @@ impl SupervisorInner {
             let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
             // a joint-space sub-motion (sequence pose step) settles before it counts as done
             if !superseded && !run.stop_requested && run.sub == SubState::Running && self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+                if !tick_output_accepted { return; }
                 let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
                 if let Some(settled) = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel)) {
                     self.quintic_settle = None;
@@ -3970,6 +3982,7 @@ impl SupervisorInner {
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
                 return;
             }
+            if !tick_output_accepted { return; }
             let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
             let result = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel));
             if let Some(settled) = result {
@@ -3984,8 +3997,10 @@ impl SupervisorInner {
         }
     }
 
-    /// Apply one executor step of a Path / Gripper reference.
-    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) {
+    /// Apply one executor step of a Path / Gripper / Replay reference.
+    /// Returns a deferred completion payload on `StepStatus::Done` so `"done"` is only
+    /// published after that tick's output has been validated and written to the driver.
+    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) -> Option<DeferredActionDone> {
         self.commanded_positions = out.positions;
         self.commanded_velocities = out.velocities;
         if out.clear_gripper_stall {
@@ -3998,21 +4013,21 @@ impl SupervisorInner {
             if a.id == id && a.is_running() && !macro_sub { a.progress = out.progress; }
         }
         match out.status {
-            StepStatus::Running => {}
+            StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
-                    self.releasing = false;
-                    self.held = None;
-                }
+                let clear_releasing = self.releasing
+                    && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
-                if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
-                if macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() {
-                        m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
-                    }
-                } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+                Some(DeferredActionDone {
+                    action_id,
+                    macro_sub,
+                    settled,
+                    holding,
+                    gripper_gap_rad,
+                    clear_releasing,
+                })
             }
             StepStatus::Failed { code, message } => {
                 if code == "TRACKING_STALL" {
@@ -4031,6 +4046,7 @@ impl SupervisorInner {
                 if macro_sub {
                     if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
                 } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                None
             }
         }
     }
@@ -4980,18 +4996,19 @@ impl SupervisorInner {
                 a.phase = Some("approach".into());
             }
         }
+        let mut deferred_done: Option<DeferredActionDone> = None;
         match stepped {
             None => {}
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
-                self.apply_action_step(action_id, out);
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Arm(mut out))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                self.apply_action_step(action_id, out);
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Replay(mut out, phase, t_s))) => {
                 reference_stepped = true;
@@ -5003,7 +5020,7 @@ impl SupervisorInner {
                         a.t_s = Some(t_s as f32);
                     }
                 }
-                self.apply_action_step(action_id, out);
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Quintic(mut point, finished, progress))) => {
                 reference_stepped = true;
@@ -5273,6 +5290,7 @@ impl SupervisorInner {
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
+        let mut tick_output_rejected = false;
         if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
@@ -5308,6 +5326,7 @@ impl SupervisorInner {
                 if tracking_active && self.tracking.recovery_suspended {
                     // Driver emitted an autonomous recovery write; suspend supervisor target
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
+                    tick_output_rejected = true;
                 } else if ramp_out_handover || tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
@@ -5362,6 +5381,7 @@ impl SupervisorInner {
                             }
                         }
                         Err(reject) => {
+                            tick_output_rejected = true;
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
                             let prev_confirmed = self.tracking.last_issued_positions.clone();
                             let prev_ws_min_depths = self.tracking.ws_min_depths.clone();
@@ -5490,12 +5510,16 @@ impl SupervisorInner {
                 }
             } else {
                 self.tracking.invalidate();
+                if self.driver.is_some() {
+                    tick_output_rejected = true;
+                }
             }
         } else {
             self.tracking.invalidate();
         }
 
         if let Some(error) = output_error {
+            tick_output_rejected = true;
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
@@ -5507,6 +5531,39 @@ impl SupervisorInner {
                 self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
             }
             tracing::error!("Control output failed: {error}");
+        }
+
+        let tick_output_accepted = !tick_output_rejected && !self.safety.state().is_stopped();
+        if let Some(done) = deferred_done {
+            if tick_output_accepted {
+                if done.clear_releasing {
+                    self.releasing = false;
+                    self.held = None;
+                }
+                if !self.pending_normal_unload {
+                    self.safety.mark_motion_finished();
+                }
+                if done.macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Done(SubDone {
+                            settled: done.settled,
+                            holding: done.holding,
+                            gripper_gap_rad: done.gripper_gap_rad,
+                            at: Instant::now(),
+                        });
+                    }
+                } else if let Some(id) = done.action_id {
+                    self.finish_action(
+                        id,
+                        "done",
+                        None,
+                        None,
+                        done.settled,
+                        done.holding,
+                        done.gripper_gap_rad,
+                    );
+                }
+            }
         }
 
         // If in simulation (no hardware driver attached), mirror commanded into measured
@@ -5572,7 +5629,7 @@ impl SupervisorInner {
             }
         }
 
-        self.reconcile_action(servo_dt);
+        self.reconcile_action(servo_dt, tick_output_accepted);
         self.expire_motion_limit();
         let obs = self.current_observation();
 
