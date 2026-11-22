@@ -123,6 +123,7 @@ fn mit_stale_rx_never_replays() {
     }
     // J4 RX lost (motor still receives) after a read of every reply; read and write up to 44 ms
     // after its last feedback
+    let _ = d.read_joint_states(); // replies become visible after an observed-empty queue
     let _ = d.read_joint_states();
     bus.with(|s| s.motors[J4].silent = true);
     let t0 = clock.now();
@@ -273,6 +274,7 @@ fn mit_watchdog_tx_loss() {
     let t = targets(&mut d, 0.0);
     d.write_joint_targets(&t).unwrap();
     let _ = d.read_joint_states();
+    let _ = d.read_joint_states();
     let lost_at = clock.now();
     bus.with(|s| for m in s.motors.iter_mut() { m.silent = true; });
     for _ in 0..30 {
@@ -307,4 +309,58 @@ fn mit_watchdog_tx_loss() {
     let rb = d.read_motor_identity(&[J4]);
     assert!(rb.is_err() || rb.unwrap()[0].timeout_raw == 0);
     assert_no_flash_write(&bus.tx_log());
+}
+
+fn reg_reply(id: u16, op: u8, rid: u8, value: [u8; 4]) -> CanFrame {
+    let [lo, hi] = id.to_le_bytes();
+    CanFrame::new_standard(0x10 + id, &[lo, hi, op, rid, value[0], value[1], value[2], value[3]]).unwrap()
+}
+
+/// Review #2: replies that were already queued when a request went out (stale) never satisfy a
+/// register read, a TIMEOUT acknowledgement or a mode-switch confirmation; only a reply received
+/// after the queue was observed empty after the request counts. The real reply is withheld.
+#[test]
+fn mit_stale_queued_replies_never_satisfy_a_transaction() {
+    let limits = b601_limits()[J4];
+    let stale_identity = |id: u16| -> Vec<CanFrame> {
+        let mut v = Vec::new();
+        for (rid, val) in [(damiao::RID_ESC_ID, u32::from(id).to_le_bytes()), (damiao::RID_MST_ID, (0x10 + u32::from(id)).to_le_bytes()),
+            (damiao::RID_SW_VER, mit_support::SW_VER.to_le_bytes()), (damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+            (damiao::RID_PMAX, limits.p_max.to_le_bytes()), (damiao::RID_VMAX, limits.v_max.to_le_bytes()),
+            (damiao::RID_TMAX, limits.t_max.to_le_bytes()), (damiao::RID_TIMEOUT, 2000u32.to_le_bytes())] {
+            v.push(reg_reply(id, damiao::REG_READ, rid, val));
+        }
+        v
+    };
+    // identity readback: J4 silent, a full set of old matching replies queued ahead
+    let (mut d, bus, _) = rig(0);
+    bus.with(|s| { s.motors[J4].silent = true; s.inject_on_next_tx = stale_identity(4); });
+    assert!(d.read_motor_identity(&[J4]).is_err(), "stale replies satisfied the identity read");
+
+    // TIMEOUT write: an old matching acknowledgement queued, the real one withheld
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap();
+    bus.with(|s| s.push_all_feedback());
+    let _ = d.read_joint_states();
+    let _ = d.read_joint_states();
+    bus.with(|s| {
+        s.motors[J4].no_write_ack = true;
+        s.inject_on_reg_write = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_TIMEOUT, 2000u32.to_le_bytes())];
+    });
+    let res = d.commission_motor_timeout(&[J4], 2000);
+    assert!(res.is_err(), "a stale acknowledgement satisfied the TIMEOUT write");
+
+    // confirmed mode switch: an old CTRL_MODE acknowledgement and an old feedback queued, the
+    // motor answers nothing after the switch
+    let (mut d, bus, _) = rig(2000);
+    let hold = hold_at(&mut d);
+    let fb = bus.with(|s| s.motors[J4].feedback_frame());
+    bus.with(|s| {
+        s.motors[J4].silent_after_mode_ack = false;
+        s.motors[J4].no_write_ack = true;
+        s.motors[J4].mute_feedback = true;
+        s.inject_on_reg_write = vec![reg_reply(4, damiao::REG_WRITE, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT.to_le_bytes()), fb];
+    });
+    assert!(d.set_joint_modes_confirmed(&modes_j4(JointMode::Mit), &hold).is_err(), "stale ACK + feedback confirmed the switch");
 }

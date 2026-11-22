@@ -126,6 +126,14 @@ pub fn decode_mit(data: &[u8; 8], l: &DamiaoLimits) -> MotorCmd {
 pub struct FakeBusState {
     pub motors: Vec<FakeMotor>,
     pub rx: VecDeque<CanFrame>,
+    /// Replies to transmitted frames: they reach `rx` only after the receive queue was observed
+    /// empty once after the transmit (a reply never precedes its request on the wire).
+    pub pending: VecDeque<CanFrame>,
+    /// Old frames delivered at once on the next transmit, ahead of any real reply (stale
+    /// replies still queued in the transport).
+    pub inject_on_next_tx: Vec<CanFrame>,
+    /// The same, on the next register write (0x7FF, opcode 0x55).
+    pub inject_on_reg_write: Vec<CanFrame>,
     /// Every frame the driver handed to the transport (also the lost and refused ones), with the
     /// fake time.
     pub tx_log: Vec<CanFrame>,
@@ -271,7 +279,7 @@ impl FakeBus {
 
     fn build(limits: &[DamiaoLimits], clock: Option<MockClock>) -> Self {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
-        Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), tx_log: Vec::new(), tx_times: Vec::new(), clock,
+        Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), tx_log: Vec::new(), tx_times: Vec::new(), clock,
             tx_lost: false, tx_error: false, tx_stall: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
             fail_tx_ids: Vec::new(), fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
     }
@@ -300,13 +308,31 @@ impl CanTransport for FakeBus {
             if *n == 0 { return Err(TransportError::Can("injected transmit error (partial batch)".into())); }
             *n -= 1;
         }
-        if !s.tx_lost { s.handle(frame); }
+        let stale = std::mem::take(&mut s.inject_on_next_tx);
+        s.rx.extend(stale);
+        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
+            let stale = std::mem::take(&mut s.inject_on_reg_write);
+            s.rx.extend(stale);
+        }
+        if !s.tx_lost {
+            let before = s.rx.len();
+            s.handle(frame);
+            let replies: Vec<CanFrame> = s.rx.drain(before..).collect();
+            s.pending.extend(replies);
+        }
         Ok(())
     }
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
-        s.rx.pop_front().ok_or(TransportError::WouldBlock)
+        match s.rx.pop_front() {
+            Some(f) => Ok(f),
+            None => {
+                let p = std::mem::take(&mut s.pending);
+                s.rx.extend(p);
+                Err(TransportError::WouldBlock)
+            }
+        }
     }
     fn flush(&mut self) -> Result<(), TransportError> {
         let mut s = self.0.lock().unwrap();
