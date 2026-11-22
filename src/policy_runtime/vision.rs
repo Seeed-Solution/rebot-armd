@@ -1279,7 +1279,11 @@ impl VideoEmbeddingHub {
         }
 
         // 6. Bilateral timestamp check (before any window mutation!)
-        let oldest_raw = req.oldest_captured_at_ms.unwrap_or(req.captured_at_ms);
+        let oldest_raw = req.oldest_captured_at_ms.ok_or_else(|| EmbeddingIngestError {
+            status: 400,
+            code: "MISSING_OLDEST_TIMESTAMP",
+            message: "oldest_captured_at_ms is required on embedding ingest".into(),
+        })?;
         if oldest_raw > req.captured_at_ms {
             return Err(EmbeddingIngestError {
                 status: 400,

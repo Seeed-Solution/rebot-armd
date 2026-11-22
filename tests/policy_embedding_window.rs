@@ -607,6 +607,7 @@ async fn positive_m1_t4_http_ingestion_concat_norm_and_live_commit() {
                 "producer_epoch": 1,
                 "frame_id": (k as u64) + 1,
                 "captured_at_ms": cap_ms,
+                "oldest_captured_at_ms": cap_ms,
                 "embedding": emb,
                 "encoder_artifact_sha256": sha_a(),
                 "preprocess_config_sha256": sha_b(),
@@ -733,7 +734,7 @@ async fn positive_t1_video_model_commits_cleanly() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 500_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(500_000),
         embedding: vec![1.0, -0.5, 0.25, 2.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -942,6 +943,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 1,
             "captured_at_ms": 9_900,
+            "oldest_captured_at_ms": 9_900,
             "embedding": vec![0.1; MAX_POLICY_INPUT_WIDTH + 1],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -977,6 +979,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 10,
             "captured_at_ms": 9_900,
+            "oldest_captured_at_ms": 9_900,
             "embedding": [1.0, 2.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -995,6 +998,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 11,
             "captured_at_ms": 9_911,
+            "oldest_captured_at_ms": 9_911,
             "embedding": [3.0, 4.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1016,6 +1020,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 11,
             "captured_at_ms": 9_750,
+            "oldest_captured_at_ms": 9_750,
             "embedding": [3.0, 4.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1034,6 +1039,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 11,
             "captured_at_ms": 9_850, // mapped = 9_950 < 10_000
+            "oldest_captured_at_ms": 9_850,
             "embedding": [3.0, 4.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1052,6 +1058,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 2,
             "frame_id": 11,
             "captured_at_ms": 9_900,
+            "oldest_captured_at_ms": 9_900,
             "embedding": [3.0, 4.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1074,6 +1081,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 10,
             "captured_at_ms": 9_900,
+            "oldest_captured_at_ms": 9_900,
             "embedding": [1.0, 2.0, 3.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1096,6 +1104,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 11,
             "captured_at_ms": 9_900,
+            "oldest_captured_at_ms": 9_900,
             "embedding": [1.0, 2.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1122,6 +1131,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
                 "producer_epoch": 1,
                 "frame_id": fid,
                 "captured_at_ms": 9_800,
+                "oldest_captured_at_ms": 9_800,
                 "embedding": [1.0, 2.0],
                 "encoder_artifact_sha256": sha_a(),
                 "preprocess_config_sha256": sha_b(),
@@ -1141,6 +1151,7 @@ async fn handshake_and_ingestion_security_invariants_a2_a4_a5_a7_a8_a9_a10_a13()
             "producer_epoch": 1,
             "frame_id": 14,
             "captured_at_ms": 9_800,
+            "oldest_captured_at_ms": 9_800,
             "embedding": [3.0, 4.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b(),
@@ -1227,7 +1238,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1245,7 +1256,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
         producer_epoch: 1,
         frame_id: 2,
         captured_at_ms: f2_ts as i64,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(f2_ts as i64),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1544,6 +1555,7 @@ async fn b1_single_step_init_returns_challenge_without_activating_handshake() {
             "producer_epoch": 1,
             "frame_id": 1,
             "captured_at_ms": 49_950,
+            "oldest_captured_at_ms": 49_950,
             "embedding": [1.0, 2.0],
             "encoder_artifact_sha256": sha_a(),
             "preprocess_config_sha256": sha_b()
@@ -1640,7 +1652,7 @@ fn b1_excessive_server_measured_rtt_rejected_without_clobbering_active_state() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 200_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(200_000),
         embedding: vec![1.0, 2.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1893,7 +1905,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
             producer_epoch: 1,
             frame_id: 1,
             captured_at_ms: 1_000_000 - 46,
-            oldest_captured_at_ms: None,
+            oldest_captured_at_ms: Some(1_000_000 - 46),
             embedding: vec![1.0, 1.0],
             encoder_artifact_sha256: sha_a(),
             preprocess_config_sha256: sha_b(),
@@ -1908,7 +1920,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
         producer_epoch: 1,
         frame_id: 2,
         captured_at_ms: 1_000_000 - 40,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000 - 40),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2289,7 +2301,7 @@ async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2382,7 +2394,7 @@ async fn m3_unbroken_renewal_mid_inference_discards_target_holds_and_resumes() {
         producer_epoch: 1,
         frame_id: 2,
         captured_at_ms: 1_000_020,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_020),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2429,7 +2441,7 @@ fn m3_repeated_renewal_without_frames_times_out_after_max_window_span() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000),
         embedding: vec![1.0, 2.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2524,7 +2536,7 @@ async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2694,7 +2706,7 @@ async fn run_m4_counter_case(
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
-        oldest_captured_at_ms: None,
+        oldest_captured_at_ms: Some(1_000_000),
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -2797,7 +2809,7 @@ async fn m4_producer_model_generation_u64_max_to_1_invalidates_ticket() {
                 producer_epoch: 1,
                 frame_id: 2,
                 captured_at_ms: 1_000_000,
-                oldest_captured_at_ms: None,
+                oldest_captured_at_ms: Some(1_000_000),
                 embedding: vec![1.0, 1.0],
                 encoder_artifact_sha256: sha_a(),
                 preprocess_config_sha256: sha_b(),
@@ -2899,7 +2911,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
             producer_epoch: 1,
             frame_id: 1,
             captured_at_ms: 1_000_000,
-            oldest_captured_at_ms: None,
+            oldest_captured_at_ms: Some(1_000_000),
             embedding: vec![1.0, 1.0],
             encoder_artifact_sha256: sha_a(),
             preprocess_config_sha256: sha_b(),
@@ -2988,7 +3000,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
             producer_epoch: 1,
             frame_id: 2,
             captured_at_ms: 1_000_049,
-            oldest_captured_at_ms: None,
+            oldest_captured_at_ms: Some(1_000_049),
             embedding: vec![1.0, 1.0],
             encoder_artifact_sha256: sha_a(),
             preprocess_config_sha256: sha_b(),
@@ -3042,7 +3054,7 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
             producer_epoch: 1,
             frame_id: 1,
             captured_at_ms: 1_000_000,
-            oldest_captured_at_ms: None,
+            oldest_captured_at_ms: Some(1_000_000),
             embedding: vec![1.0, 1.0],
             encoder_artifact_sha256: sha_a(),
             preprocess_config_sha256: sha_b(),
@@ -3127,4 +3139,191 @@ async fn m1_on_stale_hold_discards_expired_target_and_resumes_whereas_lease_loss
         assert_eq!(writes.load(Ordering::SeqCst), 0);
         assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn b02_missing_oldest_captured_at_ms_rejected_400_without_mutation_or_target() {
+    let mut weights = vec![0.0f32; 6 * 8];
+    weights[6] = 0.1;
+    weights[7] = 0.1;
+    let layers = make_linear_layers(8, 6, weights);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 20.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 200,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 200,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(500_000));
+    let addr = spawn_http_server(sup.clone(), OperatorAuth::disabled()).await;
+    let client = reqwest::Client::new();
+
+    let hs_resp = http_two_step_handshake(&client, addr, None, None, 1, 500_000, 1, None, None).await;
+    assert_eq!(hs_resp.status(), reqwest::StatusCode::OK);
+    let hs_gen = hs_resp.json::<serde_json::Value>().await.unwrap()["handshake_generation"]
+        .as_u64()
+        .unwrap();
+
+    // 1. Omitting oldest_captured_at_ms on an empty ring returns 400 MISSING_OLDEST_TIMESTAMP
+    // and never fills the ring or allows a policy runner to apply a target.
+    let missing_empty = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": hs_gen,
+            "producer_epoch": 1,
+            "frame_id": 1,
+            "captured_at_ms": 500_000,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_empty.status(), reqwest::StatusCode::BAD_REQUEST);
+    let missing_json: serde_json::Value = missing_empty.json().await.unwrap();
+    assert_eq!(missing_json["code"], "MISSING_OLDEST_TIMESTAMP");
+    assert_eq!(hub.window_len(), 0);
+    assert!(hub.frame_ids().is_empty());
+    assert!(hub.window_deadlines().is_none());
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 20);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        20.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+    let lease_gen = sup.acquire_lease("conn-b02").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-b02".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_b02".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    let baseline_motion_frame = sup.inner().read().await.last_motion_frame;
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        20.0,
+        compute_policy_deadline(Some(0.08)).unwrap(),
+        None,
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+    let obs = sup.get_observation().await;
+    let pol = obs.policy.expect("policy obs");
+    assert_eq!(pol.steps, 0);
+    assert!(pol.last_shadow_target.is_none());
+    assert_eq!(sup.inner().read().await.last_motion_frame, baseline_motion_frame);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+
+    // 2. With an existing frame in the ring, a subsequent request omitting oldest_captured_at_ms
+    // is rejected with 400 MISSING_OLDEST_TIMESTAMP and leaves ring contents and deadlines unchanged.
+    hub.bind_policy(
+        10,
+        VideoEmbeddingSpec {
+            embedding_dim: 2,
+            history_len: 2,
+            max_staleness_ms: 200,
+            max_window_span_ms: 300,
+            fps_staleness_budget_ms: Some(200),
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            embedding_norm: None,
+            on_stale: armd::policy_runtime::VisionStalePolicy::Stop,
+        },
+        20.0,
+    );
+    let valid_first = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": hs_gen,
+            "producer_epoch": 1,
+            "frame_id": 2,
+            "captured_at_ms": 500_000,
+            "oldest_captured_at_ms": 499_980,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid_first.status(), reqwest::StatusCode::OK);
+    let frames_before = hub.frame_ids();
+    let deadlines_before = hub.window_deadlines().unwrap();
+
+    hub.set_test_now_ms(Some(500_020));
+    let err_second = hub
+        .ingest_embedding(EmbeddingIngestRequest {
+            handshake_generation: hs_gen,
+            producer_epoch: 1,
+            frame_id: 3,
+            captured_at_ms: 500_020,
+            oldest_captured_at_ms: None,
+            embedding: vec![3.0, 4.0],
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            model_generation: None,
+        })
+        .unwrap_err();
+    assert_eq!(err_second.status, 400);
+    assert_eq!(err_second.code, "MISSING_OLDEST_TIMESTAMP");
+    assert_eq!(hub.frame_ids(), frames_before);
+    assert_eq!(hub.window_deadlines().unwrap(), deadlines_before);
 }
