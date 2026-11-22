@@ -608,10 +608,8 @@ fn command_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::Can
 #[test]
 fn mit_partial_send_reconnect_through_the_supervisor() {
     let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
-    // a 1 s motor TIMEOUT (recorded): the fake motor's own watchdog does not expire within this
-    // reconnect sequence (an expired motor reports a fault; that recovery is not under test here)
-    bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 20_000));
-    with_record(&mut inner, record_j4(20_000));
+    // the realistic 2000-count TIMEOUT: J4's own watchdog expires during the 400 ms below, and
+    // the clearance then recovers with torque off on every joint (mit_expiry_recovery)
     bus.with(|s| s.fail_tx_after = Some(3));
     inner.tick(DT);
     let fault = inner.safety.fault().expect("partial write latches");
@@ -636,6 +634,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
         inner.tick(DT);
     }
     assert!(cleared, "clearance");
+    assert!(!inner.is_torqued, "the expiry recovery leaves torque off");
     bus.clear_log();
     inner.set_torque(true).expect("rearm");
     assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]), "TIMEOUT readback on the rearm");
@@ -1190,4 +1189,69 @@ fn mit_hand_back_rollback_hold_obeys_the_decoded_bound() {
     }
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::BusLoss));
+}
+
+/// Frames that command motion: MIT frames (on the motor IDs, not enable/disable/clear-error) and
+/// POS_VEL targets.
+fn motion_frames(log: &[armd::transport::CanFrame]) -> Vec<armd::transport::CanFrame> {
+    log.iter().filter(|f| ((1..=7).contains(&f.id) && ![damiao::CMD_ENABLE, damiao::CMD_DISABLE, damiao::CMD_CLEAR_FAULTS].contains(&f.data))
+        || (0x101..=0x107).contains(&f.id)).copied().collect()
+}
+
+/// After an MIT loss J4's own TIMEOUT expired (state 0xD, disabled) while the other motors stay
+/// enabled: the stuck state of the real-arm expiry test.
+fn expired_after_loss() -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
+    bus.with(|s| s.fail_tx_after = Some(3));
+    inner.tick(DT);
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    bus.with(|s| s.fail_tx_after = None);
+    for _ in 0..8 { clock.advance(std::time::Duration::from_millis(50)); inner.tick(DT); }
+    assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled), "J4 did not expire");
+    assert!(bus.with(|s| s.motors.iter().enumerate().all(|(i, m)| i == 3 || m.enabled)), "the other motors stay enabled");
+    (inner, bus, clock)
+}
+
+/// Coordinator decision (round 4): clear_fault in that state recovers under operator control:
+/// clear-error to the faulted motor, a fenced disable of every motor confirmed per motor, then Idle
+/// with torque off and the MIT group reset; no MIT or POS_VEL target frame after the loss.
+#[test]
+fn mit_expiry_recovery_clears_to_idle_with_torque_off() {
+    let (mut inner, bus, clock) = expired_after_loss();
+    let msg = inner.safety.fault().unwrap().message;
+    assert!(msg.contains("torque off"), "the fault must say the recovery turns torque off: {msg}");
+    bus.clear_log();
+    let mut ok = None;
+    for _ in 0..6 {
+        match inner.clear_fault() { Ok(s) => { ok = Some(s); break; } Err(_) => { clock.advance(std::time::Duration::from_millis(120)); inner.tick(DT); } }
+    }
+    assert!(ok.is_some(), "no recovery: {:?}", inner.clear_fault());
+    assert!(matches!(inner.safety.state(), armd::SafetyState::Idle), "{:?}", inner.safety.state());
+    assert!(!inner.is_torqued);
+    assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)), "every motor disabled");
+    let log = bus.tx_log();
+    assert!(log.iter().any(|f| f.id == 4 && f.data == damiao::CMD_CLEAR_FAULTS), "clear-error to J4");
+    assert!(motion_frames(&log).is_empty(), "motion frames during the recovery: {:?}", motion_frames(&log));
+    assert_eq!(inner.mit.owner, mit::MitOwner::Off);
+    assert!(inner.tracking.last_issued_positions.is_none());
+    assert!(inner.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_none(), "record untouched");
+}
+
+/// A motor that never confirms the disable keeps the fault latched and is named; no retry loop.
+#[test]
+fn mit_expiry_recovery_keeps_the_fault_when_a_motor_does_not_confirm() {
+    let (mut inner, bus, clock) = expired_after_loss();
+    bus.with(|s| s.motors[1].no_feedback = true); // J2 answers nothing any more
+    let mut last = None;
+    for _ in 0..4 {
+        let r = inner.clear_fault();
+        assert!(r.is_err(), "cleared without J2's confirmation");
+        last = r.err().map(|e| e.to_string());
+        clock.advance(std::time::Duration::from_millis(120));
+        inner.tick(DT);
+    }
+    assert!(last.as_deref().is_some_and(|m| m.contains("J2")), "{last:?}");
+    assert!(inner.safety.state().is_stopped());
+    let disables = bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
+    assert!(disables < 60, "retry loop: {disables} disable frames");
 }

@@ -19,6 +19,21 @@ on the arm yet; every value marked "needs device verification" is an open item.
 TIMEOUT is RAM only. A power cycle resets it to 0 and the next arm refuses until it is
 commissioned again.
 
+## Recovery after a motor command timeout
+
+When MIT tracking is lost and a motor's own TIMEOUT then expires, that motor disables itself and
+reports error 0xD (CAN communication loss) while the other motors stay enabled. In that state
+`/api/v1/safety/clear_fault` (operator session) recovers under control: it sends the Damiao
+clear-error command (`FF FF FF FF FF FF FF FB` on the motor's CAN ID) to every motor in an error
+state, disables every motor and requires fresh state-0 feedback from each, and only then clears to
+Idle. **Torque is then off on every joint**, like a park torque-off: the arm drops onto whatever
+supports it. No MIT frame and no POS_VEL target is sent. A motor that does not confirm keeps the
+fault latched and is named in the reply. The MIT group is reset; the qualification record is kept
+and the next arm reads the TIMEOUT again.
+
+Before an expiry test (step 1 of the device qualification), put the arm at a supported or rest
+pose: the recovery turns torque off on all joints.
+
 ## Commissioning the motor command timeout
 
 Operator session, torque off, load mechanically supported, operator at the power cutoff.

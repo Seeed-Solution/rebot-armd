@@ -533,3 +533,12 @@ fn mit_staggered_switch_holds_do_not_extend_the_deadline() {
     assert!(d.write_joint_targets(&t).is_err(), "batch accepted 46 ms after the first hold");
     assert!(d.mit_fence_trip().is_some_and(|r| r.contains("gap")), "{:?}", d.mit_fence_trip());
 }
+
+/// The Damiao clear-error command used by the expiry recovery: FF FF FF FF FF FF FF FB on the
+/// motor's own CAN ID (DM_CAN `clear_err`), 8 bytes.
+#[test]
+fn damiao_clear_error_frame_layout() {
+    let f = damiao::build_clear_faults_frame(4);
+    assert_eq!((f.id, f.dlc, f.is_extended, f.is_rtr), (4, 8, false, false));
+    assert_eq!(f.data, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB]);
+}

@@ -265,6 +265,14 @@ pub trait ArmDriver: Send {
     /// next confirmed enable; no autonomous frame is sent for `holdoff`.
     fn set_mit_deadline_fence(&mut self, _deadline: Option<Duration>, _holdoff: Duration) {}
 
+    /// Operator recovery after an MIT loss in which a motor disabled itself (its command TIMEOUT
+    /// expired, error 0xD) while others stay enabled: clear-error to every motor in an error
+    /// state, then disable every motor and require fresh per-motor confirmation (state 0). Sends
+    /// no MIT and no POS_VEL target frame. Err names the joints that did not confirm.
+    fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        Err("MIT expiry recovery is not supported by this driver".into())
+    }
+
     /// Current time of the driver's clock (the transport's deterministic clock in tests).
     fn clock_now(&self) -> Instant { Instant::now() }
 
@@ -2973,6 +2981,29 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
 
     fn clock_now(&self) -> Instant { self.now() }
+
+    fn mit_expiry_recover(&mut self) -> Result<(), String> {
+        // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
+        let faulted: Vec<usize> = (0..self.motor_ids.len()).filter(|&i| self.motor_status[i] >= 8).collect();
+        for &i in &faulted {
+            if let Err(e) = self.can.transmit(&damiao::build_clear_faults_frame(self.motor_ids[i])) {
+                return Err(format!("clear-error to J{} not sent: {e}", i + 1));
+            }
+        }
+        if !faulted.is_empty() { self.can.flush().map_err(|e| format!("flush: {e}"))?; }
+        // 2. no cached frame may ever be replayed; then the disable of every motor
+        self.last_target_frames.fill(None);
+        let res = self.set_torque(false);
+        let cmd = self.last_enable_command;
+        let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
+            !(self.last_feedback_instant[i].is_some_and(|t| cmd.is_some_and(|c| t >= c)) && self.motor_status[i] == 0)
+        }).map(|i| format!("J{}", i + 1)).collect();
+        if res.is_err() || !unconfirmed.is_empty() {
+            return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
+        }
+        self.mit_fence = None;
+        Ok(())
+    }
 
     fn acknowledge_mit_fence_trip(&mut self) {
         if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }

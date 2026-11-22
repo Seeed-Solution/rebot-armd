@@ -2338,6 +2338,9 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
                 check the arm and power-cycle the motors".into()));
         }
+        if self.mit.owner == crate::mit::MitOwner::Lost && self.mit_expiry_state() {
+            return self.mit_expiry_recovery();
+        }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;

@@ -703,7 +703,8 @@ impl crate::supervisor::SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         // latched also over another fault (an E-stop stays the stronger state)
         if *self.safety.state() != crate::safety::SafetyState::EStop {
-            self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!("MIT_LOST: {reason}")));
+            self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!(
+                "MIT_LOST: {reason}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
         }
     }
 
@@ -730,7 +731,8 @@ impl crate::supervisor::SupervisorInner {
             if let Some(t) = tripped {
                 if code != Some(crate::safety::FaultCode::BusLoss) && code != Some(crate::safety::FaultCode::Estop) {
                     self.safety.trigger_fault_coded(crate::safety::FaultCode::BusLoss,
-                        crate::safety::FaultReason::Other(format!("MIT_LOST: driver deadline fence: {t}")));
+                        crate::safety::FaultReason::Other(format!("MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, \
+                            clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
                 }
             }
             return;
@@ -939,4 +941,55 @@ pub fn invalidate_record(c: &mut crate::calibration::CalibrationFile, joints: &[
     if !touches || obj.get("invalidated").is_some_and(|i| !i.is_null()) { return false; }
     obj.insert("invalidated".into(), json!({"reason": reason, "at": at}));
     true
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::supervisor::SupervisorInner {
+    /// After an MIT loss: a motor reports an error state (its command timeout expired: 0xD) or the
+    /// motors are partly enabled, partly disabled.
+    pub(crate) fn mit_expiry_state(&self) -> bool {
+        let Some(st) = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.motor_status()) else { return false };
+        st.iter().any(|&c| c >= 8) || (st.contains(&0) && st.contains(&1))
+    }
+
+    /// clear_fault in [`Self::mit_expiry_state`] (operator, explicit): clear-error to the faulted
+    /// motors, a disable of every motor confirmed per motor, then Idle with torque off and the
+    /// MIT group reset (fence disarmed, history cleared; the qualification record is untouched
+    /// and the next arm reads the TIMEOUT again). A motor that does not confirm keeps the fault.
+    pub(crate) fn mit_expiry_recovery(&mut self) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
+        use crate::safety::SafetyError;
+        let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+            Some(mut drv) => drv.mit_expiry_recover(),
+            None => Err("no driver".into()),
+        };
+        if let Err(e) = res {
+            let msg = format!("MIT recovery after a motor timeout failed: {e}; the fault stays latched. \
+                The recovery turns torque off on every joint (support the arm); check the named joints, then clear again");
+            tracing::error!("{msg}");
+            return Err(SafetyError::ClearFaultRejected(msg));
+        }
+        tracing::warn!("MIT recovery after a motor timeout: every motor confirmed disabled; torque is off on all joints");
+        self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        self.tracking.clear_recovery_suspension();
+        self.mit.owner = MitOwner::Off;
+        self.mit.joints.clear();
+        self.mit.last_ff.clear();
+        self.mit.last_output = None;
+        self.mit.armed_ok = false;
+        self.mit.revoke_pending = false;
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            self.commanded_positions = self.measured_positions.clone();
+            self.target_positions = self.measured_positions.clone();
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.is_torqued = false;
+        self.disable_pending = false;
+        self.pending_rearm = false;
+        self.safety.clear_fault()?;
+        let _ = self.safety.set_torque(false);
+        Ok(self.safety.state().clone())
+    }
 }
