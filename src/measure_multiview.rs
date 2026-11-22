@@ -2091,6 +2091,75 @@ mod tests {
         assert!(shifts[3] > 2.0 && shifts[3] < 6.0, "{shifts:?}");
     }
 
+    /// Planned durations of the view moves on the B601-DM profile (`ArmConfig::rebot_dm`, kept
+    /// equal to kits/recamera-b601dm/profile by tests/test_arm_profile.rs) from the start pose of
+    /// tests/test_measure_multiview.rs, as `move_joints` plans them (joint_goal_limits at
+    /// speed_scale 0.3, the quintic, the power fit): each duration is the larger of the velocity
+    /// bound 1.875 |dq| / v and the acceleration bound sqrt(5.7735 |dq| / a) of the joint that needs
+    /// longest, above the 0.04 s floor; nothing stretches it. `--nocapture` prints the table.
+    #[test]
+    fn view_move_durations_follow_the_joint_distance() {
+        let config = crate::ArmConfig::rebot_dm();
+        let mut inner = SupervisorInner::new(config.clone());
+        let start: Vec<f32> = vec![0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
+        inner.commanded_positions = start.clone();
+        inner.measured_positions = start.clone();
+        inner.target_positions = start.clone();
+        inner.safety.set_torque(true).unwrap();
+        inner.is_torqued = true;
+        let setup = inner.grasp_setup().expect("grasp setup");
+        let cam = CamModel::assumed(&config.arm_model, &setup, &config.camera_mount);
+        let pose0 = config.arm_model.fk_f32(&start).unwrap();
+        let pivot = cam.plane_point(&pose0, [cam.cx, cam.cy], setup.table_z_m + LOOK_AT_ABOVE_TABLE_M).unwrap();
+        let cam0 = camera_at(&cam, &pose0);
+        let dof = inner.config.dof;
+        let arm_dof = inner.config.arm_dof();
+        let speed_scale = DEFAULT_SPEED_SCALE;
+        let limits = inner.joint_goal_limits(speed_scale);
+        for (motion, axes_k, views) in [(Motion::Orbit, Axes::X, 3), (Motion::Orbit, Axes::X, 5), (Motion::Translate, Axes::Xy, 5)] {
+            let axes = plane_axes(&cam0, &pivot, motion);
+            let offsets = view_offsets(views, DEFAULT_BASELINE_M, axes_k);
+            let mut path: Vec<([f64; 2], Vec<f32>)> = Vec::new();
+            for &i in &visit_order(&offsets) {
+                let o = offsets[i];
+                if is_start(&o) { continue; }
+                let goal = view_pose(&pose0, &cam0.c, &pivot, &axes, o, motion);
+                let input = inner.plan_input().unwrap();
+                let mut extra = inner.goal_seed_poses();
+                extra.push(kinematics::q6(&start[..arm_dof]));
+                let seeds = motion::goal_seeds(&input, &goal, &extra);
+                let q = motion::solve_goal_joints(&input, &goal, PathOpts { yaw_free: arm_dof < 6, yaw_outward: false }, &seeds).unwrap();
+                let target = inner.joint_goal_target(&q);
+                inner.commanded_positions = target.clone();
+                path.push((o, target));
+            }
+            path.push(([0.0, 0.0], start.clone()));
+            let mut prev = start.clone();
+            let mut total = 0.0;
+            println!("{} {} x{views}, speed_scale {speed_scale}:", motion.name(), axes_k.name());
+            for (o, target) in &path {
+                let zeros = vec![0.0f32; dof];
+                let traj = crate::trajectory::TrajectoryPlanner::plan(&prev, &zeros, target, &zeros, None, &limits).unwrap();
+                let (traj, power) = inner.power_fit_quintic(traj, &prev, &zeros, target, &limits, true).unwrap();
+                let dq: Vec<f64> = (0..arm_dof).map(|j| f64::from((target[j] - prev[j]).abs())).collect();
+                let t_v = (0..arm_dof).map(|j| 1.875 * dq[j] / f64::from(limits[j].max_velocity)).fold(0.0, f64::max);
+                let t_a = (0..arm_dof).map(|j| (5.7735 * dq[j] / f64::from(limits[j].max_acceleration)).sqrt()).fold(0.0, f64::max);
+                let jmax = (0..arm_dof).max_by(|&a, &b| (dq[a] / f64::from(limits[a].max_velocity)).total_cmp(&(dq[b] / f64::from(limits[b].max_velocity)))).unwrap();
+                // a rest-to-rest profile at the same v and a (trapezoid): what a different trajectory shape would give
+                let (v, a) = (f64::from(limits[jmax].max_velocity), f64::from(limits[jmax].max_acceleration));
+                let t_trap = if dq[jmax] > v * v / a { dq[jmax] / v + v / a } else { 2.0 * (dq[jmax] / a).sqrt() };
+                println!("  to [{:+.3}, {:+.3}] m: |dq| {:?} mrad, J{} limits v {v:.3} rad/s a {a:.1} rad/s2 -> {:.3} s (velocity bound {t_v:.3}, acceleration bound {t_a:.3}, power scale {power:?}; trapezoid at the same limits {t_trap:.3} s)",
+                    o[0], o[1], dq.iter().map(|x| (x * 1000.0).round() as i64).collect::<Vec<_>>(), jmax + 1, traj.duration);
+                assert!((traj.duration - t_v.max(t_a).max(0.04)).abs() < 1e-6, "stretched: {} vs {t_v} / {t_a}", traj.duration);
+                assert!(power.is_none_or(|p| p >= 1.0 - 1e-9), "power fit slowed the move: {power:?}");
+                assert!(t_v > t_a, "velocity-bound");
+                total += traj.duration;
+                prev = target.clone();
+            }
+            println!("  planned motion {total:.2} s (+ the settle hold of at least {SETTLE_HOLD_S} s per move)", SETTLE_HOLD_S = crate::motion::SETTLE_HOLD_S);
+        }
+    }
+
     #[test]
     fn timing_overlap_and_sums() {
         let t = Instant::now();
