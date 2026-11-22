@@ -995,6 +995,15 @@ pub trait DetectionSource: Send + Sync {
     fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         self.trigger_with_focus(pipelines, wait_ms, None)
     }
+    /// Whether the provider runs the ArUco pipeline (`GET /api/mode` available.aruco).
+    fn aruco_available(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
+    /// [`DetectionSource::trigger`] that also returns the ArUco markers of the frame (pixels of
+    /// the frame's `image_size_px`) when `pipelines` names `"aruco"`. Default: no markers.
+    fn trigger_markers(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<(DetectionFrame, Vec<crate::mview_stereo::Marker>)>, String>> {
+        Box::pin(async move { Ok(self.trigger(pipelines, wait_ms).await?.map(|f| (f, Vec::new()))) })
+    }
     /// One inference with optional mask focus.
     fn trigger_with_focus(&self, _pipelines: &'static [&'static str], _wait_ms: u64, _focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async { Err("per-request pipelines not supported".to_string()) })
@@ -1193,6 +1202,21 @@ impl DetectionSource for HttpDetectionSource {
     fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         self.trigger_with_focus(pipelines, wait_ms, None)
     }
+    fn aruco_available(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;
+            Ok(v.as_ref().and_then(|v| v.get("available")).and_then(|a| a.get("aruco")).and_then(Value::as_bool).unwrap_or(false))
+        })
+    }
+    fn trigger_markers(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<(DetectionFrame, Vec<crate::mview_stereo::Marker>)>, String>> {
+        Box::pin(async move {
+            let wait_ms = wait_ms.min(5000);
+            let body = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
+            let req_started = Instant::now();
+            let v = crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?;
+            Ok(self.frame(&v, None, req_started, Instant::now(), wait_ms).map(|f| (f, parse_markers(v.get("markers").unwrap_or(&Value::Null)))))
+        })
+    }
     fn trigger_with_focus(&self, pipelines: &'static [&'static str], wait_ms: u64, focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         let focus = focus.cloned();
         Box::pin(async move {
@@ -1285,6 +1309,22 @@ impl DetectionSource for HttpDetectionSource {
             Ok(self.frame(&v, after, req_started, Instant::now(), wait_ms))
         })
     }
+}
+
+/// ArUco markers of a trigger reply (`markers`: `[{id, corners: [[x, y] x 4]}]`, pixels of the
+/// frame, the format calib_hover reads from rebot-vision's `aruco` pipeline). Entries without an
+/// integer id or four finite corners are skipped.
+pub fn parse_markers(raw: &Value) -> Vec<crate::mview_stereo::Marker> {
+    raw.as_array().map(|a| a.iter().filter_map(|m| {
+        let id = m.get("id").and_then(Value::as_i64)?;
+        let c = m.get("corners").and_then(Value::as_array).filter(|c| c.len() == 4)?;
+        let mut corners = [[0.0; 2]; 4];
+        for (k, p) in c.iter().enumerate() {
+            let p = p.as_array()?;
+            corners[k] = [p.first()?.as_f64().filter(|x| x.is_finite())?, p.get(1)?.as_f64().filter(|x| x.is_finite())?];
+        }
+        Some(crate::mview_stereo::Marker { id, corners })
+    }).collect()).unwrap_or_default()
 }
 
 fn f(v: &Value, keys: &[&str]) -> Option<f64> {
@@ -5272,5 +5312,19 @@ mod tests {
             })
         };
         assert_eq!(held_width, Some(policy.opening_m(0.5)));
+    }
+
+    #[test]
+    fn markers_of_a_trigger_reply() {
+        let v = serde_json::json!([
+            {"id": 3, "corners": [[10.0, 20.0], [30.0, 20.0], [30.0, 40.0], [10.0, 40.0]]},
+            {"id": 4, "corners": [[1, 2], [3, 4], [5, 6]]},
+            {"corners": [[1, 2], [3, 4], [5, 6], [7, 8]]},
+            {"id": 5, "corners": [[1, 2], [3, 4], [5, 6], [7, "x"]]},
+        ]);
+        let m = parse_markers(&v);
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].id, m[0].corners[2]), (3, [30.0, 40.0]));
+        assert!(parse_markers(&Value::Null).is_empty());
     }
 }

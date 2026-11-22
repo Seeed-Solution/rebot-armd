@@ -1,8 +1,11 @@
 //! Action `measure_multiview` against the in-process armd (built-in B601-DM config, no driver)
 //! with a fake vision provider that renders the scene (tests/render) from the camera pose of the
 //! measured joints: JPEG snapshots letterboxed like rebot-vision's 640x640 `/snapshot.jpg`, and a
-//! YOLO box of the object. Covers: success, target lost, a refused view pose (fallback offset)
-//! and the end on lease loss.
+//! YOLO box of the object. Like rebot-vision with inference idle, `/snapshot.jpg` returns the
+//! frame of the last trigger (a new render at the joints of that moment), not a fresh one.
+//! Covers: success, target lost, a refused view pose (fallback offset), the end on lease loss, a
+//! stale snapshot from another pose, a snapshot that never refreshes, and the camera rotation
+//! refinement (`pose_refine`): a rotation error per view, ArUco marker corners from the provider.
 mod common;
 mod render;
 
@@ -23,6 +26,11 @@ use serde_json::{json, Value};
 const START: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 const HEIGHT: f64 = 0.040;
 
+/// A rendered camera frame: its id (the trigger's `frame_id`), the joints it was rendered at,
+/// the JPEG, the object's box and the markers in view.
+#[derive(Clone)]
+struct Shot { id: u64, joints: Vec<f32>, jpeg: Vec<u8>, box_norm: Option<[f64; 4]>, markers: Vec<armd::mview_stereo::Marker> }
+
 struct FakeVision {
     sup: Arc<ArmSupervisor>,
     cam: CamModel,
@@ -33,32 +41,57 @@ struct FakeVision {
     snapshots: AtomicU64,
     /// Each snapshot takes this long (ms).
     snapshot_delay_ms: AtomicU64,
+    /// Each trigger takes this long (ms; real rebot-vision 1.0-1.5 s).
+    trigger_delay_ms: AtomicU64,
+    /// Triggers leave `/snapshot.jpg` alone (a camera whose snapshot never refreshes).
+    freeze_snapshot: AtomicBool,
     /// Set on the first snapshot (the arm settled): the creep driver starts shaking.
     shake_on_snapshot: Mutex<Option<Arc<Mutex<Creep>>>>,
     /// The creep driver's clock (stopped while rendering).
     clock: Mutex<Option<Arc<Mutex<Creep>>>>,
-    /// (joints, jpeg, box_norm) of the last render.
-    cache: Mutex<Option<(Vec<f32>, Vec<u8>, Option<[f64; 4]>)>>,
+    /// What `/snapshot.jpg` returns: the frame of the last trigger (rendered on the first
+    /// snapshot when there was none).
+    snapshot: Mutex<Option<Shot>>,
+    /// (frame id, joints) of every snapshot returned.
+    served: Mutex<Vec<(u64, Vec<f32>)>>,
+    /// Away from the start joints the camera that renders is turned by this much (rad) about its
+    /// own y axis, + or - with the sign of J1's change: a pose error the kinematics do not know.
+    rot_err: Mutex<f64>,
+    /// ArUco markers on the table (id, corners in the base frame), and whether the provider runs
+    /// the aruco pipeline.
+    markers: Mutex<Vec<(i64, [[f64; 3]; 4])>>,
+    aruco: AtomicBool,
+}
+
+/// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
+fn turned(r: &kinematics::Mat3, axis: usize, angle: f64) -> kinematics::Mat3 {
+    let (c, s) = (angle.cos(), angle.sin());
+    let (i, j) = ((axis + 1) % 3, (axis + 2) % 3);
+    let mut e = [[0.0; 3]; 3];
+    e[axis][axis] = 1.0;
+    (e[i][i], e[i][j], e[j][i], e[j][j]) = (c, -s, s, c);
+    let mut out = [[0.0; 3]; 3];
+    for a in 0..3 { for b in 0..3 { out[a][b] = (0..3).map(|k| r[a][k] * e[k][b]).sum(); } }
+    out
 }
 
 impl FakeVision {
-    /// Render (or reuse) the view of the measured joints.
-    async fn view(&self) -> (Vec<f32>, Vec<u8>, Option<[f64; 4]>) {
+    /// Render frame `id` (its noise seed) at joints `q`, the measured joints when None.
+    async fn render(&self, id: u64, q: Option<Vec<f32>>) -> Shot {
         let (q, pose) = {
             let inner = self.sup.inner().read().await;
-            let q = inner.measured_positions.clone();
+            let q = q.unwrap_or_else(|| inner.measured_positions.clone());
             let pose = inner.config.arm_model.fk_f32(&q).unwrap();
             (q, pose)
         };
-        if let Some(c) = self.cache.lock().unwrap().as_ref().filter(|c| c.0.iter().zip(&q).all(|(a, b)| (a - b).abs() < 2e-4)) {
-            return c.clone();
-        }
         // rendering takes the camera no time: the creep clock stops meanwhile
         let paused = Instant::now();
-        let cam = mm::camera_at(&self.cam, &pose);
+        let mut cam = mm::camera_at(&self.cam, &pose);
+        let err = *self.rot_err.lock().unwrap();
+        let dj1 = f64::from(q[0] - START[0]);
+        if err != 0.0 && START.iter().zip(&q).any(|(a, b)| (a - b).abs() > 1e-3) { cam.r = turned(&cam.r, 1, if dj1 < 0.0 { -err } else { err }); }
         let (w, h) = (self.cam.size[0] as usize, self.cam.size[1] as usize);
-        let seed = self.frame.load(Ordering::SeqCst) + 1;
-        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, seed);
+        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, id);
         // letterbox into a w x w square, frame in the centred rows
         let top = (w - h) / 2;
         let mut sq = vec![0u8; w * w];
@@ -67,22 +100,38 @@ impl FakeVision {
         jpeg_encoder::Encoder::new(&mut jpeg, 95).encode(&sq, w as u16, w as u16, jpeg_encoder::ColorType::Luma).unwrap();
         let b = render::box_px(&self.scene, &self.scene.boxes[0], &cam);
         let inside = b[0] > 0.0 && b[1] > 0.0 && b[2] < w as f64 && b[3] < h as f64;
-        let bn = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
-        let v = (q, jpeg, bn);
-        *self.cache.lock().unwrap() = Some(v.clone());
+        let box_norm = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
+        let markers = self.markers.lock().unwrap().iter().filter_map(|(id, c)| {
+            let mut corners = [[0.0; 2]; 4];
+            for (k, x) in c.iter().enumerate() {
+                let p = cam.project(x)?;
+                if p[0] < 2.0 || p[1] < 2.0 || p[0] > w as f64 - 2.0 || p[1] > h as f64 - 2.0 { return None; }
+                corners[k] = p;
+            }
+            Some(armd::mview_stereo::Marker { id: *id, corners })
+        }).collect();
         if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref().or(self.clock.lock().unwrap().as_ref()) { c.lock().unwrap().paused += paused.elapsed(); }
-        v
+        Shot { id, joints: q, jpeg, box_norm, markers }
     }
 
-    async fn frame_now(&self) -> DetectionFrame {
-        let (q, _, bn) = self.view().await;
-        let away = START.iter().zip(&q).any(|(a, b)| (a - b).abs() > 1e-3);
+    /// A trigger: a new frame at the current joints, which also becomes the snapshot.
+    async fn frame_now(&self) -> DetectionFrame { self.frame_with_markers().await.0 }
+
+    /// [`Self::frame_now`] with the markers of the frame.
+    async fn frame_with_markers(&self) -> (DetectionFrame, Vec<armd::mview_stereo::Marker>) {
+        let d = self.trigger_delay_ms.load(Ordering::SeqCst);
+        if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
+        // frame ids (and noise seeds) 1, 2, ... per trigger
+        let shot = self.render(self.frame.fetch_add(1, Ordering::SeqCst) + 1, None).await;
+        let away = START.iter().zip(&shot.joints).any(|(a, b)| (a - b).abs() > 1e-3);
         let hidden = self.hide_after_start.load(Ordering::SeqCst) && away;
-        let detections = bn.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
-        DetectionFrame {
-            frame_id: self.frame.fetch_add(1, Ordering::SeqCst) + 1, captured_at: Instant::now(), policy_captured_at: None,
+        let detections = shot.box_norm.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
+        let (frame_id, markers) = (shot.id, shot.markers.clone());
+        if !self.freeze_snapshot.load(Ordering::SeqCst) { *self.snapshot.lock().unwrap() = Some(shot); }
+        (DetectionFrame {
+            frame_id, captured_at: Instant::now(), policy_captured_at: None,
             image_size_px: self.cam.size, detections, depth: None, model_generation: None,
-        }
+        }, markers)
     }
 }
 
@@ -99,6 +148,13 @@ impl DetectionSource for FakeVision {
     fn trigger_with_focus(&self, _p: &'static [&'static str], _w: u64, _f: Option<&armd::grasp::MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move { Ok(Some(self.frame_now().await)) })
     }
+    fn aruco_available(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async move { Ok(self.aruco.load(Ordering::SeqCst)) }) }
+    fn trigger_markers(&self, p: &'static [&'static str], _w: u64) -> BoxFuture<'_, Result<Option<(DetectionFrame, Vec<armd::mview_stereo::Marker>)>, String>> {
+        Box::pin(async move {
+            let (f, m) = self.frame_with_markers().await;
+            Ok(Some((f, if p.contains(&"aruco") { m } else { Vec::new() })))
+        })
+    }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
     fn set_inference(&self, _e: bool) -> BoxFuture<'_, Result<(), String>> { Box::pin(async { Ok(()) }) }
     fn next_frame(&self, _a: Option<u64>, _w: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
@@ -108,10 +164,15 @@ impl DetectionSource for FakeVision {
         Box::pin(async move {
             self.snapshots.fetch_add(1, Ordering::SeqCst);
             if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref() { c.lock().unwrap().shake = true; }
-            let v = self.view().await.1;
+            let cached = self.snapshot.lock().unwrap().clone();
+            let shot = match cached {
+                Some(s) => s,
+                None => { let s = self.render(0, None).await; *self.snapshot.lock().unwrap() = Some(s.clone()); s }
+            };
+            self.served.lock().unwrap().push((shot.id, shot.joints.clone()));
             let d = self.snapshot_delay_ms.load(Ordering::SeqCst);
             if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
-            Ok(v)
+            Ok(shot.jpeg)
         })
     }
 }
@@ -138,7 +199,10 @@ async fn rig(config: ArmConfig) -> Rig { rig_driven(config, false, None).await }
 async fn rig_plain(config: ArmConfig, plain: bool) -> Rig { rig_driven(config, plain, None).await }
 
 /// [`rig`] with a plain (uniform grey) box when `plain`, and the creep driver when given.
-async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) -> Rig {
+async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) -> Rig { rig_scene(config, plain, false, driver).await }
+
+/// [`rig_driven`] with a uniform table when `plain_table`.
+async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Option<CreepArm>) -> Rig {
     let (cam, _, look) = geometry(&config);
     let sup = Arc::new(ArmSupervisor::new(config));
     if let Some(d) = driver {
@@ -147,8 +211,11 @@ async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) ->
     }
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
+    scene.plain_table = plain_table;
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
-        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), cache: Mutex::new(None) });
+        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
+        shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
+        rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -228,7 +295,11 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     assert!(o["n_points"].as_u64().unwrap() >= 20 && m["table_check"]["n_points"].as_u64().unwrap() >= 10, "{m}");
     assert!((m["baseline_m"].as_f64().unwrap() - 0.08).abs() < 1e-6);
     assert!(r.at_start().await, "returned to the start joints");
-    assert!(r.vision.snapshots.load(Ordering::SeqCst) >= 9, "2 discarded + 1 per view");
+    // per view: the snapshot before the trigger, then at least one after it
+    assert!(r.vision.snapshots.load(Ordering::SeqCst) >= 6, "2 per view");
+    for v in m["views"].as_array().unwrap() {
+        assert!(v["trigger_ms"].is_number() && v["snapshot_wait_ms"].is_number() && v["snapshot_polls"].as_u64() == Some(0), "{v}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -461,22 +532,42 @@ async fn creep_and_a_slow_limit_cycle_do_not_stop_the_captures() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaking_during_the_snapshots_retries_then_fails_moved() {
-    // still while settling; from the first snapshot on J4 drifts 30 mrad/s and each snapshot takes
-    // 60 ms: every bracket (100 ms lead + 60 ms) moves about 4.8 mrad
+    // still while settling; from the first snapshot on J4 drifts 30 mrad/s, each trigger takes
+    // 100 ms and each snapshot 60 ms: every bracket (trigger + snapshot) moves about 4.8 mrad
     let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.03, ..Default::default() }));
     let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
     let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
     r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(100, Ordering::SeqCst);
     *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
-    let ack = r.start(json!({})).await;
+    let ack = r.start(json!({"pose_refine": "off"})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let a = r.wait(id, 60.0).await;
     println!("{} {}", a["code"], a["message"]);
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
     let msg = a["message"].as_str().unwrap();
-    assert!(msg.contains("3 snapshots") && msg.contains("mrad"), "{msg}");
-    // 2 discarded + 3 tries at the start view
-    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 5);
+    assert!(msg.contains("3 snapshots") && msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
+    // at the start view: the snapshot before the first trigger, then one per try (each differs
+    // from the one before it at once)
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_pose_refine_the_bracket_limit_is_5_mrad() {
+    // as above at twice the drift: every bracket moves about 9.6 mrad, above the 5 mrad limit
+    // that applies when the views' rotations are refined (pose_refine auto, the default)
+    let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.06, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(100, Ordering::SeqCst);
+    *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
+    let ack = r.start(json!({})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 60.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
+    let msg = a["message"].as_str().unwrap();
+    assert!(msg.contains("J4") && msg.contains("limit 5.0"), "{msg}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -518,4 +609,203 @@ async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
     let doc = &bundle.doc;
     assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
     assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_snapshot_from_another_pose_is_not_used() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    // the snapshot holds a frame taken mid-motion: J1 0.05 rad and J2 0.03 rad away from the start
+    let mut q = START.to_vec();
+    q[0] += 0.05;
+    q[1] += 0.03;
+    let stale = r.vision.render(1000, Some(q.clone())).await;
+    let stale_id = stale.id;
+    *r.vision.snapshot.lock().unwrap() = Some(stale);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    let m = &a["measurement"];
+    assert_eq!(a["state"], "done", "{a}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
+    let served = r.vision.served.lock().unwrap().clone();
+    // the stale frame was the snapshot before the first trigger, but no view used it
+    assert_eq!(served[0].0, stale_id);
+    for v in m["views"].as_array().unwrap() {
+        let f = v["frame_id"].as_u64().unwrap();
+        assert_ne!(f, stale_id, "{v}");
+        let joints: Vec<f32> = v["joints_rad"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        // the accepted snapshot is the frame the view's trigger rendered, at the view's joints
+        let (_, rendered_at) = served.iter().find(|s| s.0 == f).unwrap_or_else(|| panic!("frame {f} never served as a snapshot"));
+        let diff = rendered_at.iter().zip(&joints).take(6).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(diff < 2e-3, "frame {f} rendered {diff} rad from the view joints");
+        // the stale frame was rendered far from every view: used as the view's image it would
+        // have paired the image of one pose with the joints of another
+        let off = q.iter().zip(&joints).take(6).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(off > 0.02, "stale frame {off} rad from view {v}");
+    }
+    // after each view motion the snapshot first still held the previous view's frame
+    let views = m["views"].as_array().unwrap();
+    let ids: Vec<u64> = views.iter().map(|v| v["frame_id"].as_u64().unwrap()).collect();
+    let before: Vec<u64> = ids.iter().filter_map(|f| served.iter().position(|s| s.0 == *f)).filter_map(|i| i.checked_sub(1).map(|j| served[j].0)).collect();
+    assert_eq!(before.len(), ids.len());
+    assert_eq!(&before[1..], &ids[..ids.len() - 1], "the snapshot before each view's trigger was the previous view's frame");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_that_never_refreshes_fails_detection_unavailable() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.freeze_snapshot.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box"})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let t = Instant::now();
+    let a = r.wait(id, 30.0).await;
+    println!("{} {} after {:?}", a["code"], a["message"], t.elapsed());
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("DETECTION_UNAVAILABLE")), "{a}");
+    assert!(a["message"].as_str().unwrap().contains("camera snapshot did not refresh"), "{a}");
+    // the snapshot before the trigger, then polls every REFRESH_POLL for REFRESH_MAX
+    let n = r.vision.snapshots.load(Ordering::SeqCst);
+    let polls = (mm::REFRESH_MAX.as_millis() / mm::REFRESH_POLL.as_millis()) as u64;
+    assert!((polls / 2..=polls + 20).contains(&n), "{n} snapshots, about {polls} polls expected");
+    assert!(r.at_start().await);
+}
+
+/// Six 20 mm markers on the table around the box (ids 0..5, corners counter-clockwise).
+fn table_markers(look: [f64; 3]) -> Vec<(i64, [[f64; 3]; 4])> {
+    [[-0.07, -0.045], [-0.07, 0.045], [0.07, -0.045], [0.07, 0.045], [0.0, -0.07], [0.0, 0.07]].iter().enumerate().map(|(k, o)| {
+        let (x, y) = (look[0] + o[0], look[1] + o[1]);
+        (k as i64, [[x - 0.01, y - 0.01, 0.0], [x + 0.01, y - 0.01, 0.0], [x + 0.01, y + 0.01, 0.0], [x - 0.01, y + 0.01, 0.0]])
+    }).collect()
+}
+
+/// One run with `body` against a rig whose views carry a 1.5 mrad rotation error (a uniform
+/// table when `plain_table`); the action and whether it returned to the start.
+async fn run_with_rotation_error(body: Value, markers: bool, aruco: bool, plain_table: bool) -> (Value, bool) {
+    let config = ArmConfig::rebot_dm();
+    let (_, _, look) = geometry(&config);
+    let mut r = rig_scene(config, false, plain_table, None).await;
+    *r.vision.rot_err.lock().unwrap() = 0.0015;
+    if markers { *r.vision.markers.lock().unwrap() = table_markers(look); }
+    r.vision.aruco.store(aruco, Ordering::SeqCst);
+    let ack = r.start(body).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    (a, r.at_start().await)
+}
+
+fn height(a: &Value) -> f64 { a["measurement"]["objects"][0]["height_m"].as_f64().unwrap_or_else(|| panic!("{a}")) }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rotation_error_per_view_biases_the_height_without_refinement() {
+    // 1.5 mrad turns each side view's image by about 1 px along the baseline, the two sides
+    // opposite ways: the box comes out about 3 mm off. On a uniform table no plane is fitted
+    // (on a textured one the fitted plane takes up most of this uniform bias).
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "off"}), false, false, true).await;
+    let m = &a["measurement"];
+    println!("off: height {}, pose_refine {}, table_plane {}", height(&a), m["pose_refine"], m["table_plane"]);
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(back);
+    assert_eq!(m["pose_refine"], json!({"mode": "off", "applied": false, "markers_requested": false}), "{}", m["pose_refine"]);
+    assert!(m["views"][1]["pose_refine"].is_null() && m["table_plane"].is_null(), "{m}");
+    assert!((height(&a) - HEIGHT).abs() > 0.002, "height {} without the refinement", height(&a));
+    // on the textured table without refinement the triangulated table lies off the calibrated one
+    let (a, _) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "off"}), false, false, false).await;
+    let t = &a["measurement"]["table_check"];
+    println!("off, textured table: height {}, table_check {t}, table_plane {}", height(&a), a["measurement"]["table_plane"]);
+    assert!(t["median_mm"].as_f64().unwrap().abs() > 2.0, "{t}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rotation_error_per_view_is_refined_away_from_table_texture() {
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), false, false, false).await;
+    let m = &a["measurement"];
+    println!("auto: height {}, pose_refine {}, table_check {}", height(&a), m["pose_refine"], m["table_check"]);
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(back);
+    let p = &m["pose_refine"];
+    assert_eq!((p["mode"].as_str(), p["applied"].as_bool(), p["markers_requested"].as_bool(), p["n_marker_points"].as_u64()), (Some("auto"), Some(true), Some(false), Some(0)), "{p}");
+    let views = m["views"].as_array().unwrap();
+    assert_eq!(views[0]["pose_refine"]["status"], "reference");
+    for v in &views[1..] {
+        let r = &v["pose_refine"];
+        assert_eq!(r["status"], "refined", "{r}");
+        // a turn about the camera's y axis moves the image along the baseline: the
+        // triangulation absorbs it in the depths (the reprojection rms does not change), only
+        // the coplanarity of the table points finds it
+        assert!((r["correction_mrad"].as_f64().unwrap() - 1.5).abs() < 0.2 && r["n_points"].as_u64().unwrap() >= 12, "{r}");
+    }
+    assert!((height(&a) - HEIGHT).abs() < 0.001, "height {}", height(&a));
+    assert!(m["table_check"]["median_mm"].as_f64().unwrap().abs() < 1.0, "{}", m["table_check"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn marker_corners_refine_the_poses_in_aruco_and_auto_mode() {
+    // aruco: the marker corners alone, on a uniform table (no texture, no fitted plane)
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), true, true, true).await;
+    let m = &a["measurement"];
+    println!("aruco: height {}, pose_refine {}", height(&a), m["pose_refine"]);
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(back);
+    let p = &m["pose_refine"];
+    assert_eq!((p["mode"].as_str(), p["markers_requested"].as_bool()), (Some("aruco"), Some(true)), "{p}");
+    assert_eq!(p["n_points"], p["n_marker_points"], "marker corners only: {p}");
+    for v in &m["views"].as_array().unwrap()[1..] {
+        let r = &v["pose_refine"];
+        assert_eq!(r["status"], "refined", "{r}");
+        assert!(r["n_marker_corners"].as_u64().unwrap() >= 8 && (r["correction_mrad"].as_f64().unwrap() - 1.5).abs() < 0.3, "{r}");
+    }
+    assert!((height(&a) - HEIGHT).abs() < 0.0015 && m["table_plane"].is_null(), "height {}", height(&a));
+    // auto: table texture plus the marker corners
+    let (a, _) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), true, true, false).await;
+    let p = &a["measurement"]["pose_refine"];
+    println!("auto with markers: height {}, pose_refine {p}", height(&a));
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(p["markers_requested"] == true && p["n_marker_points"].as_u64().unwrap() >= 16 && p["n_points"].as_u64() > p["n_marker_points"].as_u64(), "{p}");
+    assert!((height(&a) - HEIGHT).abs() < 0.003, "height {}", height(&a));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aruco_mode_without_markers_fails_markers_unavailable() {
+    // the provider runs ArUco but no marker is in view: after the views, back at the start
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), false, true, false).await;
+    println!("{} {}", a["code"], a["message"]);
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MARKERS_UNAVAILABLE")), "{a}");
+    assert!(a["message"].as_str().unwrap().contains("marker corners"), "{a}");
+    assert!(back, "returned to the start joints");
+    // a provider without the aruco pipeline: refused before any motion or capture
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    let ack = r.start(json!({"pose_refine": "aruco"})).await;
+    let a = r.wait(ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}")), 30.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MARKERS_UNAVAILABLE")), "{a}");
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 0);
+    assert!(r.at_start().await);
+    let rej = r.start(json!({"pose_refine": "markers"})).await;
+    assert_eq!(rej["code"], "INVALID_COMMAND", "{rej}");
+}
+
+/// `pose_refine` "off" reconstructs with the kinematic cameras, as before the refinement; on
+/// exact poses "auto" changes them by almost nothing.
+#[test]
+fn off_uses_the_kinematic_cameras() {
+    let config = ArmConfig::rebot_dm();
+    let (cam, pose, look) = geometry(&config);
+    let scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
+    let c0 = mm::camera_at(&cam, &pose);
+    let pivot = cam.plane_point(&pose, [cam.cx, cam.cy], mm::LOOK_AT_ABOVE_TABLE_M).unwrap();
+    let axes = mm::plane_axes(&c0, &pivot, mm::Motion::Orbit);
+    let (w, h) = (cam.size[0] as usize, cam.size[1] as usize);
+    let views: Vec<armd::mview_stereo::View> = [[0.0, 0.0], [-0.04, 0.0], [0.04, 0.0]].iter().enumerate().map(|(k, o)| {
+        let c = mm::camera_at(&cam, &mm::view_pose(&pose, &c0.c, &pivot, &axes, *o, mm::Motion::Orbit));
+        armd::mview_stereo::View { cam: c, img: render::render(&scene, &c, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, k as u64 + 1) }
+    }).collect();
+    let bx = render::box_px(&scene, &scene.boxes[0], &views[0].cam);
+    let off = mm::compute(&views, 0, bx, 0.0, mm::PoseRefine::Off, &[]);
+    assert!(off.pose.is_none());
+    let p = armd::mview_stereo::Params { exclude_px: Some(mm::gripper_region_px(cam.size)), ..armd::mview_stereo::Params::new(0.0) };
+    let plain = armd::mview_stereo::reconstruct(&views, 0, off.region_px, bx, &p);
+    assert_eq!(off.rec.points, plain.points);
+    let auto = mm::compute(&views, 0, bx, 0.0, mm::PoseRefine::Auto, &[]);
+    let pr = auto.pose.unwrap();
+    println!("{:?}", pr.views);
+    assert!(pr.views[1..].iter().all(|v| v.status == "refined" && v.correction_mrad < 0.3), "{:?}", pr.views);
+    assert!((auto.measure.unwrap().height_m - off.measure.unwrap().height_m).abs() < 0.002);
 }
