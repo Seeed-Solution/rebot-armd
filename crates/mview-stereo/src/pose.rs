@@ -131,6 +131,8 @@ struct MatchScratch {
     scores: Vec<f32>,
     peaks: Vec<(f32, [f64; 2])>,
     matches: Vec<([f64; 2], f64)>,
+    int_s1: Vec<u32>,
+    int_s2: Vec<u64>,
 }
 
 struct CoarseRect {
@@ -257,6 +259,258 @@ impl PeakCache<'_> {
     }
 }
 
+#[inline(always)]
+fn coarse_dot<const N: usize>(img: &Gray, a: &[f32], gx: usize, gy: usize, tr: usize) -> f32 {
+    let tn = if N > 0 { N } else { 2 * tr + 1 };
+    let mut dot = 0.0f32;
+    for pj in 0..tn {
+        let row = &img.px[(gy - tr + pj) * img.w + gx - tr..][..tn];
+        let ar = &a[pj * tn..][..tn];
+        for pi in 0..tn {
+            dot += ar[pi] * f32::from(row[pi]);
+        }
+    }
+    dot
+}
+
+fn copy_cached_overlap(cxi: i32, cyi: i32, r: i32, cr: &CoarseRect, scratch: &mut MatchScratch) {
+    if cr.r < 0 {
+        return;
+    }
+    let ox0 = (cxi as i64 - r as i64).max(cr.cx as i64 - cr.r as i64);
+    let ox1 = (cxi as i64 + r as i64).min(cr.cx as i64 + cr.r as i64);
+    let oy0 = (cyi as i64 - r as i64).max(cr.cy as i64 - cr.r as i64);
+    let oy1 = (cyi as i64 + r as i64).min(cr.cy as i64 + cr.r as i64);
+    if ox0 > ox1 || oy0 > oy1 {
+        return;
+    }
+    let n = (2 * r + 1) as usize;
+    let cn = (2 * cr.r + 1) as usize;
+    let len = (ox1 - ox0 + 1) as usize;
+    let di0 = (ox0 - (cxi as i64 - r as i64)) as usize;
+    let si0 = (ox0 - (cr.cx as i64 - cr.r as i64)) as usize;
+    for gy in oy0..=oy1 {
+        let dj = (gy - (cyi as i64 - r as i64)) as usize;
+        let sj = (gy - (cr.cy as i64 - cr.r as i64)) as usize;
+        scratch.scores[dj * n + di0..dj * n + di0 + len]
+            .copy_from_slice(&cr.scores[sj * cn + si0..sj * cn + si0 + len]);
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fill_coarse_scores<const N: usize>(
+    img: &Gray,
+    t: &Tmpl,
+    cxi: i32,
+    cyi: i32,
+    r: i32,
+    vx0: i32,
+    vx1: i32,
+    vy0: i32,
+    vy1: i32,
+    iw: usize,
+    cached: Option<&CoarseRect>,
+    s1: &[u32],
+    s2: &[u64],
+    scores: &mut [f32],
+) {
+    let tr = t.r;
+    let tn = if N > 0 { N } else { 2 * tr + 1 };
+    let n = (2 * r + 1) as usize;
+    let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
+    let sw = f64::from(t.sw);
+    let var_floor = 1e-3 * sw;
+
+    for gy in vy0..=vy1 {
+        let j = (gy - (cyi - r)) as usize;
+        let row_off = j * n;
+        let oy = (gy - vy0) as usize;
+        let top_row = oy * iw;
+        let bot_row = (oy + tn) * iw;
+        let cj_opt = cached.and_then(|cr| {
+            let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
+            (0 <= cj && cj < cn as i64).then_some(cj as usize)
+        });
+        for gx in vx0..=vx1 {
+            let i = (gx - (cxi - r)) as usize;
+            if let (Some(cr), Some(cj)) = (cached, cj_opt) {
+                let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
+                if 0 <= ci && ci < cn as i64 {
+                    scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
+                    continue;
+                }
+            }
+            let ox = (gx - vx0) as usize;
+            let sum1 = ((s1[bot_row + ox + tn] - s1[top_row + ox + tn])
+                - (s1[bot_row + ox] - s1[top_row + ox])) as f64;
+            let sum2 = ((s2[bot_row + ox + tn] - s2[top_row + ox + tn])
+                - (s2[bot_row + ox] - s2[top_row + ox])) as f64;
+            let var = sum2 - sum1 * sum1 / sw;
+            scores[row_off + i] = if var > var_floor {
+                let dot = coarse_dot::<N>(img, &t.a, gx as usize, gy as usize, tr);
+                dot / var.sqrt() as f32
+            } else {
+                0.0
+            };
+        }
+    }
+}
+
+fn fill_coarse_window_integral(
+    img: &Gray,
+    mut get_t: impl GetTmpl,
+    cxi: i32,
+    cyi: i32,
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+) {
+    if let Some(cr) = cached {
+        if cr.r >= 0
+            && (cr.cx as i64 - cr.r as i64) <= (cxi as i64 - r as i64)
+            && (cxi as i64 + r as i64) <= (cr.cx as i64 + cr.r as i64)
+            && (cr.cy as i64 - cr.r as i64) <= (cyi as i64 - r as i64)
+            && (cyi as i64 + r as i64) <= (cr.cy as i64 + cr.r as i64)
+        {
+            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            return;
+        }
+    }
+
+    let Some(t) = get_t.get_tmpl() else {
+        if let Some(cr) = cached {
+            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+        }
+        return;
+    };
+
+    if t.w.is_some() {
+        let n = (2 * r + 1) as usize;
+        let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
+        for j in 0..n {
+            let gy = cyi + j as i32 - r;
+            let row_off = j * n;
+            let cj_opt = cached.and_then(|cr| {
+                let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
+                (0 <= cj && cj < cn as i64).then_some(cj as usize)
+            });
+            for i in 0..n {
+                let gx = cxi + i as i32 - r;
+                if let (Some(cr), Some(cj)) = (cached, cj_opt) {
+                    let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
+                    if 0 <= ci && ci < cn as i64 {
+                        scratch.scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
+                        continue;
+                    }
+                }
+                if let Some(v) = ncc(img, t, f64::from(gx), f64::from(gy), false) {
+                    scratch.scores[row_off + i] = v;
+                }
+            }
+        }
+        return;
+    }
+
+    let tr = t.r;
+    if 2 * tr + 3 > img.w || 2 * tr + 3 > img.h {
+        if let Some(cr) = cached {
+            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+        }
+        return;
+    }
+    let tr_i = tr as i32;
+    let vx0 = (cxi - r).max(tr_i + 1);
+    let vx1 = (cxi + r).min(img.w as i32 - 2 - tr_i);
+    let vy0 = (cyi - r).max(tr_i + 1);
+    let vy1 = (cyi + r).min(img.h as i32 - 2 - tr_i);
+    if vx0 > vx1 || vy0 > vy1 {
+        if let Some(cr) = cached {
+            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+        }
+        return;
+    }
+
+    if let Some(cr) = cached {
+        if cr.r >= 0
+            && (cr.cx as i64 - cr.r as i64) <= vx0 as i64
+            && vx1 as i64 <= (cr.cx as i64 + cr.r as i64)
+            && (cr.cy as i64 - cr.r as i64) <= vy0 as i64
+            && vy1 as i64 <= (cr.cy as i64 + cr.r as i64)
+        {
+            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            return;
+        }
+    }
+
+    let ix0 = (vx0 - tr_i) as usize;
+    let iy0 = (vy0 - tr_i) as usize;
+    let ix1 = (vx1 + tr_i) as usize;
+    let iy1 = (vy1 + tr_i) as usize;
+    let iw = ix1 - ix0 + 2;
+    let ih = iy1 - iy0 + 2;
+    let total = iw * ih;
+    scratch.int_s1.resize(total, 0);
+    scratch.int_s2.resize(total, 0);
+    scratch.int_s1[..iw].fill(0);
+    scratch.int_s2[..iw].fill(0);
+    let rw = ix1 - ix0 + 1;
+    for y in iy0..=iy1 {
+        let row_idx = y - iy0 + 1;
+        let cur = row_idx * iw;
+        let prev = cur - iw;
+        scratch.int_s1[cur] = 0;
+        scratch.int_s2[cur] = 0;
+        let px_row = &img.px[y * img.w + ix0..][..rw];
+        let mut r1 = 0u32;
+        let mut r2 = 0u64;
+        for (col, &p) in px_row.iter().enumerate() {
+            let v = u32::from(p);
+            r1 += v;
+            r2 += u64::from(v) * u64::from(v);
+            scratch.int_s1[cur + col + 1] = scratch.int_s1[prev + col + 1] + r1;
+            scratch.int_s2[cur + col + 1] = scratch.int_s2[prev + col + 1] + r2;
+        }
+    }
+
+    const COARSE_TN: usize = 2 * COARSE_R + 1;
+    if tr == COARSE_R {
+        fill_coarse_scores::<COARSE_TN>(
+            img,
+            t,
+            cxi,
+            cyi,
+            r,
+            vx0,
+            vx1,
+            vy0,
+            vy1,
+            iw,
+            cached,
+            &scratch.int_s1,
+            &scratch.int_s2,
+            &mut scratch.scores,
+        );
+    } else {
+        fill_coarse_scores::<0>(
+            img,
+            t,
+            cxi,
+            cyi,
+            r,
+            vx0,
+            vx1,
+            vy0,
+            vy1,
+            iw,
+            cached,
+            &scratch.int_s1,
+            &scratch.int_s2,
+            &mut scratch.scores,
+        );
+    }
+}
+
 /// Coarse candidates of `t` in `img` (half resolution): the local maxima of the NCC on the
 /// integer grid within `r` px of `c` with at least [`POSE_COARSE_MIN`], best first (at most 4).
 fn window_peaks_cached(
@@ -278,30 +532,7 @@ fn window_peaks_cached(
 
     let center = (cx.abs() < 1e7 && cy.abs() < 1e7 && r < 1_000_000).then_some((cx as i32, cy as i32));
     if let Some((cxi, cyi)) = center {
-        let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
-        for j in 0..n {
-            let gy = cyi + j as i32 - r;
-            let row_off = j * n;
-            let cj_opt = cached.and_then(|cr| {
-                let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
-                (0 <= cj && cj < cn as i64).then_some(cj as usize)
-            });
-            for i in 0..n {
-                let gx = cxi + i as i32 - r;
-                if let (Some(cr), Some(cj)) = (cached, cj_opt) {
-                    let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
-                    if 0 <= ci && ci < cn as i64 {
-                        scratch.scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
-                        continue;
-                    }
-                }
-                if let Some(t) = get_t.get_tmpl() {
-                    if let Some(v) = ncc(img, t, f64::from(gx), f64::from(gy), false) {
-                        scratch.scores[row_off + i] = v;
-                    }
-                }
-            }
-        }
+        fill_coarse_window_integral(img, get_t, cxi, cyi, r, cached, scratch);
     } else {
         for j in 0..n {
             let y = cy + j as f64 - r as f64;
@@ -1434,5 +1665,149 @@ mod tests {
                 assert!(cache.pairs.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn coarse_integral_window_matches_generic_ncc_scores_and_peaks() {
+        let reference_window = |img: &Gray, t: &Tmpl, c: [f64; 2], r: i32| -> (Vec<f32>, Vec<[f64; 2]>) {
+            let n = (2 * r + 1) as usize;
+            let (cx, cy) = (c[0].round(), c[1].round());
+            let mut scores = vec![f32::NEG_INFINITY; n * n];
+            for j in 0..n {
+                let y = cy + f64::from(j as i32 - r);
+                for i in 0..n {
+                    let x = cx + f64::from(i as i32 - r);
+                    if let Some(v) = ncc(img, t, x, y, false) {
+                        scores[j * n + i] = v;
+                    }
+                }
+            }
+            let ni = n as i32;
+            let mut peaks = Vec::new();
+            for j in 0..ni {
+                for i in 0..ni {
+                    let v = scores[j as usize * n + i as usize];
+                    if v.is_nan() || f64::from(v) < POSE_COARSE_MIN {
+                        continue;
+                    }
+                    let local = (-1..=1).all(|dj| {
+                        (-1..=1).all(|di| {
+                            let (a, b) = (i + di, j + dj);
+                            (di == 0 && dj == 0)
+                                || a < 0
+                                || b < 0
+                                || a >= ni
+                                || b >= ni
+                                || scores[b as usize * n + a as usize] <= v
+                        })
+                    });
+                    if local {
+                        peaks.push((v, [cx + f64::from(i - r), cy + f64::from(j - r)]));
+                    }
+                }
+            }
+            peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top: Vec<[f64; 2]> = peaks.into_iter().take(4).map(|p| p.1).collect();
+            (scores, top)
+        };
+
+        let (w, h) = (48usize, 40usize);
+        let mut px = vec![120u8; w * h];
+        // Bright nearly-flat region (250..=255) in top-right quadrant
+        for y in 0..20 {
+            for x in 24..w {
+                px[y * w + x] = 250 + (((x * 3 + y * 5) % 6) as u8);
+            }
+        }
+        // Normal textured patterns near borders and interior
+        for y in 0..h {
+            for x in 0..24 {
+                if x < 12 && y < 12 || ((10..22).contains(&x) && (15..28).contains(&y)) || y >= 32 {
+                    let v = (((x * 73) ^ (y * 137)).wrapping_mul(179) % 210) as u8;
+                    px[y * w + x] = 20 + v;
+                }
+            }
+        }
+        // Plant an exact copy of a 5x5 textured patch near (16, 20) and near edges
+        let patch_src_x = 16usize;
+        let patch_src_y = 20usize;
+        let img = Gray::new(w, h, px).unwrap();
+
+        let tc = make_tmpl(sample_int(&img, patch_src_x, patch_src_y, COARSE_R), COARSE_R, None, 0.0).unwrap();
+        let tc_r3 = make_tmpl(sample_int(&img, patch_src_x, patch_src_y, 3), 3, None, 0.0).unwrap();
+        let tc_weighted = make_tmpl(
+            sample_int(&img, patch_src_x, patch_src_y, COARSE_R),
+            COARSE_R,
+            Some([1.0, 0.0]),
+            1.0,
+        )
+        .unwrap();
+
+        let mut scratch = MatchScratch::default();
+        let check_case = |label: &str, img: &Gray, tmpl: &Tmpl, c: [f64; 2], r: i32, cached: Option<&CoarseRect>, scratch: &mut MatchScratch| {
+            let ((top, len), _) = window_peaks_cached(img, tmpl, c, r, cached, scratch);
+            let (ref_scores, ref_peaks) = reference_window(img, tmpl, c, r);
+            assert_eq!(scratch.scores.len(), ref_scores.len(), "{label}: score len mismatch");
+            for (idx, (&got, &exp)) in scratch.scores.iter().zip(&ref_scores).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    exp.to_bits(),
+                    "{label}: score[{idx}] mismatch: got={got:?} exp={exp:?}"
+                );
+            }
+            assert_eq!(&top[..len], ref_peaks.as_slice(), "{label}: peaks mismatch");
+        };
+
+        // 1. Interior windows (flat, bright nearly-flat, textured)
+        check_case("interior_textured", &img, &tc, [16.0, 20.0], 6, None, &mut scratch);
+        check_case("interior_flat", &img, &tc, [36.0, 30.0], 4, None, &mut scratch);
+        check_case("interior_bright_nearly_flat", &img, &tc, [35.0, 10.0], 5, None, &mut scratch);
+
+        // 2. Straddling all 4 image edges and corners
+        check_case("edge_left", &img, &tc, [1.0, 6.0], 5, None, &mut scratch);
+        check_case("edge_right", &img, &tc, [(w - 2) as f64, 10.0], 5, None, &mut scratch);
+        check_case("edge_top", &img, &tc, [6.0, 1.0], 5, None, &mut scratch);
+        check_case("edge_bottom", &img, &tc, [10.0, (h - 2) as f64], 5, None, &mut scratch);
+        check_case("corner_tl_tiny_oob", &img, &tc, [1.0, 1.0], 1, None, &mut scratch);
+
+        // 3. Completely out of bounds and tiny image (no valid centers)
+        check_case("oob_neg", &img, &tc, [-15.0, -15.0], 4, None, &mut scratch);
+        check_case("oob_pos", &img, &tc, [w as f64 + 15.0, h as f64 + 15.0], 4, None, &mut scratch);
+        let tiny_img = Gray::new(6, 6, vec![100u8; 36]).unwrap();
+        check_case("tiny_img", &tiny_img, &tc, [3.0, 3.0], 3, None, &mut scratch);
+
+        // 4. Partial cache hit + integral miss
+        let (_, c_base) = window_peaks_cached(&img, &tc, [15.0, 18.0], 5, None, &mut scratch);
+        let (bcx, bcy) = c_base.unwrap();
+        let cr_partial = CoarseRect { cx: bcx, cy: bcy, r: 5, scores: scratch.scores.clone() };
+        check_case("partial_cache_hit", &img, &tc, [18.0, 20.0], 5, Some(&cr_partial), &mut scratch);
+
+        // 5. Full cache hit fast path must not invoke LazyTmpl
+        let mut lazy_called = false;
+        let lazy_tc = LazyTmpl::new(|| {
+            lazy_called = true;
+            make_tmpl(sample_int(&img, patch_src_x, patch_src_y, COARSE_R), COARSE_R, None, 0.0)
+        });
+        let ((top_hit, len_hit), _) = window_peaks_cached(&img, lazy_tc, [15.0, 18.0], 3, Some(&cr_partial), &mut scratch);
+        assert!(!lazy_called, "full cache hit fast path must not evaluate LazyTmpl");
+        let (ref_scores_hit, ref_peaks_hit) = reference_window(&img, &tc, [15.0, 18.0], 3);
+        assert_eq!(scratch.scores.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), ref_scores_hit.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        assert_eq!(&top_hit[..len_hit], ref_peaks_hit.as_slice());
+
+        // 6. Valid bounds covered by cache on straddling window must skip integral tables
+        let (_, c_edge) = window_peaks_cached(&img, &tc, [6.0, 6.0], 4, None, &mut scratch);
+        let (ecx, ecy) = c_edge.unwrap();
+        let cr_edge = CoarseRect { cx: ecx, cy: ecy, r: 4, scores: scratch.scores.clone() };
+        scratch.int_s1.clear();
+        check_case("valid_bounds_covered_by_cache", &img, &tc, [5.0, 5.0], 5, Some(&cr_edge), &mut scratch);
+        assert!(scratch.int_s1.is_empty(), "integral tables should not be built when valid bounds are cache-covered");
+
+        // 7. Non-COARSE_R radius and weighted template fallback
+        check_case("unweighted_r3", &img, &tc_r3, [16.0, 20.0], 5, None, &mut scratch);
+        check_case("weighted_fallback", &img, &tc_weighted, [16.0, 20.0], 5, None, &mut scratch);
+        let (_, c_wbase) = window_peaks_cached(&img, &tc_weighted, [15.0, 18.0], 5, None, &mut scratch);
+        let (wcx, wcy) = c_wbase.unwrap();
+        let cr_weighted_partial = CoarseRect { cx: wcx, cy: wcy, r: 5, scores: scratch.scores.clone() };
+        check_case("weighted_fallback_partial_cache", &img, &tc_weighted, [18.0, 20.0], 5, Some(&cr_weighted_partial), &mut scratch);
     }
 }
