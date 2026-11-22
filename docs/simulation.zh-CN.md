@@ -216,12 +216,14 @@ v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 0 --camer
 scripts/tracking_lead_sim.sh                                   # kit profile，J1 = position_lead（lag 0.68 s，0.03 rad）
 scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json        # 从设备复制的 B601-DM profile，joint_tracking 按文件内容
 scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json 0.68,0.65,0.71,0.17,0,0,0   # 被控对象时间常数 J1..J7（s）
+scripts/tracking_lead_sim.sh "" "" 0.005 10                   # 所有 lead 关节 max_lead_rad 0.005，RMS 降幅 >= 10 % 即通过
 ```
 
-脚本执行 `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact`（环境变量 `REBOT_TRACKING_PROFILE`、`REBOT_TRACKING_PLANT_TAU`）。测试调用 `SupervisorInner::tick`（armd 的输出路径），被控对象为逐关节一阶 POS_VEL 滞后 `dq/dt = (q_out − q) / τ`，默认 τ 为 B601-DM 拟合值 J1..J4 0.68、0.65、0.71、0.17 s。`rebot-sim` 不模拟这一滞后（见「未仿真 / 限制」），所以该检查不用 `armd --follower sim`。动作序列：home → A，然后 A → B → A 三次，每次停 3 s；A = (0.255, 0.08, 0.43)，B = (0.255, 0.12, 0.43)，pitch 41°，`yaw: "outward"`，`path: "joint"`，`speed_scale` 0.3；控制周期在 18–26 ms 之间轮换。跟踪关闭、开启各跑一次，按每个 lead 关节输出参考运动期间 q_m − q_d 的 RMS 和峰值（mrad）以及每次停止后 1 s 的误差。以下任一情况判失败：
+脚本执行 `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact`（环境变量 `REBOT_TRACKING_PROFILE`、`REBOT_TRACKING_PLANT_TAU`、`REBOT_TRACKING_MAX_LEAD`、`REBOT_TRACKING_MIN_RMS_REDUCTION_PCT`；参数为空时用默认值）。测试调用 `SupervisorInner::tick`（armd 的输出路径），被控对象为逐关节一阶 POS_VEL 滞后 `dq/dt = (q_out − q) / τ`，默认 τ 为 B601-DM 拟合值 J1..J4 0.68、0.65、0.71、0.17 s。`rebot-sim` 不模拟这一滞后（见「未仿真 / 限制」），所以该检查不用 `armd --follower sim`。动作序列：home → A，然后 A → B → A 三次，每次停 3 s；A = (0.255, 0.08, 0.43)，B = (0.255, 0.12, 0.43)，pitch 41°，`yaw: "outward"`，`path: "joint"`，`speed_scale` 0.3；控制周期在 18–26 ms 之间轮换。跟踪关闭、开启各跑一次，按每个 lead 关节输出参考运动期间 q_m − q_d 的 RMS 和峰值（mrad）以及每次停止后 1 s 的误差；按每个臂关节输出关闭 / 开启时的下发速度 |v_out| 与加速度 |a_out| 峰值（由相邻下发帧计算）、|lead| 峰值、每 tick |Δlead| 峰值；以及每次运行的收回 tick 数（`TrackingRuntime::withdrawal_ticks`：lead 候选未通过、改发收回的 tick）。以下任一情况判失败：
 
 - 出现任何故障，或完成的 A ↔ B 动作少于 6 次；
-- 运动 RMS 降幅低于 30 %，或峰值误差、终点误差高于跟踪关闭时；
+- 运动 RMS 降幅低于 30 %（或指定的最小值），或峰值误差、终点误差高于跟踪关闭时；
+- 跟踪开启时 |v_out| 峰值超过关闭时峰值的 1.5 倍，或 |lead| 峰值超过 `max_lead_rad`；
 - 有下发帧违反下述输出约束。
 
 position lead 输出约束（`src/tracking.rs`，`compute_position_lead_output_with_limits_and_budget`）：
@@ -241,6 +243,9 @@ position lead 输出约束（`src/tracking.rs`，`compute_position_lead_output_w
 | 跟踪开启 | 25.2（−41.5 %） | 39.9 | ±4.8 | 0 | 6 |
 | 真机，关闭（2026-11-22） | 43 | 69 | | 0 | 6 |
 | 修复前，开启（测试台） | | | | 第一次 A → B 即 JOINT_LIMIT | 0 |
+| 开启，`max_lead_rad` 0.005 | 39.8（−7.6 %） | 59.3 | ±8.4 | 0 | 6 |
+
+同一组运行中 J1 下发输出峰值（J2..J6 关闭 / 开启相同）：关闭 |v_out| 0.135 rad/s，|a_out| 0.26 rad/s²；开启（0.03 rad）|v_out| 0.190，|a_out| 4.37，|lead| 30.0 mrad，|Δlead| 3.90 mrad/tick；开启（0.005 rad）|v_out| 0.135，|a_out| 3.12，|lead| 5.0 mrad，|Δlead| 1.52 mrad/tick。收回 tick 数：所有运行均为 0。`max_lead_rad` 0.005 时默认检查因 30 % RMS 条件失败。
 
 被控对象是固定 τ 的一阶模型，不含摩擦、回差、随负载变化的滞后以及电机自身的 POS_VEL 环路。检查通过不代表 lead 在真机上安全或有效；真机需要按关节跟踪规范做设备验证（只开 J1，操作员在机旁，关闭 / 开启对比）。
 

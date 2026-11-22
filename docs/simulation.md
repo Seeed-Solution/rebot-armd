@@ -216,12 +216,14 @@ Run this before enabling `joint_tracking` on a real arm, and after any change to
 scripts/tracking_lead_sim.sh                                   # kit profile, J1 = position_lead (lag 0.68 s, 0.03 rad)
 scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json        # a B601-DM profile copied from the device, joint_tracking as written
 scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json 0.68,0.65,0.71,0.17,0,0,0   # plant time constants J1..J7 (s)
+scripts/tracking_lead_sim.sh "" "" 0.005 10                   # max_lead_rad 0.005 for every lead joint, pass at >= 10 % RMS reduction
 ```
 
-The script runs `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact` (`REBOT_TRACKING_PROFILE`, `REBOT_TRACKING_PLANT_TAU`). The test drives `SupervisorInner::tick` (the output path of armd) with a first-order POS_VEL lag plant, `dq/dt = (q_out − q) / τ` per joint; the default τ are the B601-DM fits J1..J4 0.68, 0.65, 0.71, 0.17 s. `rebot-sim` does not model this lag (see "Not simulated"), so the check does not use `armd --follower sim`. Sequence: home → A, then A → B → A three times with 3 s holds, A = (0.255, 0.08, 0.43), B = (0.255, 0.12, 0.43), pitch 41°, `yaw: "outward"`, `path: "joint"`, `speed_scale` 0.3; tick periods cycle through 18–26 ms. It runs once with tracking off and once on, prints per lead joint the moving RMS and peak of q_m − q_d (mrad, while the reference moves) and the error 1 s after each stop, and fails on:
+The script runs `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact` (`REBOT_TRACKING_PROFILE`, `REBOT_TRACKING_PLANT_TAU`, `REBOT_TRACKING_MAX_LEAD`, `REBOT_TRACKING_MIN_RMS_REDUCTION_PCT`; an empty argument keeps the default). The test drives `SupervisorInner::tick` (the output path of armd) with a first-order POS_VEL lag plant, `dq/dt = (q_out − q) / τ` per joint; the default τ are the B601-DM fits J1..J4 0.68, 0.65, 0.71, 0.17 s. `rebot-sim` does not model this lag (see "Not simulated"), so the check does not use `armd --follower sim`. Sequence: home → A, then A → B → A three times with 3 s holds, A = (0.255, 0.08, 0.43), B = (0.255, 0.12, 0.43), pitch 41°, `yaw: "outward"`, `path: "joint"`, `speed_scale` 0.3; tick periods cycle through 18–26 ms. It runs once with tracking off and once on, prints per lead joint the moving RMS and peak of q_m − q_d (mrad, while the reference moves) and the error 1 s after each stop; per arm joint, off and on, the peak issued velocity |v_out| and acceleration |a_out| (from consecutive issued frames), peak |lead| and peak |Δlead| per tick; and the withdrawal ticks of each run (`TrackingRuntime::withdrawal_ticks`: ticks whose output was the lead withdrawal after the lead candidate failed). It fails on:
 
 - any fault, or fewer than six completed A ↔ B moves;
-- a moving-RMS reduction below 30 %, a higher peak error, or a higher endpoint error than with tracking off;
+- a moving-RMS reduction below 30 % (or the given minimum), a higher peak error, or a higher endpoint error than with tracking off;
+- a peak |v_out| with tracking on above 1.5 × the peak with tracking off, or a peak |lead| above `max_lead_rad`;
 - an issued frame outside the output contract below.
 
 Output contract of position lead (`src/tracking.rs`, `compute_position_lead_output_with_limits_and_budget`):
@@ -241,6 +243,9 @@ Result (spark, 2026-11-22, default arguments):
 | tracking on | 25.2 (−41.5 %) | 39.9 | ±4.8 | 0 | 6 |
 | real arm, off (2026-11-22) | 43 | 69 | | 0 | 6 |
 | before the fix, on (rig) | | | | JOINT_LIMIT on the first A → B move | 0 |
+| on, `max_lead_rad` 0.005 | 39.8 (−7.6 %) | 59.3 | ±8.4 | 0 | 6 |
+
+Issued-output peaks of J1 (same runs; J2..J6 identical off and on): off |v_out| 0.135 rad/s, |a_out| 0.26 rad/s²; on (0.03 rad) |v_out| 0.190, |a_out| 4.37, |lead| 30.0 mrad, |Δlead| 3.90 mrad/tick; on (0.005 rad) |v_out| 0.135, |a_out| 3.12, |lead| 5.0 mrad, |Δlead| 1.52 mrad/tick. Withdrawal ticks: 0 in every run. With `max_lead_rad` 0.005 the default check fails on the 30 % RMS criterion.
 
 The plant is first order with a fixed τ; friction, backlash, load-dependent lag and the arm's own POS_VEL loop are not modelled. A passing check does not show the lead is safe or effective on the arm; that needs the device qualification of the joint-tracking spec (J1 only, operator at the arm, off/on comparison).
 

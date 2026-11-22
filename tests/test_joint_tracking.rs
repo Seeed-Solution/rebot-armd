@@ -4463,6 +4463,14 @@ fn b601_ab_profile(enabled: bool) -> ArmConfig {
         jt.joints[0].lag_s = 0.68;
         jt.joints[0].max_lead_rad = 0.03;
     }
+    if let Ok(v) = std::env::var("REBOT_TRACKING_MAX_LEAD") {
+        if !v.trim().is_empty() {
+            let max_lead: f32 = v.trim().parse().expect("REBOT_TRACKING_MAX_LEAD (rad)");
+            for j in jt.joints.iter_mut().filter(|j| j.strategy == TrackingStrategy::PositionLead) {
+                j.max_lead_rad = max_lead;
+            }
+        }
+    }
     jt.enabled = enabled;
     config.validate().unwrap();
     config.lease_timeout_ms = 600_000;
@@ -4512,7 +4520,7 @@ fn b601_joint_move(inner: &mut SupervisorInner, xyz: [f64; 3]) -> u64 {
 /// home -> A, then A -> B -> A three times with 3 s holds, on the lag plant, through
 /// `SupervisorInner::tick` (the real output path). `dts` cycles the tick period (control-loop
 /// jitter). Stops at the first fault.
-fn b601_ab_run(enabled: bool, dts: &[f64]) -> (ArmConfig, Vec<AbSample>) {
+fn b601_ab_run(enabled: bool, dts: &[f64]) -> (ArmConfig, Vec<AbSample>, u64) {
     const A: [f64; 3] = [0.255, 0.08, 0.43];
     const B: [f64; 3] = [0.255, 0.12, 0.43];
     let cfg = b601_ab_profile(enabled);
@@ -4559,7 +4567,28 @@ fn b601_ab_run(enabled: bool, dts: &[f64]) -> (ArmConfig, Vec<AbSample>) {
             }
         }
     }
-    (cfg, samples)
+    let withdrawals = inner.tracking.withdrawal_ticks;
+    (cfg, samples, withdrawals)
+}
+
+/// Peaks of the issued output over a whole run for joint `j`: |v_out|, |a_out| (rad/s,
+/// rad/s^2, from consecutive issued frames and the tick periods), |lead| = |q_out - q_d| and
+/// |delta lead| per tick (mrad).
+fn b601_issued_peaks(samples: &[AbSample], j: usize) -> (f64, f64, f64, f64) {
+    let (mut v_pk, mut a_pk, mut l_pk, mut dl_pk) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut v_prev, mut l_prev) = (0.0_f64, 0.0_f64);
+    for w in samples.windows(2) {
+        let (p, c) = (&w[0], &w[1]);
+        let v = f64::from(c.q_out[j] - p.q_out[j]) / c.dt;
+        let lead = f64::from(c.q_out[j] - c.q_d[j]);
+        v_pk = v_pk.max(v.abs());
+        a_pk = a_pk.max(((v - v_prev) / c.dt).abs());
+        l_pk = l_pk.max(lead.abs());
+        dl_pk = dl_pk.max((lead - l_prev).abs());
+        v_prev = v;
+        l_prev = lead;
+    }
+    (v_pk, a_pk, l_pk * 1000.0, dl_pk * 1000.0)
 }
 
 /// Per-joint A/B statistics over the A <-> B moves (mrad): moving RMS and peak of q_m - q_d
@@ -4616,14 +4645,20 @@ fn b601_speed_scale_limits(inner: &SupervisorInner, speed_scale: f32) -> Vec<arm
 
 /// Acceptance and reusable pre-enable check: the incident's joint-space A <-> B sequence on the
 /// lag plant, tracking off vs on. On: no fault, all six moves, every lead joint's moving RMS
-/// error at least 30% lower than off, no higher peak or endpoint error, and every issued frame
+/// error at least 30% lower than off (`$REBOT_TRACKING_MIN_RMS_REDUCTION_PCT`), no higher peak
+/// or endpoint error, peak |v_out| at most 1.5 x the peak with tracking off, peak |lead| within
+/// max_lead (`$REBOT_TRACKING_MAX_LEAD` overrides it for every lead joint), and every issued frame
 /// within the output contract (|v_out| <= min(v_phys, v_cap + lag a_cap), |a_out| <= a_phys,
 /// |lead| <= max_lead, |delta lead| <= lag a_cap dt). Tick periods jitter 18..26 ms.
 #[test]
 fn tracking_lead_b601_joint_move_ab() {
     let dts = [0.020, 0.018, 0.022, 0.020, 0.026, 0.019];
-    let (_, off) = b601_ab_run(false, &dts);
-    let (cfg, on) = b601_ab_run(true, &dts);
+    let (_, off, wd_off) = b601_ab_run(false, &dts);
+    let (cfg, on, wd_on) = b601_ab_run(true, &dts);
+    let min_red: f64 = std::env::var("REBOT_TRACKING_MIN_RMS_REDUCTION_PCT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map_or(30.0, |v| v.trim().parse().expect("REBOT_TRACKING_MIN_RMS_REDUCTION_PCT"));
     let jt = cfg.joint_tracking.clone().unwrap();
     let arm = cfg.arm_joint_indices();
     let lead_joints: Vec<usize> = arm
@@ -4634,6 +4669,7 @@ fn tracking_lead_b601_joint_move_ab() {
         .collect();
     assert!(!lead_joints.is_empty(), "profile has no position_lead joint with lag_s > 0");
     eprintln!("tracking A/B (mrad; moving RMS / peak of q_m - q_d, error 1 s after each stop):");
+    let mut failures = Vec::new();
     for &j in &lead_joints {
         let (s_off, s_on) = (b601_ab_stats(&off, j), b601_ab_stats(&on, j));
         let red = (1.0 - s_on.rms / s_off.rms) * 100.0;
@@ -4645,13 +4681,33 @@ fn tracking_lead_b601_joint_move_ab() {
             "  J{} on : rms {:.1} peak {:.1} ends {:?} moves {} faults {:?} | RMS -{red:.1}%",
             j + 1, s_on.rms, s_on.peak, s_on.ends, s_on.moves, s_on.faults.first()
         );
-        assert!(s_off.faults.is_empty(), "tracking off faulted: {:?}", s_off.faults.first());
-        assert!(s_on.faults.is_empty(), "tracking on faulted: {:?}", s_on.faults.first());
-        assert_eq!((s_off.moves, s_on.moves), (6, 6), "all six A<->B moves must complete");
-        assert!(red >= 30.0, "J{}: moving RMS reduction {red:.1}% < 30%", j + 1);
-        assert!(s_on.peak <= s_off.peak + 1e-6, "J{}: peak error grew {} -> {}", j + 1, s_off.peak, s_on.peak);
-        assert!(s_on.end_max <= s_off.end_max + 0.5, "J{}: endpoint error grew", j + 1);
+        if !s_off.faults.is_empty() { failures.push(format!("J{}: tracking off faulted: {:?}", j + 1, s_off.faults.first())); }
+        if !s_on.faults.is_empty() { failures.push(format!("J{}: tracking on faulted: {:?}", j + 1, s_on.faults.first())); }
+        if (s_off.moves, s_on.moves) != (6, 6) { failures.push(format!("J{}: moves off {} on {} (need 6)", j + 1, s_off.moves, s_on.moves)); }
+        if red < min_red { failures.push(format!("J{}: moving RMS reduction {red:.1}% < {min_red}%", j + 1)); }
+        if s_on.peak > s_off.peak + 1e-6 { failures.push(format!("J{}: peak error grew {:.1} -> {:.1}", j + 1, s_off.peak, s_on.peak)); }
+        if s_on.end_max > s_off.end_max + 0.5 { failures.push(format!("J{}: endpoint error grew {:.1} -> {:.1}", j + 1, s_off.end_max, s_on.end_max)); }
     }
+    eprintln!("issued output peaks (|v_out| rad/s, |a_out| rad/s^2, |lead| mrad, |delta lead| mrad/tick); withdrawal ticks off {wd_off} on {wd_on}:");
+    for (k, &j) in arm.iter().enumerate() {
+        let max_lead_mrad = f64::from(jt.joints[k].max_lead_rad) * 1000.0;
+        let p_off = b601_issued_peaks(&off, j);
+        let p_on = b601_issued_peaks(&on, j);
+        for (tag, p) in [("off", p_off), ("on ", p_on)] {
+            eprintln!(
+                "  J{} {tag}: v_out {:.4}  a_out {:.3}  lead {:.2}  dlead {:.3}{}",
+                j + 1, p.0, p.1, p.2, p.3,
+                if lead_joints.contains(&j) && tag == "on " { format!("  (max_lead {max_lead_mrad:.1})") } else { String::new() }
+            );
+        }
+        if p_on.0 > 1.5 * p_off.0 + 1e-6 {
+            failures.push(format!("J{}: peak |v_out| on {:.4} > 1.5 x off {:.4}", j + 1, p_on.0, p_off.0));
+        }
+        if p_on.2 > max_lead_mrad + 1e-2 && lead_joints.contains(&j) {
+            failures.push(format!("J{}: peak |lead| {:.3} mrad > max_lead {max_lead_mrad:.3}", j + 1, p_on.2));
+        }
+    }
+    assert!(failures.is_empty(), "tracking A/B check failed:\n  {}", failures.join("\n  "));
     // Output contract on every issued frame (arm joints).
     let caps = {
         let probe = b601_ab_profile(true);

@@ -5725,6 +5725,9 @@ impl SupervisorInner {
                                         out.ws_keepout_min_depths,
                                     );
                                     self.tracking.last_nominal = Some(nominal);
+                                    if out.withdrawn {
+                                        self.tracking.withdrawal_ticks += 1;
+                                    }
                                     tick_output_accepted = true;
                                 }
                                 Some(Err(e)) => {

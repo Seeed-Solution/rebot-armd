@@ -282,6 +282,9 @@ pub struct TrackingRuntime {
     /// Motion caps (`ActiveTrajectory::motion_limits`) of a planned motion whose reference
     /// finished, kept in force until it has settled and its residual lead is ramped out.
     pub retained_motion_limits: Option<Vec<crate::model::JointLimit>>,
+    /// Ticks whose issued output was the lead withdrawal after the lead candidate failed
+    /// validation (`TrackingOutput::withdrawn`); diagnostics only.
+    pub withdrawal_ticks: u64,
 }
 
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
@@ -492,6 +495,8 @@ pub struct TrackingOutput {
     pub velocities: Vec<f32>,
     /// 1: the shaped lead toward its target; 0: the shaped withdrawal toward zero lead.
     pub multiplier: f32,
+    /// True when the lead candidate failed validation and this is its withdrawal.
+    pub withdrawn: bool,
     pub sweep_evals_used: usize,
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     pub ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
@@ -983,6 +988,7 @@ impl crate::supervisor::SupervisorInner {
         let mut last_err: Option<TrackingReject> = None;
         let budget_start = *budget;
 
+        let lead_tried = candidates.len() > 1;
         'cand: for (m, q_cand) in candidates {
             // Per-joint position, directional allowance, velocity, and acceleration checks.
             for &j in &arm_indices {
@@ -1091,6 +1097,7 @@ impl crate::supervisor::SupervisorInner {
                 positions: q_cand,
                 velocities: v_out,
                 multiplier: m,
+                withdrawn: lead_tried && m == 0.0,
                 sweep_evals_used: budget_start.saturating_sub(*budget),
                 ws_min_depths: committed_ws_min_d,
                 ws_keepout_min_depths: None,
@@ -1283,6 +1290,7 @@ impl crate::supervisor::SupervisorInner {
             positions: q_next,
             velocities: v_out,
             multiplier: 0.0,
+            withdrawn: false,
             sweep_evals_used: budget_start.saturating_sub(*budget),
             ws_min_depths: committed_ws_min_d,
             ws_keepout_min_depths: committed_keepout_min_d,
