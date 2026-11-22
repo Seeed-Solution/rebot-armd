@@ -50,6 +50,10 @@
 //!   its correction, point count and reprojection rms before and after (`views[].pose_refine`,
 //!   `pose_refine`); a view with too few points or a correction above the cap keeps its
 //!   kinematic pose.
+//! - Heights are measured from a table plane fitted to the points outside the target box
+//!   ([`mview_stereo::fit_table_plane`], `table_plane`); the object threshold is max(5 mm, 3 x the
+//!   MAD of the table residuals). Without a usable fit the calibrated table z stays
+//!   (`table_plane` null).
 //! - The image computation runs in `spawn_blocking`, while the arm returns to the start pose.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -818,6 +822,10 @@ pub struct Computed {
     pub region_px: [f64; 4],
     /// The per-view rotation refinement ([`mview_stereo::pose`]); its cameras were used.
     pub pose: Option<mview_stereo::PoseRefinement>,
+    /// The fitted table plane the heights are measured from (None: z = table_z).
+    pub plane: Option<mview_stereo::TablePlane>,
+    /// The object threshold used (m).
+    pub object_min_h_m: f64,
     pub ms: f64,
 }
 
@@ -871,9 +879,30 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
         }
         None => mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p),
     };
-    let measure = mview_stereo::measure(&rec.points, &p);
+    // heights from the table plane fitted to the points outside the box (else z = table_z)
+    let cam0 = views.get(reference).map(|v| v.cam);
+    let centre = cam0.and_then(|c| {
+        let d = c.ray([0.5 * (ref_box_px[0] + ref_box_px[2]), 0.5 * (ref_box_px[1] + ref_box_px[3])]);
+        (d[2] < -1e-3).then(|| { let t = (table_z - c.c[2]) / d[2]; [c.c[0] + t * d[0], c.c[1] + t * d[1]] })
+    }).unwrap_or([0.0; 2]);
+    let plane = mview_stereo::fit_table_plane(&rec.points, &p, centre);
+    let mut pm = p;
+    if let Some(t) = &plane {
+        pm.plane = Some(t.plane);
+        pm.object_min_h_m = t.threshold_mm / 1000.0;
+    }
+    let measure = mview_stereo::measure(&rec.points, &pm);
     let table = mview_stereo::table_check(&rec.points, &p);
-    Computed { measure, table, rec, region_px, pose, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+    Computed { measure, table, rec, region_px, pose, plane, object_min_h_m: pm.object_min_h_m, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+}
+
+/// The `table_plane` value of the measurement: the fitted plane, or null (heights from table_z).
+pub fn plane_value(plane: &Option<mview_stereo::TablePlane>) -> Value {
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    plane.as_ref().map_or(Value::Null, |t| json!({
+        "n_points": t.n_points, "n_inliers": t.n_inliers, "offset_mm": r2(t.offset_mm), "tilt_deg": r2(t.tilt_deg),
+        "mad_mm": r2(t.mad_mm), "threshold_mm": r2(t.threshold_mm),
+    }))
 }
 
 /// The `pose_refine` value of the measurement (and of each view, `views`).
@@ -1157,6 +1186,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let mut value = measurement_value(plan, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
+    value["table_plane"] = plane_value(&c.plane);
     let (mut pose, per_view) = pose_value(mode, &c.pose);
     pose["markers_requested"] = json!(markers);
     value["pose_refine"] = pose;
@@ -1175,9 +1205,10 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     ctx.sup.inner().write().await.update_action(ctx.id, |a| a.measurement = Some(value));
     back?;
     let p = Params::new(table_z);
+    let thr_mm = c.object_min_h_m * 1000.0;
     Ok(c.measure.err().map(|_| ("TOO_FEW_POINTS".to_string(),
-        format!("fewer than {} object points more than {:.0} mm above the table in the target box: {} triangulated points in the box (height above table min {} / median {} / max {} mm, {} above {:.0} mm); {} points in all; features {}, no peak {}, ambiguous {}, refine {}, left-right {}, reprojection {}",
-            p.min_object_points, p.object_min_h_m * 1000.0, in_box["n"], in_box["min_mm"], in_box["median_mm"], in_box["max_mm"], in_box["n_above"], p.object_min_h_m * 1000.0,
+        format!("fewer than {} object points more than {thr_mm:.0} mm above the table in the target box: {} triangulated points in the box (height above table min {} / median {} / max {} mm, {} above {:.0} mm); {} points in all; features {}, no peak {}, ambiguous {}, refine {}, left-right {}, reprojection {}",
+            p.min_object_points, in_box["n"], in_box["min_mm"], in_box["median_mm"], in_box["max_mm"], in_box["n_above"], p.object_min_h_m * 1000.0,
             stats.points, stats.features, stats.no_peak, stats.ambiguous, stats.refine_rejected, stats.lr_rejected, stats.reproj_rejected))))
 }
 

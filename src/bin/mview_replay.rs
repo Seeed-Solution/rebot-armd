@@ -31,7 +31,7 @@ fn main() {
             m.height_m * 1000.0, m.top_z_m, m.n_points, m.n_edge_points, m.n_top_points, m.width_m * 1000.0, m.length_m * 1000.0, m.yaw_deg, m.reproj_rms_px),
         Err(w) => println!("measurement: {w}"),
     }
-    println!("table check n {} median {:?} mm |median| {:?} mm", c.table.n_points, c.table.median_mm, c.table.median_abs_mm);
+    println!("table check n {} median {:?} mm |median| {:?} mm; table plane {}", c.table.n_points, c.table.median_mm, c.table.median_abs_mm, armd::measure_multiview::plane_value(&c.plane));
     if args.iter().any(|a| a == "--points") {
         for q in c.rec.points.iter().filter(|q| q.in_box) {
             println!("point ref_px {:?} h {:+.1} mm edge {} consistent {} reproj {:.2} px", q.ref_px, (q.x[2] - b.table_z_m) * 1000.0, q.edge, q.consistent, q.reproj_rms_px);

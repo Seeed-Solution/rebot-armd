@@ -34,6 +34,10 @@
 //!   `consistent` when at least two other views matched and the points triangulated from the
 //!   reference with each of them agree within [`EDGE_CONSISTENCY_M`] (or 3 px of disparity): a
 //!   mismatch, or a silhouette of a curved surface that moves with the view, fails it.
+//! - Table plane ([`fit_table_plane`]): a plane fitted (RANSAC, then least squares) to the points
+//!   outside the box near the calibrated table height; heights are measured from it and the
+//!   object threshold becomes max(`object_min_h_m`, 3 x the MAD of the table residuals). Without
+//!   a usable fit the plane z = `table_z_m` stays.
 //! - Measurement ([`measure`]): points more than `object_min_h_m` above the table plane whose
 //!   reference pixel lies in the object box are object points, less isolated ones (false matches,
 //!   [`ISOLATION_K`]). The top is the p90 of the locally
@@ -182,6 +186,8 @@ pub struct Params {
     /// Height above the table that makes a point an object point (m).
     pub object_min_h_m: f64,
     pub min_object_points: usize,
+    /// Table plane [n_x, n_y, n_z, d] (unit normal up, height = n . x + d); None: z = `table_z_m`.
+    pub plane: Option<[f64; 4]>,
 }
 
 impl Params {
@@ -190,9 +196,109 @@ impl Params {
             table_z_m, max_height_m: 0.25, max_object_features: 200, max_table_features: 60, max_edge_features: 120,
             min_feature_dist_px: 5.0, min_edge_dist_px: 4.0, edge_min_grad: 6.0,
             sweep_min: 0.6, ncc_min: 0.8, ratio: 0.7, lr_tol_px: 2.0, reproj_max_px: 2.0, sweep_step_px: 0.75, object_min_h_m: 0.005,
-            min_object_points: 8,
+            min_object_points: 8, plane: None,
         }
     }
+
+    /// Height of `x` above the table plane (m).
+    #[inline]
+    pub fn height(&self, x: &Vec3) -> f64 {
+        match self.plane { Some(n) => n[0] * x[0] + n[1] * x[1] + n[2] * x[2] + n[3], None => x[2] - self.table_z_m }
+    }
+
+    /// z of the table plane at (x, y).
+    pub fn table_z_at(&self, x: f64, y: f64) -> f64 {
+        match self.plane { Some(n) if n[2].abs() > 1e-6 => -(n[0] * x + n[1] * y + n[3]) / n[2], _ => self.table_z_m }
+    }
+}
+
+/// Table plane fit: points outside the box within this of the calibrated table height (m).
+pub const PLANE_BAND_M: f64 = 0.015;
+/// RANSAC inlier distance (m), iterations, points the fit needs, largest tilt (deg) and largest
+/// offset from the calibrated table height at the box (m).
+pub const PLANE_INLIER_M: f64 = 0.002;
+pub const PLANE_ITERS: usize = 300;
+pub const PLANE_MIN_POINTS: usize = 10;
+pub const PLANE_MAX_TILT_DEG: f64 = 5.0;
+pub const PLANE_MAX_OFFSET_M: f64 = 0.01;
+/// Object threshold: this many times the MAD of the table residuals (at least `object_min_h_m`).
+pub const PLANE_MAD_K: f64 = 3.0;
+
+/// A fitted table plane.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TablePlane {
+    /// [n_x, n_y, n_z, d]: unit normal (up) and offset, height = n . x + d.
+    pub plane: [f64; 4],
+    /// Candidate points (outside the box, within [`PLANE_BAND_M`]) and RANSAC inliers.
+    pub n_points: usize,
+    pub n_inliers: usize,
+    /// Plane height above `table_z_m` at the box centre (mm) and tilt (deg).
+    pub offset_mm: f64,
+    pub tilt_deg: f64,
+    /// Median absolute deviation of the candidates' residuals (mm).
+    pub mad_mm: f64,
+    /// The object threshold max(`object_min_h_m`, [`PLANE_MAD_K`] x MAD) (mm).
+    pub threshold_mm: f64,
+}
+
+/// Least-squares plane z = a x + b y + c through `pts`.
+fn lsq_plane(pts: &[Vec3]) -> Option<[f64; 3]> {
+    let n = pts.len() as f64;
+    let (mx, my, mz) = (pts.iter().map(|p| p[0]).sum::<f64>() / n, pts.iter().map(|p| p[1]).sum::<f64>() / n, pts.iter().map(|p| p[2]).sum::<f64>() / n);
+    let (mut sxx, mut sxy, mut syy, mut sxz, mut syz) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for p in pts {
+        let (dx, dy, dz) = (p[0] - mx, p[1] - my, p[2] - mz);
+        sxx += dx * dx; sxy += dx * dy; syy += dy * dy; sxz += dx * dz; syz += dy * dz;
+    }
+    let det = sxx * syy - sxy * sxy;
+    if det.abs() < 1e-12 { return None; }
+    let a = (sxz * syy - syz * sxy) / det;
+    let b = (syz * sxx - sxz * sxy) / det;
+    Some([a, b, mz - a * mx - b * my])
+}
+
+/// Fit the table plane to the points outside the box within [`PLANE_BAND_M`] of `table_z_m`:
+/// RANSAC (deterministic, [`PLANE_ITERS`] triples, inliers within [`PLANE_INLIER_M`], normals
+/// within 20 deg of vertical), then least squares on the inliers. None with fewer than
+/// [`PLANE_MIN_POINTS`] candidates or inliers, or a plane tilted more than
+/// [`PLANE_MAX_TILT_DEG`] or more than [`PLANE_MAX_OFFSET_M`] off `table_z_m` at `centre_xy`.
+pub fn fit_table_plane(points: &[Point], p: &Params, centre_xy: [f64; 2]) -> Option<TablePlane> {
+    let cand: Vec<Vec3> = points.iter().filter(|q| !q.in_box && (q.x[2] - p.table_z_m).abs() <= PLANE_BAND_M).map(|q| q.x).collect();
+    if cand.len() < PLANE_MIN_POINTS { return None; }
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = |n: usize| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed % n as u64) as usize };
+    let mut best: Vec<bool> = Vec::new();
+    let mut best_n = 0;
+    for _ in 0..PLANE_ITERS {
+        let (i, j, k) = (next(cand.len()), next(cand.len()), next(cand.len()));
+        if i == j || j == k || i == k { continue; }
+        let nrm = kinematics::cross(&kinematics::sub(&cand[j], &cand[i]), &kinematics::sub(&cand[k], &cand[i]));
+        let l = kinematics::norm(&nrm);
+        if l < 1e-9 { continue; }
+        let nrm = [nrm[0] / l, nrm[1] / l, nrm[2] / l];
+        if nrm[2].abs() < 0.94 { continue; }
+        let inl: Vec<bool> = cand.iter().map(|x| (kinematics::dot(&nrm, &kinematics::sub(x, &cand[i]))).abs() <= PLANE_INLIER_M).collect();
+        let n = inl.iter().filter(|b| **b).count();
+        if n > best_n { best_n = n; best = inl; }
+    }
+    if best_n < PLANE_MIN_POINTS { return None; }
+    let inl: Vec<Vec3> = cand.iter().zip(&best).filter(|(_, b)| **b).map(|(x, _)| *x).collect();
+    let [a, b, c] = lsq_plane(&inl)?;
+    let l = (a * a + b * b + 1.0).sqrt();
+    let plane = [-a / l, -b / l, 1.0 / l, -c / l];
+    let tilt_deg = (1.0 / l).acos().to_degrees();
+    let offset = a * centre_xy[0] + b * centre_xy[1] + c - p.table_z_m;
+    if tilt_deg > PLANE_MAX_TILT_DEG || offset.abs() > PLANE_MAX_OFFSET_M { return None; }
+    let mut r: Vec<f64> = cand.iter().map(|x| plane[0] * x[0] + plane[1] * x[1] + plane[2] * x[2] + plane[3]).collect();
+    r.sort_by(f64::total_cmp);
+    let med = quantile(&r, 0.5);
+    let mut dev: Vec<f64> = r.iter().map(|x| (x - med).abs()).collect();
+    dev.sort_by(f64::total_cmp);
+    let mad = quantile(&dev, 0.5);
+    Some(TablePlane {
+        plane, n_points: cand.len(), n_inliers: inl.len(), offset_mm: offset * 1000.0, tilt_deg, mad_mm: mad * 1000.0,
+        threshold_mm: p.object_min_h_m.max(PLANE_MAD_K * mad) * 1000.0,
+    })
 }
 
 /// One triangulated point.
@@ -968,7 +1074,7 @@ pub fn table_check(points: &[Point], p: &Params) -> TableCheck {
 /// Object measurement from the points in the box above the table; `Err("too_few_points")`
 /// below `min_object_points` object points or [`MIN_TOP_POINTS`] points usable for the top.
 pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static str> {
-    let idx: Vec<usize> = (0..points.len()).filter(|&i| { let q = &points[i]; q.in_box && q.x[2] - p.table_z_m > p.object_min_h_m }).collect();
+    let idx: Vec<usize> = (0..points.len()).filter(|&i| { let q = &points[i]; q.in_box && p.height(&q.x) > p.object_min_h_m }).collect();
     if idx.len() < p.min_object_points { return Err("too_few_points"); }
     // isolated points (false matches): distance to the ISOLATION_K-th nearest object point above
     // max(3 x its median, ISOLATION_MIN_M)
@@ -989,7 +1095,7 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
     // top: p90 of the heights after a local median (each point's height = median of its
     // TOP_NEIGHBOURS nearest top points in x, y), so the per-point noise does not lift the p90
     let mut z: Vec<f64> = top_pts.iter().map(|q| {
-        let mut nb: Vec<(f64, f64)> = top_pts.iter().map(|o| ((o.x[0] - q.x[0]).hypot(o.x[1] - q.x[1]), o.x[2])).collect();
+        let mut nb: Vec<(f64, f64)> = top_pts.iter().map(|o| ((o.x[0] - q.x[0]).hypot(o.x[1] - q.x[1]), p.height(&o.x))).collect();
         let k = TOP_NEIGHBOURS.min(nb.len());
         nb.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
         let mut zs: Vec<f64> = nb[..k].iter().map(|n| n.1).collect();
@@ -997,7 +1103,7 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
         quantile(&zs, 0.5)
     }).collect();
     z.sort_by(f64::total_cmp);
-    let top = quantile(&z, 0.9);
+    let top_h = quantile(&z, 0.9);
     let n = obj.len() as f64;
     let (mx, my) = (obj.iter().map(|q| q.x[0]).sum::<f64>() / n, obj.iter().map(|q| q.x[1]).sum::<f64>() / n);
     let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
@@ -1016,10 +1122,11 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
     let centre = [mx + uc * c - vc * s, my + uc * s + vc * c];
     let yaw = (theta.to_degrees() + 90.0).rem_euclid(180.0) - 90.0;
     let rms = (obj.iter().map(|q| q.reproj_rms_px * q.reproj_rms_px).sum::<f64>() / n).sqrt();
+    let tz = p.table_z_at(centre[0], centre[1]);
     Ok(ObjectMeasure {
-        centroid_m: [centre[0], centre[1], 0.5 * (top + p.table_z_m)],
-        top_z_m: top,
-        height_m: top - p.table_z_m,
+        centroid_m: [centre[0], centre[1], tz + 0.5 * top_h],
+        top_z_m: tz + top_h,
+        height_m: top_h,
         width_m: v1 - v0,
         length_m: u1 - u0,
         yaw_deg: yaw,
@@ -1091,6 +1198,32 @@ mod tests {
         assert_eq!(t.n_points, 20);
         assert!((t.median_abs_mm.unwrap() - 1.5).abs() < 1e-6 && t.p90_abs_mm.unwrap() <= 2.0 + 1e-9, "{t:?}");
         assert_eq!(measure(&pts[66..], &p), Err("too_few_points"));
+    }
+
+    #[test]
+    fn the_table_plane_is_fitted_robustly_and_sets_the_heights() {
+        let mut p = Params::new(0.01);
+        // table points 3 mm above the calibrated table, tilted 1 deg about y, +-0.5 mm noise;
+        // a cable 8 mm high and points in the box do not count
+        let tilt = 1f64.to_radians().tan();
+        let z = |x: f64| 0.013 + tilt * (x - 0.3);
+        let mut pts: Vec<Point> = (0..60).map(|i| {
+            let (x, y) = (0.2 + 0.004 * f64::from(i % 20) * 2.5, -0.1 + 0.01 * f64::from(i / 20) * 10.0);
+            pt(x, y, z(x) + if i % 2 == 0 { 0.0005 } else { -0.0005 }, false)
+        }).collect();
+        pts.extend((0..8).map(|i| pt(0.25 + 0.003 * f64::from(i), 0.05, z(0.25) + 0.008, false)));
+        // the object: 40 mm above the plane
+        pts.extend((0..20).map(|i| pt(0.29 + 0.001 * f64::from(i), 0.0, z(0.29 + 0.001 * f64::from(i)) + 0.04, true)));
+        let t = fit_table_plane(&pts, &p, [0.3, 0.0]).unwrap();
+        assert_eq!((t.n_points, t.n_inliers), (68, 60), "{t:?}");
+        assert!((t.offset_mm - 3.0).abs() < 0.1 && (t.tilt_deg - 1.0).abs() < 0.1, "{t:?}");
+        assert!(t.mad_mm > 0.4 && t.mad_mm < 1.0 && t.threshold_mm == 5.0, "{t:?}");
+        p.plane = Some(t.plane);
+        let m = measure(&pts, &p).unwrap();
+        assert!((m.height_m - 0.04).abs() < 2e-4 && (m.top_z_m - z(m.centroid_m[0]) - 0.04).abs() < 2e-4, "{m:?}");
+        // too few points, or a plane far from the calibrated table: no fit
+        assert!(fit_table_plane(&pts[..9], &Params::new(0.01), [0.3, 0.0]).is_none());
+        assert!(fit_table_plane(&pts, &Params::new(-0.002), [0.3, 0.0]).is_none());
     }
 
     #[test]

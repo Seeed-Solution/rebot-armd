@@ -199,7 +199,10 @@ async fn rig(config: ArmConfig) -> Rig { rig_driven(config, false, None).await }
 async fn rig_plain(config: ArmConfig, plain: bool) -> Rig { rig_driven(config, plain, None).await }
 
 /// [`rig`] with a plain (uniform grey) box when `plain`, and the creep driver when given.
-async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) -> Rig {
+async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) -> Rig { rig_scene(config, plain, false, driver).await }
+
+/// [`rig_driven`] with a uniform table when `plain_table`.
+async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Option<CreepArm>) -> Rig {
     let (cam, _, look) = geometry(&config);
     let sup = Arc::new(ArmSupervisor::new(config));
     if let Some(d) = driver {
@@ -208,6 +211,7 @@ async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) ->
     }
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
+    scene.plain_table = plain_table;
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
         snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
         shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
@@ -655,11 +659,12 @@ fn table_markers(look: [f64; 3]) -> Vec<(i64, [[f64; 3]; 4])> {
     }).collect()
 }
 
-/// One run with `body` against a rig whose views carry a 1.5 mrad rotation error; the action.
-async fn run_with_rotation_error(body: Value, markers: bool, aruco: bool) -> (Value, bool) {
+/// One run with `body` against a rig whose views carry a 1.5 mrad rotation error (a uniform
+/// table when `plain_table`); the action and whether it returned to the start.
+async fn run_with_rotation_error(body: Value, markers: bool, aruco: bool, plain_table: bool) -> (Value, bool) {
     let config = ArmConfig::rebot_dm();
     let (_, _, look) = geometry(&config);
-    let mut r = rig(config).await;
+    let mut r = rig_scene(config, false, plain_table, None).await;
     *r.vision.rot_err.lock().unwrap() = 0.0015;
     if markers { *r.vision.markers.lock().unwrap() = table_markers(look); }
     r.vision.aruco.store(aruco, Ordering::SeqCst);
@@ -673,23 +678,29 @@ fn height(a: &Value) -> f64 { a["measurement"]["objects"][0]["height_m"].as_f64(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rotation_error_per_view_biases_the_height_without_refinement() {
-    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "off"}), false, false).await;
+    // 1.5 mrad turns each side view's image by about 1 px along the baseline, the two sides
+    // opposite ways: the box comes out about 3 mm off. On a uniform table no plane is fitted
+    // (on a textured one the fitted plane takes up most of this uniform bias).
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "off"}), false, false, true).await;
     let m = &a["measurement"];
-    println!("off: height {}, pose_refine {}", height(&a), m["pose_refine"]);
+    println!("off: height {}, pose_refine {}, table_plane {}", height(&a), m["pose_refine"], m["table_plane"]);
     assert_eq!(a["state"], "done", "{a}");
     assert!(back);
     assert_eq!(m["pose_refine"], json!({"mode": "off", "applied": false, "markers_requested": false}), "{}", m["pose_refine"]);
-    assert!(m["views"][1]["pose_refine"].is_null());
-    // 1.5 mrad turns each side view's image by about 1 px along the baseline, the two sides
-    // opposite ways: the table and the box come out about 3 mm off
+    assert!(m["views"][1]["pose_refine"].is_null() && m["table_plane"].is_null(), "{m}");
     assert!((height(&a) - HEIGHT).abs() > 0.002, "height {} without the refinement", height(&a));
+    // on the textured table without refinement the triangulated table lies off the calibrated one
+    let (a, _) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "off"}), false, false, false).await;
+    let t = &a["measurement"]["table_check"];
+    println!("off, textured table: height {}, table_check {t}, table_plane {}", height(&a), a["measurement"]["table_plane"]);
+    assert!(t["median_mm"].as_f64().unwrap().abs() > 2.0, "{t}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_rotation_error_per_view_is_refined_away_from_table_texture() {
-    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), false, false).await;
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), false, false, false).await;
     let m = &a["measurement"];
-    println!("auto: height {}, pose_refine {}", height(&a), m["pose_refine"]);
+    println!("auto: height {}, pose_refine {}, table_check {}", height(&a), m["pose_refine"], m["table_check"]);
     assert_eq!(a["state"], "done", "{a}");
     assert!(back);
     let p = &m["pose_refine"];
@@ -705,12 +716,13 @@ async fn a_rotation_error_per_view_is_refined_away_from_table_texture() {
         assert!((r["correction_mrad"].as_f64().unwrap() - 1.5).abs() < 0.2 && r["n_points"].as_u64().unwrap() >= 12, "{r}");
     }
     assert!((height(&a) - HEIGHT).abs() < 0.001, "height {}", height(&a));
+    assert!(m["table_check"]["median_mm"].as_f64().unwrap().abs() < 1.0, "{}", m["table_check"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn marker_corners_refine_the_poses_in_aruco_and_auto_mode() {
-    // aruco: the marker corners alone
-    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), true, true).await;
+    // aruco: the marker corners alone, on a uniform table (no texture, no fitted plane)
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), true, true, true).await;
     let m = &a["measurement"];
     println!("aruco: height {}, pose_refine {}", height(&a), m["pose_refine"]);
     assert_eq!(a["state"], "done", "{a}");
@@ -723,9 +735,9 @@ async fn marker_corners_refine_the_poses_in_aruco_and_auto_mode() {
         assert_eq!(r["status"], "refined", "{r}");
         assert!(r["n_marker_corners"].as_u64().unwrap() >= 8 && (r["correction_mrad"].as_f64().unwrap() - 1.5).abs() < 0.3, "{r}");
     }
-    assert!((height(&a) - HEIGHT).abs() < 0.003, "height {}", height(&a));
+    assert!((height(&a) - HEIGHT).abs() < 0.0015 && m["table_plane"].is_null(), "height {}", height(&a));
     // auto: table texture plus the marker corners
-    let (a, _) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), true, true).await;
+    let (a, _) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5}), true, true, false).await;
     let p = &a["measurement"]["pose_refine"];
     println!("auto with markers: height {}, pose_refine {p}", height(&a));
     assert_eq!(a["state"], "done", "{a}");
@@ -736,7 +748,7 @@ async fn marker_corners_refine_the_poses_in_aruco_and_auto_mode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aruco_mode_without_markers_fails_markers_unavailable() {
     // the provider runs ArUco but no marker is in view: after the views, back at the start
-    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), false, true).await;
+    let (a, back) = run_with_rotation_error(json!({"label": "box", "speed_scale": 0.5, "pose_refine": "aruco"}), false, true, false).await;
     println!("{} {}", a["code"], a["message"]);
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MARKERS_UNAVAILABLE")), "{a}");
     assert!(a["message"].as_str().unwrap().contains("marker corners"), "{a}");
