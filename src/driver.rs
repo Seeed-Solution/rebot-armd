@@ -2755,8 +2755,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let sent = self.rx_boundary()?;
             self.register_replies.clear();
             self.register_reply_log.clear();
-            *written = true;
+            // uncertain from the moment the transport accepted the write (a write that never left,
+            // WouldBlock until the retries ran out, changed nothing)
             self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
+            *written = true;
             self.can.flush()?;
             self.await_replies_after(&[(i, true, damiao::RID_TIMEOUT)], sent);
             let ack = self.register_reply_log.iter().rev()

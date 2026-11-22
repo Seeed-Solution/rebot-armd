@@ -150,6 +150,8 @@ pub struct FakeBusState {
     /// Every transmit reports WouldBlock (stalled controller); each attempt advances the clock
     /// by `stall_step`.
     pub tx_stall: bool,
+    /// Only register writes (0x7FF, opcode 0x55) report WouldBlock (never reach the bus).
+    pub stall_reg_writes: bool,
     pub stall_step: Duration,
     /// The next `n` transmits succeed, then every transmit fails (partial batch).
     pub fail_tx_after: Option<usize>,
@@ -287,7 +289,7 @@ impl FakeBus {
     fn build(limits: &[DamiaoLimits], clock: Option<MockClock>) -> Self {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
         Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), immediate_replies: false, tx_log: Vec::new(), tx_times: Vec::new(), clock,
-            tx_lost: false, tx_error: false, tx_stall: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
+            tx_lost: false, tx_error: false, tx_stall: false, stall_reg_writes: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
             fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeBusState) -> R) -> R { f(&mut self.0.lock().unwrap()) }
@@ -305,6 +307,9 @@ impl CanTransport for FakeBus {
         let t = s.now();
         s.tx_log.push(*frame);
         s.tx_times.push(t);
+        if s.stall_reg_writes && frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
+            return Err(TransportError::WouldBlock);
+        }
         if s.tx_stall {
             if let Some(c) = &s.clock { c.advance(s.stall_step); }
             return Err(TransportError::WouldBlock);

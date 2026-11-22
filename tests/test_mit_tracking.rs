@@ -1136,3 +1136,19 @@ fn mit_trip_during_hand_back_latches_bus_loss() {
     assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
     assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::BusLoss), "{:?}", inner.safety.fault());
 }
+
+/// Review round 3, #13: a TIMEOUT write that never left the transport (WouldBlock until the
+/// retries ran out) is not reported as sent-but-unconfirmed.
+#[test]
+fn mit_timeout_write_never_sent_is_not_uncertain() {
+    let bus = FakeBus::new(&b601_limits());
+    let d = disabled_driver(&bus);
+    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.tick(0.02);
+    bus.with(|s| s.stall_reg_writes = true);
+    let e = inner.mit_timeout_command(&json!({"joints": [4, 5]})).unwrap_err();
+    let f = e.reply_fields();
+    assert_eq!((f["applied"].clone(), f["uncertain"].clone(), f["not_attempted"].clone()), (json!([]), json!([]), json!([5])), "{f:?}");
+    assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 0);
+}
