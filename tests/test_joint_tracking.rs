@@ -427,11 +427,34 @@ fn tracking_off_wire_equivalence() {
         obs: Vec<RecordedObs>,
     }
 
+    #[derive(serde::Deserialize)]
+    struct RecordedMeta {
+        source_commit: String,
+        short_commit: String,
+        command: String,
+        generator: String,
+        fixture: String,
+        frames: usize,
+        obs: usize,
+        sha256: String,
+    }
+
+    let meta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tracking_off_e4f72b6_trace.meta.json");
+    let meta_raw = std::fs::read_to_string(meta_path)
+        .unwrap_or_else(|e| panic!("failed to read e4f72b6 provenance meta {meta_path}: {e}"));
+    let meta: RecordedMeta = serde_json::from_str(&meta_raw).expect("valid e4f72b6 provenance JSON");
+    assert_eq!(meta.short_commit, "e4f72b6");
+    assert!(meta.source_commit.starts_with("e4f72b6"), "unexpected source_commit {}", meta.source_commit);
+    assert!(!meta.command.is_empty() && !meta.generator.is_empty() && !meta.fixture.is_empty());
+    assert_eq!(meta.sha256.len(), 64, "provenance sha256 must be 64 hex chars");
+
     let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tracking_off_e4f72b6_trace.json");
     let raw = std::fs::read_to_string(fixture_path)
         .unwrap_or_else(|e| panic!("failed to read e4f72b6 fixture {fixture_path}: {e}"));
     let baseline: RecordedTrace = serde_json::from_str(&raw).expect("valid e4f72b6 trace JSON");
-    assert_eq!(baseline.source_commit, "e4f72b6");
+    assert_eq!(baseline.source_commit, meta.source_commit);
+    assert_eq!(baseline.frames.len(), meta.frames);
+    assert_eq!(baseline.obs.len(), meta.obs);
 
     let check_against_baseline = |label: &str, frames: &[Vec<JointTarget>], obs: &[ArmObservation]| {
         assert_eq!(frames.len(), baseline.frames.len(), "{label}: frame count vs e4f72b6");
