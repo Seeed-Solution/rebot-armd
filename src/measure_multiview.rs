@@ -525,6 +525,24 @@ pub fn decode_frame(jpeg: &[u8], size: [f64; 2]) -> Result<Gray, String> {
     Gray::new(cw, ch, px[top * w..(top + ch) * w].to_vec()).ok_or_else(|| "snapshot crop failed".to_string())
 }
 
+/// Decode a snapshot JPEG to RGB, cropped like [`decode_frame`] (the colour the luma conversion
+/// drops, for the classical silhouette).
+pub fn decode_frame_rgb(jpeg: &[u8], size: [f64; 2]) -> Result<mview_stereo::footprint::Rgb, String> {
+    use zune_jpeg::zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    let opts = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB).set_max_width(4096).set_max_height(4096);
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), opts);
+    let px = dec.decode().map_err(|e| format!("snapshot is not a JPEG: {e:?}"))?;
+    let info = dec.info().ok_or("snapshot without a JPEG header")?;
+    let (w, h) = (usize::from(info.width), usize::from(info.height));
+    if px.len() != 3 * w * h { return Err(format!("snapshot decoded to {} bytes for {w}x{h} RGB", px.len())); }
+    let (cw, ch) = (size[0].round() as usize, size[1].round() as usize);
+    if w != cw || h < ch {
+        return Err(format!("snapshot is {w}x{h}; the camera model (grasp setup image_size_px) is {cw}x{ch}"));
+    }
+    let top = (h - ch) / 2;
+    Ok(mview_stereo::footprint::Rgb { w: cw, h: ch, px: px[3 * top * w..3 * (top + ch) * w].to_vec() })
+}
+
 /// A checked run, ready to begin.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -887,11 +905,13 @@ struct Capture {
     trigger_ms: f64,
     snapshot_wait_ms: f64,
     snapshot_polls: usize,
-    /// The snapshot (debug bundles only).
+    /// The snapshot (JPEG frame source: the classical silhouette's colour and the debug bundle).
     jpeg: Option<Vec<u8>>,
     /// ArUco markers of the trigger frame (camera model pixels); empty unless requested.
     markers: Vec<mview_stereo::Marker>,
     timing: ViewTiming,
+    /// Index of the target in `detections` (set by the run once it picked the target).
+    selected: Option<usize>,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
@@ -1071,7 +1091,7 @@ async fn capture_gray(
         frame_fetch_ms, gray_convert_ms: convert_ms, parse_ms: gray.parse_ms, shift_px, margin_px,
         joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
         retry_reasons, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms,
-        settle_s, trigger_ms, snapshot_wait_ms: 0.0, snapshot_polls: 0, jpeg: None, markers: trig.markers,
+        settle_s, trigger_ms, snapshot_wait_ms: 0.0, snapshot_polls: 0, jpeg: None, markers: trig.markers, selected: None,
         timing: ViewTiming { motion_ms: 0.0, settle_ms: settle_s * 1000.0, trigger_ms: trig_total_ms, fetch_ms: fetch_total_ms,
             capture_ms: t_cap.elapsed().as_secs_f64() * 1000.0 },
     })
@@ -1160,7 +1180,8 @@ async fn capture_snapshot(
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     rescale_markers_and_frame(plan, &mut frame, &mut marks);
     let size = plan.cam.size;
-    let keep = plan.request.debug.then(|| jpeg.clone());
+    // kept for the classical silhouette (colour) and the debug bundle
+    let keep = jpeg.clone();
     let (img, decode_ms) = tokio::task::spawn_blocking(move || { let t0 = Instant::now(); let r = decode_frame(&jpeg, size); (r, t0.elapsed().as_secs_f64() * 1000.0) }).await
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
@@ -1170,7 +1191,7 @@ async fn capture_snapshot(
         gray_convert_ms: None, parse_ms: 0.0, shift_px, margin_px, joints,
         bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
         retry_reasons, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms,
-        settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks,
+        settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: Some(keep), markers: marks, selected: None,
         timing: ViewTiming { motion_ms: 0.0, settle_ms: settle_s * 1000.0, trigger_ms: trig_total_ms, fetch_ms: fetch_total_ms,
             capture_ms: t_cap.elapsed().as_secs_f64() * 1000.0 },
     })
@@ -1190,12 +1211,17 @@ fn pick_start(req: &Request, dets: &[Detection]) -> Option<Detection> {
 /// The target in another view: same label, nearest to the start view's box centre moved by
 /// `shift` (normalised image units).
 fn pick_view(target: &Detection, min_score: f64, dets: &[Detection], shift: [f64; 2]) -> Option<Detection> {
+    pick_view_index(target, min_score, dets, shift).map(|i| dets[i].clone())
+}
+
+/// [`pick_view`] as an index into `dets`.
+fn pick_view_index(target: &Detection, min_score: f64, dets: &[Detection], shift: [f64; 2]) -> Option<usize> {
     let c0 = grasp::box_centre(&target.box_norm);
     let c0 = [c0[0] + shift[0], c0[1] + shift[1]];
-    dets.iter().filter(|d| d.score >= min_score && d.label.eq_ignore_ascii_case(&target.label))
-        .map(|d| { let c = grasp::box_centre(&d.box_norm); ((c[0] - c0[0]).hypot(c[1] - c0[1]), d) })
+    dets.iter().enumerate().filter(|(_, d)| d.score >= min_score && d.label.eq_ignore_ascii_case(&target.label))
+        .map(|(i, d)| { let c = grasp::box_centre(&d.box_norm); ((c[0] - c0[0]).hypot(c[1] - c0[1]), i) })
         .filter(|(dist, _)| *dist <= TARGET_MAX_SHIFT_NORM)
-        .min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, d)| d.clone())
+        .min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, i)| i)
 }
 
 /// Plan and run the joint-space move to the arm joints solving `goal`. The `bool` of the error
@@ -1243,7 +1269,7 @@ fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
 
 /// The `measurement` value of the action (see docs/agent_action_api.md).
 fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
-    table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, ncc_backend: &mview_stereo::BackendDiagnostics, fallbacks: &[Value], compute_ms: f64) -> Value {
+    object: Option<&ObjectResult>, table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, ncc_backend: &mview_stereo::BackendDiagnostics, fallbacks: &[Value], compute_ms: f64) -> Value {
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
     let views: Vec<Value> = caps.iter().map(|c| {
@@ -1272,15 +1298,10 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "timing": c.timing.to_json(),
         })
     }).collect();
-    let (objects, why) = match result {
-        Ok(m) => (vec![json!({
-            "label": target.label, "score": target.score,
-            "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
-            "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": r1(m.yaw_deg),
-            "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points, "top_method": m.top_method,
-            "reproj_rms_px": r2(m.reproj_rms_px), "views_used": caps.len(),
-        })], Value::Null),
-        Err(w) => (Vec::new(), json!(w)),
+    let (objects, why) = match (result, object) {
+        (Ok(_), Some(o)) => (vec![object_value(target, o, caps.len())], Value::Null),
+        (Ok(m), None) => (vec![object_value(target, &object_result(m, &Err(String::new())), caps.len())], Value::Null),
+        (Err(w), _) => (Vec::new(), json!(w)),
     };
     let mm = |v: Option<f64>| v.map_or(Value::Null, |x| json!(r2(x)));
     let mut st = serde_json::to_value(stats).unwrap_or(Value::Null);
@@ -1313,6 +1334,23 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "stats": st,
         "ncc_backend": ncc_backend,
         "compute_ms": compute_ms.round(),
+    })
+}
+
+/// One `objects` entry: the stereo height and point diagnostics (`views_used`: the stereo views),
+/// the footprint (length, width, yaw, centroid, top) and its source, views and grades.
+pub fn object_value(target: &Detection, o: &ObjectResult, views_used: usize) -> Value {
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    let m = &o.m;
+    json!({
+        "label": target.label, "score": target.score,
+        "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
+        "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": r1(m.yaw_deg),
+        "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points, "top_method": m.top_method,
+        "reproj_rms_px": r2(m.reproj_rms_px), "views_used": views_used,
+        "footprint_source": o.footprint_source, "footprint_views": o.footprint_views.len(),
+        "length_confidence": o.length_confidence, "width_confidence": o.width_confidence,
     })
 }
 
@@ -1384,7 +1422,8 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
                     cap.timing.motion_ms = motion_ms;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
-                    if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
+                    cap.selected = pick_view_index(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen));
+                    if cap.selected.is_none() {
                         return Err((fail("TARGET_LOST", format!("the {} is not detected at the view offset [{:+.3}, {:+.3}] m", target.label, c[0], c[1])), true));
                     }
                     caps.push(cap);
@@ -1412,6 +1451,124 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
     Ok(())
 }
 
+/// What one view offers for its silhouette: its detections, the target among them, whether the
+/// image pixels are known to be of the trigger's frame, and the snapshot JPEG (colour) if any.
+#[derive(Debug, Clone, Default)]
+pub struct SilInput {
+    pub detections: Vec<Detection>,
+    pub selected: Option<usize>,
+    /// The image is the trigger's frame (gray frames are fetched by frame id; a refreshed
+    /// snapshot is only known to be newer than the trigger request).
+    pub frame_verified: bool,
+    pub jpeg: Option<Vec<u8>>,
+    pub min_score: f64,
+}
+
+/// A view's silhouette or why it has none.
+#[derive(Debug, Clone)]
+pub struct ViewSilhouette {
+    pub sil: Option<mview_stereo::footprint::Silhouette>,
+    /// Why the model contour (if any) or the classical mask was not used.
+    pub rejected: Vec<String>,
+}
+
+/// The silhouette of view `view` (camera model of `size` px): the target detection's model contour
+/// when valid; else the classical colour mask in its box, from the snapshot's colour, only when
+/// the snapshot is the trigger's frame or the target is the only detection of its label (so a box
+/// from another frame cannot select another object). The gripper jaws are its occluder.
+pub fn view_silhouette(view: usize, input: &SilInput, size: [f64; 2]) -> ViewSilhouette {
+    use mview_stereo::footprint::{classical_silhouette, ClassicalParams, MaskSource, Silhouette};
+    let mut rejected = Vec::new();
+    let Some(det) = input.selected.and_then(|i| input.detections.get(i)) else {
+        return ViewSilhouette { sil: None, rejected: vec!["no_target".into()] };
+    };
+    let occluders_px = vec![gripper_region_px(size)];
+    match &det.contour_norm {
+        Some(Ok(c)) => {
+            let poly_px = c.iter().map(|q| [q[0] * size[0], q[1] * size[1]]).collect();
+            return ViewSilhouette { sil: Some(Silhouette { view, poly_px, source: MaskSource::Seg, occluders_px }), rejected };
+        }
+        Some(Err(e)) => rejected.push(format!("contour: {e}")),
+        None => {}
+    }
+    let Some(jpeg) = input.jpeg.as_deref() else {
+        rejected.push("classical: no_colour_image".into());
+        return ViewSilhouette { sil: None, rejected };
+    };
+    let same_label = input.detections.iter().filter(|d| d.score >= input.min_score && d.label.eq_ignore_ascii_case(&det.label)).count();
+    if !input.frame_verified && same_label != 1 {
+        rejected.push("classical: frame_unverified_ambiguous".into());
+        return ViewSilhouette { sil: None, rejected };
+    }
+    let b = det.box_norm;
+    let box_px = [b[0] * size[0], b[1] * size[1], b[2] * size[0], b[3] * size[1]];
+    let res = decode_frame_rgb(jpeg, size).and_then(|rgb| classical_silhouette(&rgb, box_px, &ClassicalParams::default()).map_err(str::to_string));
+    match res {
+        Ok(poly_px) => ViewSilhouette { sil: Some(Silhouette { view, poly_px, source: MaskSource::Classical, occluders_px }), rejected },
+        Err(e) => { rejected.push(format!("classical: {e}")); ViewSilhouette { sil: None, rejected } }
+    }
+}
+
+/// The silhouettes of all views ([`view_silhouette`]).
+pub fn silhouettes(inputs: &[SilInput], size: [f64; 2]) -> Vec<ViewSilhouette> {
+    inputs.iter().enumerate().map(|(k, i)| view_silhouette(k, i, size)).collect()
+}
+
+/// The measured object: the stereo measurement with the footprint (length, width, yaw, centre)
+/// from the silhouettes when they agree, else the stereo points' footprint with low grades.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjectResult {
+    pub m: mview_stereo::ObjectMeasure,
+    /// `seg_mask`, `classical_mask`, `mixed_mask` or `stereo_points`.
+    pub footprint_source: &'static str,
+    /// Views whose silhouettes were fused (empty for `stereo_points`).
+    pub footprint_views: Vec<usize>,
+    pub length_confidence: &'static str,
+    pub width_confidence: &'static str,
+    pub yaw_determinate: bool,
+}
+
+/// [`ObjectResult`] from the stereo measurement and the footprint (heights stay the stereo's).
+pub fn object_result(m: &mview_stereo::ObjectMeasure, fp: &Result<mview_stereo::footprint::Footprint, String>) -> ObjectResult {
+    match fp {
+        Ok(f) => {
+            let mut o = m.clone();
+            o.length_m = f.length_m;
+            o.width_m = f.width_m;
+            o.yaw_deg = f.yaw_deg;
+            o.centroid_m = f.centroid_m;
+            o.top_z_m = f.top_z_m;
+            ObjectResult { m: o, footprint_source: f.source, footprint_views: f.views.clone(), length_confidence: f.length_confidence.name(),
+                width_confidence: f.width_confidence.name(), yaw_determinate: f.yaw_determinate }
+        }
+        Err(_) => ObjectResult { m: m.clone(), footprint_source: "stereo_points", footprint_views: Vec::new(), length_confidence: "low", width_confidence: "low",
+            yaw_determinate: m.length_m - m.width_m >= mview_stereo::footprint::FootprintParams::default().square_ratio * m.length_m },
+    }
+}
+
+/// The `footprint` diagnostics of the measurement.
+pub fn footprint_value(sils: &[ViewSilhouette], fp: &Option<Result<mview_stereo::footprint::Footprint, String>>) -> Value {
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let views: Vec<Value> = sils.iter().map(|v| json!({
+        "source": v.sil.as_ref().map(|s| s.source.name()),
+        "n_vertices": v.sil.as_ref().map(|s| s.poly_px.len()),
+        "rejected": v.rejected,
+    })).collect();
+    let (result, why) = match fp {
+        Some(Ok(f)) => (json!({
+            "source": f.source, "views": f.views, "length_mm": r1(f.length_m * 1000.0), "width_mm": r1(f.width_m * 1000.0), "yaw_deg": r1(f.yaw_deg),
+            "yaw_determinate": f.yaw_determinate, "length_confidence": f.length_confidence.name(), "width_confidence": f.width_confidence.name(),
+            "view_spans_mm": f.view_spans_m.iter().map(|s| [r1(s[0] * 1000.0), r1(s[1] * 1000.0)]).collect::<Vec<_>>(),
+            "height_sensitivity_mm": f.height_sensitivity_m.map(|x| if x.is_finite() { json!(r1(x * 1000.0)) } else { Value::Null }),
+            "max_ray_angle_deg": r1(f.max_ray_angle_deg),
+            "rejected": f.rejected.iter().map(|(v, r)| json!({"view": v, "reason": r})).collect::<Vec<_>>(),
+        }), Value::Null),
+        Some(Err(e)) => (Value::Null, json!(e)),
+        None => (Value::Null, json!("no_stereo_height")),
+    };
+    json!({"views": views, "result": result, "why": why})
+}
+
 /// What [`compute`] returns.
 pub struct Computed {
     pub measure: Result<mview_stereo::ObjectMeasure, &'static str>,
@@ -1426,6 +1583,11 @@ pub struct Computed {
     pub object_min_h_m: f64,
     /// Active NCC backend, selection reason, and kernel call counts for this run.
     pub ncc_backend: mview_stereo::BackendDiagnostics,
+    /// Per-view silhouettes and the footprint fused from them (None: no stereo height).
+    pub silhouettes: Vec<ViewSilhouette>,
+    pub footprint: Option<Result<mview_stereo::footprint::Footprint, String>>,
+    /// The stereo measurement with the footprint applied ([`object_result`]).
+    pub object: Option<ObjectResult>,
     pub ms: f64,
 }
 
@@ -1463,6 +1625,14 @@ pub fn shared_marker_corners(markers: &[Vec<mview_stereo::Marker>], reference: u
 /// refinement (`mode`; `markers` per view, camera model pixels), then the reconstruction with
 /// the refined cameras.
 pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64, mode: PoseRefine, markers: &[Vec<mview_stereo::Marker>]) -> Computed {
+    compute_full(views, reference, ref_box_px, table_z, mode, markers, Vec::new())
+}
+
+/// [`compute`] with the views' silhouettes ([`silhouettes`]): after the stereo height, the
+/// footprint from the silhouettes with the cameras the reconstruction used and the fitted table
+/// plane (else z = table_z).
+pub fn compute_full(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64, mode: PoseRefine, markers: &[Vec<mview_stereo::Marker>],
+    sils: Vec<ViewSilhouette>) -> Computed {
     let t0 = Instant::now();
     let region_px = feature_region(ref_box_px);
     let mut p = Params::new(table_z);
@@ -1495,7 +1665,18 @@ pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: 
     }
     let measure = mview_stereo::measure(&rec.points, &pm);
     let table = mview_stereo::table_check(&rec.points, &p);
-    Computed { measure, table, rec, region_px, pose, plane, object_min_h_m: pm.object_min_h_m, ncc_backend, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+    let (footprint, object) = match &measure {
+        Ok(m) => {
+            let cams: Vec<Camera> = pose.as_ref().map(|pr| pr.cams.clone()).unwrap_or_else(|| views.iter().map(|v| v.cam).collect());
+            let plane_v = plane.as_ref().map_or([0.0, 0.0, 1.0, -table_z], |t| t.plane);
+            let list: Vec<mview_stereo::footprint::Silhouette> = sils.iter().filter_map(|v| v.sil.clone()).collect();
+            let fp = mview_stereo::footprint::footprint(&cams, &list, plane_v, m.height_m, &mview_stereo::footprint::FootprintParams::default());
+            let o = object_result(m, &fp);
+            (Some(fp), Some(o))
+        }
+        Err(_) => (None, None),
+    };
+    Computed { measure, table, rec, region_px, pose, plane, object_min_h_m: pm.object_min_h_m, ncc_backend, silhouettes: sils, footprint, object, ms: t0.elapsed().as_secs_f64() * 1000.0 }
 }
 
 /// The `table_plane` value of the measurement: the fitted plane, or null (heights from table_z).
@@ -1728,8 +1909,21 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
             "end_pose": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
             "tcp": {"xyz_m": tcp_pose.p, "r": mat_json(&tcp_pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
-            "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
+            "detections": v.detections.iter().map(|d| {
+                let mut o = json!({"label": d.label, "score": d.score, "box_norm": d.box_norm});
+                match &d.contour_norm {
+                    Some(Ok(c)) => o["contour"] = json!(c),
+                    Some(Err(e)) => o["contour_error"] = json!(e),
+                    None => {}
+                }
+                o
+            }).collect::<Vec<_>>(),
             "markers": v.markers.iter().map(|m| json!({"id": m.id, "corners": m.corners})).collect::<Vec<_>>(),
+            "selected_detection": v.selected, "trigger_frame_id": v.frame_id, "frame_verified": v.frame_source == FrameSource::Gray,
+            "content_size_px": plan.cam.size,
+            "silhouette": c.silhouettes.get(k).map_or(Value::Null, |s| json!({
+                "source": s.sil.as_ref().map(|x| x.source.name()), "contour_px": s.sil.as_ref().map(|x| &x.poly_px), "rejected": s.rejected,
+            })),
         })
     }).collect();
     let tz = plan.setup.table_z_m;
@@ -1793,7 +1987,38 @@ pub struct Bundle {
     pub markers: Vec<Vec<mview_stereo::Marker>>,
     /// The run's `pose_refine` (`auto` when the bundle does not say).
     pub pose_refine: PoseRefine,
+    /// Per view: detections (with contours), the target and the colour JPEG for the silhouettes.
+    pub sil_inputs: Vec<SilInput>,
+    /// Camera model image size (px).
+    pub size: [f64; 2],
     pub doc: Value,
+}
+
+/// A bundle view's detections (label, score, box_norm, optional contour).
+fn bundle_detections(v: &Value) -> Vec<Detection> {
+    v["detections"].as_array().map(|a| a.iter().filter_map(|d| {
+        let b: [f64; 4] = serde_json::from_value(d["box_norm"].clone()).ok()?;
+        Some(Detection {
+            label: d["label"].as_str()?.to_string(), score: d["score"].as_f64()?, raw_score_valid: true, box_norm: b,
+            angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None,
+            length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None,
+            contour_norm: d.get("contour").filter(|c| !c.is_null()).map(|c| grasp::parse_contour(c, false, [1.0, 1.0])),
+        })
+    }).collect()).unwrap_or_default()
+}
+
+/// The target of every view of a bundle without `selected_detection`: in the reference view the
+/// detection overlapping `ref_box_px` best, elsewhere the same label nearest to its box centre.
+fn derive_selection(dets: &[Vec<Detection>], reference: usize, ref_box_px: [f64; 4], size: [f64; 2], label: Option<&str>, min_score: f64) -> Vec<Option<usize>> {
+    let rb = [ref_box_px[0] / size[0], ref_box_px[1] / size[1], ref_box_px[2] / size[0], ref_box_px[3] / size[1]];
+    let Some(target) = dets.get(reference).and_then(|ds| ds.iter().filter(|d| label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)))
+        .map(|d| (grasp::iou(&d.box_norm, &rb), d)).filter(|(i, _)| *i > 0.5).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, d)| d.clone())) else {
+        return vec![None; dets.len()];
+    };
+    let c0 = grasp::box_centre(&target.box_norm);
+    dets.iter().map(|ds| ds.iter().enumerate().filter(|(_, d)| d.score >= min_score && d.label.eq_ignore_ascii_case(&target.label))
+        .map(|(i, d)| { let c = grasp::box_centre(&d.box_norm); ((c[0] - c0[0]).hypot(c[1] - c0[1]), i) })
+        .min_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, i)| i)).collect()
 }
 
 /// Read a bundle directory (v1 legacy JPEG bundles and v2 bundles with per-view `"encoding"`
@@ -1815,6 +2040,8 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
     let size = [f(&i["size"][0], "size")?, f(&i["size"][1], "size")?];
     let mut views = Vec::new();
     let mut markers = Vec::new();
+    let mut sil_inputs: Vec<SilInput> = Vec::new();
+    let min_score = doc["request"]["min_score"].as_f64().unwrap_or(0.3);
     for (k, v) in doc["views"].as_array().ok_or("bundle: views missing")?.iter().enumerate() {
         markers.push(grasp::parse_markers(&v["markers"]));
         let file = v["file"].as_str().ok_or("bundle: view file missing")?;
@@ -1834,14 +2061,26 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
         };
         let cam = Camera { r: mat(&v["camera"]["r_base_cam"], &format!("views[{k}].camera"))?, c: vec3(&v["camera"]["c_m"], &format!("views[{k}].camera"))?, fx, fy, cx, cy };
         views.push(View { cam, img });
+        let detections = bundle_detections(v);
+        let selected = v["selected_detection"].as_u64().map(|i| i as usize).filter(|i| *i < detections.len());
+        sil_inputs.push(SilInput {
+            detections, selected, frame_verified: v["frame_verified"].as_bool().unwrap_or(false),
+            jpeg: (encoding == "jpeg").then_some(bytes), min_score,
+        });
     }
     let b = &doc["ref_box_px"];
+    let reference = doc["reference"].as_u64().ok_or("bundle: reference missing")? as usize;
+    let ref_box_px = [f(&b[0], "ref_box_px")?, f(&b[1], "ref_box_px")?, f(&b[2], "ref_box_px")?, f(&b[3], "ref_box_px")?];
+    // bundles before selected_detection: derive the target of every view
+    if sil_inputs.iter().all(|s| s.selected.is_none()) {
+        let dets: Vec<Vec<Detection>> = sil_inputs.iter().map(|s| s.detections.clone()).collect();
+        for (s, sel) in sil_inputs.iter_mut().zip(derive_selection(&dets, reference, ref_box_px, size, doc["request"]["label"].as_str(), min_score)) { s.selected = sel; }
+    }
     Ok(Bundle {
-        reference: doc["reference"].as_u64().ok_or("bundle: reference missing")? as usize,
-        ref_box_px: [f(&b[0], "ref_box_px")?, f(&b[1], "ref_box_px")?, f(&b[2], "ref_box_px")?, f(&b[3], "ref_box_px")?],
+        reference, ref_box_px,
         table_z_m: f(&doc["table_z_m"], "table_z_m")?,
         pose_refine: doc["request"]["pose_refine"].as_str().and_then(PoseRefine::parse).unwrap_or(PoseRefine::Auto),
-        views, markers, doc,
+        views, markers, sil_inputs, size, doc,
     })
 }
 
@@ -1851,7 +2090,8 @@ pub fn replay_bundle(dir: &std::path::Path) -> Result<(Bundle, Computed), String
 /// [`replay_bundle`] with `pose_refine` `mode` instead of the run's.
 pub fn replay_bundle_with(dir: &std::path::Path, mode: Option<PoseRefine>) -> Result<(Bundle, Computed), String> {
     let b = read_bundle(dir)?;
-    let c = compute(&b.views, b.reference, b.ref_box_px, b.table_z_m, mode.unwrap_or(b.pose_refine), &b.markers);
+    let sils = silhouettes(&b.sil_inputs, b.size);
+    let c = compute_full(&b.views, b.reference, b.ref_box_px, b.table_z_m, mode.unwrap_or(b.pose_refine), &b.markers, sils);
     Ok((b, c))
 }
 
@@ -1899,6 +2139,15 @@ async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     move_joints(ctx, plan, "return", &q).await.map_err(|(s, _)| s)
 }
 
+/// The silhouette inputs of the captures (detections, target, colour snapshot; gray frames are
+/// fetched by the trigger's frame id).
+fn sil_inputs(caps: &[Capture], min_score: f64) -> Vec<SilInput> {
+    caps.iter().map(|c| SilInput {
+        detections: c.detections.clone(), selected: c.selected, frame_verified: c.frame_source == FrameSource::Gray,
+        jpeg: c.jpeg.clone(), min_score,
+    }).collect()
+}
+
 /// The run; Ok(Some((code, message))): a measurement failure after the views (the action fails
 /// with it, after the return to the start pose).
 async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSource>, hold: &mut Option<CameraHold>) -> Result<Option<(String, String)>, Stop> {
@@ -1943,6 +2192,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSou
     };
     timing.detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
     let mut first = first;
+    first.selected = first.detections.iter().position(|d| *d == target);
     let pivot = look_at(plan, &first.pose, &target);
     {
         let b = target.box_norm;
@@ -1970,7 +2220,8 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSou
     // reference: the view closest to the start pose; its own detection box
     let reference = (0..caps.len()).min_by(|&a, &b| dist2(&caps[a].offset, &[0.0; 2]).total_cmp(&dist2(&caps[b].offset, &[0.0; 2]))).unwrap_or(0);
     let shift = plan.cam.to_norm(caps[reference].shift_px);
-    let ref_det = pick_view(&target, plan.request.min_score, &caps[reference].detections, shift).unwrap_or_else(|| target.clone());
+    let ref_det = caps[reference].selected.and_then(|i| caps[reference].detections.get(i).cloned())
+        .or_else(|| pick_view(&target, plan.request.min_score, &caps[reference].detections, shift)).unwrap_or_else(|| target.clone());
     let b = ref_det.box_norm;
     let ref_box_px = [b[0] * plan.cam.size[0], b[1] * plan.cam.size[1], b[2] * plan.cam.size[0], b[3] * plan.cam.size[1]];
     let marks: Vec<Vec<mview_stereo::Marker>> = caps.iter().map(|c| c.markers.clone()).collect();
@@ -1987,10 +2238,13 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSou
     let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
     let table_z = plan.setup.table_z_m;
     let keep_views_for_debug = plan.request.debug && frame_source == FrameSource::Gray;
+    let sil_inputs = sil_inputs(&caps, plan.request.min_score);
+    let size = plan.cam.size;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
     let task = tokio::task::spawn_blocking(move || {
         let t0 = Instant::now();
-        let c = compute(&views, reference, ref_box_px, table_z, mode, &marks);
+        let sils = silhouettes(&sil_inputs, size);
+        let c = compute_full(&views, reference, ref_box_px, table_z, mode, &marks, sils);
         let span = (t0, Instant::now());
         let returned_views = if keep_views_for_debug { views } else { Vec::new() };
         (c, returned_views, span)
@@ -2013,7 +2267,8 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSou
         c.measure.as_ref().map(|m| m.height_m)
     );
     let in_box = box_heights(&c.rec.points, table_z);
-    let mut value = measurement_value(plan, frame_source, &caps, &ref_det, &c.measure, &c.table, &stats, &c.ncc_backend, &fallbacks, c.ms);
+    let mut value = measurement_value(plan, frame_source, &caps, &ref_det, &c.measure, c.object.as_ref(), &c.table, &stats, &c.ncc_backend, &fallbacks, c.ms);
+    value["footprint"] = footprint_value(&c.silhouettes, &c.footprint);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
     value["table_plane"] = plane_value(&c.plane);
@@ -2432,6 +2687,87 @@ mod tests {
         }
     }
 
+    fn sdet(label: &str, score: f64, b: [f64; 4], contour: Option<Result<Vec<[f64; 2]>, String>>) -> Detection {
+        Detection { label: label.into(), score, raw_score_valid: true, box_norm: b, angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false,
+            disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None,
+            contour_norm: contour }
+    }
+
+    /// A 640x640 colour snapshot (letterboxed 640x360) with a yellow ellipse on white paper.
+    fn colour_snapshot() -> Vec<u8> {
+        let (w, h) = (640usize, 640usize);
+        let mut px = vec![0u8; w * h * 3];
+        for y in 0..h { for x in 0..w {
+            let (u, v) = ((x as f64 - 200.0) / 60.0, (y as f64 - 140.0 - 120.0) / 25.0);
+            let c = if !(140..500).contains(&y) { [0, 0, 0] } else if u * u + v * v < 1.0 { [230, 200, 30] } else if (x / 16 + y / 16) % 2 == 0 { [235, 235, 230] } else { [40, 40, 45] };
+            px[3 * (y * w + x)..3 * (y * w + x) + 3].copy_from_slice(&c);
+        }}
+        let mut out = Vec::new();
+        jpeg_encoder::Encoder::new(&mut out, 92).encode(&px, w as u16, h as u16, jpeg_encoder::ColorType::Rgb).unwrap();
+        out
+    }
+
+    #[test]
+    fn view_silhouettes_prefer_the_contour_and_gate_the_classical_mask() {
+        let size = [640.0, 360.0];
+        let b = [130.0 / 640.0, 90.0 / 360.0, 270.0 / 640.0, 150.0 / 360.0];
+        let tri = vec![[0.25, 0.3], [0.4, 0.3], [0.3, 0.4]];
+        let jpeg = colour_snapshot();
+        let input = |dets: Vec<Detection>, verified: bool, jpeg: Option<Vec<u8>>| SilInput { detections: dets, selected: Some(0), frame_verified: verified, jpeg, min_score: 0.3 };
+        // a valid model contour wins (pixels of the camera model)
+        let v = view_silhouette(2, &input(vec![sdet("banana", 0.9, b, Some(Ok(tri.clone())))], false, Some(jpeg.clone())), size);
+        let s = v.sil.unwrap();
+        assert_eq!((s.view, s.source.name(), s.poly_px[0]), (2, "seg_mask", [160.0, 108.0]));
+        assert_eq!(s.occluders_px, vec![gripper_region_px(size)]);
+        // a malformed contour: that candidate only; the colour mask of the unambiguous target
+        let v = view_silhouette(0, &input(vec![sdet("banana", 0.9, b, Some(Err("contour_zero_area".into())))], false, Some(jpeg.clone())), size);
+        assert_eq!(v.sil.as_ref().map(|s| s.source.name()), Some("classical_mask"), "{:?}", v.rejected);
+        assert_eq!(v.rejected, vec!["contour: contour_zero_area".to_string()]);
+        let area = mview_stereo::footprint::polygon_area2(&v.sil.unwrap().poly_px).abs() * 0.5;
+        let want = std::f64::consts::PI * 60.0 * 25.0;
+        assert!((area - want).abs() < 0.08 * want, "{area} {want}");
+        // two detections of the label in a snapshot not verified to be the trigger's frame
+        let two = vec![sdet("banana", 0.9, b, None), sdet("banana", 0.5, [0.6, 0.2, 0.7, 0.4], None)];
+        let v = view_silhouette(0, &input(two.clone(), false, Some(jpeg.clone())), size);
+        assert!(v.sil.is_none() && v.rejected == vec!["classical: frame_unverified_ambiguous".to_string()], "{:?}", v.rejected);
+        // verified frame: allowed
+        assert!(view_silhouette(0, &input(two, true, Some(jpeg)), size).sil.is_some());
+        // gray frames have no colour; no target
+        let v = view_silhouette(0, &input(vec![sdet("banana", 0.9, b, None)], true, None), size);
+        assert_eq!(v.rejected, vec!["classical: no_colour_image".to_string()]);
+        let v = view_silhouette(0, &SilInput { selected: None, ..input(vec![], true, None) }, size);
+        assert_eq!(v.rejected, vec!["no_target".to_string()]);
+    }
+
+    #[test]
+    fn contours_parse_and_bundles_keep_them() {
+        assert_eq!(grasp::parse_contour(&json!([[0.1, 0.1], [0.2, 0.1], [0.1, 0.3]]), false, [640.0, 360.0]).unwrap().len(), 3);
+        assert_eq!(grasp::parse_contour(&json!([[64.0, 36.0], [128.0, 36.0], [64.0, 108.0]]), true, [640.0, 360.0]).unwrap()[2], [0.1, 0.3]);
+        assert_eq!(grasp::parse_contour(&json!([[0.1, 0.1], [0.2, 0.1]]), false, [1.0, 1.0]).unwrap_err(), "contour_too_few_vertices");
+        assert_eq!(grasp::parse_contour(&json!([[0.1, 0.1], [0.2], [0.1, 0.3]]), false, [1.0, 1.0]).unwrap_err(), "contour_vertex_not_a_pair");
+        assert_eq!(grasp::parse_contour(&json!([[0.1, 0.1], [0.2, 2.0], [0.1, 0.3]]), false, [1.0, 1.0]).unwrap_err(), "contour_vertex_out_of_range");
+        assert_eq!(grasp::parse_contour(&json!({"x": 1}), false, [1.0, 1.0]).unwrap_err(), "contour_not_an_array");
+        let many: Vec<[f64; 2]> = (0..129).map(|k| { let a = k as f64 * 0.0487; [0.5 + 0.2 * a.cos(), 0.5 + 0.2 * a.sin()] }).collect();
+        assert_eq!(grasp::parse_contour(&json!(many), false, [1.0, 1.0]).unwrap_err(), "contour_too_many_vertices");
+        // the perception parser: a malformed contour leaves the detection
+        let f = grasp::parse_detections(&json!([
+            {"class_name": "banana", "confidence": 0.9, "format": "xywh_center", "x": 0.5, "y": 0.5, "w": 0.2, "h": 0.2, "contour": [[0.4, 0.4], [0.6, 0.4], [0.5, 0.6]]},
+            {"class_name": "banana", "confidence": 0.8, "format": "xywh_center", "x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1, "contour": [[0.4, 0.4], "x"]},
+            {"class_name": "cup", "confidence": 0.7, "format": "xywh_center", "x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1}]), [640.0, 360.0]);
+        assert_eq!(f.len(), 3);
+        assert!(matches!(&f[0].contour_norm, Some(Ok(c)) if c.len() == 3));
+        assert!(matches!(&f[1].contour_norm, Some(Err(_))));
+        assert!(f[2].contour_norm.is_none());
+        // bundle detections and the derived selection of older bundles
+        let v = json!({"detections": [{"label": "banana", "score": 0.9, "box_norm": [0.4, 0.1, 0.6, 0.9], "contour": [[0.4, 0.1], [0.6, 0.1], [0.5, 0.9]]},
+            {"label": "remote", "score": 0.4, "box_norm": [0.3, 0.3, 0.5, 0.9]}]});
+        let d = bundle_detections(&v);
+        assert!(matches!(&d[0].contour_norm, Some(Ok(_))) && d[1].contour_norm.is_none());
+        let other = vec![sdet("remote", 0.4, [0.3, 0.3, 0.5, 0.9], None), sdet("banana", 0.8, [0.42, 0.12, 0.62, 0.92], None)];
+        let sel = derive_selection(&[d, other, vec![]], 0, [256.0, 36.0, 384.0, 324.0], [640.0, 360.0], Some("banana"), 0.3);
+        assert_eq!(sel, vec![Some(0), Some(1), None]);
+    }
+
     #[test]
     fn ncc_backend_diagnostics_reported_in_compute_measurement_and_bundle() {
         let (w, h) = (320usize, 240usize);
@@ -2533,7 +2869,7 @@ mod tests {
             snapshot_polls: 1,
             jpeg: None,
             markers: Vec::new(),
-            timing: ViewTiming { motion_ms: 1000.0, settle_ms: 2000.0, trigger_ms: 100.0, fetch_ms: 10.0, capture_ms: 150.0 },
+            selected: None, timing: ViewTiming { motion_ms: 1000.0, settle_ms: 2000.0, trigger_ms: 100.0, fetch_ms: 10.0, capture_ms: 150.0 },
         }).collect();
         let det = Detection {
             label: "box".into(),
@@ -2551,11 +2887,11 @@ mod tests {
             jaw_clear: None,
             depth_angle_deg: None,
             depth_angle_conf: None,
-            depth_width_px: None,
+            depth_width_px: None, contour_norm: None,
         };
         let mut stats = c.rec.stats;
         stats.sweep_ms = 12.346;
-        let val = measurement_value(&plan, FrameSource::Snapshot, &caps, &det, &c.measure, &c.table, &stats, &c.ncc_backend, &[], c.ms);
+        let val = measurement_value(&plan, FrameSource::Snapshot, &caps, &det, &c.measure, c.object.as_ref(), &c.table, &stats, &c.ncc_backend, &[], c.ms);
         assert_eq!(val["stats"]["ncc_backend"], json!(c.ncc_backend.backend));
         assert_eq!(val["stats"]["ncc_backend_reason"], json!(c.ncc_backend.reason));
         assert_eq!(val["stats"]["sweep_ms"], json!(12.35));

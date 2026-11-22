@@ -164,7 +164,7 @@ impl SimCamera {
             }
         }
 
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, raw_score_valid: true, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, raw_score_valid: true, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None, contour_norm: None }];
         if self.visible.load(Ordering::SeqCst) {
             if let Some(b) = self.project_box(&pose) {
                 let (mut angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
@@ -174,7 +174,7 @@ impl SimCamera {
                     angle_deg = Some(a + sign * noise);
                 }
                 let grasp_width_px = *self.width_px.lock().unwrap();
-                detections.push(Detection { label: self.label.clone(), score: 0.9, raw_score_valid: true, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus: false, disp_fg, disp_bg, depth_conf, length_px, jaw_clear, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None });
+                detections.push(Detection { label: self.label.clone(), score: 0.9, raw_score_valid: true, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus: false, disp_fg, disp_bg, depth_conf, length_px, jaw_clear, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None, contour_norm: None });
             }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;

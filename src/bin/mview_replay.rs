@@ -142,6 +142,15 @@ fn main() {
             m.height_m * 1000.0, m.top_method, m.top_z_m, m.n_points, m.n_edge_points, m.n_top_points, m.width_m * 1000.0, m.length_m * 1000.0, m.yaw_deg, m.reproj_rms_px),
         Err(w) => println!("measurement: {w}"),
     }
+    for (k, v) in c.silhouettes.iter().enumerate() {
+        println!("silhouette view {k}: {} ({} vertices) rejected {:?}", v.sil.as_ref().map_or("none", |s| s.source.name()), v.sil.as_ref().map_or(0, |s| s.poly_px.len()), v.rejected);
+    }
+    if let Some(o) = &c.object {
+        println!("footprint {} views {:?}: length {:.1} mm ({}), width {:.1} mm ({}), yaw {:.1} deg{}, centroid {:?}, height {:.1} mm",
+            o.footprint_source, o.footprint_views, o.m.length_m * 1000.0, o.length_confidence, o.m.width_m * 1000.0, o.width_confidence, o.m.yaw_deg,
+            if o.yaw_determinate { "" } else { " (indeterminate)" }, o.m.centroid_m.map(|x| (x * 1e4).round() / 1e4), o.m.height_m * 1000.0);
+    }
+    println!("footprint detail {}", armd::measure_multiview::footprint_value(&c.silhouettes, &c.footprint));
     println!("table check n {} median {:?} mm |median| {:?} mm; table plane {}", c.table.n_points, c.table.median_mm, c.table.median_abs_mm, armd::measure_multiview::plane_value(&c.plane));
     if args.iter().any(|a| a == "--points") {
         for q in c.rec.points.iter().filter(|q| q.in_box) {
@@ -192,6 +201,8 @@ fn main() {
             "points": pts,
             "stats": c.rec.stats,
             "backend": &c.ncc_backend,
+            "silhouettes": c.silhouettes.iter().map(|v| json!({"source": v.sil.as_ref().map(|s| s.source.name()), "poly_px": v.sil.as_ref().map(|s| &s.poly_px), "rejected": v.rejected})).collect::<Vec<_>>(),
+            "footprint": armd::measure_multiview::footprint_value(&c.silhouettes, &c.footprint),
         });
         #[cfg(feature = "mview-profile")]
         {

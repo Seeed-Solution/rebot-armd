@@ -30,7 +30,7 @@ const HEIGHT: f64 = 0.040;
 /// A rendered camera frame: its id (the trigger's `frame_id`), the joints it was rendered at,
 /// the un-letterboxed gray image, the JPEG, the object's box and the markers in view.
 #[derive(Clone)]
-struct Shot { id: u64, joints: Vec<f32>, img: armd::mview_stereo::Gray, jpeg: Vec<u8>, box_norm: Option<[f64; 4]>, markers: Vec<armd::mview_stereo::Marker> }
+struct Shot { id: u64, joints: Vec<f32>, img: armd::mview_stereo::Gray, jpeg: Vec<u8>, box_norm: Option<[f64; 4]>, markers: Vec<armd::mview_stereo::Marker>, contour: Vec<[f64; 2]> }
 
 struct FakeVision {
     sup: Arc<ArmSupervisor>,
@@ -89,6 +89,8 @@ struct FakeVision {
     hold_clients: Mutex<Vec<String>>,
     /// Called at the start of every trigger (JPEG and gray).
     on_trigger: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Detections carry the box's image outline as a segmentation contour.
+    contours: AtomicBool,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -130,6 +132,7 @@ impl FakeVision {
         let b = render::box_px(&self.scene, &self.scene.boxes[0], &cam);
         let inside = b[0] > 0.0 && b[1] > 0.0 && b[2] < w as f64 && b[3] < h as f64;
         let box_norm = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
+        let contour: Vec<[f64; 2]> = render::box_hull_px(&self.scene, &self.scene.boxes[0], &cam).iter().map(|q| [q[0] / w as f64, q[1] / h as f64]).collect();
         let markers = self.markers.lock().unwrap().iter().filter_map(|(id, c)| {
             let mut corners = [[0.0; 2]; 4];
             for (k, x) in c.iter().enumerate() {
@@ -145,7 +148,7 @@ impl FakeVision {
         {
             c.lock().unwrap().paused += paused.elapsed();
         }
-        Shot { id, joints: q, img, jpeg, box_norm, markers }
+        Shot { id, joints: q, img, jpeg, box_norm, markers, contour }
     }
 
     /// A trigger: a new frame at the current joints, which also becomes the snapshot.
@@ -169,7 +172,12 @@ impl FakeVision {
         let shot = self.render(self.frame.fetch_add(1, Ordering::SeqCst) + 1, None).await;
         let away = START.iter().zip(&shot.joints).any(|(a, b)| (a - b).abs() > 1e-3);
         let hidden = self.hide_after_start.load(Ordering::SeqCst) && away;
-        let detections = shot.box_norm.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
+        let with_contour = self.contours.load(Ordering::SeqCst);
+        let detections = shot.box_norm.filter(|_| !hidden).map(|b| {
+            let mut d = det("box", 0.9, b);
+            if with_contour { d.contour_norm = Some(Ok(shot.contour.clone())); }
+            vec![d]
+        }).unwrap_or_default();
         let (frame_id, markers) = (shot.id, shot.markers.clone());
         let ran_gray = pipelines.contains(&"gray") && self.gray.load(Ordering::SeqCst);
         if ran_gray {
@@ -189,7 +197,7 @@ fn det(label: &str, score: f64, b: [f64; 4]) -> Detection {
     Detection {
         label: label.into(), score, raw_score_valid: true, box_norm: b, angle_deg: None, angle_conf: None, grasp_width_px: None,
         mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None,
-        depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None,
+        depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None, contour_norm: None,
     }
 }
 
@@ -362,7 +370,8 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
         gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
         hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false),
-        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None) });
+        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None),
+        contours: AtomicBool::new(false) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -440,6 +449,9 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     assert!((h - HEIGHT).abs() < 0.003, "height {h}");
     assert!((o["top_z_m"].as_f64().unwrap() - h - m["table_z_m"].as_f64().unwrap()).abs() < 1e-3);
     assert!(o["n_points"].as_u64().unwrap() >= 20 && m["table_check"]["n_points"].as_u64().unwrap() >= 10, "{m}");
+    // no model contour: a colour mask of the grey render, else the stereo points
+    assert!(["classical_mask", "stereo_points"].contains(&o["footprint_source"].as_str().unwrap()), "{o}");
+    assert!(o["length_confidence"].is_string() && o["width_confidence"].is_string() && o["footprint_views"].is_u64(), "{o}");
     assert!((m["baseline_m"].as_f64().unwrap() - 0.08).abs() < 1e-6);
     assert!(r.at_start().await, "returned to the start joints");
     // per view: the snapshot before the trigger, then at least one after it
@@ -448,6 +460,33 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
         assert!(v["trigger_ms"].is_number() && v["snapshot_wait_ms"].is_number() && v["snapshot_polls"].as_u64() == Some(0), "{v}");
     }
     check_timing(m, 0.0, 0.0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn segmentation_contours_give_the_footprint_and_keep_the_height() {
+    // the 50 x 30 mm box, yaw 0.3 rad, 40 mm high; the detections carry its image outline
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.contours.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "views": 5, "motion": "translate", "axes": "xy"})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = r.wait(ack["action_id"].as_u64().unwrap(), 180.0).await;
+    let m = &a["measurement"];
+    assert_eq!(a["state"].as_str(), Some("done"), "{a}");
+    let o = &m["objects"][0];
+    println!("{}\n{}", o, m["footprint"]);
+    assert_eq!((o["footprint_source"].as_str(), o["footprint_views"].as_u64(), o["views_used"].as_u64()), (Some("seg_mask"), Some(5), Some(5)), "{o}");
+    let look = geometry(&ArmConfig::rebot_dm()).2;
+    // the top rim projected to mid height: up to h/2 tan(ray angle) outside the box per side
+    let sens = &m["footprint"]["result"]["height_sensitivity_mm"];
+    let (sl, sw) = (sens[0].as_f64().unwrap() / 1000.0, sens[1].as_f64().unwrap() / 1000.0);
+    let (l, w) = (o["length_m"].as_f64().unwrap(), o["width_m"].as_f64().unwrap());
+    assert!(l > 0.048 && l - 0.05 < 0.003 + sl && w > 0.028 && w - 0.03 < 0.003 + sw, "{o} {sens}");
+    let c = &o["centroid_m"];
+    assert!((c[0].as_f64().unwrap() - look[0]).abs() < 0.003 && (c[1].as_f64().unwrap() - look[1]).abs() < 0.003, "{o} {look:?}");
+    let dy = (o["yaw_deg"].as_f64().unwrap() - 0.3f64.to_degrees() + 90.0).rem_euclid(180.0) - 90.0;
+    assert!(dy.abs() < 5.0, "{o}");
+    let h = o["height_m"].as_f64().unwrap();
+    assert!((h - HEIGHT).abs() < 0.003, "height {h}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1377,7 +1416,7 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
         gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
         hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false),
-        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None) });
+        hold_restart_after: AtomicU64::new(0), release_args: Mutex::new(Vec::new()), hold_clients: Mutex::new(Vec::new()), on_trigger: Mutex::new(None), contours: AtomicBool::new(false) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

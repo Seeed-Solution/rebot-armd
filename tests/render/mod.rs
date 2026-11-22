@@ -187,6 +187,23 @@ pub fn box_px(scene: &Scene, b: &BoxObj, cam: &Camera) -> [f64; 4] {
     r
 }
 
+/// Image outline of a box: the convex hull of its 8 projected corners (px; empty when a corner is
+/// behind the camera).
+pub fn box_hull_px(scene: &Scene, b: &BoxObj, cam: &Camera) -> Vec<[f64; 2]> {
+    let (c, s) = (b.yaw.cos(), b.yaw.sin());
+    let mut pts = Vec::new();
+    for i in 0..8 {
+        let u = if i & 1 == 0 { -0.5 } else { 0.5 } * b.size[0];
+        let v = if i & 2 == 0 { -0.5 } else { 0.5 } * b.size[1];
+        let z = if i & 4 == 0 { 0.0 } else { b.size[2] };
+        match cam.project(&[b.xy[0] + u * c - v * s, b.xy[1] + u * s + v * c, scene.table_z + z]) {
+            Some(q) => pts.push(q),
+            None => return Vec::new(),
+        }
+    }
+    armd::mview_stereo::footprint::convex_hull(&pts)
+}
+
 /// `cam` moved by `offset` = [x, y] (m) along its own image x and y axes, orientation kept.
 pub fn translate(cam: &Camera, offset: [f64; 2]) -> Camera {
     let (x, y) = (kinematics::column(&cam.r, 0), kinematics::column(&cam.r, 1));

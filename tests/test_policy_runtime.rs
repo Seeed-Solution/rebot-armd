@@ -3045,7 +3045,7 @@ mod phase2_vision {
             jaw_clear: None,
             depth_angle_deg: None,
             depth_angle_conf: None,
-            depth_width_px: None,
+            depth_width_px: None, contour_norm: None,
         }
     }
 

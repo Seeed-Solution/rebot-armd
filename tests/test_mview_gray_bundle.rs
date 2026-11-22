@@ -70,7 +70,7 @@ impl DetectionSource for GrayOnlyVision {
                 label: "box".into(), score: 0.9, raw_score_valid: true, box_norm: b,
                 angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false,
                 disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None,
-                depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None,
+                depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None, contour_norm: None,
             }]).unwrap_or_default();
             {
                 let mut ring = self.ring.lock().unwrap();
