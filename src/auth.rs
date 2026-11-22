@@ -207,7 +207,7 @@ pub fn validate_origin_headers_with_allowed(
         let shadows_public = origin.host == pub_origin.host
             && (origin.port == pub_origin.port
                 || (origin.port == 80 && pub_origin.port == 443));
-        if allowed_origins.iter().any(|allowed| *allowed == origin)
+        if allowed_origins.contains(&origin)
             && !(shadows_public && origin.scheme != pub_origin.scheme)
         {
             return true;
@@ -220,7 +220,7 @@ pub fn validate_origin_headers_with_allowed(
             && !shadows_public;
     }
 
-    if allowed_origins.iter().any(|allowed| *allowed == origin) {
+    if allowed_origins.contains(&origin) {
         return true;
     }
 
