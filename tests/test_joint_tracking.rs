@@ -3032,7 +3032,7 @@ fn tracking_rejection_fallback_validates_dynamics_and_ramps() {
     let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
     assert!(
         inner
-            .validate_fallback_hold_with_dynamics(Some(&prev), Some(&vec![0.0; 7]), &q0, DT, &limits, true, &mut budget)
+            .validate_fallback_hold_with_dynamics(Some(&prev), Some(&[0.0; 7]), &q0, DT, &limits, true, &mut budget)
             .is_none(),
         "direct fallback validation must reject -1.5 rad/s jump from prev_confirmed to q_m"
     );
