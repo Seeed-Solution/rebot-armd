@@ -1125,34 +1125,78 @@ pub fn load_builtin_tool(id: &str) -> Option<(ToolManifest, String)> {
     load_builtin_tool_in_roots(id, &search_builtin_roots())
 }
 
-pub fn get_base_robot_xml() -> String {
-    if let Ok(path) = std::env::var("ARMD_SANDBOX_BASE_XML") {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            return content;
-        }
-    }
-    if let Ok(content) = std::fs::read_to_string("./sim/mujoco/models/rebot_b601dm_scene.xml") {
-        return content;
-    }
-    FALLBACK_BASE_XML.to_string()
+struct ResolvedBaseRobotXml {
+    xml: String,
+    watch_paths: Vec<PathBuf>,
 }
 
-/// Select the base MuJoCo robot XML for the specified canonical robot ID.
-/// Refuses to silently fall back to B601 XML for any non-B601 robot.
-pub fn get_base_robot_xml_for_robot(robot: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    match normalize_robot_id(robot).as_deref() {
-        Some("b601dm") => Ok(get_base_robot_xml()),
-        Some("so-arm101") => {
-            if let Ok(path) = std::env::var("ARMD_SANDBOX_SO_ARM101_BASE_XML") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    return Ok(content);
-                }
-            }
-            if let Ok(content) = std::fs::read_to_string("./sim/mujoco/models/so_arm101_scene.xml") {
-                return Ok(content);
-            }
-            Ok(SO_ARM101_BASE_XML.to_string())
+fn push_watch_path_with_canonical(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    candidate: PathBuf,
+) {
+    if seen.insert(candidate.clone()) {
+        paths.push(candidate.clone());
+    }
+    if let Ok(canon) = std::fs::canonicalize(&candidate) {
+        if seen.insert(canon.clone()) {
+            paths.push(canon);
         }
+    }
+}
+
+fn resolve_base_robot_xml_from_candidates(
+    env_var: &str,
+    default_rel_path: &str,
+    fallback: &str,
+) -> ResolvedBaseRobotXml {
+    let mut watch_paths = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(path) = std::env::var(env_var) {
+        let env_path = PathBuf::from(&path);
+        push_watch_path_with_canonical(&mut watch_paths, &mut seen, env_path.clone());
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            return ResolvedBaseRobotXml {
+                xml: content,
+                watch_paths,
+            };
+        }
+    }
+
+    let rel_path = PathBuf::from(default_rel_path);
+    push_watch_path_with_canonical(&mut watch_paths, &mut seen, rel_path.clone());
+    if let Ok(content) = std::fs::read_to_string(&rel_path) {
+        return ResolvedBaseRobotXml {
+            xml: content,
+            watch_paths,
+        };
+    }
+
+    ResolvedBaseRobotXml {
+        xml: fallback.to_string(),
+        watch_paths,
+    }
+}
+
+fn resolve_base_robot_xml_b601dm() -> ResolvedBaseRobotXml {
+    resolve_base_robot_xml_from_candidates(
+        "ARMD_SANDBOX_BASE_XML",
+        "./sim/mujoco/models/rebot_b601dm_scene.xml",
+        FALLBACK_BASE_XML,
+    )
+}
+
+fn resolve_base_robot_xml_for_robot(
+    robot: &str,
+) -> Result<ResolvedBaseRobotXml, (StatusCode, Json<serde_json::Value>)> {
+    match normalize_robot_id(robot).as_deref() {
+        Some("b601dm") => Ok(resolve_base_robot_xml_b601dm()),
+        Some("so-arm101") => Ok(resolve_base_robot_xml_from_candidates(
+            "ARMD_SANDBOX_SO_ARM101_BASE_XML",
+            "./sim/mujoco/models/so_arm101_scene.xml",
+            SO_ARM101_BASE_XML,
+        )),
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1162,6 +1206,16 @@ pub fn get_base_robot_xml_for_robot(robot: &str) -> Result<String, (StatusCode, 
             })),
         )),
     }
+}
+
+pub fn get_base_robot_xml() -> String {
+    resolve_base_robot_xml_b601dm().xml
+}
+
+/// Select the base MuJoCo robot XML for the specified canonical robot ID.
+/// Refuses to silently fall back to B601 XML for any non-B601 robot.
+pub fn get_base_robot_xml_for_robot(robot: &str) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    resolve_base_robot_xml_for_robot(robot).map(|r| r.xml)
 }
 
 // ---------------------------------------------------------------------------
@@ -2209,6 +2263,7 @@ impl SandboxState {
         tool_id: &str,
         policy_id: Option<&str>,
         base_xml: &str,
+        base_xml_watch_paths: &[PathBuf],
     ) -> PackStatFingerprint {
         let mut roots = Vec::new();
         let mut absent_watch_dirs = Vec::new();
@@ -2250,7 +2305,17 @@ impl SandboxState {
             }
         }
 
-        let extra_watch_paths = collect_base_mesh_watch_paths(base_xml);
+        let mut extra_watch_paths = Vec::new();
+        let mut seen_extra = HashSet::new();
+        for p in base_xml_watch_paths
+            .iter()
+            .cloned()
+            .chain(collect_base_mesh_watch_paths(base_xml))
+        {
+            if seen_extra.insert(p.clone()) {
+                extra_watch_paths.push(p);
+            }
+        }
         PackStatFingerprint::collect(roots, absent_watch_dirs, extra_watch_paths)
     }
 }
@@ -4289,12 +4354,14 @@ fn build_bundle_from_disk(
     state
         .peak_concurrent_rebuilds
         .fetch_max(active_now, Ordering::SeqCst);
-    let base_xml = get_base_robot_xml_for_robot(running_robot)?;
+    let resolved_base = resolve_base_robot_xml_for_robot(running_robot)?;
+    let base_xml = resolved_base.xml;
     let pre_fp = state.collect_pack_pre_fingerprint(
         &current.active_scene,
         &current.active_tool,
         current.active_policy.as_deref(),
         &base_xml,
+        &resolved_base.watch_paths,
     );
     let delay_ms = state.bundle_rebuild_delay_ms.load(Ordering::Relaxed);
     if delay_ms > 0 {
@@ -5187,12 +5254,14 @@ pub async fn activate(
         ),
     };
 
-    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
+    let resolved_base = resolve_base_robot_xml_for_robot(&running_robot)?;
+    let base_xml = resolved_base.xml;
     let pre_fp = state.collect_pack_pre_fingerprint(
         &scene_id,
         &tool_id,
         policy_id.as_deref(),
         &base_xml,
+        &resolved_base.watch_paths,
     );
 
     let ResolvedPack {
@@ -7736,6 +7805,39 @@ mod tests {
         assert!(
             !fp2.matches_disk(),
             "creating a previously missing extra_file must invalidate fingerprint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pack_stat_fingerprint_watches_symlink_and_canonical_target_for_base_xml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let target_xml = tmp.path().join("target_base.xml");
+        let link_xml = tmp.path().join("link_base.xml");
+        std::fs::write(&target_xml, b"<mujoco><worldbody/></mujoco>").unwrap();
+        std::os::unix::fs::symlink(&target_xml, &link_xml).unwrap();
+
+        let mut watch_paths = Vec::new();
+        let mut seen = HashSet::new();
+        push_watch_path_with_canonical(&mut watch_paths, &mut seen, link_xml.clone());
+        assert_eq!(watch_paths.len(), 2);
+        assert!(watch_paths.contains(&link_xml));
+        assert!(watch_paths.contains(&target_xml.canonicalize().unwrap()));
+
+        let fp = PackStatFingerprint::collect(vec![pack_dir], Vec::new(), watch_paths);
+        assert!(fp.matches_disk());
+
+        std::thread::sleep(Duration::from_millis(5));
+        std::fs::write(
+            &target_xml,
+            b"<mujoco><worldbody><site name=\"edited\"/></worldbody></mujoco>",
+        )
+        .unwrap();
+        assert!(
+            !fp.matches_disk(),
+            "editing canonical symlink target must invalidate fingerprint"
         );
     }
 }
