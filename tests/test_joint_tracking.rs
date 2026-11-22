@@ -3387,7 +3387,7 @@ fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
         cfg.lease_timeout_ms = 600_000;
         cfg.workspace = None;
         cfg.joint_tracking = Some(lead_config(true, 0.68));
-        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         let mut prev_q = q0.to_vec();
         prev_q[0] = 0.020;
         let mut prev_v = vec![0.0; 7];
@@ -3411,6 +3411,27 @@ fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
             res.is_err(),
             "torque-hold clamp violating max_acceleration must be rejected, got {res:?}"
         );
+
+        // Review 3 B3: through the supervisor, the rejection fallback must enforce the
+        // torque-hold direction like the primary ramp: J1 never advances past the last issued
+        // output or the hold position in the push direction. Here no step satisfies both
+        // the hold and a_max, so no frame is sent and the fault hold repeats 0.020.
+        inner.config.torque_guard = None; // keep the hand-set hold in force across ticks
+        let idx0 = drv.with(|s| s.written.len());
+        let obs = inner.tick(DT);
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "rejected torque-hold ramp must fault: {:?}", obs.safety_state);
+        for _ in 0..5 {
+            inner.tick(DT);
+        }
+        let frames = drv.with(|s| s.written[idx0..].to_vec());
+        assert!(!frames.is_empty(), "fault hold keeps writing frames");
+        for (k, f) in frames.iter().enumerate() {
+            assert!(
+                f[0].position <= 0.020 + 1e-6,
+                "fallback frame {k} advances J1 into the torque hold: {} > 0.020",
+                f[0].position
+            );
+        }
     }
 }
 

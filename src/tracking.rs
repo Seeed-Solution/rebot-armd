@@ -1078,6 +1078,20 @@ impl crate::supervisor::SupervisorInner {
             if !feasible {
                 continue;
             }
+            // Torque hold: exactly the primary ramp's rule (`compute_lead_ramp_out`): never
+            // advance the held joint past the last issued output or the hold position in the
+            // push direction; the dynamics check below rejects a clamp beyond a_max.
+            if let Some(h) = self.torque_guard.hold {
+                let j = h.joint;
+                if arm_indices.contains(&j) {
+                    if (q_c[j] - pq[j]) * h.sign > 1e-6 {
+                        q_c[j] = pq[j];
+                    }
+                    if (pq[j] - h.hold_q) * h.sign <= 1e-6 && (q_c[j] - h.hold_q) * h.sign > 1e-5 {
+                        q_c[j] = h.hold_q;
+                    }
+                }
+            }
             if let Err(e) = Self::fallback_dynamics_ok(&arm_indices, pq, prev_v, &q_c, dt, active_limits) {
                 last_err = e;
                 continue;
