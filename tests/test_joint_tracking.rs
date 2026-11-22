@@ -2948,11 +2948,11 @@ fn tracking_rejection_fallback_shares_per_tick_sweep_budget() {
     let mut q_hold = q0.to_vec();
     q_hold[0] += 1.5;
     assert!(
-        !inner.validate_fallback_hold_with_budget(Some(&q0), &q_hold, true, &mut zero_budget),
+        !inner.validate_fallback_hold_with_budget(None, &q_hold, true, &mut zero_budget),
         "fallback must NOT allocate a fresh sweep budget when remaining tick budget is 0"
     );
     let mut shared_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-    assert!(inner.validate_fallback_hold_with_budget(Some(&q0), &q_hold, true, &mut shared_budget));
+    assert!(inner.validate_fallback_hold_with_budget(None, &q_hold, true, &mut shared_budget));
     assert!(shared_budget < MAX_KEEPOUT_EVALS_PER_TICK, "fallback sweep must debit the shared budget");
 
     // Trigger a live workspace rejection on a tick and assert total evals across primary + fallback
@@ -2971,5 +2971,67 @@ fn tracking_rejection_fallback_shares_per_tick_sweep_budget() {
         "combined primary + fallback sweep evals {} exceeded budget {}",
         inner.tracking.last_tick_sweep_evals,
         MAX_KEEPOUT_EVALS_PER_TICK
+    );
+}
+
+/// Review 2 B2: Rejection fallback must validate issued->hold velocity and acceleration;
+/// when a 1-tick jump to measured hold exceeds dynamics limits, it ramps smoothly within limits.
+#[test]
+fn tracking_rejection_fallback_validates_dynamics_and_ramps() {
+    use armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.workspace = None;
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+
+    // Simulate prev_confirmed 0.030 rad ahead of measured q0 (1.5 rad/s > 0.45 rad/s limit!).
+    let mut prev = q0.to_vec();
+    prev[0] = 0.030;
+    inner.tracking.record_issued(prev.clone(), vec![0.0; 7]);
+
+    // 1. Direct fallback validation MUST reject the 1-tick 1.5 rad/s jump to q0.
+    let limits = inner.active_tracking_limits(DT, 1.0);
+    let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+    assert!(
+        inner
+            .validate_fallback_hold_with_dynamics(Some(&prev), Some(&vec![0.0; 7]), &q0, DT, &limits, true, &mut budget)
+            .is_none(),
+        "direct fallback validation must reject -1.5 rad/s jump from prev_confirmed to q_m"
+    );
+
+    // 2. Live tracking rejection: install a nominal trajectory at q0 while prev_confirmed
+    //    is at 0.030 rad so tracking rejects the -1.5 rad/s jump to q0; fallback must NOT
+    //    jump straight to q0 in 1 tick and must ramp smoothly within velocity/accel limits.
+    let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &q0, &[0.0; 7], Some(0.2), &inner.config.limits).unwrap();
+    let _ = inner.safety.mark_motion_started();
+    inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+    let idx_before = drv.with(|s| s.written.len());
+    let obs = inner.tick(DT);
+    assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
+    assert!(
+        obs.fault.as_ref().is_some_and(|f| f.message.contains("Joint tracking output rejected")),
+        "expected tracking rejection fault, got {:?}",
+        obs.fault
+    );
+    let fb_frame = drv.with(|s| s.written[idx_before].clone());
+    let step_v = ((fb_frame[0].position - prev[0]) as f64 / DT).abs();
+    let max_v = limits[0].max_velocity as f64;
+    let max_a = limits[0].max_acceleration as f64;
+    let step_a = (step_v / DT).abs();
+    assert!(
+        step_v <= max_v + 1e-2 && step_a <= max_a + 1e-1,
+        "fallback ramp exceeded dynamics limits: prev={} -> fb={} (v={step_v:.3}/{max_v:.3}, a={step_a:.3}/{max_a:.3})",
+        prev[0],
+        fb_frame[0].position
+    );
+    assert!(
+        fb_frame[0].position < prev[0] - 1e-4 && fb_frame[0].position > q0[0] + 1e-3,
+        "fallback should step partway from prev ({}) toward q0 ({}), got {}",
+        prev[0],
+        q0[0],
+        fb_frame[0].position
     );
 }

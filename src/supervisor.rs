@@ -5415,6 +5415,7 @@ impl SupervisorInner {
                             tick_output_rejected = true;
                             let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
                             let prev_confirmed = self.tracking.last_issued_positions.clone();
+                            let prev_velocities = self.tracking.last_issued_velocities.clone();
                             let prev_ws_min_depths = self.tracking.ws_min_depths.clone();
                             let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
                                 && self.measured_positions.len() == self.config.dof
@@ -5447,41 +5448,36 @@ impl SupervisorInner {
                             }
 
                             // B2: explicit validated fallback for fresh vs stale feedback.
-                            // Never transmit an unvalidated measured hold (keep-out between
-                            // prev_confirmed and q_m) or a hold synthesized from stale feedback.
+                            // Checks position, issued->hold dynamics (velocity/acceleration),
+                            // and swept workspace using the shared per-tick sweep budget;
+                            // ramps smoothly toward the hold if one-tick step exceeds limits,
+                            // or preserves `prev_confirmed` if blocked/stale.
                             let candidate_hold = self.commanded_positions.clone();
-                            let fallback_target: Option<(Vec<f32>, Option<(u64, crate::kinematics::SlotBuf)>)> =
-                                if fresh_meas
-                                    && self.validate_fallback_hold_with_budget(
-                                        prev_confirmed.as_deref(),
-                                        &candidate_hold,
-                                        fresh_meas,
-                                        &mut tick_sweep_budget,
-                                    )
-                                {
-                                    Some((candidate_hold, None))
-                                } else if let Some(mut preserved) = prev_confirmed {
-                                    if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) {
-                                        if preserved.len() > g {
-                                            preserved[g] = c;
-                                        }
-                                    }
-                                    self.commanded_positions = preserved.clone();
-                                    self.target_positions = preserved.clone();
-                                    self.commanded_velocities.fill(0.0);
-                                    self.commanded_accelerations.fill(0.0);
-                                    Some((preserved, prev_ws_min_depths))
-                                } else {
-                                    None
-                                };
+                            let fallback = self.resolve_rejection_fallback(
+                                prev_confirmed.as_deref(),
+                                prev_velocities.as_deref(),
+                                prev_ws_min_depths.as_ref(),
+                                &candidate_hold,
+                                grip_cmd,
+                                servo_dt,
+                                &active_limits,
+                                fresh_meas,
+                                &mut tick_sweep_budget,
+                            );
 
-                            if let Some((hold_pos, ws_keep)) = fallback_target {
-                                let targets: Vec<JointTarget> = hold_pos
+                            if let Some(fb) = fallback {
+                                self.commanded_positions = fb.positions.clone();
+                                self.target_positions = fb.positions.clone();
+                                self.commanded_velocities = fb.velocities.clone();
+                                self.commanded_accelerations.fill(0.0);
+                                let targets: Vec<JointTarget> = fb
+                                    .positions
                                     .iter()
+                                    .zip(fb.velocities.iter())
                                     .enumerate()
-                                    .map(|(i, &p)| JointTarget {
+                                    .map(|(i, (&p, &v))| JointTarget {
                                         position: p,
-                                        velocity: Some(0.0),
+                                        velocity: Some(v),
                                         torque: if gravity_output_enabled {
                                             self.gravity_torques_ramped.get(i).copied()
                                         } else {
@@ -5498,9 +5494,9 @@ impl SupervisorInner {
                                     .map(|mut driver| driver.write_joint_targets(&targets));
                                 match write_res {
                                     Some(Ok(())) => self.tracking.record_issued_with_ws(
-                                        hold_pos,
-                                        vec![0.0; self.config.dof],
-                                        ws_keep,
+                                        fb.positions,
+                                        fb.velocities,
+                                        fb.ws_min_depths,
                                     ),
                                     Some(Err(e)) => {
                                         self.tracking.invalidate();

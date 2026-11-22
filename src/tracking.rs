@@ -299,6 +299,15 @@ pub enum TrackingReject {
     JointLimit(String),
 }
 
+/// Validated physical output for a rejection fallback hold or bounded ramp step.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct ValidatedFallback {
+    pub positions: Vec<f32>,
+    pub velocities: Vec<f32>,
+    pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+}
+
 /// Validated physical output for the current control tick.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
@@ -821,6 +830,200 @@ impl crate::supervisor::SupervisorInner {
     /// Explicitly validate a proposed fallback hold pose `q_hold` against fresh feedback,
     /// joint position limits, and swept workspace/keep-out constraints from both
     /// `prev_confirmed` and `q_m`. Returns false when feedback is stale or any sweep fails.
+    /// Explicitly validate a proposed fallback hold pose `q_hold` against fresh feedback,
+    /// joint position limits, dynamics (velocity & acceleration from `prev_confirmed`),
+    /// and swept workspace/keep-out constraints from both `prev_confirmed` and `q_m`.
+    /// Returns `Some(updated_ws_min_depths)` when valid, or `None` otherwise.
+    pub fn validate_fallback_hold_with_dynamics(
+        &self,
+        prev_confirmed: Option<&[f32]>,
+        prev_velocities: Option<&[f32]>,
+        q_hold: &[f32],
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+        fresh_meas: bool,
+        budget: &mut usize,
+    ) -> Option<Option<(u64, crate::kinematics::SlotBuf)>> {
+        use crate::chain::WorkspaceEvaluator;
+        use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+
+        let dof = self.config.dof;
+        if !fresh_meas
+            || !dt.is_finite()
+            || dt <= 0.0
+            || active_limits.len() != dof
+            || q_hold.len() != dof
+            || !q_hold.iter().all(|q| q.is_finite())
+        {
+            return None;
+        }
+        let arm_indices = self.config.arm_joint_indices();
+        let prev_q = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite()));
+        let prev_v = prev_velocities.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite()));
+        for &j in &arm_indices {
+            let lim = &active_limits[j];
+            if q_hold[j] < lim.min_position - 1e-5 || q_hold[j] > lim.max_position + 1e-5 {
+                return None;
+            }
+            if let Some(pq) = prev_q {
+                let v_cand = (f64::from(q_hold[j]) - f64::from(pq[j])) / dt;
+                let v_prev_j = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
+                let a_cand = (v_cand - v_prev_j) / dt;
+                if !v_cand.is_finite()
+                    || v_cand.abs() > f64::from(lim.max_velocity) + 1e-4
+                    || !a_cand.is_finite()
+                    || a_cand.abs() > f64::from(lim.max_acceleration) + 1e-3
+                {
+                    return None;
+                }
+            }
+        }
+        let mut committed_ws = None;
+        if let Some((ws, cam)) = self.workspace_policy() {
+            let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+            if let Some(pq) = prev_q {
+                let mut c_prev = eval.alloc_buf();
+                eval.eval_into(pq, &mut c_prev, "tracking_fallback").ok()?;
+                let mut min_d = match &self.tracking.ws_min_depths {
+                    Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => {
+                        md.clone()
+                    }
+                    _ => eval.init_min_depths(&c_prev),
+                };
+                eval.sweep_linear_step(
+                    pq,
+                    q_hold,
+                    &c_prev,
+                    &mut min_d,
+                    budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_fallback",
+                    "tracking_fallback",
+                )
+                .ok()?;
+                committed_ws = Some((self.workspace_revision, min_d));
+            }
+            let mut c_meas = eval.alloc_buf();
+            eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback").ok()?;
+            let mut min_d_meas = eval.init_min_depths(&c_meas);
+            eval.sweep_linear_step(
+                &self.measured_positions,
+                q_hold,
+                &c_meas,
+                &mut min_d_meas,
+                budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                "tracking_fallback",
+                "tracking_fallback",
+            )
+            .ok()?;
+            if committed_ws.is_none() {
+                committed_ws = Some((self.workspace_revision, min_d_meas));
+            }
+        }
+        Some(committed_ws)
+    }
+
+    /// Resolve a rejection fallback response using a single shared sweep `budget`:
+    /// 1. Accept `q_hold` directly if fresh, within dynamics limits from `prev_confirmed`,
+    ///    and workspace-safe.
+    /// 2. Otherwise, if fresh and `prev_confirmed` is available, compute one bounded ramp
+    ///    step from `prev_confirmed` toward `q_hold` within `active_limits` and validate it.
+    /// 3. Otherwise, preserve `prev_confirmed` (keeping gripper command and prior escape depths).
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_rejection_fallback(
+        &self,
+        prev_confirmed: Option<&[f32]>,
+        prev_velocities: Option<&[f32]>,
+        prev_ws_min_depths: Option<&(u64, crate::kinematics::SlotBuf)>,
+        q_hold: &[f32],
+        grip_cmd: Option<f32>,
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+        fresh_meas: bool,
+        budget: &mut usize,
+    ) -> Option<ValidatedFallback> {
+        let dof = self.config.dof;
+        let prev_q = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite()));
+        let prev_v = prev_velocities.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite()));
+
+        // 1. Direct validated hold (position + dynamics + swept workspace).
+        if let Some(ws_depths) = self.validate_fallback_hold_with_dynamics(
+            prev_q,
+            prev_v,
+            q_hold,
+            dt,
+            active_limits,
+            fresh_meas,
+            budget,
+        ) {
+            let v_out: Vec<f32> = if let Some(pq) = prev_q {
+                (0..dof)
+                    .map(|i| ((f64::from(q_hold[i]) - f64::from(pq[i])) / dt) as f32)
+                    .collect()
+            } else {
+                vec![0.0; dof]
+            };
+            return Some(ValidatedFallback {
+                positions: q_hold.to_vec(),
+                velocities: v_out,
+                ws_min_depths: ws_depths,
+            });
+        }
+
+        // 2. Bounded ramp step from `prev_confirmed` toward `q_hold` when fresh.
+        if fresh_meas {
+            if let Some(pq) = prev_q {
+                let arm_indices = self.config.arm_joint_indices();
+                let mut q_step = q_hold.to_vec();
+                let mut feasible = true;
+                for &j in &arm_indices {
+                    let lim = &active_limits[j];
+                    let v_prev_j = prev_v.map_or(0.0, |pv| pv[j]);
+                    if let Some((q_s, _, _)) = Self::bounded_servo_step(pq[j], q_hold[j], v_prev_j, dt, lim) {
+                        q_step[j] = q_s;
+                    } else {
+                        feasible = false;
+                        break;
+                    }
+                }
+                if feasible {
+                    if let Some(ws_depths) = self.validate_fallback_hold_with_dynamics(
+                        Some(pq),
+                        prev_v,
+                        &q_step,
+                        dt,
+                        active_limits,
+                        fresh_meas,
+                        budget,
+                    ) {
+                        let v_out: Vec<f32> = (0..dof)
+                            .map(|i| ((f64::from(q_step[i]) - f64::from(pq[i])) / dt) as f32)
+                            .collect();
+                        return Some(ValidatedFallback {
+                            positions: q_step,
+                            velocities: v_out,
+                            ws_min_depths: ws_depths,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3. Preserve `prev_confirmed` (or write nothing if no prior confirmed output exists).
+        let mut preserved = prev_q?.to_vec();
+        if let (Some(g), Some(c)) = (self.config.gripper_index(), grip_cmd) {
+            if preserved.len() > g {
+                preserved[g] = c;
+            }
+        }
+        Some(ValidatedFallback {
+            positions: preserved,
+            velocities: vec![0.0; dof],
+            ws_min_depths: prev_ws_min_depths.cloned(),
+        })
+    }
+
     pub fn validate_fallback_hold(
         &self,
         prev_confirmed: Option<&[f32]>,
@@ -838,71 +1041,17 @@ impl crate::supervisor::SupervisorInner {
         fresh_meas: bool,
         budget: &mut usize,
     ) -> bool {
-        use crate::chain::WorkspaceEvaluator;
-        use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
-
-        let dof = self.config.dof;
-        if !fresh_meas || q_hold.len() != dof || !q_hold.iter().all(|q| q.is_finite()) {
-            return false;
-        }
-        let arm_indices = self.config.arm_joint_indices();
-        for &j in &arm_indices {
-            let lim = &self.config.limits[j];
-            if q_hold[j] < lim.min_position - 1e-5 || q_hold[j] > lim.max_position + 1e-5 {
-                return false;
-            }
-        }
-        if let Some((ws, cam)) = self.workspace_policy() {
-            let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
-            if let Some(prev_q) = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite())) {
-                let mut c_prev = eval.alloc_buf();
-                if eval.eval_into(prev_q, &mut c_prev, "tracking_fallback").is_err() {
-                    return false;
-                }
-                let mut min_d = match &self.tracking.ws_min_depths {
-                    Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => {
-                        md.clone()
-                    }
-                    _ => eval.init_min_depths(&c_prev),
-                };
-                if eval
-                    .sweep_linear_step(
-                        prev_q,
-                        q_hold,
-                        &c_prev,
-                        &mut min_d,
-                        budget,
-                        MAX_KEEPOUT_EVALS_PER_TICK,
-                        "tracking_fallback",
-                        "tracking_fallback",
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-            }
-            let mut c_meas = eval.alloc_buf();
-            if eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback").is_err() {
-                return false;
-            }
-            let mut min_d_meas = eval.init_min_depths(&c_meas);
-            if eval
-                .sweep_linear_step(
-                    &self.measured_positions,
-                    q_hold,
-                    &c_meas,
-                    &mut min_d_meas,
-                    budget,
-                    MAX_KEEPOUT_EVALS_PER_TICK,
-                    "tracking_fallback",
-                    "tracking_fallback",
-                )
-                .is_err()
-            {
-                return false;
-            }
-        }
-        true
+        let limits = self.active_tracking_limits(0.02, self.motion_time_scale());
+        self.validate_fallback_hold_with_dynamics(
+            prev_confirmed,
+            self.tracking.last_issued_velocities.as_deref(),
+            q_hold,
+            0.02,
+            &limits,
+            fresh_meas,
+            budget,
+        )
+        .is_some()
     }
 }
 
