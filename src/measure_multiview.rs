@@ -1461,13 +1461,19 @@ mod tests {
         let ref_box_px = [100.0, 70.0, 220.0, 170.0];
         let c = compute(&views, 1, ref_box_px, 0.0, PoseRefine::Off, &[]);
 
-        assert_eq!(c.ncc_backend.backend, "scalar");
+        let expected_backend = mview_stereo::backend_diagnostics();
+        assert_eq!(c.ncc_backend.backend, expected_backend.backend);
+        assert_eq!(c.ncc_backend.reason, expected_backend.reason);
         #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
         {
             assert!(!c.ncc_backend.reason.is_empty(), "reason should be non-empty");
+            let total_kernel_calls = c.ncc_backend.counts.coarse_dots_scalar
+                + c.ncc_backend.counts.coarse_dots_xthead071
+                + c.ncc_backend.counts.patch_moments_scalar
+                + c.ncc_backend.counts.patch_moments_xthead071;
             assert!(
-                c.ncc_backend.counts.coarse_dots_scalar > 0 || c.ncc_backend.counts.patch_moments_scalar > 0,
-                "expected scalar NCC kernel counts > 0, got {:?}",
+                total_kernel_calls > 0,
+                "expected NCC kernel counts > 0 across backends, got {:?}",
                 c.ncc_backend.counts
             );
         }
