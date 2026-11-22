@@ -2625,3 +2625,63 @@ fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
         );
     }
 }
+
+/// T2: Prove with real `DamiaoArmDriver<MockCanTransport>` that keeping the stricter
+/// `write_modes` hold-transmit + flush checks leaves every previously succeeding sequence
+/// unchanged: (1) cold arm, (2) gravity-comp enter/exit, (3) re-arm after interrupted MIT session.
+#[test]
+fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
+    use armd::driver::DamiaoArmDriver;
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::transport::{CanFrame, MockCanTransport};
+
+    let make_healthy_can = || -> MockCanTransport {
+        let mut mock = MockCanTransport::new();
+        let limits = DamiaoLimits::default();
+        let p = damiao::float_to_uint(0.15, limits.p_min, limits.p_max, 16);
+        let enabled_fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+        let disabled_fb = CanFrame::new_standard(0x11, &[0x01, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+        mock.respond_to_transmit(damiao::build_enable_frame(1), enabled_fb);
+        mock.respond_to_transmit(damiao::build_disable_frame(1), disabled_fb);
+        let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
+            CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
+        };
+        for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
+            mock.respond_to_transmit(
+                damiao::build_read_register_frame(1, rid),
+                mk_reply(damiao::REG_READ, rid, val.to_le_bytes()),
+            );
+        }
+        for mode in [damiao::CTRL_MODE_MIT, damiao::CTRL_MODE_POS_VEL] {
+            mock.respond_to_transmit(
+                damiao::build_set_control_mode_frame(1, mode),
+                mk_reply(damiao::REG_WRITE, damiao::RID_CTRL_MODE, mode.to_le_bytes()),
+            );
+        }
+        mock
+    };
+
+    // 1. Cold arm (no mode switches issued)
+    let mut drv = DamiaoArmDriver::new(make_healthy_can(), vec![1]);
+    drv.set_torque(true).expect("cold arm must succeed unchanged");
+    assert!(drv.is_enabled());
+    assert!(!drv.joint_modes_uncertain());
+
+    // 2. Gravity-comp enter (POS_VEL -> MIT) and exit (MIT -> POS_VEL)
+    drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.15, 0.0, 30.0, 1.0, 0.0)])
+        .expect("gravity-comp entry must succeed unchanged");
+    assert!(!drv.joint_modes_uncertain());
+    drv.set_joint_modes(&[JointMode::Position], &[JointTarget::position(0.15)])
+        .expect("gravity-comp exit must succeed unchanged");
+    assert!(!drv.joint_modes_uncertain());
+
+    // 3. Re-arm after interrupted MIT session (motor left in MIT when torque disabled -> restored on set_torque(true))
+    drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.15, 0.0, 30.0, 1.0, 0.0)])
+        .expect("enter MIT before simulated interruption");
+    drv.set_torque(false).expect("disable while in MIT");
+    assert!(!drv.is_enabled());
+    drv.set_torque(true)
+        .expect("re-arm after interrupted MIT session must restore POS_VEL with dual-hold and succeed");
+    assert!(drv.is_enabled());
+    assert!(!drv.joint_modes_uncertain());
+}
