@@ -804,7 +804,7 @@ fn m1_calib_hover_resume_rejects_tool_mismatch_candidate_mismatch_and_floor_viol
 
     let body = json!({
         "candidate_fingerprint": "fp-A",
-        "rpy_rad": [0.0, 1.5708, 0.0],
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
         "points": [
             {"id": "p1", "approach_m": [0.25, 0.0, 0.14], "hover_m": [0.25, 0.0, 0.08]},
             {"id": "p2", "approach_m": [0.25, 0.05, 0.14], "hover_m": [0.25, 0.05, 0.08]}
@@ -1236,7 +1236,7 @@ fn r2_m05_m06_hover_resume_requires_fp_and_physical_jaw_curve_required() {
     let mut inner = common::sim_at(cfg, &INSPECT);
     let body = json!({
         "candidate_fingerprint": "fp-A",
-        "rpy_rad": [0.0, 1.5708, 0.0],
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
         "points": [{"id": "p1", "approach_m": [0.25, 0.0, 0.14], "hover_m": [0.25, 0.0, 0.08]}]
     });
     let mut plan = armd::calib_hover::prepare(&inner, &body, inner.safety.epoch_id()).unwrap();
@@ -1283,7 +1283,7 @@ fn r2_b05_replay_rejects_embedded_parquet_sidecar_conflict_and_m12_so101_manifes
         frames: frames.len(),
         joint_names: fin.limits.iter().map(|l| l.name.clone()).collect(),
         units: "rad".into(),
-        joint_zero: armd::recording::JointZeroStamp::of(&vec![0.0; 7]),
+        joint_zero: armd::recording::JointZeroStamp::of(&[0.0; 7]),
         profile_id: fin.profile_id.clone(),
         armd_version: "test".into(),
         fps_nominal: 50.0,
