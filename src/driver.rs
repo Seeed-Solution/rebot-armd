@@ -104,12 +104,25 @@ pub trait ArmDriver: Send {
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
 
-    /// Receive instant of each joint's latest feedback sample. Drivers that keep the
-    /// receive times report them directly; the default derives them from `feedback_ages`.
+    /// Monotonic receive instant of the last received sample for each joint.
+    /// Reading a cache does not refresh it. Default derives it from [`Self::feedback_ages`].
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         let now = Instant::now();
-        self.feedback_ages().into_iter().map(|a| a.and_then(|a| now.checked_sub(a))).collect()
+        self.feedback_ages().into_iter().map(|a| a.and_then(|age| now.checked_sub(age))).collect()
     }
+
+    /// Monotonic per-joint hardware feedback sequence counter, incremented once per decoded
+    /// hardware reply for that joint. Reading a cache does not advance it. Empty means the
+    /// driver does not report explicit counters (supervisor falls back to instant advances).
+    fn feedback_seqs(&self) -> Vec<u64> { Vec::new() }
+
+    /// Per joint, a monotonic instant at which the driver saw its receive queue empty before it
+    /// read that joint's last decoded sample, so the sample was enqueued after this instant
+    /// (None: no empty queue was seen before it). Decode-time instants cannot bound queued
+    /// frames: a bounded drain can decode a backlog several ticks after it arrived. Empty means
+    /// the driver has no receive queue between bus and decode (request/response transports);
+    /// callers then use [`Self::feedback_instants`].
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> { Vec::new() }
 
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
@@ -268,6 +281,7 @@ pub struct FeetechArmDriver<T: Transport> {
     cached_loads: Vec<f32>,
     pub motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     confirmed_enable_state: EnableState,
     tx_echo: Option<bool>,
     tx_echo_auto: bool,
@@ -316,6 +330,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             cached_loads: vec![0.0; dof],
             motor_status: vec![0; dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             confirmed_enable_state: EnableState::Unknown,
             tx_echo: None,
             tx_echo_auto: false,
@@ -399,6 +414,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.cached_loads = vec![0.0; dof];
             self.motor_status = vec![0; dof];
             self.last_feedback_instant = vec![None; dof];
+            self.feedback_seq.resize(dof, 0);
             self.cached_raw_steps = vec![0; dof];
             self.last_enable_confirmed = vec![None; dof];
             self.missed_enable_polls = vec![0; dof];
@@ -1112,6 +1128,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 self.cached_loads[joint_idx] = load;
                                 self.motor_status[joint_idx] = pkt.error;
                                 self.last_feedback_instant[joint_idx] = Some(read_time);
+                                self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
 
                                 replied_ids.insert(pkt.id);
                             }
@@ -1193,7 +1210,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .collect()
     }
 
-    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
+    }
 
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
@@ -1871,6 +1894,7 @@ pub struct FashionStarArmDriver<T: Transport> {
     zero_offsets: Vec<u16>,
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
 }
@@ -1884,6 +1908,7 @@ impl<T: Transport> FashionStarArmDriver<T> {
             zero_offsets: vec![fashionstar::DEFAULT_ZERO_OFFSET; dof],
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
         }
@@ -1918,7 +1943,13 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
-    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
+    }
 
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
@@ -2021,6 +2052,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
                             self.cached_states[joint_idx].position = fashionstar::tenth_deg_to_rad(tenth_deg);
                             self.last_feedback_instant[joint_idx] = Some(Instant::now());
+                            self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
                             break;
                         }
                     }
@@ -2083,6 +2115,11 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     cached_states: Vec<JointState>,
     last_target_frames: Vec<Option<CanFrame>>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
+    /// Instant taken before the last receive call that found the RX queue empty.
+    rx_empty_instant: Option<Instant>,
+    /// `rx_empty_instant` when each joint's last sample was decoded.
+    feedback_queue_bound: Vec<Option<Instant>>,
     motor_status: Vec<u8>,
     is_enabled: bool,
     pending_rearm: bool,
@@ -2128,6 +2165,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             cached_states: vec![JointState::default(); dof],
             last_target_frames: vec![None; dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
+            rx_empty_instant: None,
+            feedback_queue_bound: vec![None; dof],
             motor_status: vec![0; dof],
             is_enabled: false,
             pending_rearm: true,
@@ -2490,7 +2530,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
-    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
+    }
+
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        self.feedback_queue_bound.clone()
+    }
 
 
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
@@ -2909,6 +2959,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let mut frames_processed = 0;
         let mut rx_drained = false;
         while frames_processed < 64 && t0.elapsed() < MAX_RX_DURATION {
+            // Taken before the receive: an empty result means the queue was empty after it.
+            let attempt = Instant::now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -2974,6 +3026,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 temperature: feedback.t_mos.max(feedback.t_rotor),
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
@@ -2983,6 +3037,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
+                    self.rx_empty_instant = Some(attempt);
                     if self.awaiting_rx_boundary {
                         self.awaiting_rx_boundary = false;
                         self.last_feedback_instant.fill(None);
@@ -3087,6 +3142,11 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     default_kd: f32,
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
+    /// Instant taken before the last receive call that found the RX queue empty.
+    rx_empty_instant: Option<Instant>,
+    /// `rx_empty_instant` when each joint's last sample was decoded.
+    feedback_queue_bound: Vec<Option<Instant>>,
     fault_flags: Vec<u8>,
 }
 
@@ -3102,6 +3162,9 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             default_kd: 1.0,
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
+            rx_empty_instant: None,
+            feedback_queue_bound: vec![None; dof],
             fault_flags: vec![0; dof],
         }
     }
@@ -3131,7 +3194,17 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
-    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
+    }
+
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        self.feedback_queue_bound.clone()
+    }
 
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
@@ -3233,6 +3306,8 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         let t0 = Instant::now();
         let mut frames_processed = 0;
         while frames_processed < 64 {
+            // Taken before the receive: an empty result means the queue was empty after it.
+            let attempt = Instant::now();
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
@@ -3249,12 +3324,18 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                                 temperature: feedback.mos_temperature,
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
                     if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
                         break;
                     }
+                }
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.rx_empty_instant = Some(attempt);
+                    break;
                 }
                 Err(_) => break,
             }

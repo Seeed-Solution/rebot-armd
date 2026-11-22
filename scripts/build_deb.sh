@@ -156,8 +156,13 @@ if [ -n "${REBOT_VISION_BIN:-}" ]; then
     echo "[2/5] Using prebuilt rebot-vision: ${VISION_BIN}"
 else
     echo "[2/5] Building rebot-vision in container ${RECAMERA_DOCKER}..."
-    "${SCRIPT_DIR}/build_vision.sh"
-    VISION_BIN="${REPO_ROOT}/target/vision-riscv/rebot-vision"
+    # build_vision.sh copies its own generation here under its publish lock; the shared
+    # target/vision-riscv/current may be switched by a concurrent build
+    VISION_COPY="${REPO_ROOT}/target/deb_vision.$$"
+    rm -rf "${VISION_COPY}"
+    trap 'rm -rf "${VISION_COPY}"' EXIT
+    REBOT_VISION_COPY_TO="${VISION_COPY}" "${SCRIPT_DIR}/build_vision.sh"
+    VISION_BIN="${VISION_COPY}/rebot-vision"
 fi
 if [ ! -f "${VISION_BIN}" ]; then
     echo "Error: rebot-vision binary not found at ${VISION_BIN}" >&2

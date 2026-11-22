@@ -36,9 +36,12 @@
 #include "depth_geom.h"
 #include "depth_stage.h"
 #include "detector.h"
+#include "frame_guard.h"
+#include "gray_frame.h"
 #include "http_control.h"
 #include "json.hpp"
 #include "model_catalogue.h"
+#include "model_swap.h"
 #include "result_json.h"
 #include "version.h"
 #include "vision_control.h"
@@ -600,6 +603,16 @@ int main(int argc, char** argv) {
     stream.bitrate_kbps = static_cast<uint32_t>(g_cfg.stream_bitrate_kbps);
     app.with_camera(cam).with_stream_mode(af::StreamMode::WsOnly, stream, g_cfg.debug_port);
 
+    // The ArUco crop, gray extraction, and detection normalisation use the visible part of the
+    // letterboxed inference frame (same geometry as the debug /results overlay).
+    const rv::ContentRect content = rv::content_rect(g_cfg.inference_w, g_cfg.inference_h, g_cfg.stream_w, g_cfg.stream_h);
+    const af::Rect crop{static_cast<int32_t>(std::lround(content.x)), static_cast<int32_t>(std::lround(content.y)),
+                        static_cast<int32_t>(std::lround(content.w)), static_cast<int32_t>(std::lround(content.h))};
+    const double disp_sx = content.w > 0 ? g_cfg.stream_w / content.w : 1.0;
+    const double disp_sy = content.h > 0 ? g_cfg.stream_h / content.h : 1.0;
+    const bool gray_geom_ok = (crop.x >= 0 && crop.y >= 0 && crop.w == rv::kGrayWidth && crop.h == rv::kGrayHeight &&
+                               crop.x + crop.w <= g_cfg.inference_w && crop.y + crop.h <= g_cfg.inference_h);
+
     rv::VisionControl::Options vo;
     vo.fps = g_cfg.fps;
     vo.mode = g_cfg.mode;
@@ -620,6 +633,15 @@ int main(int argc, char** argv) {
     vo.intrinsics.marker_size = g_cfg.aruco.marker_size;
     vo.intrinsics_cli_override = g_cfg.intrinsics_cli;
     vo.config_path = g_cfg.config_path;
+    vo.gray_available = gray_geom_ok;
+    vo.gray_width = crop.w;
+    vo.gray_height = crop.h;
+    vo.gray_crop[0] = crop.x;
+    vo.gray_crop[1] = crop.y;
+    vo.gray_crop[2] = crop.w;
+    vo.gray_crop[3] = crop.h;
+    vo.frame_size[0] = g_cfg.inference_w;
+    vo.frame_size[1] = g_cfg.inference_h;
     if (g_cfg.intrinsics_cli) {
         MA_LOGW(TAG, "Intrinsics set on the command line: PUT /api/calibration/intrinsics is refused (CLI_OVERRIDE)");
     }
@@ -638,19 +660,13 @@ int main(int argc, char** argv) {
         }
         MA_LOGI(TAG, "Processing %s (camera gate %d fps)", on ? "ON" : "OFF", gate_fps);
     });
-    MA_LOGI(TAG, "Start: mode %s, inference %s, fps %d", rv::mode_name(ctl.mode()),
-            ctl.continuous_enabled() ? "on" : "standby", ctl.active_fps());
+    MA_LOGI(TAG, "Start: mode %s, inference %s, fps %d, instance %s, gray %s", rv::mode_name(ctl.mode()),
+            ctl.continuous_enabled() ? "on" : "standby", ctl.active_fps(), ctl.instance_id().c_str(),
+            ctl.gray_available() ? "on" : "off");
 
     rv::HttpControlServer http(ctl);
     if (!http.start(g_cfg.control_port)) MA_LOGE(TAG, "HTTP control unavailable on port %d", g_cfg.control_port);
 
-    // The ArUco crop and the detection normalisation use the visible part of the
-    // letterboxed inference frame (same geometry as the debug /results overlay).
-    const rv::ContentRect content = rv::content_rect(g_cfg.inference_w, g_cfg.inference_h, g_cfg.stream_w, g_cfg.stream_h);
-    const af::Rect crop{static_cast<int32_t>(std::lround(content.x)), static_cast<int32_t>(std::lround(content.y)),
-                        static_cast<int32_t>(std::lround(content.w)), static_cast<int32_t>(std::lround(content.h))};
-    const double disp_sx = content.w > 0 ? g_cfg.stream_w / content.w : 1.0;
-    const double disp_sy = content.h > 0 ? g_cfg.stream_h / content.h : 1.0;
     MA_LOGI(TAG, "Content rect in %dx%d: x=%d y=%d w=%d h=%d", g_cfg.inference_w, g_cfg.inference_h, crop.x, crop.y,
             crop.w, crop.h);
 
@@ -661,7 +677,6 @@ int main(int argc, char** argv) {
     std::deque<std::string> labels;  // class names of `boxes` / `dets` (a deque keeps c_str() valid on push_back)
     ArucoStats aruco_stats;
     std::string extra;
-    uint32_t frame_id = 0;
     // Frame age for triggers and the rate gate. retrieveFrame() returns the newest queued
     // frame: if the grab waited, the frame arrived during the wait (now); if one was already
     // queued, it arrived after the previous grab.
@@ -672,28 +687,27 @@ int main(int argc, char** argv) {
     // A swap (POST /api/models) on the frame thread, the only user of the slots: the changed
     // slots are unloaded first, then loaded into fresh objects, so the ION peak stays within the
     // new set. A failed load leaves its slot empty; the other slot keeps its new state.
-    auto apply_swap = [&](const rv::SwapRequest& s) {
+    // rv::run_model_swap prepares every name copy before a model is installed and unloads the
+    // changed slots again when anything throws, ending the swap Failed (never left Running).
+    auto apply_swap = [&](const rv::SwapRequest& s) noexcept {
         const auto t0 = std::chrono::steady_clock::now();
-        if (s.detector.change) {
-            detector.reset();
-            set_detector(resident, nullptr, "", "");
-        }
-        if (s.depth.change) {
-            depth_stage.reset();
-            set_depth(resident, nullptr, nullptr);
-        }
         std::string failed;
-        if (const rv::ModelEntry* m = ctl.catalogue().find(s.detector.name)) {
-            detector = load_detector(m->path, kind_hint_of(m->kind), m->classes);
-            set_detector(resident, detector.get(), m->name, m->path);
-            if (!detector) failed = "detector";
-        }
-        if (const rv::ModelEntry* m = ctl.catalogue().find(s.depth.name)) {
-            depth_stage = load_depth(m->path);
-            set_depth(resident, depth_stage.get(), m);
-            if (!depth_stage) failed += failed.empty() ? "depth" : ",depth";
-        }
-        model_generation = ctl.finish_swap(resident, failed.empty() ? "" : "LOAD_FAILED:" + failed);
+        model_generation = rv::run_model_swap(
+            ctl, s, resident,
+            [&](const rv::ModelEntry& m, const char*& kind, bool& mask) {
+                detector = load_detector(m.path, kind_hint_of(m.kind), m.classes);
+                if (!detector) return false;
+                kind = kind_name(detector->getKind());
+                mask = g_cfg.mask_enabled && detector->getKind() == yolo::Kind::Segment;
+                return true;
+            },
+            [&](const rv::ModelEntry& m) {
+                depth_stage = load_depth(m.path);
+                return depth_stage != nullptr;
+            },
+            [&]() noexcept { detector.reset(); },
+            [&]() noexcept { depth_stage.reset(); },
+            &failed);
         MA_LOGI(TAG, "Model swap to generation %llu in %.0f ms: detector %s, depth %s%s%s",
                 static_cast<unsigned long long>(model_generation), ms_since(t0),
                 resident.model_name.empty() ? "-" : resident.model_name.c_str(),
@@ -702,12 +716,16 @@ int main(int argc, char** argv) {
     };
 
     app.on_started(set_ae_fixed_frame_rate).on_before_grab([&] { before_grab_ms = rv::mono_ms(); });
-    app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
+    // One frame's work; on_frame below runs it under a frame guard.
+    auto process_frame = [&](const af::VideoFrame& frame, af::Result& r) {
         const uint64_t grab_ms = rv::mono_ms();
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
-        rv::SwapRequest swap;
-        if (ctl.take_swap(swap)) apply_swap(swap);
+        // take_swap leaves the swap Pending when its copy throws; apply_swap does not throw.
+        rv::contain_frame([&] {
+            rv::SwapRequest swap;
+            if (ctl.take_swap(swap)) apply_swap(swap);
+        }, [&](const char* what) { MA_LOGE(TAG, "Model swap not taken: %s", what); });
         // PUT /api/calibration/intrinsics: applied before this frame's pipelines run
         rv::Intrinsics intr;
         uint64_t intr_rev = 0;
@@ -725,157 +743,220 @@ int main(int argc, char** argv) {
             r.publish = false;  // standby: no /results; the stream and snapshot keep running
             return;
         }
-        const auto t_frame = std::chrono::steady_clock::now();
-        rv::VisionResult vr;
-        vr.frame_id = ++frame_id;
-        vr.frame_ms = frame_ms;
-        vr.wait_ms = before_grab_ms;
-        vr.grab_ms = grab_ms;
-        vr.offered = ctl.offered();
-        vr.ts_ms = capture_unix_ms(frame.ts_ms);
-        vr.mode = ctl.mode();
-        vr.width = crop.w;
-        vr.height = crop.h;
-        vr.model_generation = model_generation;
-        boxes.clear();
-        dets.clear();
-        labels.clear();
-        markers.clear();
+        // Contain any exception of this frame (bad_alloc while preparing the publication, ...):
+        // the frame is dropped and the callback returns normally.
+        const bool frame_ok = rv::contain_frame([&] {
+            const auto t_frame = std::chrono::steady_clock::now();
+            rv::VisionResult vr;
+            vr.frame_id = ctl.next_frame_id(vr.instance_id);
+            vr.frame_ms = frame_ms;
+            vr.wait_ms = before_grab_ms;
+            vr.grab_ms = grab_ms;
+            vr.offered = ctl.offered();
+            vr.ts_ms = capture_unix_ms(frame.ts_ms);
+            vr.mode = ctl.mode();
+            vr.width = crop.w;
+            vr.height = crop.h;
+            vr.model_generation = model_generation;
+            boxes.clear();
+            dets.clear();
+            labels.clear();
+            markers.clear();
 
-        if (p.yolo && detector) {  // an empty slot reports ran: false
-            const auto t0 = std::chrono::steady_clock::now();
-            ma_img_t img = af::to_ma_img(frame);
-            for (const auto& d : detector->detect(&img, frame_focus.active ? &frame_focus : nullptr,
-                                                 static_cast<float>(crop.x), static_cast<float>(crop.y),
-                                                 static_cast<float>(crop.w), static_cast<float>(crop.h))) {
-                // DetBox and af::Box hold const char*: the names live in `labels` until the next frame
-                labels.push_back(detector->className(d.class_id));
-                const char* label = labels.back().c_str();
-                rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, label,
-                               d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus};
-                det.length_px = d.length_px;
-                det.has_obb = d.has_obb;
-                det.obb_corners = d.obb_corners;
-                dets.push_back(det);
-                af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
-                b.x = d.x * frame.width;
-                b.y = d.y * frame.height;
-                b.w = d.w * frame.width;
-                b.h = d.h * frame.height;
-                b.score = d.confidence;
-                b.cls = d.class_id;
-                b.label = label;
-                boxes.push_back(b);
-            }
-            vr.ran_yolo = true;
-            vr.yolo_ms = ms_since(t0);
-            if (detector->getKind() == yolo::Kind::Segment) {
-                vr.mask_ms = detector->mask_ms();
-            }
-            vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
-        }
-        std::string display_markers;
-        if (p.aruco) {
-            const auto t0 = std::chrono::steady_clock::now();
-            const af::VideoFrame sub = frame.sub_frame(crop);
-            if (sub.valid()) {
-                // a trigger's frame is always scanned whole (ROI tracking is for subscriptions)
-                vr.rejected = aruco_stage.run(sub.data(), sub.width, sub.height, static_cast<int>(sub.stride()), markers,
-                                              triggered.aruco);
-            }
-            vr.ran_aruco = true;
-            vr.aruco_ms = ms_since(t0);
-            vr.aruco_stages_json = rv::aruco_stages_json(aruco_stage.last_timing());
-            aruco_stats.add(vr.aruco_ms, aruco_stage.last_timing(), g_cfg.aruco_stats_every);
-            vr.count = static_cast<int>(markers.size());
-            vr.undistorted = aruco_stage.undistorted();
-            vr.markers_json = rv::markers_json(markers);
-            display_markers = rv::markers_json(markers, disp_sx, disp_sy);
-        }
-        if (p.depth && depth_stage) {
-            const auto t0 = std::chrono::steady_clock::now();
-            const af::VideoFrame sub = frame.sub_frame(crop);
-            if (sub.valid() && depth_stage->run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
-                vr.ran_depth = true;
-                vr.depth_ms = ms_since(t0);
-                if (ctl.depth_map_wanted()) {  // GET /api/depth waits: hand the grid over (copy, 344 KB)
-                    const float* m = depth_stage->depth_map();
-                    vr.depth_grid_w = depth_stage->grid_w();
-                    vr.depth_grid_h = depth_stage->grid_h();
-                    vr.depth_disp = std::make_shared<const std::vector<float>>(
-                        m, m + static_cast<size_t>(vr.depth_grid_w) * static_cast<size_t>(vr.depth_grid_h));
-                }
-
-                // Convert DetBoxes to DepthBoxes in content pixel coordinates
-                std::vector<rv::DepthBox> all_depth_boxes;
-                all_depth_boxes.reserve(dets.size());
-                for (const auto& d : dets) {
-                    const float x = (d.x * frame.width - content.x) / content.w;
-                    const float y = (d.y * frame.height - content.y) / content.h;
-                    const float w = d.w * frame.width / content.w;
-                    const float h = d.h * frame.height / content.h;
-                    all_depth_boxes.push_back({
-                        (x - w * 0.5f) * content.w,
-                        (y - h * 0.5f) * content.h,
-                        (x + w * 0.5f) * content.w,
-                        (y + h * 0.5f) * content.h
+            // Convert the validated RGB888 visible crop into owned gray storage BEFORE YOLO, ArUco,
+            // or depth run so downstream preprocessors or scratch buffers cannot alias or mutate it.
+            std::shared_ptr<rv::GrayFrame> gray_rec;
+            if (p.gray && ctl.gray_available()) {
+                const auto t_gray = std::chrono::steady_clock::now();
+                const bool src_ok = (frame.format == af::PixelFormat::RGB888 &&
+                                     frame.channel == 0 &&
+                                     frame.width == g_cfg.inference_w &&
+                                     frame.height == g_cfg.inference_h &&
+                                     frame.cpu_accessible());
+                const af::VideoFrame sub = src_ok ? frame.sub_frame(crop) : af::VideoFrame{};
+                if (src_ok && sub.valid() && sub.cpu_accessible() &&
+                    sub.width == rv::kGrayWidth && sub.height == rv::kGrayHeight &&
+                    sub.stride() >= static_cast<uint32_t>(sub.width) * 3u) {
+                    // The instance-id copy into meta can throw: a failure drops gray for this frame only.
+                    const bool gray_ok = rv::contain_frame([&] {
+                        rv::GrayFrameMeta meta;
+                        meta.instance_id = vr.instance_id;
+                        meta.frame_id = vr.frame_id;
+                        meta.channel = frame.channel;
+                        meta.ts_ms = vr.ts_ms;
+                        meta.frame_mono_ms = vr.frame_ms;
+                        meta.wait_mono_ms = vr.wait_ms;
+                        meta.grab_mono_ms = vr.grab_ms;
+                        meta.model_generation = vr.model_generation;
+                        auto rec = rv::make_gray_frame(frame.data(), frame.width, frame.height,
+                                                       static_cast<int>(frame.stride()),
+                                                       crop.x, crop.y, crop.w, crop.h, meta);
+                        if (rec) {
+                            rec->convert_ms = ms_since(t_gray);
+                            vr.ran_gray = true;
+                            vr.gray_ms = rec->convert_ms;
+                            gray_rec = std::move(rec);
+                        } else {
+                            MA_LOGW(TAG, "Gray conversion/allocation failed on frame %u", vr.frame_id);
+                        }
+                    }, [&](const char* what) {
+                        MA_LOGW(TAG, "Gray record preparation failed on frame %u: %s", vr.frame_id, what);
                     });
+                    if (!gray_ok) {
+                        gray_rec.reset();
+                        vr.ran_gray = false;
+                        vr.gray_ms = 0;
+                    }
+                } else {
+                    MA_LOGW(TAG, "Gray frame geometry/format mismatch on frame %u: fmt=%d ch=%u size=%ux%u sub=%ux%u stride=%u",
+                            vr.frame_id, static_cast<int>(frame.format), frame.channel,
+                            frame.width, frame.height, sub.width, sub.height, sub.stride());
                 }
+            }
 
-                // Analyze each detection box
-                for (size_t i = 0; i < dets.size(); ++i) {
-                    // jaw_clear across the mask-angle closing direction when a seg model gave one
-                    auto res = rv::analyze_box_depth(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
-                                                     i, all_depth_boxes, content.w, content.h,
-                                                     rv::jaw_close_deg(dets[i]));
-                    rv::apply_box_depth(dets[i], res);
+            if (p.yolo && detector) {  // an empty slot reports ran: false
+                const auto t0 = std::chrono::steady_clock::now();
+                ma_img_t img = af::to_ma_img(frame);
+                for (const auto& d : detector->detect(&img, frame_focus.active ? &frame_focus : nullptr,
+                                                     static_cast<float>(crop.x), static_cast<float>(crop.y),
+                                                     static_cast<float>(crop.w), static_cast<float>(crop.h))) {
+                    // DetBox and af::Box hold const char*: the names live in `labels` until the next frame
+                    labels.push_back(detector->className(d.class_id));
+                    const char* label = labels.back().c_str();
+                    rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, label,
+                                   d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus};
+                    det.length_px = d.length_px;
+                    det.has_obb = d.has_obb;
+                    det.obb_corners = d.obb_corners;
+                    dets.push_back(det);
+                    af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
+                    b.x = d.x * frame.width;
+                    b.y = d.y * frame.height;
+                    b.w = d.w * frame.width;
+                    b.h = d.h * frame.height;
+                    b.score = d.confidence;
+                    b.cls = d.class_id;
+                    b.label = label;
+                    boxes.push_back(b);
+                }
+                vr.ran_yolo = true;
+                vr.yolo_ms = ms_since(t0);
+                if (detector->getKind() == yolo::Kind::Segment) {
+                    vr.mask_ms = detector->mask_ms();
                 }
                 vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
-
-                auto table_samples = rv::sample_table_disparity(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
-                                                                all_depth_boxes, content.w, content.h);
-                std::ostringstream ds;
-                ds << std::fixed << "{\"metric_model\":" << (resident.depth_metric ? "true" : "false")
-                   << ",\"grid_w\":" << depth_stage->grid_w()
-                   << ",\"grid_h\":" << depth_stage->grid_h()
-                   << ",\"table_samples\":[";
-                bool first = true;
-                for (size_t i = 0; i < table_samples.size(); ++i) {
-                    const auto& s = table_samples[i];
-                    if (!std::isfinite(s.u_px) || !std::isfinite(s.v_px) || !std::isfinite(s.disp)) continue;
-                    if (!first) ds << ',';
-                    first = false;
-                    ds << '[' << std::setprecision(1) << s.u_px << ','
-                       << s.v_px << ',' << std::setprecision(4) << s.disp << ']';
+            }
+            std::string display_markers;
+            if (p.aruco) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const af::VideoFrame sub = frame.sub_frame(crop);
+                if (sub.valid()) {
+                    // a trigger's frame is always scanned whole (ROI tracking is for subscriptions)
+                    vr.rejected = aruco_stage.run(sub.data(), sub.width, sub.height, static_cast<int>(sub.stride()), markers,
+                                                  triggered.aruco);
                 }
-                ds << "]}";
-                vr.depth_json = ds.str();
-            } else {
-                vr.ran_depth = false;
-                vr.depth_ms = ms_since(t0);
-                MA_LOGW(TAG, "Depth pipeline failed on frame %u", vr.frame_id);
+                vr.ran_aruco = true;
+                vr.aruco_ms = ms_since(t0);
+                vr.aruco_stages_json = rv::aruco_stages_json(aruco_stage.last_timing());
+                aruco_stats.add(vr.aruco_ms, aruco_stage.last_timing(), g_cfg.aruco_stats_every);
+                vr.count = static_cast<int>(markers.size());
+                vr.undistorted = aruco_stage.undistorted();
+                vr.markers_json = rv::markers_json(markers);
+                display_markers = rv::markers_json(markers, disp_sx, disp_sy);
             }
-        }
-        vr.inference_ms = ms_since(t_frame);
-        ctl.publish(vr);
+            if (p.depth && depth_stage) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const af::VideoFrame sub = frame.sub_frame(crop);
+                if (sub.valid() && depth_stage->run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
+                    vr.ran_depth = true;
+                    vr.depth_ms = ms_since(t0);
+                    if (ctl.depth_map_wanted()) {  // GET /api/depth waits: hand the grid over (copy, 344 KB)
+                        const float* m = depth_stage->depth_map();
+                        vr.depth_grid_w = depth_stage->grid_w();
+                        vr.depth_grid_h = depth_stage->grid_h();
+                        vr.depth_disp = std::make_shared<const std::vector<float>>(
+                            m, m + static_cast<size_t>(vr.depth_grid_w) * static_cast<size_t>(vr.depth_grid_h));
+                    }
 
-        r.width = frame.width;
-        r.height = frame.height;
-        r.inference_ms = vr.inference_ms;
-        r.set_boxes(boxes.data(), boxes.size());
-        extra = rv::debug_extra(vr.mode, display_markers);
-        r.debug_extra = extra;
+                    // Convert DetBoxes to DepthBoxes in content pixel coordinates
+                    std::vector<rv::DepthBox> all_depth_boxes;
+                    all_depth_boxes.reserve(dets.size());
+                    for (const auto& d : dets) {
+                        const float x = (d.x * frame.width - content.x) / content.w;
+                        const float y = (d.y * frame.height - content.y) / content.h;
+                        const float w = d.w * frame.width / content.w;
+                        const float h = d.h * frame.height / content.h;
+                        all_depth_boxes.push_back({
+                            (x - w * 0.5f) * content.w,
+                            (y - h * 0.5f) * content.h,
+                            (x + w * 0.5f) * content.w,
+                            (y + h * 0.5f) * content.h
+                        });
+                    }
 
-        if (g_cfg.verbose) {
-            MA_LOGI(TAG, "Frame %u %s: %zu detections (%.0f ms), %zu markers (%.0f ms), depth %s (%.0f ms)",
-                    vr.frame_id, rv::mode_name(vr.mode), dets.size(), vr.yolo_ms, markers.size(), vr.aruco_ms,
-                    vr.ran_depth ? "on" : "off", vr.depth_ms);
-            if (vr.ran_yolo && detector) {
-                float pre = 0, infer = 0, post = 0;
-                detector->stage_ms(pre, infer, post);
-                MA_LOGI(TAG, "Frame %u yolo stages: pre %.2f ms, inference %.0f ms, post %.2f ms, mask %.2f ms",
-                        vr.frame_id, pre, infer, post, vr.mask_ms);
+                    // Analyze each detection box
+                    for (size_t i = 0; i < dets.size(); ++i) {
+                        // jaw_clear across the mask-angle closing direction when a seg model gave one
+                        auto res = rv::analyze_box_depth(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
+                                                         i, all_depth_boxes, content.w, content.h,
+                                                         rv::jaw_close_deg(dets[i]));
+                        rv::apply_box_depth(dets[i], res);
+                    }
+                    vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
+
+                    auto table_samples = rv::sample_table_disparity(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
+                                                                    all_depth_boxes, content.w, content.h);
+                    std::ostringstream ds;
+                    ds << std::fixed << "{\"metric_model\":" << (resident.depth_metric ? "true" : "false")
+                       << ",\"grid_w\":" << depth_stage->grid_w()
+                       << ",\"grid_h\":" << depth_stage->grid_h()
+                       << ",\"table_samples\":[";
+                    bool first = true;
+                    for (size_t i = 0; i < table_samples.size(); ++i) {
+                        const auto& s = table_samples[i];
+                        if (!std::isfinite(s.u_px) || !std::isfinite(s.v_px) || !std::isfinite(s.disp)) continue;
+                        if (!first) ds << ',';
+                        first = false;
+                        ds << '[' << std::setprecision(1) << s.u_px << ','
+                           << s.v_px << ',' << std::setprecision(4) << s.disp << ']';
+                    }
+                    ds << "]}";
+                    vr.depth_json = ds.str();
+                } else {
+                    vr.ran_depth = false;
+                    vr.depth_ms = ms_since(t0);
+                    MA_LOGW(TAG, "Depth pipeline failed on frame %u", vr.frame_id);
+                }
             }
+            vr.inference_ms = ms_since(t_frame);
+            ctl.publish(vr, std::move(gray_rec));
+
+            r.width = frame.width;
+            r.height = frame.height;
+            r.inference_ms = vr.inference_ms;
+            r.set_boxes(boxes.data(), boxes.size());
+            extra = rv::debug_extra(vr.mode, display_markers);
+            r.debug_extra = extra;
+
+            if (g_cfg.verbose) {
+                MA_LOGI(TAG, "Frame %u %s: %zu detections (%.0f ms), %zu markers (%.0f ms), depth %s (%.0f ms)",
+                        vr.frame_id, rv::mode_name(vr.mode), dets.size(), vr.yolo_ms, markers.size(), vr.aruco_ms,
+                        vr.ran_depth ? "on" : "off", vr.depth_ms);
+                if (vr.ran_yolo && detector) {
+                    float pre = 0, infer = 0, post = 0;
+                    detector->stage_ms(pre, infer, post);
+                    MA_LOGI(TAG, "Frame %u yolo stages: pre %.2f ms, inference %.0f ms, post %.2f ms, mask %.2f ms",
+                            vr.frame_id, pre, infer, post, vr.mask_ms);
+                }
+            }
+        }, [&](const char* what) { MA_LOGE(TAG, "Frame dropped: %s", what); });
+        if (!frame_ok) r.publish = false;
+    };
+    app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
+        // Contain anything process_frame lets through (frame plan, intrinsics, ...): no publication.
+        if (!rv::contain_frame([&] { process_frame(frame, r); },
+                               [&](const char* what) { MA_LOGE(TAG, "Frame callback failed: %s", what); })) {
+            r.publish = false;
         }
     });
 

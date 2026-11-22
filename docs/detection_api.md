@@ -21,7 +21,7 @@ Every `rebot-vision` response body has `"api_version"`: 2 from 1.3.0, 1 in 1.2. 
 | `/api/v1/detection/inference` | `GET` | `GET /api/inference` | `{"enabled":bool,"fps":n,"active_fps":n,"idle_fps":1}` |
 | `/api/v1/detection/inference` | `POST` | `POST /api/inference` | Body `{"enabled":true\|false}`; same shape as GET. A bad body returns 400 `{"error":...}` |
 | `/api/v1/detection/latest` | `GET` | `GET /api/results/latest` (query string passed through) | `{"enabled":bool,"frame_id":u32,"ts_ms":n,"age_ms":n,"inference_time_ms":n,"detections":[...],"timeout"?:true}` |
-| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["depth"] \| ["yolo","depth"] \| ..., "wait_ms"?: 0..5000, "mask_focus"?: {"label"?: string, "box_norm": [x0,y0,x1,y1]}}`. `{"success":true,"requested":[...],"frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `yolo`/`depth` without a model → 409 |
+| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["depth"] \| ["gray"] \| ["yolo","gray"] \| ..., "wait_ms"?: 0..5000, "mask_focus"?: {"label"?: string, "box_norm": [x0,y0,x1,y1]}}`. `{"success":true,"requested":[...],"instance_id":"...","frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `"gray"` from non-loopback peer → 403, `yolo`/`depth`/`gray` unavailable → 409 |
 | `/api/v1/detection/mask_focus` | `GET` | `GET /api/mask_focus` | `{"api_version":2,"mask_focus":{...}\|null}` |
 | `/api/v1/detection/mask_focus` | `POST` | `POST /api/mask_focus` | Body `{"label"?: string, "box_norm": [x0,y0,x1,y1], "ttl_ms"?: 100..10000}`; empty `{}` or `ttl_ms: 0` clears it. Returns same shape as GET |
 | `/api/v1/vision/mode` | `GET` | `GET /api/mode` | mode body below |
@@ -99,7 +99,8 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
  "measured":{"input_fps":7.5,"result_fps":5.0},"trigger":true,
  "per_request_pipelines":true,"subscriptions":true,"max_fps":5,
  "continuous":{"active":true,"pipelines":["yolo","aruco"],"fps":5,"subscriptions":0},
- "available":{"yolo":true,"aruco":true,"depth":true},
+ "available":{"yolo":true,"aruco":true,"depth":true,"gray":true},
+ "gray_frames":{"encoding":"RGF1","format":"gray8","width":640,"height":360,"stride":640,"crop":[0,140,640,360],"frame_size":[640,640],"luma":"(77*R+150*G+29*B)>>8","luma_range":"full_0_255","ring":4,"exposure_qualified":false},
  "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","kind":"detect","mask":false,"mask_max_boxes":3},
  "depth_model":{"name":"zipdepth_metric_384x224_bf16_rgb","path":"/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel","metric":true},
  "family":"aruco4x4_50",
@@ -233,6 +234,42 @@ Body (little-endian) / 响应体（小端）:
 - `scale`: depth_m = `scale_m` / disparity of the model output, with `scale_m` = (`fx` / 640) x 640 / 600 from the current intrinsics (the nominal metric scale armd's grasp code uses before its table fit); values outside 0.02-65 m are 0. `stats`: valid cells and percentiles in mm. `ts_ms`: frame capture time (Unix ms); `inference_ms`: depth stage time. `scale`：深度（米）= `scale_m` / 模型输出视差，`scale_m` = (`fx` / 640) x 640 / 600，取自当前内参（armd 抓取代码在桌面拟合前使用的名义度量比例）；超出 0.02-65 m 的值为 0。`stats`：有效单元数与毫米百分位数。`ts_ms`：帧采集时间（Unix 毫秒）；`inference_ms`：深度阶段耗时。
 - Errors (JSON, passed through by armd) / 错误（JSON，经 armd 原样透传）: 409 `{"error":"depth unavailable"}` (no depth model / 未加载深度模型), 409 `{"error":"depth not metric"}` (relative model loaded / 加载的是相对深度模型), 409 `{"error":"depth busy"}` (another map request is running / 另一深度图请求进行中), 429 `{"error":"depth rate limited","retry_after_ms":n}` with `Retry-After: <s>` (more than one accepted request per second / 每秒超过一次), 503 `{"error":"depth failed"}` (the depth stage failed on the frame / 该帧深度阶段失败), 504 `{"error":"depth timeout"}` (no frame within `wait_ms` / `wait_ms` 内无帧). armd: unreachable 502 `{"error":"detector unreachable"}`, no reply within 6 s 504 `{"error":"detector timed out"}`; 403 `OPERATOR_REQUIRED` without an operator session. armd：不可达 502，6 秒内无回复 504；无操作员会话 403 `OPERATOR_REQUIRED`。
 - Cost: one depth inference (173 ms measured with the resident metric model on 2026-11-21) plus a 344 KB copy of the grid on the frame thread and the mm encoding on the request thread; the body is 172 KB. 开销：一次深度推理（2026-11-21 实测常驻度量模型 173 ms），帧线程复制 344 KB 网格，请求线程做毫米编码；响应体 172 KB。
+
+## Gray frame / 灰度帧
+
+`rebot-vision` exposes raw 8-bit grayscale frames on `:8090` for local on-device consumers (used by `armd` `measure_multiview`); `armd` does not proxy this route.
+
+`rebot-vision` 在 `:8090` 上为本机消费端提供原始 8 位灰度帧（供 `armd` `measure_multiview` 使用）；`armd` 不代理该路由。
+
+- **Loopback-only access / 仅限回环访问**: both `"gray"` in `POST /api/trigger` and `GET /api/frame/gray` check the TCP peer address (`127.0.0.0/8`, `::1`, or `::ffff:127.0.0.0/104`). Remote peers receive `available.gray: false` and `gray_frames: null` in `GET /api/mode`, and `403 FORBIDDEN` if they explicitly request `"gray"` or `GET /api/frame/gray`. Non-gray triggers continue working for remote peers. `POST /api/trigger` 中的 `"gray"` 与 `GET /api/frame/gray` 均校验对端 TCP 地址；非回环对端在 `GET /api/mode` 中看到 `available.gray: false`、`gray_frames: null`，显式请求返回 `403 FORBIDDEN`。不含 `"gray"` 的普通触发对远端仍兼容。
+- **Trigger-only pipeline / 仅限单次触发**: `"gray"` is accepted only in `POST /api/trigger` explicit `pipelines` lists (`["yolo","gray"]`, `["yolo","aruco","gray"]`). `POST /api/subscribe` and persistent mode configuration reject `"gray"` with `400`. When requested, the frame thread validates CH0 RGB888 geometry and converts the visible `640x360` band (`crop [0, 140, 640, 360]`) using `(77*R + 150*G + 29*B) >> 8` (full-range 0..255) into an owned buffer **before** YOLO, ArUco, or depth run, then atomically publishes the result (`instance_id`, `frame_id`, `pipelines.gray.ran: true`) and immutable gray record into a 4-entry FIFO ring. `"gray"` 仅在 `POST /api/trigger` 显式流水线列表中接受，订阅与持久模式返回 `400`。帧线程在 YOLO / ArUco / 深度运行之前校验 CH0 RGB888 几何并按 `(77*R + 150*G + 29*B) >> 8`（0..255 全范围）将 `640x360` 可见区域转换到自有缓冲，再原子发布结果（`instance_id`、`frame_id`、`pipelines.gray.ran: true`）并写入容量为 4 的 FIFO 环形缓冲。
+- **Exact retrieval / 精确获取**: `GET /api/frame/gray?instance_id=<id>&frame_id=<u32>` (immediate lookup, `Cache-Control: no-store`). Concurrent transfers are bounded (`503 GRAY_BUSY` with `Retry-After: 1`) with an absolute send deadline and zero body-sized copies. 精确即时查询，响应带 `Cache-Control: no-store`；并发发送受限（超出返回 `503 GRAY_BUSY` 与 `Retry-After: 1`），带绝对发送超时且无整帧拷贝。
+
+| Status / 状态码 | Error / 错误码 | Condition / 条件 |
+|---|---|---|
+| 200 | — | `application/octet-stream`, `RGF1` binary body below / 下述 `RGF1` 二进制响应体 |
+| 400 | `INVALID_PARAM` | missing, malformed, unknown, duplicate, or overflowing query parameter / 参数缺失、格式错误、未知、重复或溢出 |
+| 403 | `FORBIDDEN` | peer address is not loopback / 对端非回环地址 |
+| 404 | `FRAME_NOT_STORED` | `frame_id` not stored in the current lookup window (e.g. frame ran without `gray`, future ID, or before first eviction) / 当前查询窗口内未存该帧 |
+| 410 | `FRAME_EXPIRED` | `instance_id` mismatch (process restart or counter rollover) or `frame_id` at or below the highest evicted gray frame ID / 实例不匹配或已被环形缓冲淘汰 |
+| 503 | `GRAY_BUSY` | concurrent gray transfer limit reached (`Retry-After: 1`) / 达到并发发送上限 |
+
+`RGF1` body (little-endian) / `RGF1` 响应体（小端）:
+
+| Bytes / 字节 | Content / 内容 |
+|---|---|
+| 0..3 | `RGF1` |
+| 4..7 | `n`, u32 LE: length of the UTF-8 JSON header (including trailing ASCII space padding) / UTF-8 JSON 头长度（含尾部空格补齐） |
+| 8..8+n | UTF-8 JSON header, space-padded so `(8 + n) % 8 == 0` / 以空格补齐使像素起始偏移为 8 的倍数 |
+| 8+n.. | `height` × `stride` raw 8-bit luma bytes (`640 × 360 = 230,400` bytes, `stride = 640`), row-major / 行优先 8 位亮度字节 |
+
+```json
+{"api_version":2,"encoding":"RGF1","format":"gray8","instance_id":"rv-0123456789abcdef","frame_id":42,
+ "width":640,"height":360,"stride":640,"frame_size":[640,640],"frame_format":"RGB888","crop":[0,140,640,360],
+ "channel":0,"luma":"(77*R+150*G+29*B)>>8","luma_range":"full_0_255",
+ "ts_ms":1763791234567,"frame_mono_ms":123450,"wait_mono_ms":123401,"grab_mono_ms":123452,
+ "stored_mono_ms":123459,"convert_ms":4.9,"model_generation":3}
+```
 
 ## Camera intrinsics / 相机内参
 

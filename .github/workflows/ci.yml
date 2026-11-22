@@ -58,6 +58,8 @@ jobs:
           done
       - name: Build script syntax
         run: bash -n scripts/build_deb.sh && bash -n scripts/build_vision.sh
+      - name: build_vision.sh publication tests
+        run: bash scripts/tests/build_vision_publish_test.sh
 
   vision-host-tests:
     # Portable parts of rebot-vision (kits/recamera-b601dm/vision/tests), no SG2002 SDK.

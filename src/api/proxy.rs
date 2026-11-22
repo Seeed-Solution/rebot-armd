@@ -172,14 +172,48 @@ impl DetectorUpstream {
             Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
             None => (rest, ""),
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?),
-            None => (authority, 80),
+        let (host, port) = if let Some(rest_br) = authority.strip_prefix('[') {
+            let Some((h, after)) = rest_br.split_once(']') else {
+                return Err(format!("unclosed IPv6 literal in detector URL: {url}"));
+            };
+            let port = if after.is_empty() {
+                80
+            } else if let Some(p) = after.strip_prefix(':') {
+                p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?
+            } else {
+                return Err(format!("invalid authority in detector URL: {url}"));
+            };
+            (h, port)
+        } else {
+            let (h, p) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?),
+                None => (authority, 80),
+            };
+            if h.contains('[') || h.contains(']') {
+                return Err(format!("invalid host in detector URL: {url}"));
+            }
+            (h, p)
         };
         if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
             return Err(format!("invalid host in detector URL: {url}"));
         }
         Ok(Self { host: host.to_string(), port, base_path: path.to_string() })
+    }
+
+    /// True when the upstream host is a loopback address (`localhost`, `127.0.0.0/8`, `::1`,
+    /// or IPv4-mapped `::ffff:127.0.0.0/104`).
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+            return v4.is_loopback();
+        }
+        if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+            return v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback());
+        }
+        false
     }
 
     /// `ARMD_DETECTOR_URL` if set and valid, else [`DEFAULT_DETECTOR_URL`].
@@ -205,9 +239,14 @@ pub(crate) struct UpstreamResponse {
 /// Raw HTTP/1.1 request bytes. A request with a body always carries `Content-Type: application/json`
 /// (the detector rejects other content types on POST /api/trigger and /api/inference).
 fn build_request(up: &DetectorUpstream, method: &Method, path_and_query: &str, body: Option<&[u8]>) -> Vec<u8> {
+    let host_hdr = if up.host.contains(':') {
+        format!("[{}]:{}", up.host, up.port)
+    } else {
+        format!("{}:{}", up.host, up.port)
+    };
     let mut req = format!(
-        "{method} {}{path_and_query} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\nConnection: close\r\n",
-        up.base_path, up.host, up.port
+        "{method} {}{path_and_query} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: application/json\r\nConnection: close\r\n",
+        up.base_path
     );
     if let Some(b) = body {
         req.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()));
@@ -538,6 +577,22 @@ pub(crate) async fn fetch_snapshot(up: &DetectorUpstream, timeout: Duration) -> 
         .map_err(|_| "snapshot timed out".to_string())??;
     if !r.status.is_success() { return Err(format!("snapshot returned {}", r.status)); }
     Ok(r.body)
+}
+
+/// One raw HTTP request to the detector control port returning `(status, content_type, body)`
+/// for armd's internal binary endpoints (e.g. `GET /api/frame/gray`).
+pub(crate) async fn request_status_bytes(
+    up: &DetectorUpstream,
+    method: &str,
+    path_and_query: &str,
+    timeout: Duration,
+) -> Result<(StatusCode, Option<String>, Vec<u8>), String> {
+    let method = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(timeout, upstream_request(up, method, path_and_query, None))
+        .await
+        .map_err(|_| "detector timed out".to_string())??;
+    let ct = r.content_type.and_then(|v| v.to_str().ok().map(str::to_string));
+    Ok((r.status, ct, r.body))
 }
 
 /// GET /api/v1/detection/mask_focus -> upstream GET /api/mask_focus

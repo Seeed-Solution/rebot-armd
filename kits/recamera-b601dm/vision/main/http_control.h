@@ -45,9 +45,13 @@ class HttpControlServer {
 public:
     static constexpr int kMaxClients = 8;
     static constexpr int kRequestDeadlineMs = 3000;  // headers + body, total
+    static constexpr int kDefaultSendDeadlineMs = 2000;  // total response send deadline
 
     explicit HttpControlServer(VisionControl& ctl) : ctl_(ctl) {}
     ~HttpControlServer();
+
+    void set_send_deadline_ms(int ms) noexcept { send_deadline_ms_.store(ms > 0 ? ms : kDefaultSendDeadlineMs); }
+    int bound_port() const noexcept { return bound_port_.load(); }
 
     bool start(int port);
     void stop();
@@ -65,6 +69,8 @@ private:
 
     VisionControl& ctl_;
     int server_fd_ = -1;
+    std::atomic<int> bound_port_{0};
+    std::atomic<int> send_deadline_ms_{kDefaultSendDeadlineMs};
     std::atomic<bool> running_{false};
     std::unique_ptr<std::thread> thread_;
     std::mutex clients_mu_;

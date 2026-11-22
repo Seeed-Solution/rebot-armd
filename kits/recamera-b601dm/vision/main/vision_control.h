@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "depth_map.h"
+#include "gray_frame.h"
 #include "intrinsics.h"
 #include "mask_geom.h"
 #include "model_catalogue.h"
@@ -31,16 +33,17 @@ struct Pipelines {
     bool yolo = false;
     bool aruco = false;
     bool depth = false;
-    bool any() const noexcept { return yolo || aruco || depth; }
+    bool gray = false;
+    bool any() const noexcept { return yolo || aruco || depth || gray; }
     bool operator==(const Pipelines& o) const noexcept {
-        return yolo == o.yolo && aruco == o.aruco && depth == o.depth;
+        return yolo == o.yolo && aruco == o.aruco && depth == o.depth && gray == o.gray;
     }
     Pipelines operator|(const Pipelines& o) const noexcept {
-        return {yolo || o.yolo, aruco || o.aruco, depth || o.depth};
+        return {yolo || o.yolo, aruco || o.aruco, depth || o.depth, gray || o.gray};
     }
     /** Every pipeline of `o` is in this set. */
     bool covers(const Pipelines& o) const noexcept {
-        return (yolo || !o.yolo) && (aruco || !o.aruco) && (depth || !o.depth);
+        return (yolo || !o.yolo) && (aruco || !o.aruco) && (depth || !o.depth) && (gray || !o.gray);
     }
 };
 
@@ -105,17 +108,20 @@ private:
 
 /** One processed frame. JSON fragments are built by the frame thread (result_json.h). */
 struct VisionResult {
-    uint32_t frame_id = 0;  ///< 0: no result produced yet
-    uint64_t ts_ms = 0;     ///< frame capture time, Unix epoch ms
-    uint64_t frame_ms = 0;  ///< mono_ms() the frame is known to be newer than (frame_plan())
+    std::string instance_id;  ///< process/instance identity owning `frame_id`
+    uint32_t frame_id = 0;    ///< 0: no result produced yet
+    uint64_t ts_ms = 0;       ///< frame capture time, Unix epoch ms
+    uint64_t frame_ms = 0;    ///< mono_ms() the frame is known to be newer than (frame_plan())
     float inference_ms = 0;
     Mode mode = Mode::Off;  ///< base mode when the frame ran
     bool ran_yolo = false;
     bool ran_aruco = false;
     bool ran_depth = false;
+    bool ran_gray = false;
     float yolo_ms = 0;
     float aruco_ms = 0;
     float depth_ms = 0;
+    float gray_ms = 0;
     float mask_ms = -1.0f;
     int width = 640;   ///< visible image size that detections / markers refer to
     int height = 360;
@@ -210,6 +216,14 @@ public:
         Intrinsics intrinsics;           ///< what the ArUco stage started with
         bool intrinsics_cli_override = false;
         std::string config_path;         ///< active vision.json (PUT /api/calibration/intrinsics writes it)
+        bool gray_available = true;      ///< fixed-format 640x360 gray frames supported by this config
+        int gray_width = kGrayWidth;
+        int gray_height = kGrayHeight;
+        int gray_crop[4] = {0, 140, kGrayWidth, kGrayHeight};
+        int frame_size[2] = {640, 640};
+        std::string instance_id;         ///< optional override for tests; empty = auto-generated
+        uint32_t initial_frame_id = 0;   ///< optional starting frame counter for rollover tests
+        int max_gray_sends = 2;          ///< maximum concurrent GET /api/frame/gray responses
     };
 
     enum class IntrinsicsStatus { Ok, CliOverride, RevisionMismatch, PersistFailed };
@@ -219,22 +233,21 @@ public:
 
     class TriggerScope {
     public:
-        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) : c_(&c), req_(request_ms) {
-            c_->trigger_begin(req_, p, focus);
-        }
+        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr)
+            : c_(&c), handle_(c_->trigger_begin(request_ms, p, focus)) {}
         ~TriggerScope() { release(); }
         TriggerScope(const TriggerScope&) = delete;
         TriggerScope& operator=(const TriggerScope&) = delete;
         void release() {
             if (c_) {
-                c_->trigger_end(req_);
+                c_->trigger_end(handle_);
                 c_ = nullptr;
             }
         }
 
     private:
         VisionControl* c_;
-        uint64_t req_;
+        uint64_t handle_ = 0;
     };
 
     VisionControl(const Options& opt, OnChange on_change);
@@ -257,6 +270,14 @@ public:
     int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
     bool depth_available() const { return models().depth_available; }
+    bool gray_available() const noexcept { return gray_available_; }
+    int gray_width() const noexcept { return gray_width_; }
+    int gray_height() const noexcept { return gray_height_; }
+    const int* gray_crop() const noexcept { return gray_crop_; }
+    const int* frame_size() const noexcept { return frame_size_; }
+    std::string instance_id() const;
+    /** Allocate the next frame_id on the frame thread, rotating instance_id before u32 wrap. */
+    uint32_t next_frame_id(std::string& instance_out);
     const Catalogue& catalogue() const noexcept { return catalogue_; }
 
     /**
@@ -272,6 +293,11 @@ public:
     bool take_swap(SwapRequest& out);
     /** Frame thread: publish the set after a swap (generation +1); `error` empty = idle, else failed. */
     uint64_t finish_swap(ModelSet now, const std::string& error);
+    /**
+     * End a Running swap that threw: clears the slots the caller unloaded, marks the swap Failed
+     * ("SWAP_FAILED") and returns the new generation. Does not allocate.
+     */
+    uint64_t fail_swap(bool detector_cleared, bool depth_cleared) noexcept;
     /** Swap state, its error and the generation it publishes (pending / running) or published. */
     SwapState swap_state(std::string* error = nullptr, uint64_t* generation = nullptr) const;
 
@@ -340,8 +366,8 @@ public:
 
     /** A trigger without pipelines: the default subscription's, else the last active mode's. */
     Pipelines default_trigger_pipelines() const;
-    void trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr);
-    void trigger_end(uint64_t request_ms);
+    uint64_t trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr);
+    void trigger_end(uint64_t handle);
     TriggerScope trigger_scope(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) {
         return TriggerScope(*this, request_ms, p, focus);
     }
@@ -355,23 +381,46 @@ public:
         return TriggerScope(*this, request_ms, default_trigger_pipelines(), nullptr);
     }
 
-    void publish(const VisionResult& r);
+    /**
+     * Atomically publish a processed frame result and its optional gray frame record (frozen as
+     * immutable once retained in `gray_ring_`, with `stored_mono_ms` stamped after insertion under
+     * `mu_`). Any evicted gray frame is destroyed outside `mu_`. If `r.ran_gray` is true without a
+     * valid matching `gray` record, `ran_gray` is cleared and nothing is installed in the gray ring.
+     */
+    void publish(const VisionResult& r, std::shared_ptr<GrayFrame> gray = nullptr);
+    /** Atomically capture the current `(instance_id, frame_id)` baseline under `mu_`. */
+    void current_baseline(std::string& instance_out, uint32_t& frame_id_out) const;
+    /** Look up a retained gray frame by `(instance_id, frame_id)` (immediate, no wait). */
+    GrayRing::Lookup get_gray(const std::string& instance_id, uint32_t frame_id,
+                              std::shared_ptr<const GrayFrame>& out) const;
+    /** Acquire a concurrent gray-frame send slot; returns nullptr when at capacity (503 GRAY_BUSY). */
+    std::shared_ptr<void> try_acquire_gray_send();
+    int active_gray_sends() const noexcept { return active_gray_sends_->load(std::memory_order_acquire); }
+    int max_gray_sends() const noexcept { return max_gray_sends_; }
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
-     * Wait for a result newer than `after` from a frame newer than request_ms that ran at least
-     * `need` (a trigger's result). Returns true on timeout.
+     * Wait for a result newer than `(after_instance, after)` from a frame newer than request_ms
+     * that ran at least `need` (a trigger's result). Passing the captured `(after_instance, after)`
+     * pair prevents a rollover race between baseline capture and wait entry. When
+     * `require_depth_map` is true, only results carrying a valid `depth_disp` grid satisfy the wait.
+     * Returns true on timeout.
      */
-    bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out);
+    bool wait_fresh(const std::string& after_instance, uint32_t after, uint64_t request_ms, Pipelines need,
+                    int wait_ms, VisionResult& out, bool require_depth_map = false);
+    bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
+                    bool require_depth_map = false);
     void shutdown();
 
 private:
     struct Trigger {
-        uint64_t request_ms;
+        uint64_t handle = 0;
+        uint64_t request_ms = 0;
         Pipelines pipelines;
         bool has_focus = false;
         MaskFocus focus;
     };
+    static constexpr size_t kRecentResultsCap = 8;
     Continuous continuous_locked() const noexcept;
     bool processing_locked() const noexcept { return continuous_locked().active() || !triggers_.empty(); }
     int fps_locked() const noexcept;
@@ -395,6 +444,7 @@ private:
     int fps_ = 5;
     MaskFocus persistent_focus_;
     std::vector<Trigger> triggers_;  ///< pending triggers
+    uint64_t next_trigger_handle_ = 1;
     std::vector<Subscription> subs_;
     uint64_t next_sub_id_ = 1;
     bool reported_proc_ = false;
@@ -405,7 +455,19 @@ private:
     RateMeter input_meter_;
     RateMeter result_meter_;
     uint32_t offered_ = 0;
+    const bool gray_available_;
+    const int gray_width_;
+    const int gray_height_;
+    int gray_crop_[4] = {0, 140, kGrayWidth, kGrayHeight};
+    int frame_size_[2] = {640, 640};
+    std::string instance_id_;
+    uint32_t frame_seq_ = 0;
+    GrayRing gray_ring_{kGrayRingCapacity};
     VisionResult latest_;
+    VisionResult latest_depth_map_;
+    std::vector<VisionResult> recent_results_;
+    size_t recent_head_ = 0;
+    size_t recent_count_ = 0;
     bool stopping_ = false;
     ModelSet models_;
     SwapState swap_ = SwapState::Idle;
@@ -420,6 +482,8 @@ private:
     uint64_t intrinsics_applied_ = 1;
     DepthMapGate depth_map_gate_{1000};
     std::atomic<int> depth_map_wanted_{0};
+    const int max_gray_sends_;
+    std::shared_ptr<std::atomic<int>> active_gray_sends_;
 };
 
 /** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
@@ -435,6 +499,22 @@ struct HttpReply {
     std::string body;
     std::string content_type = "application/json";
     std::vector<std::pair<std::string, std::string>> headers;  ///< extra response headers
+    /** Optional immutable binary segment appended directly after `body` without copying. */
+    std::shared_ptr<const std::vector<uint8_t>> binary_segment;
+    /** Optional RAII guard (e.g., concurrent gray send slot) held until reply transmission finishes. */
+    std::shared_ptr<void> send_guard;
+
+    size_t content_length() const noexcept {
+        return body.size() + (binary_segment ? binary_segment->size() : 0u);
+    }
+    std::string full_body() const {
+        if (!binary_segment || binary_segment->empty()) return body;
+        std::string out;
+        out.reserve(body.size() + binary_segment->size());
+        out.append(body);
+        out.append(reinterpret_cast<const char*>(binary_segment->data()), binary_segment->size());
+        return out;
+    }
 };
 
 /** Who sent the request. Loopback = 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104. */
@@ -447,8 +527,12 @@ struct RequestPeer {
  *   GET  /api/inference                 POST /api/inference {"enabled": bool}
  *   GET  /api/mode                      POST /api/mode {"mode"?, "enabled"?, "fps"?}
  *   GET  /api/results/latest[?after=<frame_id>&wait_ms=<0..5000>]
- *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco", ...], "wait_ms"?}
- *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
+ *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco"|"depth"|"gray", ...], "wait_ms"?}
+ *        ("gray" accepted from loopback peers only; 403 otherwise)
+ *   GET  /api/frame/gray?instance_id=<id>&frame_id=<u32>  (loopback peer only; 403 otherwise)
+ *        exact immediate lookup; 200 application/octet-stream (RGF1), 400 invalid/duplicate/overflow
+ *        params, 404 FRAME_NOT_STORED, 410 FRAME_EXPIRED, 503 GRAY_BUSY + Retry-After
+ *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}  ("gray" refused: 400)
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
  *   GET  /api/depth[?wait_ms=<0..5000>]  one depth inference on a fresh frame; 200

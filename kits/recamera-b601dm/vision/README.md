@@ -5,9 +5,18 @@ The reCamera kit's camera process (C++, SG2002). One process owns the camera and
 - H.264 video over WebSocket on `:8001` (`/`; each binary message is one access unit followed by
   an 8-byte little-endian Unix-ms timestamp), the overlay stream `/results` and `/snapshot.jpg`;
 - the perception provider API v2 on `:8090` (`/api/inference`, `/api/results/latest`,
-  `/api/trigger`, `/api/mode`, `/api/subscribe`, `/api/subscriptions`, `/api/depth`), which armd
-  proxies under `/api/v1/detection/*` and `/api/v1/vision/*`. API and result shapes:
+  `/api/trigger`, `/api/mode`, `/api/subscribe`, `/api/subscriptions`, `/api/depth`,
+  `/api/frame/gray`), which armd proxies under `/api/v1/detection/*` and `/api/v1/vision/*`
+  (except loopback-only `/api/frame/gray` and `/api/calibration/intrinsics`). API and result shapes:
   [docs/detection_api.md](../../../docs/detection_api.md).
+- `GET /api/frame/gray?instance_id=<id>&frame_id=<u32>` (loopback-only): exact retrieval of a
+  640x360 8-bit grayscale frame produced by a loopback `POST /api/trigger` naming `"gray"`
+  (`main/gray_frame.{h,cpp}`). Converted from the validated CH0 RGB888 visible band
+  (`(77*R + 150*G + 29*B) >> 8`, full-range 0..255) into an owned buffer before YOLO/ArUco/depth
+  run, published atomically with the trigger result into a 4-entry FIFO ring, and sent as a
+  segmented `RGF1` binary payload (`application/octet-stream`, `Cache-Control: no-store`, bounded
+  concurrent transfers with an absolute send deadline). Remote peers see `available.gray: false` and
+  receive `403 FORBIDDEN`. Subscriptions reject `"gray"` (`400`).
 - `GET /api/depth`: one depth inference on the next frame (a depth trigger, so it shares the frame
   thread's single depth stage), returned as a 384x224 u16 millimetre map with a JSON header
   (`main/depth_map.{h,cpp}`). One request at a time (409 `depth busy`), at most one per second

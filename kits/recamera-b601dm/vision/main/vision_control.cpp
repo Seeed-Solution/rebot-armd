@@ -105,10 +105,23 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       catalogue_(opt.catalogue),
       on_change_(std::move(on_change)),
       fps_(clamp_fps(opt.fps)),
+      gray_available_(opt.gray_available && opt.gray_width == kGrayWidth && opt.gray_height == kGrayHeight),
+      gray_width_(opt.gray_width),
+      gray_height_(opt.gray_height),
+      instance_id_(opt.instance_id.empty() ? generate_instance_id() : opt.instance_id),
+      frame_seq_(opt.initial_frame_id),
+      recent_results_(kRecentResultsCap),
       models_(model_set_of(opt)),
       intrinsics_cli_(opt.intrinsics_cli_override),
       config_path_(opt.config_path),
-      intrinsics_(opt.intrinsics) {
+      intrinsics_(opt.intrinsics),
+      max_gray_sends_(opt.max_gray_sends > 0 ? opt.max_gray_sends : 1),
+      active_gray_sends_(std::make_shared<std::atomic<int>>(0)) {
+    // swap error texts (SWAP_FAILED, LOAD_FAILED:detector,depth, ...) then never reallocate, so
+    // finish_swap() and fail_swap() do not allocate
+    swap_error_.reserve(64);
+    for (int i = 0; i < 4; ++i) gray_crop_[i] = opt.gray_crop[i];
+    for (int i = 0; i < 2; ++i) frame_size_[i] = opt.frame_size[i];
     Mode m = opt.mode;
     // Without a model, YOLO modes fall back to what still works.
     if (!opt.yolo_available) m = (m == Mode::Both || m == Mode::Aruco) ? Mode::Aruco : Mode::Off;
@@ -116,6 +129,7 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
     last_active_ = m != Mode::Off ? m : (opt.yolo_available ? Mode::Yolo : Mode::Aruco);
     continuous_ = opt.enabled && m != Mode::Off;
     latest_.mode = mode_;
+    latest_.instance_id = instance_id_;
     reported_proc_ = processing_locked();
     reported_gate_ = gate_locked();
     gate_active_ = continuous_locked().active();
@@ -175,9 +189,19 @@ void VisionControl::notify_locked() {
     const bool proc = processing_locked();
     const int gate = gate_locked();
     if (proc == reported_proc_ && gate == reported_gate_) return;
+    const bool prev_proc = reported_proc_;
+    const int prev_gate = reported_gate_;
     reported_proc_ = proc;
     reported_gate_ = gate;
-    if (on_change_) on_change_(proc, gate);
+    if (!on_change_) return;
+    try {
+        on_change_(proc, gate);
+    } catch (...) {
+        // not reported: the next notification calls the callback again
+        reported_proc_ = prev_proc;
+        reported_gate_ = prev_gate;
+        throw;
+    }
 }
 
 int VisionControl::camera_fps() const {
@@ -420,10 +444,60 @@ Pipelines VisionControl::default_trigger_pipelines() const {
     return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
 }
 
-void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus) {
+std::string VisionControl::instance_id() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return instance_id_;
+}
+
+uint32_t VisionControl::next_frame_id(std::string& instance_out) {
+    std::vector<std::shared_ptr<const GrayFrame>> displaced;
+    VisionResult displaced_depth;
+    uint32_t id = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const bool rollover = frame_seq_ == UINT32_MAX;
+        // 1. Everything that can allocate, before any member changes: a failure leaves identity,
+        //    sequence and retained records as they were, and the next call rolls over again.
+        std::string next_inst;
+        std::string latest_inst;
+        if (rollover) {
+            next_inst = generate_instance_id();
+            if (next_inst == instance_id_) next_inst = generate_instance_id();
+            latest_inst = next_inst;
+            displaced.reserve(gray_ring_.capacity());  // GrayRing::clear() then does not allocate
+        }
+        std::string out = rollover ? next_inst : instance_id_;
+        // 2. Commit with non-throwing operations.
+        if (rollover) {
+            gray_ring_.clear(displaced);
+            // Keep the pre-sized history slots (publish() indexes them); empty them and restart
+            // the ring so no index refers to a previous-generation entry.
+            for (VisionResult& slot : recent_results_) slot = VisionResult{};
+            recent_head_ = 0;
+            recent_count_ = 0;
+            // The retained depth map belongs to the previous generation.
+            displaced_depth = std::move(latest_depth_map_);
+            latest_depth_map_ = VisionResult{};
+            latest_.frame_id = 0;
+            latest_.instance_id = std::move(latest_inst);
+            instance_id_ = std::move(next_inst);
+            frame_seq_ = 0;
+        }
+        id = ++frame_seq_;
+        instance_out = std::move(out);
+    }
+    displaced.clear();
+    displaced_depth.depth_disp.reset();
+    return id;
+}
+
+uint64_t VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus) {
+    uint64_t handle = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         Trigger t;
+        handle = next_trigger_handle_++;
+        t.handle = handle;
         t.request_ms = request_ms;
         t.pipelines = p;
         if (focus && focus->active) {
@@ -436,13 +510,14 @@ void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFo
         notify_locked();
     }
     cv_.notify_all();
+    return handle;
 }
 
-void VisionControl::trigger_end(uint64_t request_ms) {
+void VisionControl::trigger_end(uint64_t handle) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = triggers_.begin(); it != triggers_.end(); ++it) {
-            if (it->request_ms == request_ms) {
+            if (it->handle == handle) {
                 triggers_.erase(it);
                 break;
             }
@@ -452,29 +527,151 @@ void VisionControl::trigger_end(uint64_t request_ms) {
     cv_.notify_all();
 }
 
-void VisionControl::publish(const VisionResult& r) {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        latest_ = r;
-        latest_.done_ms = mono_ms();
-        result_meter_.add(r.frame_ms);
-    }
-    cv_.notify_all();
+static bool has_valid_depth_map(const VisionResult& r) noexcept {
+    return r.depth_disp && r.depth_grid_w > 0 && r.depth_grid_h > 0 &&
+           r.depth_disp->size() == static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h);
 }
 
-bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out) {
+void VisionControl::publish(const VisionResult& r, std::shared_ptr<GrayFrame> gray) {
+    std::shared_ptr<const GrayFrame> displaced_gray;
+    VisionResult displaced_latest;
+    VisionResult displaced_depth;
+    VisionResult displaced_hist;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // 1. Prepare all potentially allocating state BEFORE mutating any shared member so an
+        //    allocation failure cannot leave gray_ring_, latest_, or recent_results_ out of sync.
+        VisionResult stored = r;
+        if (stored.instance_id.empty()) stored.instance_id = instance_id_;
+        bool gray_ok = false;
+        if (stored.ran_gray) {
+            gray_ok = gray && gray->valid() && gray->frame_id == stored.frame_id &&
+                      gray->instance_id == stored.instance_id;
+            if (!gray_ok) {
+                stored.ran_gray = false;
+                stored.gray_ms = 0;
+                gray.reset();
+            }
+        } else {
+            gray.reset();
+        }
+        stored.done_ms = mono_ms();
+
+        VisionResult hist = stored;
+        hist.depth_disp.reset();
+        const bool save_depth = has_valid_depth_map(stored);
+        VisionResult depth_copy;
+        if (save_depth) depth_copy = stored;
+
+        // 2. Commit atomically using strictly non-throwing operations into pre-allocated storage.
+        if (gray_ok) {
+            GrayFrame* raw_gray = gray.get();
+            displaced_gray = gray_ring_.put(std::move(gray));
+            // Stamp stored_mono_ms after ring insertion while mu_ is still held (no reader can
+            // observe the record until mu_ unlocks, after which it is only exposed as const).
+            raw_gray->stored_mono_ms = mono_ms();
+        }
+        displaced_latest = std::move(latest_);
+        latest_ = std::move(stored);
+        if (save_depth) {
+            displaced_depth = std::move(latest_depth_map_);
+            latest_depth_map_ = std::move(depth_copy);
+        }
+        size_t hist_idx = 0;
+        if (recent_count_ >= kRecentResultsCap) {
+            hist_idx = recent_head_;
+            recent_head_ = (recent_head_ + 1) % kRecentResultsCap;
+        } else {
+            hist_idx = (recent_head_ + recent_count_) % kRecentResultsCap;
+            ++recent_count_;
+        }
+        displaced_hist = std::move(recent_results_[hist_idx]);
+        recent_results_[hist_idx] = std::move(hist);
+        result_meter_.add(latest_.frame_ms);
+    }
+    cv_.notify_all();
+    // Displaced (or rejected) buffers are destroyed here, outside mu_.
+    displaced_gray.reset();
+    displaced_depth.depth_disp.reset();
+    displaced_latest.depth_disp.reset();
+    gray.reset();
+}
+
+void VisionControl::current_baseline(std::string& instance_out, uint32_t& frame_id_out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    instance_out = (latest_.frame_id != 0 && !latest_.instance_id.empty()) ? latest_.instance_id : instance_id_;
+    frame_id_out = latest_.frame_id;
+}
+
+GrayRing::Lookup VisionControl::get_gray(const std::string& instance_id, uint32_t frame_id,
+                                         std::shared_ptr<const GrayFrame>& out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return gray_ring_.find(instance_id, frame_id, instance_id_, out);
+}
+
+std::shared_ptr<void> VisionControl::try_acquire_gray_send() {
+    std::atomic<int>* counter = active_gray_sends_.get();
+    int cur = counter->load(std::memory_order_acquire);
+    while (cur < max_gray_sends_) {
+        if (counter->compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            std::shared_ptr<std::atomic<int>> keep = active_gray_sends_;
+            return std::shared_ptr<void>(counter, [keep](void*) {
+                keep->fetch_sub(1, std::memory_order_acq_rel);
+            });
+        }
+    }
+    return nullptr;
+}
+
+bool VisionControl::wait_fresh(const std::string& after_instance, uint32_t after, uint64_t request_ms, Pipelines need,
+                               int wait_ms, VisionResult& out, bool require_depth_map) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
     std::unique_lock<std::mutex> lk(mu_);
+    const std::string start_instance = after_instance.empty() ? instance_id_ : after_instance;
     // A frame planned before this trigger was registered can be newer than request_ms but
-    // lack its pipelines; the next one has them.
-    auto fresh = [&] {
-        return latest_.frame_id > after && latest_.frame_ms >= request_ms &&
-               Pipelines{latest_.ran_yolo, latest_.ran_aruco, latest_.ran_depth}.covers(need);
+    // lack its pipelines; the next one has them. Scanning recent_results_ newest-to-oldest
+    // also preserves the qualifying result if a later non-matching frame updates latest_.
+    // Map waiters require the actual depth_disp payload, preserved in latest_depth_map_ across
+    // intervening non-depth publications.
+    auto matches = [&](const VisionResult& r) {
+        if (r.frame_id == 0) return false;
+        // Only the baseline's generation and the current one exist for this waiter; anything
+        // else (a retained entry of an older generation) is not newer than the baseline.
+        if (r.instance_id != start_instance && r.instance_id != instance_id_) return false;
+        const bool newer = (r.instance_id == start_instance) ? (r.frame_id > after) : true;
+        if (!newer || r.frame_ms < request_ms) return false;
+        if (!Pipelines{r.ran_yolo, r.ran_aruco, r.ran_depth, r.ran_gray}.covers(need)) return false;
+        if (require_depth_map && !has_valid_depth_map(r)) return false;
+        return true;
     };
-    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return fresh() || stopping_; });
+    auto find_match = [&]() -> const VisionResult* {
+        if (require_depth_map) {
+            if (matches(latest_)) return &latest_;
+            if (matches(latest_depth_map_)) return &latest_depth_map_;
+            return nullptr;
+        }
+        for (size_t i = recent_count_; i-- > 0;) {
+            const VisionResult& entry = recent_results_[(recent_head_ + i) % kRecentResultsCap];
+            if (matches(entry)) {
+                if (entry.frame_id == latest_.frame_id && entry.instance_id == latest_.instance_id) return &latest_;
+                return &entry;
+            }
+        }
+        return matches(latest_) ? &latest_ : nullptr;
+    };
+    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return find_match() != nullptr || stopping_; });
+    if (const VisionResult* hit = find_match()) {
+        out = *hit;
+        return false;
+    }
     out = latest_;
-    return !fresh();
+    return true;
+}
+
+bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
+                               bool require_depth_map) {
+    return wait_fresh(std::string{}, after, request_ms, need, wait_ms, out, require_depth_map);
 }
 
 bool VisionControl::latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out) {
@@ -501,9 +698,10 @@ VisionControl::Status VisionControl::request_swap(const SwapRequest& req, uint64
     budget = check_budget(catalogue_, after_swap(req.detector, models_.model_name),
                           after_swap(req.depth, models_.depth_model_name));
     if (!budget.ok) return Status::IonBudget;
-    swap_ = SwapState::Pending;
-    swap_req_ = req;
+    SwapRequest stored = req;  // may throw: copied before the swap is marked Pending
+    swap_req_ = std::move(stored);
     swap_error_.clear();
+    swap_ = SwapState::Pending;
     generation = models_.generation + 1;
     notify_locked();
     return Status::Ok;
@@ -521,9 +719,15 @@ bool VisionControl::take_swap(SwapRequest& out) {
         notify_locked();
         return false;
     }
+    SwapRequest taken = swap_req_;  // may throw: a failed copy leaves the swap Pending
     swap_ = SwapState::Running;
-    out = swap_req_;
-    notify_locked();
+    try {
+        notify_locked();  // the camera-gate callback can throw
+    } catch (...) {
+        swap_ = SwapState::Pending;  // not taken: the next frame takes it again
+        throw;
+    }
+    out = std::move(taken);
     return true;
 }
 
@@ -533,6 +737,27 @@ uint64_t VisionControl::finish_swap(ModelSet now, const std::string& error) {
     models_ = std::move(now);
     swap_ = error.empty() ? SwapState::Idle : SwapState::Failed;
     swap_error_ = error;
+    return models_.generation;
+}
+
+uint64_t VisionControl::fail_swap(bool detector_cleared, bool depth_cleared) noexcept {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (detector_cleared) {
+        models_.yolo_available = false;
+        models_.model_name.clear();
+        models_.model_path.clear();
+        models_.model_kind.clear();
+        models_.mask = false;
+    }
+    if (depth_cleared) {
+        models_.depth_available = false;
+        models_.depth_model_name.clear();
+        models_.depth_model_path.clear();
+        models_.depth_metric = false;
+    }
+    ++models_.generation;
+    swap_ = SwapState::Failed;
+    swap_error_.assign("SWAP_FAILED");  // within the capacity reserved by the constructor
     return models_.generation;
 }
 
@@ -628,6 +853,7 @@ static nlohmann::json pipeline_list(Pipelines p) {
     if (p.yolo) a.push_back("yolo");
     if (p.aruco) a.push_back("aruco");
     if (p.depth) a.push_back("depth");
+    if (p.gray) a.push_back("gray");
     return a;
 }
 
@@ -750,14 +976,18 @@ static HttpReply put_intrinsics(VisionControl& ctl, const std::string& body, Req
     return {200, intrinsics_body(ctl)};
 }
 
-static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
+static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0, RequestPeer peer = {}) {
     const uint64_t now = now_ms ? now_ms : mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
     const ModelSet ms = ctl.models();
+    const bool gray_avail = peer.loopback && ctl.gray_available();
+    const int* crop = ctl.gray_crop();
+    const int* fsize = ctl.frame_size();
     MaskFocus mf;
     nlohmann::json j = {
         {"api_version", kApiVersion},
+        {"instance_id", ctl.instance_id()},
         {"mode", mode_name(m)},
         {"modes", {"off", "yolo", "aruco", "both"}},
         {"pipelines", {{"yolo", p.yolo}, {"aruco", p.aruco}, {"depth", p.depth}}},
@@ -775,7 +1005,21 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"subscriptions", true},
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
-        {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}}},
+        {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}, {"gray", gray_avail}}},
+        {"gray_frames",
+         gray_avail
+             ? nlohmann::json{{"encoding", "RGF1"},
+                              {"format", "gray8"},
+                              {"width", ctl.gray_width()},
+                              {"height", ctl.gray_height()},
+                              {"stride", ctl.gray_width()},
+                              {"crop", {crop[0], crop[1], crop[2], crop[3]}},
+                              {"frame_size", {fsize[0], fsize[1]}},
+                              {"luma", "(77*R+150*G+29*B)>>8"},
+                              {"luma_range", "full_0_255"},
+                              {"ring", kGrayRingCapacity},
+                              {"exposure_qualified", false}}
+             : nlohmann::json(nullptr)},
         {"model", {{"name", ms.model_name}, {"path", ms.model_path}, {"kind", name_or_null(ms.model_kind)}, {"mask", ms.mask}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
         {"depth_model", ms.depth_available ? nlohmann::json{{"name", ms.depth_model_name}, {"path", ms.depth_model_path}, {"metric", ms.depth_metric}} : nullptr},
         {"family", ctl.family()},
@@ -786,8 +1030,8 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
     return j.dump();
 }
 
-static std::string mode_body(const VisionControl& ctl, uint64_t now_ms = 0) {
-    return status_json(ctl, now_ms);
+static std::string mode_body(const VisionControl& ctl, uint64_t now_ms = 0, RequestPeer peer = {}) {
+    return status_json(ctl, now_ms, peer);
 }
 
 static bool query_param(const std::string& query, const std::string& key, std::string& value) {
@@ -829,7 +1073,8 @@ static bool wait_ms_param(const std::string& query, int& wait_ms) {
 static void put_result(std::ostringstream& s, const VisionResult& r, const std::string& family, uint64_t now_ms) {
     const uint64_t now = now_ms == 0 ? get_unix_ms() : now_ms;
     const long long age = static_cast<long long>(now) - static_cast<long long>(r.ts_ms);
-    s << std::fixed << ",\"mode\":\"" << mode_name(r.mode) << "\",\"frame_id\":" << r.frame_id
+    s << std::fixed << ",\"instance_id\":" << nlohmann::json(r.instance_id).dump()
+      << ",\"mode\":\"" << mode_name(r.mode) << "\",\"frame_id\":" << r.frame_id
       << ",\"ts_ms\":" << r.ts_ms << ",\"age_ms\":" << (age < 0 ? 0 : age) << ",\"inference_time_ms\":"
       << std::setprecision(1) << r.inference_ms << ",\"width\":" << r.width << ",\"height\":" << r.height
       << ",\"pipelines\":{\"yolo\":{\"ran\":" << (r.ran_yolo ? "true" : "false") << ",\"ms\":" << r.yolo_ms;
@@ -838,7 +1083,8 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
     }
     s << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
     if (!r.aruco_stages_json.empty()) s << ",\"stages\":" << r.aruco_stages_json;
-    s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms << "}}"
+    s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms
+      << "},\"gray\":{\"ran\":" << (r.ran_gray ? "true" : "false") << ",\"ms\":" << r.gray_ms << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
       << "\",\"undistorted\":" << (r.undistorted ? "true" : "false") << ",\"rejected\":" << r.rejected
       << ",\"markers\":" << r.markers_json << ",\"model_generation\":" << r.model_generation;
@@ -898,8 +1144,8 @@ static bool body_object(const std::string& body, nlohmann::json& out) {
     return !out.is_discarded() && out.is_object();
 }
 
-/** "pipelines": a non-empty list of "yolo" / "aruco" / "depth" (duplicates allowed). */
-static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
+/** "pipelines": a non-empty list of "yolo" / "aruco" / "depth" (and "gray" when `allow_gray`). */
+static bool parse_pipelines(const nlohmann::json& v, Pipelines& out, bool allow_gray = false) {
     if (!v.is_array() || v.empty()) return false;
     Pipelines p;
     for (const auto& x : v) {
@@ -908,6 +1154,7 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
         if (s == "yolo") p.yolo = true;
         else if (s == "aruco") p.aruco = true;
         else if (s == "depth") p.depth = true;
+        else if (allow_gray && s == "gray") p.gray = true;
         else return false;
     }
     out = p;
@@ -915,6 +1162,8 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
 }
 
 static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\"";
+static const char* kTriggerPipelinesError =
+    "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\", \"gray\"";
 
 static bool parse_mask_focus(const nlohmann::json& v, MaskFocus& out) {
     if (!v.is_object()) return false;
@@ -967,7 +1216,7 @@ static HttpReply post_mask_focus(VisionControl& ctl, const std::string& body, ui
 }
 
 static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, const std::string& body,
-                               uint64_t now_ms, const RequestTimes* times) {
+                               uint64_t now_ms, const RequestTimes* times, RequestPeer peer) {
     int wait_ms = 2500;  // aruco-detector default for the single shot
     if (!wait_ms_param(query, wait_ms)) return {400, error_body("wait_ms must be a non-negative integer")};
     nlohmann::json j;
@@ -978,7 +1227,19 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     }
     Pipelines want = ctl.default_trigger_pipelines();
     if (auto it = j.find("pipelines"); it != j.end()) {
-        if (!parse_pipelines(*it, want)) return {400, error_body(kPipelinesError)};
+        if (!parse_pipelines(*it, want, /*allow_gray=*/true)) return {400, error_body(kTriggerPipelinesError)};
+        if (want.gray && !peer.loopback) {
+            return {403, nlohmann::json{{"api_version", kApiVersion},
+                                        {"error", "FORBIDDEN"},
+                                        {"detail", "gray pipeline is accepted from a loopback peer only"}}
+                             .dump()};
+        }
+        if (want.gray && !ctl.gray_available()) {
+            return {409, nlohmann::json{{"api_version", kApiVersion},
+                                        {"error", "gray unavailable"},
+                                        {"detail", "gray frames are not supported for the configured frame geometry"}}
+                             .dump()};
+        }
         if (want.yolo && !ctl.yolo_available()) return yolo_unavailable_reply();
         if (want.depth && !ctl.depth_available()) return depth_unavailable_reply();
     }
@@ -991,9 +1252,9 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
         }
     }
 
-    VisionResult current;
-    ctl.latest(false, 0, 0, current);
-    const uint32_t baseline = current.frame_id;
+    std::string baseline_instance;
+    uint32_t baseline = 0;
+    ctl.current_baseline(baseline_instance, baseline);
 
     // Served by the first frame newer than this request, with the requested pipelines added
     // to that frame; the camera gate opens meanwhile.
@@ -1006,12 +1267,13 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     {
         auto scope = ctl.trigger_scope(request_ms, want, has_focus ? &focus : nullptr);
         gate_ms = mono_ms();
-        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+        timeout = ctl.wait_fresh(baseline_instance, baseline, request_ms, want, wait_ms, r);
         wake_ms = mono_ms();
     }
     std::ostringstream s;
     s << "{\"api_version\":" << kApiVersion;
-    if (timeout || r.frame_id <= baseline) {
+    const bool same_inst = (r.instance_id == baseline_instance);
+    if (timeout || r.frame_id == 0 || (same_inst && r.frame_id <= baseline)) {
         s << ",\"success\":false,\"timeout\":true,\"count\":0,\"detections\":[],\"markers\":[]}";
         return {200, s.str()};
     }
@@ -1069,19 +1331,20 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     } gate_end{ctl};
 
     const Pipelines want{false, false, true};
-    VisionResult current;
-    ctl.latest(false, 0, 0, current);
-    const uint32_t baseline = current.frame_id;
+    std::string baseline_instance;
+    uint32_t baseline = 0;
+    ctl.current_baseline(baseline_instance, baseline);
     ctl.depth_map_wait(true);
     const uint64_t request_ms = mono_ms();
     VisionResult r;
     bool timeout = false;
     {
         auto scope = ctl.trigger_scope(request_ms, want, nullptr);
-        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+        timeout = ctl.wait_fresh(baseline_instance, baseline, request_ms, want, wait_ms, r, /*require_depth_map=*/true);
     }
     ctl.depth_map_wait(false);
-    if (timeout || r.frame_id <= baseline) return depth_error(504, "depth timeout", "no depth frame within wait_ms");
+    const bool same_inst = (r.instance_id == baseline_instance);
+    if (timeout || r.frame_id == 0 || (same_inst && r.frame_id <= baseline)) return depth_error(504, "depth timeout", "no depth frame within wait_ms");
     if (!r.depth_disp || r.depth_grid_w <= 0 || r.depth_grid_h <= 0 ||
         r.depth_disp->size() != static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h))
         return depth_error(503, "depth failed", "the depth stage gave no map for this frame");
@@ -1105,6 +1368,121 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     return out;
 }
 
+static nlohmann::json gray_error_json(const char* code, const std::string& detail) {
+    return {{"api_version", kApiVersion}, {"error", code}, {"detail", detail}};
+}
+
+static HttpReply gray_error(int status, const char* code, const std::string& detail) {
+    return {status, gray_error_json(code, detail).dump()};
+}
+
+static bool valid_instance_token(const std::string& s) {
+    if (s.empty() || s.size() > 64) return false;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+static bool parse_gray_query(const std::string& query, std::string& instance_id, uint32_t& frame_id,
+                             std::string& detail) {
+    if (query.empty()) {
+        detail = "query requires instance_id and frame_id";
+        return false;
+    }
+    bool seen_inst = false;
+    bool seen_fid = false;
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t end = query.find('&', pos);
+        if (end == std::string::npos) end = query.size();
+        const std::string item = query.substr(pos, end - pos);
+        if (item.empty()) {
+            detail = "empty query parameter";
+            return false;
+        }
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            detail = "malformed query parameter";
+            return false;
+        }
+        const std::string k = item.substr(0, eq);
+        const std::string v = item.substr(eq + 1);
+        if (k == "instance_id") {
+            if (seen_inst) {
+                detail = "duplicate instance_id parameter";
+                return false;
+            }
+            if (!valid_instance_token(v)) {
+                detail = "instance_id must be 1..64 [A-Za-z0-9_-] characters";
+                return false;
+            }
+            instance_id = v;
+            seen_inst = true;
+        } else if (k == "frame_id") {
+            if (seen_fid) {
+                detail = "duplicate frame_id parameter";
+                return false;
+            }
+            unsigned long long n = 0;
+            if (!parse_u64(v, n) || n > 0xFFFFFFFFull) {
+                detail = "frame_id must be an unsigned 32-bit integer";
+                return false;
+            }
+            frame_id = static_cast<uint32_t>(n);
+            seen_fid = true;
+        } else {
+            detail = "unknown query parameter \"" + k + "\"";
+            return false;
+        }
+        if (end == query.size()) break;
+        pos = end + 1;
+    }
+    if (!seen_inst || !seen_fid) {
+        detail = "both instance_id and frame_id are required";
+        return false;
+    }
+    return true;
+}
+
+static HttpReply gray_frame_reply(VisionControl& ctl, const std::string& query, RequestPeer peer) {
+    if (!peer.loopback) {
+        return gray_error(403, "FORBIDDEN", "GET /api/frame/gray is accepted from a loopback peer only");
+    }
+    std::string inst;
+    uint32_t fid = 0;
+    std::string detail;
+    if (!parse_gray_query(query, inst, fid, detail)) {
+        return gray_error(400, "INVALID_PARAM", detail);
+    }
+    std::shared_ptr<void> guard = ctl.try_acquire_gray_send();
+    if (!guard) {
+        HttpReply busy = gray_error(503, "GRAY_BUSY", "too many concurrent gray frame transfers");
+        busy.headers.push_back({"Retry-After", "1"});
+        return busy;
+    }
+    std::shared_ptr<const GrayFrame> rec;
+    switch (ctl.get_gray(inst, fid, rec)) {
+        case GrayRing::Lookup::Expired:
+            return gray_error(410, "FRAME_EXPIRED",
+                              "gray frame is from an older instance or has been evicted from the ring");
+        case GrayRing::Lookup::NotStored:
+            return gray_error(404, "FRAME_NOT_STORED", "no gray frame stored for that frame_id");
+        case GrayRing::Lookup::Found: {
+            HttpReply out;
+            out.status = 200;
+            out.content_type = "application/octet-stream";
+            out.body = gray_frame_header(*rec);
+            out.binary_segment = rec->pixels;
+            out.send_guard = std::move(guard);
+            return out;
+        }
+    }
+    return gray_error(404, "FRAME_NOT_STORED", "no gray frame stored for that frame_id");
+}
+
 static HttpReply status_reply(VisionControl::Status st, const std::string& ok_body) {
     switch (st) {
         case VisionControl::Status::BadFps:
@@ -1118,7 +1496,7 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
     }
 }
 
-static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
+static HttpReply post_mode(VisionControl& ctl, const std::string& body, RequestPeer peer) {
     const nlohmann::json j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded() || !j.is_object()) return {400, error_body("body must be a JSON object")};
     Mode mode;
@@ -1144,7 +1522,7 @@ static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
     }
     if (!pm && !pe && !pf) return {400, error_body("body needs \"mode\", \"enabled\" or \"fps\"")};
     const VisionControl::Status st = ctl.apply(pm, pe, pf);
-    return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl) : "");
+    return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl, 0, peer) : "");
 }
 
 static HttpReply post_models(VisionControl& ctl, const std::string& body) {
@@ -1234,8 +1612,8 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             return {200, inference_body(ctl)};
         }
     } else if (path == "/api/mode" || path == "/api/status") {
-        if (method == "GET") return {200, status_json(ctl, now)};
-        if (method == "POST" && path == "/api/mode") return post_mode(ctl, body);
+        if (method == "GET") return {200, status_json(ctl, now, peer)};
+        if (method == "POST" && path == "/api/mode") return post_mode(ctl, body, peer);
     } else if (path == "/api/mask_focus") {
         if (method == "GET") {
             MaskFocus f;
@@ -1247,7 +1625,9 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
-        return trigger_reply(ctl, query, body, now_ms, times);
+        return trigger_reply(ctl, query, body, now_ms, times, peer);
+    } else if (path == "/api/frame/gray" && method == "GET") {
+        return gray_frame_reply(ctl, query, peer);
     } else if (path == "/api/depth" && method == "GET") {
         return depth_map_reply(ctl, query, now);
     } else if (path == "/api/models" && method == "POST") {
