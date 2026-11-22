@@ -470,41 +470,59 @@ pub(crate) enum RiscvVExt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IsaVersion {
     None,
-    Parts(u32, Option<u32>, Option<u32>),
+    MajorMinor(u32, Option<u32>),
 }
 
-/// Consume `<digits>(p<digits>)*` starting at `bytes[pos]`. Only treats `'p'` as a version
+/// Consume `<digits>(p<digits>)?` starting at `bytes[pos]`. Only treats `'p'` as a version
 /// separator when immediately followed by an ASCII digit so `i2p0p` still parses `p` later.
-fn parse_version_suffix(bytes: &[u8], pos: &mut usize) -> IsaVersion {
+fn parse_version_suffix(bytes: &[u8], pos: &mut usize) -> Result<IsaVersion, &'static str> {
     if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
-        return IsaVersion::None;
+        return Ok(IsaVersion::None);
     }
-    let read_digits = |p: &mut usize| -> Option<u32> {
+    let read_digits = |p: &mut usize| -> Result<u32, &'static str> {
         let start = *p;
         while *p < bytes.len() && bytes[*p].is_ascii_digit() {
             *p += 1;
         }
-        std::str::from_utf8(&bytes[start..*p]).ok()?.parse::<u32>().ok()
+        std::str::from_utf8(&bytes[start..*p])
+            .map_err(|_| "isa:version_overflow")?
+            .parse::<u32>()
+            .map_err(|_| "isa:version_overflow")
     };
-    let Some(major) = read_digits(pos) else {
-        return IsaVersion::None;
-    };
+    let major = read_digits(pos)?;
     let mut minor = None;
-    let mut patch = None;
     if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
         *pos += 1;
-        minor = read_digits(pos);
+        minor = Some(read_digits(pos)?);
         if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
-            *pos += 1;
-            patch = read_digits(pos);
+            return Err("isa:extra_version_component");
         }
     }
-    // Reject extra `p<digits>` chains beyond major.minor.patch cleanly in callers via leftover check.
-    while *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
-        *pos += 1;
-        let _ = read_digits(pos);
+    Ok(IsaVersion::MajorMinor(major, minor))
+}
+
+/// Validate an optional trailing `<digits>(p<digits>)*` version suffix on a multi-letter
+/// (`z*`/`x*`/`s*`) extension segment so overflow and extra components are rejected uniformly.
+fn validate_multi_ext_version(ext: &str) -> Result<(), &'static str> {
+    let bytes = ext.as_bytes();
+    let mut i = bytes.len();
+    if i == 0 || !bytes[i - 1].is_ascii_digit() {
+        return Ok(());
     }
-    IsaVersion::Parts(major, minor, patch)
+    loop {
+        while i > 0 && bytes[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        if i >= 2 && bytes[i - 1] == b'p' && bytes[i - 2].is_ascii_digit() {
+            i -= 1;
+            continue;
+        }
+        break;
+    }
+    let mut pos = i;
+    let _ = parse_version_suffix(bytes, &mut pos)?;
+    debug_assert_eq!(pos, bytes.len());
+    Ok(())
 }
 
 fn is_single_letter_ext(b: u8) -> bool {
@@ -542,8 +560,8 @@ fn is_rvv1_subext_name(seg: &str) -> bool {
 fn classify_v_version(ver: IsaVersion) -> RiscvVExt {
     match ver {
         IsaVersion::None => RiscvVExt::Unversioned,
-        IsaVersion::Parts(0, Some(7), None) => RiscvVExt::Draft0p7,
-        IsaVersion::Parts(maj, min, _) => RiscvVExt::OtherVersion(maj, min),
+        IsaVersion::MajorMinor(0, Some(7)) => RiscvVExt::Draft0p7,
+        IsaVersion::MajorMinor(maj, min) => RiscvVExt::OtherVersion(maj, min),
     }
 }
 
@@ -581,7 +599,7 @@ pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
         return Err("isa:invalid_base");
     }
     let mut pos = 1usize;
-    let _base_ver = parse_version_suffix(b0, &mut pos);
+    let _base_ver = parse_version_suffix(b0, &mut pos)?;
     while pos < b0.len() {
         let ch = b0[pos];
         if matches!(ch, b'z' | b'x') {
@@ -589,6 +607,7 @@ pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
             if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return Err("isa:invalid_multi_ext");
             }
+            validate_multi_ext_version(tail)?;
             if is_rvv1_subext_name(tail) {
                 rvv1_subext = true;
             }
@@ -603,6 +622,7 @@ pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
                 if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
                     return Err("isa:invalid_multi_ext");
                 }
+                validate_multi_ext_version(tail)?;
                 break;
             }
         }
@@ -610,7 +630,7 @@ pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
             return Err("isa:invalid_single_ext");
         }
         pos += 1;
-        let ver = parse_version_suffix(b0, &mut pos);
+        let ver = parse_version_suffix(b0, &mut pos)?;
         if ch == b'v' {
             record_v_ext(&mut v_ext, classify_v_version(ver));
         }
@@ -629,17 +649,19 @@ pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
             if seg.len() < 2 {
                 return Err("isa:short_multi_ext");
             }
+            validate_multi_ext_version(seg)?;
             if is_rvv1_subext_name(seg) {
                 rvv1_subext = true;
             }
         } else if sb[0] == b's' && seg.len() > 1 && !sb[1].is_ascii_digit() {
             // Multi-letter supervisor extension such as sstc, svpbmt.
+            validate_multi_ext_version(seg)?;
         } else {
             if !is_single_letter_ext(sb[0]) {
                 return Err("isa:invalid_single_ext");
             }
             let mut p = 1usize;
-            let ver = parse_version_suffix(sb, &mut p);
+            let ver = parse_version_suffix(sb, &mut p)?;
             if p != sb.len() {
                 return Err("isa:trailing_garbage");
             }
@@ -851,7 +873,11 @@ pub(crate) fn detect_backend(
                 first_uarch = Some(hart.uarch);
                 first_isa_raw = isa_str;
             }
-            Some(ref v0) if *v0 != parsed || first_uarch != Some(hart.uarch) => {
+            Some(ref v0)
+                if *v0 != parsed
+                    || first_uarch != Some(hart.uarch)
+                    || !first_isa_raw.trim().eq_ignore_ascii_case(isa_str.trim()) =>
+            {
                 return BackendSelection {
                     backend: NccBackendKind::Scalar,
                     reason: "cpuinfo:mixed_harts".to_string(),
@@ -1571,11 +1597,11 @@ mod tests {
         assert_eq!(sel_no_uarch.backend, NccBackendKind::Xthead071);
         assert_eq!(sel_no_uarch.reason, "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x");
 
-        // `v0p7p1` is NOT exact `v0p7` and must be rejected to Scalar.
+        // `v0p7p1` has an extra version component and must be rejected to Scalar.
         let p_0p7p1 = valid_sg2002_probe("rv64imafdcv0p7p1");
         let sel_0p7p1 = detect_backend(None, true, &p_0p7p1);
         assert_eq!(sel_0p7p1.backend, NccBackendKind::Scalar);
-        assert_eq!(sel_0p7p1.reason, "isa:non_0p7_v");
+        assert_eq!(sel_0p7p1.reason, "isa:extra_version_component");
     }
 
     #[test]
@@ -1833,6 +1859,77 @@ mod tests {
         let sel_no_hwcap = detect_backend(None, true, &no_hwcap);
         assert_eq!(sel_no_hwcap.backend, NccBackendKind::Scalar);
         assert_eq!(sel_no_hwcap.reason, "auxv:no_v_hwcap");
+    }
+
+    #[test]
+    fn isa_detector_rejects_extra_version_overflow_and_full_isa_mismatch_across_harts() {
+        // Extra version components must be rejected with `isa:extra_version_component`.
+        for isa in [
+            "rv64imafdcv0p7p1p2",
+            "rv64imafdc_v0p7p1p2",
+            "rv64imafdcv0p7p1",
+            "rv64i2p0p1p2_v0p7",
+            "rv64imafdcv0p7_zba0p7p1p2",
+            "rv64imafdcv0p7zba0p7p1p2",
+            "rv64imafdc_sstc1p0p1",
+        ] {
+            let probe = valid_sg2002_probe(isa);
+            let sel = detect_backend(None, true, &probe);
+            assert_eq!(sel.backend, NccBackendKind::Scalar, "isa={isa}: {sel:?}");
+            assert_eq!(sel.reason, "isa:extra_version_component", "isa={isa}: {sel:?}");
+        }
+
+        // Numeric overflow in version components must be rejected with `isa:version_overflow`.
+        for isa in [
+            "rv64imafdcv4294967296",
+            "rv64imafdc_v4294967296",
+            "rv64imafdcv0p4294967296",
+            "rv64i4294967296_v0p7",
+            "rv64imafdcv0p7_zba4294967296",
+            "rv64imafdcv0p7_zba0p4294967296",
+        ] {
+            let probe = valid_sg2002_probe(isa);
+            let sel = detect_backend(None, true, &probe);
+            assert_eq!(sel.backend, NccBackendKind::Scalar, "isa={isa}: {sel:?}");
+            assert_eq!(sel.reason, "isa:version_overflow", "isa={isa}: {sel:?}");
+        }
+
+        // Differing full ISA strings across harts must be rejected even when classified V ext
+        // and `uarch` are identical.
+        for (isa0, isa1, uarch_line) in [
+            ("rv64imafdvcsu", "rv64imafdcv", ""),
+            ("rv64imafdvcsu", "rv64imafdvcsu_zba", ""),
+            ("rv64imafdcv0p7", "rv64imafdcv0p7_xtheadba", "uarch\t\t: thead,c906\n"),
+            ("rv64imafdcv0p7", "rv64imafdc_v0p7", "uarch\t\t: thead,c906\n"),
+        ] {
+            let mut probe = valid_sg2002_probe(isa0);
+            probe.cpuinfo = Some(format!(
+                "processor\t: 0\nhart\t\t: 0\nisa\t\t: {isa0}\n{uarch_line}\n\
+                 processor\t: 1\nhart\t\t: 1\nisa\t\t: {isa1}\n{uarch_line}"
+            ));
+            let sel = detect_backend(None, true, &probe);
+            assert_eq!(
+                sel.backend,
+                NccBackendKind::Scalar,
+                "isa0={isa0} isa1={isa1}: {sel:?}"
+            );
+            assert_eq!(
+                sel.reason,
+                "cpuinfo:mixed_harts",
+                "isa0={isa0} isa1={isa1}: {sel:?}"
+            );
+        }
+
+        // Identical multi-hart `cvitek,cv181x` + `rv64imafdvcsu` selects `Xthead071`.
+        let mut same_multi = valid_sg2002_probe("rv64imafdvcsu");
+        same_multi.cpuinfo = Some(
+            "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdvcsu\nmmu\t\t: sv39\n\n\
+             processor\t: 1\nhart\t\t: 1\nisa\t\t: rv64imafdvcsu\nmmu\t\t: sv39\n"
+                .to_string(),
+        );
+        let sel_same = detect_backend(None, true, &same_multi);
+        assert_eq!(sel_same.backend, NccBackendKind::Xthead071);
+        assert_eq!(sel_same.reason, "detect:hwcap_v+isa_v+dt_cvitek_cv181x");
     }
 
     #[test]
