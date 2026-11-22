@@ -2641,9 +2641,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut why = "mode write, hold or flush";
         let batch_start = self.now();
         if self.can.flush().is_err() { failed = joints.to_vec(); }
-        if failed.is_empty() && self.mit_fence.is_some() && self.fence_check().is_ok() {
-            // the holds are the switched joints' complete commands
-            self.mit_fence_last_tx = Some(batch_start);
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            // holds completing past the deadline trip it: the switch fails, nothing more is sent
+            if self.fence_check().is_err() {
+                for &i in joints { self.joint_modes[i] = None; }
+                return (joints.to_vec(), "deadline fence (holds completed past it)");
+            }
+            if failed.is_empty() {
+                // the holds are the switched joints' complete commands
+                self.mit_fence_last_tx = Some(batch_start);
+            }
         }
         let pending: Vec<usize> = joints.iter().copied().filter(|i| !failed.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = pending.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
@@ -2717,10 +2724,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let previous = self.joint_modes.clone();
         let (failed, why) = self.write_modes_confirmed(&changing, &target, hold, false);
-        if failed.is_empty() {
+        // the confirmation wait counts against the fence too: a trip there fails the switch
+        let fence_ok = !(self.mit_fence.is_some() || self.mit_fence_trip.is_some()) || self.fence_check().is_ok();
+        if failed.is_empty() && fence_ok {
             tracing::info!("Damiao control mode switched and confirmed for joints {:?}", changing.iter().map(|i| i + 1).collect::<Vec<_>>());
             return Ok(());
         }
+        let failed = if failed.is_empty() { changing.clone() } else { failed };
         for &i in &changing { self.joint_modes[i] = None; }
         let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.control_mode)).collect();
         // the rollback is confirmed like the forward switch (acknowledgement + fresh feedback)
@@ -2897,6 +2907,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        // MIT tracking owns the joints (fence armed) or lost them (tripped): only the fenced,
+        // confirmed switch may touch the modes
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+            return Err(ArmDriverError::HardwareFault("MIT tracking holds the deadline fence: plain mode switch refused".into()));
+        }
         let n = self.motor_ids.len();
         if modes.len() != n || hold.len() != n {
             return Err(ArmDriverError::JointCountMismatch { expected: n, actual: modes.len().min(hold.len()) });

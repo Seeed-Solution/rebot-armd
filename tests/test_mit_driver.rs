@@ -441,3 +441,25 @@ fn mit_batch_completing_past_the_deadline_trips() {
     let res = d.write_joint_targets(&t);
     assert!(res.is_err() && d.mit_fence_trip().is_some(), "completion past the deadline accepted: {res:?}");
 }
+
+/// Review round 3, #7: a hand back whose holds complete past the deadline fails (the post-flush
+/// fence error is not swallowed), even if the acknowledgement and feedback then arrive; a plain
+/// mode switch (gravity compensation entry) after a trip is refused with nothing sent.
+#[test]
+fn mit_hand_back_past_the_deadline_fails_and_plain_switch_is_refused_after_a_trip() {
+    let (mut d, bus, clock) = mit_rig(2000);
+    clock.advance(Duration::from_millis(5));
+    let t = targets(&mut d, 0.0);
+    d.write_joint_targets(&t).unwrap();
+    let _ = d.read_joint_states();
+    clock.advance(Duration::from_millis(39)); // 39 ms after the last batch
+    let hold = (0..7).map(|i| JointTarget::mit(t[i].position, 0.0, 12.0, 0.4, 0.5)).collect::<Vec<_>>();
+    bus.with(|s| s.tx_step = Duration::from_millis(3)); // mode write + hold: each check passes, the flush is at 45 ms
+    let res = d.set_joint_modes_confirmed(&[JointMode::Position; 7], &hold);
+    assert!(res.is_err(), "hand back reported success after the deadline: {res:?}");
+    assert!(d.mit_fence_trip().is_some());
+    bus.with(|s| s.tx_step = Duration::ZERO);
+    bus.clear_log();
+    assert!(d.set_joint_modes(&[JointMode::Mit; 7], &hold).is_err(), "plain switch accepted after a trip");
+    assert!(bus.tx_log().is_empty(), "{:?}", bus.tx_log());
+}
