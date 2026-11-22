@@ -1443,3 +1443,288 @@ def test_m5_enforces_exact_and_combined_element_body_geom_budgets(tmp_path: Path
         compose_spec(spec, scene_pack=sp, tool_pack=tp)
     assert exc_comb.value.code == "INVALID_PACK"
 
+
+def _make_lost_ack_harness(tmp_path: Path):
+    import multiprocessing as mp
+
+    from rebot_sim.perception import CameraRig, SharedState
+
+    sim = Simulator(_free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    lock = mp.get_context("spawn").Lock()
+    st = SharedState(sim.model.nq, sim.model.nv, lock=lock)
+    st.write(sim.data)
+    sim.shared = st
+
+    faults: dict[str, str | None] = {
+        "tx_commit_physics": None,  # "drop_before" | "drop_after"
+        "tx_finalize": None,        # "drop_after"
+        "tx_rollback_physics": None,  # "drop_after"
+        "tx_mark_degraded": None,   # "drop_after"
+    }
+
+    class _FaultyPipeAdapter:
+        def call(self, msg, timeout=None):
+            op = msg[0]
+            mode = faults.get(op)
+            if mode == "drop_before":
+                faults[op] = None
+                raise TimeoutError(f"simulated request loss before {op}")
+            with sim.lock:
+                if op == "tx_prepare":
+                    res = sim._tx_prepare_locked(msg[1])
+                elif op == "tx_commit_physics":
+                    res = sim._tx_commit_physics_locked(msg[1])
+                elif op == "tx_mark_degraded":
+                    res = sim._tx_mark_degraded_locked(msg[1])
+                elif op == "tx_finalize":
+                    res = sim._tx_finalize_locked(msg[1])
+                elif op == "tx_rollback_physics":
+                    res = sim._tx_rollback_physics_locked(msg[1])
+                elif op == "tx_abort":
+                    res = sim._tx_abort_locked(msg[1])
+                elif op == "state":
+                    res = sim._state_locked()
+                elif op == "tx_commit":
+                    res = sim._tx_commit_locked(msg[1])
+                else:
+                    res = {}
+            if mode == "drop_after":
+                faults[op] = None
+                raise TimeoutError(f"simulated reply loss after {op}")
+            return res
+
+    rig = CameraRig(
+        {
+            "fps": 10,
+            "size": [320, 180],
+            "mount": CameraMount().ipc(),
+            "scene_stream": False,
+            "has_meshes": False,
+            "noise": {},
+        },
+        SharedState(sim.model.nq, sim.model.nv, name=st.shm.name, lock=lock),
+        _FaultyPipeAdapter(),
+    )
+    setup_err: dict = {}
+    setup_done = threading.Event()
+    stop = threading.Event()
+
+    def cam_thread():
+        try:
+            rig.setup()
+        except Exception as exc:
+            setup_err["err"] = exc
+            setup_done.set()
+            return
+        setup_done.set()
+        try:
+            while not stop.is_set():
+                req = None
+                with rig.reload_lock:
+                    if rig._reload_req is not None:
+                        req, rig._reload_req = rig._reload_req, None
+                if req is not None:
+                    op = req["op"]
+                    if op == "stage":
+                        rig._stage_camera_tx(req)
+                    elif op == "commit_staged":
+                        rig._commit_staged_camera_tx(req)
+                    elif op == "finalize_cam":
+                        rig._finalize_camera_tx(req)
+                    elif op == "restore_prev_cam":
+                        rig._restore_prev_camera_tx(req)
+                    elif op == "abort_staged":
+                        rig._abort_staged_camera_tx(req)
+                    req["done"].set()
+                stop.wait(0.01)
+        finally:
+            for obj in (getattr(rig, "renderer", None), getattr(rig, "seg_renderer", None), rig.state):
+                if obj is not None:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+
+    t = threading.Thread(target=cam_thread, daemon=True)
+    t.start()
+    setup_done.wait(timeout=10.0)
+    if "err" in setup_err:
+        stop.set()
+        t.join(2)
+        sim.close()
+        pytest.skip(f"MuJoCo GL unavailable: {setup_err['err']}")
+
+    def cleanup():
+        stop.set()
+        t.join(2)
+        sim.close()
+
+    return sim, rig, faults, cleanup
+
+
+def _cam_scene_id(rig) -> str:
+    sp = getattr(rig.scene, "scene_pack", None)
+    return sp.id if sp is not None else "default"
+
+
+def _phys_scene_id(sim) -> str:
+    return sim.scene_pack.id if sim.scene_pack is not None else "default"
+
+
+def test_m6_request_lost_before_physics_applies_recovers_via_rollback_or_all(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        # Establish initial committed baseline (scene_a, tx-init)
+        assert rig.prepare_scene({"tx_id": "tx-init", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-init"})[0] == 200
+
+        # Subtest 1: request lost BEFORE tx_commit_physics applies -> camera_only refused 409,
+        # rollback_physics restores both to scene_a / tx-init.
+        assert rig.prepare_scene({"tx_id": "tx-lost-req-1", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        faults["tx_commit_physics"] = "drop_before"
+        c_fail, d_fail = rig.commit_scene({"tx_id": "tx-lost-req-1"})
+        assert c_fail == 503 and d_fail["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert rig.pending_tx_id == "tx-lost-req-1"
+
+        c_cam, r_cam = rig.commit_scene({"tx_id": "tx-lost-req-1", "phase": "camera_only"})
+        assert c_cam == 409 and r_cam["code"] == "PHYSICS_NOT_COMMITTED"
+        assert _cam_scene_id(rig) == "scene_a"
+
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-lost-req-1", "phase": "rollback_physics"})
+        assert c_rb == 200 and r_rb["state"] == "ABORTED"
+        assert _phys_scene_id(sim) == "scene_a" and sim.active_tx_id == "tx-init"
+        assert _cam_scene_id(rig) == "scene_a" and rig.camera_tx_id == "tx-init"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+
+        # Subtest 2: request lost BEFORE tx_commit_physics applies -> phase="all" retries & commits both to scene_b
+        assert rig.prepare_scene({"tx_id": "tx-lost-req-2", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        faults["tx_commit_physics"] = "drop_before"
+        c_fail2, _ = rig.commit_scene({"tx_id": "tx-lost-req-2"})
+        assert c_fail2 == 503
+
+        c_all, r_all = rig.commit_scene({"tx_id": "tx-lost-req-2", "phase": "all"})
+        assert c_all == 200 and r_all["state"] == "COMMITTED"
+        assert _phys_scene_id(sim) == "scene_b" and sim.active_tx_id == "tx-lost-req-2"
+        assert _cam_scene_id(rig) == "scene_b" and rig.camera_tx_id == "tx-lost-req-2"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+    finally:
+        cleanup()
+
+
+def test_m6_reply_lost_after_tx_commit_physics_recovers_via_camera_only_and_rollback(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        assert rig.prepare_scene({"tx_id": "tx-base", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-base"})[0] == 200
+
+        # Case 1: reply lost AFTER tx_commit_physics applies -> recovers via camera_only (both on scene_b)
+        assert rig.prepare_scene({"tx_id": "tx-phys-ack-1", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        faults["tx_commit_physics"] = "drop_after"
+        c1, d1 = rig.commit_scene({"tx_id": "tx-phys-ack-1"})
+        assert c1 == 503 and d1["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert rig.pending_tx_id == "tx-phys-ack-1"
+        assert _phys_scene_id(sim) == "scene_b"
+        assert _cam_scene_id(rig) == "scene_a"
+
+        c_rec, r_rec = rig.commit_scene({"tx_id": "tx-phys-ack-1", "phase": "camera_only"})
+        assert c_rec == 200 and r_rec["state"] == "COMMITTED"
+        assert _phys_scene_id(sim) == "scene_b" and sim.active_tx_id == "tx-phys-ack-1"
+        assert _cam_scene_id(rig) == "scene_b" and rig.camera_tx_id == "tx-phys-ack-1"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+
+        # Case 2: reply lost AFTER tx_commit_physics applies -> recovers via rollback_physics (both on scene_b)
+        assert rig.prepare_scene({"tx_id": "tx-phys-ack-2", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        faults["tx_commit_physics"] = "drop_after"
+        c2, _ = rig.commit_scene({"tx_id": "tx-phys-ack-2"})
+        assert c2 == 503 and rig.pending_tx_id == "tx-phys-ack-2"
+
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-phys-ack-2", "phase": "rollback_physics"})
+        assert c_rb == 200 and r_rb["state"] == "ABORTED"
+        assert _phys_scene_id(sim) == "scene_b" and sim.active_tx_id == "tx-phys-ack-1"
+        assert _cam_scene_id(rig) == "scene_b" and rig.camera_tx_id == "tx-phys-ack-1"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+    finally:
+        cleanup()
+
+
+def test_m6_reply_lost_after_tx_finalize_refuses_rollback_and_heals_idempotently(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        assert rig.prepare_scene({"tx_id": "tx-base", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-base"})[0] == 200
+
+        # Reply lost AFTER tx_finalize commits on physics (also drop tx_mark_degraded reply to test try/except)
+        assert rig.prepare_scene({"tx_id": "tx-fin-lost", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        faults["tx_finalize"] = "drop_after"
+        faults["tx_mark_degraded"] = "drop_after"
+        c_deg, d_deg = rig.commit_scene({"tx_id": "tx-fin-lost"})
+        assert c_deg == 503 and d_deg["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert rig.pending_tx_id == "tx-fin-lost"
+        assert rig.sim_state()["activation_state"] == "DEGRADED_SPLIT"
+
+        # rollback_physics MUST be refused 409 TX_ALREADY_COMMITTED and camera NOT rolled back!
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-fin-lost", "phase": "rollback_physics"})
+        assert c_rb == 409 and r_rb["code"] == "TX_ALREADY_COMMITTED"
+        assert _cam_scene_id(rig) == "scene_b"
+
+        # camera_only calls idempotent finalize -> 200 COMMITTED, both on scene_b, serving resumes!
+        c_fin, r_fin = rig.commit_scene({"tx_id": "tx-fin-lost", "phase": "camera_only"})
+        assert c_fin == 200 and r_fin["state"] == "COMMITTED"
+        assert _phys_scene_id(sim) == "scene_b" and sim.active_tx_id == "tx-fin-lost"
+        assert _cam_scene_id(rig) == "scene_b" and rig.camera_tx_id == "tx-fin-lost"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+        assert rig.sim_state()["degraded"] is False
+    finally:
+        cleanup()
+
+
+def test_m6_reply_lost_after_tx_rollback_physics_reconciles_idempotently(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        assert rig.prepare_scene({"tx_id": "tx-base", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-base"})[0] == 200
+
+        assert rig.prepare_scene({"tx_id": "tx-rb-lost", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        rig._before_camera_commit_hook = lambda _staged: (_ for _ in ()).throw(RuntimeError("cam swap err"))
+        c_deg, _ = rig.commit_scene({"tx_id": "tx-rb-lost"})
+        assert c_deg == 503 and rig.activation_state == "DEGRADED_SPLIT"
+        rig._before_camera_commit_hook = None
+
+        # Reply lost AFTER tx_rollback_physics completes on physics
+        faults["tx_rollback_physics"] = "drop_after"
+        with pytest.raises(TimeoutError):
+            rig.commit_scene({"tx_id": "tx-rb-lost", "phase": "rollback_physics"})
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert sim.activation_state == "COMMITTED"
+        assert _phys_scene_id(sim) == "scene_a" and sim.active_tx_id == "tx-base"
+
+        # Retry rollback_physics reconciles cleanly -> 200 ABORTED, both on scene_a
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-rb-lost", "phase": "rollback_physics"})
+        assert c_rb == 200 and r_rb["state"] == "ABORTED"
+        assert _phys_scene_id(sim) == "scene_a" and sim.active_tx_id == "tx-base"
+        assert _cam_scene_id(rig) == "scene_a" and rig.camera_tx_id == "tx-base"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+    finally:
+        cleanup()
+

@@ -2016,6 +2016,7 @@ class CameraRig:
         self.reload_wake_event = threading.Event()
         self.activation_state = "COMMITTED"
         self.active_tx_id: str | None = None
+        self.pending_tx_id: str | None = None
         self.camera_tx_id: str | None = None
         self.camera_committed_tx_id: str | None = None
         self._staged_cam_tx: dict | None = None
@@ -2698,6 +2699,7 @@ class CameraRig:
 
     def _enter_degraded_split(self, tx_id: str, err_msg: str) -> tuple[int, dict]:
         self.activation_state = "DEGRADED_SPLIT"
+        self.pending_tx_id = tx_id
         self.active_tx_id = tx_id
         try:
             self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": err_msg}), timeout=1.0)
@@ -2772,12 +2774,35 @@ class CameraRig:
             return self._enter_degraded_split(tx_id, str(fin.get("error", "finalize failed")))
         self.active_tx_id = tx_id
         self.camera_tx_id = tx_id
+        self.pending_tx_id = None
         self.activation_state = "COMMITTED"
         self._run_reload_op(
             {"op": "finalize_cam", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
             timeout=2.0,
         )
         return 200, self._strip_internal(fin)
+
+    def _rollback_camera_for_tx(self, tx_id: str) -> tuple[int, dict] | None:
+        if self.camera_committed_tx_id == tx_id and self._prev_cam_gen is not None:
+            cam_op = "restore_prev_cam"
+        elif self._staged_cam_tx is not None and self._staged_cam_tx.get("tx_id") == tx_id:
+            cam_op = "abort_staged"
+        else:
+            return None
+        abort_err = self._run_reload_op(
+            {"op": cam_op, "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+            timeout=3.0,
+        )
+        if abort_err:
+            # M04: Keep physics rollback snapshot intact so retry succeeds cleanly
+            return 503, {
+                "error": abort_err,
+                "code": "CAMERA_ABORT_FAILED",
+                "state": "DEGRADED_SPLIT",
+                "tx_id": self.active_tx_id,
+                "camera_tx_id": self.camera_tx_id,
+            }
+        return None
 
     def commit_scene(self, body: dict) -> tuple[int, dict]:
         if not self._tx_lock.acquire(blocking=False):
@@ -2802,75 +2827,141 @@ class CameraRig:
                 res = self.link.call(("tx_commit", body), timeout=3.0)
                 return int(res.get("_http_status", 200)), self._strip_internal(res)
 
-            if phase == "rollback_physics":
-                if self.activation_state != "DEGRADED_SPLIT" or self.active_tx_id != tx_id:
-                    return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
-                cam_op = (
-                    "restore_prev_cam"
-                    if self.camera_committed_tx_id == tx_id and self._prev_cam_gen is not None
-                    else "abort_staged"
-                )
-                abort_err = self._run_reload_op(
-                    {"op": cam_op, "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
-                    timeout=3.0,
-                )
-                if abort_err:
-                    # M04: Keep physics rollback snapshot intact so retry succeeds cleanly
-                    return 503, {
-                        "error": abort_err,
-                        "code": "CAMERA_ABORT_FAILED",
-                        "state": "DEGRADED_SPLIT",
-                        "tx_id": self.active_tx_id,
-                        "camera_tx_id": self.camera_tx_id,
-                    }
-                res = self.link.call(("tx_rollback_physics", {"tx_id": tx_id}), timeout=3.0)
-                status = int(res.get("_http_status", 200))
-                if status != 200 or "error" in res:
-                    return (status if status != 200 else 500), self._strip_internal(res)
-                self.active_tx_id = res.get("restored_tx_id")
-                self.camera_tx_id = res.get("camera_tx_id")
-                self.camera_committed_tx_id = None
-                self.activation_state = "COMMITTED"
-                self.perception.clear_latest()
-                return 200, self._strip_internal(res)
-
-            if phase == "camera_only":
-                if self.activation_state != "DEGRADED_SPLIT" or self.active_tx_id != tx_id:
-                    return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
-                if self.camera_committed_tx_id != tx_id:
-                    err = self._run_reload_op(
-                        {"op": "commit_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
-                        timeout=5.0,
-                    )
-                    if err:
+            if self.activation_state == "DEGRADED_SPLIT":
+                if tx_id not in (self.pending_tx_id, self.active_tx_id):
+                    if phase == "all":
                         return 503, {
-                            "error": err,
+                            "error": "SIM_ACTIVATION_DEGRADED",
                             "code": "SIM_ACTIVATION_DEGRADED",
                             "state": "DEGRADED_SPLIT",
-                            "tx_id": tx_id,
-                            "physics_tx_id": tx_id,
+                            "tx_id": self.pending_tx_id or self.active_tx_id,
                             "camera_tx_id": self.camera_tx_id,
                         }
-                return self._finish_finalize(tx_id)
+                    return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
+
+                # ALWAYS query physics state FIRST before mutating or rolling back camera
+                phys = self.link.call(("state",), timeout=2.0)
+                staged_tx_id = phys.get("staged_tx_id")
+                staged_committed = bool(phys.get("staged_physics_committed", False))
+
+                # (a) Physics already finalized tx_id
+                if staged_tx_id is None and phys.get("tx_id") == tx_id and phys.get("camera_tx_id") == tx_id:
+                    if phase == "rollback_physics":
+                        return 409, {
+                            "error": f"tx {tx_id!r} is already committed and cannot be rolled back",
+                            "code": "TX_ALREADY_COMMITTED",
+                        }
+                    if self.camera_committed_tx_id != tx_id and self._staged_cam_tx is not None:
+                        err = self._run_reload_op(
+                            {"op": "commit_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                            timeout=5.0,
+                        )
+                        if err:
+                            return self._enter_degraded_split(tx_id, err)
+                    return self._finish_finalize(tx_id)
+
+                # (b) Physics committed tx_id (awaiting finalize or rollback_physics)
+                if staged_tx_id == tx_id and staged_committed:
+                    if phase in {"camera_only", "all"}:
+                        if self.camera_committed_tx_id != tx_id:
+                            err = self._run_reload_op(
+                                {"op": "commit_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
+                                timeout=5.0,
+                            )
+                            if err:
+                                return self._enter_degraded_split(tx_id, err)
+                        return self._finish_finalize(tx_id)
+                    cam_err = self._rollback_camera_for_tx(tx_id)
+                    if cam_err is not None:
+                        return cam_err
+                    res = self.link.call(("tx_rollback_physics", {"tx_id": tx_id}), timeout=3.0)
+                    status = int(res.get("_http_status", 200))
+                    if status != 200 or "error" in res:
+                        return (status if status != 200 else 500), self._strip_internal(res)
+                    self.active_tx_id = res.get("restored_tx_id")
+                    self.camera_tx_id = res.get("camera_tx_id")
+                    self.camera_committed_tx_id = None
+                    self.pending_tx_id = None
+                    self.activation_state = "COMMITTED"
+                    self.perception.clear_latest()
+                    return 200, self._strip_internal(res)
+
+                # (c) Physics has NOT committed tx_id
+                if staged_tx_id == tx_id and not staged_committed:
+                    if phase == "camera_only":
+                        return 409, {
+                            "error": f"tx {tx_id!r} physics has not been committed",
+                            "code": "PHYSICS_NOT_COMMITTED",
+                        }
+                    if phase == "rollback_physics":
+                        cam_err = self._rollback_camera_for_tx(tx_id)
+                        if cam_err is not None:
+                            return cam_err
+                        abort_res = self.link.call(("tx_abort", {"tx_id": tx_id}), timeout=3.0)
+                        a_status = int(abort_res.get("_http_status", 200))
+                        if a_status != 200:
+                            return a_status, self._strip_internal(abort_res)
+                        self.active_tx_id = phys.get("tx_id")
+                        self.camera_tx_id = phys.get("camera_tx_id")
+                        self.camera_committed_tx_id = None
+                        self.pending_tx_id = None
+                        self.activation_state = "COMMITTED"
+                        self.perception.clear_latest()
+                        return 200, {
+                            "ok": True,
+                            "state": "ABORTED",
+                            "tx_id": tx_id,
+                            "restored_tx_id": self.active_tx_id,
+                            "camera_tx_id": self.camera_tx_id,
+                            "robot": phys.get("robot"),
+                            "scene": phys.get("scene"),
+                            "tool": phys.get("tool"),
+                            "scene_digest": phys.get("scene_digest"),
+                            "tool_digest": phys.get("tool_digest"),
+                        }
+                    # phase == "all": fall through to normal commit_physics -> commit_staged -> finalize
+                # (d) Physics already rolled back tx_id
+                elif staged_tx_id is None and phys.get("activation_state") == "COMMITTED" and phys.get("tx_id") != tx_id:
+                    if phase == "rollback_physics":
+                        cam_err = self._rollback_camera_for_tx(tx_id)
+                        if cam_err is not None:
+                            return cam_err
+                        self.active_tx_id = phys.get("tx_id")
+                        self.camera_tx_id = phys.get("camera_tx_id")
+                        self.camera_committed_tx_id = None
+                        self.pending_tx_id = None
+                        self.activation_state = "COMMITTED"
+                        self.perception.clear_latest()
+                        return 200, {
+                            "ok": True,
+                            "state": "ABORTED",
+                            "tx_id": tx_id,
+                            "restored_tx_id": self.active_tx_id,
+                            "camera_tx_id": self.camera_tx_id,
+                            "robot": phys.get("robot"),
+                            "scene": phys.get("scene"),
+                            "tool": phys.get("tool"),
+                            "scene_digest": phys.get("scene_digest"),
+                            "tool_digest": phys.get("tool_digest"),
+                            "idempotent": True,
+                        }
+                    return 409, {"error": f"tx {tx_id!r} is not prepared", "code": "TX_NOT_PREPARED"}
+                else:
+                    if phase in {"camera_only", "rollback_physics"}:
+                        return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
+
+            if phase in {"rollback_physics", "camera_only"}:
+                return 409, {"error": f"tx {tx_id!r} is not in DEGRADED_SPLIT", "code": "TX_NOT_PREPARED"}
 
             # phase == "all"
-            if self.activation_state == "DEGRADED_SPLIT":
-                return 503, {
-                    "error": "SIM_ACTIVATION_DEGRADED",
-                    "code": "SIM_ACTIVATION_DEGRADED",
-                    "state": "DEGRADED_SPLIT",
-                    "tx_id": self.active_tx_id,
-                    "camera_tx_id": self.camera_tx_id,
-                }
             # M03: Gate frame/video publication BEFORE physics commit
             prev_state = self.activation_state
             self.activation_state = "COMMITTING"
             try:
                 phys = self.link.call(("tx_commit_physics", {"tx_id": tx_id}), timeout=3.0)
-            except Exception:
-                # Reply lost/ambiguous: keep COMMITTING/DEGRADED_SPLIT so old frames don't leak
-                self.activation_state = "DEGRADED_SPLIT"
-                raise
+            except Exception as exc:
+                # Reply lost/ambiguous: enter DEGRADED_SPLIT retaining pending_tx_id so recovery reconciles
+                return self._enter_degraded_split(tx_id, f"physics commit failed: {exc}")
             p_status = int(phys.get("_http_status", 200))
             if p_status != 200:
                 self.activation_state = prev_state
@@ -2886,10 +2977,7 @@ class CameraRig:
                 timeout=5.0,
             )
             if err:
-                self.activation_state = "DEGRADED_SPLIT"
-                self.active_tx_id = tx_id
-                deg = self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": err}), timeout=1.0)
-                return 503, self._strip_internal(deg)
+                return self._enter_degraded_split(tx_id, err)
 
             return self._finish_finalize(tx_id)
         finally:
@@ -2910,7 +2998,7 @@ class CameraRig:
                     "error": "SIM_ACTIVATION_DEGRADED",
                     "code": "SIM_ACTIVATION_DEGRADED",
                     "state": "DEGRADED_SPLIT",
-                    "tx_id": self.active_tx_id,
+                    "tx_id": self.pending_tx_id or self.active_tx_id,
                     "camera_tx_id": self.camera_tx_id,
                 }
             res = self.link.call(("tx_abort", {"tx_id": tx_id}), timeout=3.0)
@@ -2920,6 +3008,8 @@ class CameraRig:
                     {"op": "abort_staged", "done": threading.Event(), "tx_id": tx_id, "err_box": {}, "cancelled": False},
                     timeout=3.0,
                 )
+                if self.pending_tx_id == tx_id:
+                    self.pending_tx_id = None
             return status, self._strip_internal(res)
         finally:
             self._tx_lock.release()
@@ -3097,6 +3187,12 @@ class CameraRig:
             cam_body["delivery_delay_ms"] = round(float(frame.get("delivery_delay_s", 0.0)) * 1000.0, 3)
         out["camera"] = cam_body
         out["detector_mode"] = self.detector_mode
+        if self.activation_state == "DEGRADED_SPLIT":
+            out["activation_state"] = "DEGRADED_SPLIT"
+            out["degraded"] = True
+            out["pending_tx_id"] = self.pending_tx_id
+            if self.pending_tx_id and not out.get("tx_id"):
+                out["tx_id"] = self.pending_tx_id
         if self.dr_config.enabled and self.dr_summary is not None:
             out["dr"] = self.dr_summary
         else:

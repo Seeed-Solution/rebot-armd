@@ -317,6 +317,7 @@ class Simulator:
         self._staged_tx: dict | None = None
         self._tx_lock = threading.Lock()
         self._committed_tx_payloads: dict[str, tuple] = {}
+        self._rolled_back_tx_ids: collections.deque[str] = collections.deque(maxlen=256)
         self._camera_prepare_cb = None
         self._camera_commit_cb = None
         self._camera_abort_cb = None
@@ -644,6 +645,12 @@ class Simulator:
             "tool_digest": self.active_tool_digest,
             "activation_state": self.activation_state,
             "degraded": self.activation_state == "DEGRADED_SPLIT",
+            "staged_tx_id": self._staged_tx["tx_id"] if self._staged_tx else None,
+            "staged_physics_committed": (
+                bool(self._staged_tx.get("physics_committed", False))
+                if self._staged_tx
+                else False
+            ),
         }
         if self.dr_config.enabled and self.dr_summary is not None:
             out["dr"] = self.dr_summary
@@ -1169,7 +1176,12 @@ class Simulator:
                 "code": "TX_BUSY",
             }
         if self.activation_state == "DEGRADED_SPLIT":
-            return self._degraded_split_reply(include_robot=True)
+            if not (
+                self._staged_tx is not None
+                and self._staged_tx.get("tx_id") == tx_id
+                and not self._staged_tx.get("physics_committed", False)
+            ):
+                return self._degraded_split_reply(include_robot=True)
         if self._staged_tx is None or self._staged_tx["tx_id"] != tx_id:
             return {
                 "_http_status": 409,
@@ -1220,43 +1232,92 @@ class Simulator:
     def _tx_mark_degraded_locked(self, params: dict) -> dict:
         tx_id = str(params.get("tx_id") or "")
         err = str(params.get("error") or "camera commit failed")
-        self.active_tx_id = tx_id or self.active_tx_id
+        staged_uncommitted = (
+            self._staged_tx is not None
+            and self._staged_tx.get("tx_id") == tx_id
+            and not self._staged_tx.get("physics_committed", False)
+        )
+        if not staged_uncommitted:
+            self.active_tx_id = tx_id or self.active_tx_id
         self.activation_state = "DEGRADED_SPLIT"
         out = self._degraded_split_reply(include_robot=True)
         out["error"] = err
         out["physics_tx_id"] = self.active_tx_id
+        if staged_uncommitted and tx_id:
+            out["tx_id"] = tx_id
         return out
 
     def _tx_finalize_locked(self, params: dict) -> dict:
         tx_id = params.get("tx_id")
         if (
-            not isinstance(tx_id, str)
-            or self._staged_tx is None
-            or self._staged_tx.get("tx_id") != tx_id
+            isinstance(tx_id, str)
+            and self._staged_tx is not None
+            and self._staged_tx.get("tx_id") == tx_id
         ):
-            return {
-                "_http_status": 409,
-                "error": f"tx {tx_id!r} is not staged for finalization",
-                "code": "TX_NOT_PREPARED",
-            }
-        staged = self._staged_tx
-        if staged.get("prev_snapshot") is not None:
-            old_shared = staged["prev_snapshot"].get("shared")
-            if old_shared is not None and old_shared is not self.shared:
-                self._old_shared.append(old_shared)
-        self._close_old_shared_locked()
-        self._record_committed_tx_locked(tx_id, staged["fingerprint"])
-        self.active_tx_id = tx_id
-        self.camera_tx_id = tx_id
-        self.activation_state = "COMMITTED"
-        self._staged_tx = None
-        return self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
+            staged = self._staged_tx
+            if staged.get("physics_committed") is not True:
+                return {
+                    "_http_status": 409,
+                    "error": f"tx {tx_id!r} physics has not been committed",
+                    "code": "TX_NOT_COMMITTED",
+                }
+            if staged.get("prev_snapshot") is not None:
+                old_shared = staged["prev_snapshot"].get("shared")
+                if old_shared is not None and old_shared is not self.shared:
+                    self._old_shared.append(old_shared)
+            self._close_old_shared_locked()
+            self._record_committed_tx_locked(tx_id, staged["fingerprint"])
+            self.active_tx_id = tx_id
+            self.camera_tx_id = tx_id
+            self.activation_state = "COMMITTED"
+            self._staged_tx = None
+            return self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
+        if (
+            isinstance(tx_id, str)
+            and self._staged_tx is None
+            and tx_id == self.active_tx_id == self.camera_tx_id
+            and tx_id in self._committed_tx_payloads
+        ):
+            self.activation_state = "COMMITTED"
+            res = self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
+            res["idempotent"] = True
+            return res
+        return {
+            "_http_status": 409,
+            "error": f"tx {tx_id!r} is not staged for finalization",
+            "code": "TX_NOT_PREPARED",
+        }
 
     def _tx_rollback_physics_locked(self, params: dict) -> dict:
         tx_id = params.get("tx_id")
+        if self._staged_tx is None:
+            if (
+                isinstance(tx_id, str)
+                and tx_id == self.active_tx_id == self.camera_tx_id
+                and tx_id in self._committed_tx_payloads
+            ):
+                return {
+                    "_http_status": 409,
+                    "error": f"tx {tx_id!r} is already committed and cannot be rolled back",
+                    "code": "TX_ALREADY_COMMITTED",
+                }
+            if (
+                isinstance(tx_id, str)
+                and self.activation_state == "COMMITTED"
+                and tx_id in self._rolled_back_tx_ids
+            ):
+                res = self._tx_active_summary(
+                    state="ABORTED", tx_key="restored_tx_id", include_camera_tx=True
+                )
+                res["idempotent"] = True
+                return res
+            return {
+                "_http_status": 409,
+                "error": f"tx {tx_id!r} is not in DEGRADED_SPLIT",
+                "code": "TX_NOT_PREPARED",
+            }
         if (
             self.activation_state not in {"DEGRADED_SPLIT", "COMMITTING"}
-            or self._staged_tx is None
             or self._staged_tx.get("tx_id") != tx_id
             or self._staged_tx.get("prev_snapshot") is None
         ):
@@ -1286,6 +1347,8 @@ class Simulator:
                 pass
         self._staged_tx = None
         self.activation_state = "COMMITTED"
+        if isinstance(tx_id, str):
+            self._rolled_back_tx_ids.append(tx_id)
         return self._tx_active_summary(
             state="ABORTED", tx_key="restored_tx_id", include_camera_tx=True
         )
@@ -1323,6 +1386,12 @@ class Simulator:
 
         if phase == "camera_only":
             if (
+                self._staged_tx is None
+                and tx_id == self.active_tx_id == self.camera_tx_id
+                and tx_id in self._committed_tx_payloads
+            ):
+                return self._tx_finalize_locked({"tx_id": tx_id})
+            if (
                 self.activation_state != "DEGRADED_SPLIT"
                 or self._staged_tx is None
                 or self._staged_tx.get("tx_id") != tx_id
@@ -1357,10 +1426,21 @@ class Simulator:
                 "code": "TX_BUSY",
             }
         if self.activation_state == "DEGRADED_SPLIT":
+            if (
+                self._staged_tx is not None
+                and self._staged_tx.get("tx_id") == tx_id
+                and not self._staged_tx.get("physics_committed", False)
+            ):
+                self._cleanup_staged_tx_locked()
+                self._close_old_shared_locked()
+                self.activation_state = "COMMITTED"
+                self._rolled_back_tx_ids.append(tx_id)
+                return {"_http_status": 200, "ok": True, "state": "ABORTED", "tx_id": tx_id}
             return self._degraded_split_reply(include_robot=True)
         if self._staged_tx is not None and self._staged_tx.get("tx_id") == tx_id:
             self._cleanup_staged_tx_locked()
             self._close_old_shared_locked()
+            self._rolled_back_tx_ids.append(tx_id)
         return {"_http_status": 200, "ok": True, "state": "ABORTED", "tx_id": tx_id}
 
     @staticmethod
