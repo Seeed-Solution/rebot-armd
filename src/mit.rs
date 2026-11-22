@@ -543,7 +543,18 @@ impl crate::supervisor::SupervisorInner {
             if ![q_d, v_d, a_d, q_m, v_m].iter().all(|x| x.is_finite()) { return Err(format!("J{}: non-finite reference or feedback", j + 1)); }
             let hold = self.mit_in_hold(v_d, a_d);
             let (kp, kd) = if hold { (c.hold_kp.unwrap_or(0.0), c.hold_kd.unwrap_or(0.0)) } else { (c.kp, c.kd) };
-            let pd = kp * (q_d - q_m) + kd * (v_d - v_m);
+            let wl = wire_limits(&self.config, j);
+            let off = self.joint_zero_offsets.get(j).copied().unwrap_or(0.0);
+            if (q_d + off).abs() > wl.p_max || v_d.abs() > wl.v_max || kp > wl.kp_max || kd > wl.kd_max || kp <= 0.0 || kd <= 0.0 {
+                return Err(format!("J{}: MIT frame outside the wire ranges (q {:.3}, v {v_d:.3}, kp {kp}, kd {kd})", j + 1, q_d + off));
+            }
+            // every field as the motor decodes it (position in the motor frame, after the zero offset)
+            let grid = |x: f32, lo: f32, hi: f32, bits: u32| damiao::uint_to_float(damiao::float_to_uint(x, lo, hi, bits), lo, hi, bits);
+            let q_w = grid(q_d + off, wl.p_min, wl.p_max, 16) - off;
+            let v_w = grid(v_d, wl.v_min, wl.v_max, 12);
+            let kp_w = grid(kp, wl.kp_min, wl.kp_max, 12);
+            let kd_w = grid(kd, wl.kd_min, wl.kd_max, 12);
+            let pd = kp_w * (q_w - q_m) + kd_w * (v_w - v_m);
             let dynamic = if hold { 0.0 } else {
                 c.coulomb_nm * (v_d / MIT_COULOMB_VEL_RAD_S).clamp(-1.0, 1.0) + c.viscous_nm_s_rad * v_d + c.inertia_kg_m2 * a_d
             };
@@ -552,19 +563,20 @@ impl crate::supervisor::SupervisorInner {
             let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
             let mut lo = (-l).max(-l - pd).max(last - MIT_FF_SLEW_NM_S * dt);
             let mut hi = l.min(l - pd).min(last + MIT_FF_SLEW_NM_S * dt);
-            if let Some(h) = self.torque_guard.hold.filter(|h| h.joint == j) {
+            let guard = self.torque_guard.hold.filter(|h| h.joint == j);
+            if let Some(h) = guard {
                 if h.sign > 0.0 { hi = hi.min(-pd); } else { lo = lo.max(-pd); }
             }
             if lo.is_nan() || hi.is_nan() || lo > hi {
                 return Err(format!("J{}: empty effort interval [{lo:.3}, {hi:.3}] N·m (pd {pd:.3}, L {l})", j + 1));
             }
-            let wl = wire_limits(&self.config, j);
             let tau = quantize_into(raw.clamp(lo, hi), lo, hi, &wl)
                 .ok_or_else(|| format!("J{}: no wire torque value inside [{lo:.4}, {hi:.4}]", j + 1))?;
-            let q_wire = q_d + self.joint_zero_offsets.get(j).copied().unwrap_or(0.0);
-            if q_wire.abs() > wl.p_max || v_d.abs() > wl.v_max || kp > wl.kp_max || kd > wl.kd_max || kp <= 0.0 || kd <= 0.0 {
-                return Err(format!("J{}: MIT frame outside the wire ranges (q {q_wire:.3}, v {v_d:.3}, kp {kp}, kd {kd})", j + 1));
+            let total = pd + tau;
+            if total.abs() > l + 1e-6 || guard.is_some_and(|h| h.sign * total > 1e-6) {
+                return Err(format!("J{}: decoded effort {total:.4} N·m outside the limit {l} or the relieving side", j + 1));
             }
+            let (q_d, v_d, kp, kd) = (q_w, v_w, kp_w, kd_w);
             *t = JointTarget::mit(q_d, v_d, kp, kd, tau);
             ff[j] = tau;
         }

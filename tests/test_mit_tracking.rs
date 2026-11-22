@@ -546,7 +546,7 @@ fn mit_collision_and_guarded_retreat_hold_without_dynamic_terms() {
     let mut held = t.clone();
     let ff = inner.mit_prepare(&mut held, DT).unwrap();
     assert!(ff[3] < g + 0.525 - 0.29 && ff[3] >= g + 0.525 - 0.30 - 0.01, "slewed toward gravity only: {}", ff[3]);
-    assert_eq!(held[3].kp, Some(12.0));
+    assert!((held[3].kp.unwrap() - 12.0).abs() < 0.13, "hold gain on the wire grid");
     inner.collision.hold = None;
     // guarded retreat: the total effort never pushes into the held direction
     inner.torque_guard.hold = Some(armd::torque_guard::TorqueHold { joint: 3, hold_q: inner.commanded_positions[3], sign: 1.0,
@@ -697,4 +697,47 @@ fn mit_failed_disable_never_replays_the_cached_mit_frame() {
     let replays: Vec<_> = bus.tx_log().into_iter().filter(|f| f.id == 4 && f.data != damiao::CMD_DISABLE).collect();
     assert!(replays.is_empty(), "cached MIT frame replayed after the failed disable: {replays:?}");
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x104), "invented POS_VEL hold on the MIT joint");
+}
+
+/// Review #8: the effort bound holds for the frame the motor decodes: with every field on the
+/// wire grid (position after the zero offset, velocity, kp, kd, torque), |pd + tau_ff| <= L where
+/// pd uses the decoded fields and the tick's measured state. Saturated case (gravity above L) over
+/// several limits and zero offsets, moving out and back and holding.
+#[test]
+fn mit_effort_bound_holds_on_decoded_wire_fields() {
+    let mut worst_excess = f32::MIN;
+    let mut frames_checked = 0;
+    for (n, l) in [0.20_f32, 0.213, 0.227, 0.241].into_iter().enumerate() {
+        for zero in [0.0_f32, 0.0131, 0.0287] {
+            let mut cfg = mit_config_j4();
+            { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.effort_limit_nm = l; j4.kd = 0.47; j4.hold_kd = Some(0.47); j4.kp = 13.3; }
+            let (mut inner, bus) = active_rig(cfg, zero);
+            for leg in [0.04_f32 + 0.003 * n as f32, -0.04] {
+                let inp = inner.plan_input().unwrap();
+                let mut goal = [0.0_f64; 6];
+                for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
+                goal[3] += f64::from(leg);
+                inner.install_joint_goal(&inp, &goal, 0.3, "joint_move", None, None).unwrap();
+                for _ in 0..150 {
+                    // the joint lags its command by a varying amount: pd is nonzero
+                    bus.with(|s| s.follow_commands = false);
+                    bus.clear_log();
+                    inner.tick(DT);
+                    bus.with(|s| { let m = &mut s.motors[3]; if let Some(mit_support::MotorCmd::Mit { p, .. }) = m.last_cmd { m.q += 0.7 * (p - m.q); m.v = 0.02; } });
+                    let (q_m, v_m) = (inner.measured_positions[3], inner.measured_velocities[3]);
+                    if let Some(&(p, v, kp, kd, t)) = mit_frames(&bus.tx_log(), 4).first() {
+                        let pd = kp * (p - zero - q_m) + kd * (v - v_m);
+                        worst_excess = worst_excess.max((pd + t).abs() - l);
+                        frames_checked += 1;
+                    }
+                    assert!(!inner.safety.state().is_stopped(), "{:?}", inner.safety.state());
+                    if inner.active_trajectory.is_none() && inner.commanded_velocities[3] == 0.0 { break; }
+                }
+            }
+        }
+    }
+    eprintln!("decoded |pd + tau| - L: worst {worst_excess:.6} over {frames_checked} frames");
+    assert!(frames_checked > 500);
+    assert!(worst_excess <= 1e-5, "decoded effort exceeds the limit by {worst_excess}");
+    assert!(worst_excess > -0.01, "the bound was not exercised: {worst_excess}");
 }
