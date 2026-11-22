@@ -5327,8 +5327,15 @@ impl SupervisorInner {
                             }
                         }
                         Err(reject) => {
-                            let was_streaming = self.servo_target.is_some();
-                            self.tracking.invalidate();
+                            let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
+                            let prev_confirmed = self.tracking.last_issued_positions.clone();
+                            let prev_ws_min_depths = self.tracking.ws_min_depths.clone();
+                            let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
+                                && self.measured_positions.len() == self.config.dof
+                                && self.measured_positions.iter().all(|q| q.is_finite());
+                            let gripper_idx = self.config.gripper_index();
+                            let grip_cmd = gripper_idx.and_then(|g| self.commanded_positions.get(g).copied());
+
                             match reject {
                                 crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
                                     self.enter_servo_keepout_hold(&ws_err);
@@ -5352,31 +5359,70 @@ impl SupervisorInner {
                                     );
                                 }
                             }
-                            if self.measured_positions.iter().all(|q| q.is_finite()) {
-                                if let Some(ref d) = self.driver {
-                                    if let Ok(mut driver) = d.lock() {
-                                        let targets: Vec<JointTarget> = self
-                                            .commanded_positions
-                                            .iter()
-                                            .zip(self.commanded_velocities.iter())
-                                            .enumerate()
-                                            .map(|(i, (&p, &v))| JointTarget {
-                                                position: p,
-                                                velocity: Some(v),
-                                                torque: if gravity_output_enabled {
-                                                    self.gravity_torques_ramped.get(i).copied()
-                                                } else {
-                                                    Some(0.0)
-                                                },
-                                                kp: None,
-                                                kd: None,
-                                            })
-                                            .collect();
-                                        if let Err(e) = driver.write_joint_targets(&targets) {
-                                            output_error = Some(e.to_string());
+
+                            // B2: explicit validated fallback for fresh vs stale feedback.
+                            // Never transmit an unvalidated measured hold (keep-out between
+                            // prev_confirmed and q_m) or a hold synthesized from stale feedback.
+                            let candidate_hold = self.commanded_positions.clone();
+                            let fallback_target: Option<(Vec<f32>, Option<(u64, crate::kinematics::SlotBuf)>)> =
+                                if fresh_meas
+                                    && self.validate_fallback_hold(
+                                        prev_confirmed.as_deref(),
+                                        &candidate_hold,
+                                        fresh_meas,
+                                    )
+                                {
+                                    Some((candidate_hold, None))
+                                } else if let Some(mut preserved) = prev_confirmed {
+                                    if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) {
+                                        if preserved.len() > g {
+                                            preserved[g] = c;
                                         }
                                     }
+                                    self.commanded_positions = preserved.clone();
+                                    self.target_positions = preserved.clone();
+                                    self.commanded_velocities.fill(0.0);
+                                    self.commanded_accelerations.fill(0.0);
+                                    Some((preserved, prev_ws_min_depths))
+                                } else {
+                                    None
+                                };
+
+                            if let Some((hold_pos, ws_keep)) = fallback_target {
+                                let targets: Vec<JointTarget> = hold_pos
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &p)| JointTarget {
+                                        position: p,
+                                        velocity: Some(0.0),
+                                        torque: if gravity_output_enabled {
+                                            self.gravity_torques_ramped.get(i).copied()
+                                        } else {
+                                            Some(0.0)
+                                        },
+                                        kp: None,
+                                        kd: None,
+                                    })
+                                    .collect();
+                                let write_res = self
+                                    .driver
+                                    .as_ref()
+                                    .and_then(|d| d.lock().ok())
+                                    .map(|mut driver| driver.write_joint_targets(&targets));
+                                match write_res {
+                                    Some(Ok(())) => self.tracking.record_issued_with_ws(
+                                        hold_pos,
+                                        vec![0.0; self.config.dof],
+                                        ws_keep,
+                                    ),
+                                    Some(Err(e)) => {
+                                        self.tracking.invalidate();
+                                        output_error = Some(e.to_string());
+                                    }
+                                    None => self.tracking.invalidate(),
                                 }
+                            } else {
+                                self.tracking.invalidate();
                             }
                         }
                     }

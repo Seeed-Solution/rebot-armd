@@ -643,7 +643,8 @@ fn lead_limits_and_withdrawal() {
         for _ in 0..130 {
             inner2.tick(DT);
         }
-        let lead_big = drv2.with(|s| s.written.last().unwrap()[0].position) - inner2.commanded_positions[0];
+        let prev_confirmed = inner2.tracking.last_issued_positions.clone().unwrap();
+        let lead_big = prev_confirmed[0] - inner2.commanded_positions[0];
         assert!(lead_big > 0.015, "expected large active lead, got {lead_big}");
 
         let writes_before = drv2.with(|s| s.written.len());
@@ -652,10 +653,16 @@ fn lead_limits_and_withdrawal() {
         assert!(matches!(obs2.safety_state, SafetyState::Fault(_)), "unsafe stale withdrawal must fault, got {:?}", obs2.safety_state);
         assert_eq!(obs2.fault.as_ref().map(|f| f.code), Some(FaultCode::JointLimit));
         assert!(inner2.active_trajectory.is_none(), "motion must be terminated");
-        assert!(inner2.tracking.last_issued_positions.is_none(), "output history must be invalidated");
-        // Verify the unsafe nominal target was NOT written; only stationary hold at measured pose was written.
-        let last_written = drv2.with(|s| s.written[writes_before][0].position);
-        assert!((last_written - obs2.positions[0]).abs() <= 1e-4, "expected hold at measured {}, got {last_written}", obs2.positions[0]);
+        // B2: with stale (150 ms) feedback, fallback must preserve the last confirmed safe output
+        // rather than writing a hold synthesized from the stale 150 ms-old measured sample!
+        assert_eq!(inner2.tracking.last_issued_positions.as_deref(), Some(prev_confirmed.as_slice()));
+        let fallback_written = drv2.with(|s| s.written[writes_before][0].position);
+        assert!(
+            (fallback_written - prev_confirmed[0]).abs() <= 1e-6,
+            "stale-feedback fallback must hold last confirmed output {}, got {fallback_written} (stale q_m={})",
+            prev_confirmed[0],
+            obs2.positions[0]
+        );
     }
 
     // --- (e) Unsafe return to nominal (keep-out between last_issued and nominal q_d) ---
@@ -692,20 +699,41 @@ fn lead_limits_and_withdrawal() {
 
             if streaming {
                 inner.servo_target = Some(q0.to_vec());
+                inner.servo_stream_active = true;
             } else {
                 let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &q0, &[0.0; 7], Some(1.0), &inner.config.limits).unwrap();
                 inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
             }
+            let writes_before = drv.with(|s| s.written.len());
             let obs = inner.tick(DT);
             assert!(inner.servo_target.is_none() && inner.active_trajectory.is_none(), "motion must terminate");
-            assert!(inner.tracking.last_issued_positions.is_none(), "history must invalidate");
+            // B2: fallback must NOT send rejected q0 across the keep-out box; it must preserve
+            // last confirmed output q_lead on the rejection tick AND subsequent hold ticks!
+            let fallback_frame = drv.with(|s| s.written[writes_before].clone());
+            assert!(
+                (fallback_frame[0].position - q_lead[0]).abs() <= 1e-6,
+                "fallback must preserve q_lead {}, never send rejected q0 {}: got {}",
+                q_lead[0],
+                q0[0],
+                fallback_frame[0].position
+            );
+            assert_eq!(fallback_frame[0].velocity, Some(0.0));
             if streaming {
                 assert_eq!(obs.motion_limit.as_ref().map(|m| m.reason), Some(MotionLimitReason::Workspace));
                 assert!(obs.workspace_violation.is_some());
             } else {
                 assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "trajectory unsafe return must fault, got {:?}", obs.safety_state);
             }
-            let _ = drv;
+            // Next tick in hold/fault must STILL hold q_lead, never jumping across the keep-out to q0.
+            let next_idx = drv.with(|s| s.written.len());
+            inner.tick(DT);
+            let next_frame = drv.with(|s| s.written[next_idx].clone());
+            assert!(
+                (next_frame[0].position - q_lead[0]).abs() <= 1e-6,
+                "subsequent hold tick must stay at q_lead {}, got {}",
+                q_lead[0],
+                next_frame[0].position
+            );
         }
     }
 }

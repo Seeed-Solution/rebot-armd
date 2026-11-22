@@ -589,6 +589,83 @@ impl crate::supervisor::SupervisorInner {
 
         Err(last_err.unwrap_or_else(|| TrackingReject::JointLimit("no valid tracking candidate".into())))
     }
+
+    /// Explicitly validate a proposed fallback hold pose `q_hold` against fresh feedback,
+    /// joint position limits, and swept workspace/keep-out constraints from both
+    /// `prev_confirmed` and `q_m`. Returns false when feedback is stale or any sweep fails.
+    pub fn validate_fallback_hold(
+        &self,
+        prev_confirmed: Option<&[f32]>,
+        q_hold: &[f32],
+        fresh_meas: bool,
+    ) -> bool {
+        use crate::chain::WorkspaceEvaluator;
+        use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+
+        let dof = self.config.dof;
+        if !fresh_meas || q_hold.len() != dof || !q_hold.iter().all(|q| q.is_finite()) {
+            return false;
+        }
+        let arm_indices = self.config.arm_joint_indices();
+        for &j in &arm_indices {
+            let lim = &self.config.limits[j];
+            if q_hold[j] < lim.min_position - 1e-5 || q_hold[j] > lim.max_position + 1e-5 {
+                return false;
+            }
+        }
+        if let Some((ws, cam)) = self.workspace_policy() {
+            let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+            let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+            if let Some(prev_q) = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite())) {
+                let mut c_prev = eval.alloc_buf();
+                if eval.eval_into(prev_q, &mut c_prev, "tracking_fallback").is_err() {
+                    return false;
+                }
+                let mut min_d = match &self.tracking.ws_min_depths {
+                    Some((rev, md)) if *rev == self.workspace_revision && md.as_slice().len() == eval.total_slots => {
+                        md.clone()
+                    }
+                    _ => eval.init_min_depths(&c_prev),
+                };
+                if eval
+                    .sweep_linear_step(
+                        prev_q,
+                        q_hold,
+                        &c_prev,
+                        &mut min_d,
+                        &mut budget,
+                        MAX_KEEPOUT_EVALS_PER_TICK,
+                        "tracking_fallback",
+                        "tracking_fallback",
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            let mut c_meas = eval.alloc_buf();
+            if eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_fallback").is_err() {
+                return false;
+            }
+            let mut min_d_meas = eval.init_min_depths(&c_meas);
+            if eval
+                .sweep_linear_step(
+                    &self.measured_positions,
+                    q_hold,
+                    &c_meas,
+                    &mut min_d_meas,
+                    &mut budget,
+                    MAX_KEEPOUT_EVALS_PER_TICK,
+                    "tracking_fallback",
+                    "tracking_fallback",
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
