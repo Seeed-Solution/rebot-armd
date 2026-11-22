@@ -4057,7 +4057,8 @@ fn tracking_braking_fallback_keeps_rejected_motion_caps() {
 }
 
 /// Review 4 #3: without velocity feedback, two rest samples less than one control period
-/// apart (by their feedback timestamps) are no evidence of rest, however many ticks repeat.
+/// apart (by their feedback timestamps) are no evidence of rest. Review 5 #4: spacing is set
+/// only through the reported feedback ages (no wall-clock assumption about tick duration).
 #[test]
 fn tracking_rest_samples_must_be_one_control_period_apart() {
     use armd::tracking::TrackingHistoryState;
@@ -4069,9 +4070,13 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
         ..ArmConfig::rebot_dm()
     };
     let period = Duration::from_secs_f64(1.0 / f64::from(cfg.control_frequency_hz));
-    assert!(period >= Duration::from_millis(5), "test needs a measurable control period");
+    assert_eq!(period, Duration::from_millis(20), "the B601-DM profile runs at 50 Hz");
+    let base = Duration::from_millis(60);
     let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
-    drv.with(|s| s.velocity_feedback = false);
+    drv.with(|s| {
+        s.velocity_feedback = false;
+        s.feedback_age = base;
+    });
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
     inner.lease_enabled = false;
     inner.commanded_positions = q0.to_vec();
@@ -4079,21 +4084,19 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
     inner.set_torque(true).unwrap();
-    // Back-to-back ticks, fresh (age 0) feedback each: samples microseconds apart.
-    for k in 0..5 {
-        let started = std::time::Instant::now();
+    // Controlled feedback timestamps (reported ages), 5 ms apart per tick: every pair of
+    // samples so far lies less than one control period (20 ms) apart.
+    for k in 0..4u32 {
+        drv.with(|s| s.feedback_age = base - Duration::from_millis(5) * k);
         inner.tick(DT);
-        assert!(started.elapsed() < period, "tick {k} took a whole control period; the test needs sub-period spacing");
         assert_eq!(
             inner.tracking.history_state,
             TrackingHistoryState::Unknown,
             "tick {k}: rest samples < one control period apart must not seed"
         );
     }
-    // One sample a full period older than the next: evidence.
-    drv.with(|s| s.feedback_age = period + Duration::from_millis(2));
-    inner.tick(DT);
-    drv.with(|s| s.feedback_age = Duration::ZERO);
+    // The next sample is newer than every earlier one by more than a period: evidence.
+    drv.with(|s| s.feedback_age = base - Duration::from_millis(15) - period - Duration::from_millis(5));
     inner.tick(DT);
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
