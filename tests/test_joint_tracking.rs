@@ -4286,3 +4286,46 @@ fn tracking_disabled_block_does_not_reject_profile() {
         assert!(cfg.validate().is_err(), "{label}: an enabled tracking block stays strictly validated");
     }
 }
+
+/// Review 6 B: the 100 ms reference-age limit applies where the evidence is used: after a
+/// control-loop pause the next sample (300 ms after the reference) is no evidence of rest,
+/// although it is more than one period newer; it becomes the new reference, and the next
+/// sample one period later is evidence. Receive instants are injected.
+#[test]
+fn tracking_rest_reference_expires_across_control_loop_pause() {
+    use armd::tracking::TrackingHistoryState;
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let ms = Duration::from_millis;
+    let base = std::time::Instant::now();
+    let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+    drv.with(|s| {
+        s.velocity_feedback = false;
+        s.feedback_instants = Some(vec![base; 7]);
+    });
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+    inner.lease_enabled = false;
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    inner.tick(DT);
+    assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
+    // The control loop pauses; the next sample arrives 300 ms after the reference.
+    drv.with(|s| s.feedback_instants = Some(vec![base + ms(300); 7]));
+    inner.tick(DT);
+    assert_eq!(
+        inner.tracking.history_state,
+        TrackingHistoryState::Unknown,
+        "a reference older than 100 ms at the point of use is no evidence"
+    );
+    drv.with(|s| s.feedback_instants = Some(vec![base + ms(320); 7]));
+    inner.tick(DT);
+    assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "fresh reference one period older is evidence");
+}

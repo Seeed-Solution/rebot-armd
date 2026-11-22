@@ -18,7 +18,8 @@ pub const STATIONARY_VELOCITY_RAD_S: f32 = 0.05;
 /// apart that still counts as evidence of rest without velocity feedback (rad;
 /// 0.05 rad/s over a 20 ms tick).
 pub const STATIONARY_POSITION_TOL_RAD: f32 = 1.0e-3;
-/// Oldest a kept reference rest sample may be (its newest joint reply) before it is replaced.
+/// Oldest a reference rest sample may be (its newest joint reply, against the current
+/// sample's newest reply) when it is kept and when it is used as evidence.
 pub const STATIONARY_SAMPLE_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Per-joint tracking control law.
@@ -455,14 +456,17 @@ impl crate::supervisor::SupervisorInner {
                     .is_some_and(|v| v.is_finite() && v.abs() <= STATIONARY_VELOCITY_RAD_S)
             });
         }
-        let (Some((sampled_newest, q_prev)), Some((oldest_now, _))) =
+        let (Some((sampled_newest, q_prev)), Some((oldest_now, newest_now))) =
             (self.tracking.position_sample.as_ref(), self.feedback_instant_range())
         else {
             return false;
         };
-        // At least one control period between the samples by their feedback timestamps.
+        // At least one control period between the samples by their feedback timestamps, and
+        // the reference at most STATIONARY_SAMPLE_MAX_AGE older than this sample (also after a
+        // control-loop pause).
         let period = std::time::Duration::from_secs_f64(1.0 / f64::from(self.config.control_frequency_hz.max(1)));
         oldest_now.checked_duration_since(*sampled_newest).is_some_and(|gap| gap >= period)
+            && newest_now.checked_duration_since(*sampled_newest).is_some_and(|age| age <= STATIONARY_SAMPLE_MAX_AGE)
             && q_prev.len() == dof
             && arm.iter().all(|&j| (self.measured_positions[j] - q_prev[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
     }
@@ -482,14 +486,17 @@ impl crate::supervisor::SupervisorInner {
             return;
         }
         let arm = self.config.arm_joint_indices();
+        let range = self.feedback_instant_range();
         let keep = self.tracking.position_sample.as_ref().is_some_and(|(newest, q_ref)| {
-            newest.elapsed() <= STATIONARY_SAMPLE_MAX_AGE
+            // Age of the reference against this sample's receive time (driver clock).
+            range.is_some_and(|(_, newest_now)| {
+                newest_now.checked_duration_since(*newest).is_some_and(|age| age <= STATIONARY_SAMPLE_MAX_AGE)
+            })
                 && q_ref.len() == dof
                 && arm.iter().all(|&j| (self.measured_positions[j] - q_ref[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
         });
         if !keep {
-            self.tracking.position_sample =
-                self.feedback_instant_range().map(|(_, newest)| (newest, self.measured_positions.clone()));
+            self.tracking.position_sample = range.map(|(_, newest)| (newest, self.measured_positions.clone()));
         }
     }
 
