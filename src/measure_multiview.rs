@@ -32,15 +32,18 @@
 //!   (all views); every view its own `decode_ms`. `measurement.timing` and `views[].timing`: the
 //!   wall-clock phases ([`RunTiming`], [`ViewTiming`]).
 //! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
-//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`). The start view (the arm was not
+//!   sliding window of samples with new feedback for every arm joint ([`feedback_advanced`]), until
+//!   [`MAX_SETTLE_S`], else `NOT_SETTLED`). The start view (the arm was not
 //!   moved by the action) skips the minimum wait: the settle rule only, for up to
 //!   [`MAX_SETTLE_S`] - [`MIN_SETTLE_S`]. Then one snapshot `s0`: with
 //!   inference idle the camera runs at 1 fps, so `/snapshot.jpg` can still hold a frame taken while
 //!   the arm moved (real B601-DM, 2026-11-22: the same frame for 0.7-2.2 s). A joint sample, a YOLO
 //!   trigger (a frame newer than the request; it also refreshes the snapshot), then snapshots every
 //!   [`REFRESH_POLL`] until one differs from `s0` (at most [`REFRESH_MAX`], else
-//!   `DETECTION_UNAVAILABLE`), then a second joint sample. The view's pose is the FK of the two
-//!   samples' mean joints; when they differ by more than [`BRACKET_RAD`] the trigger and snapshot
+//!   `DETECTION_UNAVAILABLE`), then a second joint sample with feedback newer than the snapshot
+//!   (as for gray frames). The view's pose is the FK of the two samples' mean joints; the joints
+//!   are also polled between the two ([`BracketTrack`]), and when an arm joint's range over all
+//!   these samples ([`bracket_range`]) exceeds [`BRACKET_RAD`] the trigger and snapshot
 //!   are retried (`s0` = the last snapshot), at most [`SNAPSHOT_TRIES`] times, then `MOVED`. The
 //!   target box comes from the trigger frame of the accepted try.
 //! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
@@ -579,13 +582,6 @@ async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     Ok(())
 }
 
-/// Measured joints (all) and velocities (arm joints).
-async fn sample(ctx: &MacroCtx) -> (Vec<f32>, Vec<f32>) {
-    let inner = ctx.sup.inner().read().await;
-    let arm = inner.config.arm_joint_indices();
-    (inner.measured_positions.clone(), arm.iter().map(|&i| inner.measured_velocities.get(i).copied().unwrap_or(0.0)).collect())
-}
-
 /// Measured joints (all), per-arm-joint feedback instants, and per-arm-joint monotonic feedback
 /// sequence counters, read coherently under one lock.
 async fn sample_with_timing(ctx: &MacroCtx) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
@@ -675,16 +671,30 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     recheck(ctx, plan).await?;
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let mut win: std::collections::VecDeque<(Vec<f32>, Vec<f32>)> = std::collections::VecDeque::new();
+    // the sequence counters of the last sample taken (the first read only sets them): a sample
+    // enters the window only when every arm joint has new feedback since the previous one, so the
+    // window holds STILL_WINDOW distinct samples, never re-reads of a cached one
+    let mut last_seqs: Option<Vec<u64>> = None;
     loop {
         ctx.check().await?;
-        win.push_back(sample(ctx).await);
-        if win.len() > STILL_WINDOW { win.pop_front(); }
+        let (pos, vel, _, seqs) = { ctx.sup.inner().read().await.arm_feedback_snapshot() };
+        if last_seqs.as_deref().is_some_and(|prev| feedback_advanced(prev, &seqs)) {
+            win.push_back((pos, vel));
+            if win.len() > STILL_WINDOW { win.pop_front(); }
+        }
+        if last_seqs.as_deref().is_none_or(|prev| feedback_advanced(prev, &seqs)) { last_seqs = Some(seqs); }
         if win.len() == STILL_WINDOW && is_still(&win, &arm) { return Ok(t0.elapsed().as_secs_f64()); }
         if t0.elapsed().as_secs_f64() > max_s {
-            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {max_s} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples)")));
+            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {max_s} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples with new feedback; {} taken)", win.len())));
         }
         tokio::time::sleep(STILL_SAMPLE).await;
     }
+}
+
+/// Every arm joint's feedback sequence counter moved on from `prev` (a new hardware sample per
+/// joint, not a re-read of the cached one).
+pub fn feedback_advanced(prev: &[u64], cur: &[u64]) -> bool {
+    !cur.is_empty() && prev.len() == cur.len() && prev.iter().zip(cur).all(|(&p, &c)| c != p)
 }
 
 /// The settle rule over a window of (positions, arm velocities) samples.
@@ -699,8 +709,66 @@ pub fn is_still(win: &std::collections::VecDeque<(Vec<f32>, Vec<f32>)>, arm: &[u
 
 /// Largest difference of the arm joints between two samples (rad), and that joint's index.
 pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> (f32, usize) {
-    arm.iter().map(|&i| ((a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs(), i))
-        .fold((0.0, arm.first().copied().unwrap_or(0)), |m, x| if x.0 > m.0 { x } else { m })
+    bracket_range(&[a, b], arm)
+}
+
+/// Largest range (max - min) of an arm joint over all samples of a bracket (A, the samples
+/// polled between, B), and that joint's index: a joint that moves and comes back between A and B
+/// counts with how far it went, not with its endpoints only.
+pub fn bracket_range(samples: &[&[f32]], arm: &[usize]) -> (f32, usize) {
+    arm.iter().map(|&i| {
+        let (lo, hi) = samples.iter().filter_map(|s| s.get(i)).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        (if hi >= lo { hi - lo } else { 0.0 }, i)
+    }).fold((0.0, arm.first().copied().unwrap_or(0)), |m, x| if x.0 > m.0 { x } else { m })
+}
+
+/// The measured joints polled every [`BRACKET_TRACK_SAMPLE`] from bracket sample A until
+/// [`BracketTrack::finish`] (sample B taken); on an early return `Drop` stops the poll.
+struct BracketTrack {
+    task: Option<tokio::task::JoinHandle<()>>,
+    samples: Arc<std::sync::Mutex<Vec<Vec<f32>>>>,
+}
+
+/// Poll period of the joints between bracket samples A and B.
+pub const BRACKET_TRACK_SAMPLE: Duration = Duration::from_millis(5);
+
+impl BracketTrack {
+    fn start(sup: Arc<ArmSupervisor>) -> Self {
+        let samples = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = samples.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let q = sup.inner().read().await.measured_positions.clone();
+                if let Ok(mut v) = out.lock() { v.push(q); }
+                tokio::time::sleep(BRACKET_TRACK_SAMPLE).await;
+            }
+        });
+        Self { task: Some(task), samples }
+    }
+
+    /// Stop polling; the samples taken.
+    async fn finish(mut self) -> Vec<Vec<f32>> {
+        if let Some(t) = self.task.take() {
+            t.abort();
+            let _ = t.await;
+        }
+        std::mem::take(&mut *self.samples.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl Drop for BracketTrack {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() { t.abort(); }
+    }
+}
+
+/// [`bracket_range`] over A, the polled samples and B.
+fn tracked_spread(a: &[f32], between: &[Vec<f32>], b: &[f32], arm: &[usize]) -> (f32, usize) {
+    let mut all: Vec<&[f32]> = Vec::with_capacity(between.len() + 2);
+    all.push(a);
+    all.extend(between.iter().map(Vec::as_slice));
+    all.push(b);
+    bracket_range(&all, arm)
 }
 
 /// Wall-clock phases of one view (ms), `views[].timing`: the view motion including its planning
@@ -880,17 +948,18 @@ async fn capture_gray(
             recheck(ctx, plan).await?;
             let t_a = Instant::now();
             let (a, inst_a) = sample_with_instants(ctx).await;
+            let track = BracketTrack::start(ctx.sup.clone());
             let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
             let t_trigger = Instant::now();
             let res = src.trigger_gray(pipelines, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))?;
             let call_ms = t_trigger.elapsed().as_secs_f64() * 1000.0;
             trig_total_ms += call_ms;
             if let Some(r) = res {
-                trig = Some((r, t_a, a, age_a_ms, call_ms));
+                trig = Some((r, t_a, a, track, age_a_ms, call_ms));
                 break;
             }
         }
-        let (trig, t_a, a, age_a_ms, trigger_ms) =
+        let (trig, t_a, a, track, age_a_ms, trigger_ms) =
             trig.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
         let Some(instance_id) = trig.instance_id.clone().filter(|s| !s.is_empty()) else {
             return Err(fail("DETECTION_UNAVAILABLE", "gray trigger reply missing instance_id"));
@@ -947,9 +1016,10 @@ async fn capture_gray(
         let (_, _, fence_seqs) = sample_with_timing(ctx).await;
         let (b, inst_b, feedback_wait_b_ms) = sample_fresh_after(ctx, plan, t_fetch_done, &fence_seqs).await?;
         let t_b = Instant::now();
+        let between = track.finish().await;
         let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
         let age_b_ms = max_feedback_age_ms(t_b, &inst_b);
-        let (spread, joint) = bracket_spread(&a, &b, &arm);
+        let (spread, joint) = tracked_spread(&a, &between, &b, &arm);
         tries.push((spread, joint));
         if spread <= bracket_limit {
             let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
@@ -1013,17 +1083,18 @@ async fn capture_snapshot(
             recheck(ctx, plan).await?;
             let t_a = Instant::now();
             let (a, inst_a) = sample_with_instants(ctx).await;
+            let track = BracketTrack::start(ctx.sup.clone());
             let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
             let t_trigger = Instant::now();
             let got = if markers { src.trigger_markers(YOLO_ARUCO, TRIGGER_WAIT_MS).await } else { src.trigger(YOLO, TRIGGER_WAIT_MS).await.map(|f| f.map(|f| (f, Vec::new()))) };
             trig_total_ms += t_trigger.elapsed().as_secs_f64() * 1000.0;
             if let Some(f) = got.map_err(|e| source_fail(format!("trigger: {e}")))? {
                 let t_reply = Instant::now();
-                frame = Some((f, t_a, a, age_a_ms, t_reply, (t_reply - t_trigger).as_secs_f64() * 1000.0));
+                frame = Some((f, t_a, a, track, age_a_ms, t_reply, (t_reply - t_trigger).as_secs_f64() * 1000.0));
                 break;
             }
         }
-        let (frame, t_a, a, age_a_ms, t_reply, trigger_ms) =
+        let (frame, t_a, a, track, age_a_ms, t_reply, trigger_ms) =
             frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
         let mut polls = 0;
         let jpeg = loop {
@@ -1038,21 +1109,26 @@ async fn capture_snapshot(
         };
         let wait_ms = t_reply.elapsed().as_secs_f64() * 1000.0;
         fetch_total_ms += wait_ms;
+        // B: like the gray path, a hardware sample of every arm joint taken after the snapshot
+        // arrived, not the cached one (which may not have changed since A)
+        let t_snap_done = Instant::now();
+        let (_, _, fence_seqs) = sample_with_timing(ctx).await;
+        let (b, inst_b, feedback_wait_b_ms) = sample_fresh_after(ctx, plan, t_snap_done, &fence_seqs).await?;
         let t_b = Instant::now();
-        let (b, inst_b) = sample_with_instants(ctx).await;
+        let between = track.finish().await;
         let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
         let age_b_ms = max_feedback_age_ms(t_b, &inst_b);
-        let (spread, joint) = bracket_spread(&a, &b, &arm);
+        let (spread, joint) = tracked_spread(&a, &between, &b, &arm);
         tries.push((spread, joint));
         if spread <= bracket_limit {
             let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
-            got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls, bracket_duration_ms, age_a_ms, age_b_ms));
+            got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls, bracket_duration_ms, feedback_wait_b_ms, age_a_ms, age_b_ms));
             break;
         }
         retry_reasons.push("moved".into());
         s0 = jpeg;
     }
-    let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls, bracket_duration_ms, feedback_age_a_ms, feedback_age_b_ms)) = got else {
+    let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms)) = got else {
         let mrad: Vec<String> = tries.iter().map(|(t, j)| format!("J{} {:.1}", j + 1, t * 1000.0)).collect();
         return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
     };
@@ -1070,7 +1146,7 @@ async fn capture_snapshot(
         frame_id: frame.frame_id, detections: frame.detections, decode_ms, frame_fetch_ms: 0.0,
         gray_convert_ms: None, parse_ms: 0.0, shift_px, margin_px, joints,
         bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
-        retry_reasons, bracket_duration_ms, feedback_wait_b_ms: 0.0, feedback_age_a_ms, feedback_age_b_ms,
+        retry_reasons, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms,
         settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks,
         timing: ViewTiming { motion_ms: 0.0, settle_ms: settle_s * 1000.0, trigger_ms: trig_total_ms, fetch_ms: fetch_total_ms,
             capture_ms: t_cap.elapsed().as_secs_f64() * 1000.0 },
@@ -2207,6 +2283,24 @@ mod tests {
         let (d, j) = bracket_spread(&a, &b, &arm);
         assert!((d - 0.0025).abs() < 1e-7);
         assert_eq!(j, 4, "the joint with the largest change");
+        // a move and return between A and B: equal endpoints, the range over all samples counts
+        let mut mid = a.clone();
+        mid[2] = 0.004;
+        assert_eq!(bracket_range(&[&a, &a], &arm).0, 0.0);
+        let (d, j) = bracket_range(&[&a, &mid, &a], &arm);
+        assert!((d - 0.004).abs() < 1e-7 && j == 2, "{d} J{j}");
+        assert_eq!(bracket_range(&[&a, &mid, &b], &arm), (0.004, 2));
+    }
+
+    #[test]
+    fn a_window_sample_needs_new_feedback_on_every_arm_joint() {
+        assert!(feedback_advanced(&[1, 1, 1], &[2, 3, 2]));
+        // a cached re-read, or one joint without a new sample: not a new window sample
+        assert!(!feedback_advanced(&[1, 1, 1], &[1, 1, 1]));
+        assert!(!feedback_advanced(&[1, 1, 1], &[2, 1, 2]));
+        assert!(!feedback_advanced(&[1, 1], &[2, 2, 2]));
+        assert!(!feedback_advanced(&[], &[]));
+        assert!(feedback_advanced(&[u64::MAX], &[0]), "the counter wraps");
     }
 
     #[test]

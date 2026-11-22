@@ -81,6 +81,8 @@ struct FakeVision {
     holds: AtomicU64,
     releases: Mutex<Vec<String>>,
     held: AtomicBool,
+    /// Called at the start of every trigger (JPEG and gray).
+    on_trigger: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -149,6 +151,7 @@ impl FakeVision {
     }
 
     async fn frame_with_pipelines(&self, pipelines: &[&str]) -> ((DetectionFrame, Vec<armd::mview_stereo::Marker>), bool) {
+        if let Some(cb) = self.on_trigger.lock().unwrap().as_ref() { cb(); }
         if pipelines.contains(&"gray") {
             if let Some(c) = self.shake_on_gray_trigger.lock().unwrap().as_ref() {
                 c.lock().unwrap().shake = true;
@@ -345,7 +348,7 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
         gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
-        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false) });
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false), on_trigger: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -597,6 +600,8 @@ struct Creep {
     shake_t0: Option<f32>,
     /// Time the clock stood still.
     paused: Duration,
+    /// J4 offset by `.2` (rad) from `.0` for `.1`, then back (a move-and-return).
+    bump: Option<(Instant, Duration, f32)>,
 }
 
 /// common::TestArm reporting positions with creep and limit cycles (real B601-DM, 2026-11-22).
@@ -614,6 +619,9 @@ impl CreepArm {
         if a > 0.0 {
             p[3] = a * (tau * t / per).sin();
             v[3] = a * tau / per * (tau * t / per).cos();
+        }
+        if let Some((t0, d, amp)) = c.bump {
+            if t0.elapsed() < d { p[3] += amp; }
         }
         if c.shake {
             let ts = *c.shake_t0.get_or_insert(t);
@@ -1311,7 +1319,7 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
         gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
         gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None),
-        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false) });
+        hold_supported: AtomicBool::new(true), holds: AtomicU64::new(0), releases: Mutex::new(Vec::new()), held: AtomicBool::new(false), on_trigger: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1525,4 +1533,68 @@ fn malformed_gray_descriptor_does_not_select_gray() {
     let mut remote = mode(None);
     remote.upstream_loopback = false;
     assert_eq!(mm::select_frame_source(&remote), mm::FrameSource::Snapshot);
+}
+
+/// TestArm whose feedback looks fresh (age 0) but, once `frozen`, reports the same per-joint
+/// sequence counters: the supervisor keeps re-reading a cached sample.
+struct FrozenFeedbackArm { inner: common::TestArm, frozen: Arc<AtomicBool>, seq: u64 }
+
+impl ArmDriver for FrozenFeedbackArm {
+    fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+    fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { self.inner.feedback_ages() }
+    fn feedback_seqs(&self) -> Vec<u64> { vec![self.seq; 7] }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        if !self.frozen.load(Ordering::SeqCst) { self.seq += 1; }
+        self.inner.read_joint_states()
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn supports_mit_mode_switch(&self) -> bool { false }
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_feedback_without_new_samples_never_counts_as_still() {
+    // feedback within the freshness bound but no new sample (sequence counters stand still): the
+    // start view's still window never fills, so NOT_SETTLED without any trigger
+    for gray in [false, true] {
+        let frozen = Arc::new(AtomicBool::new(false));
+        let d = FrozenFeedbackArm { inner: common::TestArm::new(), frozen: frozen.clone(), seq: 0 };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(d)).await;
+        r.vision.gray.store(gray, Ordering::SeqCst);
+        frozen.store(true, Ordering::SeqCst);
+        let ack = r.start(json!({"label": "box"})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 30.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "gray {gray}: {a}");
+        assert!(a["message"].as_str().unwrap().contains("0 taken"), "{a}");
+        assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger while the feedback is cached");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_and_return_between_the_bracket_samples_fails_moved() {
+    // J4 jumps 10 mrad for 80 ms at the start of every trigger (200 ms) and comes back before
+    // sample B: the endpoints agree, the joints polled in between do not
+    for gray in [false, true] {
+        let creep = Arc::new(Mutex::new(Creep::default()));
+        let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+        let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+        r.vision.gray.store(gray, Ordering::SeqCst);
+        r.vision.trigger_delay_ms.store(200, Ordering::SeqCst);
+        let c = creep.clone();
+        *r.vision.on_trigger.lock().unwrap() = Some(Box::new(move || {
+            c.lock().unwrap().bump = Some((Instant::now(), Duration::from_millis(80), 0.010));
+        }));
+        let ack = r.start(json!({"pose_refine": "off"})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 60.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "gray {gray}: {a}");
+        let msg = a["message"].as_str().unwrap();
+        assert!(msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
+        assert_eq!(r.vision.frame.load(Ordering::SeqCst), mm::SNAPSHOT_TRIES as u64, "gray {gray}");
+    }
 }
