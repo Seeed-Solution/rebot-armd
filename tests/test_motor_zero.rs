@@ -364,3 +364,21 @@ async fn refused_software_zero_does_not_invalidate_the_mit_record() {
     let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
     assert!(file.mit_record().unwrap().unwrap().invalidated.is_none(), "record invalidated on disk by a refused zero");
 }
+
+/// Review round 4 (M4): a software zero whose backup cannot be written changes nothing, the MIT
+/// qualification included (the invalidation follows the backup).
+#[tokio::test]
+async fn software_zero_backup_failure_keeps_the_mit_record() {
+    let with_record = |dir: &Path| {
+        let mut file = CalibrationFile { joint_zero: Some(armd::joint_zero::JointZero::new(&[0.0; 7], "software", "rest")), ..Default::default() };
+        file.mit_qualification = Some(mit_record_j2());
+        std::fs::write(dir.join("calibration.json"), serde_json::to_string(&file).unwrap()).unwrap();
+        std::fs::write(dir.join("backups"), "not a directory").unwrap();
+    };
+    let mut r = rig(None, with_record).await;
+    set_q(&r, Q).await;
+    let rej = cmd(&mut r, PATH, json!({"joints": [2], "method": "software"})).await;
+    assert_eq!(rej["type"], "command_reject", "{rej}");
+    let inner = r.sup.inner().read().await;
+    assert!(inner.calibration.as_ref().unwrap().mit_record().unwrap().unwrap().invalidated.is_none(), "record invalidated although the zero failed");
+}
