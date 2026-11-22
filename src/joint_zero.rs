@@ -165,6 +165,14 @@ impl ArmDriver for ZeroOffsetDriver {
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { Some(self.offsets.clone()) }
     fn take_recovery_writes(&mut self) -> Vec<usize> { self.inner.take_recovery_writes() }
     fn set_strict_mode_handover(&mut self, strict: bool) { self.inner.set_strict_mode_handover(strict) }
+    fn set_joint_modes_confirmed(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        match self.to_motor(hold) {
+            None => self.inner.set_joint_modes_confirmed(modes, hold),
+            Some(m) => self.inner.set_joint_modes_confirmed(modes, &m),
+        }
+    }
+    fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
+    fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
         self.inner.commission_motor_timeout(joints, counts)

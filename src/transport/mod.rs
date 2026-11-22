@@ -258,6 +258,12 @@ pub trait AsyncTransport: Send {
 
 /// CAN bus frame transport trait
 pub trait CanTransport: Send {
+    /// Optional deterministic clock supplied by test transports ([`DriverClock`]).
+    /// Production transports return `None`: drivers use the system clock unchanged.
+    fn clock(&self) -> Option<std::sync::Arc<dyn DriverClock>> {
+        None
+    }
+
     /// Transmit a CAN frame
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError>;
 
