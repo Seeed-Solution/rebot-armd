@@ -1164,6 +1164,9 @@ async fn settle_min_s_sets_the_wait_at_the_view_poses() {
     assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
     let d = r.sup.inner().read().await.safety_describe();
     assert_eq!(d["limits"]["measure_multiview"]["settle_min_s"], json!([0.5, 3.0]));
+    // the longest settle deadline a request can get: settle_min_s 3 + the 2 s of still windows
+    assert_eq!(d["limits"]["measure_multiview"]["max_settle_s"], json!(5.0));
+    assert_eq!((mm::max_settle_s(mm::MIN_SETTLE_S), mm::max_settle_s(0.5)), (mm::MAX_SETTLE_S, 2.5));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

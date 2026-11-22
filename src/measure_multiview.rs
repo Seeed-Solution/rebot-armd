@@ -126,6 +126,11 @@ pub const STILL_SAMPLE: Duration = Duration::from_millis(20);
 pub const STILL_VEL: f32 = 0.03;
 pub const STILL_RANGE_RAD: f32 = 0.003;
 pub const MAX_SETTLE_S: f64 = 4.0;
+
+/// The settle deadline after a view motion for a minimum wait `min_s` (the windows get
+/// [`MAX_SETTLE_S`] - [`MIN_SETTLE_S`] after it): [`MAX_SETTLE_S`] at the default, up to 5 s at
+/// the largest `settle_min_s`.
+pub fn max_settle_s(min_s: f64) -> f64 { min_s + (MAX_SETTLE_S - MIN_SETTLE_S) }
 /// The snapshot's pose: the joints sampled before the trigger request and right after the fresh
 /// snapshot, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the two,
 /// trigger and snapshot are retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`]
@@ -554,7 +559,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     // (the last one may start just before REFRESH_MAX) and the retry gap
     let try_s = SNAPSHOT_GAP_RETRY.as_secs_f64() + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0)
         + 3.5 + REFRESH_MAX.as_secs_f64() + 3.5;
-    let capture_s = request.settle_min_s + (MAX_SETTLE_S - MIN_SETTLE_S) + 3.5 + SNAPSHOT_TRIES as f64 * try_s;
+    let capture_s = max_settle_s(request.settle_min_s) + 3.5 + SNAPSHOT_TRIES as f64 * try_s;
     let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
@@ -679,7 +684,7 @@ async fn sample_fresh_after(
 async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     let t0 = Instant::now();
     let until = t0 + Duration::from_secs_f64(min_s);
-    let max_s = min_s + (MAX_SETTLE_S - MIN_SETTLE_S);
+    let max_s = max_settle_s(min_s);
     while Instant::now() < until {
         ctx.check().await?;
         tokio::time::sleep(POLL).await;
