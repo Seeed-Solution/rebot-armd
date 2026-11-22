@@ -491,18 +491,45 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
     match loaded {
         crate::persist::Loaded::Loaded(mut file) => {
             strip_mismatched_tool_records(&mut file, &inner.config.active_tool);
-            if let Some(z) = &file.joint_zero {
-                match z.validate(Some(inner.config.dof)).and_then(|()| inner.set_joint_zero_offsets(&z.offsets())) {
-                    Ok(()) => tracing::info!("Joint zero loaded from {} (method {}, set {}): offsets {:?} rad", path.display(), z.method,
-                        z.set_at.as_deref().unwrap_or("?"), z.offsets()),
+            let mut pending_jz_err: Option<String> = None;
+            let pending_joint_zero = if let Some(z) = &file.joint_zero {
+                match z.validate(Some(inner.config.dof)) {
+                    Ok(()) if !inner.is_torqued && !inner.disable_pending => Some(z.offsets()),
+                    Ok(()) => {
+                        tracing::warn!("Ignoring the joint zero in {}: torque is on; offsets 0", path.display());
+                        pending_jz_err = Some("calibration.json: joint_zero: torque is on; offsets 0 are used".into());
+                        file.joint_zero = None;
+                        None
+                    }
                     Err(e) => {
+                        tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
+                        pending_jz_err = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
+                        file.joint_zero = None;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if !file.has_camera() {
+                if let Some(err) = pending_jz_err.take() {
+                    inner.calibration_load_error = Some(err);
+                }
+                if let Some(ref offsets) = pending_joint_zero {
+                    if let Err(e) = inner.set_joint_zero_offsets(offsets) {
                         tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
                         inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
                         file.joint_zero = None;
+                    } else if let Some(z) = &file.joint_zero {
+                        tracing::info!(
+                            "Joint zero loaded from {} (method {}, set {}): offsets {:?} rad",
+                            path.display(),
+                            z.method,
+                            z.set_at.as_deref().unwrap_or("?"),
+                            z.offsets()
+                        );
                     }
                 }
-            }
-            if !file.has_camera() {
                 if let Some(k) = &file.kinematics {
                     if let Err(e) = inner.set_kinematics_correction(Some(&k.joints)) {
                         tracing::warn!("Ignoring the kinematic correction in {}: {e}", path.display());
@@ -517,12 +544,13 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             file.camera_mount = mount.clone();
 
             // Pre-validate candidate kinematics and synced grasp_setup BEFORE committing any live state.
+            let mut pending_kin_err: Option<String> = None;
             let candidate_arm_model = if let Some(k) = &file.kinematics {
                 match inner.config.arm_model.with_correction(Some(&k.joints)) {
                     Ok(m) => Some(m),
                     Err(e) => {
                         tracing::warn!("Ignoring the kinematic correction in {}: {e}; using the uncorrected model", path.display());
-                        inner.calibration_load_error = Some(format!("calibration.json: kinematics: {e}; the uncorrected model is used"));
+                        pending_kin_err = Some(format!("calibration.json: kinematics: {e}; the uncorrected model is used"));
                         file.kinematics = None;
                         None
                     }
@@ -554,6 +582,25 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             } else {
                 None
             };
+
+            if let Some(err) = pending_jz_err.or(pending_kin_err) {
+                inner.calibration_load_error = Some(err);
+            }
+            if let Some(ref offsets) = pending_joint_zero {
+                if let Err(e) = inner.set_joint_zero_offsets(offsets) {
+                    tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
+                    inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
+                    file.joint_zero = None;
+                } else if let Some(z) = &file.joint_zero {
+                    tracing::info!(
+                        "Joint zero loaded from {} (method {}, set {}): offsets {:?} rad",
+                        path.display(),
+                        z.method,
+                        z.set_at.as_deref().unwrap_or("?"),
+                        z.offsets()
+                    );
+                }
+            }
 
             tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
                 path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
@@ -1674,13 +1721,14 @@ fn diff_view(vision: &Value, state: &ArmdState, inner: &SupervisorInner) -> Valu
         &inner.joint_zero_offsets,
         Some(&inner.config.active_tool.config_digest),
     );
+    let legacy_fp = legacy_file_fingerprint(c, &state.camera_mount, &inner.joint_zero_offsets);
     let mut v = json!({"vision_intrinsics": vision, "camera_mount": mount_summary(&state.camera_mount),
         "kinematics": c.and_then(|c| c.kinematics.as_ref()),
         "grasp": state.grasp_setup.as_ref().map(grasp_fields),
         "x_fingerprint": x_fp, "fingerprint": fp,
         "table_z_m": c.and_then(|c| c.table_z_m), "table_z_source": c.and_then(|c| c.table_z_source.as_deref()),
         "tool": c.and_then(|c| c.tool.as_ref()), "acceptance": c.and_then(|c| c.acceptance.as_ref()).map(|a| json!({"passed": a.passed, "fingerprint": a.fingerprint, "job_id": a.job_id})),
-        "floor": inner.profile_floor_z_m.map(|p| floor_view_for(p, c, &fp, &inner.config.active_tool))});
+        "floor": inner.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, c, &fp, Some(&legacy_fp), &inner.config.active_tool))});
     if let Some(p) = state.grip_pixel_model { v["grip_pixel_model"] = json!(p); }
     v
 }

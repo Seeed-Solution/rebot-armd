@@ -1388,29 +1388,52 @@ fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
 
 fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<(), String> {
     check_tcp_site_not_in_frame(node)?;
+    if let Some(host_body) = node
+        .ancestors()
+        .skip(1)
+        .find(|a| a.is_element() && a.tag_name().name() == "body")
+    {
+        if host_body
+            .attribute("name")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(
+                "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name"
+                    .into(),
+            );
+        }
+    }
     if node.attribute("fromto").is_some() {
         return Err("base MJCF <site name=\"tcp\"> uses unsupported 'fromto' attribute".into());
     }
-    let explicit_class = node
+    let raw_explicit_class = node
         .attribute("class")
         .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "main");
-    if let Some(cls) = explicit_class {
+        .filter(|s| !s.is_empty());
+    if let Some(cls) = raw_explicit_class.filter(|s| *s != "main") {
         return Err(format!(
             "base MJCF <site name=\"tcp\"> uses unsupported class '{cls}'"
         ));
     }
-    let ancestor_childclass = node.ancestors().skip(1).find_map(|a| {
-        a.is_element()
-            .then(|| {
-                a.attribute("childclass")
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "main")
-            })
-            .flatten()
-    });
+    // Explicit class="main" on <site name="tcp"> overrides any ancestor childclass.
+    let effective_class = if raw_explicit_class == Some("main") {
+        None
+    } else {
+        node.ancestors().skip(1).find_map(|a| {
+            a.is_element()
+                .then(|| {
+                    a.attribute("childclass")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "main")
+                })
+                .flatten()
+        })
+    };
     const TRANSFORM_ATTRS: [&str; 7] =
         ["pos", "quat", "euler", "axisangle", "xyaxes", "zaxis", "fromto"];
+    let mut active_defaults: Vec<roxmltree::Node> = Vec::new();
     for def in doc.descendants() {
         if !def.is_element() || def.tag_name().name() != "default" {
             continue;
@@ -1419,14 +1442,32 @@ fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) ->
             .attribute("class")
             .map(str::trim)
             .filter(|s| !s.is_empty() && *s != "main");
-        let applies = match (ancestor_childclass, def_class) {
-            (_, None) => true,
-            (Some(ac), Some(dc)) => ac == dc,
-            (None, Some(_)) => false,
-        };
-        if !applies {
-            continue;
+        let has_named_default_ancestor = def.ancestors().skip(1).any(|a| {
+            a.is_element()
+                && a.tag_name().name() == "default"
+                && a.attribute("class")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "main")
+                    .is_some()
+        });
+        if def_class.is_none() && !has_named_default_ancestor {
+            active_defaults.push(def);
         }
+        if let Some(ec) = effective_class {
+            if def_class == Some(ec) {
+                for anc in def.ancestors() {
+                    if anc.is_element() && anc.tag_name().name() == "default" {
+                        active_defaults.push(anc);
+                    }
+                }
+            }
+        }
+    }
+    for def in active_defaults {
+        let def_class = def
+            .attribute("class")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "main");
         for child in def.children() {
             if child.is_element()
                 && child.tag_name().name() == "site"
@@ -1448,12 +1489,19 @@ fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> 
         for site in base_doc.descendants() {
             if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
                 check_tcp_site_not_in_frame(site)?;
-                for anc in site.ancestors().skip(1) {
-                    if anc.is_element() && anc.tag_name().name() == "body" {
-                        if let Some(bname) = anc.attribute("name").map(str::trim).filter(|s| !s.is_empty()) {
-                            return Ok(bname.to_string());
-                        }
-                    }
+                if let Some(direct_body) = site
+                    .ancestors()
+                    .skip(1)
+                    .find(|anc| anc.is_element() && anc.tag_name().name() == "body")
+                {
+                    let bname = direct_body
+                        .attribute("name")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            "base MJCF <site name=\"tcp\"> is directly inside an unnamed <body>; give its host <body> a non-empty name".to_string()
+                        })?;
+                    return Ok(bname.to_string());
                 }
             }
         }
@@ -2595,5 +2643,44 @@ mod tests {
           <worldbody><body name="end_link" childclass="tool_cls"><site name="tcp"/></body></worldbody>
         </mujoco>"#;
         assert!(compose_mjcf(childclass_default_base, None, Some(&framed_manifest), None).unwrap_err().contains("default"));
+
+        // 16. R8 M3 & m3:
+        // (a) Nested <default> inheritance chain (<default class="parent"><site .../><default class="leaf">...)
+        //     propagates parent's <site> transform to childclass="leaf" and fails closed.
+        let nested_default_base = r#"<mujoco>
+          <default>
+            <default class="parent">
+              <site quat="0 1 0 0"/>
+              <default class="leaf">
+                <geom rgba="1 0 0 1"/>
+              </default>
+            </default>
+          </default>
+          <worldbody><body name="end_link" childclass="leaf"><site name="tcp" pos="0 0 0"/></body></worldbody>
+        </mujoco>"#;
+        assert!(compose_mjcf(nested_default_base, None, Some(&framed_manifest), None).unwrap_err().contains("default"));
+
+        // (b) Explicit class="main" on <site name="tcp"> overrides ancestor childclass="painted".
+        let explicit_main_base = r#"<mujoco>
+          <default>
+            <default class="painted"><site pos="0 0 0.05" quat="0 1 0 0"/></default>
+          </default>
+          <worldbody><body name="end_link" childclass="painted"><site name="tcp" class="main" pos="0 0 0"/></body></worldbody>
+        </mujoco>"#;
+        let main_ok = compose_mjcf(explicit_main_base, None, Some(&framed_manifest), Some(so101_geom_tool))
+            .expect("explicit class=\"main\" must override ancestor childclass");
+        assert!(main_ok.contains("0.02 0 0"), "expected tcp_offset 0.02 applied: {main_ok}");
+
+        // 17. R8 M4: <site name="tcp"> directly inside an unnamed child <body> fails closed instead of
+        // silently skipping to a named grandparent body.
+        let unnamed_body_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <body pos="0 0 0.10"><site name="tcp" pos="0 0 0"/></body>
+          </body>
+        </worldbody></mujoco>"#;
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(unnamed_body_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("unnamed <body>"), "expected unnamed <body> rejection, got: {err}");
+        }
     }
 }

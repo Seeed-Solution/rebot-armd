@@ -2240,12 +2240,21 @@ async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint(
             "q_end_cam": q_tilt15
         },
         "intrinsics": {"fx": 0.0, "fy": 830.0, "cx": 320.0, "cy": 180.0},
-        "table_z_m": 0.014
+        "table_z_m": 0.014,
+        "joint_zero": {
+            "joints": [
+                {"offset_rad": 0.05}, {"offset_rad": 0.0}, {"offset_rad": 0.0},
+                {"offset_rad": 0.0}, {"offset_rad": 0.0}, {"offset_rad": 0.0}, {"offset_rad": 0.0}
+            ],
+            "method": "software",
+            "set_at": "2026-11-22T00:00:00Z"
+        }
     })).unwrap();
     std::fs::write(&cal_path, serde_json::to_string_pretty(&bad_cal).unwrap()).unwrap();
 
     let tool_b = other_tool_cfg();
     let orig_mount = tool_b.camera_mount.clone();
+    let orig_dof = tool_b.dof;
     let sup_bad = Arc::new(ArmSupervisor::new(tool_b));
     grasp::load_into(&sup_bad, &gs_path).await; // Missing -> sets grasp_setup_needs_camera_sync=true
     let err = calibration::load_into(&sup_bad, &cal_path, Some(&gs_path)).await.unwrap_err();
@@ -2253,6 +2262,7 @@ async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint(
     {
         let inner = sup_bad.inner().read().await;
         assert_eq!(inner.config.camera_mount, orig_mount, "M6: failed sync must not install partial camera_mount");
+        assert_eq!(inner.joint_zero_offsets, vec![0.0; orig_dof], "m1: failed load_into must not mutate joint_zero_offsets");
         assert!(inner.grasp_setup_needs_camera_sync, "M6: failed sync must retain grasp_setup_needs_camera_sync");
         assert!(inner.calibration.is_none());
     }
@@ -2285,10 +2295,58 @@ async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint(
     let mut sup_stock = common::sim_at(stock_cfg.clone(), &INSPECT);
     sup_stock.set_calibration(Some(legacy_cal.clone()));
     assert_eq!(sup_stock.floor_source, "calibration_hover", "stock device must keep legacy hover floor");
+    let expected_stock_floor = (0.025 - 0.003) as f32;
     assert!(
-        (sup_stock.config.workspace.as_ref().unwrap().floor_z_m - (0.025 - 0.003)).abs() < 1e-6,
+        (sup_stock.config.workspace.as_ref().unwrap().floor_z_m - expected_stock_floor).abs() < 1e-6,
         "stock calibrated hover floor must be preserved"
     );
+
+    // R8 m2: calibration::apply dry_run `before.floor` must also honor the legacy stock hover floor.
+    {
+        let vision_app = axum::Router::new().route(
+            "/api/calibration/intrinsics",
+            axum::routing::get(|| async {
+                axum::Json(json!({
+                    "fx": 824.0, "fy": 824.0, "cx": 320.0, "cy": 180.0,
+                    "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+                    "width": 640, "height": 360, "marker_size": 0.05, "revision": 1
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let srv = tokio::spawn(async move { axum::serve(listener, vision_app).await.unwrap() });
+        let up = armd::api::proxy::DetectorUpstream::parse(&url).unwrap();
+        let deps = calibration::CalibrationDeps::new(dir.path().join("dry_cal.json"), None, up);
+        let sup_arc = Arc::new(ArmSupervisor::new(stock_cfg.clone()));
+        sup_arc.inner().write().await.set_calibration(Some(legacy_cal.clone()));
+        let mut intrinsics = serde_json::Map::new();
+        intrinsics.insert("fx".into(), json!(824.0));
+        intrinsics.insert("fy".into(), json!(824.0));
+        intrinsics.insert("cx".into(), json!(320.0));
+        intrinsics.insert("cy".into(), json!(180.0));
+        let req = calibration::ApplyRequest {
+            intrinsics,
+            offset_m: stock_cfg.camera_mount.offset_m.unwrap_or([0.0; 3]),
+            q_end_cam: q_tilt15,
+            table_z_m: 0.025,
+            rms: None,
+            solved_at: None,
+            dry_run: true,
+            kinematics: None,
+            table_z_source: "camera".to_string(),
+            tool: None,
+            acceptance: None,
+        };
+        let check: calibration::LeaseCheck = Box::new(|_| Ok(()));
+        let dry = calibration::apply(&sup_arc, &deps, req, &check).await.unwrap();
+        srv.abort();
+        assert_eq!(dry["before"]["floor"]["source"], "calibration_hover", "{dry}");
+        assert!(
+            (dry["before"]["floor"]["effective_floor_z_m"].as_f64().unwrap() - f64::from(expected_stock_floor)).abs() < 1e-6,
+            "{dry}"
+        );
+    }
 
     // Non-stock tool must still reject legacy fingerprint even if acceptance record had no tool_id.
     let mut fin = finray_cfg();

@@ -4203,6 +4203,50 @@ async fn converge_degraded_split(
                 }
             }
         }
+        // M2: If camera_only returned 503 DEGRADED_SPLIT (or degraded 200) carrying a mismatched
+        // robot or foreign owner tx_id, fail immediately without falling back to rollback_physics.
+        if let Ok(resp_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
+            let resp_owner = extract_remote_tx_id(&resp.body);
+            if resp_val.get("robot").is_some_and(|v| !v.is_null()) {
+                if let Err(err) = check_required_upstream_robot_match(
+                    &resp_val,
+                    running_robot,
+                    "SIM_RECOVERY_INCOMPATIBLE",
+                    resp_owner.as_deref().unwrap_or(&split_tx_id),
+                    "degraded split camera_only",
+                ) {
+                    let msg = err.1 .0["error"]
+                        .as_str()
+                        .unwrap_or("camera_only response robot mismatch")
+                        .to_string();
+                    {
+                        let mut tx_w = state.tx_state.write().await;
+                        *tx_w = foreign_degraded_from_sim_val(
+                            &snap,
+                            resp_owner.or(Some(split_tx_id.clone())),
+                            &resp_val,
+                            msg,
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+            if let Some(foreign_tx) = resp_owner.filter(|rt| rt != &split_tx_id) {
+                let msg = format!(
+                    "Sim camera_only returned DEGRADED_SPLIT owned by foreign transaction '{foreign_tx}' (not '{split_tx_id}'); refusing rollback_physics"
+                );
+                {
+                    let mut tx_w = state.tx_state.write().await;
+                    *tx_w = foreign_degraded_from_sim_val(
+                        &snap,
+                        Some(foreign_tx.clone()),
+                        &resp_val,
+                        msg.clone(),
+                    );
+                }
+                return Err(degraded_split_http_error(Some(&foreign_tx), &msg));
+            }
+        }
     }
 
     let rollback_body = serde_json::to_vec(&serde_json::json!({
@@ -5035,6 +5079,7 @@ pub async fn activate(
                 let mut owner_tx = extract_remote_tx_id(&resp.body);
                 let mut state_conflict = false;
                 if owner_tx.is_none()
+                    || sim_val.get("robot").is_none_or(serde_json::Value::is_null)
                     || sim_val.get("scene").is_none_or(serde_json::Value::is_null)
                     || sim_val.get("tool").is_none_or(serde_json::Value::is_null)
                     || (snap.target_scene_digest.is_some()
@@ -5062,15 +5107,14 @@ pub async fn activate(
                 }
                 let (owner_tx_id, target_matches_tx) = match owner_tx {
                     Some(remote_owner) if !state_conflict && remote_owner == tx_id => {
-                        let robot_ok = !sim_val.get("robot").is_some_and(|v| !v.is_null())
-                            || check_required_upstream_robot_match(
-                                &sim_val,
-                                &running_robot,
-                                "SIM_RECOVERY_INCOMPATIBLE",
-                                &remote_owner,
-                                "prepare degraded split",
-                            )
-                            .is_ok();
+                        let robot_ok = check_required_upstream_robot_match(
+                            &sim_val,
+                            &running_robot,
+                            "SIM_RECOVERY_INCOMPATIBLE",
+                            &remote_owner,
+                            "prepare degraded split",
+                        )
+                        .is_ok();
                         let matches = robot_ok
                             && remote_target_matches_local(
                                 &sim_val,
@@ -5084,11 +5128,16 @@ pub async fn activate(
                     Some(remote_owner) => (Some(remote_owner), false),
                     None => (None, false),
                 };
+                let stored_detail = if sim_val.is_null() {
+                    detail.clone()
+                } else {
+                    serde_json::to_string(&sim_val).unwrap_or_else(|_| detail.clone())
+                };
                 let mut tx_w = state.tx_state.write().await;
                 *tx_w = if target_matches_tx {
-                    snap.into_degraded(owner_tx_id.clone(), true, detail.clone())
+                    snap.into_degraded(owner_tx_id.clone(), true, stored_detail)
                 } else {
-                    foreign_degraded_from_sim_val(&snap, owner_tx_id.clone(), &sim_val, detail.clone())
+                    foreign_degraded_from_sim_val(&snap, owner_tx_id.clone(), &sim_val, stored_detail)
                 };
                 return Err(degraded_split_http_error(owner_tx_id.as_deref(), &detail));
             }
@@ -5534,17 +5583,54 @@ pub async fn recover_split(
         ));
     }
 
-    if let Ok(detail_val) = serde_json::from_str::<serde_json::Value>(&detail) {
-        if detail_val.get("robot").is_some_and(|v| !v.is_null()) {
-            check_required_upstream_robot_match(
-                &detail_val,
-                &running_robot,
-                "SIM_RECOVERY_INCOMPATIBLE",
-                &tx_id,
-                "degraded split recovery",
-            )?;
+    let mut detail_val = serde_json::from_str::<serde_json::Value>(&detail)
+        .unwrap_or(serde_json::Value::Null);
+    if detail_val.get("robot").is_none_or(serde_json::Value::is_null) {
+        if let Ok(sresp) = sim_tx_call(
+            &upstream,
+            Method::GET,
+            "/sim/state",
+            None,
+            state.sim_timeouts.reconcile,
+        )
+        .await
+        {
+            if sresp.status.is_success() {
+                if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
+                    if let Some(sv_tx) = sv
+                        .get("tx_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if sv_tx != tx_id {
+                            return Err(degraded_split_http_error(
+                                Some(sv_tx),
+                                &format!(
+                                    "Sim /sim/state owner tx_id '{sv_tx}' does not match '{tx_id}'"
+                                ),
+                            ));
+                        }
+                    }
+                    if detail_val.is_object() {
+                        let mut dummy_tx = Some(tx_id.clone());
+                        if let Err(msg) = merge_consistent_split_state(&mut detail_val, &mut dummy_tx, sv) {
+                            return Err(degraded_split_http_error(Some(&tx_id), &msg));
+                        }
+                    } else {
+                        detail_val = sv;
+                    }
+                }
+            }
         }
     }
+    check_required_upstream_robot_match(
+        &detail_val,
+        &running_robot,
+        "SIM_RECOVERY_INCOMPATIBLE",
+        &tx_id,
+        "degraded split recovery",
+    )?;
 
     let commit_bytes = serde_json::to_vec(&serde_json::json!({
         "tx_id": tx_id,
