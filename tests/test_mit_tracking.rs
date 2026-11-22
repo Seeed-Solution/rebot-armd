@@ -993,3 +993,30 @@ fn mit_near_misses_are_counted_without_cancelling() {
     }
     panic!("could not stay under 45 ms in three attempts");
 }
+
+/// Review round 3, #6: the fence is armed before the first MIT-capable switch frame. A handover
+/// whose mode acknowledgement is lost (the motor did switch) waits past 45 ms; the fence trips and
+/// the rollback sends no further MIT frame (only the original hold went out).
+#[test]
+fn mit_handover_is_fenced_from_the_first_switch_frame() {
+    let bus = FakeBus::new(&b601_limits());
+    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
+    let mut d = disabled_driver(&bus);
+    d.check_mapping_ranges();
+    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.tick(DT);
+    inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
+    with_record(&mut inner, record_j4(2000));
+    inner.set_torque(true).unwrap();
+    bus.with(|s| s.motors[3].no_write_ack = true); // the switch happens, its ACK is lost
+    bus.clear_log();
+    inner.tick(DT);
+    inner.tick(DT);
+    assert!(!inner.mit_active());
+    let log = bus.tx_log();
+    let w = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_MIT).data).expect("switch to MIT");
+    let mit_after = mit_frames(&log[w..], 4).len();
+    assert_eq!(mit_after, 1, "MIT frames after the switch: only the hold; the rollback after the 45 ms trip must send none ({mit_after})");
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost, "mode uncertain after an unconfirmed rollback");
+}

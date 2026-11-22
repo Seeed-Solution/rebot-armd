@@ -767,9 +767,16 @@ impl crate::supervisor::SupervisorInner {
         let holdoff = self.mit_holdoff();
         let (res, uncertain) = {
             let Some(Ok(mut drv)) = self.driver.as_ref().map(|d| d.lock()) else { return };
+            // armed before the first MIT-capable switch frame: a lost acknowledgement or a slow
+            // confirmation cannot outlast the deadline, and a rollback after a trip sends nothing
+            drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff);
             let res = drv.set_joint_modes_confirmed(&modes, &hold);
-            if res.is_ok() { drv.set_mit_deadline_fence(Some(MIT_DEADLINE), holdoff); }
-            (res, drv.joint_modes_uncertain())
+            let uncertain = drv.joint_modes_uncertain();
+            if res.is_err() && !uncertain && drv.mit_fence_trip().is_none() {
+                // switched back and confirmed in position control: nothing to fence
+                drv.set_mit_deadline_fence(None, Duration::ZERO);
+            }
+            (res, uncertain || drv.mit_fence_trip().is_some())
         };
         match res {
             Ok(()) => {
