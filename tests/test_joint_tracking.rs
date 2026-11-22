@@ -4255,3 +4255,26 @@ fn tracking_braking_fallback_follows_governor_scale_drop() {
         );
     }
 }
+
+/// Review 5 #5: an explicitly disabled tracking block never rejects a profile for a
+/// tracking-only validation error (e4f72b6 had no such block; armd logs a warning instead);
+/// an enabled block stays strictly validated.
+#[test]
+fn tracking_disabled_block_does_not_reject_profile() {
+    let invalid_blocks: Vec<(&str, Box<dyn Fn(&mut JointTrackingConfig)>)> = vec![
+        ("wrong length", Box::new(|jt: &mut JointTrackingConfig| jt.joints.truncate(5))),
+        ("lag out of range", Box::new(|jt: &mut JointTrackingConfig| jt.joints[0].lag_s = 9.0)),
+        ("mit in phase 1", Box::new(|jt: &mut JointTrackingConfig| jt.joints[1].strategy = TrackingStrategy::Mit)),
+        ("non-finite", Box::new(|jt: &mut JointTrackingConfig| jt.joints[2].kp = f32::NAN)),
+    ];
+    for (label, mutate) in &invalid_blocks {
+        let mut jt = JointTrackingConfig::rebot_dm();
+        mutate(&mut jt);
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.joint_tracking = Some(jt.clone());
+        assert!(cfg.validate().is_ok(), "{label}: a disabled tracking block must not reject the profile: {:?}", cfg.validate());
+        jt.enabled = true;
+        cfg.joint_tracking = Some(jt);
+        assert!(cfg.validate().is_err(), "{label}: an enabled tracking block stays strictly validated");
+    }
+}

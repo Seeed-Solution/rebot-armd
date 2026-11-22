@@ -1463,7 +1463,13 @@ impl ArmConfig {
             }
         }
         if let Some(jt) = &self.joint_tracking {
-            jt.validate(self.arm_dof(), self.dof, self.gripper_index())?;
+            match jt.validate(self.arm_dof(), self.dof, self.gripper_index()) {
+                Ok(()) => {}
+                Err(e) if jt.enabled => return Err(e),
+                // A disabled block is never evaluated: like a profile without one (before joint
+                // tracking existed), it does not reject the profile.
+                Err(e) => tracing::warn!("joint_tracking is disabled and invalid (ignored): {e}"),
+            }
         }
         if let Some(ws) = &self.workspace {
             ws.validate()?;
