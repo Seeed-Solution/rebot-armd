@@ -3800,6 +3800,14 @@ fn tracking_park_rejection_fallback_keeps_park_workspace_and_depths() {
 /// measured -> new-target segment, the fallback sends no frame instead of the braking step.
 #[test]
 fn tracking_braking_fallback_sweeps_measured_segment_when_moving() {
+    // Review 5 #1: also a braking step of a single f32 ULP (far below any tolerance) must be
+    // swept from the measurement; only a bitwise-unchanged target is exempt.
+    for one_ulp in [false, true] {
+        braking_fallback_lagged_arm_case(one_ulp);
+    }
+}
+
+fn braking_fallback_lagged_arm_case(one_ulp: bool) {
     let mut jt = JointTrackingConfig::rebot_dm();
     jt.enabled = true;
     jt.joints[0].lag_s = 0.68;
@@ -3812,13 +3820,28 @@ fn tracking_braking_fallback_sweeps_measured_segment_when_moving() {
     let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
     drv.with(|s| s.pinned[0] = Some(q0[0])); // the arm lags at q0
 
-    // Issued J1 0.008 rad ahead of measured, still moving at +0.2 rad/s toward the park
-    // reference; the box sits between measured (q0) and issued, not between issued and
-    // the braking step (~q0 + 0.010).
+    // Issued J1 0.008 rad ahead of measured, still moving toward the park reference; the
+    // box sits between measured (q0) and issued, not between issued and the braking step.
     let mut pq = q0.to_vec();
     pq[0] += 0.008;
     let mut pv = vec![0.0; 7];
-    pv[0] = 0.2;
+    pv[0] = if one_ulp {
+        // Smallest prior velocity whose braking step (same f32 arithmetic as the fallback)
+        // moves J1 by exactly one ULP.
+        let lim = inner.active_tracking_limits(DT, 1.0)[0].clone();
+        let dv = lim.max_acceleration * DT as f32;
+        let mut v = dv;
+        loop {
+            let q = pq[0] + (v - dv).max(0.0) * DT as f32;
+            if q.to_bits() == pq[0].to_bits() + 1 {
+                break v;
+            }
+            assert!(q.to_bits() <= pq[0].to_bits(), "overshot one ULP");
+            v = f32::from_bits(v.to_bits() + 1);
+        }
+    } else {
+        0.2
+    };
     inner.tracking.record_issued(pq.clone(), pv);
     let half = 0.0008_f32;
     let ws = inner.config.workspace.as_mut().unwrap();
@@ -3834,13 +3857,17 @@ fn tracking_braking_fallback_sweeps_measured_segment_when_moving() {
 
     let idx0 = drv.with(|s| s.written.len());
     let obs = inner.tick(DT);
-    assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "rejection must fault: {:?}", obs.safety_state);
-    assert_eq!(drv.with(|s| s.written.len()), idx0, "no braking frame may cross the keep-out from the measured pose");
+    assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "one_ulp={one_ulp}: rejection must fault: {:?}", obs.safety_state);
+    assert_eq!(
+        drv.with(|s| s.written.len()),
+        idx0,
+        "one_ulp={one_ulp}: no braking frame may cross the keep-out from the measured pose"
+    );
     for _ in 0..3 {
         inner.tick(DT);
     }
     for (k, f) in drv.with(|s| s.written[idx0..].to_vec()).iter().enumerate() {
-        assert_eq!(f[0].position.to_bits(), pq[0].to_bits(), "fault hold frame {k} must repeat the last issued J1");
+        assert_eq!(f[0].position.to_bits(), pq[0].to_bits(), "one_ulp={one_ulp}: fault hold frame {k} must repeat the last issued J1");
     }
 }
 

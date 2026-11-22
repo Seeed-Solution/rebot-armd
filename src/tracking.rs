@@ -1209,19 +1209,19 @@ impl crate::supervisor::SupervisorInner {
                 last_err = e;
                 continue;
             }
-            // Every step that moves the output is also swept from the fresh measurement (a
-            // lagging arm travels from there); only a braking step at rest, which repeats
-            // `prev_confirmed`, is swept from `prev_confirmed` alone.
-            let moves = arm_indices.iter().any(|&j| (q_c[j] - pq[j]).abs() > 1e-7);
+            // Every step that moves the output (any bit of an arm target changes) is also swept
+            // from the fresh measurement (a lagging arm travels from there); only a braking step
+            // that repeats `prev_confirmed` bit for bit is swept from `prev_confirmed` alone.
+            let moves = arm_indices.iter().any(|&j| q_c[j].to_bits() != pq[j].to_bits());
             let check_meas = fresh_meas && (moves || !brake_only);
             match self.fallback_workspace_check(Some(pq), prev_ws_min_depths, &q_c, keepout_only, check_meas, budget) {
                 Ok(ws) => {
                     let velocities: Vec<f32> =
                         (0..dof).map(|i| ((f64::from(q_c[i]) - f64::from(pq[i])) / dt) as f32).collect();
-                    // At rest on the hold, or at rest after a pure braking step (the step
-                    // toward the hold was refused): the ramp is complete.
+                    // At rest (target bitwise unchanged) on the hold, or at rest after a pure
+                    // braking step (the step toward the hold was refused): the ramp is complete.
                     let done = arm_indices.iter().all(|&j| {
-                        (q_c[j] - pq[j]).abs() <= 1e-7 && (brake_only || (q_c[j] - q_hold[j]).abs() <= 1e-5)
+                        q_c[j].to_bits() == pq[j].to_bits() && (brake_only || (q_c[j] - q_hold[j]).abs() <= 1e-5)
                     });
                     return Ok(ValidatedFallback { positions: q_c, velocities, ws_min_depths: ws, done });
                 }
