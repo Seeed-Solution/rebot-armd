@@ -454,6 +454,9 @@ pub struct SupervisorInner {
     pub gripper_calib_revision: u64,
     /// Monotonic revision for grasp setup (starts at 1).
     pub grasp_setup_revision: u64,
+    /// True when startup `grasp::load_into` fell back to tool defaults (missing/rejected
+    /// `grasp_setup.json`) and should adopt shared camera fields from `calibration.json`.
+    pub grasp_setup_needs_camera_sync: bool,
     /// When true (inside ArmSupervisor::tick), zero_check(store_offset=true) defers disk persist
     /// and memory commit until after the lock is released.
     pub defer_zero_check_persist: bool,
@@ -691,6 +694,7 @@ impl SupervisorInner {
             zero_check_params: None,
             gripper_calib_revision: 1,
             grasp_setup_revision: 1,
+            grasp_setup_needs_camera_sync: false,
             defer_zero_check_persist: false,
             zero_check_persisting: None,
             pending_zero_check_persist: None,

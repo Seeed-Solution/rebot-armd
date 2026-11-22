@@ -648,6 +648,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
     let Some(base) = inner.grasp_setup() else { return; };
     let (mut setup, outcome) = load_setup_for_tool(path, &base, &inner.config.active_tool);
+    let mut needs_camera_sync = false;
     match &outcome {
         LoadOutcome::Loaded => {
             if let Some(gp) = inner.config.gripper_policy.as_ref() {
@@ -661,6 +662,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
                 ) {
                     tracing::warn!("Ignoring grasp setup from {}: {e}; using defaults", path.display());
                     setup = base;
+                    needs_camera_sync = true;
                 } else {
                     tracing::info!("Grasp setup loaded from {}", path.display());
                 }
@@ -668,9 +670,16 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
                 tracing::info!("Grasp setup loaded from {}", path.display());
             }
         }
-        LoadOutcome::Missing => tracing::info!("No grasp setup at {}; using defaults", path.display()),
-        LoadOutcome::Invalid(e) => tracing::warn!("Ignoring grasp setup file: {e}; using defaults"),
+        LoadOutcome::Missing => {
+            tracing::info!("No grasp setup at {}; using defaults", path.display());
+            needs_camera_sync = true;
+        }
+        LoadOutcome::Invalid(e) => {
+            tracing::warn!("Ignoring grasp setup file: {e}; using defaults");
+            needs_camera_sync = true;
+        }
     }
+    inner.grasp_setup_needs_camera_sync = needs_camera_sync;
     inner.set_grasp_setup(setup);
 }
 

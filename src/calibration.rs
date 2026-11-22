@@ -469,7 +469,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             file.camera_mount = mount.clone();
             tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
                 path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
-            inner.set_camera_mount(mount);
+            inner.set_camera_mount(mount.clone());
             if let Some(k) = &file.kinematics {
                 match inner.set_kinematics_correction(Some(&k.joints)) {
                     Ok(()) => {
@@ -482,6 +482,26 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                         file.kinematics = None;
                     }
                 }
+            }
+            if inner.grasp_setup_needs_camera_sync {
+                if let Some(mut setup) = inner.config.grasp.clone() {
+                    let arm_model = inner.config.arm_model.clone();
+                    let tcp_offset = inner.config.tcp_offset;
+                    refresh_grasp_setup_camera_fields(
+                        &mut setup,
+                        file.intrinsics.as_ref(),
+                        &mount,
+                        file.table_z_m,
+                        &arm_model,
+                        &tcp_offset,
+                    );
+                    if let Err(e) = setup.validate() {
+                        tracing::warn!("Skipping startup grasp setup camera sync from {}: {e}", path.display());
+                    } else {
+                        inner.set_grasp_setup(setup);
+                    }
+                }
+                inner.grasp_setup_needs_camera_sync = false;
             }
             inner.set_calibration(Some(file));
             Ok(())
@@ -785,6 +805,43 @@ pub fn grip_pixel_norm_for_tcp(
     let px = cam.project(&end_pose, &[0.0, 0.0, setup.table_z_m + setup.grasp_height_m])?;
     let n = cam.to_norm(px);
     Some([(n[0] * 1e4).round() / 1e4, (n[1] * 1e4).round() / 1e4])
+}
+
+/// Sync camera-derived fields of `GraspSetup` from camera intrinsics, mount, and optional `table_z_m`,
+/// recomputing `grip_pixel_norm` via [`grip_pixel_norm_for_tcp`].
+fn refresh_grasp_setup_camera_fields(
+    setup: &mut GraspSetup,
+    intrinsics: Option<&Value>,
+    mount: &CameraMount,
+    table_z_m: Option<f64>,
+    arm_model: &crate::chain::ArmModel,
+    tcp_offset: &[f64; 3],
+) {
+    if let Some(intr) = intrinsics {
+        if let Some(fx) = intr.get("fx").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            setup.fx_px = fx;
+        }
+        if let Some(fy) = intr.get("fy").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            setup.fy_px = fy;
+        }
+        if let Some(cx) = intr.get("cx").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            setup.cx_px = Some(cx);
+        }
+        if let Some(cy) = intr.get("cy").and_then(Value::as_f64).filter(|v| v.is_finite()) {
+            setup.cy_px = Some(cy);
+        }
+        setup.image_size_px = IMAGE_SIZE_PX;
+    }
+    setup.camera_tilt_deg = f64::from(mount.tilt_deg);
+    if let Some(z) = table_z_m.filter(|z| z.is_finite()) {
+        setup.table_z_m = z;
+    }
+    let cam = CamModel::assumed(arm_model, setup, mount);
+    if let Some(p) = grip_pixel_norm_for_tcp(&cam, setup, tcp_offset)
+        .filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v)))
+    {
+        setup.grip_pixel_norm = p;
+    }
 }
 
 /// The grasp setup fields the calibration sets.
@@ -1639,27 +1696,15 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
             target.grasp_setup = None;
         }
         if let Some(mut live_b) = before.grasp_setup.clone() {
-            let vg = |k: &str| vision_values.get(k).and_then(Value::as_f64);
-            if let Some(fx) = vg("fx") { live_b.fx_px = fx; }
-            if let Some(fy) = vg("fy") { live_b.fy_px = fy; }
-            if let Some(cx) = vg("cx") { live_b.cx_px = Some(cx); }
-            if let Some(cy) = vg("cy") { live_b.cy_px = Some(cy); }
-            live_b.image_size_px = IMAGE_SIZE_PX;
-            live_b.camera_tilt_deg = f64::from(target.camera_mount.tilt_deg);
-            if let Some(cal_z) = target
-                .calibration
-                .as_ref()
-                .and_then(|c| c.table_z_m)
-                .filter(|z| z.is_finite())
-            {
-                live_b.table_z_m = cal_z;
-            }
-            let cam = CamModel::assumed(&arm_model, &live_b, &target.camera_mount);
-            if let Some(p) = grip_pixel_norm_for_tcp(&cam, &live_b, &tcp_offset)
-                .filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v)))
-            {
-                live_b.grip_pixel_norm = p;
-            }
+            let intrinsics_val = Value::Object(vision_values.clone());
+            refresh_grasp_setup_camera_fields(
+                &mut live_b,
+                Some(&intrinsics_val),
+                &target.camera_mount,
+                target.calibration.as_ref().and_then(|c| c.table_z_m),
+                &arm_model,
+                &tcp_offset,
+            );
             live_b
                 .validate()
                 .map_err(|e| CalibError::invalid(format!("grasp setup after cross-tool restore: {e}")))?;
@@ -1746,6 +1791,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "zero_convention": inner.config.zero_reference.as_ref().map(|_| &inner.zero_convention),
         "calibration_tools": inner.calibration_tools(),
         "calibration_tool": inner.config.calibration_tool,
+        "active_tool": inner.config.active_tool,
         "verification": verification_view(&inner),
         "floor": inner.profile_floor_z_m.map(|p| floor_view_for(p, inner.calibration.as_ref(), &live_fingerprints(&inner).1, &inner.config.active_tool)),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,

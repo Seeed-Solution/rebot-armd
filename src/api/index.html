@@ -6824,6 +6824,18 @@ async function cwvTipMeasure() {
   CWV.tipBusy = true; CWV.tip = null; CWV.roi = null; CWV.frames = 0; cwSetStatus(t('cw.tip.busy'));
   const want = 16, frames = [];
   let last = null, lastDet = null, tries = 0;
+  let capToolId = 'unknown_tool', capToolDigest = (S.activeTool && S.activeTool.config_digest) || null;
+  try {
+    const st0 = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json();
+    if (st0.active_tool) {
+      S.activeTool = st0.active_tool;
+      if (!st0.active_tool.is_stock && st0.active_tool.id) capToolId = st0.active_tool.id;
+      else if (st0.calibration_tool && st0.calibration_tool.tool_id) capToolId = st0.calibration_tool.tool_id;
+      if (st0.active_tool.config_digest) capToolDigest = st0.active_tool.config_digest;
+    } else if (st0.calibration_tool && st0.calibration_tool.tool_id) {
+      capToolId = st0.calibration_tool.tool_id;
+    }
+  } catch (_) {}
   try {
     const pos0 = o.positions.slice();
     while (frames.length < want && tries++ < 60) {
@@ -6853,18 +6865,8 @@ async function cwvTipMeasure() {
     const base = { ...CWZ.solve.apply, dry_run: true };
     const d1 = await commandRPC('/api/v1/calibration/apply', base, true, 15000);
     CWV.xfp = d1.after && d1.after.x_fingerprint;
-    let toolId = 'unknown_tool';
-    let toolDigest = (S.activeTool && S.activeTool.config_digest) || null;
-    try {
-      const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json();
-      if (st.active_tool && !st.active_tool.is_stock && st.active_tool.id) {
-        toolId = st.active_tool.id;
-        if (st.active_tool.config_digest) toolDigest = st.active_tool.config_digest;
-      } else {
-        if (st.calibration_tool && st.calibration_tool.tool_id) toolId = st.calibration_tool.tool_id;
-        if (!toolDigest && st.active_tool && st.active_tool.config_digest) toolDigest = st.active_tool.config_digest;
-      }
-    } catch (_) {}
+    const toolId = capToolId;
+    const toolDigest = capToolDigest;
     const tool = { tool_id: toolId, ...(toolDigest ? { tool_config_digest: toolDigest } : {}), tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
       fit: { frames: res.frames, reproj_px: +res.reprojPx.toFixed(3), gap_px: +res.gapPx.toFixed(3), std_mm: +res.stdMm.toFixed(3) } };
     const d2 = await commandRPC('/api/v1/calibration/apply', { ...base, tool }, true, 15000);

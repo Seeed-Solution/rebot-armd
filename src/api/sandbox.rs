@@ -3944,6 +3944,49 @@ fn foreign_degraded_from_sim_val(
     }
 }
 
+fn merge_consistent_split_state(
+    observed_val: &mut serde_json::Value,
+    observed_tx: &mut Option<String>,
+    sv: serde_json::Value,
+) -> Result<(), String> {
+    let (sv_tx, sv_state) = extract_remote_tx_and_state(&sv);
+    if !sv_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+        return Ok(());
+    }
+    match (observed_tx.as_deref(), sv_tx) {
+        (None, Some(_)) => {}
+        (Some(otx), Some(stx)) if otx == stx => {}
+        _ => return Ok(()),
+    }
+    if let (Some(dst), Some(src)) = (observed_val.as_object(), sv.as_object()) {
+        for k in ["scene", "tool", "scene_digest", "tool_digest", "robot"] {
+            if let (Some(dv), Some(sv_v)) = (
+                dst.get(k).filter(|v| !v.is_null()),
+                src.get(k).filter(|v| !v.is_null()),
+            ) {
+                if dv != sv_v {
+                    return Err(format!(
+                        "Conflicting DEGRADED_SPLIT metadata for '{k}' between split response and /sim/state"
+                    ));
+                }
+            }
+        }
+    }
+    *observed_tx = sv_tx.map(str::to_string);
+    if observed_val.is_null() {
+        *observed_val = sv;
+    } else if let (Some(dst), Some(src)) = (observed_val.as_object_mut(), sv.as_object()) {
+        for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest", "robot"] {
+            if dst.get(k).is_none_or(serde_json::Value::is_null) {
+                if let Some(v) = src.get(k) {
+                    dst.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn converge_degraded_split(
     state: &SandboxState,
     upstream: &DetectorUpstream,
@@ -3974,35 +4017,33 @@ async fn converge_degraded_split(
         {
             if sresp.status.is_success() {
                 if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
-                    let (sv_tx, sv_state) = extract_remote_tx_and_state(&sv);
-                    if sv_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
-                        let owner_compatible = match (observed_tx.as_deref(), sv_tx) {
-                            (None, Some(stx)) => {
-                                observed_tx = Some(stx.to_string());
-                                true
-                            }
-                            (Some(otx), Some(stx)) => otx == stx,
-                            _ => false,
-                        };
-                        if owner_compatible {
-                            if observed_val.is_null() {
-                                observed_val = sv;
-                            } else if let (Some(dst), Some(src)) =
-                                (observed_val.as_object_mut(), sv.as_object())
-                            {
-                                for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
-                                    if dst.get(k).is_none_or(serde_json::Value::is_null) {
-                                        if let Some(v) = src.get(k) {
-                                            dst.insert(k.to_string(), v.clone());
-                                        }
-                                    }
-                                }
-                            }
+                    if let Err(conflict_msg) =
+                        merge_consistent_split_state(&mut observed_val, &mut observed_tx, sv)
+                    {
+                        {
+                            let mut tx_w = state.tx_state.write().await;
+                            *tx_w = foreign_degraded_from_sim_val(
+                                &snap,
+                                observed_tx.clone(),
+                                &observed_val,
+                                conflict_msg.clone(),
+                            );
                         }
+                        return Err(degraded_split_http_error(observed_tx.as_deref(), &conflict_msg));
                     }
                 }
             }
         }
+    }
+
+    if observed_val.get("robot").is_some_and(|v| !v.is_null()) {
+        check_required_upstream_robot_match(
+            &observed_val,
+            running_robot,
+            "SIM_RECOVERY_INCOMPATIBLE",
+            observed_tx.as_deref().unwrap_or(&snap.tx_id),
+            "degraded split convergence",
+        )?;
     }
 
     let Some(remote_tx) = observed_tx else {
@@ -4265,6 +4306,13 @@ async fn reconcile_unknown_tx(
                 return Ok(());
             }
             if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                check_required_upstream_robot_match(
+                    &sim_val,
+                    running_robot,
+                    "SIM_RECOVERY_INCOMPATIBLE",
+                    tx_id,
+                    "state reconciliation",
+                )?;
                 let own_snap = TxSnapshot {
                     tx_id: tx_id.clone(),
                     prev_tx_id: prev_tx_id.clone(),
@@ -4514,6 +4562,13 @@ async fn reconcile_lost_commit_ack(
         return Ok(None);
     }
     if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+        check_required_upstream_robot_match(
+            &sim_val,
+            running_robot,
+            "SIM_RECOVERY_INCOMPATIBLE",
+            &tx_id,
+            "state reconciliation",
+        )?;
         let detail = String::from_utf8_lossy(&sresp.body).to_string();
         if remote_tx == Some(tx_id.as_str()) {
             let committed = converge_degraded_split(state, upstream, running_robot, snap, &detail).await?;
@@ -4907,6 +4962,7 @@ pub async fn activate(
                 let mut sim_val = serde_json::from_slice::<serde_json::Value>(&resp.body)
                     .unwrap_or(serde_json::Value::Null);
                 let mut owner_tx = extract_remote_tx_id(&resp.body);
+                let mut state_conflict = false;
                 if owner_tx.is_none()
                     || sim_val.get("scene").is_none_or(serde_json::Value::is_null)
                     || sim_val.get("tool").is_none_or(serde_json::Value::is_null)
@@ -4922,38 +4978,15 @@ pub async fn activate(
                     {
                         if sresp.status.is_success() {
                             if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
-                                let (sv_tx, sv_state) = extract_remote_tx_and_state(&sv);
-                                if sv_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
-                                    let merge_ok = match (owner_tx.as_deref(), sv_tx) {
-                                        (None, Some(stx)) => {
-                                            owner_tx = Some(stx.to_string());
-                                            true
-                                        }
-                                        (Some(otx), Some(stx)) => otx == stx,
-                                        _ => false,
-                                    };
-                                    if merge_ok {
-                                        if sim_val.is_null() {
-                                            sim_val = sv;
-                                        } else if let (Some(dst), Some(src)) =
-                                            (sim_val.as_object_mut(), sv.as_object())
-                                        {
-                                            for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
-                                                if dst.get(k).is_none_or(serde_json::Value::is_null) {
-                                                    if let Some(v) = src.get(k) {
-                                                        dst.insert(k.to_string(), v.clone());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                if merge_consistent_split_state(&mut sim_val, &mut owner_tx, sv).is_err() {
+                                    state_conflict = true;
                                 }
                             }
                         }
                     }
                 }
                 let (owner_tx_id, target_matches_tx) = match owner_tx {
-                    Some(remote_owner) if remote_owner == tx_id => {
+                    Some(remote_owner) if !state_conflict && remote_owner == tx_id => {
                         let matches = remote_target_matches_local(
                             &sim_val,
                             &snap.target_scene,
@@ -5195,6 +5228,13 @@ pub async fn recover_split(
                     "Remote /sim/state reports DEGRADED_SPLIT without tx_id",
                 )
             })?;
+            check_required_upstream_robot_match(
+                &sim_val,
+                &running_robot,
+                "SIM_RECOVERY_INCOMPATIBLE",
+                adopted_tx,
+                "state reconciliation",
+            )?;
             let prev_active = state.active.read().await.clone();
             let r_scene = sim_val
                 .get("scene")

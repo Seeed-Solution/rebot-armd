@@ -1372,11 +1372,26 @@ fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) ->
     Ok(crate::kinematics::IDENTITY)
 }
 
+fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
+    if node
+        .ancestors()
+        .skip(1)
+        .any(|a| a.is_element() && a.tag_name().name() == "frame")
+    {
+        return Err(
+            "base MJCF <site name=\"tcp\"> inside unsupported <frame> ancestor; declare <site name=\"tcp\"> directly inside its host <body>"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
     let req = requested.trim();
     if req.is_empty() || req == "end_link" {
         for site in base_doc.descendants() {
             if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
+                check_tcp_site_not_in_frame(site)?;
                 for anc in site.ancestors().skip(1) {
                     if anc.is_element() && anc.tag_name().name() == "body" {
                         if let Some(bname) = anc.attribute("name").map(str::trim).filter(|s| !s.is_empty()) {
@@ -1651,6 +1666,7 @@ pub fn compose_mjcf(
                             })
                     });
                     if let Some(site_node) = tcp_node {
+                        check_tcp_site_not_in_frame(site_node)?;
                         let site_host = site_node
                             .ancestors()
                             .skip(1)
@@ -1731,6 +1747,7 @@ pub fn compose_mjcf(
                     if overlaps_delete {
                         continue;
                     }
+                    check_tcp_site_not_in_frame(node)?;
                     let base_pos = match node.attribute("pos") {
                         Some(raw) => parse_mjcf_vec3(raw, "pos")?,
                         None => [0.0; 3],
@@ -2490,6 +2507,24 @@ mod tests {
             assert_eq!(pad.parent().and_then(|p| p.attribute("name")), Some("gripper"), "attach_body={attach_val:?}");
             let w = doc.descendants().find(|n| n.attribute("name") == Some("suction_weld_0_chip")).unwrap();
             assert_eq!(w.attribute("body1"), Some("gripper"), "attach_body={attach_val:?}");
+        }
+
+        // 14. R6 M3: Base <site name="tcp"> nested inside <frame> fails closed instead of silently losing
+        // the <frame> transform on composed tool geometries.
+        let framed_tcp_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <frame pos="0 0 0.10"><site name="tcp" pos="0 0 0"/></frame>
+          </body>
+        </worldbody></mujoco>"#;
+        let framed_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
+            "id": "framed_tool",
+            "kind": "suction",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.02, 0.0, 0.0]
+        })).unwrap();
+        for tool_xml in [None, Some(so101_geom_tool)] {
+            let err = compose_mjcf(framed_tcp_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
+            assert!(err.contains("frame"), "expected <frame> rejection, got: {err}");
         }
     }
 }

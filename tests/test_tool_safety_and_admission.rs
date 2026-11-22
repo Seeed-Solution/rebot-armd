@@ -1992,6 +1992,10 @@ async fn r5_m4_and_m5_fingertip_digest_binding_and_lateral_tcp_grip_pixel() {
         .await
         .unwrap();
     assert_eq!(ok_res["calibration"]["tool"]["tool_config_digest"], tool_b.active_tool.config_digest);
+    // m1: GET /api/v1/calibration status includes active_tool with config_digest.
+    let status_val = armd::calibration::status(&sup_b, &deps).await;
+    assert_eq!(status_val["active_tool"]["id"], tool_b.active_tool.id);
+    assert_eq!(status_val["active_tool"]["config_digest"], tool_b.active_tool.config_digest);
 
     // M5: Lateral tcp_offset (y != 0) shifts grip_pixel_norm horizontally relative to y = 0.
     let make_lat_cfg = |dy: f64| {
@@ -2019,4 +2023,144 @@ async fn r5_m4_and_m5_fingertip_digest_binding_and_lateral_tcp_grip_pixel() {
     assert!((stored_y[0].as_f64().unwrap() - gpy[0].as_f64().unwrap()).abs() < 1e-6);
 
     server.abort();
+}
+
+#[tokio::test]
+async fn r6_m4_startup_tool_swap_syncs_shared_camera_calibration_into_new_tool_grasp_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    let mut tool_a = finray_cfg();
+    tool_a.active_tool.commissioning_required = false;
+    let mut gs_a = tool_a.grasp.clone().unwrap();
+    gs_a.fx_px = 700.0;
+    gs_a.max_grasp_width_m = 0.071;
+    std::fs::write(&gs_path, armd::grasp::serialize_setup_for_tool(&gs_a, &tool_a.active_tool)).unwrap();
+
+    // Shared camera calibration (intrinsics + mount + camera table_z_m), plus Tool A's fingertip record.
+    let q_tilt15 = kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0));
+    let shared_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": [-0.0725, 0.0010, 0.0650],
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {
+            "fx": 835.0,
+            "fy": 833.0,
+            "cx": 319.0,
+            "cy": 181.0,
+            "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0,
+            "width": 640, "height": 360
+        },
+        "table_z_m": 0.014,
+        "table_z_source": "camera",
+        "tool": {
+            "tool_id": tool_a.active_tool.id,
+            "tool_config_digest": tool_a.active_tool.config_digest,
+            "tip_cam_m": [0.0, 0.0, 0.1],
+            "x_fingerprint": "old_xf",
+            "measured_at": "2026-11-22T00:00:00Z"
+        }
+    })).unwrap();
+    std::fs::write(&cal_path, serde_json::to_string_pretty(&shared_cal).unwrap()).unwrap();
+
+    // Boot under Tool B (with lateral tcp_offset so grip_pixel_norm_for_tcp differs from [0,0,0]).
+    let lat_pack: ToolPackConfig = serde_json::from_value(json!({
+        "id": "tool_b_lat",
+        "kind": "gripper",
+        "robots": ["b601dm"],
+        "tcp_offset": [0.025, 0.030, 0.0],
+        "armd": {
+            "gripper_policy": {
+                "jaw_opening_nominal": [[-5.7, 0.041], [0.0, 0.0]]
+            },
+            "grasp": {
+                "max_grasp_width_m": 0.041
+            }
+        }
+    })).unwrap();
+    let tool_b = tool::apply_tool_overlay(&ArmConfig::rebot_dm(), &lat_pack).unwrap();
+    let sup_b = Arc::new(ArmSupervisor::new(tool_b.clone()));
+
+    grasp::load_into(&sup_b, &gs_path).await;
+    calibration::load_into(&sup_b, &cal_path, Some(&gs_path)).await.unwrap();
+
+    let live_b = sup_b.inner().read().await.grasp_setup().unwrap();
+    assert!((live_b.max_grasp_width_m - 0.041).abs() < 1e-6, "Tool B grasp width must stay 0.041");
+    assert!((live_b.fx_px - 835.0).abs() < 1e-6, "fx_px must sync from shared calibration");
+    assert!((live_b.fy_px - 833.0).abs() < 1e-6, "fy_px must sync from shared calibration");
+    assert_eq!(live_b.cx_px, Some(319.0));
+    assert_eq!(live_b.cy_px, Some(181.0));
+    assert!((live_b.table_z_m - 0.014).abs() < 1e-6, "table_z_m must sync from shared camera calibration");
+    assert!((live_b.camera_tilt_deg - (-15.0)).abs() < 1e-3);
+
+    let mount_b = sup_b.inner().read().await.config.camera_mount.clone();
+    let arm_b = sup_b.inner().read().await.config.arm_model.clone();
+    let cam_b = grasp::CamModel::assumed(&arm_b, &live_b, &mount_b);
+    let expected_gp = calibration::grip_pixel_norm_for_tcp(&cam_b, &live_b, &tool_b.tcp_offset).unwrap();
+    assert!(
+        (live_b.grip_pixel_norm[0] - expected_gp[0]).abs() < 1e-6
+            && (live_b.grip_pixel_norm[1] - expected_gp[1]).abs() < 1e-6,
+        "grip_pixel_norm={:?} expected={expected_gp:?}",
+        live_b.grip_pixel_norm
+    );
+    assert!(sup_b.inner().read().await.calibration.as_ref().unwrap().tool.is_none());
+}
+
+#[test]
+fn r6_m5_calib_hover_enforces_commissioning_linear_and_angular_speed_caps() {
+    let mut cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    let mut inner = common::sim_at(cfg.clone(), &INSPECT);
+
+    let body = json!({
+        "candidate_fingerprint": "fp-hover-comm",
+        "rpy_rad": [0.0, std::f64::consts::FRAC_PI_2, 0.0],
+        "approach_speed_mps": 0.05,
+        "descent_speed_mps": 0.015,
+        "points": [{
+            "id": "p0",
+            "approach_m": [0.28, 0.0, 0.14],
+            "hover_m": [0.28, 0.0, 0.05]
+        }]
+    });
+    let plan = armd::calib_hover::prepare(&inner, &body, inner.safety.epoch_id()).unwrap();
+    assert!(
+        plan.job.params.approach_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9,
+        "uncommissioned approach_speed_mps={} exceeded 0.03",
+        plan.job.params.approach_speed_mps
+    );
+    assert!(
+        plan.job.params.descent_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9,
+        "uncommissioned descent_speed_mps={} exceeded 0.03",
+        plan.job.params.descent_speed_mps
+    );
+    assert!(
+        plan.angular_speed_rps <= armd::calib_hover::COMMISSIONING_MAX_ANGULAR_RPS + 1e-9,
+        "uncommissioned angular_speed_rps={} exceeded 0.2",
+        plan.angular_speed_rps
+    );
+
+    // Resume of a previously saved fast job while still uncommissioned must also enforce the caps.
+    let mut fast_job = plan.job.clone();
+    fast_job.id = "hv-resume-comm".into();
+    fast_job.params.approach_speed_mps = 0.05;
+    fast_job.state = "failed".into();
+    inner.hover_jobs.push(fast_job);
+    let resumed = armd::calib_hover::prepare(
+        &inner,
+        &json!({"resume": "hv-resume-comm", "candidate_fingerprint": "fp-hover-comm"}),
+        inner.safety.epoch_id(),
+    )
+    .unwrap();
+    assert!(resumed.job.params.approach_speed_mps <= armd::calib_hover::COMMISSIONING_MAX_LINEAR_MPS + 1e-9);
+    assert!(resumed.angular_speed_rps <= armd::calib_hover::COMMISSIONING_MAX_ANGULAR_RPS + 1e-9);
+
+    // Once commissioned, full configured speeds are allowed.
+    cfg.active_tool.commissioning_required = false;
+    let inner_ok = common::sim_at(cfg, &INSPECT);
+    let plan_ok = armd::calib_hover::prepare(&inner_ok, &body, inner_ok.safety.epoch_id()).unwrap();
+    assert!((plan_ok.job.params.approach_speed_mps - 0.05).abs() < 1e-9);
+    assert!((plan_ok.angular_speed_rps - armd::motion::DEFAULT_ANGULAR_RPS).abs() < 1e-9);
 }

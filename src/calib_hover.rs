@@ -42,6 +42,9 @@ pub const MAX_DESCENT_MPS: f64 = 0.015;
 pub const DEFAULT_DESCENT_MPS: f64 = 0.01;
 pub const MAX_APPROACH_MPS: f64 = 0.05;
 pub const DEFAULT_APPROACH_MPS: f64 = 0.04;
+/// Commissioning linear/angular caps matching WS Cartesian moves (`0.2 * MAX_*`).
+pub const COMMISSIONING_MAX_LINEAR_MPS: f64 = 0.2 * crate::motion::MAX_LINEAR_MPS;
+pub const COMMISSIONING_MAX_ANGULAR_RPS: f64 = 0.2 * crate::motion::MAX_ANGULAR_RPS;
 /// Wait after the descent before the first frame (s).
 pub const MIN_SETTLE_S: f64 = 2.5;
 pub const MAX_SETTLE_S: f64 = 10.0;
@@ -143,6 +146,7 @@ pub struct HoverPlan {
     pub epoch: u64,
     pub workspace_revision: u64,
     pub calibration_revision: u64,
+    pub angular_speed_rps: f64,
     pub deadline_s: f64,
 }
 
@@ -188,7 +192,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Hove
     if inner.workspace_policy().is_none() { return Err(ArmError::detailed(400, "UNSUPPORTED", "calib_hover needs the Cartesian workspace (profile workspace + kinematics)", Value::Null)); }
     let o = body.as_object().ok_or_else(|| invalid("Command body must be an object"))?;
     let floor = inner.workspace_policy().map_or(0.0, |(ws, _)| f64::from(ws.floor_z_m));
-    let job = if let Some(r) = o.get("resume") {
+    let mut job = if let Some(r) = o.get("resume") {
         for k in o.keys() {
             if k != "resume" && k != "candidate_fingerprint" {
                 return Err(invalid(format!("resume takes no other field ({k})")));
@@ -279,12 +283,26 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Hove
     inner.action_preconditions()?;
     inner.gravity_comp_motion_busy()?;
     if !inner.is_torqued { return Err(crate::safety::SafetyError::NotArmed(inner.safety.state().clone()).into()); }
+    let angular_speed_rps = if inner.config.active_tool.commissioning_required {
+        job.params.approach_speed_mps = job.params.approach_speed_mps.min(COMMISSIONING_MAX_LINEAR_MPS);
+        job.params.descent_speed_mps = job.params.descent_speed_mps.min(COMMISSIONING_MAX_LINEAR_MPS);
+        crate::motion::DEFAULT_ANGULAR_RPS.min(COMMISSIONING_MAX_ANGULAR_RPS)
+    } else {
+        crate::motion::DEFAULT_ANGULAR_RPS
+    };
     // bound: per pending point approach (from up to 0.6 m away) + descent + settle + capture + retreat
     let p = &job.params;
     let per_point = 0.6 / p.approach_speed_mps + 2.0 * APPROACH_RISE_M[1] / p.descent_speed_mps + p.settle_s
         + (p.discard + p.frames) as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 0.5) + 3.0 * crate::motion::SETTLE_MAX_S;
     let pending = job.points.iter().filter(|q| q.state == "pending").count() as f64;
-    Ok(HoverPlan { job, epoch, workspace_revision: inner.workspace_revision, calibration_revision: inner.calibration_revision, deadline_s: per_point * pending + 30.0 })
+    Ok(HoverPlan {
+        job,
+        epoch,
+        workspace_revision: inner.workspace_revision,
+        calibration_revision: inner.calibration_revision,
+        angular_speed_rps,
+        deadline_s: per_point * pending + 30.0,
+    })
 }
 
 /// Store `job` (replacing one with the same id; at most [`KEEP_JOBS`]).
@@ -459,8 +477,8 @@ fn classify(e: (Stop, bool)) -> PointEnd {
 
 async fn run_point(ctx: &MacroCtx, plan: &HoverPlan, point: &mut HoverPoint, up: &crate::api::proxy::DetectorUpstream, t0: Instant) -> Result<(), PointEnd> {
     let p = plan.job.params.clone();
-    let approach = Speed { linear: p.approach_speed_mps, ..Speed::default() };
-    let descent = Speed { linear: p.descent_speed_mps, ..Speed::default() };
+    let approach = Speed { linear: p.approach_speed_mps, angular: plan.angular_speed_rps };
+    let descent = Speed { linear: p.descent_speed_mps, angular: plan.angular_speed_rps };
     recheck(ctx, plan).await.map_err(PointEnd::Abort)?;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("approach:{}", point.id), 0.0, None, None);
     ctx.move_arm_staged("approach", goal(point.approach_m, point.rpy_rad), approach, None).await.map_err(classify)?;
