@@ -5345,8 +5345,14 @@ impl SupervisorInner {
                 } else if ramp_out_handover || tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
                     let active_limits = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
                     let eval_res = if ramp_out_handover {
-                        self.compute_lead_ramp_out(servo_dt, &active_limits, self.pending_normal_unload)
+                        self.compute_lead_ramp_out_with_budget(
+                            servo_dt,
+                            &active_limits,
+                            self.pending_normal_unload,
+                            &mut tick_sweep_budget,
+                        )
                     } else if self.handover_settling_since.is_some() {
                         // Moving lease handover with lead already ramped out: validate nominal
                         // handover hold/braking without adding new lead.
@@ -5354,9 +5360,19 @@ impl SupervisorInner {
                         for j in &mut zero_jt.joints {
                             j.strategy = crate::tracking::TrackingStrategy::Position;
                         }
-                        self.compute_position_lead_output_with_limits(servo_dt, &zero_jt, &active_limits)
+                        self.compute_position_lead_output_with_limits_and_budget(
+                            servo_dt,
+                            &zero_jt,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
                     } else {
-                        self.compute_position_lead_output_with_limits(servo_dt, jt, &active_limits)
+                        self.compute_position_lead_output_with_limits_and_budget(
+                            servo_dt,
+                            jt,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
                     };
                     match eval_res {
                         Ok(out) => {
@@ -5436,10 +5452,11 @@ impl SupervisorInner {
                             let candidate_hold = self.commanded_positions.clone();
                             let fallback_target: Option<(Vec<f32>, Option<(u64, crate::kinematics::SlotBuf)>)> =
                                 if fresh_meas
-                                    && self.validate_fallback_hold(
+                                    && self.validate_fallback_hold_with_budget(
                                         prev_confirmed.as_deref(),
                                         &candidate_hold,
                                         fresh_meas,
+                                        &mut tick_sweep_budget,
                                     )
                                 {
                                     Some((candidate_hold, None))
@@ -5496,6 +5513,8 @@ impl SupervisorInner {
                             }
                         }
                     }
+                    self.tracking.last_tick_sweep_evals =
+                        MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
                 } else {
                     if tracking_active {
                         self.tracking.invalidate();

@@ -183,6 +183,9 @@ pub struct TrackingRuntime {
     /// Per-joint instant of the latest autonomous driver recovery write awaiting
     /// fresh post-recovery feedback.
     pub recovery_joints: Vec<(usize, std::time::Instant)>,
+    /// Total workspace sweep evaluations consumed on the most recent tick across
+    /// primary evaluation and any rejection fallback.
+    pub last_tick_sweep_evals: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -365,6 +368,17 @@ impl crate::supervisor::SupervisorInner {
         jt: &JointTrackingConfig,
         active_limits: &[crate::model::JointLimit],
     ) -> Result<TrackingOutput, TrackingReject> {
+        let mut budget = crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        self.compute_position_lead_output_with_limits_and_budget(dt, jt, active_limits, &mut budget)
+    }
+
+    pub fn compute_position_lead_output_with_limits_and_budget(
+        &self,
+        dt: f64,
+        jt: &JointTrackingConfig,
+        active_limits: &[crate::model::JointLimit],
+        budget: &mut usize,
+    ) -> Result<TrackingOutput, TrackingReject> {
         use std::time::Duration;
         use crate::chain::WorkspaceEvaluator;
         use crate::safety::SafetyError;
@@ -507,7 +521,7 @@ impl crate::supervisor::SupervisorInner {
         // sharing one per-tick workspace subdivision budget across all attempts and both segments.
         let multipliers = if has_desired_lead { LEAD_MULTIPLIERS } else { ZERO_ONLY };
         let mut last_err: Option<TrackingReject> = None;
-        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+        let budget_start = *budget;
 
         'cand: for &m in multipliers {
             let mut q_cand = self.commanded_positions.clone();
@@ -597,7 +611,7 @@ impl crate::supervisor::SupervisorInner {
                     &q_cand,
                     c_prev,
                     &mut local_min_d,
-                    &mut budget,
+                    budget,
                     MAX_KEEPOUT_EVALS_PER_TICK,
                     "tracking_lead",
                     "tracking_lead",
@@ -612,7 +626,7 @@ impl crate::supervisor::SupervisorInner {
                         &q_cand,
                         c_meas,
                         &mut local_meas_min_d,
-                        &mut budget,
+                        budget,
                         MAX_KEEPOUT_EVALS_PER_TICK,
                         "tracking_lead",
                         "tracking_lead",
@@ -631,7 +645,7 @@ impl crate::supervisor::SupervisorInner {
                 positions: q_cand,
                 velocities: v_out,
                 multiplier: m,
-                sweep_evals_used: MAX_KEEPOUT_EVALS_PER_TICK - budget,
+                sweep_evals_used: budget_start.saturating_sub(*budget),
                 ws_min_depths: committed_ws_min_d,
             });
         }
@@ -651,6 +665,17 @@ impl crate::supervisor::SupervisorInner {
         dt: f64,
         active_limits: &[crate::model::JointLimit],
         keepout_only: bool,
+    ) -> Result<TrackingOutput, TrackingReject> {
+        let mut budget = crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        self.compute_lead_ramp_out_with_budget(dt, active_limits, keepout_only, &mut budget)
+    }
+
+    pub fn compute_lead_ramp_out_with_budget(
+        &self,
+        dt: f64,
+        active_limits: &[crate::model::JointLimit],
+        keepout_only: bool,
+        budget: &mut usize,
     ) -> Result<TrackingOutput, TrackingReject> {
         use std::time::Duration;
         use crate::chain::WorkspaceEvaluator;
@@ -724,7 +749,7 @@ impl crate::supervisor::SupervisorInner {
             q_next[j] = q_final;
         }
 
-        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+        let budget_start = *budget;
         let mut committed_ws_min_d = None;
         if let Some((ws, cam)) = self.workspace_policy() {
             let keepout_ws = keepout_only.then(|| ws.keepout_only());
@@ -750,7 +775,7 @@ impl crate::supervisor::SupervisorInner {
                     &q_next,
                     &c_prev,
                     &mut local_min_d,
-                    &mut budget,
+                    budget,
                     MAX_KEEPOUT_EVALS_PER_TICK,
                     "tracking_ramp_out",
                     "tracking_ramp_out",
@@ -767,7 +792,7 @@ impl crate::supervisor::SupervisorInner {
                         &q_next,
                         &c_meas,
                         &mut local_meas_min_d,
-                        &mut budget,
+                        budget,
                         MAX_KEEPOUT_EVALS_PER_TICK,
                         "tracking_ramp_out",
                         "tracking_ramp_out",
@@ -788,7 +813,7 @@ impl crate::supervisor::SupervisorInner {
             positions: q_next,
             velocities: v_out,
             multiplier: 0.0,
-            sweep_evals_used: MAX_KEEPOUT_EVALS_PER_TICK - budget,
+            sweep_evals_used: budget_start.saturating_sub(*budget),
             ws_min_depths: committed_ws_min_d,
         })
     }
@@ -801,6 +826,17 @@ impl crate::supervisor::SupervisorInner {
         prev_confirmed: Option<&[f32]>,
         q_hold: &[f32],
         fresh_meas: bool,
+    ) -> bool {
+        let mut budget = crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+        self.validate_fallback_hold_with_budget(prev_confirmed, q_hold, fresh_meas, &mut budget)
+    }
+
+    pub fn validate_fallback_hold_with_budget(
+        &self,
+        prev_confirmed: Option<&[f32]>,
+        q_hold: &[f32],
+        fresh_meas: bool,
+        budget: &mut usize,
     ) -> bool {
         use crate::chain::WorkspaceEvaluator;
         use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
@@ -818,7 +854,6 @@ impl crate::supervisor::SupervisorInner {
         }
         if let Some((ws, cam)) = self.workspace_policy() {
             let eval = WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
-            let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
             if let Some(prev_q) = prev_confirmed.filter(|v| v.len() == dof && v.iter().all(|q| q.is_finite())) {
                 let mut c_prev = eval.alloc_buf();
                 if eval.eval_into(prev_q, &mut c_prev, "tracking_fallback").is_err() {
@@ -836,7 +871,7 @@ impl crate::supervisor::SupervisorInner {
                         q_hold,
                         &c_prev,
                         &mut min_d,
-                        &mut budget,
+                        budget,
                         MAX_KEEPOUT_EVALS_PER_TICK,
                         "tracking_fallback",
                         "tracking_fallback",
@@ -857,7 +892,7 @@ impl crate::supervisor::SupervisorInner {
                     q_hold,
                     &c_meas,
                     &mut min_d_meas,
-                    &mut budget,
+                    budget,
                     MAX_KEEPOUT_EVALS_PER_TICK,
                     "tracking_fallback",
                     "tracking_fallback",

@@ -2929,3 +2929,47 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
         "unaffected J2 must NOT have been reseeded straight to lagging measured pose"
     );
 }
+
+/// Review 2 m2: Primary evaluation and rejection fallback share a single per-tick sweep budget.
+#[test]
+fn tracking_rejection_fallback_shares_per_tick_sweep_budget() {
+    use armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
+
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+
+    // First verify directly that a zero remaining budget fails fallback sweep subdivision
+    // rather than allocating a fresh MAX_KEEPOUT_EVALS_PER_TICK budget, and that a normal
+    // budget is decremented in place.
+    let mut zero_budget = 0usize;
+    let mut q_hold = q0.to_vec();
+    q_hold[0] += 1.5;
+    assert!(
+        !inner.validate_fallback_hold_with_budget(Some(&q0), &q_hold, true, &mut zero_budget),
+        "fallback must NOT allocate a fresh sweep budget when remaining tick budget is 0"
+    );
+    let mut shared_budget = MAX_KEEPOUT_EVALS_PER_TICK;
+    assert!(inner.validate_fallback_hold_with_budget(Some(&q0), &q_hold, true, &mut shared_budget));
+    assert!(shared_budget < MAX_KEEPOUT_EVALS_PER_TICK, "fallback sweep must debit the shared budget");
+
+    // Trigger a live workspace rejection on a tick and assert total evals across primary + fallback
+    // remain strictly <= MAX_KEEPOUT_EVALS_PER_TICK.
+    let mut ws = inner.config.workspace.clone().unwrap();
+    ws.floor_z_m = 5.0;
+    inner.config.workspace = Some(ws);
+    inner.workspace_revision += 1;
+    let mut q_bad = q0.to_vec();
+    q_bad[1] += 0.02;
+    inner.commanded_positions = q_bad;
+    inner.commanded_velocities[1] = 0.25;
+    let _ = inner.tick(DT);
+    assert!(
+        inner.tracking.last_tick_sweep_evals <= MAX_KEEPOUT_EVALS_PER_TICK,
+        "combined primary + fallback sweep evals {} exceeded budget {}",
+        inner.tracking.last_tick_sweep_evals,
+        MAX_KEEPOUT_EVALS_PER_TICK
+    );
+}
