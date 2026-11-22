@@ -505,6 +505,7 @@ pub struct EmbeddingWindowSnapshot {
     pub invalidation_generation: u64,
     pub clock_handshake_generation: u64,
     pub clock_handshake_expires_at_ms: u64,
+    pub handshake_continuity_epoch: u64,
     pub window_newest_deadline_ms: u64,
     pub window_oldest_deadline_ms: u64,
     pub policy_instance_id: Option<u64>,
@@ -529,6 +530,7 @@ pub struct LiveEmbeddingTicketState {
     pub invalidation_generation: u64,
     pub clock_handshake_generation: u64,
     pub clock_handshake_expires_at_ms: u64,
+    pub handshake_continuity_epoch: u64,
     pub continuous_renewal_floor_gen: u64,
 }
 
@@ -555,6 +557,7 @@ struct EmbeddingHubInner {
     test_now_ms: Option<u64>,
     default_handshake_ttl_ms: u64,
     handshake_generation: u64,
+    handshake_continuity_epoch: u64,
     handshake: Option<ClockHandshakeState>,
     refill_started_at_ms: Option<u64>,
     continuous_renewal_floor_gen: u64,
@@ -579,6 +582,7 @@ impl Default for EmbeddingHubInner {
             test_now_ms: None,
             default_handshake_ttl_ms: DEFAULT_HANDSHAKE_TTL_MS,
             handshake_generation: 0,
+            handshake_continuity_epoch: 0,
             handshake: None,
             refill_started_at_ms: None,
             continuous_renewal_floor_gen: 0,
@@ -655,6 +659,7 @@ impl EmbeddingHubInner {
             invalidation_generation: self.invalidation_generation,
             clock_handshake_generation,
             clock_handshake_expires_at_ms,
+            handshake_continuity_epoch: self.handshake_continuity_epoch,
             continuous_renewal_floor_gen: self.continuous_renewal_floor_gen,
         }
     }
@@ -733,6 +738,16 @@ impl VideoEmbeddingHub {
     pub fn handshake_state(&self) -> Option<ClockHandshakeState> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.handshake.clone()
+    }
+
+    pub fn active_continuity_epoch(&self) -> Option<u64> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now_ms = inner.now_ms();
+        inner
+            .handshake
+            .as_ref()
+            .filter(|hs| now_ms <= hs.handshake_expires_at_ms)
+            .map(|_| inner.handshake_continuity_epoch)
     }
 
     pub fn window_len(&self) -> usize {
@@ -1117,6 +1132,7 @@ impl VideoEmbeddingHub {
                 inner.refill_started_at_ms = Some(s2);
             }
         } else {
+            inner.handshake_continuity_epoch = inner.handshake_continuity_epoch.wrapping_add(1);
             inner.continuous_renewal_floor_gen = gen;
             inner.refill_started_at_ms = None;
         }
@@ -1435,7 +1451,24 @@ impl VideoEmbeddingHub {
         spec: &VideoEmbeddingSpec,
         run_started_ms: u64,
     ) -> EmbeddingSampleDecision {
+        self.sample_window_with_continuity(spec, run_started_ms, None)
+    }
+
+    pub fn sample_window_with_continuity(
+        &self,
+        spec: &VideoEmbeddingSpec,
+        run_started_ms: u64,
+        expected_continuity_epoch: Option<u64>,
+    ) -> EmbeddingSampleDecision {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = expected_continuity_epoch {
+            if inner.handshake_continuity_epoch != exp {
+                return EmbeddingSampleDecision::Stop {
+                    reason: "HANDSHAKE_EXPIRED",
+                    message: "Clock handshake expired and re-established out of continuity between control ticks".into(),
+                };
+            }
+        }
         let now_ms = inner.now_ms();
         let eff_staleness = inner
             .bound
@@ -1553,6 +1586,7 @@ impl VideoEmbeddingHub {
             invalidation_generation: inner.invalidation_generation,
             clock_handshake_generation: hs.handshake_generation,
             clock_handshake_expires_at_ms: hs.handshake_expires_at_ms,
+            handshake_continuity_epoch: inner.handshake_continuity_epoch,
             window_newest_deadline_ms: newest_dl,
             window_oldest_deadline_ms: oldest_dl,
             policy_instance_id: inner.bound.as_ref().map(|b| b.policy_instance_id),

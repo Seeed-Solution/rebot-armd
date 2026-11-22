@@ -3505,3 +3505,165 @@ async fn m02_unbroken_renewal_commit_past_old_ticket_expiry_holds_and_resumes() 
     assert_eq!(end_pol.vision_frame_id, Some(2));
     assert!(non_home_writes.load(Ordering::SeqCst) >= 1);
 }
+
+#[tokio::test]
+async fn r2_late_handshake_renewal_between_ticks_stops_with_handshake_expired() {
+    let mut weights = vec![0.0f32; 6 * 8];
+    weights[6] = 0.05;
+    weights[7] = 0.05;
+    let layers = make_linear_layers(8, 6, weights);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 5.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 500,
+                "max_window_span_ms": 500,
+                "fps_staleness_budget_ms": 500,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_default_handshake_ttl_ms(100);
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs1 = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    let initial_continuity_epoch = hub.live_ticket_state().handshake_continuity_epoch;
+    assert_eq!(initial_continuity_epoch, 1);
+
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs1.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: Some(1_000_000),
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 5);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        5.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-r2-8").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-r2-8".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_r2_8".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        5.0,
+        compute_policy_deadline(Some(1.0)).unwrap(),
+        None,
+        None,
+    );
+
+    // Wait for step 1 to commit cleanly.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        sup.tick(0.02).await;
+        if let Some(pol) = sup.get_observation().await.policy {
+            if pol.steps >= 1 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for policy step 1 to commit"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let writes_after_step1 = non_home_writes.load(Ordering::SeqCst);
+    assert_eq!(writes_after_step1, 1);
+
+    // Between tick 1 and tick 2: hs1 expires (1_000_120 > 1_000_100), producer completes
+    // a late handshake (hs2) and refills the ring buffer BEFORE tick 2 runs.
+    hub.set_test_now_ms(Some(1_000_120));
+    let hs2 = hub_two_step_handshake(&hub, 1, 1_000_120, 1, true);
+    assert!(hs2.handshake_generation > hs1.handshake_generation);
+    assert_eq!(
+        hub.live_ticket_state().handshake_continuity_epoch,
+        initial_continuity_epoch + 1,
+        "late handshake after expiry must advance handshake_continuity_epoch"
+    );
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs2.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 2,
+        captured_at_ms: 1_000_120,
+        oldest_captured_at_ms: Some(1_000_120),
+        embedding: vec![2.0, 2.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    // Tick 2 must immediately stop fail-closed with HANDSHAKE_EXPIRED and emit 0 additional targets.
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    let end_obs = sup.get_observation().await;
+    let end_pol = end_obs.policy.expect("policy obs");
+    assert!(!end_pol.active);
+    assert_eq!(end_pol.stop_reason.as_deref(), Some("HANDSHAKE_EXPIRED"));
+    assert_eq!(end_pol.steps, 1);
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), writes_after_step1);
+}

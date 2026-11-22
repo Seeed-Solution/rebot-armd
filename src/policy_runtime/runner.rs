@@ -1057,6 +1057,9 @@ pub fn spawn_policy_runner(
         };
         let run_started_at = Instant::now();
         let mut locked_generation: Option<u64> = None;
+        let mut locked_continuity_epoch: Option<u64> = embedding_hub
+            .as_ref()
+            .and_then(|h| h.active_continuity_epoch());
 
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1109,8 +1112,13 @@ pub fn spawn_policy_runner(
                         );
                         break;
                     };
-                    match hub.sample_window(emb_spec, emb_run_started_ms) {
+                    match hub.sample_window_with_continuity(
+                        emb_spec,
+                        emb_run_started_ms,
+                        locked_continuity_epoch,
+                    ) {
                         EmbeddingSampleDecision::Ready(win) => {
+                            locked_continuity_epoch.get_or_insert(win.handshake_continuity_epoch);
                             let ticket = InferenceTicket::new(
                                 action_id,
                                 lease_gen,
