@@ -12,6 +12,9 @@ pub const MAX_TRACKING_LAG_S: f32 = 1.5;
 pub const DEFAULT_MAX_LEAD_RAD: f32 = 0.030;
 /// Maximum allowed per-joint position lead (rad).
 pub const MAX_LEAD_RAD_LIMIT: f32 = 0.030;
+/// Damiao MIT frame gain ranges (`DamiaoLimits::default`: kp 0..500, kd 0..5).
+pub const MIT_WIRE_KP_MAX: f32 = 500.0;
+pub const MIT_WIRE_KD_MAX: f32 = 5.0;
 /// Measured arm-joint speed at or below which velocity feedback is evidence of rest (rad/s).
 pub const STATIONARY_VELOCITY_RAD_S: f32 = 0.05;
 /// Largest arm-joint position change between two fresh samples at least one control tick
@@ -46,6 +49,13 @@ pub struct JointTrackingJoint {
     pub viscous_nm_s_rad: f32,
     pub inertia_kg_m2: f32,
     pub effort_limit_nm: f32,
+    /// MIT stationary-hold stiffness (N·m/rad); only for `mit` joints, tuned separately from
+    /// the tracking `kp` under the same ceilings (Phase 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_kp: Option<f32>,
+    /// MIT stationary-hold damping (N·m·s/rad); only for `mit` joints (Phase 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_kd: Option<f32>,
 }
 
 impl Default for JointTrackingJoint {
@@ -61,6 +71,8 @@ impl Default for JointTrackingJoint {
             viscous_nm_s_rad: 0.0,
             inertia_kg_m2: 0.0,
             effort_limit_nm: 0.0,
+            hold_kp: None,
+            hold_kd: None,
         }
     }
 }
@@ -91,8 +103,24 @@ impl JointTrackingConfig {
         }
     }
 
-    /// Validate schema invariants for Phase 1 (`position` and `position_lead` only;
-    /// `mit` is rejected in Phase 1).
+    /// Indices into `joints` (arm order) whose strategy is `mit`.
+    pub fn mit_joint_slots(&self) -> Vec<usize> {
+        self.joints.iter().enumerate().filter(|(_, j)| j.strategy == TrackingStrategy::Mit).map(|(k, _)| k).collect()
+    }
+
+    /// Tracking is enabled and at least one joint selects `mit` (each such joint carries the
+    /// MIT-only keys `hold_kp` / `hold_kd`, so no Phase 1 profile can request it).
+    pub fn mit_requested(&self) -> bool {
+        self.enabled && !self.mit_joint_slots().is_empty()
+    }
+
+    /// Validate schema invariants. `position` and `position_lead` as in Phase 1. `mit` (Phase 2,
+    /// disabled by default) is the explicit request: it needs the MIT-only keys `hold_kp` /
+    /// `hold_kd` and positive `kp`, `kd`, `effort_limit_nm` within the wire ranges (profile
+    /// ceilings and term fit: [`crate::model::ArmConfig::validate`]; activation: the
+    /// qualification gate in `src/mit.rs`). Every configuration Phase 1 accepted or refused is
+    /// accepted or refused unchanged: Phase 1 refused `mit` and the unknown keys `hold_kp` /
+    /// `hold_kd`, and both stay refused unless they come together.
     pub fn validate(&self, arm_dof: usize, dof: usize, gripper_index: Option<usize>) -> Result<(), String> {
         if let Some(g) = gripper_index {
             if self.joints.len() > g {
@@ -150,9 +178,24 @@ impl JointTrackingConfig {
             finite_nonneg("effort_limit_nm", j.effort_limit_nm)?;
 
             if matches!(j.strategy, TrackingStrategy::Mit) {
-                return Err(format!(
-                    "joint_tracking.joints[{i}]: strategy 'mit' is not supported in Phase 1 (only 'position' and 'position_lead' are accepted)"
-                ));
+                if j.hold_kp.is_none() || j.hold_kd.is_none() {
+                    return Err(format!(
+                        "joint_tracking.joints[{i}]: strategy 'mit' needs hold_kp and hold_kd (MIT is disabled by default)"
+                    ));
+                }
+                let positive = |name: &str, v: f32, max: f32| -> Result<(), String> {
+                    if !v.is_finite() || v <= 0.0 || v > max {
+                        return Err(format!("joint_tracking.joints[{i}].{name} must be in (0, {max}] for strategy 'mit', got {v}"));
+                    }
+                    Ok(())
+                };
+                positive("kp", j.kp, MIT_WIRE_KP_MAX)?;
+                positive("kd", j.kd, MIT_WIRE_KD_MAX)?;
+                positive("effort_limit_nm", j.effort_limit_nm, f32::MAX)?;
+                positive("hold_kp", j.hold_kp.unwrap_or(f32::NAN), MIT_WIRE_KP_MAX)?;
+                positive("hold_kd", j.hold_kd.unwrap_or(f32::NAN), MIT_WIRE_KD_MAX)?;
+            } else if j.hold_kp.is_some() || j.hold_kd.is_some() {
+                return Err(format!("joint_tracking.joints[{i}]: hold_kp / hold_kd are only for strategy 'mit'"));
             }
         }
         Ok(())

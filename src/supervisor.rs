@@ -352,6 +352,9 @@ pub struct SupervisorInner {
     /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
     /// profile's camera mount.
     pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
+    /// MIT not requested.
+    pub mit_gate_error: Option<String>,
     /// The profile's `workspace.floor_z_m` (None without a workspace). `config.workspace.floor_z_m`
     /// holds the effective floor ([`crate::calibration::effective_floor`]), recomputed by
     /// [`refresh_effective_floor`](Self::refresh_effective_floor) whenever its inputs change.
@@ -631,6 +634,7 @@ impl SupervisorInner {
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
+            mit_gate_error: None,
             profile_floor_z_m,
             floor_source: "profile",
             hover_jobs: Vec::new(),
@@ -1775,6 +1779,17 @@ impl SupervisorInner {
                 }
                 return Err(SafetyError::EStopActive);
             }
+
+            // MIT tracking (Phase 2): every arm and rearm rechecks the qualification against a fresh
+            // register readback (nonzero TIMEOUT, identity, ranges); unqualified hardware refuses
+            // MIT before any motion. MIT not requested: no readback, no change.
+            if let Err(e) = self.mit_gate() {
+                let msg = format!("MIT_UNQUALIFIED: MIT tracking refused: {e}");
+                tracing::error!("{msg}");
+                self.mit_gate_error = Some(msg.clone());
+                return Err(SafetyError::ClearFaultRejected(msg));
+            }
+            self.mit_gate_error = None;
 
             // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback
             let any_driver_enabled = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));

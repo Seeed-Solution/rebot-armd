@@ -20,6 +20,7 @@ pub mod gravity;
 pub mod kinematics;
 #[cfg(not(target_arch = "wasm32"))] pub mod macro_action;
 #[cfg(not(target_arch = "wasm32"))] pub mod measure_multiview;
+#[cfg(not(target_arch = "wasm32"))] pub mod mit;
 #[cfg(not(target_arch = "wasm32"))] pub mod motor_zero;
 #[cfg(not(target_arch = "wasm32"))] pub use ::mview_stereo;
 pub mod mjcf_compose;

@@ -241,6 +241,18 @@ pub trait ArmDriver: Send {
     /// only when its hold frames and the bus flush also succeed. Off (default) keeps the
     /// pre-tracking behaviour, where a matching mode acknowledgement confirms the switch.
     fn set_strict_mode_handover(&mut self, _strict: bool) {}
+
+    /// Fresh register readback of the motors of `joints` (0-based): identity, firmware, mode,
+    /// mapping ranges and the command timeout (MIT qualification gate, `src/mit.rs`). Read only.
+    fn read_motor_identity(&mut self, _joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> {
+        Err(ArmDriverError::Protocol("motor identity readback is not supported by this driver".into()))
+    }
+
+    /// Write the motor command timeout of `joints` to `counts` in RAM (never flash), check the
+    /// acknowledgement and confirm it with a separate read. Torque off only.
+    fn commission_motor_timeout(&mut self, _joints: &[usize], _counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
+        Err(ArmDriverError::Protocol("motor timeout commissioning is not supported by this driver".into()))
+    }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -2105,6 +2117,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     recovery_written_joints: Vec<usize>,
     /// `ArmDriver::set_strict_mode_handover`; false keeps the e4f72b6 `write_modes`.
     strict_mode_handover: bool,
+    /// Register replies with the CAN ID they arrived on and their receive instant (MIT
+    /// identity readback and TIMEOUT commissioning).
+    register_reply_log: Vec<(damiao::RegisterReply, u32, Instant)>,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2143,6 +2158,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             range_check: None,
             recovery_written_joints: Vec::new(),
             strict_mode_handover: false,
+            register_reply_log: Vec::new(),
         }
     }
 
@@ -2398,6 +2414,42 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         failed
     }
 
+    /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
+    /// replies matched by motor ID, read opcode and RID, newer than the request. Returns
+    /// (value, reply CAN ID) per RID.
+    fn read_registers_fresh(&mut self, i: usize, rids: &[u8]) -> Result<Vec<([u8; 4], u32)>, ArmDriverError> {
+        let id = self.motor_ids[i];
+        self.register_replies.clear();
+        self.register_reply_log.clear();
+        let sent_at = Instant::now();
+        for &rid in rids {
+            self.transmit_with_retry(&damiao::build_read_register_frame(id, rid))?;
+        }
+        self.can.flush()?;
+        let expected: Vec<(usize, bool, u8)> = rids.iter().map(|&rid| (i, false, rid)).collect();
+        let _ = self.await_register_replies(&expected);
+        rids.iter().map(|&rid| {
+            self.register_reply_log.iter().rev()
+                .find(|(r, _, at)| r.motor_id == id && !r.write && r.rid == rid && *at >= sent_at)
+                .map(|(r, fid, _)| (r.value, *fid))
+                .ok_or_else(|| ArmDriverError::HardwareFault(format!("Joint {} (CAN ID 0x{id:X}) did not answer the read of register {rid}", i + 1)))
+        }).collect()
+    }
+
+    fn identity_of(&mut self, i: usize) -> Result<crate::mit::MotorIdentity, ArmDriverError> {
+        const RIDS: [u8; 8] = [damiao::RID_ESC_ID, damiao::RID_MST_ID, damiao::RID_SW_VER, damiao::RID_CTRL_MODE,
+            damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX, damiao::RID_TIMEOUT];
+        let v = self.read_registers_fresh(i, &RIDS)?;
+        let reply_id = v[0].1;
+        if let Some((_, other)) = v.iter().find(|(_, fid)| *fid != reply_id) {
+            return Err(ArmDriverError::HardwareFault(format!("Joint {}: register replies arrived on CAN IDs 0x{reply_id:X} and 0x{other:X}", i + 1)));
+        }
+        let u = |k: usize| u32::from_le_bytes(v[k].0);
+        let f = |k: usize| f32::from_le_bytes(v[k].0);
+        Ok(crate::mit::MotorIdentity { joint: i + 1, motor_id: self.motor_ids[i], reply_id, esc_id: u(0), mst_id: u(1), sw_ver: u(2),
+            ctrl_mode: u(3), pmax: f(4), vmax: f(5), tmax: f(6), timeout_raw: u(7) })
+    }
+
     pub fn with_vlim(mut self, vlim: f32) -> Self {
         self.default_vlim = vlim;
         self
@@ -2571,6 +2623,67 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_strict_mode_handover(&mut self, strict: bool) {
         self.strict_mode_handover = strict;
+    }
+
+    fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> {
+        let n = self.motor_ids.len();
+        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 }); }
+        joints.iter().map(|&i| self.identity_of(i)).collect()
+    }
+
+    fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, ArmDriverError> {
+        let n = self.motor_ids.len();
+        if let Some(&j) = joints.iter().find(|&&j| j >= n) { return Err(ArmDriverError::JointCountMismatch { expected: n, actual: j + 1 }); }
+        if counts == 0 || counts > crate::mit::MAX_TIMEOUT_COUNTS {
+            return Err(ArmDriverError::Protocol(format!("TIMEOUT counts must be in 1..={}", crate::mit::MAX_TIMEOUT_COUNTS)));
+        }
+        if self.is_enabled || self.is_enabling {
+            return Err(ArmDriverError::Protocol("the TIMEOUT commissioning needs torque off".into()));
+        }
+        for &i in joints {
+            // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
+            let fresh = self.last_feedback_instant[i].is_some_and(|t| t.elapsed() <= ZERO_FEEDBACK_MAX_AGE
+                && self.last_enable_command.is_none_or(|c| t >= c));
+            if self.awaiting_rx_boundary || !fresh || self.motor_status[i] != 0 {
+                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
+                    i + 1, self.motor_ids[i], self.motor_status[i])));
+            }
+        }
+        let mut out = Vec::with_capacity(joints.len());
+        for &i in joints {
+            let id = self.motor_ids[i];
+            let before = self.identity_of(i)?;
+            if before.reply_id != before.mst_id {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: register replies on 0x{:X} but MST_ID {}", i + 1, before.reply_id, before.mst_id)));
+            }
+            // RAM write (0x55), checked acknowledgement
+            self.register_replies.clear();
+            self.register_reply_log.clear();
+            let sent_at = Instant::now();
+            self.transmit_with_retry(&damiao::build_write_register_u32_frame(id, damiao::RID_TIMEOUT, counts))?;
+            self.can.flush()?;
+            let _ = self.await_register_replies(&[(i, true, damiao::RID_TIMEOUT)]);
+            let ack = self.register_reply_log.iter().rev()
+                .find(|(r, _, at)| r.motor_id == id && r.write && r.rid == damiao::RID_TIMEOUT && *at >= sent_at).copied();
+            let Some((ack, ack_id, _)) = ack else {
+                return Err(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{id:X}) did not acknowledge the TIMEOUT write", i + 1)));
+            };
+            if ack_id != before.mst_id || ack.as_u32() != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT write acknowledged with {} on 0x{ack_id:X} (wrote {counts}, MST_ID {})",
+                    i + 1, ack.as_u32(), before.mst_id)));
+            }
+            // separate read: fresh motor ID, reply ID, opcode, RID and value
+            let readback = self.identity_of(i)?;
+            let same = readback.motor_id == before.motor_id && readback.reply_id == before.reply_id && readback.esc_id == before.esc_id
+                && readback.mst_id == before.mst_id && readback.sw_ver == before.sw_ver;
+            if !same || readback.timeout_raw != counts {
+                return Err(ArmDriverError::HardwareFault(format!("joint {}: TIMEOUT readback {} (wrote {counts}) or identity changed", i + 1, readback.timeout_raw)));
+            }
+            tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): TIMEOUT {} -> {counts} counts (RAM)", i + 1, before.timeout_raw);
+            out.push(crate::mit::TimeoutCommissioning { before, written_raw: counts, ack_raw: ack.as_u32(), readback,
+                unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED, unit_verified: false });
+        }
+        Ok(out)
     }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
@@ -2944,6 +3057,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     {
                         // A register reply is not feedback: byte 0 would decode as state 0.
                         if self.register_replies.len() < 64 { self.register_replies.push(reply); }
+                        if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, Instant::now())); }
                         if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION { break; }
                         continue;
                     }
