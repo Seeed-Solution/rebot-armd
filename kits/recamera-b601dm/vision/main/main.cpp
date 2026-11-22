@@ -36,6 +36,7 @@
 #include "depth_geom.h"
 #include "depth_stage.h"
 #include "detector.h"
+#include "gray_frame.h"
 #include "http_control.h"
 #include "json.hpp"
 #include "model_catalogue.h"
@@ -600,6 +601,16 @@ int main(int argc, char** argv) {
     stream.bitrate_kbps = static_cast<uint32_t>(g_cfg.stream_bitrate_kbps);
     app.with_camera(cam).with_stream_mode(af::StreamMode::WsOnly, stream, g_cfg.debug_port);
 
+    // The ArUco crop, gray extraction, and detection normalisation use the visible part of the
+    // letterboxed inference frame (same geometry as the debug /results overlay).
+    const rv::ContentRect content = rv::content_rect(g_cfg.inference_w, g_cfg.inference_h, g_cfg.stream_w, g_cfg.stream_h);
+    const af::Rect crop{static_cast<int32_t>(std::lround(content.x)), static_cast<int32_t>(std::lround(content.y)),
+                        static_cast<int32_t>(std::lround(content.w)), static_cast<int32_t>(std::lround(content.h))};
+    const double disp_sx = content.w > 0 ? g_cfg.stream_w / content.w : 1.0;
+    const double disp_sy = content.h > 0 ? g_cfg.stream_h / content.h : 1.0;
+    const bool gray_geom_ok = (crop.x >= 0 && crop.y >= 0 && crop.w == rv::kGrayWidth && crop.h == rv::kGrayHeight &&
+                               crop.x + crop.w <= g_cfg.inference_w && crop.y + crop.h <= g_cfg.inference_h);
+
     rv::VisionControl::Options vo;
     vo.fps = g_cfg.fps;
     vo.mode = g_cfg.mode;
@@ -620,6 +631,15 @@ int main(int argc, char** argv) {
     vo.intrinsics.marker_size = g_cfg.aruco.marker_size;
     vo.intrinsics_cli_override = g_cfg.intrinsics_cli;
     vo.config_path = g_cfg.config_path;
+    vo.gray_available = gray_geom_ok;
+    vo.gray_width = crop.w;
+    vo.gray_height = crop.h;
+    vo.gray_crop[0] = crop.x;
+    vo.gray_crop[1] = crop.y;
+    vo.gray_crop[2] = crop.w;
+    vo.gray_crop[3] = crop.h;
+    vo.frame_size[0] = g_cfg.inference_w;
+    vo.frame_size[1] = g_cfg.inference_h;
     if (g_cfg.intrinsics_cli) {
         MA_LOGW(TAG, "Intrinsics set on the command line: PUT /api/calibration/intrinsics is refused (CLI_OVERRIDE)");
     }
@@ -638,19 +658,13 @@ int main(int argc, char** argv) {
         }
         MA_LOGI(TAG, "Processing %s (camera gate %d fps)", on ? "ON" : "OFF", gate_fps);
     });
-    MA_LOGI(TAG, "Start: mode %s, inference %s, fps %d", rv::mode_name(ctl.mode()),
-            ctl.continuous_enabled() ? "on" : "standby", ctl.active_fps());
+    MA_LOGI(TAG, "Start: mode %s, inference %s, fps %d, instance %s, gray %s", rv::mode_name(ctl.mode()),
+            ctl.continuous_enabled() ? "on" : "standby", ctl.active_fps(), ctl.instance_id().c_str(),
+            ctl.gray_available() ? "on" : "off");
 
     rv::HttpControlServer http(ctl);
     if (!http.start(g_cfg.control_port)) MA_LOGE(TAG, "HTTP control unavailable on port %d", g_cfg.control_port);
 
-    // The ArUco crop and the detection normalisation use the visible part of the
-    // letterboxed inference frame (same geometry as the debug /results overlay).
-    const rv::ContentRect content = rv::content_rect(g_cfg.inference_w, g_cfg.inference_h, g_cfg.stream_w, g_cfg.stream_h);
-    const af::Rect crop{static_cast<int32_t>(std::lround(content.x)), static_cast<int32_t>(std::lround(content.y)),
-                        static_cast<int32_t>(std::lround(content.w)), static_cast<int32_t>(std::lround(content.h))};
-    const double disp_sx = content.w > 0 ? g_cfg.stream_w / content.w : 1.0;
-    const double disp_sy = content.h > 0 ? g_cfg.stream_h / content.h : 1.0;
     MA_LOGI(TAG, "Content rect in %dx%d: x=%d y=%d w=%d h=%d", g_cfg.inference_w, g_cfg.inference_h, crop.x, crop.y,
             crop.w, crop.h);
 
@@ -661,7 +675,6 @@ int main(int argc, char** argv) {
     std::deque<std::string> labels;  // class names of `boxes` / `dets` (a deque keeps c_str() valid on push_back)
     ArucoStats aruco_stats;
     std::string extra;
-    uint32_t frame_id = 0;
     // Frame age for triggers and the rate gate. retrieveFrame() returns the newest queued
     // frame: if the grab waited, the frame arrived during the wait (now); if one was already
     // queued, it arrived after the previous grab.
@@ -727,7 +740,7 @@ int main(int argc, char** argv) {
         }
         const auto t_frame = std::chrono::steady_clock::now();
         rv::VisionResult vr;
-        vr.frame_id = ++frame_id;
+        vr.frame_id = ctl.next_frame_id(vr.instance_id);
         vr.frame_ms = frame_ms;
         vr.wait_ms = before_grab_ms;
         vr.grab_ms = grab_ms;
@@ -741,6 +754,58 @@ int main(int argc, char** argv) {
         dets.clear();
         labels.clear();
         markers.clear();
+
+        // Convert the validated RGB888 visible crop into owned gray storage BEFORE YOLO, ArUco,
+        // or depth run so downstream preprocessors or scratch buffers cannot alias or mutate it.
+        std::shared_ptr<const rv::GrayFrame> gray_rec;
+        if (p.gray && ctl.gray_available()) {
+            const auto t_gray = std::chrono::steady_clock::now();
+            const bool src_ok = (frame.format == af::PixelFormat::RGB888 &&
+                                 frame.channel == 0 &&
+                                 frame.width == g_cfg.inference_w &&
+                                 frame.height == g_cfg.inference_h &&
+                                 frame.cpu_accessible());
+            const af::VideoFrame sub = src_ok ? frame.sub_frame(crop) : af::VideoFrame{};
+            if (src_ok && sub.valid() && sub.cpu_accessible() &&
+                sub.width == rv::kGrayWidth && sub.height == rv::kGrayHeight &&
+                sub.stride() >= static_cast<uint32_t>(sub.width) * 3u) {
+                std::vector<uint8_t> px_vec;
+                if (rv::extract_gray_crop(frame.data(), frame.width, frame.height,
+                                          static_cast<int>(frame.stride()),
+                                          crop.x, crop.y, crop.w, crop.h, px_vec)) {
+                    auto rec = std::make_shared<rv::GrayFrame>();
+                    rec->instance_id = vr.instance_id;
+                    rec->frame_id = vr.frame_id;
+                    rec->width = sub.width;
+                    rec->height = sub.height;
+                    rec->stride = sub.width;
+                    rec->frame_w = frame.width;
+                    rec->frame_h = frame.height;
+                    rec->crop_x = crop.x;
+                    rec->crop_y = crop.y;
+                    rec->crop_w = crop.w;
+                    rec->crop_h = crop.h;
+                    rec->channel = frame.channel;
+                    rec->ts_ms = vr.ts_ms;
+                    rec->frame_mono_ms = vr.frame_ms;
+                    rec->wait_mono_ms = vr.wait_ms;
+                    rec->grab_mono_ms = vr.grab_ms;
+                    rec->convert_ms = ms_since(t_gray);
+                    rec->stored_mono_ms = rv::mono_ms();
+                    rec->model_generation = vr.model_generation;
+                    rec->pixels = std::make_shared<const std::vector<uint8_t>>(std::move(px_vec));
+                    gray_rec = std::move(rec);
+                    vr.ran_gray = true;
+                    vr.gray_ms = gray_rec->convert_ms;
+                } else {
+                    MA_LOGW(TAG, "Gray conversion/allocation failed on frame %u", vr.frame_id);
+                }
+            } else {
+                MA_LOGW(TAG, "Gray frame geometry/format mismatch on frame %u: fmt=%d ch=%u size=%ux%u sub=%ux%u stride=%u",
+                        vr.frame_id, static_cast<int>(frame.format), frame.channel,
+                        frame.width, frame.height, sub.width, sub.height, sub.stride());
+            }
+        }
 
         if (p.yolo && detector) {  // an empty slot reports ran: false
             const auto t0 = std::chrono::steady_clock::now();
@@ -857,7 +922,7 @@ int main(int argc, char** argv) {
             }
         }
         vr.inference_ms = ms_since(t_frame);
-        ctl.publish(vr);
+        ctl.publish(vr, std::move(gray_rec));
 
         r.width = frame.width;
         r.height = frame.height;

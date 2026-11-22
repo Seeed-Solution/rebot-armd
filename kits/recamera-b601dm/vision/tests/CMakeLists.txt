@@ -40,6 +40,7 @@ add_executable(vision_control_test
     ${MAIN}/result_json.cpp
     ${MAIN}/depth_geom.cpp
     ${MAIN}/depth_map.cpp
+    ${MAIN}/gray_frame.cpp
     ${MAIN}/http_control.cpp)
 target_include_directories(vision_control_test PRIVATE ${MAIN})
 target_compile_options(vision_control_test PRIVATE -Wall -Wextra)
@@ -54,6 +55,7 @@ add_executable(intrinsics_test
     ${MAIN}/result_json.cpp
     ${MAIN}/depth_geom.cpp
     ${MAIN}/depth_map.cpp
+    ${MAIN}/gray_frame.cpp
     ${MAIN}/http_control.cpp)
 target_include_directories(intrinsics_test PRIVATE ${MAIN})
 target_compile_options(intrinsics_test PRIVATE -Wall -Wextra)
@@ -119,11 +121,19 @@ add_test(NAME depth_geom COMMAND depth_geom_test)
 
 add_executable(depth_map_test ${CMAKE_CURRENT_LIST_DIR}/depth_map_test.cpp ${MAIN}/depth_map.cpp
                               ${MAIN}/vision_control.cpp ${MAIN}/intrinsics.cpp ${MAIN}/model_catalogue.cpp
-                              ${MAIN}/result_json.cpp ${MAIN}/depth_geom.cpp ${MAIN}/http_control.cpp)
+                              ${MAIN}/result_json.cpp ${MAIN}/depth_geom.cpp ${MAIN}/gray_frame.cpp ${MAIN}/http_control.cpp)
 target_include_directories(depth_map_test PRIVATE ${MAIN})
 target_compile_options(depth_map_test PRIVATE -Wall -Wextra)
 target_link_libraries(depth_map_test PRIVATE rv_json Threads::Threads)
 add_test(NAME depth_map COMMAND depth_map_test)
+
+add_executable(gray_frame_test ${CMAKE_CURRENT_LIST_DIR}/gray_frame_test.cpp ${MAIN}/gray_frame.cpp
+                               ${MAIN}/vision_control.cpp ${MAIN}/intrinsics.cpp ${MAIN}/model_catalogue.cpp
+                               ${MAIN}/result_json.cpp ${MAIN}/depth_geom.cpp ${MAIN}/depth_map.cpp ${MAIN}/http_control.cpp)
+target_include_directories(gray_frame_test PRIVATE ${MAIN})
+target_compile_options(gray_frame_test PRIVATE -Wall -Wextra)
+target_link_libraries(gray_frame_test PRIVATE rv_json Threads::Threads)
+add_test(NAME gray_frame COMMAND gray_frame_test)
 
 add_executable(obb_geom_test ${CMAKE_CURRENT_LIST_DIR}/obb_geom_test.cpp ${MAIN}/obb_geom.cpp)
 target_include_directories(obb_geom_test PRIVATE ${MAIN})

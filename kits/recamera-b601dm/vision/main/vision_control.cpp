@@ -105,10 +105,17 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       catalogue_(opt.catalogue),
       on_change_(std::move(on_change)),
       fps_(clamp_fps(opt.fps)),
+      gray_available_(opt.gray_available && opt.gray_width == kGrayWidth && opt.gray_height == kGrayHeight),
+      gray_width_(opt.gray_width),
+      gray_height_(opt.gray_height),
+      instance_id_(opt.instance_id.empty() ? generate_instance_id() : opt.instance_id),
+      frame_seq_(opt.initial_frame_id),
       models_(model_set_of(opt)),
       intrinsics_cli_(opt.intrinsics_cli_override),
       config_path_(opt.config_path),
       intrinsics_(opt.intrinsics) {
+    for (int i = 0; i < 4; ++i) gray_crop_[i] = opt.gray_crop[i];
+    for (int i = 0; i < 2; ++i) frame_size_[i] = opt.frame_size[i];
     Mode m = opt.mode;
     // Without a model, YOLO modes fall back to what still works.
     if (!opt.yolo_available) m = (m == Mode::Both || m == Mode::Aruco) ? Mode::Aruco : Mode::Off;
@@ -116,6 +123,7 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
     last_active_ = m != Mode::Off ? m : (opt.yolo_available ? Mode::Yolo : Mode::Aruco);
     continuous_ = opt.enabled && m != Mode::Off;
     latest_.mode = mode_;
+    latest_.instance_id = instance_id_;
     reported_proc_ = processing_locked();
     reported_gate_ = gate_locked();
     gate_active_ = continuous_locked().active();
@@ -420,10 +428,40 @@ Pipelines VisionControl::default_trigger_pipelines() const {
     return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
 }
 
-void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus) {
+std::string VisionControl::instance_id() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return instance_id_;
+}
+
+uint32_t VisionControl::next_frame_id(std::string& instance_out) {
+    std::vector<std::shared_ptr<const GrayFrame>> displaced;
+    uint32_t id = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (frame_seq_ == UINT32_MAX) {
+            std::string next_inst = generate_instance_id();
+            if (next_inst == instance_id_) next_inst = generate_instance_id();
+            instance_id_ = std::move(next_inst);
+            frame_seq_ = 0;
+            gray_ring_.clear(displaced);
+            recent_results_.clear();
+            latest_.frame_id = 0;
+            latest_.instance_id = instance_id_;
+        }
+        id = ++frame_seq_;
+        instance_out = instance_id_;
+    }
+    displaced.clear();
+    return id;
+}
+
+uint64_t VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus) {
+    uint64_t handle = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
         Trigger t;
+        handle = next_trigger_handle_++;
+        t.handle = handle;
         t.request_ms = request_ms;
         t.pipelines = p;
         if (focus && focus->active) {
@@ -436,13 +474,14 @@ void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFo
         notify_locked();
     }
     cv_.notify_all();
+    return handle;
 }
 
-void VisionControl::trigger_end(uint64_t request_ms) {
+void VisionControl::trigger_end(uint64_t handle) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = triggers_.begin(); it != triggers_.end(); ++it) {
-            if (it->request_ms == request_ms) {
+            if (it->handle == handle) {
                 triggers_.erase(it);
                 break;
             }
@@ -452,29 +491,75 @@ void VisionControl::trigger_end(uint64_t request_ms) {
     cv_.notify_all();
 }
 
-void VisionControl::publish(const VisionResult& r) {
+void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray) {
+    std::shared_ptr<const GrayFrame> displaced;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        latest_ = r;
-        latest_.done_ms = mono_ms();
-        result_meter_.add(r.frame_ms);
+        VisionResult stored = r;
+        if (stored.instance_id.empty()) stored.instance_id = instance_id_;
+        if (stored.ran_gray) {
+            const bool gray_ok = gray && gray->valid() && gray->frame_id == stored.frame_id &&
+                                 gray->instance_id == stored.instance_id;
+            if (gray_ok) {
+                displaced = gray_ring_.put(std::move(gray));
+            } else {
+                stored.ran_gray = false;
+                stored.gray_ms = 0;
+                gray.reset();
+            }
+        } else {
+            gray.reset();
+        }
+        stored.done_ms = mono_ms();
+        latest_ = stored;
+        VisionResult hist = stored;
+        hist.depth_disp.reset();
+        if (recent_results_.size() >= kRecentResultsCap) recent_results_.pop_front();
+        recent_results_.push_back(std::move(hist));
+        result_meter_.add(stored.frame_ms);
     }
     cv_.notify_all();
+    // Displaced (or rejected) gray buffer is destroyed here, outside mu_.
+    displaced.reset();
+    gray.reset();
+}
+
+GrayRing::Lookup VisionControl::get_gray(const std::string& instance_id, uint32_t frame_id,
+                                         std::shared_ptr<const GrayFrame>& out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return gray_ring_.find(instance_id, frame_id, instance_id_, out);
 }
 
 bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
     std::unique_lock<std::mutex> lk(mu_);
+    const std::string start_instance = instance_id_;
     // A frame planned before this trigger was registered can be newer than request_ms but
-    // lack its pipelines; the next one has them.
-    auto fresh = [&] {
-        return latest_.frame_id > after && latest_.frame_ms >= request_ms &&
-               Pipelines{latest_.ran_yolo, latest_.ran_aruco, latest_.ran_depth}.covers(need);
+    // lack its pipelines; the next one has them. Scanning recent_results_ newest-to-oldest
+    // also preserves the qualifying result if a later non-matching frame updates latest_.
+    auto matches = [&](const VisionResult& r) {
+        if (r.frame_id == 0) return false;
+        const bool newer = (r.instance_id == start_instance) ? (r.frame_id > after) : true;
+        return newer && r.frame_ms >= request_ms &&
+               Pipelines{r.ran_yolo, r.ran_aruco, r.ran_depth, r.ran_gray}.covers(need);
     };
-    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return fresh() || stopping_; });
+    auto find_match = [&]() -> const VisionResult* {
+        for (auto it = recent_results_.rbegin(); it != recent_results_.rend(); ++it) {
+            if (matches(*it)) {
+                if (it->frame_id == latest_.frame_id && it->instance_id == latest_.instance_id) return &latest_;
+                return &(*it);
+            }
+        }
+        return matches(latest_) ? &latest_ : nullptr;
+    };
+    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return find_match() != nullptr || stopping_; });
+    if (const VisionResult* hit = find_match()) {
+        out = *hit;
+        return false;
+    }
     out = latest_;
-    return !fresh();
+    return true;
 }
 
 bool VisionControl::latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out) {
@@ -994,6 +1079,7 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     VisionResult current;
     ctl.latest(false, 0, 0, current);
     const uint32_t baseline = current.frame_id;
+    const std::string baseline_instance = current.instance_id.empty() ? ctl.instance_id() : current.instance_id;
 
     // Served by the first frame newer than this request, with the requested pipelines added
     // to that frame; the camera gate opens meanwhile.
@@ -1011,7 +1097,8 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     }
     std::ostringstream s;
     s << "{\"api_version\":" << kApiVersion;
-    if (timeout || r.frame_id <= baseline) {
+    const bool same_inst = (r.instance_id == baseline_instance);
+    if (timeout || r.frame_id == 0 || (same_inst && r.frame_id <= baseline)) {
         s << ",\"success\":false,\"timeout\":true,\"count\":0,\"detections\":[],\"markers\":[]}";
         return {200, s.str()};
     }
@@ -1072,6 +1159,7 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     VisionResult current;
     ctl.latest(false, 0, 0, current);
     const uint32_t baseline = current.frame_id;
+    const std::string baseline_instance = current.instance_id.empty() ? ctl.instance_id() : current.instance_id;
     ctl.depth_map_wait(true);
     const uint64_t request_ms = mono_ms();
     VisionResult r;
@@ -1081,7 +1169,8 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
         timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
     }
     ctl.depth_map_wait(false);
-    if (timeout || r.frame_id <= baseline) return depth_error(504, "depth timeout", "no depth frame within wait_ms");
+    const bool same_inst = (r.instance_id == baseline_instance);
+    if (timeout || r.frame_id == 0 || (same_inst && r.frame_id <= baseline)) return depth_error(504, "depth timeout", "no depth frame within wait_ms");
     if (!r.depth_disp || r.depth_grid_w <= 0 || r.depth_grid_h <= 0 ||
         r.depth_disp->size() != static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h))
         return depth_error(503, "depth failed", "the depth stage gave no map for this frame");

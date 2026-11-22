@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "depth_map.h"
+#include "gray_frame.h"
 #include "intrinsics.h"
 #include "mask_geom.h"
 #include "model_catalogue.h"
@@ -31,16 +33,17 @@ struct Pipelines {
     bool yolo = false;
     bool aruco = false;
     bool depth = false;
-    bool any() const noexcept { return yolo || aruco || depth; }
+    bool gray = false;
+    bool any() const noexcept { return yolo || aruco || depth || gray; }
     bool operator==(const Pipelines& o) const noexcept {
-        return yolo == o.yolo && aruco == o.aruco && depth == o.depth;
+        return yolo == o.yolo && aruco == o.aruco && depth == o.depth && gray == o.gray;
     }
     Pipelines operator|(const Pipelines& o) const noexcept {
-        return {yolo || o.yolo, aruco || o.aruco, depth || o.depth};
+        return {yolo || o.yolo, aruco || o.aruco, depth || o.depth, gray || o.gray};
     }
     /** Every pipeline of `o` is in this set. */
     bool covers(const Pipelines& o) const noexcept {
-        return (yolo || !o.yolo) && (aruco || !o.aruco) && (depth || !o.depth);
+        return (yolo || !o.yolo) && (aruco || !o.aruco) && (depth || !o.depth) && (gray || !o.gray);
     }
 };
 
@@ -105,17 +108,20 @@ private:
 
 /** One processed frame. JSON fragments are built by the frame thread (result_json.h). */
 struct VisionResult {
-    uint32_t frame_id = 0;  ///< 0: no result produced yet
-    uint64_t ts_ms = 0;     ///< frame capture time, Unix epoch ms
-    uint64_t frame_ms = 0;  ///< mono_ms() the frame is known to be newer than (frame_plan())
+    std::string instance_id;  ///< process/instance identity owning `frame_id`
+    uint32_t frame_id = 0;    ///< 0: no result produced yet
+    uint64_t ts_ms = 0;       ///< frame capture time, Unix epoch ms
+    uint64_t frame_ms = 0;    ///< mono_ms() the frame is known to be newer than (frame_plan())
     float inference_ms = 0;
     Mode mode = Mode::Off;  ///< base mode when the frame ran
     bool ran_yolo = false;
     bool ran_aruco = false;
     bool ran_depth = false;
+    bool ran_gray = false;
     float yolo_ms = 0;
     float aruco_ms = 0;
     float depth_ms = 0;
+    float gray_ms = 0;
     float mask_ms = -1.0f;
     int width = 640;   ///< visible image size that detections / markers refer to
     int height = 360;
@@ -210,6 +216,13 @@ public:
         Intrinsics intrinsics;           ///< what the ArUco stage started with
         bool intrinsics_cli_override = false;
         std::string config_path;         ///< active vision.json (PUT /api/calibration/intrinsics writes it)
+        bool gray_available = true;      ///< fixed-format 640x360 gray frames supported by this config
+        int gray_width = kGrayWidth;
+        int gray_height = kGrayHeight;
+        int gray_crop[4] = {0, 140, kGrayWidth, kGrayHeight};
+        int frame_size[2] = {640, 640};
+        std::string instance_id;         ///< optional override for tests; empty = auto-generated
+        uint32_t initial_frame_id = 0;   ///< optional starting frame counter for rollover tests
     };
 
     enum class IntrinsicsStatus { Ok, CliOverride, RevisionMismatch, PersistFailed };
@@ -219,22 +232,21 @@ public:
 
     class TriggerScope {
     public:
-        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) : c_(&c), req_(request_ms) {
-            c_->trigger_begin(req_, p, focus);
-        }
+        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr)
+            : c_(&c), handle_(c_->trigger_begin(request_ms, p, focus)) {}
         ~TriggerScope() { release(); }
         TriggerScope(const TriggerScope&) = delete;
         TriggerScope& operator=(const TriggerScope&) = delete;
         void release() {
             if (c_) {
-                c_->trigger_end(req_);
+                c_->trigger_end(handle_);
                 c_ = nullptr;
             }
         }
 
     private:
         VisionControl* c_;
-        uint64_t req_;
+        uint64_t handle_ = 0;
     };
 
     VisionControl(const Options& opt, OnChange on_change);
@@ -257,6 +269,14 @@ public:
     int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
     bool depth_available() const { return models().depth_available; }
+    bool gray_available() const noexcept { return gray_available_; }
+    int gray_width() const noexcept { return gray_width_; }
+    int gray_height() const noexcept { return gray_height_; }
+    const int* gray_crop() const noexcept { return gray_crop_; }
+    const int* frame_size() const noexcept { return frame_size_; }
+    std::string instance_id() const;
+    /** Allocate the next frame_id on the frame thread, rotating instance_id before u32 wrap. */
+    uint32_t next_frame_id(std::string& instance_out);
     const Catalogue& catalogue() const noexcept { return catalogue_; }
 
     /**
@@ -340,8 +360,8 @@ public:
 
     /** A trigger without pipelines: the default subscription's, else the last active mode's. */
     Pipelines default_trigger_pipelines() const;
-    void trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr);
-    void trigger_end(uint64_t request_ms);
+    uint64_t trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr);
+    void trigger_end(uint64_t handle);
     TriggerScope trigger_scope(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) {
         return TriggerScope(*this, request_ms, p, focus);
     }
@@ -355,7 +375,15 @@ public:
         return TriggerScope(*this, request_ms, default_trigger_pipelines(), nullptr);
     }
 
-    void publish(const VisionResult& r);
+    /**
+     * Atomically publish a processed frame result and its optional immutable gray frame record.
+     * Any evicted gray frame is destroyed outside `mu_`. If `r.ran_gray` is true without a valid
+     * matching `gray` record, `ran_gray` is cleared and nothing is installed in the gray ring.
+     */
+    void publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray = nullptr);
+    /** Look up a retained gray frame by `(instance_id, frame_id)` (immediate, no wait). */
+    GrayRing::Lookup get_gray(const std::string& instance_id, uint32_t frame_id,
+                              std::shared_ptr<const GrayFrame>& out) const;
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
@@ -367,11 +395,13 @@ public:
 
 private:
     struct Trigger {
-        uint64_t request_ms;
+        uint64_t handle = 0;
+        uint64_t request_ms = 0;
         Pipelines pipelines;
         bool has_focus = false;
         MaskFocus focus;
     };
+    static constexpr size_t kRecentResultsCap = 8;
     Continuous continuous_locked() const noexcept;
     bool processing_locked() const noexcept { return continuous_locked().active() || !triggers_.empty(); }
     int fps_locked() const noexcept;
@@ -395,6 +425,7 @@ private:
     int fps_ = 5;
     MaskFocus persistent_focus_;
     std::vector<Trigger> triggers_;  ///< pending triggers
+    uint64_t next_trigger_handle_ = 1;
     std::vector<Subscription> subs_;
     uint64_t next_sub_id_ = 1;
     bool reported_proc_ = false;
@@ -405,7 +436,16 @@ private:
     RateMeter input_meter_;
     RateMeter result_meter_;
     uint32_t offered_ = 0;
+    const bool gray_available_;
+    const int gray_width_;
+    const int gray_height_;
+    int gray_crop_[4] = {0, 140, kGrayWidth, kGrayHeight};
+    int frame_size_[2] = {640, 640};
+    std::string instance_id_;
+    uint32_t frame_seq_ = 0;
+    GrayRing gray_ring_{kGrayRingCapacity};
     VisionResult latest_;
+    std::deque<VisionResult> recent_results_;
     bool stopping_ = false;
     ModelSet models_;
     SwapState swap_ = SwapState::Idle;

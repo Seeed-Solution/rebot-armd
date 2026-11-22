@@ -31,6 +31,7 @@ set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/depth_geom.cpp
     ${CMAKE_CURRENT_LIST_DIR}/depth_map.cpp
     ${CMAKE_CURRENT_LIST_DIR}/depth_stage.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gray_frame.cpp
 )
 
 component_register(
