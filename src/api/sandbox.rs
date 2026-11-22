@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 pub use crate::mjcf_compose::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,7 @@ use super::assets;
 use super::proxy::{self, DetectorUpstream};
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+static NEXT_BUNDLE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
 static TARGET_REPLACE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024; // 1 MiB
@@ -1451,8 +1452,14 @@ impl PackStatFingerprint {
     }
 }
 
+struct InflightStatCheck {
+    cache_id: u64,
+    rx: tokio::sync::watch::Receiver<Option<bool>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedBundle {
+    cache_id: u64,
     pub robot: String,
     pub active_scene: String,
     pub active_tool: String,
@@ -1498,6 +1505,12 @@ pub struct SandboxState {
     bundle_cache: RwLock<Vec<Arc<CachedBundle>>>,
     bundle_rebuild_sem: Arc<Semaphore>,
     bundle_rebuild_count: Arc<AtomicU64>,
+    stat_check_inflight: Arc<std::sync::Mutex<Option<InflightStatCheck>>>,
+    bundle_stat_walk_count: Arc<AtomicU64>,
+    stat_walk_delay_ms: AtomicU64,
+    in_flight_rebuilds: Arc<AtomicUsize>,
+    peak_concurrent_rebuilds: Arc<AtomicUsize>,
+    bundle_rebuild_delay_ms: AtomicU64,
     builtin_roots: Option<Vec<PathBuf>>,
     #[cfg(feature = "policy-runtime")]
     policy_load_delay_ms: AtomicU64,
@@ -1527,6 +1540,12 @@ impl SandboxState {
             bundle_cache: RwLock::new(Vec::new()),
             bundle_rebuild_sem: Arc::new(Semaphore::new(1)),
             bundle_rebuild_count: Arc::new(AtomicU64::new(0)),
+            stat_check_inflight: Arc::new(std::sync::Mutex::new(None)),
+            bundle_stat_walk_count: Arc::new(AtomicU64::new(0)),
+            stat_walk_delay_ms: AtomicU64::new(0),
+            in_flight_rebuilds: Arc::new(AtomicUsize::new(0)),
+            peak_concurrent_rebuilds: Arc::new(AtomicUsize::new(0)),
+            bundle_rebuild_delay_ms: AtomicU64::new(0),
             builtin_roots: None,
             #[cfg(feature = "policy-runtime")]
             policy_load_delay_ms: AtomicU64::new(0),
@@ -1538,6 +1557,117 @@ impl SandboxState {
     /// Number of full disk reread/validate/hash/compose bundle rebuilds performed by `get_bundle`.
     pub fn bundle_rebuild_count(&self) -> u64 {
         self.bundle_rebuild_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of `PackStatFingerprint::matches_disk` walks executed on warm cache hits.
+    pub fn bundle_stat_walk_count(&self) -> u64 {
+        self.bundle_stat_walk_count.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: artificial delay inside each warm bundle stat walk.
+    pub fn set_stat_walk_delay_ms(&self, delay_ms: u64) {
+        self.stat_walk_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    /// Peak number of concurrent `build_bundle_from_disk` executions observed on this state.
+    pub fn peak_concurrent_rebuilds(&self) -> usize {
+        self.peak_concurrent_rebuilds.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: artificial delay inside `build_bundle_from_disk`.
+    pub fn set_bundle_rebuild_delay_ms(&self, delay_ms: u64) {
+        self.bundle_rebuild_delay_ms.store(delay_ms, Ordering::Relaxed);
+    }
+
+    /// Single-flight coalescing for warm `PackStatFingerprint::matches_disk` checks keyed by `cache_id`.
+    async fn check_bundle_fresh(self: &Arc<Self>, cached: &CachedBundle) -> bool {
+        let cache_id = cached.cache_id;
+        loop {
+            enum Action {
+                Wait(tokio::sync::watch::Receiver<Option<bool>>),
+                WaitThenRetry(tokio::sync::watch::Receiver<Option<bool>>),
+                Run(tokio::sync::watch::Sender<Option<bool>>),
+            }
+
+            let action = {
+                let mut guard = self
+                    .stat_check_inflight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                match guard.as_ref() {
+                    Some(inflight) if inflight.cache_id == cache_id => {
+                        Action::Wait(inflight.rx.clone())
+                    }
+                    Some(inflight) => Action::WaitThenRetry(inflight.rx.clone()),
+                    None => {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        *guard = Some(InflightStatCheck { cache_id, rx });
+                        Action::Run(tx)
+                    }
+                }
+            };
+
+            match action {
+                Action::Wait(mut rx) => {
+                    loop {
+                        if let Some(res) = *rx.borrow_and_update() {
+                            return res;
+                        }
+                        if rx.changed().await.is_err() {
+                            return false;
+                        }
+                    }
+                }
+                Action::WaitThenRetry(mut rx) => {
+                    loop {
+                        if rx.borrow_and_update().is_some() {
+                            break;
+                        }
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Action::Run(tx) => {
+                    let state_c = Arc::clone(self);
+                    let fp = cached.stat_fingerprint.clone();
+                    return tokio::task::spawn_blocking(move || {
+                        struct StatSlotGuard {
+                            slot: Arc<std::sync::Mutex<Option<InflightStatCheck>>>,
+                            tx: Option<tokio::sync::watch::Sender<Option<bool>>>,
+                            result: bool,
+                        }
+                        impl Drop for StatSlotGuard {
+                            fn drop(&mut self) {
+                                {
+                                    let mut guard =
+                                        self.slot.lock().unwrap_or_else(|e| e.into_inner());
+                                    *guard = None;
+                                }
+                                if let Some(tx) = self.tx.take() {
+                                    let _ = tx.send(Some(self.result));
+                                }
+                            }
+                        }
+                        let mut guard = StatSlotGuard {
+                            slot: Arc::clone(&state_c.stat_check_inflight),
+                            tx: Some(tx),
+                            result: false,
+                        };
+                        state_c.bundle_stat_walk_count.fetch_add(1, Ordering::Relaxed);
+                        let delay_ms = state_c.stat_walk_delay_ms.load(Ordering::Relaxed);
+                        if delay_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        let fresh = fp.matches_disk();
+                        guard.result = fresh;
+                        fresh
+                    })
+                    .await
+                    .unwrap_or(false);
+                }
+            }
+        }
     }
 
     async fn lookup_cached_bundle(&self, robot: &str, active: &ActiveState) -> Option<Arc<CachedBundle>> {
@@ -3985,6 +4115,7 @@ fn build_cached_bundle_from_snapshot(
     let stat_fingerprint = PackStatFingerprint::collect(roots, absent_watch_dirs);
 
     Arc::new(CachedBundle {
+        cache_id: NEXT_BUNDLE_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         robot: snap.robot,
         active_scene: snap.scene_id,
         active_tool: snap.tool_id,
@@ -4011,6 +4142,26 @@ fn build_bundle_from_disk(
     requested_robot: Option<&str>,
     current: &ActiveState,
 ) -> Result<Arc<CachedBundle>, (StatusCode, Json<serde_json::Value>)> {
+    struct RebuildConcurrencyGuard<'a> {
+        in_flight: &'a AtomicUsize,
+    }
+    impl Drop for RebuildConcurrencyGuard<'_> {
+        fn drop(&mut self) {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let active_now = state.in_flight_rebuilds.fetch_add(1, Ordering::SeqCst) + 1;
+    let _concurrency_guard = RebuildConcurrencyGuard {
+        in_flight: &state.in_flight_rebuilds,
+    };
+    state
+        .peak_concurrent_rebuilds
+        .fetch_max(active_now, Ordering::SeqCst);
+    let delay_ms = state.bundle_rebuild_delay_ms.load(Ordering::Relaxed);
+    if delay_ms > 0 {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+
     let ResolvedPack {
         canon_dir: scene_dir,
         manifest: scene_manifest,
@@ -5549,15 +5700,29 @@ pub async fn recover_split(
                     None,
                 )
                 .await;
+            let permit = state
+                .bundle_rebuild_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Bundle rebuild semaphore closed"})),
+                    )
+                })?;
             let state_c = state.clone();
             let robot_c = running_robot.clone();
             let active_snap = state.active.read().await.clone();
             if let Ok(Ok(cached)) = tokio::task::spawn_blocking(move || {
-                build_bundle_from_disk(&state_c, &robot_c, None, &active_snap)
+                let _permit = permit;
+                let cached = build_bundle_from_disk(&state_c, &robot_c, None, &active_snap)?;
+                state_c.insert_cached_bundle_blocking(cached.clone());
+                Ok::<_, (StatusCode, Json<serde_json::Value>)>(cached)
             })
             .await
             {
-                state.insert_cached_bundle(cached).await;
+                let _ = cached;
             }
             Ok(Json(serde_json::json!({
                 "ok": true,
@@ -5671,11 +5836,7 @@ pub async fn get_bundle(
 
     let current = state.active.read().await.clone();
     if let Some(cached) = state.lookup_cached_bundle(&running_robot, &current).await {
-        let fp = cached.stat_fingerprint.clone();
-        let fresh = tokio::task::spawn_blocking(move || fp.matches_disk())
-            .await
-            .unwrap_or(false);
-        if fresh {
+        if state.check_bundle_fresh(&cached).await {
             return Ok(Json(render_bundle_json(&cached, &current)));
         }
     }
@@ -5694,11 +5855,7 @@ pub async fn get_bundle(
 
     let current = state.active.read().await.clone();
     if let Some(cached) = state.lookup_cached_bundle(&running_robot, &current).await {
-        let fp = cached.stat_fingerprint.clone();
-        let fresh = tokio::task::spawn_blocking(move || fp.matches_disk())
-            .await
-            .unwrap_or(false);
-        if fresh {
+        if state.check_bundle_fresh(&cached).await {
             return Ok(Json(render_bundle_json(&cached, &current)));
         }
     }

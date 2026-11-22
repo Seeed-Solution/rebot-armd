@@ -2808,4 +2808,175 @@ async fn sandbox_m5_rejects_expansion_tags_and_enforces_single_and_combined_elem
     assert_eq!(err_act["code"], "INVALID_PACK", "{err_act}");
 }
 
+#[tokio::test]
+async fn sandbox_m07_concurrent_warm_bundle_gets_coalesce_stat_walks() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="warm_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/warm_scene"),
+        "warm_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "warm_scene".to_string();
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    // Cold GET warms the bundle cache.
+    let (st0, body0) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st0, StatusCode::OK, "{body0}");
+    assert_eq!(state.bundle_rebuild_count(), 1);
+    let expected_sha = body0["composed_xml_sha256"].as_str().unwrap().to_string();
+
+    // Concurrent burst of 12 warm GETs must coalesce onto 1 stat walk and 0 rebuilds.
+    state.set_stat_walk_delay_ms(80);
+    let walks_before = state.bundle_stat_walk_count();
+    let rebuilds_before = state.bundle_rebuild_count();
+    let barrier = Arc::new(tokio::sync::Barrier::new(12));
+    let mut handles = Vec::new();
+    for _ in 0..12 {
+        let app_c = app.clone();
+        let b_c = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            b_c.wait().await;
+            send_json(&app_c, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+    for h in handles {
+        let (st, body) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["composed_xml_sha256"].as_str(), Some(expected_sha.as_str()));
+    }
+    assert_eq!(state.bundle_rebuild_count(), rebuilds_before);
+    assert_eq!(
+        state.bundle_stat_walk_count() - walks_before,
+        1,
+        "12 concurrent warm GETs must coalesce onto 1 stat walk"
+    );
+
+    // Sequential GET after burst must still run a fresh stat check (not stale-cached).
+    state.set_stat_walk_delay_ms(0);
+    let (st_seq, _) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st_seq, StatusCode::OK);
+    assert_eq!(state.bundle_stat_walk_count() - walks_before, 2);
+}
+
+#[tokio::test]
+async fn sandbox_m08_recover_split_shares_rebuild_semaphore_with_cold_get_bundle() {
+    let _env_guard = SIM_ENV_LOCK.lock().await;
+    let _upload_guard = UPLOAD_LOCK.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="split_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/split_scene"),
+        "split_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    let commit_done = Arc::new(tokio::sync::Notify::new());
+    let commit_done_c = commit_done.clone();
+
+    let mock_sim = axum::Router::new()
+        .route(
+            "/sim/scene/commit",
+            post(move || {
+                let commit_done_c = commit_done_c.clone();
+                async move {
+                    commit_done_c.notify_waiters();
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "ok": true,
+                            "state": "COMMITTED",
+                            "tx_id": "tx-m08",
+                            "camera_tx_id": "tx-m08",
+                            "robot": "b601dm",
+                            "scene": "split_scene",
+                            "tool": "default"
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/sim/state",
+            get(|| async move {
+                axum::Json(json!({
+                    "tx_id": "tx-m08",
+                    "activation_state": "DEGRADED_SPLIT",
+                    "robot": "b601dm",
+                    "scene": "split_scene",
+                    "tool": "default"
+                }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+    std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "split_scene".to_string();
+    state.set_bundle_rebuild_delay_ms(80);
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let notified = commit_done.notified();
+    let app_rec = app.clone();
+    let rec_handle = tokio::spawn(async move {
+        send_json(
+            &app_rec,
+            "POST",
+            "/api/v1/sandbox/recover-split",
+            Some(json!({"action": "replay_camera"})),
+        )
+        .await
+    });
+
+    // Wait until recover_split receives 200 from /sim/scene/commit and enters build_bundle_from_disk,
+    // then fire concurrent cold GET /api/v1/sandbox/bundle requests against the empty cache.
+    notified.await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut get_handles = Vec::new();
+    for _ in 0..4 {
+        let app_get = app.clone();
+        get_handles.push(tokio::spawn(async move {
+            send_json(&app_get, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+
+    let (st_rec, body_rec) = rec_handle.await.unwrap();
+    assert_eq!(st_rec, StatusCode::OK, "{body_rec}");
+    assert_eq!(body_rec["state"], "COMMITTED", "{body_rec}");
+
+    for h in get_handles {
+        let (st_get, body_get) = h.await.unwrap();
+        assert_eq!(st_get, StatusCode::OK, "{body_get}");
+        assert!(body_get["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+
+    std::env::remove_var("ARMD_SIM_URL");
+    server.abort();
+
+    assert_eq!(
+        state.peak_concurrent_rebuilds(),
+        1,
+        "recover_split and cold GET /bundle must share bundle_rebuild_sem so peak_concurrent_rebuilds == 1"
+    );
+}
+
 
