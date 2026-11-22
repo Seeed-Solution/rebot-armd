@@ -410,6 +410,8 @@ pub struct SupervisorInner {
     pub collision: crate::collision::CollisionGuard,
     /// Torque-saturation guard state (`src/torque_guard.rs`).
     pub torque_guard: crate::torque_guard::TorqueGuard,
+    /// Joint tracking output history (`src/tracking.rs`).
+    pub tracking: crate::tracking::TrackingRuntime,
     /// Supply-current estimate (`src/power.rs`).
     pub power: crate::power::PowerMonitor,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
@@ -654,6 +656,7 @@ impl SupervisorInner {
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
             torque_guard: crate::torque_guard::TorqueGuard::default(),
+            tracking: crate::tracking::TrackingRuntime::default(),
             power: crate::power::PowerMonitor::default(),
             follower: None,
             base_gripper_policy,
@@ -5185,26 +5188,126 @@ impl SupervisorInner {
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
             if send_to_bus {
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let targets: Vec<JointTarget> = self
-                            .commanded_positions
-                            .iter()
-                            .zip(self.commanded_velocities.iter())
-                            .enumerate()
-                            .map(|(i, (&p, &v))| JointTarget {
-                                position: p,
-                                velocity: Some(v),
-                                torque: if gravity_output_enabled {
-                                    self.gravity_torques_ramped.get(i).copied()
-                                } else {
-                                    Some(0.0)
-                                },
-                                kp: None,
-                                kd: None,
-                            })
-                            .collect();
-                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+                let tracking_owned = tracking_active
+                    && self.driver.is_some()
+                    && !self.safety.state().is_stopped()
+                    && !self.pending_normal_unload
+                    && self.handover_settling_since.is_none();
+
+                if tracking_owned {
+                    let jt = self.config.joint_tracking.as_ref().unwrap();
+                    match self.compute_position_lead_output(servo_dt, jt) {
+                        Ok(out) => {
+                            let targets: Vec<JointTarget> = out
+                                .positions
+                                .iter()
+                                .zip(self.commanded_velocities.iter())
+                                .enumerate()
+                                .map(|(i, (&p, &v))| JointTarget {
+                                    position: p,
+                                    velocity: Some(v),
+                                    torque: if gravity_output_enabled {
+                                        self.gravity_torques_ramped.get(i).copied()
+                                    } else {
+                                        Some(0.0)
+                                    },
+                                    kp: None,
+                                    kd: None,
+                                })
+                                .collect();
+                            let write_res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+                                Some(mut driver) => Some(driver.write_joint_targets(&targets)),
+                                None => None,
+                            };
+                            match write_res {
+                                Some(Ok(())) => self.tracking.record_issued(out.positions, out.velocities),
+                                Some(Err(e)) => {
+                                    self.tracking.invalidate();
+                                    output_error = Some(e.to_string());
+                                }
+                                None => self.tracking.invalidate(),
+                            }
+                        }
+                        Err(reject) => {
+                            let was_streaming = self.servo_target.is_some();
+                            self.tracking.invalidate();
+                            match reject {
+                                crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
+                                    self.enter_servo_keepout_hold(&ws_err);
+                                }
+                                crate::tracking::TrackingReject::Workspace(ws_err) => {
+                                    tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
+                                    self.hold_measured_pose();
+                                    self.macro_run = None;
+                                    self.safety.trigger_fault_coded(
+                                        FaultCode::Other,
+                                        FaultReason::Other(format!("Joint tracking output rejected: {ws_err}")),
+                                    );
+                                }
+                                crate::tracking::TrackingReject::JointLimit(msg) => {
+                                    tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
+                                    self.hold_measured_pose();
+                                    self.macro_run = None;
+                                    self.safety.trigger_fault_coded(
+                                        FaultCode::JointLimit,
+                                        FaultReason::Other(format!("Joint tracking output rejected: {msg}")),
+                                    );
+                                }
+                            }
+                            if self.measured_positions.iter().all(|q| q.is_finite()) {
+                                if let Some(ref d) = self.driver {
+                                    if let Ok(mut driver) = d.lock() {
+                                        let targets: Vec<JointTarget> = self
+                                            .commanded_positions
+                                            .iter()
+                                            .zip(self.commanded_velocities.iter())
+                                            .enumerate()
+                                            .map(|(i, (&p, &v))| JointTarget {
+                                                position: p,
+                                                velocity: Some(v),
+                                                torque: if gravity_output_enabled {
+                                                    self.gravity_torques_ramped.get(i).copied()
+                                                } else {
+                                                    Some(0.0)
+                                                },
+                                                kp: None,
+                                                kd: None,
+                                            })
+                                            .collect();
+                                        if let Err(e) = driver.write_joint_targets(&targets) {
+                                            output_error = Some(e.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if tracking_active {
+                        self.tracking.invalidate();
+                    }
+                    if let Some(ref d) = self.driver {
+                        if let Ok(mut driver) = d.lock() {
+                            let targets: Vec<JointTarget> = self
+                                .commanded_positions
+                                .iter()
+                                .zip(self.commanded_velocities.iter())
+                                .enumerate()
+                                .map(|(i, (&p, &v))| JointTarget {
+                                    position: p,
+                                    velocity: Some(v),
+                                    torque: if gravity_output_enabled {
+                                        self.gravity_torques_ramped.get(i).copied()
+                                    } else {
+                                        Some(0.0)
+                                    },
+                                    kp: None,
+                                    kd: None,
+                                })
+                                .collect();
+                            if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                        }
                     }
                 }
             }
