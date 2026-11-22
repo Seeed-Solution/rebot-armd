@@ -1728,3 +1728,125 @@ def test_m6_reply_lost_after_tx_rollback_physics_reconciles_idempotently(tmp_pat
     finally:
         cleanup()
 
+
+def test_m09a_lost_nack_preserves_physics_active_tx_and_recovers(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        assert rig.prepare_scene({"tx_id": "tx-good", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-good"})[0] == 200
+
+        # Physics rejects unprepared tx-bad with 409, and reply is lost -> camera enters DEGRADED_SPLIT
+        faults["tx_commit_physics"] = "drop_after"
+        c_deg, d_deg = rig.commit_scene({"tx_id": "tx-bad"})
+        assert c_deg == 503 and d_deg["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert sim.active_tx_id == "tx-good"
+        assert sim.degraded_tx_id == "tx-bad"
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert rig.pending_tx_id == "tx-bad"
+        assert rig.active_tx_id == "tx-good"
+
+        # camera_only for unprepared tx-bad must be refused 409 TX_NOT_PREPARED
+        c_cam, r_cam = rig.commit_scene({"tx_id": "tx-bad", "phase": "camera_only"})
+        assert c_cam == 409 and r_cam["code"] == "TX_NOT_PREPARED"
+
+        # rollback_physics for tx-bad restores both to COMMITTED on tx-good's scene_a
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-bad", "phase": "rollback_physics"})
+        assert c_rb == 200 and r_rb["state"] == "ABORTED"
+        assert sim.activation_state == "COMMITTED" and sim.active_tx_id == "tx-good"
+        assert sim.degraded_tx_id is None
+        assert rig.activation_state == "COMMITTED" and rig.active_tx_id == "tx-good"
+        assert rig.camera_tx_id == "tx-good" and rig.pending_tx_id is None
+        assert _phys_scene_id(sim) == "scene_a" and _cam_scene_id(rig) == "scene_a"
+    finally:
+        cleanup()
+
+
+def test_m09b_lost_nack_preserves_unrelated_staged_tx(tmp_path: Path):
+    sim, rig, faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        assert rig.prepare_scene({"tx_id": "tx-good", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-good"})[0] == 200
+
+        # Stage a different tx-other on scene_b
+        assert rig.prepare_scene({"tx_id": "tx-other", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+        assert sim._staged_tx is not None and sim._staged_tx["tx_id"] == "tx-other"
+
+        # Unrelated tx-bad commit hits 409 on physics and reply is lost
+        faults["tx_commit_physics"] = "drop_after"
+        c_deg, d_deg = rig.commit_scene({"tx_id": "tx-bad"})
+        assert c_deg == 503 and d_deg["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert sim.active_tx_id == "tx-good"
+        assert sim._staged_tx is not None and sim._staged_tx["tx_id"] == "tx-other"
+        assert sim.degraded_tx_id == "tx-bad"
+        assert rig.pending_tx_id == "tx-bad"
+
+        # rollback_physics for tx-bad clears DEGRADED_SPLIT while preserving tx-good AND staged tx-other!
+        c_rb, r_rb = rig.commit_scene({"tx_id": "tx-bad", "phase": "rollback_physics"})
+        assert c_rb == 200 and r_rb["state"] == "ABORTED"
+        assert sim.activation_state == "COMMITTED"
+        assert sim.active_tx_id == "tx-good"
+        assert sim.degraded_tx_id is None
+        assert sim._staged_tx is not None and sim._staged_tx["tx_id"] == "tx-other"
+        assert rig.activation_state == "COMMITTED" and rig.active_tx_id == "tx-good"
+        assert rig.pending_tx_id is None
+
+        # The preserved staged tx-other can still commit cleanly!
+        c_ok, r_ok = rig.commit_scene({"tx_id": "tx-other"})
+        assert c_ok == 200 and r_ok["state"] == "COMMITTED"
+        assert _phys_scene_id(sim) == "scene_b" and sim.active_tx_id == "tx-other"
+        assert _cam_scene_id(rig) == "scene_b" and rig.camera_tx_id == "tx-other"
+    finally:
+        cleanup()
+
+
+def test_m16_finalize_cam_timeout_tracks_pending_cleanup_and_retries_cleanly(tmp_path: Path):
+    sim, rig, _faults, cleanup = _make_lost_ack_harness(tmp_path)
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+        scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+        assert rig.prepare_scene({"tx_id": "tx-base", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"})[0] == 200
+        assert rig.commit_scene({"tx_id": "tx-base"})[0] == 200
+
+        assert rig.prepare_scene({"tx_id": "tx-m16", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"})[0] == 200
+
+        orig_run_reload_op = rig._run_reload_op
+        fail_once = {"armed": True}
+
+        def _injected_reload_op(req, timeout=5.0):
+            if req.get("op") == "finalize_cam" and fail_once["armed"]:
+                fail_once["armed"] = False
+                return "camera reload timed out"
+            return orig_run_reload_op(req, timeout=timeout)
+
+        rig._run_reload_op = _injected_reload_op
+        c_deg, d_deg = rig.commit_scene({"tx_id": "tx-m16"})
+        rig._run_reload_op = orig_run_reload_op
+
+        assert c_deg == 503 and d_deg["code"] == "SIM_ACTIVATION_DEGRADED"
+        assert rig.activation_state == "DEGRADED_SPLIT"
+        assert rig.pending_tx_id == "tx-m16"
+        assert rig.pending_cam_cleanup_tx_id == "tx-m16"
+        assert rig._prev_cam_gen is not None
+        st_mid = rig.sim_state()
+        assert st_mid["pending_cam_cleanup_tx_id"] == "tx-m16"
+
+        # Retry camera_only -> idempotent physics finalize + completes finalize_cam + clears cleanup state
+        c_ok, r_ok = rig.commit_scene({"tx_id": "tx-m16", "phase": "camera_only"})
+        assert c_ok == 200 and r_ok["state"] == "COMMITTED"
+        assert rig.pending_cam_cleanup_tx_id is None
+        assert rig.pending_tx_id is None
+        assert rig._prev_cam_gen is None
+        assert rig.active_tx_id == "tx-m16"
+        assert rig.camera_tx_id == "tx-m16"
+        assert rig.activation_state == "COMMITTED"
+        assert sim.activation_state == "COMMITTED"
+        st_end = rig.sim_state()
+        assert "pending_cam_cleanup_tx_id" not in st_end
+    finally:
+        cleanup()
+

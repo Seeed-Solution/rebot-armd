@@ -313,6 +313,7 @@ class Simulator:
         self._pending_scene: dict | None = None
         self.active_tx_id: str | None = None
         self.camera_tx_id: str | None = None
+        self.degraded_tx_id: str | None = None
         self.activation_state: str = "COMMITTED"
         self._staged_tx: dict | None = None
         self._tx_lock = threading.Lock()
@@ -641,6 +642,7 @@ class Simulator:
             "detector_mode": self.detector_mode,
             "tx_id": self.active_tx_id,
             "camera_tx_id": self.camera_tx_id,
+            "degraded_tx_id": self.degraded_tx_id,
             "scene_digest": self.active_scene_digest,
             "tool_digest": self.active_tool_digest,
             "activation_state": self.activation_state,
@@ -743,6 +745,7 @@ class Simulator:
             "shared": self.shared,
             "tx_id": self.active_tx_id,
             "camera_tx_id": self.camera_tx_id,
+            "degraded_tx_id": self.degraded_tx_id,
             "scene_digest": self.active_scene_digest,
             "tool_digest": self.active_tool_digest,
             "dr": self.dr,
@@ -1219,6 +1222,7 @@ class Simulator:
             staged["physics_committed"] = True
         except Exception as exc:
             self._restore_snapshot_locked(snap)
+            self.degraded_tx_id = None
             self.activation_state = "COMMITTED"
             self._cleanup_staged_tx_locked()
             return {
@@ -1232,18 +1236,26 @@ class Simulator:
     def _tx_mark_degraded_locked(self, params: dict) -> dict:
         tx_id = str(params.get("tx_id") or "")
         err = str(params.get("error") or "camera commit failed")
-        staged_uncommitted = (
+        staged_committed = (
             self._staged_tx is not None
             and self._staged_tx.get("tx_id") == tx_id
-            and not self._staged_tx.get("physics_committed", False)
+            and self._staged_tx.get("physics_committed") is True
         )
-        if not staged_uncommitted:
-            self.active_tx_id = tx_id or self.active_tx_id
+        if staged_committed and tx_id:
+            self.active_tx_id = tx_id
+        self.degraded_tx_id = tx_id or self.active_tx_id
         self.activation_state = "DEGRADED_SPLIT"
         out = self._degraded_split_reply(include_robot=True)
         out["error"] = err
+        out["pending_tx_id"] = self.degraded_tx_id
         out["physics_tx_id"] = self.active_tx_id
-        if staged_uncommitted and tx_id:
+        out["staged_tx_id"] = self._staged_tx["tx_id"] if self._staged_tx else None
+        out["staged_physics_committed"] = (
+            bool(self._staged_tx.get("physics_committed", False))
+            if self._staged_tx
+            else False
+        )
+        if tx_id:
             out["tx_id"] = tx_id
         return out
 
@@ -1269,6 +1281,7 @@ class Simulator:
             self._record_committed_tx_locked(tx_id, staged["fingerprint"])
             self.active_tx_id = tx_id
             self.camera_tx_id = tx_id
+            self.degraded_tx_id = None
             self.activation_state = "COMMITTED"
             self._staged_tx = None
             return self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
@@ -1278,6 +1291,7 @@ class Simulator:
             and tx_id == self.active_tx_id == self.camera_tx_id
             and tx_id in self._committed_tx_payloads
         ):
+            self.degraded_tx_id = None
             self.activation_state = "COMMITTED"
             res = self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
             res["idempotent"] = True
@@ -1346,6 +1360,7 @@ class Simulator:
             except Exception:
                 pass
         self._staged_tx = None
+        self.degraded_tx_id = None
         self.activation_state = "COMMITTED"
         if isinstance(tx_id, str):
             self._rolled_back_tx_ids.append(tx_id)
@@ -1433,6 +1448,16 @@ class Simulator:
             ):
                 self._cleanup_staged_tx_locked()
                 self._close_old_shared_locked()
+                self.degraded_tx_id = None
+                self.activation_state = "COMMITTED"
+                self._rolled_back_tx_ids.append(tx_id)
+                return {"_http_status": 200, "ok": True, "state": "ABORTED", "tx_id": tx_id}
+            if (
+                self.degraded_tx_id == tx_id
+                and (self._staged_tx is None or self._staged_tx.get("tx_id") != tx_id)
+                and self.active_tx_id != tx_id
+            ):
+                self.degraded_tx_id = None
                 self.activation_state = "COMMITTED"
                 self._rolled_back_tx_ids.append(tx_id)
                 return {"_http_status": 200, "ok": True, "state": "ABORTED", "tx_id": tx_id}
