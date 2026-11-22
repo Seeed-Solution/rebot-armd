@@ -62,6 +62,8 @@ struct TrackingTestState {
     mode_hold_frames: Vec<(Vec<JointMode>, Vec<JointTarget>)>,
     /// When true, the next `set_joint_modes` call fails (auto-clears).
     fail_mode_switch: bool,
+    /// Reported `DriverCapabilities::velocity_feedback` (default true).
+    velocity_feedback: bool,
 }
 
 impl TrackingTestState {
@@ -86,6 +88,7 @@ impl TrackingTestState {
             modes: vec![JointMode::Position; dof],
             mode_hold_frames: Vec::new(),
             fail_mode_switch: false,
+            velocity_feedback: true,
         }
     }
 }
@@ -105,7 +108,7 @@ impl TrackingTestDriver {
 impl ArmDriver for TrackingTestDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities {
-            velocity_feedback: true,
+            velocity_feedback: self.0.lock().unwrap().velocity_feedback,
             torque_feedback: true,
             temperature_feedback: true,
             torque_feedforward: false,
@@ -2823,9 +2826,21 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
         fn push_feedback(&mut self, i: usize) {
             let id = (i + 1) as u8;
             let p_u = damiao::float_to_uint(self.q_meas[i], self.limits.p_min, self.limits.p_max, 16);
+            // Zero velocity and torque (raw 0 would decode as -30 rad/s and -18 N·m).
+            let v_u = damiao::float_to_uint(0.0, self.limits.v_min, self.limits.v_max, 12);
+            let t_u = damiao::float_to_uint(0.0, self.limits.t_min, self.limits.t_max, 12);
             let frame = CanFrame::new_standard(
                 0x10 + u16::from(id),
-                &[0x10 | id, (p_u >> 8) as u8, p_u as u8, 0, 0, 0, 30, 30],
+                &[
+                    0x10 | id,
+                    (p_u >> 8) as u8,
+                    p_u as u8,
+                    (v_u >> 4) as u8,
+                    (((v_u & 0x0F) << 4) | (t_u >> 8)) as u8,
+                    t_u as u8,
+                    30,
+                    30,
+                ],
             )
             .unwrap();
             self.rx.push_back(frame);
@@ -3708,4 +3723,88 @@ fn tracking_park_rejection_fallback_keeps_park_workspace_and_depths() {
         full_depths_before,
         "the park fallback must not overwrite the full-workspace escape depths"
     );
+}
+
+/// Review 3 M1: tracking seeds a stationary baseline only on positive evidence that the
+/// arm is at rest: velocity feedback within 0.05 rad/s, or (without velocity feedback) two
+/// fresh position samples at least one tick apart within 1 mrad. Until then the output is
+/// the plain nominal position and the history stays `Unknown`.
+#[test]
+fn tracking_seeds_only_on_positive_stationarity_evidence() {
+    use armd::tracking::TrackingHistoryState;
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = || ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+
+    // 1. No velocity feedback: one sample at enable is no evidence.
+    {
+        let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+        drv.with(|s| s.velocity_feedback = false);
+        let mut inner = SupervisorInner::new(cfg()).with_driver(Box::new(drv.clone()));
+        inner.lease_enabled = false;
+        inner.commanded_positions = q0.to_vec();
+        inner.measured_positions = q0.to_vec();
+        inner.target_positions = q0.to_vec();
+        inner.tick(DT);
+        inner.set_torque(true).unwrap();
+        assert_eq!(
+            inner.tracking.history_state,
+            TrackingHistoryState::Unknown,
+            "enable without velocity feedback must not claim a stationary baseline"
+        );
+
+        // The arm drifts 5 mrad per tick: never stationary -> plain nominal output, Unknown.
+        for k in 0..5 {
+            drv.with(|s| s.pinned[0] = Some(q0[0] + 0.005 * (k + 1) as f32));
+            drv.with(|s| s.q[0] = s.pinned[0].unwrap());
+            let idx = drv.with(|s| s.written.len());
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "tick {k}: {:?}", obs.fault);
+            assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "moving tick {k} must stay Unknown");
+            let f = drv.with(|s| s.written[idx].clone());
+            for (j, t) in f.iter().enumerate() {
+                assert_eq!(t.position.to_bits(), inner.commanded_positions[j].to_bits(), "tick {k} joint {j}: plain output");
+            }
+        }
+        // Back at the nominal pose and at rest for two fresh samples -> evidence -> tracking
+        // takes over the output.
+        drv.with(|s| {
+            s.pinned[0] = Some(q0[0]);
+            s.q[0] = q0[0];
+        });
+        inner.tick(DT);
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "one sample at rest is not evidence");
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational(), "{:?}", obs.fault);
+        assert_ne!(
+            inner.tracking.history_state,
+            TrackingHistoryState::Unknown,
+            "two fresh position samples at rest are evidence of stationarity"
+        );
+    }
+
+    // 2. Velocity feedback reporting motion: Unknown history stays Unknown with plain output.
+    {
+        let (mut inner, drv) = rig_at(cfg(), &q0, vec![0.0; 7]);
+        inner.tracking.invalidate();
+        drv.with(|s| {
+            s.pinned[0] = Some(q0[0]);
+            s.v[0] = 0.25;
+        });
+        for k in 0..3 {
+            drv.with(|s| s.v[0] = 0.25);
+            let idx = drv.with(|s| s.written.len());
+            inner.tick(DT);
+            assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "tick {k}: moving arm must stay Unknown");
+            let f = drv.with(|s| s.written[idx].clone());
+            assert_eq!(f[0].position.to_bits(), inner.commanded_positions[0].to_bits(), "tick {k}: plain output");
+        }
+        drv.with(|s| s.v[0] = 0.0);
+        inner.tick(DT);
+        assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "velocity feedback at rest is evidence");
+    }
 }

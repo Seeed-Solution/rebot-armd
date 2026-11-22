@@ -1888,11 +1888,13 @@ impl SupervisorInner {
                 let has_vel_fb = self.driver.as_ref().is_none_or(|d| {
                     d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback)
                 });
-                let arm_stationary = !has_vel_fb
-                    || arm_indices.iter().all(|&j| {
+                // Positive evidence only: without velocity feedback a single sample cannot show
+                // rest; the history stays Unknown until two samples do (plain output meanwhile).
+                let arm_stationary = has_vel_fb
+                    && arm_indices.iter().all(|&j| {
                         self.measured_velocities
                             .get(j)
-                            .is_some_and(|v| v.is_finite() && v.abs() <= 0.05)
+                            .is_some_and(|v| v.is_finite() && v.abs() <= crate::tracking::STATIONARY_VELOCITY_RAD_S)
                     });
                 let aligned_with_issued = !self
                     .tracking
@@ -5480,10 +5482,13 @@ impl SupervisorInner {
                         || self.torque_guard.hold.is_some()
                         || holding_residual)
                     && has_residual;
+                // Unknown history: plain nominal output until the arm is confirmed at rest.
                 let tracking_owned = tracking_active
                     && self.driver.is_some()
                     && !self.safety.state().is_stopped()
-                    && !self.pending_normal_unload;
+                    && !self.pending_normal_unload
+                    && (self.tracking.history_state != crate::tracking::TrackingHistoryState::Unknown
+                        || self.tracking_stationary_evidence());
 
                 if tracking_active
                     && self.tracking.fallback_ramp.is_some()
@@ -5655,6 +5660,10 @@ impl SupervisorInner {
             }
         } else {
             self.tracking.invalidate();
+        }
+
+        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+            self.note_tracking_position_sample();
         }
 
         if let Some(error) = output_error {

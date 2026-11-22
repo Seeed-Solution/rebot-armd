@@ -12,6 +12,12 @@ pub const MAX_TRACKING_LAG_S: f32 = 1.5;
 pub const DEFAULT_MAX_LEAD_RAD: f32 = 0.030;
 /// Maximum allowed per-joint position lead (rad).
 pub const MAX_LEAD_RAD_LIMIT: f32 = 0.030;
+/// Measured arm-joint speed at or below which velocity feedback is evidence of rest (rad/s).
+pub const STATIONARY_VELOCITY_RAD_S: f32 = 0.05;
+/// Largest arm-joint position change between two fresh samples at least one control tick
+/// apart that still counts as evidence of rest without velocity feedback (rad;
+/// 0.05 rad/s over a 20 ms tick).
+pub const STATIONARY_POSITION_TOL_RAD: f32 = 1.0e-3;
 
 /// Per-joint tracking control law.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +199,10 @@ pub struct TrackingRuntime {
     /// toward this hold pose within the active limits, one tick at a time, until it
     /// is at rest (also while the rejection fault is latched).
     pub fallback_ramp: Option<FallbackRamp>,
+    /// Fresh measured arm position of an earlier control tick, with the receive time of
+    /// its newest joint sample: stationarity evidence for drivers without velocity
+    /// feedback (`SupervisorInner::tracking_stationary_evidence`).
+    pub position_sample: Option<(std::time::Instant, Vec<f32>)>,
 }
 
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
@@ -378,6 +388,66 @@ pub struct TrackingOutput {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
+    /// Receive times of the oldest and newest joint feedback sample, when every joint has one.
+    fn feedback_instant_range(&self) -> Option<(std::time::Instant, std::time::Instant)> {
+        let now = std::time::Instant::now();
+        let ages = self.driver.as_ref()?.lock().ok()?.feedback_ages();
+        if ages.len() != self.config.dof {
+            return None;
+        }
+        let ages: Vec<std::time::Duration> = ages.into_iter().collect::<Option<Vec<_>>>()?;
+        let oldest = now.checked_sub(*ages.iter().max()?)?;
+        let newest = now.checked_sub(*ages.iter().min()?)?;
+        Some((oldest, newest))
+    }
+
+    /// Positive evidence that the arm joints are at rest, from fresh feedback: measured
+    /// velocities within [`STATIONARY_VELOCITY_RAD_S`] when the driver reports velocity,
+    /// otherwise two position samples at least one control tick apart (every joint
+    /// re-sampled in between) within [`STATIONARY_POSITION_TOL_RAD`].
+    pub fn tracking_stationary_evidence(&self) -> bool {
+        let dof = self.config.dof;
+        if !self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
+            || self.measured_positions.len() != dof
+            || !self.measured_positions.iter().all(|q| q.is_finite())
+        {
+            return false;
+        }
+        let arm = self.config.arm_joint_indices();
+        let velocity_feedback = self
+            .driver
+            .as_ref()
+            .is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+        if velocity_feedback {
+            return arm.iter().all(|&j| {
+                self.measured_velocities
+                    .get(j)
+                    .is_some_and(|v| v.is_finite() && v.abs() <= STATIONARY_VELOCITY_RAD_S)
+            });
+        }
+        let (Some((sampled_newest, q_prev)), Some((oldest_now, _))) =
+            (self.tracking.position_sample.as_ref(), self.feedback_instant_range())
+        else {
+            return false;
+        };
+        oldest_now > *sampled_newest
+            && q_prev.len() == dof
+            && arm.iter().all(|&j| (self.measured_positions[j] - q_prev[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
+    }
+
+    /// Record this tick's fresh measured position as the next stationarity sample
+    /// (cleared when feedback is not fresh).
+    pub fn note_tracking_position_sample(&mut self) {
+        let fresh = self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
+            && self.measured_positions.len() == self.config.dof
+            && self.measured_positions.iter().all(|q| q.is_finite());
+        self.tracking.position_sample = if fresh {
+            self.feedback_instant_range().map(|(_, newest)| (newest, self.measured_positions.clone()))
+        } else {
+            None
+        };
+    }
+
     /// Applicable per-joint output limits for the active motion (planned speed cap,
     /// servo/policy speed cap, and power-governor time scaling).
     pub fn active_tracking_limits(&self, dt: f64, time_scale: f64) -> Vec<crate::model::JointLimit> {
@@ -552,6 +622,13 @@ impl crate::supervisor::SupervisorInner {
                 if !fresh_meas {
                     return Err(TrackingReject::JointLimit(
                         "tracking output history is unknown without fresh feedback".into(),
+                    ));
+                }
+                // Seeding at the measurement with zero prior velocity needs positive
+                // evidence that the arm is at rest.
+                if !self.tracking_stationary_evidence() {
+                    return Err(TrackingReject::JointLimit(
+                        "tracking output history is unknown and the arm is not confirmed at rest".into(),
                     ));
                 }
                 seeded_q = (0..dof)
