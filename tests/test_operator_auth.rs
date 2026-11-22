@@ -1738,10 +1738,16 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
     // Lock operator session during staging -> publish MUST be aborted with OPERATOR_REQUIRED
     let lock_res = client.post(format!("{base}/api/v1/auth/lock")).header(AUTHORIZATION.as_str(), format!("Bearer {tok}")).send().await.unwrap();
     assert_eq!(lock_res.status(), 200);
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    // the staged write takes 250 ms; wait for the action to end instead of a fixed sleep (slow under load)
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let act = loop {
+        let act = sup.get_observation().await.action.unwrap();
+        if act.state != "running" || std::time::Instant::now() >= deadline {
+            break act;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-
-    let act = sup.get_observation().await.action.unwrap();
     assert_eq!(act.id, aid);
     assert_eq!(act.state, "failed", "{act:?}");
     assert_eq!(act.code.as_deref(), Some("OPERATOR_REQUIRED"), "{act:?}");
@@ -1811,9 +1817,18 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
         }
     }
     assert_eq!(sup_exp.inner().read().await.zero_check_persisting, Some(aid_exp));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // the lease expires after 200 ms and the staged write takes 300 ms; wait past the expiry, then for
+    // the action to end instead of a fixed sleep (slow under load)
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let act_exp = loop {
+        let act = sup_exp.get_observation().await.action.unwrap();
+        if act.state != "running" || std::time::Instant::now() >= deadline {
+            break act;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-    let act_exp = sup_exp.get_observation().await.action.unwrap();
     assert_eq!(act_exp.id, aid_exp);
     assert_eq!(act_exp.state, "cancelled", "{act_exp:?}");
     assert_eq!(act_exp.code.as_deref(), Some("LEASE_LOST"), "{act_exp:?}");
