@@ -9028,13 +9028,16 @@ function mitRecoveryObserve() {
   }
 }
 function clearFault() {
-  const confirmed = !!mitRecovery && mitRecovery.el.isConnected && mitRecovery.key === mitFaultKey();
+  // the fault this tap is about, read now: a later observation may already show another fault
+  const tapKey = mitFaultKey();
+  const confirmed = !!tapKey && !!mitRecovery && mitRecovery.el.isConnected && mitRecovery.key === tapKey;
   if (mitRecovery) { mitRecovery.el.remove(); mitRecovery = null; }
   return api('/api/v1/safety/clear_fault', confirmed ? { mit_recovery: 'torque_off_all' } : undefined, { quiet: true })
     .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : (confirmed ? 'mit.recovery.done' : 'toast.reset_ok')), 'ok'))
     .catch((e) => {
       if (e && e.code === 'MIT_RECOVERY_CONFIRM_REQUIRED') {
-        mitRecovery = { el: toast(t('mit.recovery.confirm'), 'err', e.code), key: mitFaultKey() };
+        // arm only if the fault is still the one this tap was sent for (else drop the late reply)
+        if (tapKey && mitFaultKey() === tapKey) mitRecovery = { el: toast(t('mit.recovery.confirm'), 'err', e.code), key: tapKey };
         return;
       }
       toast(e && e.message ? e.message : String(e), 'err', e && e.code);

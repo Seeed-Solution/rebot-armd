@@ -29,7 +29,7 @@ decides from it (stale feedback: refused, nothing sent). Inside the quiet period
 MIT_QUIET_PERIOD` and the remaining milliseconds. In the expiry state it needs the
 explicit body `{"mit_recovery": "torque_off_all"}` (without it: `409
 MIT_RECOVERY_CONFIRM_REQUIRED`; the cockpit shows the warning and sends the confirmation only on
-a second tap within 8 s). With it armd recovers under control: it sends the Damiao
+a second tap while the warning is shown, for the same fault). With it armd recovers under control: it sends the Damiao
 clear-error command (`FF FF FF FF FF FF FF FB` on the motor's CAN ID) to every motor in an error
 state, disables every motor and requires fresh state-0 feedback from each, and only then clears to
 Idle. **Torque is then off on every joint**, like a park torque-off: the arm drops onto whatever

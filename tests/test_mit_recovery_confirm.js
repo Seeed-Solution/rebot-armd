@@ -55,5 +55,16 @@ ${source('clearFault')}
   run("reply = 'ok'");
   await run('clearFault()');
   assert.equal(run('calls[1]'), undefined, 'confirmation carried over to another fault');
+  // the fault changes while the first tap's request is in flight: the late reply must not arm
+  run("calls = []; toasts = []; reply = 'confirm'; S.epoch = 9");
+  await run(`(async () => {
+    const pending = clearFault();       // request for the fault at epoch 9
+    S.epoch = 10;                         // observation switches before the reply arrives
+    await pending;
+  })()`);
+  assert.equal(run('toasts.length'), 0, 'late reply for an old fault armed the confirmation');
+  run("reply = 'ok'");
+  await run('clearFault()');
+  assert.equal(run('calls[1]'), undefined, 'second tap confirmed a fault the first tap was not about');
   console.log('PASS: MIT recovery confirmation is bound to the visible warning and the fault instance');
 })().catch((e) => { console.error(e); process.exit(1); });
