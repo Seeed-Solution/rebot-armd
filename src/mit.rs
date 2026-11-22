@@ -765,12 +765,13 @@ impl crate::supervisor::SupervisorInner {
         }
     }
 
-    /// Torque went off: MIT owns nothing; the motors keep CTRL_MODE MIT in RAM until the next
+    /// Torque goes off: MIT owns nothing; the motors keep CTRL_MODE MIT in RAM until the next
     /// enable restores the base mode. A cancelled group stays cancelled until cleared.
     pub(crate) fn mit_torque_off(&mut self) {
         self.mit.armed_ok = false;
         if self.mit.owner == MitOwner::Active {
-            if let Some(mut drv) = self.driver.as_ref().and_then(|d| d.lock().ok()) { drv.set_mit_deadline_fence(None, Duration::ZERO); }
+            // The driver fence stays armed through the disable (no recovery replay, no invented
+            // hold even when the disable fails); a confirmed disable or enable disarms it.
             self.mit.owner = MitOwner::Off;
             self.mit.joints.clear();
             self.mit.last_output = None;

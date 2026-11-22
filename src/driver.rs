@@ -3056,6 +3056,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
+            // MIT tracking: before the first disable frame, discard every cached target so no
+            // later recovery can replay one, whatever the disable's outcome (the fence stays
+            // armed until the disable is confirmed).
+            if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
+                self.last_target_frames.fill(None);
+            }
             // Still send disable if draining times out: thermal protection must not
             // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
             self.awaiting_rx_boundary = !self.drain_rx_before_command();

@@ -677,3 +677,24 @@ fn mit_failed_readback_on_rearm_revokes_authorization() {
         assert!(inner.mit_motion_blocker().is_some(), "{label}: motions allowed");
     }
 }
+
+/// Review #5: a disable that fails (no frame reaches the motors, they stay enabled in MIT) never
+/// reopens the cached MIT frame for driver recovery: a joint going stale afterwards gets no
+/// replay and no invented hold.
+#[test]
+fn mit_failed_disable_never_replays_the_cached_mit_frame() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    for _ in 0..3 { inner.tick(DT); }
+    bus.with(|s| s.fail_tx_ids = (1..=7).collect());
+    inner.apply_stop_policy(armd::StopPolicy::ThermalTrip);
+    assert!(bus.with(|s| s.motors[3].enabled), "the disable must not have reached J4");
+    bus.with(|s| { s.fail_tx_ids.clear(); s.motors[3].silent = true; });
+    bus.clear_log();
+    for _ in 0..12 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        inner.tick(DT);
+    }
+    let replays: Vec<_> = bus.tx_log().into_iter().filter(|f| f.id == 4 && f.data != damiao::CMD_DISABLE).collect();
+    assert!(replays.is_empty(), "cached MIT frame replayed after the failed disable: {replays:?}");
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x104), "invented POS_VEL hold on the MIT joint");
+}
