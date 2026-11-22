@@ -406,6 +406,7 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     for v in m["views"].as_array().unwrap() {
         assert!(v["trigger_ms"].is_number() && v["snapshot_wait_ms"].is_number() && v["snapshot_polls"].as_u64() == Some(0), "{v}");
     }
+    check_timing(m, 0.0, 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -715,6 +716,10 @@ async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
     let doc = &bundle.doc;
     assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
     assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
+    // phase timing in the bundle: per view and in the stored measurement
+    for k in 0..3 { assert_eq!(doc["views"][k]["timing"], m["views"][k]["timing"], "view {k}"); }
+    assert_eq!(doc["measurement"]["timing"], m["timing"]);
+    check_timing(m, 0.0, 0.0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -916,10 +921,38 @@ fn off_uses_the_kinematic_cameras() {
     assert!((auto.measure.unwrap().height_m - off.measure.unwrap().height_m).abs() < 0.002);
 }
 
+/// `measurement.timing` and `views[].timing` are consistent: per-view phases add up to the
+/// action sums, every trigger / fetch took at least the fake provider's delay, the overlap of the
+/// reconstruction with the return is within both, and the phases fit in the total.
+fn check_timing(m: &Value, trigger_min_ms: f64, fetch_min_ms: f64) {
+    let t = &m["timing"];
+    let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or_else(|| panic!("{k} in {v}"));
+    let views = m["views"].as_array().unwrap();
+    for (k, v) in views.iter().enumerate() {
+        let vt = &v["timing"];
+        assert!(f(vt, "trigger_ms") >= trigger_min_ms && f(vt, "fetch_ms") >= fetch_min_ms, "view {k}: {vt}");
+        assert!(f(vt, "capture_ms") + 0.2 >= f(vt, "trigger_ms") + f(vt, "fetch_ms"), "view {k}: {vt}");
+        assert!(f(vt, "settle_ms") > 0.0, "view {k}: {vt}");
+        if k == 0 { assert_eq!(f(vt, "motion_ms"), 0.0, "{vt}"); } else { assert!(f(vt, "motion_ms") > 100.0, "view {k}: {vt}"); }
+    }
+    for key in ["motion_ms", "settle_ms", "trigger_ms", "fetch_ms", "capture_ms"] {
+        let sum: f64 = views.iter().map(|v| f(&v["timing"], key)).sum();
+        assert!((sum - f(t, key)).abs() < 0.5, "{key}: {sum} vs {t}");
+    }
+    let (ret, comp, ov, total) = (f(t, "return_ms"), f(t, "compute_ms"), f(t, "compute_return_overlap_ms"), f(t, "total_ms"));
+    assert!(ret > 100.0 && comp > 0.0 && ov >= 0.0 && ov <= ret.min(comp) + 0.2, "{t}");
+    let first = &views[0]["timing"];
+    assert!(f(t, "detect_ms") + 0.5 >= f(first, "settle_ms") + f(first, "capture_ms"), "{t}");
+    let parts = f(t, "negotiate_ms") + f(t, "detect_ms") + f(t, "views_ms") + ret + comp - ov;
+    assert!(parts <= total + 50.0 && total <= parts + 2000.0, "parts {parts} vs {t}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
     let mut r = rig(ArmConfig::rebot_dm()).await;
     r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(40, Ordering::SeqCst);
+    r.vision.gray_fetch_delay_ms.store(30, Ordering::SeqCst);
     let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
     let a = r.wait(id, 150.0).await;
@@ -939,6 +972,8 @@ async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
         assert!(v["feedback_age_a_ms"].is_number() && v["feedback_age_b_ms"].is_number(), "{v}");
     }
     assert!(m["stats"]["frame_fetch_ms"].is_number() && m["stats"]["parse_ms"].is_number(), "{}", m["stats"]);
+    check_timing(m, 40.0, 30.0);
+    println!("timing {}", m["timing"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

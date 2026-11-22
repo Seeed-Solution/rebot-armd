@@ -29,7 +29,8 @@
 //!   moves ([`PLAN_REFUSALS`]) is retried at the mirrored offset (when unused), then at 0.75 and
 //!   0.5 of the offset on either side; when all are refused the action fails with the refusal code.
 //! - Times: `measurement.stats` carries the stage times of the reconstruction and `decode_ms`
-//!   (all views); every view its own `decode_ms`.
+//!   (all views); every view its own `decode_ms`. `measurement.timing` and `views[].timing`: the
+//!   wall-clock phases ([`RunTiming`], [`ViewTiming`]).
 //! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
 //!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`). Then one snapshot `s0`: with
 //!   inference idle the camera runs at 1 fps, so `/snapshot.jpg` can still hold a frame taken while
@@ -615,6 +616,66 @@ pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> (f32, usize) {
         .fold((0.0, arm.first().copied().unwrap_or(0)), |m, x| if x.0 > m.0 { x } else { m })
 }
 
+/// Wall-clock phases of one view (ms), `views[].timing`: the view motion including its planning
+/// and refused fallback plans (0 for the start view), the settle wait, the time inside detection
+/// triggers and inside frame fetches (gray frame, or the snapshot before the trigger plus the wait
+/// for the refreshed one), all tries summed, and the capture from the end of the settle wait to the
+/// accepted frame (triggers, fetches, bracket samples, retry gaps, decode).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ViewTiming {
+    pub motion_ms: f64,
+    pub settle_ms: f64,
+    pub trigger_ms: f64,
+    pub fetch_ms: f64,
+    pub capture_ms: f64,
+}
+
+impl ViewTiming {
+    pub fn to_json(&self) -> Value {
+        let r1 = |x: f64| (x * 10.0).round() / 10.0;
+        json!({"motion_ms": r1(self.motion_ms), "settle_ms": r1(self.settle_ms), "trigger_ms": r1(self.trigger_ms),
+            "fetch_ms": r1(self.fetch_ms), "capture_ms": r1(self.capture_ms)})
+    }
+}
+
+/// Wall-clock phases of the action (ms), `measurement.timing`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RunTiming {
+    /// `GET /api/mode` of the vision provider (and the camera hold, when used).
+    pub negotiate_ms: f64,
+    /// The start view: settle check, trigger and fetch, until the target is picked.
+    pub detect_ms: f64,
+    /// From the start capture to the last view capture (motions, settles, captures).
+    pub views_ms: f64,
+    /// The return to the start joints (0 without `return_to_start`).
+    pub return_ms: f64,
+    /// The reconstruction (in `spawn_blocking`), and how much of it ran during the return.
+    pub compute_ms: f64,
+    pub overlap_ms: f64,
+    /// From the start of the run until the measurement is complete (after the return and the
+    /// reconstruction; the debug bundle is written afterwards).
+    pub total_ms: f64,
+}
+
+/// Length (ms) of the intersection of two time intervals.
+pub fn overlap_ms(a: (Instant, Instant), b: (Instant, Instant)) -> f64 {
+    let (lo, hi) = (a.0.max(b.0), a.1.min(b.1));
+    if hi > lo { (hi - lo).as_secs_f64() * 1000.0 } else { 0.0 }
+}
+
+/// `measurement.timing`: the action phases and the per-view phases summed over the views.
+pub fn timing_value(run: &RunTiming, views: &[ViewTiming]) -> Value {
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let sum = |f: fn(&ViewTiming) -> f64| r1(views.iter().map(f).sum::<f64>());
+    json!({
+        "negotiate_ms": r1(run.negotiate_ms), "detect_ms": r1(run.detect_ms), "views_ms": r1(run.views_ms),
+        "motion_ms": sum(|v| v.motion_ms), "settle_ms": sum(|v| v.settle_ms), "trigger_ms": sum(|v| v.trigger_ms),
+        "fetch_ms": sum(|v| v.fetch_ms), "capture_ms": sum(|v| v.capture_ms),
+        "return_ms": r1(run.return_ms), "compute_ms": r1(run.compute_ms), "compute_return_overlap_ms": r1(run.overlap_ms),
+        "total_ms": r1(run.total_ms),
+    })
+}
+
 /// One view's capture.
 struct Capture {
     offset: [f64; 2],
@@ -652,6 +713,7 @@ struct Capture {
     jpeg: Option<Vec<u8>>,
     /// ArUco markers of the trigger frame (camera model pixels); empty unless requested.
     markers: Vec<mview_stereo::Marker>,
+    timing: ViewTiming,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
@@ -708,6 +770,8 @@ async fn capture_gray(
     markers: bool,
 ) -> Result<Capture, Stop> {
     let settle_s = settle(ctx, plan).await?;
+    let t_cap = Instant::now();
+    let (mut trig_total_ms, mut fetch_total_ms) = (0.0, 0.0);
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
     let pipelines = if markers { YOLO_ARUCO_GRAY } else { YOLO_GRAY };
@@ -730,8 +794,10 @@ async fn capture_gray(
             let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
             let t_trigger = Instant::now();
             let res = src.trigger_gray(pipelines, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))?;
+            let call_ms = t_trigger.elapsed().as_secs_f64() * 1000.0;
+            trig_total_ms += call_ms;
             if let Some(r) = res {
-                trig = Some((r, t_a, a, age_a_ms, t_trigger.elapsed().as_secs_f64() * 1000.0));
+                trig = Some((r, t_a, a, age_a_ms, call_ms));
                 break;
             }
         }
@@ -745,7 +811,10 @@ async fn capture_gray(
             last_acq_err = Some(format!("gray frame {}: provider did not produce gray image", trig.frame.frame_id));
             continue;
         }
-        let gray = match src.gray_frame(&instance_id, trig.frame.frame_id).await {
+        let t_fetch = Instant::now();
+        let fetched = src.gray_frame(&instance_id, trig.frame.frame_id).await;
+        fetch_total_ms += t_fetch.elapsed().as_secs_f64() * 1000.0;
+        let gray = match fetched {
             Ok(g) => g,
             Err(e) if e.is_retryable() => {
                 retry_reasons.push(e.retry_reason().into());
@@ -821,6 +890,8 @@ async fn capture_gray(
         joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
         retry_reasons, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms,
         settle_s, trigger_ms, snapshot_wait_ms: 0.0, snapshot_polls: 0, jpeg: None, markers: trig.markers,
+        timing: ViewTiming { motion_ms: 0.0, settle_ms: settle_s * 1000.0, trigger_ms: trig_total_ms, fetch_ms: fetch_total_ms,
+            capture_ms: t_cap.elapsed().as_secs_f64() * 1000.0 },
     })
 }
 
@@ -835,9 +906,11 @@ async fn capture_snapshot(
     markers: bool,
 ) -> Result<Capture, Stop> {
     let settle_s = settle(ctx, plan).await?;
+    let t_cap = Instant::now();
     let snap = || async { src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}"))) };
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
     let mut s0 = snap().await?;
+    let (mut trig_total_ms, mut fetch_total_ms) = (0.0, t_cap.elapsed().as_secs_f64() * 1000.0);
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let mut tries: Vec<(f32, usize)> = Vec::new();
     let mut retry_reasons: Vec<String> = Vec::new();
@@ -853,6 +926,7 @@ async fn capture_snapshot(
             let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
             let t_trigger = Instant::now();
             let got = if markers { src.trigger_markers(YOLO_ARUCO, TRIGGER_WAIT_MS).await } else { src.trigger(YOLO, TRIGGER_WAIT_MS).await.map(|f| f.map(|f| (f, Vec::new()))) };
+            trig_total_ms += t_trigger.elapsed().as_secs_f64() * 1000.0;
             if let Some(f) = got.map_err(|e| source_fail(format!("trigger: {e}")))? {
                 let t_reply = Instant::now();
                 frame = Some((f, t_a, a, age_a_ms, t_reply, (t_reply - t_trigger).as_secs_f64() * 1000.0));
@@ -873,6 +947,7 @@ async fn capture_snapshot(
             ctx.check().await?;
         };
         let wait_ms = t_reply.elapsed().as_secs_f64() * 1000.0;
+        fetch_total_ms += wait_ms;
         let t_b = Instant::now();
         let (b, inst_b) = sample_with_instants(ctx).await;
         let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
@@ -907,6 +982,8 @@ async fn capture_snapshot(
         bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
         retry_reasons, bracket_duration_ms, feedback_wait_b_ms: 0.0, feedback_age_a_ms, feedback_age_b_ms,
         settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks,
+        timing: ViewTiming { motion_ms: 0.0, settle_ms: settle_s * 1000.0, trigger_ms: trig_total_ms, fetch_ms: fetch_total_ms,
+            capture_ms: t_cap.elapsed().as_secs_f64() * 1000.0 },
     })
 }
 
@@ -1000,6 +1077,7 @@ fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], t
         "feedback_age_b_ms": c.feedback_age_b_ms.map(r2),
         "settle_s": r2(c.settle_s),
         "trigger_ms": c.trigger_ms.round(), "snapshot_wait_ms": c.snapshot_wait_ms.round(), "snapshot_polls": c.snapshot_polls,
+        "timing": c.timing.to_json(),
     })).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
@@ -1083,6 +1161,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
         let o = offsets[i];
         if is_start(&o) { continue; } // the start capture
         ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("view:{k}"), k as f32 / (total + 1.0), None, None);
+        let t_view = Instant::now();
         let mut candidates = vec![o];
         let mut tried = 0;
         let mut last_refusal: Option<Stop> = None;
@@ -1100,13 +1179,15 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
             };
             match moved {
                 Ok(()) => {
+                    let motion_ms = t_view.elapsed().as_secs_f64() * 1000.0;
                     if c != o {
                         fallbacks.push(json!({"offset_m": o.map(r4), "used_offset_m": c.map(r4), "code": last_refusal.as_ref().map(|s| match s { Stop::Fail(c, _) => c.clone(), Stop::Cancelled => String::new() })}));
                         used.retain(|u| dist2(u, &o) > 1e-9);
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers).await.map_err(|s| (s, true))?;
+                    let mut cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers).await.map_err(|s| (s, true))?;
+                    cap.timing.motion_ms = motion_ms;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
                     if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
@@ -1450,6 +1531,7 @@ fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture],
             "settle_s": v.settle_s, "trigger_ms": v.trigger_ms,
             "frame_fetch_ms": v.frame_fetch_ms, "gray_convert_ms": v.gray_convert_ms, "parse_ms": v.parse_ms,
             "snapshot_wait_ms": v.snapshot_wait_ms, "snapshot_polls": v.snapshot_polls,
+            "timing": v.timing.to_json(),
             "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
@@ -1623,9 +1705,13 @@ async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
 /// The run; Ok(Some((code, message))): a measurement failure after the views (the action fails
 /// with it, after the return to the start pose).
 async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> Result<Option<(String, String)>, Stop> {
+    let t_run = Instant::now();
+    let mut timing = RunTiming::default();
     recheck(ctx, plan).await?;
     // Negotiate capabilities and image source ONCE for the whole run (never switch mid-run).
+    let t_neg = Instant::now();
     let mode = src.mode_info().await.map_err(|e| source_fail(format!("cannot reach the vision provider: {e}")))?;
+    timing.negotiate_ms = t_neg.elapsed().as_secs_f64() * 1000.0;
     if !mode.per_request_pipelines {
         return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)"));
     }
@@ -1647,12 +1733,14 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
         _ => None,
     };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
+    let t_detect = Instant::now();
     let first = capture(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
             if plan.request.target_box.is_some() { " overlapping target.box_norm" } else { "" })));
     };
+    timing.detect_ms = t_detect.elapsed().as_secs_f64() * 1000.0;
     let mut first = first;
     let pivot = look_at(plan, &first.pose, &target);
     {
@@ -1662,7 +1750,9 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     }
     let mut caps = vec![first];
     let mut fallbacks = Vec::new();
+    let t_views = Instant::now();
     let views_res = run_views(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), &mut caps, &target, &mut fallbacks, &pivot, markers).await;
+    timing.views_ms = t_views.elapsed().as_secs_f64() * 1000.0;
     if let Err((stop, moved)) = views_res {
         // a measurement failure goes back to the start first; a stop, fault, collision, torque
         // limit, lease loss or anything else ends the action where the arm is
@@ -1698,12 +1788,19 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let keep_views_for_debug = plan.request.debug && frame_source == FrameSource::Gray;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
     let task = tokio::task::spawn_blocking(move || {
+        let t0 = Instant::now();
         let c = compute(&views, reference, ref_box_px, table_z, mode, &marks);
+        let span = (t0, Instant::now());
         let returned_views = if keep_views_for_debug { views } else { Vec::new() };
-        (c, returned_views)
+        (c, returned_views, span)
     });
+    let t_ret = Instant::now();
     let back = back_to_start(ctx, plan).await;
-    let (c, mut computed_views) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
+    let ret_span = (t_ret, Instant::now());
+    let (c, mut computed_views, compute_span) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
+    timing.return_ms = if plan.request.return_to_start { (ret_span.1 - ret_span.0).as_secs_f64() * 1000.0 } else { 0.0 };
+    timing.compute_ms = (compute_span.1 - compute_span.0).as_secs_f64() * 1000.0;
+    timing.overlap_ms = if plan.request.return_to_start { overlap_ms(compute_span, ret_span) } else { 0.0 };
     let stats = c.rec.stats;
     tracing::info!(
         "measure_multiview {}: {} views, ncc_backend={} ({}), {stats:?}, {:.0} ms, {:?}",
@@ -1719,6 +1816,9 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
     value["table_plane"] = plane_value(&c.plane);
+    timing.total_ms = t_run.elapsed().as_secs_f64() * 1000.0;
+    let view_timing: Vec<ViewTiming> = caps.iter().map(|c| c.timing).collect();
+    value["timing"] = timing_value(&timing, &view_timing);
     let (mut pose, per_view) = pose_value(mode, &c.pose);
     pose["markers_requested"] = json!(markers);
     value["pose_refine"] = pose;
@@ -1898,6 +1998,22 @@ mod tests {
         }
         // a few mrad on a wrist joint is several px: the pose must be the one of the snapshot
         assert!(shifts[3] > 2.0 && shifts[3] < 6.0, "{shifts:?}");
+    }
+
+    #[test]
+    fn timing_overlap_and_sums() {
+        let t = Instant::now();
+        let ms = |x: u64| t + Duration::from_millis(x);
+        // compute 0..800 ms, return 300..2300 ms: 500 ms overlap; disjoint and nested intervals
+        assert!((overlap_ms((ms(0), ms(800)), (ms(300), ms(2300))) - 500.0).abs() < 1e-6);
+        assert_eq!(overlap_ms((ms(0), ms(100)), (ms(200), ms(300))), 0.0);
+        assert!((overlap_ms((ms(100), ms(200)), (ms(0), ms(300))) - 100.0).abs() < 1e-6);
+        let v = |m: f64, s: f64| ViewTiming { motion_ms: m, settle_ms: s, trigger_ms: 100.0, fetch_ms: 20.0, capture_ms: 150.0 };
+        let run = RunTiming { negotiate_ms: 5.0, detect_ms: 2400.0, views_ms: 9000.0, return_ms: 3000.0, compute_ms: 800.0, overlap_ms: 500.0, total_ms: 14800.0 };
+        let j = timing_value(&run, &[v(0.0, 2200.0), v(3000.0, 2200.0), v(3500.0, 2200.0)]);
+        assert_eq!((j["motion_ms"].as_f64(), j["settle_ms"].as_f64(), j["trigger_ms"].as_f64(), j["fetch_ms"].as_f64()), (Some(6500.0), Some(6600.0), Some(300.0), Some(60.0)), "{j}");
+        assert_eq!((j["compute_return_overlap_ms"].as_f64(), j["total_ms"].as_f64(), j["detect_ms"].as_f64()), (Some(500.0), Some(14800.0), Some(2400.0)), "{j}");
+        assert_eq!(v(1.0, 2.0).to_json()["settle_ms"], 2.0);
     }
 
     #[test]
@@ -2121,6 +2237,7 @@ mod tests {
             snapshot_polls: 1,
             jpeg: None,
             markers: Vec::new(),
+            timing: ViewTiming { motion_ms: 1000.0, settle_ms: 2000.0, trigger_ms: 100.0, fetch_ms: 10.0, capture_ms: 150.0 },
         }).collect();
         let det = Detection {
             label: "box".into(),
