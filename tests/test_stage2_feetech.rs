@@ -16,12 +16,15 @@ use armd::protocol::feetech::{
 };
 use armd::safety::{FaultCode, SafetyError, SafetyState};
 use armd::supervisor::{ArmError, ArmSupervisor};
-use armd::transport::{MockTransport, SerialTransportConfig, Transport, TransportError};
+use armd::transport::{DriverClock, MockClock, MockTransport, SerialTransportConfig, Transport, TransportError};
 
 #[derive(Clone, Default)]
 struct SharedTransport(Arc<Mutex<MockTransport>>);
 
 impl Transport for SharedTransport {
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+        Transport::clock(&*self.0.lock().unwrap())
+    }
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         self.0.lock().unwrap().read(buf)
     }
@@ -1278,7 +1281,7 @@ fn test_feetech_set_torque_rejects_stale_feedback() {
     assert!(driver.is_feedback_valid());
 
     // Wait > 250ms for feedback to become stale
-    std::thread::sleep(Duration::from_millis(260));
+    driver.transport().advance_clock(Duration::from_millis(260));
     assert!(!driver.is_feedback_valid());
 
     driver.transport_mut().take_tx(); // clear any previous packets
@@ -2121,6 +2124,9 @@ fn test_feetech_eeprom_relock_sent_when_aborted_during_write() {
         abort_flag: Arc<AtomicBool>,
     }
     impl Transport for AbortOnLock0Transport {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Transport::clock(&self.inner)
+        }
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
             self.inner.read(buf)
         }
@@ -2599,7 +2605,7 @@ fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
     let _ = driver.transport_mut().take_tx();
 
     // Fast-forward last_enable_poll by setting it in the past (> 200ms)
-    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+    driver.last_enable_poll = Some(driver.clock_now() - Duration::from_millis(250));
 
     // Provide only the REG_TORQUE_ENABLE response with value 0 (disabled!),
     // NO position chunk feedback is provided, so position chunk read will hit timeout.
@@ -2704,7 +2710,7 @@ fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
 
     // Now position telemetry stays fresh, but enable responses either return 2 or are suppressed
     // First, test unexpected value 2 immediately degrades to Unknown:
-    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+    driver.last_enable_poll = Some(driver.clock_now() - Duration::from_millis(250));
     let cs_tq2 = calculate_checksum(1, 3, 0x00, &[2]);
     let rx_tq2 = vec![0xFF, 0xFF, 1, 3, 0x00, 2, cs_tq2];
     let mut poll_rx = Vec::new();
@@ -2722,7 +2728,7 @@ fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
     assert_eq!(driver.enable_state(), EnableState::Enabled);
 
     for _ in 0..3 {
-        driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+        driver.last_enable_poll = Some(driver.clock_now() - Duration::from_millis(250));
         // Provide ONLY position feedback; enable poll receives no response
         driver.transport_mut().provide_rx(&fb);
         let _ = driver.read_joint_states();
@@ -3150,7 +3156,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
     driver.set_confirmed_enable_state(EnableState::Enabled);
     driver.set_read_poll_count(8);
-    driver.last_enable_poll = Some(Instant::now());
+    driver.last_enable_poll = Some(driver.clock_now());
 
     let build_resp = |id: u8| -> Vec<u8> {
         let pos = 2048u16.to_le_bytes();
@@ -3177,7 +3183,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     // clear_input_buffer() would have been called and wiped the partial frame!
     driver.transport_mut().clear_write_responses();
     let clears_before_reassembly = driver.transport().clear_input_count();
-    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(500));
+    driver.last_enable_poll = Some(driver.clock_now() - Duration::from_millis(500));
     driver.transport_mut().provide_rx(&resp1[4..8]);
 
     let _ = driver.read_joint_states();
@@ -3204,7 +3210,7 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
     driver.set_confirmed_enable_state(EnableState::Enabled);
-    driver.last_enable_poll = Some(Instant::now());
+    driver.last_enable_poll = Some(driver.clock_now());
 
     let build_resp = |id: u8| -> Vec<u8> {
         let pos = 2048u16.to_le_bytes();
@@ -3226,7 +3232,7 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     assert_eq!(driver.incomplete_chunk_idx(), Some(0));
 
     // Simulate 50 Hz control tick gap (18ms..20ms, well within 25ms TTL)
-    std::thread::sleep(Duration::from_millis(18));
+    driver.transport().advance_clock(Duration::from_millis(18));
 
     // Provide remaining bytes
     driver.transport_mut().clear_write_responses();
@@ -3424,7 +3430,7 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     assert!(obs.fault.is_none());
 
     // Allow feedback to age / tick without fresh bytes (stale condition)
-    std::thread::sleep(Duration::from_millis(5));
+    mock.lock().unwrap().advance_clock(Duration::from_millis(5));
     supervisor.tick(0.02).await;
 
     // Now rising edge: hardware packet arrives with error byte 0x20 on arm joint 1
@@ -3538,4 +3544,377 @@ fn test_feetech_trailing_partial_frame_rejects_bogus_id_and_length() {
     assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF], &[1, 2, 3], 10), Some(&[0xFF, 0xFF][..]));
     assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x01], &[1, 2, 3], 10), Some(&[0xFF, 0xFF, 0x01][..]));
     assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x01, 0x0A], &[1, 2, 3], 10), Some(&[0xFF, 0xFF, 0x01, 0x0A][..]));
+}
+
+// -------------------------------------------------------------------------
+// 67. MockClock deterministic read/error/sharing behavior
+// -------------------------------------------------------------------------
+#[test]
+fn test_mock_clock_advances_only_on_zero_byte_or_nonempty_error_reads() {
+    let clock = MockClock::new();
+    let step = Duration::from_millis(2);
+    clock.set_idle_read_step(step);
+
+    let mut transport = MockTransport::new().with_clock(clock.clone());
+    assert_eq!(clock.elapsed(), Duration::ZERO);
+    assert_eq!(transport.clock().elapsed(), Duration::ZERO);
+
+    // 1. Ok(n > 0) advances 0ns
+    transport.provide_rx(&[0xAA, 0xBB, 0xCC]);
+    let mut buf = [0u8; 4];
+    assert_eq!(transport.read(&mut buf).unwrap(), 3);
+    assert_eq!(clock.elapsed(), Duration::ZERO);
+
+    // 2. Ok(0) on empty rx_buffer advances by idle_read_step
+    assert_eq!(transport.read(&mut buf).unwrap(), 0);
+    assert_eq!(clock.elapsed(), step);
+
+    // 3. chunk_size_limit(Some(0)) with non-empty rx_buffer advances idle_read_step
+    transport.provide_rx(&[0x11]);
+    transport.set_chunk_size_limit(Some(0));
+    assert_eq!(transport.read(&mut buf).unwrap(), 0);
+    assert_eq!(clock.elapsed(), step * 2);
+
+    // 4. chunk_size_limit(Some(0)) with non-empty staged_reads advances idle_read_step
+    transport.queue_staged_read(&[0x22]);
+    assert_eq!(transport.read(&mut buf).unwrap(), 0);
+    assert_eq!(clock.elapsed(), step * 3);
+    transport.clear();
+    transport.set_chunk_size_limit(None);
+
+    // 5. buf = &mut [] with error_on_next_read consumes & returns error with 0ns advance,
+    //    and next nonempty read returns Ok(0) and advances idle_read_step
+    transport.set_error_on_next_read(Some("one-shot empty buf error".to_string()));
+    let elapsed_before_empty_err = clock.elapsed();
+    let err = transport.read(&mut []).unwrap_err();
+    assert!(err.to_string().contains("one-shot empty buf error"));
+    assert_eq!(clock.elapsed(), elapsed_before_empty_err);
+
+    assert_eq!(transport.read(&mut buf).unwrap(), 0);
+    assert_eq!(clock.elapsed(), elapsed_before_empty_err + step);
+
+    // 6. Nonempty buf (&mut [0u8; 4]) + set_error_on_next_read: returns Err, advances by
+    //    exactly one idle_read_step, and subsequent nonempty read returns Ok(0) + advances step
+    transport.set_error_on_next_read(Some("one-shot nonempty buf error".to_string()));
+    let elapsed_before_nonempty_err = clock.elapsed();
+    let mut nonempty_buf = [0u8; 4];
+    let err2 = transport.read(&mut nonempty_buf).unwrap_err();
+    assert!(err2.to_string().contains("one-shot nonempty buf error"));
+    assert_eq!(clock.elapsed(), elapsed_before_nonempty_err + step);
+
+    assert_eq!(transport.read(&mut nonempty_buf).unwrap(), 0);
+    assert_eq!(clock.elapsed(), elapsed_before_nonempty_err + step * 2);
+}
+
+#[test]
+#[should_panic(expected = "idle_read_step must be non-zero")]
+fn test_mock_clock_rejects_zero_idle_step() {
+    let clock = MockClock::new();
+    clock.set_idle_read_step(Duration::ZERO);
+}
+
+#[test]
+fn test_mock_clock_panics_on_overflow_exhaustion() {
+    let clock = MockClock::new();
+    let initial = Duration::from_nanos(u64::MAX - 10);
+    clock.advance(initial);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        clock.advance(Duration::from_nanos(20));
+    }));
+    assert!(res.is_err());
+    assert_eq!(clock.elapsed(), initial);
+}
+
+#[test]
+fn test_feetech_transport_replacement_with_different_clock_panics() {
+    let replace_and_run = |f: fn(&mut FeetechArmDriver<MockTransport>)| {
+        let mut driver = FeetechArmDriver::new(MockTransport::new(), vec![1, 2]).with_tx_echo(Some(false));
+        let mut replacement = MockTransport::new();
+        replacement.provide_rx(&[0xAA, 0xBB]);
+        *driver.transport_mut() = replacement;
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut driver)));
+        let err = res.expect_err("expected panic when transport clock domain changed");
+        let msg = err
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| err.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("");
+        assert!(
+            msg.contains("transport clock domain changed after construction"),
+            "unexpected panic payload: {msg:?}"
+        );
+        assert!(
+            driver.transport_mut().take_tx().is_empty(),
+            "replacement transport must receive zero bytes before panic"
+        );
+        assert_eq!(driver.transport().rx_len(), 2);
+        assert_eq!(driver.transport().clear_input_count(), 0);
+    };
+
+    replace_and_run(|d| {
+        let _ = d.read_joint_states();
+    });
+    replace_and_run(|d| {
+        let _ = d.set_torque(false);
+    });
+    replace_and_run(|d| {
+        let targets = [JointTarget::position(0.0), JointTarget::position(0.0)];
+        let _ = d.write_joint_targets(&targets);
+    });
+    replace_and_run(|d| {
+        d.motor_status[0] = 0x20;
+        let _ = d.clear_fault();
+    });
+    replace_and_run(|d| {
+        let _ = d.configure_servos();
+    });
+    replace_and_run(|d| {
+        let _ = d.refresh_enable_state();
+    });
+    replace_and_run(|d| {
+        d.set_gripper_index(Some(0));
+    });
+    replace_and_run(|d| {
+        d.set_abort_flag(Arc::new(AtomicBool::new(false)));
+    });
+}
+
+#[test]
+fn test_feetech_configure_servos_eeprom_2ms_pacing() {
+    struct RecordingTransport {
+        inner: MockTransport,
+        clock: MockClock,
+        writes: Arc<Mutex<Vec<(Duration, Vec<u8>)>>>,
+        abort_on_lock0: Option<Arc<AtomicBool>>,
+        on_min_angle_written: Option<Vec<u8>>,
+    }
+    impl Transport for RecordingTransport {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Transport::clock(&self.inner)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            self.inner.read(buf)
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+            self.writes.lock().unwrap().push((self.clock.elapsed(), buf.to_vec()));
+            if let Some(ref flag) = self.abort_on_lock0 {
+                let lock0 = feetech::build_write_u8(1, feetech::REG_LOCK, 0);
+                if buf == lock0.as_slice() {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+            let min_write = feetech::build_write_u16(1, feetech::REG_MIN_ANGLE_LIMIT_L, 200);
+            if buf == min_write.as_slice() {
+                if let Some(ref updated_reply) = self.on_min_angle_written {
+                    let read_min = feetech::build_read(1, feetech::REG_MIN_ANGLE_LIMIT_L, 2);
+                    self.inner.clear_write_responses();
+                    self.inner.stage_reply(&read_min, updated_reply);
+                }
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn clear_input_buffer(&mut self) {
+            self.inner.clear_input_buffer();
+        }
+    }
+
+    let reply_u8 = |val: u8| -> Vec<u8> {
+        let cs = calculate_checksum(1, 3, 0x00, &[val]);
+        vec![0xFF, 0xFF, 1, 3, 0x00, val, cs]
+    };
+    let reply_u16 = |val: u16| -> Vec<u8> {
+        let b = val.to_le_bytes();
+        let cs = calculate_checksum(1, 4, 0x00, &b);
+        vec![0xFF, 0xFF, 1, 4, 0x00, b[0], b[1], cs]
+    };
+    let stage_initial_reads = |mock: &mut MockTransport| {
+        mock.stage_reply(&feetech::build_read(1, feetech::REG_MODEL_L, 2), &reply_u16(feetech::EXPECTED_MODEL_STS3215));
+        mock.stage_reply(&feetech::build_read(1, REG_TORQUE_ENABLE, 1), &reply_u8(0));
+        mock.stage_reply(&feetech::build_read(1, REG_RETURN_DELAY, 1), &reply_u8(0));
+        mock.stage_reply(&feetech::build_read(1, REG_STATUS_RETURN_LEVEL, 1), &reply_u8(0));
+        mock.stage_reply(&feetech::build_read(1, REG_MIN_ANGLE_LIMIT_L, 2), &reply_u16(0));
+        mock.stage_reply(&feetech::build_read(1, REG_MAX_ANGLE_LIMIT_L, 2), &reply_u16(4095));
+        mock.stage_reply(&feetech::build_read(1, REG_P_COEF, 1), &reply_u8(16));
+        mock.stage_reply(&feetech::build_read(1, REG_D_COEF, 1), &reply_u8(32));
+        mock.stage_reply(&feetech::build_read(1, REG_I_COEF, 1), &reply_u8(0));
+        mock.stage_reply(&feetech::build_read(1, REG_MAX_TORQUE_L, 2), &reply_u16(1000));
+        mock.stage_reply(&feetech::build_read(1, REG_PROTECTION_CURRENT_L, 2), &reply_u16(500));
+        mock.stage_reply(&feetech::build_read(1, REG_OVERLOAD_TORQUE, 1), &reply_u8(100));
+        mock.stage_reply(&feetech::build_read(1, REG_OPERATING_MODE, 1), &reply_u8(0));
+    };
+
+    let mut cfg = feetech::FeetechConfig::default();
+    cfg.joints = vec![feetech::FeetechJointCalib {
+        id: 1,
+        range_min_steps: Some(200),
+        range_max_steps: Some(4095),
+        ..Default::default()
+    }];
+
+    // Subcase 1: Normal EEPROM programming (2ms after REG_LOCK=0 and 2ms after register write)
+    {
+        let mut mock = MockTransport::new_preserving();
+        stage_initial_reads(&mut mock);
+        let clock = mock.clock();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let transport = RecordingTransport {
+            inner: mock,
+            clock,
+            writes: writes.clone(),
+            abort_on_lock0: None,
+            on_min_angle_written: Some(reply_u16(200)),
+        };
+        let mut driver = FeetechArmDriver::new(transport, vec![1])
+            .with_tx_echo(Some(false))
+            .with_config(cfg.clone());
+        driver.configure_servos().expect("configure_servos must succeed");
+
+        let log = writes.lock().unwrap();
+        let lock0 = feetech::build_write_u8(1, REG_LOCK, 0);
+        let write_min = feetech::build_write_u16(1, REG_MIN_ANGLE_LIMIT_L, 200);
+        let read_min = feetech::build_read(1, REG_MIN_ANGLE_LIMIT_L, 2);
+
+        let lock0_idx = log.iter().position(|(_, b)| *b == lock0).unwrap();
+        let min_idx = log.iter().position(|(_, b)| *b == write_min).unwrap();
+        let readback_idx = log[min_idx + 1..]
+            .iter()
+            .position(|(_, b)| *b == read_min)
+            .map(|o| min_idx + 1 + o)
+            .unwrap();
+
+        let t_lock0 = log[lock0_idx].0;
+        let t_min = log[min_idx].0;
+        let t_readback = log[readback_idx].0;
+        assert_eq!(
+            t_min - t_lock0,
+            Duration::from_millis(2),
+            "EEPROM write must wait exactly 2ms after REG_LOCK=0 (t_lock0={:?}, t_min={:?})",
+            t_lock0,
+            t_min
+        );
+        assert_eq!(
+            t_readback - t_min,
+            Duration::from_millis(2),
+            "EEPROM readback must wait exactly 2ms after EEPROM write (t_min={:?}, t_readback={:?})",
+            t_min,
+            t_readback
+        );
+    }
+
+    // Subcase 2: Abort/relock path (2ms elapses between REG_LOCK=0 and REG_LOCK=1)
+    {
+        let mut mock = MockTransport::new_preserving();
+        stage_initial_reads(&mut mock);
+        let clock = mock.clock();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let transport = RecordingTransport {
+            inner: mock,
+            clock,
+            writes: writes.clone(),
+            abort_on_lock0: Some(abort_flag.clone()),
+            on_min_angle_written: None,
+        };
+        let mut driver = FeetechArmDriver::new(transport, vec![1])
+            .with_tx_echo(Some(false))
+            .with_config(cfg);
+        driver.set_abort_flag(abort_flag);
+        let res = driver.configure_servos();
+        assert!(res.is_err(), "aborted configure_servos must fail");
+
+        let log = writes.lock().unwrap();
+        let lock0 = feetech::build_write_u8(1, REG_LOCK, 0);
+        let lock1 = feetech::build_write_u8(1, REG_LOCK, 1);
+        let t_lock0 = log.iter().find(|(_, b)| *b == lock0).unwrap().0;
+        let t_lock1 = log.iter().find(|(_, b)| *b == lock1).unwrap().0;
+        assert_eq!(
+            t_lock1 - t_lock0,
+            Duration::from_millis(2),
+            "REG_LOCK=1 relock must occur exactly 2ms after REG_LOCK=0 (t_lock0={:?}, t_lock1={:?})",
+            t_lock0,
+            t_lock1
+        );
+    }
+}
+
+#[test]
+fn test_feetech_partial_frame_ttl_exact_25ms_boundary() {
+    let build_resp = |id: u8, pos_steps: u16| -> Vec<u8> {
+        let pos = pos_steps.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    let target_steps = 2500u16;
+    let full_pkt = build_resp(1, target_steps);
+    let prefix = &full_pkt[..4];
+    let suffix = &full_pkt[4..];
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+
+    // Case A: below boundary (25ms - 1ns) -> decodes exact target position
+    {
+        let mut driver = FeetechArmDriver::new(MockTransport::new(), vec![1]).with_tx_echo(Some(false));
+        driver.transport_mut().stage_reply(&sync_read, prefix);
+        let _ = driver.read_joint_states();
+        let started_at = driver
+            .incomplete_frame_started_at()
+            .expect("partial frame start timestamp must be recorded");
+
+        let elapsed = driver.clock_now().duration_since(started_at);
+        let target_elapsed = Duration::from_millis(25) - Duration::from_nanos(1);
+        driver
+            .transport()
+            .advance_clock(target_elapsed.checked_sub(elapsed).unwrap());
+        assert_eq!(driver.clock_now().duration_since(started_at), target_elapsed);
+
+        driver.transport_mut().clear_write_responses();
+        driver.transport_mut().provide_rx(suffix);
+        let states = driver
+            .read_joint_states()
+            .expect("reassembly just below 25ms TTL must succeed");
+        let expected_pos = driver.config().joints[0].steps_to_rad(target_steps as i32);
+        assert!(
+            (states[0].position - expected_pos).abs() < 1e-4,
+            "expected {}, got {}",
+            expected_pos,
+            states[0].position
+        );
+        assert!(driver.feedback_ages()[0].is_some());
+    }
+
+    // Case B: at boundary (exact 25ms) -> expires partial_pos_rx and does NOT decode suffix
+    {
+        let mut driver = FeetechArmDriver::new(MockTransport::new(), vec![1]).with_tx_echo(Some(false));
+        driver.transport_mut().stage_reply(&sync_read, prefix);
+        let _ = driver.read_joint_states();
+        let started_at = driver
+            .incomplete_frame_started_at()
+            .expect("partial frame start timestamp must be recorded");
+
+        let elapsed = driver.clock_now().duration_since(started_at);
+        let target_elapsed = Duration::from_millis(25);
+        driver
+            .transport()
+            .advance_clock(target_elapsed.checked_sub(elapsed).unwrap());
+        assert_eq!(driver.clock_now().duration_since(started_at), target_elapsed);
+
+        driver.transport_mut().clear_write_responses();
+        driver.transport_mut().provide_rx(suffix);
+        let states = driver
+            .read_joint_states()
+            .expect("expired partial frame poll must succeed cleanly");
+        assert_eq!(states.len(), 1);
+        assert_eq!(driver.incomplete_chunk_idx(), None);
+        assert!(driver.feedback_ages()[0].is_none());
+    }
 }
