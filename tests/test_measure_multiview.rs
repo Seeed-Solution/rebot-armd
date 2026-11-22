@@ -997,8 +997,9 @@ struct ScheduledRxFrame {
 }
 
 /// Queue-backed feedback fake modelling SocketCAN + Damiao decode-time stamping:
-/// frames arrive in `rx_queue`, `read_joint_states()` drains available frames, stamps
-/// `Instant::now()` at decode time, and increments `seqs[joint]` once per decoded frame.
+/// frames arrive in `rx_queue`, `read_joint_states()` drains at most `drain_limit` frames per
+/// tick, stamps `Instant::now()` at decode time, increments `seqs[joint]` once per decoded frame,
+/// and reports as queue bound the instant before the last read that found `rx_queue` empty.
 struct FeedbackControl {
     /// Joint held off auto-enqueue (until `unhold_at`, or indefinitely if `None`).
     held_joint: Option<(usize, Option<Instant>)>,
@@ -1009,6 +1010,10 @@ struct FeedbackControl {
     applied_step: [f32; 7],
     instants: [Instant; 7],
     seqs: [u64; 7],
+    /// Frames decoded per `read_joint_states()` (the driver's bounded drain).
+    drain_limit: usize,
+    rx_empty: Instant,
+    bounds: [Instant; 7],
 }
 
 impl FeedbackControl {
@@ -1020,6 +1025,9 @@ impl FeedbackControl {
             applied_step: [0.0; 7],
             instants: [now; 7],
             seqs: [1; 7],
+            drain_limit: usize::MAX,
+            rx_empty: now,
+            bounds: [now; 7],
         }
     }
 }
@@ -1046,6 +1054,10 @@ impl ArmDriver for QueuedFeedbackArm {
     fn feedback_seqs(&self) -> Vec<u64> {
         let c = self.ctrl.lock().unwrap();
         c.seqs.to_vec()
+    }
+    fn feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
+        let c = self.ctrl.lock().unwrap();
+        c.bounds.iter().copied().map(Some).collect()
     }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let now = Instant::now();
@@ -1075,11 +1087,17 @@ impl ArmDriver for QueuedFeedbackArm {
                 }
             }
             c.pending_rx = remaining;
-            // Drain rx_queue and stamp at decode time (just like DamiaoArmDriver::read_joint_states).
-            while let Some((j, step_rad)) = c.rx_queue.pop_front() {
+            // Bounded drain, stamped at decode time (just like DamiaoArmDriver::read_joint_states).
+            for _ in 0..c.drain_limit {
+                let attempt = Instant::now();
+                let Some((j, step_rad)) = c.rx_queue.pop_front() else {
+                    c.rx_empty = attempt;
+                    break;
+                };
                 c.applied_step[j] = step_rad;
                 c.instants[j] = Instant::now();
                 c.seqs[j] = c.seqs[j].wrapping_add(1);
+                c.bounds[j] = c.rx_empty;
             }
             c.applied_step
         };
@@ -1220,6 +1238,40 @@ async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_st
         let a = r.wait(id, 60.0).await;
         assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("STALE_TELEMETRY")), "{a}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_sample_b_rejects_two_old_replies_drained_after_the_fence() {
+    // At the fence the RX queue already holds a backlog: filler replies of other joints and two
+    // OLD replies of J5, which then stays silent. The bounded drain (8 frames per tick, 6 fresh
+    // replies arrive per tick) decodes the backlog over several ticks after the fence, so J5's
+    // decode stamps are post-fence and its counter advances by 2. Neither proves a post-fence
+    // sample: with no fresh J5 reply the capture must fail STALE_TELEMETRY.
+    let inner_arm = common::TestArm::new();
+    inner_arm.0.lock().unwrap().q = START;
+    let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+    let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
+    let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+    let ctrl_cb = ctrl.clone();
+    *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
+        let mut c = ctrl_cb.lock().unwrap();
+        let old = c.applied_step[4];
+        c.held_joint = Some((4, None));
+        c.drain_limit = 8;
+        for k in 0..20 {
+            let j = [0, 1, 2, 3, 5, 6][k % 6];
+            let s = c.applied_step[j];
+            c.rx_queue.push_back((j, s));
+        }
+        c.rx_queue.push_back((4, old));
+        c.rx_queue.push_back((4, old));
+    }));
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 60.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("STALE_TELEMETRY")), "{a}");
+    let c = ctrl.lock().unwrap();
+    assert!(c.seqs[4] >= 3, "both old J5 replies were decoded after the fence: seq {}", c.seqs[4]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
