@@ -164,10 +164,11 @@ const YOLO_GRAY: &[&str] = &["yolo", "gray"];
 const YOLO_ARUCO_GRAY: &[&str] = &["yolo", "aruco", "gray"];
 /// `pose_refine` `"aruco"`: marker corners each view must share with the reference view.
 pub const MIN_MARKER_CORNERS: usize = 8;
-/// Camera hold during a gray-frame run ([`CameraHold`]): the provider's subscription client, its
-/// time to live and how often armd refreshes it. The hold ends at most this TTL after armd stops
-/// refreshing it (a crash included).
-pub const CAMERA_HOLD_CLIENT: &str = "armd-measure-multiview";
+/// Camera hold during a gray-frame run ([`CameraHold`]): the provider's subscription client
+/// (this prefix and the action id, [`camera_hold_client`]: a cancelled run's late release cannot
+/// end the next run's hold), its time to live and how often armd refreshes it. The hold ends at
+/// most this TTL after armd stops refreshing it (a crash included).
+pub const CAMERA_HOLD_CLIENT_PREFIX: &str = "armd-mview-";
 pub const CAMERA_HOLD_TTL_MS: u64 = 5000;
 pub const CAMERA_HOLD_REFRESH: Duration = Duration::from_millis(1500);
 const CAMERA_RELEASE_WAIT: Duration = Duration::from_secs(1);
@@ -190,9 +191,11 @@ pub struct CameraHold {
     pub status: &'static str,
 }
 
+/// The camera hold client of action `action_id`.
+pub fn camera_hold_client(action_id: u64) -> String { format!("{CAMERA_HOLD_CLIENT_PREFIX}{action_id}") }
+
 impl CameraHold {
-    pub async fn start(src: Arc<dyn DetectionSource>, wanted: bool) -> Self {
-        let client = CAMERA_HOLD_CLIENT.to_string();
+    pub async fn start(src: Arc<dyn DetectionSource>, wanted: bool, client: String) -> Self {
         let mut h = Self { src, client, ticket: Arc::new(std::sync::Mutex::new(None)), refresh: None, status: "off" };
         if !wanted { return h; }
         match h.src.camera_hold(&h.client, CAMERA_HOLD_TTL_MS).await {
@@ -1915,7 +1918,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src_arc: &Arc<dyn DetectionSou
         (Ok(fmt), FrameSource::Gray) => fmt.clone(),
         _ => None,
     };
-    let held = hold.insert(CameraHold::start(src_arc.clone(), frame_source == FrameSource::Gray).await);
+    let held = hold.insert(CameraHold::start(src_arc.clone(), frame_source == FrameSource::Gray, camera_hold_client(ctx.id)).await);
     let camera_hold = held.status;
     timing.negotiate_ms = t_neg.elapsed().as_secs_f64() * 1000.0;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
