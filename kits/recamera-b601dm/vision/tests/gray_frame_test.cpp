@@ -714,6 +714,70 @@ static void test_depth_map_waiter_intervening_publication() {
     CHECK(direct.depth_disp != nullptr && direct.depth_disp->size() == 16);
 }
 
+static void test_gray_allocation_failure_after_conversion_and_noexcept_ring() {
+    static_assert(noexcept(std::declval<GrayRing&>().put(std::shared_ptr<const GrayFrame>{})),
+                  "GrayRing::put must be noexcept");
+
+    // 1. Allocation failure AFTER RGB888 -> gray8 conversion succeeds (bad_alloc from record
+    //    allocator): make_gray_frame must catch it and return nullptr without leaving partial state.
+    const std::vector<uint8_t> rgb(640u * 640u * 3u, 0x55);
+    GrayFrameMeta meta;
+    meta.instance_id = "rv-alloc";
+    meta.frame_id = 1;
+    meta.ts_ms = 1763791234000;
+    meta.frame_mono_ms = 100;
+    meta.wait_mono_ms = 90;
+    meta.grab_mono_ms = 101;
+    meta.stored_mono_ms = 105;
+
+    bool alloc_called = false;
+    auto failing_alloc = [&]() -> std::shared_ptr<GrayFrame> {
+        alloc_called = true;
+        throw std::bad_alloc();
+    };
+    auto failed_rec = make_gray_frame(rgb.data(), 640, 640, 640 * 3, 0, 140, 640, 360, meta, failing_alloc);
+    CHECK(alloc_called);
+    CHECK(failed_rec == nullptr);
+
+    // Also test null return from record allocator
+    auto null_rec = make_gray_frame(rgb.data(), 640, 640, 640 * 3, 0, 140, 640, 360, meta,
+                                    []() -> std::shared_ptr<GrayFrame> { return nullptr; });
+    CHECK(null_rec == nullptr);
+
+    // 2. Normal path succeeds and publishes atomically; failed record leaves ring & ran_gray clean.
+    VisionControl::Options opt;
+    opt.instance_id = "rv-alloc";
+    VisionControl ctl(opt, nullptr);
+    VisionResult vr;
+    vr.instance_id = "rv-alloc";
+    vr.frame_id = ctl.next_frame_id(vr.instance_id);
+    vr.frame_ms = mono_ms();
+    vr.ran_gray = (failed_rec != nullptr);
+    ctl.publish(vr, failed_rec);
+    VisionResult got;
+    ctl.latest(false, 0, 0, got);
+    CHECK(!got.ran_gray);
+    std::shared_ptr<const GrayFrame> found;
+    CHECK(ctl.get_gray("rv-alloc", vr.frame_id, found) == GrayRing::Lookup::NotStored);
+
+    // 3. Wraparound of pre-allocated recent_results_ ring (> kRecentResultsCap) preserves newest matches.
+    for (int i = 0; i < 12; ++i) {
+        meta.frame_id = ctl.next_frame_id(meta.instance_id);
+        auto ok_rec = make_gray_frame(rgb.data(), 640, 640, 640 * 3, 0, 140, 640, 360, meta);
+        CHECK(ok_rec != nullptr && ok_rec->valid());
+        VisionResult r;
+        r.instance_id = meta.instance_id;
+        r.frame_id = meta.frame_id;
+        r.frame_ms = mono_ms() + 10 + static_cast<uint64_t>(i);
+        r.ran_gray = (i == 9);  // only one recent gray frame before 2 non-gray frames
+        r.ran_yolo = true;
+        ctl.publish(r, r.ran_gray ? ok_rec : nullptr);
+    }
+    VisionResult matched;
+    CHECK(!ctl.wait_fresh(0, mono_ms(), Pipelines{false, false, false, true}, 50, matched));
+    CHECK(matched.ran_gray && matched.frame_id == 11);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -733,6 +797,7 @@ int main(int argc, char** argv) {
     test_http_contract_peer_errors_and_subscriptions();
     test_http_server_sockets();
     test_depth_map_waiter_intervening_publication();
+    test_gray_allocation_failure_after_conversion_and_noexcept_ring();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

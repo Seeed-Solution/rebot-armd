@@ -769,34 +769,24 @@ int main(int argc, char** argv) {
             if (src_ok && sub.valid() && sub.cpu_accessible() &&
                 sub.width == rv::kGrayWidth && sub.height == rv::kGrayHeight &&
                 sub.stride() >= static_cast<uint32_t>(sub.width) * 3u) {
-                std::vector<uint8_t> px_vec;
-                if (rv::extract_gray_crop(frame.data(), frame.width, frame.height,
-                                          static_cast<int>(frame.stride()),
-                                          crop.x, crop.y, crop.w, crop.h, px_vec)) {
-                    auto rec = std::make_shared<rv::GrayFrame>();
-                    rec->instance_id = vr.instance_id;
-                    rec->frame_id = vr.frame_id;
-                    rec->width = sub.width;
-                    rec->height = sub.height;
-                    rec->stride = sub.width;
-                    rec->frame_w = frame.width;
-                    rec->frame_h = frame.height;
-                    rec->crop_x = crop.x;
-                    rec->crop_y = crop.y;
-                    rec->crop_w = crop.w;
-                    rec->crop_h = crop.h;
-                    rec->channel = frame.channel;
-                    rec->ts_ms = vr.ts_ms;
-                    rec->frame_mono_ms = vr.frame_ms;
-                    rec->wait_mono_ms = vr.wait_ms;
-                    rec->grab_mono_ms = vr.grab_ms;
+                rv::GrayFrameMeta meta;
+                meta.instance_id = vr.instance_id;
+                meta.frame_id = vr.frame_id;
+                meta.channel = frame.channel;
+                meta.ts_ms = vr.ts_ms;
+                meta.frame_mono_ms = vr.frame_ms;
+                meta.wait_mono_ms = vr.wait_ms;
+                meta.grab_mono_ms = vr.grab_ms;
+                meta.model_generation = vr.model_generation;
+                auto rec = rv::make_gray_frame(frame.data(), frame.width, frame.height,
+                                               static_cast<int>(frame.stride()),
+                                               crop.x, crop.y, crop.w, crop.h, meta);
+                if (rec) {
                     rec->convert_ms = ms_since(t_gray);
                     rec->stored_mono_ms = rv::mono_ms();
-                    rec->model_generation = vr.model_generation;
-                    rec->pixels = std::make_shared<const std::vector<uint8_t>>(std::move(px_vec));
-                    gray_rec = std::move(rec);
                     vr.ran_gray = true;
-                    vr.gray_ms = gray_rec->convert_ms;
+                    vr.gray_ms = rec->convert_ms;
+                    gray_rec = std::move(rec);
                 } else {
                     MA_LOGW(TAG, "Gray conversion/allocation failed on frame %u", vr.frame_id);
                 }

@@ -453,7 +453,9 @@ private:
     GrayRing gray_ring_{kGrayRingCapacity};
     VisionResult latest_;
     VisionResult latest_depth_map_;
-    std::deque<VisionResult> recent_results_;
+    std::vector<VisionResult> recent_results_;
+    size_t recent_head_ = 0;
+    size_t recent_count_ = 0;
     bool stopping_ = false;
     ModelSet models_;
     SwapState swap_ = SwapState::Idle;

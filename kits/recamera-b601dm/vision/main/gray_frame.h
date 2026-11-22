@@ -5,7 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -63,6 +63,30 @@ struct GrayFrame {
     bool valid() const noexcept;
 };
 
+/** Metadata copied into a newly built GrayFrame by make_gray_frame(). */
+struct GrayFrameMeta {
+    std::string instance_id;
+    uint32_t frame_id = 0;
+    int channel = 0;
+    uint64_t ts_ms = 0;
+    uint64_t frame_mono_ms = 0;
+    uint64_t wait_mono_ms = 0;
+    uint64_t grab_mono_ms = 0;
+    uint64_t stored_mono_ms = 0;
+    float convert_ms = 0.0f;
+    uint64_t model_generation = 0;
+};
+
+/**
+ * Validate source geometry, convert the RGB888 crop into owned gray8 pixels, and allocate the
+ * complete GrayFrame record. Any allocation failure (before or after conversion) is caught and
+ * returns nullptr without throwing or leaving partial state.
+ */
+std::shared_ptr<GrayFrame> make_gray_frame(
+    const uint8_t* frame_rgb, int frame_w, int frame_h, int frame_stride,
+    int crop_x, int crop_y, int crop_w, int crop_h, const GrayFrameMeta& meta,
+    const std::function<std::shared_ptr<GrayFrame>()>& alloc_record = nullptr) noexcept;
+
 /** Generate an opaque process/instance identifier unique per vision startup or rollover. */
 std::string generate_instance_id();
 
@@ -87,10 +111,11 @@ class GrayRing {
 public:
     enum class Lookup { Found, NotStored, Expired };
 
-    explicit GrayRing(size_t capacity = kGrayRingCapacity) : capacity_(capacity > 0 ? capacity : 1) {}
+    explicit GrayRing(size_t capacity = kGrayRingCapacity)
+        : capacity_(capacity > 0 ? capacity : 1), slots_(capacity_) {}
 
-    /** Insert `frame`. Returns the displaced oldest entry if the ring was full, else nullptr. */
-    std::shared_ptr<const GrayFrame> put(std::shared_ptr<const GrayFrame> frame);
+    /** Insert `frame` without allocating. Returns the displaced oldest entry if full, else nullptr. */
+    std::shared_ptr<const GrayFrame> put(std::shared_ptr<const GrayFrame> frame) noexcept;
 
     /**
      * Resolve `(instance_id, frame_id)` against `current_instance_id`:
@@ -105,14 +130,16 @@ public:
     /** Remove all retained records into `displaced` (caller frees outside lock) and reset eviction state. */
     void clear(std::vector<std::shared_ptr<const GrayFrame>>& displaced);
 
-    size_t size() const noexcept { return ring_.size(); }
+    size_t size() const noexcept { return count_; }
     size_t capacity() const noexcept { return capacity_; }
     bool has_evicted() const noexcept { return has_evicted_; }
     uint32_t highest_evicted_id() const noexcept { return highest_evicted_id_; }
 
 private:
     size_t capacity_;
-    std::deque<std::shared_ptr<const GrayFrame>> ring_;
+    std::vector<std::shared_ptr<const GrayFrame>> slots_;
+    size_t head_ = 0;
+    size_t count_ = 0;
     bool has_evicted_ = false;
     uint32_t highest_evicted_id_ = 0;
 };

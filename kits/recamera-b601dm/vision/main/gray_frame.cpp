@@ -67,6 +67,45 @@ bool GrayFrame::valid() const noexcept {
     return pixels->size() == expected;
 }
 
+std::shared_ptr<GrayFrame> make_gray_frame(
+    const uint8_t* frame_rgb, int frame_w, int frame_h, int frame_stride,
+    int crop_x, int crop_y, int crop_w, int crop_h, const GrayFrameMeta& meta,
+    const std::function<std::shared_ptr<GrayFrame>()>& alloc_record) noexcept {
+    try {
+        std::vector<uint8_t> px_vec;
+        if (!extract_gray_crop(frame_rgb, frame_w, frame_h, frame_stride,
+                               crop_x, crop_y, crop_w, crop_h, px_vec)) {
+            return nullptr;
+        }
+        std::shared_ptr<GrayFrame> rec = alloc_record ? alloc_record() : std::make_shared<GrayFrame>();
+        if (!rec) return nullptr;
+        rec->instance_id = meta.instance_id;
+        rec->frame_id = meta.frame_id;
+        rec->width = crop_w;
+        rec->height = crop_h;
+        rec->stride = crop_w;
+        rec->frame_w = frame_w;
+        rec->frame_h = frame_h;
+        rec->crop_x = crop_x;
+        rec->crop_y = crop_y;
+        rec->crop_w = crop_w;
+        rec->crop_h = crop_h;
+        rec->channel = meta.channel;
+        rec->ts_ms = meta.ts_ms;
+        rec->frame_mono_ms = meta.frame_mono_ms;
+        rec->wait_mono_ms = meta.wait_mono_ms;
+        rec->grab_mono_ms = meta.grab_mono_ms;
+        rec->stored_mono_ms = meta.stored_mono_ms;
+        rec->convert_ms = meta.convert_ms;
+        rec->model_generation = meta.model_generation;
+        rec->pixels = std::make_shared<const std::vector<uint8_t>>(std::move(px_vec));
+        if (!rec->valid()) return nullptr;
+        return rec;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 std::string generate_instance_id() {
     static std::atomic<uint64_t> seq{0};
     const uint64_t n = seq.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -170,20 +209,24 @@ bool parse_gray_frame_body(const std::string& body, std::string& json_out, std::
     return true;
 }
 
-std::shared_ptr<const GrayFrame> GrayRing::put(std::shared_ptr<const GrayFrame> frame) {
+std::shared_ptr<const GrayFrame> GrayRing::put(std::shared_ptr<const GrayFrame> frame) noexcept {
     std::shared_ptr<const GrayFrame> displaced;
     if (!frame || !frame->valid()) return displaced;
-    if (ring_.size() >= capacity_) {
-        displaced = std::move(ring_.front());
-        ring_.pop_front();
+    if (count_ >= capacity_) {
+        displaced = std::move(slots_[head_]);
+        slots_[head_] = std::move(frame);
+        head_ = (head_ + 1) % capacity_;
         if (displaced) {
             if (!has_evicted_ || displaced->frame_id > highest_evicted_id_) {
                 highest_evicted_id_ = displaced->frame_id;
             }
             has_evicted_ = true;
         }
+    } else {
+        const size_t idx = (head_ + count_) % capacity_;
+        slots_[idx] = std::move(frame);
+        ++count_;
     }
-    ring_.push_back(std::move(frame));
     return displaced;
 }
 
@@ -192,9 +235,10 @@ GrayRing::Lookup GrayRing::find(const std::string& instance_id, uint32_t frame_i
                                 std::shared_ptr<const GrayFrame>& out) const {
     out.reset();
     if (instance_id.empty() || instance_id != current_instance_id) return Lookup::Expired;
-    for (auto it = ring_.rbegin(); it != ring_.rend(); ++it) {
-        if (*it && (*it)->frame_id == frame_id && (*it)->instance_id == instance_id) {
-            out = *it;
+    for (size_t i = count_; i-- > 0;) {
+        const auto& entry = slots_[(head_ + i) % capacity_];
+        if (entry && entry->frame_id == frame_id && entry->instance_id == instance_id) {
+            out = entry;
             return Lookup::Found;
         }
     }
@@ -203,11 +247,14 @@ GrayRing::Lookup GrayRing::find(const std::string& instance_id, uint32_t frame_i
 }
 
 void GrayRing::clear(std::vector<std::shared_ptr<const GrayFrame>>& displaced) {
-    displaced.reserve(displaced.size() + ring_.size());
-    for (auto& e : ring_) {
-        if (e) displaced.push_back(std::move(e));
+    // Prepare capacity before mutating ring state so an allocation failure leaves ring intact.
+    displaced.reserve(displaced.size() + count_);
+    for (size_t i = 0; i < count_; ++i) {
+        auto& entry = slots_[(head_ + i) % capacity_];
+        if (entry) displaced.push_back(std::move(entry));
     }
-    ring_.clear();
+    head_ = 0;
+    count_ = 0;
     has_evicted_ = false;
     highest_evicted_id_ = 0;
 }

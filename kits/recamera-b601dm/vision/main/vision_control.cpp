@@ -110,6 +110,7 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       gray_height_(opt.gray_height),
       instance_id_(opt.instance_id.empty() ? generate_instance_id() : opt.instance_id),
       frame_seq_(opt.initial_frame_id),
+      recent_results_(kRecentResultsCap),
       models_(model_set_of(opt)),
       intrinsics_cli_(opt.intrinsics_cli_override),
       config_path_(opt.config_path),
@@ -499,18 +500,21 @@ static bool has_valid_depth_map(const VisionResult& r) noexcept {
 }
 
 void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray) {
-    std::shared_ptr<const GrayFrame> displaced;
+    std::shared_ptr<const GrayFrame> displaced_gray;
+    VisionResult displaced_latest;
     VisionResult displaced_depth;
+    VisionResult displaced_hist;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        // 1. Prepare all potentially allocating state BEFORE mutating any shared member so an
+        //    allocation failure cannot leave gray_ring_, latest_, or recent_results_ out of sync.
         VisionResult stored = r;
         if (stored.instance_id.empty()) stored.instance_id = instance_id_;
+        bool gray_ok = false;
         if (stored.ran_gray) {
-            const bool gray_ok = gray && gray->valid() && gray->frame_id == stored.frame_id &&
-                                 gray->instance_id == stored.instance_id;
-            if (gray_ok) {
-                displaced = gray_ring_.put(std::move(gray));
-            } else {
+            gray_ok = gray && gray->valid() && gray->frame_id == stored.frame_id &&
+                      gray->instance_id == stored.instance_id;
+            if (!gray_ok) {
                 stored.ran_gray = false;
                 stored.gray_ms = 0;
                 gray.reset();
@@ -519,21 +523,40 @@ void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFra
             gray.reset();
         }
         stored.done_ms = mono_ms();
-        latest_ = stored;
-        if (has_valid_depth_map(stored)) {
-            displaced_depth = std::move(latest_depth_map_);
-            latest_depth_map_ = stored;
-        }
+
         VisionResult hist = stored;
         hist.depth_disp.reset();
-        if (recent_results_.size() >= kRecentResultsCap) recent_results_.pop_front();
-        recent_results_.push_back(std::move(hist));
-        result_meter_.add(stored.frame_ms);
+        const bool save_depth = has_valid_depth_map(stored);
+        VisionResult depth_copy;
+        if (save_depth) depth_copy = stored;
+
+        // 2. Commit atomically using strictly non-throwing operations into pre-allocated storage.
+        if (gray_ok) {
+            displaced_gray = gray_ring_.put(std::move(gray));
+        }
+        displaced_latest = std::move(latest_);
+        latest_ = std::move(stored);
+        if (save_depth) {
+            displaced_depth = std::move(latest_depth_map_);
+            latest_depth_map_ = std::move(depth_copy);
+        }
+        size_t hist_idx = 0;
+        if (recent_count_ >= kRecentResultsCap) {
+            hist_idx = recent_head_;
+            recent_head_ = (recent_head_ + 1) % kRecentResultsCap;
+        } else {
+            hist_idx = (recent_head_ + recent_count_) % kRecentResultsCap;
+            ++recent_count_;
+        }
+        displaced_hist = std::move(recent_results_[hist_idx]);
+        recent_results_[hist_idx] = std::move(hist);
+        result_meter_.add(latest_.frame_ms);
     }
     cv_.notify_all();
     // Displaced (or rejected) buffers are destroyed here, outside mu_.
-    displaced.reset();
+    displaced_gray.reset();
     displaced_depth.depth_disp.reset();
+    displaced_latest.depth_disp.reset();
     gray.reset();
 }
 
@@ -582,10 +605,11 @@ bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines ne
             if (matches(latest_depth_map_)) return &latest_depth_map_;
             return nullptr;
         }
-        for (auto it = recent_results_.rbegin(); it != recent_results_.rend(); ++it) {
-            if (matches(*it)) {
-                if (it->frame_id == latest_.frame_id && it->instance_id == latest_.instance_id) return &latest_;
-                return &(*it);
+        for (size_t i = recent_count_; i-- > 0;) {
+            const VisionResult& entry = recent_results_[(recent_head_ + i) % kRecentResultsCap];
+            if (matches(entry)) {
+                if (entry.frame_id == latest_.frame_id && entry.instance_id == latest_.instance_id) return &latest_;
+                return &entry;
             }
         }
         return matches(latest_) ? &latest_ : nullptr;
