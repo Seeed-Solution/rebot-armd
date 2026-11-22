@@ -1021,3 +1021,89 @@ fn tracking_safety_references() {
         assert_eq!(cmds_off, cmds_on);
     }
 }
+
+/// M3: Revision-tagged escape depths persist across ticks, are evaluated on copies,
+/// committed only after a successful write, and reject slight reversals back toward
+/// an obstacle (including ratcheting by sub-WORKSPACE_EPS steps).
+#[test]
+fn tracking_escape_depths_persist_across_ticks() {
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    jt.joints[0].lag_s = 0.0; // isolate multi-tick escape bookkeeping cleanly
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        joint_tracking: Some(jt),
+        ..ArmConfig::rebot_dm()
+    };
+    cfg.limits[0].max_acceleration = 100.0;
+    let q0 = INSPECT;
+    // Clear link capsules & extra end points so a single keep-out half-space in z isolates
+    // monotonic escape along J2 cleanly.
+    let ws_mut = cfg.workspace.as_mut().unwrap();
+    ws_mut.check_points_end_m = vec![[0.0, 0.0, 0.0]];
+    ws_mut.link_capsules.clear();
+    ws_mut.self_collision_enabled = false;
+    ws_mut.self_collision_pairs.clear();
+    cfg.camera_mount.offset_m = None;
+    let p0 = cfg.arm_model.fk_f32(&q0).unwrap().p;
+    // Find which J2 direction moves TCP upward (+z).
+    let mut q_probe = q0;
+    q_probe[1] += 0.05;
+    let dir: f32 = if cfg.arm_model.fk_f32(&q_probe).unwrap().p[2] > p0[2] { 1.0 } else { -1.0 };
+    cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
+        name: "escape_box".into(),
+        min_m: [-1.0, -1.0, -1.0],
+        max_m: [1.0, 1.0, p0[2] as f32 + 0.025],
+    });
+    let ws = cfg.workspace.as_ref().unwrap();
+    let d0 = cfg.arm_model.workspace_violation(&q0, ws, &cfg.camera_mount).total;
+    assert!(d0 > 0.020, "start pose must be inside keep-out box, depth={d0}");
+
+    cfg.limits[1].max_acceleration = 100.0;
+    let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+    // Step outward across 3 ticks on J2 so intrusion decreases monotonically.
+    let jt_ref = inner.config.joint_tracking.as_ref().unwrap().clone();
+    let mut prev_depth = d0;
+    for step_idx in 1..=3 {
+        let mut q_step = q0;
+        q_step[1] += dir * 0.02 * step_idx as f32;
+        inner.commanded_positions = q_step.to_vec();
+        inner.measured_positions = q_step.to_vec();
+        let out = inner.compute_position_lead_output(DT, &jt_ref).expect("escaping step must pass");
+        assert!(out.sweep_evals_used <= armd::supervisor::MAX_KEEPOUT_EVALS_PER_TICK);
+        let ws = inner.config.workspace.as_ref().unwrap();
+        let d_now = inner.config.arm_model.workspace_violation(&out.positions, ws, &inner.config.camera_mount).total;
+        assert!(d_now < prev_depth, "escape depth should decrease: {d_now} < {prev_depth}");
+        prev_depth = d_now;
+        // Commit as if write succeeded.
+        inner.tracking.record_issued_with_ws(out.positions, out.velocities, out.ws_min_depths);
+    }
+    let committed_before = inner.tracking.ws_min_depths.clone().expect("escape depths committed");
+    assert_eq!(committed_before.0, inner.workspace_revision);
+
+    // Now reverse slightly back toward the obstacle in sub-WORKSPACE_EPS steps:
+    // without persistent escape depths, each tiny reversal would reset min_depths and ratchet inward.
+    let q_base = inner.tracking.last_issued_positions.clone().unwrap();
+    let mut reversed_rejected = false;
+    for k in 1..=10 {
+        let mut q_rev = q_base.clone();
+        q_rev[1] -= dir * 0.002 * k as f32; // tiny step back toward q0 (~0.5 mm/step)
+        inner.commanded_positions = q_rev.clone();
+        inner.measured_positions = q_rev;
+        match inner.compute_position_lead_output(DT, &jt_ref) {
+            Ok(out) => {
+                inner.tracking.record_issued_with_ws(out.positions, out.velocities, out.ws_min_depths);
+            }
+            Err(_) => {
+                reversed_rejected = true;
+                // On rejection, committed escape depths must not have been mutated.
+                assert_eq!(
+                    inner.tracking.ws_min_depths.as_ref().unwrap().1.as_slice(),
+                    committed_before.1.as_slice()
+                );
+                break;
+            }
+        }
+    }
+    assert!(reversed_rejected, "slight multi-tick reversal toward obstacle must be rejected");
+}

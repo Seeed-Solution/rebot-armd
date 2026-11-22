@@ -159,6 +159,9 @@ impl JointTrackingConfig {
 pub struct TrackingRuntime {
     pub last_issued_positions: Option<Vec<f32>>,
     pub last_issued_velocities: Option<Vec<f32>>,
+    /// Persistent monotonic workspace escape baseline for issued tracking outputs,
+    /// tagged with `workspace_revision` and committed only after a successful write.
+    pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -168,6 +171,7 @@ impl TrackingRuntime {
         if positions.iter().all(|q| q.is_finite()) {
             self.last_issued_positions = Some(positions.to_vec());
             self.last_issued_velocities = Some(vec![0.0; positions.len()]);
+            self.ws_min_depths = None;
         } else {
             self.invalidate();
         }
@@ -179,10 +183,23 @@ impl TrackingRuntime {
         self.last_issued_velocities = Some(velocities);
     }
 
+    /// Record a successfully issued combined output vector and commit its workspace escape depths.
+    pub fn record_issued_with_ws(
+        &mut self,
+        positions: Vec<f32>,
+        velocities: Vec<f32>,
+        ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    ) {
+        self.last_issued_positions = Some(positions);
+        self.last_issued_velocities = Some(velocities);
+        self.ws_min_depths = ws_min_depths;
+    }
+
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
     pub fn invalidate(&mut self) {
         self.last_issued_positions = None;
         self.last_issued_velocities = None;
+        self.ws_min_depths = None;
     }
 }
 
@@ -202,6 +219,7 @@ pub struct TrackingOutput {
     pub velocities: Vec<f32>,
     pub multiplier: f32,
     pub sweep_evals_used: usize,
+    pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -311,6 +329,7 @@ impl crate::supervisor::SupervisorInner {
                     velocities: vec![0.0; dof],
                     multiplier: 0.0,
                     sweep_evals_used: 0,
+                    ws_min_depths: None,
                 });
             }
             None => {
@@ -334,7 +353,14 @@ impl crate::supervisor::SupervisorInner {
             let mut c_prev = eval.alloc_buf();
             eval.eval_into(prev_q, &mut c_prev, "tracking_lead")
                 .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
-            let min_d_prev = eval.init_min_depths(&c_prev);
+            let min_d_prev = match &self.tracking.ws_min_depths {
+                Some((rev, min_d))
+                    if *rev == self.workspace_revision && min_d.as_slice().len() == eval.total_slots =>
+                {
+                    min_d.clone()
+                }
+                _ => eval.init_min_depths(&c_prev),
+            };
             let meas_ctx = if fresh_meas {
                 let mut c_meas = eval.alloc_buf();
                 eval.eval_into(&self.measured_positions, &mut c_meas, "tracking_lead")
@@ -432,6 +458,7 @@ impl crate::supervisor::SupervisorInner {
             }
 
             // Combined-vector workspace and swept keep-out checks on both segments.
+            let mut committed_ws_min_d = None;
             if let Some((ref eval, ref c_prev, ref min_d_prev, ref meas_ctx)) = ws_ctx {
                 let mut local_min_d = min_d_prev.clone();
                 if let Err((_, f)) = eval.sweep_linear_step(
@@ -448,12 +475,12 @@ impl crate::supervisor::SupervisorInner {
                     continue 'cand;
                 }
                 if let Some((ref c_meas, ref min_d_meas)) = meas_ctx {
-                    let mut local_min_d = min_d_meas.clone();
+                    let mut local_meas_min_d = min_d_meas.clone();
                     if let Err((_, f)) = eval.sweep_linear_step(
                         &self.measured_positions,
                         &q_cand,
                         c_meas,
-                        &mut local_min_d,
+                        &mut local_meas_min_d,
                         &mut budget,
                         MAX_KEEPOUT_EVALS_PER_TICK,
                         "tracking_lead",
@@ -463,6 +490,7 @@ impl crate::supervisor::SupervisorInner {
                         continue 'cand;
                     }
                 }
+                committed_ws_min_d = Some((self.workspace_revision, local_min_d));
             }
 
             let v_out: Vec<f32> = (0..dof)
@@ -473,6 +501,7 @@ impl crate::supervisor::SupervisorInner {
                 velocities: v_out,
                 multiplier: m,
                 sweep_evals_used: MAX_KEEPOUT_EVALS_PER_TICK - budget,
+                ws_min_depths: committed_ws_min_d,
             });
         }
 

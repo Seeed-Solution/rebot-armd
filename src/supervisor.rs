@@ -5244,7 +5244,11 @@ impl SupervisorInner {
                                 .and_then(|d| d.lock().ok())
                                 .map(|mut driver| driver.write_joint_targets(&targets));
                             match write_res {
-                                Some(Ok(())) => self.tracking.record_issued(out.positions, out.velocities),
+                                Some(Ok(())) => self.tracking.record_issued_with_ws(
+                                    out.positions,
+                                    out.velocities,
+                                    out.ws_min_depths,
+                                ),
                                 Some(Err(e)) => {
                                     self.tracking.invalidate();
                                     output_error = Some(e.to_string());
