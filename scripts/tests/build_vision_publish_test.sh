@@ -59,5 +59,21 @@ cur="$(cat "${OUT}/rebot-vision")"
 check 'case "${cur}" in par-*) true ;; *) false ;; esac'
 check '[ "$(cut -d" " -f1 "${OUT}/current/rebot-vision.sha256")" = "$(printf %s "${cur}" | sha256sum | cut -d" " -f1)" ]'
 
+# 3. REBOT_VISION_COPY_TO hands each caller its own generation, even while other publishers
+#    switch `current` and collect old generations.
+( for i in 1 2 3 4 5 6; do publish "noise-${i}"; done ) & noise=$!
+pids=()
+for i in 1 2 3; do
+    mkdir -p "${T}/copy-${i}"
+    ( publish "mine-${i}" REBOT_VISION_COPY_TO="${T}/copy-${i}" ) & pids+=($!)
+done
+for p in "${pids[@]}"; do check "wait ${p}"; done
+wait "${noise}"
+for i in 1 2 3; do
+    check '[ "$(cat "${T}/copy-'"${i}"'/rebot-vision")" = "mine-'"${i}"'" ]'
+    check '[ "$(cut -d" " -f1 "${T}/copy-'"${i}"'/rebot-vision.sha256")" = "$(printf mine-'"${i}"' | sha256sum | cut -d" " -f1)" ]'
+    check '[ -x "${T}/copy-'"${i}"'/rebot-vision" ]'
+done
+
 if [ "${FAIL}" != 0 ]; then echo "build_vision publish tests: FAILED" >&2; exit 1; fi
 echo "build_vision publish tests: all passed"

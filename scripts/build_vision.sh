@@ -23,6 +23,10 @@ set -euo pipefail
 # PATH and SG200X_SDK_PATH / SSCMA_ROOT must be set.
 #
 # REBOT_VISION_ALLOW_UNPINNED=1 builds against an SSCMA_ROOT off the lock commit.
+# REBOT_VISION_COPY_TO=<dir> copies this build's own generation (binary, map, checksum) into
+# <dir> while the publish lock is held, before old generations are collected: a caller such
+# as build_deb.sh reads from there, not from the shared `current` pointer, which another
+# publisher may switch. The last line printed names this build's generation.
 # REBOT_VISION_PUBLISH_PREBUILT=<binary> skips the build and publishes that file (and
 # <binary>.map when present) through the same output path; scripts/tests use it.
 # ==============================================================================
@@ -279,6 +283,13 @@ for f in rebot-vision rebot-vision.map rebot-vision.sha256; do
         swap_link "current/${f}" "${OUT_DIR}/${f}"
     fi
 done
+if [ -n "${REBOT_VISION_COPY_TO:-}" ]; then
+    mkdir -p "${REBOT_VISION_COPY_TO}"
+    cp -p "${GEN_DIR}/rebot-vision" "${GEN_DIR}/rebot-vision.sha256" "${REBOT_VISION_COPY_TO}/"
+    if [ -f "${GEN_DIR}/rebot-vision.map" ]; then
+        cp -p "${GEN_DIR}/rebot-vision.map" "${REBOT_VISION_COPY_TO}/"
+    fi
+fi
 collect_garbage
 release_lock
 
