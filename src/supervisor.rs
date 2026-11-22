@@ -5311,12 +5311,17 @@ impl SupervisorInner {
                 let arm_indices = self.config.arm_joint_indices();
                 let has_residual = tracking_active
                     && self.tracking.has_residual_lead(&self.commanded_positions, &arm_indices);
+                let holding_residual = !reference_stepped
+                    && self.active_trajectory.is_none()
+                    && self.servo_target.is_none()
+                    && self.commanded_velocities.iter().all(|&v| v.abs() <= 1e-6);
                 let ramp_out_handover = tracking_active
                     && self.driver.is_some()
                     && !self.safety.state().is_stopped()
                     && (self.pending_normal_unload
                         || self.handover_settling_since.is_some()
-                        || self.torque_guard.hold.is_some())
+                        || self.torque_guard.hold.is_some()
+                        || holding_residual)
                     && has_residual;
                 let tracking_owned = tracking_active
                     && self.driver.is_some()

@@ -683,6 +683,21 @@ impl crate::supervisor::SupervisorInner {
                     }
                 }
             }
+            let in_streaming = self.servo_target.is_some() || self.servo_stream_active;
+            if in_streaming && fresh_meas {
+                let stream_lead = self.config.servo_max_lead_rad;
+                let meas = self.measured_positions[j];
+                let advancing_pos = q_final > pq + 1e-6;
+                let advancing_neg = q_final < pq - 1e-6;
+                if (advancing_pos && q_final > meas + stream_lead + 1e-5)
+                    || (advancing_neg && q_final < meas - stream_lead - 1e-5)
+                {
+                    return Err(TrackingReject::JointLimit(format!(
+                        "joint {} ramp-out candidate {q_final:.4} rad exceeds streaming measured-lead allowance around {meas:.4}",
+                        j + 1
+                    )));
+                }
+            }
             q_next[j] = q_final;
         }
 

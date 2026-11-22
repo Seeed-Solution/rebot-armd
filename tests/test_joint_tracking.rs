@@ -51,6 +51,12 @@ struct TrackingTestState {
     include_gravity_torque: bool,
     /// When true, the next `write_joint_targets` call fails with a bus error (auto-clears).
     fail_next_write: bool,
+    /// Current per-joint mode as last confirmed by `set_joint_modes`.
+    modes: Vec<JointMode>,
+    /// Recorded `(modes, hold_targets)` pairs from every `set_joint_modes` call.
+    mode_hold_frames: Vec<(Vec<JointMode>, Vec<JointTarget>)>,
+    /// When true, the next `set_joint_modes` call fails (auto-clears).
+    fail_mode_switch: bool,
 }
 
 impl TrackingTestState {
@@ -70,6 +76,9 @@ impl TrackingTestState {
             written: Vec::new(),
             include_gravity_torque: true,
             fail_next_write: false,
+            modes: vec![JointMode::Position; dof],
+            mode_hold_frames: Vec::new(),
+            fail_mode_switch: false,
         }
     }
 }
@@ -191,7 +200,35 @@ impl ArmDriver for TrackingTestDriver {
     fn supports_mit_mode_switch(&self) -> bool {
         true
     }
-    fn set_joint_modes(&mut self, _modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut s = self.0.lock().unwrap();
+        if s.fail_mode_switch {
+            s.fail_mode_switch = false;
+            return Err(ArmDriverError::HardwareFault("simulated mode-switch failure".into()));
+        }
+        s.modes = modes.to_vec();
+        s.mode_hold_frames.push((modes.to_vec(), hold.to_vec()));
+        // Honour the mode-switch hold frame immediately on the plant when torqued.
+        if s.enabled == EnableState::Enabled {
+            for (i, t) in hold.iter().enumerate().take(s.dof) {
+                if let Some(pin) = s.pinned[i] {
+                    s.q[i] = pin;
+                    s.v[i] = 0.0;
+                    continue;
+                }
+                let tau_i = s.tau_s[i];
+                if tau_i > 1e-6 {
+                    let alpha = 1.0 - (-DT / f64::from(tau_i)).exp();
+                    let qn = f64::from(s.q[i]) + (f64::from(t.position) - f64::from(s.q[i])) * alpha;
+                    let vn = (f64::from(t.position) - qn) / f64::from(tau_i);
+                    s.q[i] = qn as f32;
+                    s.v[i] = vn as f32;
+                } else {
+                    s.q[i] = t.position;
+                    s.v[i] = 0.0;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -360,6 +397,74 @@ fn tracking_off_wire_equivalence() {
     assert!(frames_none.len() > 700, "expected full multi-producer trace, got {}", frames_none.len());
     assert_targets_bit_eq(&frames_none, &frames_disabled, "tracking_off_wire_equivalence");
     assert_obs_equiv(&obs_none, &obs_disabled, "tracking_off_wire_equivalence");
+
+    // M7: Compare BOTH disabled modes bit-for-bit against the pre-change trace fixture
+    // recorded on baseline commit e4f72b6 (before joint_tracking existed).
+    #[derive(serde::Deserialize)]
+    struct RecordedTarget {
+        p: u32,
+        v: Option<u32>,
+        t: Option<u32>,
+        kp: Option<u32>,
+        kd: Option<u32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RecordedObs {
+        positions: Vec<u32>,
+        velocities: Vec<u32>,
+        torques: Vec<u32>,
+        commanded_positions: Vec<u32>,
+        is_torqued: bool,
+        safety_state: String,
+        fault: Option<String>,
+        gripper: Option<String>,
+        motion_limit: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RecordedTrace {
+        source_commit: String,
+        frames: Vec<Vec<RecordedTarget>>,
+        obs: Vec<RecordedObs>,
+    }
+
+    let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tracking_off_e4f72b6_trace.json");
+    let raw = std::fs::read_to_string(fixture_path)
+        .unwrap_or_else(|e| panic!("failed to read e4f72b6 fixture {fixture_path}: {e}"));
+    let baseline: RecordedTrace = serde_json::from_str(&raw).expect("valid e4f72b6 trace JSON");
+    assert_eq!(baseline.source_commit, "e4f72b6");
+
+    let check_against_baseline = |label: &str, frames: &[Vec<JointTarget>], obs: &[ArmObservation]| {
+        assert_eq!(frames.len(), baseline.frames.len(), "{label}: frame count vs e4f72b6");
+        for (k, (got, exp)) in frames.iter().zip(baseline.frames.iter()).enumerate() {
+            assert_eq!(got.len(), exp.len(), "{label}: tick {k} dof vs e4f72b6");
+            for (j, (gt, et)) in got.iter().zip(exp.iter()).enumerate() {
+                assert_eq!(gt.position.to_bits(), et.p, "{label}: tick {k} joint {j} position vs e4f72b6");
+                assert_eq!(gt.velocity.map(f32::to_bits), et.v, "{label}: tick {k} joint {j} velocity vs e4f72b6");
+                assert_eq!(gt.torque.map(f32::to_bits), et.t, "{label}: tick {k} joint {j} torque vs e4f72b6");
+                assert_eq!(gt.kp.map(f32::to_bits), et.kp, "{label}: tick {k} joint {j} kp vs e4f72b6");
+                assert_eq!(gt.kd.map(f32::to_bits), et.kd, "{label}: tick {k} joint {j} kd vs e4f72b6");
+            }
+        }
+        assert_eq!(obs.len(), baseline.obs.len(), "{label}: obs count vs e4f72b6");
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        for (k, (go, eo)) in obs.iter().zip(baseline.obs.iter()).enumerate() {
+            assert_eq!(bits(&go.positions), eo.positions, "{label}: tick {k} positions vs e4f72b6");
+            assert_eq!(bits(&go.velocities), eo.velocities, "{label}: tick {k} velocities vs e4f72b6");
+            assert_eq!(bits(&go.torques), eo.torques, "{label}: tick {k} torques vs e4f72b6");
+            assert_eq!(bits(&go.commanded_positions), eo.commanded_positions, "{label}: tick {k} commanded vs e4f72b6");
+            assert_eq!(go.is_torqued, eo.is_torqued, "{label}: tick {k} is_torqued vs e4f72b6");
+            assert_eq!(format!("{:?}", go.safety_state), eo.safety_state, "{label}: tick {k} safety_state vs e4f72b6");
+            assert_eq!(go.fault.as_ref().map(|f| format!("{f:?}")), eo.fault, "{label}: tick {k} fault vs e4f72b6");
+            assert_eq!(go.gripper.as_ref().map(|g| format!("{g:?}")), eo.gripper, "{label}: tick {k} gripper vs e4f72b6");
+            assert_eq!(
+                go.motion_limit.as_ref().map(|m| format!("{:?}:{:?}", m.reason, m.joint)),
+                eo.motion_limit,
+                "{label}: tick {k} motion_limit vs e4f72b6"
+            );
+        }
+    };
+    check_against_baseline("joint_tracking=None vs e4f72b6", &frames_none, &obs_none);
+    check_against_baseline("joint_tracking=enabled:false vs e4f72b6", &frames_disabled, &obs_disabled);
 }
 
 /// Phase 1 Test 2: Integrates `dq/dt = (q_out - q) / 0.68` at 20 ms with a smooth
@@ -1917,5 +2022,545 @@ fn tracking_defers_action_done_until_final_output_accepted() {
         let act = obs.action.expect("action status present");
         assert_eq!(act.id, id);
         assert_eq!(act.state, "failed", "action must NOT report done when final frame fails driver write");
+    }
+}
+
+/// M7: Drive active non-zero lead (`>= 0.015 rad`) through every safety/control transition
+/// with leases enabled and a fake driver that can fail writes and honours mode-switch holds:
+/// stop, fault, E-stop, collision, torque hold, lease loss, park, partial write, reconnect,
+/// and handover (both moving lease preemption and gravity-comp MIT <-> POS_VEL handover).
+/// Asserts last frame before, every frame during, and first frame after each transition.
+#[test]
+fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
+    use armd::tracking::TrackingHistoryState;
+
+    const CLIENT_A: &str = "client-a";
+    const CLIENT_B: &str = "client-b";
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let tau_s = vec![0.68, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05];
+
+    let rig_leased = |mut cfg: ArmConfig| -> (SupervisorInner, TrackingTestDriver, u64) {
+        cfg.workspace = None;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let drv = TrackingTestDriver::new(&q0, tau_s.clone());
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+        assert!(inner.lease_enabled, "M7 transitions must run with leases enabled");
+        inner.acquire_lease(CLIENT_A).unwrap();
+        inner.commanded_positions = q0.to_vec();
+        inner.measured_positions = q0.to_vec();
+        inner.target_positions = q0.to_vec();
+        inner.tick(DT);
+        inner.set_torque(true).unwrap();
+        inner.tick(DT);
+        assert!(inner.safety.state().is_operational(), "{:?}", inner.safety.state());
+        let epoch = inner.safety.epoch_id();
+        (inner, drv, epoch)
+    };
+
+    // Drive J1 along a smooth quintic trajectory with lease heartbeats until active lead >= 0.015 rad.
+    // Returns `(last_frame_before, nominal_before, lead_before, written_len_before)`.
+    let drive_active_lead = |inner: &mut SupervisorInner, drv: &TrackingTestDriver, client: &str| -> (Vec<JointTarget>, f32, f32, usize) {
+        let start = inner.commanded_positions.clone();
+        let mut goal = start.clone();
+        goal[0] += 0.20;
+        let traj = TrajectoryPlanner::plan(
+            &start,
+            &vec![0.0; start.len()],
+            &goal,
+            &vec![0.0; start.len()],
+            Some(4.0),
+            &inner.config.limits,
+        )
+        .unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        for _ in 0..65 {
+            let epoch = inner.safety.epoch_id();
+            inner.heartbeat(client, epoch).unwrap();
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "active lead buildup faulted: {:?}", obs.fault);
+        }
+        let written_len = drv.with(|s| s.written.len());
+        let last_before = drv.with(|s| s.written.last().unwrap().clone());
+        let nominal_before = inner.commanded_positions[0];
+        let lead_before = last_before[0].position - nominal_before;
+        assert!(
+            lead_before >= 0.015,
+            "expected active lead >= 0.015 rad before transition, got {lead_before:.4}"
+        );
+        (last_before, nominal_before, lead_before, written_len)
+    };
+
+    let hb = |inner: &mut SupervisorInner, client: &str| {
+        let epoch = inner.safety.epoch_id();
+        let _ = inner.heartbeat(client, epoch);
+    };
+
+    // 1. STOP (stop_motion mid-stream with active lead)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let max_v = inner.config.limits[0].max_velocity as f64;
+
+        inner.stop_motion();
+        let mut prev_pos = last_before[0].position;
+        for _ in 0..35 {
+            hb(&mut inner, CLIENT_A);
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "stop transition faulted: {:?}", obs.fault);
+        }
+        let during_and_after = drv.with(|s| s.written[idx_before..].to_vec());
+        assert_eq!(during_and_after.len(), 35);
+        for (k, frame) in during_and_after.iter().enumerate() {
+            let step_v = ((frame[0].position - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "stop tick {k} exceeded max velocity: {step_v:.3}");
+            prev_pos = frame[0].position;
+        }
+        // First frame after stop settles: zero velocity, zero lead.
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        let first_after = drv.with(|s| s.written.last().unwrap().clone());
+        assert!(obs_after.safety_state.is_operational());
+        assert!((first_after[0].position - inner.commanded_positions[0]).abs() < 1e-4, "stop residual lead");
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 2. FAULT (FollowingError fault mid-motion -> clear_fault -> re-enable)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (_last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+
+        // Induce a real supervisor FollowingError fault on J1.
+        let q_pin = inner.commanded_positions[0] - (inner.config.following_error.max_error_rad + 0.05);
+        inner.config.following_error.persistence_ms = 0;
+        drv.with(|s| {
+            s.pinned[0] = Some(q_pin);
+            s.q[0] = q_pin;
+            s.v[0] = 0.0;
+        });
+        for _ in 0..5 {
+            hb(&mut inner, CLIENT_A);
+            let obs = inner.tick(DT);
+            assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "expected FollowingError fault");
+        }
+        // Every frame during fault must carry zero velocity and hold measured (no added lead).
+        let during = drv.with(|s| s.written[idx_before..].to_vec());
+        assert!(!during.is_empty());
+        for (k, frame) in during.iter().enumerate() {
+            assert!(frame[0].velocity.unwrap_or(0.0).abs() <= 1e-4, "fault tick {k} must have zero velocity");
+            assert!((frame[0].position - q_pin).abs() < 1e-4, "fault tick {k} must hold measured pose");
+        }
+        // Unpin, clear fault, and confirm first frame after is clean stationary baseline.
+        drv.with(|s| s.pinned[0] = None);
+        inner.clear_fault().unwrap();
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3, "post-fault first frame must hold measured");
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 3. E-STOP (EStopLatch mid-motion -> active restorative hold at measured -> clear_fault)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (_last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let hold_j0 = inner.measured_positions[0];
+
+        inner.apply_stop_policy(StopPolicy::EStopLatch);
+        for _ in 0..5 {
+            let obs = inner.tick(DT);
+            assert_eq!(obs.safety_state, SafetyState::EStop);
+            assert!(obs.is_torqued, "EStopLatch keeps restorative holding torque on");
+        }
+        // Every frame during E-stop holds measured pose with zero velocity and zero lead.
+        let during = drv.with(|s| s.written[idx_before..].to_vec());
+        assert_eq!(during.len(), 5, "expected restorative hold frames during E-stop");
+        for (k, frame) in during.iter().enumerate() {
+            assert!((frame[0].position - hold_j0).abs() < 1e-4, "E-stop tick {k} must hold measured pose");
+            assert!(frame[0].velocity.unwrap_or(0.0).abs() < 1e-4, "E-stop tick {k} must have zero velocity");
+        }
+
+        inner.clear_fault().unwrap();
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!(
+            (first_after[0].position - inner.measured_positions[0]).abs() < 1e-3,
+            "post-estop first frame must hold measured: {} vs {}",
+            first_after[0].position,
+            inner.measured_positions[0]
+        );
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 4. COLLISION (collision guard trip mid-stream -> hold -> quiet release)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        inner.collision.enabled = true;
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+
+        // Inject high external torque spike on J1 until collision guard trips.
+        drv.with(|s| s.forced_torque[0] = Some(12.0));
+        let mut tripped = false;
+        let mut trip_meas = 0.0_f32;
+        for _ in 0..10 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+            if inner.collision.hold.is_some() {
+                tripped = true;
+                trip_meas = inner.measured_positions[0];
+                break;
+            }
+        }
+        assert!(tripped, "collision guard must trip on torque spike");
+        // Clear torque spike and wait through quiet hold period (resume_after_s = 2.0 s) until auto-resume.
+        drv.with(|s| s.forced_torque[0] = None);
+        let mut hold_frames = Vec::new();
+        for _ in 0..150 {
+            let before_tick = drv.with(|s| s.written.len());
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+            let frame = drv.with(|s| s.written[before_tick].clone());
+            if inner.collision.hold.is_some() {
+                hold_frames.push(frame);
+            } else {
+                break;
+            }
+        }
+        assert!(inner.collision.hold.is_none(), "collision hold must clear after quiet period");
+        // Every frame during collision hold must not push forward past last_before and must hold measured pose.
+        for (k, frame) in hold_frames.iter().enumerate() {
+            assert!(
+                frame[0].position <= last_before[0].position + 1e-4,
+                "collision hold tick {k} pushed forward past pre-trip lead"
+            );
+            assert!(
+                (frame[0].position - trip_meas).abs() < 0.02,
+                "collision hold tick {k} drifted from measured pose: {} vs {}",
+                frame[0].position,
+                trip_meas
+            );
+            assert!(frame[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+        }
+        assert!(drv.with(|s| s.written.len()) > idx_before);
+        // First frame after collision hold clears: clean stationary baseline, operational.
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.commanded_positions[0]).abs() < 1e-4);
+    }
+
+    // 5. TORQUE HOLD (torque guard saturation trip -> relieving ramp-out -> release)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        cfg.torque_guard = Some(TorqueGuardPolicy {
+            enabled: true,
+            ratio: 0.60,
+            persist_ms: 40,
+            ..Default::default()
+        });
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let max_v = inner.config.limits[0].max_velocity as f64;
+
+        drv.with(|s| s.forced_torque[0] = Some(25.0));
+        let mut tripped = false;
+        let mut prev_pos = last_before[0].position;
+        for k in 0..25 {
+            let before_tick = drv.with(|s| s.written.len());
+            hb(&mut inner, CLIENT_A);
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "torque hold must stay operational: {:?}", obs.fault);
+            if inner.torque_guard.hold.is_some() {
+                tripped = true;
+                drv.with(|s| s.forced_torque[0] = Some(5.0));
+            }
+            let frame = drv.with(|s| s.written[before_tick].clone());
+            let step_v = ((frame[0].position - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "torque hold tick {k} velocity {step_v:.3} > {max_v:.3}");
+            if tripped {
+                assert!(frame[0].position <= prev_pos + 1e-6, "torque hold tick {k} advanced in +1 tripped direction");
+            }
+            prev_pos = frame[0].position;
+        }
+        assert!(tripped, "torque guard must trip");
+        assert!(drv.with(|s| s.written.len()) > idx_before);
+        // Drop overload and retreat in the relieving (-1) direction so torque hold releases cleanly.
+        drv.with(|s| s.forced_torque[0] = None);
+        let mut retreat = inner.commanded_positions.clone();
+        retreat[0] -= 0.08;
+        for _ in 0..80 {
+            let epoch = inner.safety.epoch_id();
+            inner.heartbeat(CLIENT_A, epoch).unwrap();
+            let _ = inner.servo(retreat.clone(), epoch);
+            inner.tick(DT);
+            if inner.torque_guard.hold.is_none() {
+                break;
+            }
+        }
+        assert!(inner.torque_guard.hold.is_none(), "torque hold must clear after relieving retreat");
+        inner.stop_motion();
+        for _ in 0..20 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+        }
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.commanded_positions[0]).abs() < 1e-3);
+    }
+
+    // 6. LEASE LOSS (watchdog timeout while streaming with active lead -> re-acquire + re-arm)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 200;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let max_v = inner.config.limits[0].max_velocity as f64;
+
+        // Backdate both watchdog and lease heartbeats past lease_timeout_ms so lease loss fires.
+        let expired = std::time::Instant::now() - Duration::from_secs(5);
+        inner.last_heartbeat = expired;
+        if let Some(l) = inner.active_lease.as_mut() {
+            l.acquired_at = expired;
+        }
+        for _ in 0..250 {
+            inner.tick(DT);
+            if !inner.is_torqued || matches!(inner.safety.state(), SafetyState::Fault(_)) {
+                break;
+            }
+        }
+        let during = drv.with(|s| s.written[idx_before..].to_vec());
+        assert!(!during.is_empty(), "lease-loss transition must ramp/park smoothly");
+        let mut prev_pos = last_before[0].position;
+        for (k, frame) in during.iter().enumerate() {
+            let step_v = ((frame[0].position - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "lease-loss tick {k} exceeded velocity cap: {step_v:.3}");
+            prev_pos = frame[0].position;
+        }
+        // Re-acquire lease, clear any watchdog fault, re-enable -> first frame after is clean hold.
+        inner.acquire_lease(CLIENT_B).unwrap();
+        if matches!(inner.safety.state(), SafetyState::Fault(_)) {
+            inner.clear_fault().unwrap();
+        }
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_B);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3);
+    }
+
+    // 7. PARK (NormalUnload with active lead -> smooth ramp-out -> settle -> torque off -> re-arm)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let max_v = inner.config.limits[0].max_velocity as f64;
+
+        // Simulate mechanical rest support at resting pose so support_torque_limits can clear.
+        drv.with(|s| s.include_gravity_torque = false);
+        inner.apply_stop_policy(StopPolicy::NormalUnload);
+        for _ in 0..400 {
+            let obs = inner.tick(DT);
+            if !obs.is_torqued {
+                break;
+            }
+        }
+        assert!(
+            !inner.is_torqued,
+            "park must complete and disable torque (state={:?}, pending={}, dur={:?}, q_m={:?}, q_c={:?})",
+            inner.safety.state(),
+            inner.pending_normal_unload,
+            inner.unload_planned_duration,
+            inner.measured_positions,
+            inner.commanded_positions,
+        );
+        let during = drv.with(|s| s.written[idx_before..].to_vec());
+        assert!(during.len() >= 5, "park must ramp lead out and settle before torque-off");
+        let mut prev_pos = last_before[0].position;
+        for (k, frame) in during.iter().enumerate() {
+            let step_v = ((frame[0].position - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "park tick {k} exceeded velocity cap: {step_v:.3}");
+            prev_pos = frame[0].position;
+        }
+        // Re-arm -> first frame after is clean stationary hold at parked pose.
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3);
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 8. PARTIAL WRITE (driver write failure mid-stream -> fault + history Unknown -> clear + re-arm)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (_last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+
+        drv.with(|s| s.fail_next_write = true);
+        hb(&mut inner, CLIENT_A);
+        let obs_fail = inner.tick(DT);
+        assert!(matches!(obs_fail.safety_state, SafetyState::Fault(_)), "write failure must latch fault");
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown, "write failure must invalidate history");
+        assert_eq!(drv.with(|s| s.written.len()), idx_before, "failed write must not append a confirmed frame");
+
+        inner.clear_fault().unwrap();
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3);
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 9. RECONNECT (bus feedback loss -> output_suspended / BusLoss -> restore feedback -> re-arm)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (_last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+
+        // Make feedback exceed BUS_LOSS_TIMEOUT (500 ms) so bus loss suspends all bus writes immediately.
+        drv.with(|s| s.feedback_age = Duration::from_millis(600));
+        for _ in 0..5 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+        }
+        let during = drv.with(|s| s.written[idx_before..].to_vec());
+        assert!(during.is_empty(), "stale/lost bus must suppress every write, wrote {}", during.len());
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
+
+        // Restore fresh feedback, clear any fault, and confirm clean first frame after reconnect.
+        drv.with(|s| s.feedback_age = Duration::ZERO);
+        hb(&mut inner, CLIENT_A);
+        inner.tick(DT);
+        if matches!(inner.safety.state(), SafetyState::Fault(_)) {
+            inner.clear_fault().unwrap();
+        }
+        inner.set_torque(true).unwrap();
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.measured_positions[0]).abs() < 1e-3);
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
+    }
+
+    // 10a. HANDOVER — moving lease preemption with active lead
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (last_before, _nom, _lead, idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        let max_v = inner.config.limits[0].max_velocity as f64;
+
+        inner.preempt_lease(CLIENT_B, "takeover").unwrap();
+        assert!(inner.handover_settling_since.is_some(), "moving handover must enter settling");
+        let mut prev_pos = last_before[0].position;
+        let mut settled = false;
+        for k in 0..60 {
+            let before_tick = drv.with(|s| s.written.len());
+            hb(&mut inner, CLIENT_B);
+            let obs = inner.tick(DT);
+            assert!(obs.safety_state.is_operational(), "handover tick {k} faulted: {:?}", obs.fault);
+            let frame = drv.with(|s| s.written[before_tick].clone());
+            let step_v = ((frame[0].position - prev_pos) as f64 / DT).abs();
+            assert!(step_v <= max_v + 1e-2, "handover tick {k} exceeded velocity cap: {step_v:.3}");
+            prev_pos = frame[0].position;
+            if inner.handover_settling_since.is_none() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "moving lease handover must finish settling");
+        assert!(drv.with(|s| s.written.len()) > idx_before);
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_B);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        assert!((first_after[0].position - inner.commanded_positions[0]).abs() < 1e-4);
+    }
+
+    // 10b. HANDOVER — gravity-comp mode-switch handover (honours mode-switch hold frames)
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 5_000;
+        let (mut inner, drv, _) = rig_leased(cfg);
+        let (_last_before, _nom, _lead, _idx_before) = drive_active_lead(&mut inner, &drv, CLIENT_A);
+        // Stop and settle to enter gravity comp cleanly.
+        inner.stop_motion();
+        for _ in 0..45 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+        }
+        drv.with(|s| s.v.fill(0.0));
+        hb(&mut inner, CLIENT_A);
+        inner.tick(DT);
+
+        inner.enter_gravity_comp(Default::default()).unwrap();
+        let enter_switches = drv.with(|s| s.mode_hold_frames.len());
+        assert_eq!(enter_switches, 1, "entering gravity comp must send MIT mode-switch hold frame");
+        assert_eq!(drv.with(|s| s.mode_hold_frames[0].0[0]), JointMode::Mit);
+
+        // Float for 2 ticks, then exit gravity comp.
+        for _ in 0..2 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+        }
+        let idx_during_exit = drv.with(|s| s.written.len());
+        inner.exit_gravity_comp("REQUESTED", "m7");
+        for _ in 0..10 {
+            hb(&mut inner, CLIENT_A);
+            inner.tick(DT);
+            if inner.gravity_comp.is_none() {
+                break;
+            }
+        }
+        assert!(inner.gravity_comp.is_none(), "gravity-comp handback must complete when stationary");
+        let switches = drv.with(|s| s.mode_hold_frames.clone());
+        assert_eq!(switches.len(), 2, "exiting gravity comp must send Position mode-switch hold frame");
+        assert_eq!(switches[1].0[0], JointMode::Position);
+        // Every MIT hold frame during Exiting had valid MIT gains and finite targets.
+        let during_exit = drv.with(|s| s.written[idx_during_exit..].to_vec());
+        assert!(!during_exit.is_empty());
+        // First POS_VEL frame after handback is a confirmed stationary baseline at the hold pose.
+        let idx_after = drv.with(|s| s.written.len());
+        hb(&mut inner, CLIENT_A);
+        let obs_after = inner.tick(DT);
+        assert!(obs_after.safety_state.is_operational());
+        let first_after = drv.with(|s| s.written[idx_after].clone());
+        let hold_j0 = switches[1].1[0].position;
+        assert!((first_after[0].position - hold_j0).abs() < 1e-4, "first POS_VEL frame after handback must match hold");
+        assert!(first_after[0].velocity.unwrap_or(0.0).abs() < 1e-4);
     }
 }
