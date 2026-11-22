@@ -3327,3 +3327,181 @@ async fn b02_missing_oldest_captured_at_ms_rejected_400_without_mutation_or_targ
     assert_eq!(hub.frame_ids(), frames_before);
     assert_eq!(hub.window_deadlines().unwrap(), deadlines_before);
 }
+
+#[tokio::test]
+async fn m02_unbroken_renewal_commit_past_old_ticket_expiry_holds_and_resumes() {
+    let mut weights = vec![0.0f32; 6 * 8];
+    weights[6] = 0.05;
+    weights[7] = 0.05;
+    let layers = make_linear_layers(8, 6, weights);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 20.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 500,
+                "max_window_span_ms": 500,
+                "fps_staleness_budget_ms": 500,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_default_handshake_ttl_ms(100);
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs1 = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    assert_eq!(hs1.handshake_expires_at_ms, 1_000_100);
+
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs1.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: Some(1_000_000),
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 20);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        20.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-m02").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-m02".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_m02".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        20.0,
+        compute_policy_deadline(Some(0.45)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    // On-time renewal at t = 1_000_090 (before hs1 expiry 1_000_100), extending to 1_000_290.
+    hub.set_default_handshake_ttl_ms(200);
+    hub.set_test_now_ms(Some(1_000_090));
+    let hs2 = hub_two_step_handshake(&hub, 1, 1_000_090, 1, true);
+    assert!(hs2.handshake_generation > hs1.handshake_generation);
+    assert_eq!(hs2.handshake_expires_at_ms, 1_000_290);
+
+    // Advance commit clock past old ticket expiry (1_000_120 > 1_000_100) while new hs2 is valid (<= 1_000_290).
+    hub.set_test_now_ms(Some(1_000_120));
+
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    sup.tick(0.02).await;
+    let mid_obs = sup.get_observation().await;
+    let mid_pol = mid_obs.policy.expect("policy still running in hold");
+    assert!(
+        mid_pol.active,
+        "policy must hold cleanly across unbroken renewal even past old ticket expiry"
+    );
+    assert_eq!(mid_pol.steps, 0, "in-flight target from old ticket must be discarded");
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+
+    // Refill under hs2 and let the runner commit
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs2.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 2,
+        captured_at_ms: 1_000_120,
+        oldest_captured_at_ms: Some(1_000_120),
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        sup.tick(0.02).await;
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    let end_obs = sup.get_observation().await;
+    let end_pol = end_obs.policy.expect("policy obs");
+    assert_eq!(end_pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+    assert!(end_pol.steps >= 1);
+    assert_eq!(end_pol.vision_frame_id, Some(2));
+    assert!(non_home_writes.load(Ordering::SeqCst) >= 1);
+}

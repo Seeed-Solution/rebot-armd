@@ -821,16 +821,16 @@ impl InferenceTicket {
                 actual: live.invalidation_generation,
             });
         }
-        if live.now_armd_ms > self.clock_handshake_expires_at_ms {
-            return Err(TicketViolation::ClockHandshakeExpired {
-                now_ms: live.now_armd_ms,
-                expires_at_ms: self.clock_handshake_expires_at_ms,
-            });
-        }
         if live.clock_handshake_generation != self.clock_handshake_generation {
             return Err(TicketViolation::ClockHandshakeGenerationMismatch {
                 expected: self.clock_handshake_generation,
                 actual: live.clock_handshake_generation,
+            });
+        }
+        if live.now_armd_ms > self.clock_handshake_expires_at_ms {
+            return Err(TicketViolation::ClockHandshakeExpired {
+                now_ms: live.now_armd_ms,
+                expires_at_ms: self.clock_handshake_expires_at_ms,
             });
         }
         if live.now_armd_ms > self.window_newest_deadline_ms {
@@ -1353,11 +1353,35 @@ pub fn spawn_policy_runner(
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
                     Ok(now_ms) => Some(now_ms),
-                    Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual })
-                        if actual != 0 && guard.is_unbroken_active_renewal(expected) =>
-                    {
-                        hold_step = true;
-                        None
+                    Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
+                        if actual != 0 && guard.is_unbroken_active_renewal(expected) {
+                            hold_step = true;
+                            None
+                        } else {
+                            let now_armd_ms = guard.live_ticket_state().now_armd_ms;
+                            if now_armd_ms > ticket.clock_handshake_expires_at_ms() {
+                                let exp_violation = TicketViolation::ClockHandshakeExpired {
+                                    now_ms: now_armd_ms,
+                                    expires_at_ms: ticket.clock_handshake_expires_at_ms(),
+                                };
+                                inner.fail_policy_run(
+                                    action_id,
+                                    exp_violation.code(),
+                                    exp_violation.message(),
+                                );
+                            } else {
+                                let violation = TicketViolation::ClockHandshakeGenerationMismatch {
+                                    expected,
+                                    actual,
+                                };
+                                inner.fail_policy_run(
+                                    action_id,
+                                    violation.code(),
+                                    violation.message(),
+                                );
+                            }
+                            break;
+                        }
                     }
                     Err(
                         TicketViolation::WindowNewestExpired { .. }
