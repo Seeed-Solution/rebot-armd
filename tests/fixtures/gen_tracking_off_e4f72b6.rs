@@ -311,6 +311,18 @@ fn generate_e4f72b6_fixture() {
     inner.apply_stop_policy(StopPolicy::NormalUnload);
     step(&mut inner, 200);
 
+    // 8. Park completes: the settle hold ends with torque off (bounded), then idle ticks.
+    // At the resting pose the arm sits on its mechanical support: the fake plant stops
+    // reporting gravity load so the support-torque check of the settle can pass.
+    drv.with(|s| s.include_gravity_torque = false);
+    let mut park_ticks = 0;
+    while inner.is_torqued && park_ticks < 2000 {
+        step(&mut inner, 1);
+        park_ticks += 1;
+    }
+    assert!(!inner.is_torqued, "park must complete with torque off within 2000 extra ticks");
+    step(&mut inner, 10);
+
     let frames = drv.with(|s| s.written.clone());
     let trace = RecordedTrace {
         source_commit,
