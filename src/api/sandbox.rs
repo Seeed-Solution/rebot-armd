@@ -4060,8 +4060,8 @@ fn build_bundle_from_disk(
     };
 
     let base_xml = get_base_robot_xml_for_robot(running_robot)?;
-    let composed_xml = compose_mjcf(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    let composed_xml = compose_mjcf_checked(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
+        .map_err(|e| PackFileError::from(e).into_http_error("INVALID_PACK", "MJCF composition failed"))?;
 
     Ok(build_cached_bundle_from_snapshot(
         &state.root,
@@ -4931,12 +4931,13 @@ pub async fn activate(
     };
 
     let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
-    let composed = compose_mjcf(
+    let composed = compose_mjcf_checked(
         &base_xml,
         Some(&scene_world_xml),
         Some(&tool_manifest),
         Some(&tool_xml),
-    ).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("MJCF composition failed: {e}")}))))?;
+    )
+    .map_err(|e| PackFileError::from(e).into_http_error("INVALID_PACK", "MJCF composition failed"))?;
 
     let bundle_snapshot = ActivationBundleSnapshot {
         robot: running_robot.clone(),

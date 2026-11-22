@@ -15,13 +15,18 @@ import pytest
 from rebot_sim.camera import CameraMount
 from rebot_sim.pack import (
     MAX_MESH_FILES,
+    MAX_PACK_BODIES,
+    MAX_PACK_GEOMS,
     MAX_PACK_TOTAL_BYTES,
     MAX_SINGLE_MESH_BYTES,
     MAX_TOTAL_VERTICES,
     MAX_XML_BYTES,
+    MAX_XML_ELEMENTS,
     PackValidationError,
+    compose_spec,
     compute_pack_digest,
     load_scene_pack,
+    load_tool_pack,
     validate_pack_security,
 )
 from rebot_sim.perception import Perception, PerceptionServer
@@ -1358,4 +1363,83 @@ def test_b02_camera_commit_not_cancelled_after_effective_swap():
     finally:
         st.close()
         sim.close()
+
+
+@pytest.mark.parametrize(
+    "bad_xml",
+    [
+        '<mujoco><worldbody><replicate count="10"><body name="r"/></replicate></worldbody></mujoco>',
+        '<mujoco><worldbody><frame pos="0 0 0"><body name="f"/></frame></worldbody></mujoco>',
+        '<mujoco><include file="other.xml"/><worldbody/></mujoco>',
+        '<mujoco><worldbody><composite type="grid" count="2 2 1"/></worldbody></mujoco>',
+        '<mujoco><worldbody><flexcomp name="fx" type="grid" count="2 2 1"/></worldbody></mujoco>',
+        '<mujoco><worldbody><attach model="m" body="b"/></worldbody></mujoco>',
+        '<mujoco><asset><model name="m" file="sub.xml"/></asset><worldbody/></mujoco>',
+    ],
+)
+def test_m5_rejects_expansion_constructs(tmp_path: Path, bad_xml: str):
+    pdir = _write_minimal_scene(tmp_path / "exp_scene", world_xml=bad_xml)
+    with pytest.raises(PackValidationError) as exc:
+        validate_pack_security(pdir, "scene")
+    assert exc.value.code == "INVALID_PACK"
+
+
+def test_m5_enforces_exact_and_combined_element_body_geom_budgets(tmp_path: Path):
+    import mujoco
+
+    from rebot_sim.model import SCENE_XML
+
+    assert MAX_XML_ELEMENTS == 4_096
+    assert MAX_PACK_BODIES == 512
+    assert MAX_PACK_GEOMS == 1_024
+
+    def make_bodies_xml(n: int) -> str:
+        inner = "".join(f'<body name="b{i}"/>' for i in range(n))
+        return f"<mujoco><worldbody>{inner}</worldbody></mujoco>"
+
+    def make_geoms_xml(n: int) -> str:
+        inner = "".join(
+            f'<geom name="g{i}" type="box" size="0.01 0.01 0.01"/>' for i in range(n)
+        )
+        return f"<mujoco><worldbody>{inner}</worldbody></mujoco>"
+
+    # Exact MAX_PACK_BODIES accepted, MAX_PACK_BODIES + 1 rejected
+    ok_b = _write_minimal_scene(tmp_path / "ok_bodies", world_xml=make_bodies_xml(MAX_PACK_BODIES))
+    assert len(validate_pack_security(ok_b, "scene")) == 64
+
+    over_b = _write_minimal_scene(tmp_path / "over_bodies", world_xml=make_bodies_xml(MAX_PACK_BODIES + 1))
+    with pytest.raises(PackValidationError) as exc_b:
+        validate_pack_security(over_b, "scene")
+    assert exc_b.value.code == "INVALID_PACK"
+
+    # Exact MAX_PACK_GEOMS accepted, MAX_PACK_GEOMS + 1 rejected
+    ok_g = _write_minimal_scene(tmp_path / "ok_geoms", world_xml=make_geoms_xml(MAX_PACK_GEOMS))
+    assert len(validate_pack_security(ok_g, "scene")) == 64
+
+    over_g = _write_minimal_scene(tmp_path / "over_geoms", world_xml=make_geoms_xml(MAX_PACK_GEOMS + 1))
+    with pytest.raises(PackValidationError) as exc_g:
+        validate_pack_security(over_g, "scene")
+    assert exc_g.value.code == "INVALID_PACK"
+
+    # Combined scene (300 bodies) + tool (250 bodies) = 550 > 512: individually valid,
+    # rejected by compose_spec BEFORE MuJoCo compilation!
+    scene_dir = _write_minimal_scene(
+        tmp_path / "scene_300", pack_id="scene_300", world_xml=make_bodies_xml(300)
+    )
+    tool_dir = tmp_path / "tool_250"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    (tool_dir / "tool.xml").write_text(make_bodies_xml(250), encoding="utf-8")
+    (tool_dir / "tool.json").write_text(
+        json.dumps({"id": "tool_250", "name": "Tool 250", "kind": "gripper", "tool_xml": "tool.xml"}),
+        encoding="utf-8",
+    )
+
+    sp = load_scene_pack(scene_dir, prefer_disk=True)
+    tp = load_tool_pack(tool_dir, prefer_disk=True)
+    assert sp is not None and tp is not None
+
+    spec = mujoco.MjSpec.from_file(str(SCENE_XML))
+    with pytest.raises(PackValidationError) as exc_comb:
+        compose_spec(spec, scene_pack=sp, tool_pack=tp)
+    assert exc_comb.value.code == "INVALID_PACK"
 

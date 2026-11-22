@@ -19,7 +19,10 @@ use tower::ServiceExt;
 
 use armd::api::create_router_with_sandbox;
 use armd::api::sandbox::{normalize_robot_id, ActivationTxState, SandboxState, SimTxTimeouts};
-use armd::mjcf_compose::{compute_pack_digest, MAX_XML_BYTES};
+use armd::mjcf_compose::{
+    compose_mjcf, compute_pack_digest, FALLBACK_BASE_XML, MAX_PACK_BODIES, MAX_PACK_GEOMS,
+    MAX_XML_BYTES, MAX_XML_ELEMENTS,
+};
 use armd::{ArmConfig, ArmSupervisor, OperatorAuth};
 
 static SIM_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2642,6 +2645,167 @@ async fn sandbox_bundle_rejects_same_byte_size_valid_replacement_tampering_on_di
     let (st, err) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
     assert_eq!(err["code"], "INVALID_PACK", "{err}");
+}
+
+#[tokio::test]
+async fn sandbox_m5_rejects_expansion_tags_and_enforces_single_and_combined_element_budgets() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    // 1. Reject expansion/forbidden XML constructs on both Boundary 1 and Boundary 2
+    let expansion_cases = [
+        ("replicate", r#"<mujoco><worldbody><replicate count="10"><body name="r"/></replicate></worldbody></mujoco>"#),
+        ("frame", r#"<mujoco><worldbody><frame pos="0 0 0"><body name="f"/></frame></worldbody></mujoco>"#),
+        ("include", r#"<mujoco><include file="other.xml"/><worldbody/></mujoco>"#),
+        ("composite", r#"<mujoco><worldbody><composite type="grid" count="2 2 1"/></worldbody></mujoco>"#),
+        ("flexcomp", r#"<mujoco><worldbody><flexcomp name="fx" type="grid" count="2 2 1"/></worldbody></mujoco>"#),
+        ("attach", r#"<mujoco><worldbody><attach model="m" body="b"/></worldbody></mujoco>"#),
+        ("model", r#"<mujoco><asset><model name="m" file="sub.xml"/></asset><worldbody/></mujoco>"#),
+    ];
+    for (name, xml) in expansion_cases {
+        let id = format!("exp_{name}");
+        let (st, body) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/scenes",
+            Some(json!({
+                "id": id,
+                "scene_json": {"id": id, "name": name, "world_xml": "world.xml"},
+                "world_xml": xml
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "Boundary 1 ({name}): {body}");
+        assert_eq!(body["code"], "INVALID_PACK", "Boundary 1 ({name}): {body}");
+
+        let disk_id = format!("disk_exp_{name}");
+        write_disk_scene(&tmp.path().join("scenes").join(&disk_id), &disk_id, xml, &[]);
+        assert_boundary2_rejected(&state, &app, &disk_id).await;
+    }
+
+    // 2. Accept exact MAX_PACK_BODIES and MAX_PACK_GEOMS, reject limit + 1
+    let make_bodies_xml = |n: usize| {
+        let mut s = String::from("<mujoco><worldbody>");
+        for i in 0..n {
+            s.push_str(&format!(r#"<body name="b{i}"/>"#));
+        }
+        s.push_str("</worldbody></mujoco>");
+        s
+    };
+    let make_geoms_xml = |n: usize| {
+        let mut s = String::from("<mujoco><worldbody>");
+        for i in 0..n {
+            s.push_str(&format!(r#"<geom name="g{i}" type="box" size="0.01 0.01 0.01"/>"#));
+        }
+        s.push_str("</worldbody></mujoco>");
+        s
+    };
+
+    let (st, ok_bodies) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "exact_bodies",
+            "scene_json": {"id": "exact_bodies", "name": "Exact Bodies", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_bodies_xml(MAX_PACK_BODIES)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ok_bodies}");
+
+    let (st, over_bodies) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "over_bodies",
+            "scene_json": {"id": "over_bodies", "name": "Over Bodies", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_bodies_xml(MAX_PACK_BODIES + 1)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{over_bodies}");
+    assert_eq!(over_bodies["code"], "INVALID_PACK");
+
+    let (st, ok_geoms) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "exact_geoms",
+            "scene_json": {"id": "exact_geoms", "name": "Exact Geoms", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_geoms_xml(MAX_PACK_GEOMS)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ok_geoms}");
+
+    let (st, over_geoms) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "over_geoms",
+            "scene_json": {"id": "over_geoms", "name": "Over Geoms", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_geoms_xml(MAX_PACK_GEOMS + 1)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{over_geoms}");
+    assert_eq!(over_geoms["code"], "INVALID_PACK");
+
+    // 3. Combined scene (300 bodies) + tool (250 bodies) = 550 > 512: each uploads fine individually,
+    //    but compose_mjcf AND POST /activate reject before compilation!
+    let scene_300 = make_bodies_xml(300);
+    let tool_250 = make_bodies_xml(250);
+    assert_eq!(MAX_XML_ELEMENTS, 4_096);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "scene_300_bodies",
+            "scene_json": {"id": "scene_300_bodies", "name": "Scene 300", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": scene_300
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/tools",
+        Some(json!({
+            "id": "tool_250_bodies",
+            "tool_json": {"id": "tool_250_bodies", "name": "Tool 250", "kind": "gripper", "tool_xml": "tool.xml", "robots": ["b601dm"]},
+            "tool_xml": tool_250
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Direct compose_mjcf rejects combined overflow
+    assert!(compose_mjcf(FALLBACK_BASE_XML, Some(&scene_300), None, Some(&tool_250)).is_err());
+
+    // Activate rejects combined overflow with 400 INVALID_PACK
+    let (st, err_act) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "scene_300_bodies", "tool": "tool_250_bodies"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err_act}");
+    assert_eq!(err_act["code"], "INVALID_PACK", "{err_act}");
 }
 
 

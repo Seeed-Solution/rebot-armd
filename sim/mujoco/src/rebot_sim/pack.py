@@ -24,12 +24,28 @@ PACK_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 MAX_XML_BYTES = 512 * 1024  # 512 KiB
 MAX_XML_DEPTH = 32
+MAX_XML_ELEMENTS = 4_096
+MAX_PACK_BODIES = 512
+MAX_PACK_GEOMS = 1_024
 MAX_PACK_TOTAL_BYTES = 10 * 1024 * 1024  # 10 MiB
 MAX_SINGLE_MESH_BYTES = 4 * 1024 * 1024  # 4 MiB
 MAX_MESH_FILES = 16
 MAX_TOTAL_VERTICES = 150_000
 
-_FORBIDDEN_XML_TAGS = frozenset({"include", "plugin", "custom", "extension"})
+_FORBIDDEN_XML_TAGS = frozenset(
+    {
+        "include",
+        "plugin",
+        "custom",
+        "extension",
+        "replicate",
+        "frame",
+        "composite",
+        "flexcomp",
+        "attach",
+        "model",
+    }
+)
 _PATH_ATTRS = frozenset(
     {
         "file",
@@ -481,14 +497,212 @@ def _walk_pack_files(root: Path, *, check_urdf: bool = True) -> list[tuple[str, 
     return files
 
 
+def _check_element_budgets(elements: int, bodies: int, geoms: int, label: str) -> None:
+    if elements > MAX_XML_ELEMENTS:
+        raise PackValidationError(
+            f"XML element count {elements} exceeds budget {MAX_XML_ELEMENTS} in {label}",
+            code="INVALID_PACK",
+        )
+    if bodies > MAX_PACK_BODIES:
+        raise PackValidationError(
+            f"Body count {bodies} exceeds budget {MAX_PACK_BODIES} in {label}",
+            code="INVALID_PACK",
+        )
+    if geoms > MAX_PACK_GEOMS:
+        raise PackValidationError(
+            f"Geom count {geoms} exceeds budget {MAX_PACK_GEOMS} in {label}",
+            code="INVALID_PACK",
+        )
+
+
+def _validate_xml_text_tree(
+    xml_text: str,
+    label: str,
+    *,
+    root_resolved: Path | None = None,
+    xml_parent: Path | None = None,
+    vertex_budget_used: int = 0,
+    mesh_count_used: int = 0,
+    element_budget_used: int = 0,
+    body_budget_used: int = 0,
+    geom_budget_used: int = 0,
+) -> tuple[
+    list[tuple[str, str, str]],
+    int,
+    int,
+    int,
+    int,
+    int,
+    Path | None,
+    Path | None,
+    Path | None,
+    bool,
+    bool,
+]:
+    upper = xml_text.upper()
+    if "<!DOCTYPE" in upper:
+        raise PackValidationError(
+            f"Forbidden <!DOCTYPE construct in {label}", code="INVALID_PACK"
+        )
+    if "<!ENTITY" in upper:
+        raise PackValidationError(
+            f"Forbidden <!ENTITY construct in {label}", code="INVALID_PACK"
+        )
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise PackValidationError(
+            f"Malformed XML in {label}: {exc}", code="INVALID_PACK"
+        ) from None
+
+    if _local_tag(root.tag) == "robot":
+        raise PackValidationError(
+            f"URDF <robot> XML is not supported: {label}",
+            code="UNSUPPORTED_FORMAT",
+        )
+
+    mesh_base = xml_parent
+    tex_base = xml_parent
+    asset_base = xml_parent
+    has_meshdir = False
+    has_texturedir = False
+
+    ref_elements: list[tuple[str, str, str]] = []
+    inline_mesh_count = 0
+    inline_verts = 0
+    elem_count = 0
+    body_count = 0
+    geom_count = 0
+
+    stack: list[tuple[ET.Element, int]] = [(root, 1)]
+    while stack:
+        el, depth = stack.pop()
+        if depth > MAX_XML_DEPTH:
+            raise PackValidationError(
+                f"XML nesting depth {depth} exceeds limit {MAX_XML_DEPTH} in {label}",
+                code="INVALID_PACK",
+            )
+        tag = _local_tag(el.tag)
+        if tag in _FORBIDDEN_XML_TAGS:
+            raise PackValidationError(
+                f"Forbidden XML element <{tag}> in {label}",
+                code="INVALID_PACK",
+            )
+        elem_count += 1
+        if tag == "body":
+            body_count += 1
+        elif tag == "geom":
+            geom_count += 1
+        _check_element_budgets(elem_count, body_count, geom_count, label)
+        _check_element_budgets(
+            element_budget_used + elem_count,
+            body_budget_used + body_count,
+            geom_budget_used + geom_count,
+            label,
+        )
+        for attr, val in el.attrib.items():
+            attr_l = _local_tag(attr)
+            if attr_l in _PATH_ATTRS:
+                is_dir_attr = attr_l in {"meshdir", "texturedir", "assetdir"}
+                if _is_unsafe_rel_path(val, allow_dot_dir=is_dir_attr):
+                    raise PackValidationError(
+                        f"Unsafe path {val!r} in attribute {attr_l!r} of <{tag}>",
+                        code="PATH_ESCAPE",
+                    )
+                if val.strip().lower().endswith(".urdf"):
+                    raise PackValidationError(
+                        f"URDF reference {val!r} is not supported",
+                        code="UNSUPPORTED_FORMAT",
+                    )
+
+        if tag == "compiler" and root_resolved is not None and xml_parent is not None:
+            for dir_attr in ("assetdir", "meshdir", "texturedir"):
+                if dir_attr in el.attrib:
+                    d_val = el.attrib[dir_attr].strip()
+                    d_resolved = _check_contained(
+                        root_resolved, xml_parent / d_val, f"{dir_attr}={d_val!r}"
+                    )
+                    if not d_resolved.is_dir():
+                        raise PackValidationError(
+                            f"Compiler {dir_attr}={d_val!r} is not a directory",
+                            code="INVALID_PACK",
+                        )
+                    if dir_attr == "assetdir":
+                        asset_base = d_resolved
+                    elif dir_attr == "meshdir":
+                        mesh_base = d_resolved
+                        has_meshdir = True
+                    else:
+                        tex_base = d_resolved
+                        has_texturedir = True
+
+        if tag == "mesh" and "vertex" in el.attrib:
+            raw_v = el.attrib["vertex"].strip()
+            toks = raw_v.split()
+            try:
+                floats = [float(t) for t in toks]
+            except ValueError:
+                raise PackValidationError(
+                    f"Non-numeric inline mesh vertex data in {label}",
+                    code="INVALID_PACK",
+                ) from None
+            if not floats or len(floats) % 3 != 0 or not all(math.isfinite(x) for x in floats):
+                raise PackValidationError(
+                    f"Invalid inline mesh vertex data in {label}",
+                    code="INVALID_PACK",
+                )
+            inline_mesh_count += 1
+            if mesh_count_used + inline_mesh_count > MAX_MESH_FILES:
+                raise PackValidationError(
+                    f"Mesh count {mesh_count_used + inline_mesh_count} exceeds limit {MAX_MESH_FILES}",
+                    code="PACK_TOO_LARGE",
+                )
+            v_add = len(floats) // 3
+            inline_verts += v_add
+            if vertex_budget_used + inline_verts > MAX_TOTAL_VERTICES:
+                raise PackValidationError(
+                    f"Total vertex count {vertex_budget_used + inline_verts} exceeds budget {MAX_TOTAL_VERTICES}",
+                    code="PACK_TOO_LARGE",
+                )
+
+        if tag in {"mesh", "hfield", "skin", "model"} and "file" in el.attrib:
+            ref_elements.append((tag, "file", el.attrib["file"].strip()))
+        elif tag == "texture":
+            for t_attr in _TEXTURE_FILE_ATTRS:
+                if t_attr in el.attrib:
+                    ref_elements.append((tag, t_attr, el.attrib[t_attr].strip()))
+
+        for child in reversed(list(el)):
+            stack.append((child, depth + 1))
+
+    return (
+        ref_elements,
+        inline_mesh_count,
+        inline_verts,
+        elem_count,
+        body_count,
+        geom_count,
+        mesh_base,
+        tex_base,
+        asset_base,
+        has_meshdir,
+        has_texturedir,
+    )
+
+
 def validate_xml_file_security(
     xml_path: Path,
     root_dir: Path,
     *,
     vertex_budget_used: int = 0,
     mesh_count_used: int = 0,
+    element_budget_used: int = 0,
+    body_budget_used: int = 0,
+    geom_budget_used: int = 0,
     validate_refs: bool = True,
     validate_mesh_files: bool = True,
+    counts_out: dict[str, int] | None = None,
 ) -> tuple[list[Path], int, int, list[Path]]:
     """Validate XML security/budget rules, inline mesh budgets, and referenced asset closure within root_dir.
 
@@ -524,128 +738,33 @@ def validate_xml_file_security(
             f"XML file {xml_path.name} is not valid UTF-8: {exc}", code="INVALID_PACK"
         ) from None
 
-    upper = xml_text.upper()
-    if "<!DOCTYPE" in upper:
-        raise PackValidationError(
-            f"Forbidden <!DOCTYPE construct in {xml_path.name}", code="INVALID_PACK"
-        )
-    if "<!ENTITY" in upper:
-        raise PackValidationError(
-            f"Forbidden <!ENTITY construct in {xml_path.name}", code="INVALID_PACK"
-        )
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as exc:
-        raise PackValidationError(
-            f"Malformed XML in {xml_path.name}: {exc}", code="INVALID_PACK"
-        ) from None
-
-    if _local_tag(root.tag) == "robot":
-        raise PackValidationError(
-            f"URDF <robot> XML is not supported: {xml_path.name}",
-            code="UNSUPPORTED_FORMAT",
-        )
-
-    # Pass 1: depth, forbidden tags, path attribute safety, inline mesh budgets, and <compiler> dirs
-    mesh_base = xml_resolved.parent
-    tex_base = xml_resolved.parent
-    asset_base = xml_resolved.parent
-    has_meshdir = False
-    has_texturedir = False
-
-    ref_elements: list[tuple[str, str, str]] = []
-    inline_mesh_count = 0
-    inline_verts = 0
-
-    stack: list[tuple[ET.Element, int]] = [(root, 1)]
-    while stack:
-        el, depth = stack.pop()
-        if depth > MAX_XML_DEPTH:
-            raise PackValidationError(
-                f"XML nesting depth {depth} exceeds limit {MAX_XML_DEPTH} in {xml_path.name}",
-                code="INVALID_PACK",
-            )
-        tag = _local_tag(el.tag)
-        if tag in _FORBIDDEN_XML_TAGS:
-            raise PackValidationError(
-                f"Forbidden XML element <{tag}> in {xml_path.name}",
-                code="INVALID_PACK",
-            )
-        for attr, val in el.attrib.items():
-            attr_l = _local_tag(attr)
-            if attr_l in _PATH_ATTRS:
-                is_dir_attr = attr_l in {"meshdir", "texturedir", "assetdir"}
-                if _is_unsafe_rel_path(val, allow_dot_dir=is_dir_attr):
-                    raise PackValidationError(
-                        f"Unsafe path {val!r} in attribute {attr_l!r} of <{tag}>",
-                        code="PATH_ESCAPE",
-                    )
-                if val.strip().lower().endswith(".urdf"):
-                    raise PackValidationError(
-                        f"URDF reference {val!r} is not supported",
-                        code="UNSUPPORTED_FORMAT",
-                    )
-
-        if tag == "compiler":
-            for dir_attr in ("assetdir", "meshdir", "texturedir"):
-                if dir_attr in el.attrib:
-                    d_val = el.attrib[dir_attr].strip()
-                    d_resolved = _check_contained(
-                        root_resolved, xml_resolved.parent / d_val, f"{dir_attr}={d_val!r}"
-                    )
-                    if not d_resolved.is_dir():
-                        raise PackValidationError(
-                            f"Compiler {dir_attr}={d_val!r} is not a directory",
-                            code="INVALID_PACK",
-                        )
-                    if dir_attr == "assetdir":
-                        asset_base = d_resolved
-                    elif dir_attr == "meshdir":
-                        mesh_base = d_resolved
-                        has_meshdir = True
-                    else:
-                        tex_base = d_resolved
-                        has_texturedir = True
-
-        if tag == "mesh" and "vertex" in el.attrib:
-            raw_v = el.attrib["vertex"].strip()
-            toks = raw_v.split()
-            try:
-                floats = [float(t) for t in toks]
-            except ValueError:
-                raise PackValidationError(
-                    f"Non-numeric inline mesh vertex data in {xml_path.name}",
-                    code="INVALID_PACK",
-                ) from None
-            if not floats or len(floats) % 3 != 0 or not all(math.isfinite(x) for x in floats):
-                raise PackValidationError(
-                    f"Invalid inline mesh vertex data in {xml_path.name}",
-                    code="INVALID_PACK",
-                )
-            inline_mesh_count += 1
-            if mesh_count_used + inline_mesh_count > MAX_MESH_FILES:
-                raise PackValidationError(
-                    f"Mesh count {mesh_count_used + inline_mesh_count} exceeds limit {MAX_MESH_FILES}",
-                    code="PACK_TOO_LARGE",
-                )
-            v_add = len(floats) // 3
-            inline_verts += v_add
-            if vertex_budget_used + inline_verts > MAX_TOTAL_VERTICES:
-                raise PackValidationError(
-                    f"Total vertex count {vertex_budget_used + inline_verts} exceeds budget {MAX_TOTAL_VERTICES}",
-                    code="PACK_TOO_LARGE",
-                )
-
-        if tag in {"mesh", "hfield", "skin", "model"} and "file" in el.attrib:
-            ref_elements.append((tag, "file", el.attrib["file"].strip()))
-        elif tag == "texture":
-            for t_attr in _TEXTURE_FILE_ATTRS:
-                if t_attr in el.attrib:
-                    ref_elements.append((tag, t_attr, el.attrib[t_attr].strip()))
-
-        for child in reversed(list(el)):
-            stack.append((child, depth + 1))
+    (
+        ref_elements,
+        inline_mesh_count,
+        inline_verts,
+        elem_count,
+        body_count,
+        geom_count,
+        mesh_base,
+        tex_base,
+        asset_base,
+        has_meshdir,
+        has_texturedir,
+    ) = _validate_xml_text_tree(
+        xml_text,
+        xml_path.name,
+        root_resolved=root_resolved,
+        xml_parent=xml_resolved.parent,
+        vertex_budget_used=vertex_budget_used,
+        mesh_count_used=mesh_count_used,
+        element_budget_used=element_budget_used,
+        body_budget_used=body_budget_used,
+        geom_budget_used=geom_budget_used,
+    )
+    if counts_out is not None:
+        counts_out["elements"] = elem_count
+        counts_out["bodies"] = body_count
+        counts_out["geoms"] = geom_count
 
     # Pass 2: resolve references relative to XML's own parent dir / compiler dirs
     referenced_meshes: list[Path] = []
@@ -659,6 +778,7 @@ def validate_xml_file_security(
                 base = tex_base if has_texturedir else asset_base
             else:
                 base = asset_base
+            assert base is not None
             resolved_ref = _check_contained(
                 root_resolved, base / rel_file, f"<{tag} {attr_name}={rel_file!r}>"
             )
@@ -882,20 +1002,31 @@ def validate_pack_security(
     if primary_xml not in xml_files:
         xml_files.append(primary_xml)
 
-    # Validate ALL XML files in the pack (including inline mesh counts/vertices + reference closure)
+    # Validate ALL XML files in the pack (including inline mesh counts/vertices, element budgets, + reference closure)
     inline_mesh_total = 0
     total_vertices = 0
+    total_elements = 0
+    total_bodies = 0
+    total_geoms = 0
     for xf in xml_files:
+        xf_counts: dict[str, int] = {}
         ref_meshes, inline_cnt, inline_verts, _ = validate_xml_file_security(
             xf,
             root,
             vertex_budget_used=total_vertices,
             mesh_count_used=len(mesh_files) + inline_mesh_total,
+            element_budget_used=total_elements,
+            body_budget_used=total_bodies,
+            geom_budget_used=total_geoms,
             validate_refs=True,
             validate_mesh_files=False,
+            counts_out=xf_counts,
         )
         inline_mesh_total += inline_cnt
         total_vertices += inline_verts
+        total_elements += xf_counts.get("elements", 0)
+        total_bodies += xf_counts.get("bodies", 0)
+        total_geoms += xf_counts.get("geoms", 0)
         for rm in ref_meshes:
             if rm not in mesh_files:
                 mesh_files[rm] = rm.relative_to(root).as_posix()
@@ -1393,16 +1524,49 @@ def compose_spec(
     robot: str = "b601dm",
 ) -> None:
     """Attach optional ScenePack world XML and ToolPack end-effector XML onto base robot MjSpec."""
+    scene_counts: dict[str, int] = {"elements": 0, "bodies": 0, "geoms": 0}
+    tool_counts: dict[str, int] = {"elements": 0, "bodies": 0, "geoms": 0}
+    scene_ref_meshes: list[Path] = []
+    scene_root: Path | None = None
+
+    if scene_pack is not None:
+        scene_root = _pack_root_dir(scene_pack.source_ref, scene_pack.world_xml_path)
+        scene_ref_meshes, _, _, _ = validate_xml_file_security(
+            scene_pack.world_xml_path, scene_root, counts_out=scene_counts
+        )
+
+    if tool_pack is not None and not tool_pack.is_default:
+        if tool_pack.tool_spec_xml is not None:
+            _, _, _, t_el, t_bo, t_ge, *_ = _validate_xml_text_tree(
+                tool_pack.tool_spec_xml, f"tool preset {tool_pack.id}"
+            )
+            tool_counts = {"elements": t_el, "bodies": t_bo, "geoms": t_ge}
+        elif tool_pack.tool_xml_path is not None:
+            tool_root = _pack_root_dir(tool_pack.source_ref, tool_pack.tool_xml_path)
+            validate_xml_file_security(
+                tool_pack.tool_xml_path, tool_root, counts_out=tool_counts
+            )
+        else:
+            raise ValueError(
+                f"ToolPack {tool_pack.id!r} has neither tool_xml_path nor tool_spec_xml"
+            )
+
+    _check_element_budgets(
+        scene_counts["elements"] + tool_counts["elements"],
+        scene_counts["bodies"] + tool_counts["bodies"],
+        scene_counts["geoms"] + tool_counts["geoms"],
+        "combined scene + tool packs",
+    )
+
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore", message=".*empty prefix.*", category=UserWarning
         )
 
         if scene_pack is not None:
+            assert scene_root is not None
             _delete_named(spec, "bodies", ["cube"])
-            scene_root = _pack_root_dir(scene_pack.source_ref, scene_pack.world_xml_path)
-            ref_meshes, _, _, _ = validate_xml_file_security(scene_pack.world_xml_path, scene_root)
-            has_local_meshes = bool(ref_meshes) or (
+            has_local_meshes = bool(scene_ref_meshes) or (
                 bool(scene_pack.source_ref)
                 and Path(scene_pack.source_ref).is_dir()
                 and any(
@@ -1441,8 +1605,6 @@ def compose_spec(
             if tool_pack.tool_spec_xml is not None:
                 tool_spec = mujoco.MjSpec.from_string(tool_pack.tool_spec_xml)
             elif tool_pack.tool_xml_path is not None:
-                tool_root = _pack_root_dir(tool_pack.source_ref, tool_pack.tool_xml_path)
-                validate_xml_file_security(tool_pack.tool_xml_path, tool_root)
                 tool_spec = mujoco.MjSpec.from_file(str(tool_pack.tool_xml_path))
             else:
                 raise ValueError(
