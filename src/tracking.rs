@@ -248,6 +248,11 @@ pub struct TrackingRuntime {
     pub history_state: TrackingHistoryState,
     pub last_issued_positions: Option<Vec<f32>>,
     pub last_issued_velocities: Option<Vec<f32>>,
+    /// Nominal reference (`q_d`) of the tick that issued `last_issued_positions` and its
+    /// discrete velocity (`(q_d - q_d_prev) / dt`). The issued lead is
+    /// `last_issued_positions - last_nominal.0`. None: unknown, the issued output is taken
+    /// as nominal (zero lead).
+    pub last_nominal: Option<(Vec<f32>, Vec<f32>)>,
     /// Persistent monotonic workspace escape baseline for issued tracking outputs,
     /// tagged with `workspace_revision` and committed only after a successful write.
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
@@ -277,6 +282,9 @@ pub struct TrackingRuntime {
     /// Motion caps (`ActiveTrajectory::motion_limits`) of a planned motion whose reference
     /// finished, kept in force until it has settled and its residual lead is ramped out.
     pub retained_motion_limits: Option<Vec<crate::model::JointLimit>>,
+    /// Ticks whose issued output was the lead withdrawal after the lead candidate failed
+    /// validation (`TrackingOutput::withdrawn`); diagnostics only.
+    pub withdrawal_ticks: u64,
 }
 
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
@@ -314,6 +322,7 @@ impl TrackingRuntime {
             self.history_state = TrackingHistoryState::Stationary;
             self.last_issued_positions = Some(positions.to_vec());
             self.last_issued_velocities = Some(vec![0.0; positions.len()]);
+            self.last_nominal = Some((positions.to_vec(), vec![0.0; positions.len()]));
             self.ws_min_depths = None;
             self.ws_keepout_min_depths = None;
             self.recovery_suspended = false;
@@ -374,11 +383,17 @@ impl TrackingRuntime {
                     if let Some(v) = prev_v.get_mut(j) {
                         *v = 0.0;
                     }
+                    // The driver's hold put the joint at rest at q with zero lead.
+                    if let Some((nq, nv)) = self.last_nominal.as_mut().filter(|(nq, nv)| nq.len() == dof && nv.len() == dof) {
+                        nq[j] = q;
+                        nv[j] = 0.0;
+                    }
                 }
             }
         } else {
             self.history_state = TrackingHistoryState::Unknown;
             self.last_issued_velocities = None;
+            self.last_nominal = None;
         }
     }
 
@@ -393,6 +408,7 @@ impl TrackingRuntime {
         self.history_state = TrackingHistoryState::Issued;
         self.last_issued_positions = Some(positions);
         self.last_issued_velocities = Some(velocities);
+        self.last_nominal = None;
     }
 
     /// Record a successfully issued combined output vector and commit its workspace escape depths.
@@ -417,6 +433,7 @@ impl TrackingRuntime {
         self.history_state = TrackingHistoryState::Issued;
         self.last_issued_positions = Some(positions);
         self.last_issued_velocities = Some(velocities);
+        self.last_nominal = None;
         self.ws_min_depths = ws_min_depths;
         self.ws_keepout_min_depths = ws_keepout_min_depths;
     }
@@ -426,9 +443,28 @@ impl TrackingRuntime {
         self.history_state = TrackingHistoryState::Unknown;
         self.last_issued_positions = None;
         self.last_issued_velocities = None;
+        self.last_nominal = None;
         self.ws_min_depths = None;
         self.ws_keepout_min_depths = None;
         self.fallback_ramp = None;
+    }
+
+    /// Nominal history entry for an output issued this tick against nominal `q_d`: `q_d`
+    /// and its discrete velocity from the previous nominal (from the previous issued output
+    /// when the nominal is unknown; zero without history). Call before `record_issued*`.
+    pub fn nominal_entry(&self, q_d: &[f32], dt: f64) -> (Vec<f32>, Vec<f32>) {
+        let dof = q_d.len();
+        let prev = self
+            .last_nominal
+            .as_ref()
+            .map(|(q, _)| q)
+            .or(self.last_issued_positions.as_ref())
+            .filter(|q| q.len() == dof && dt.is_finite() && dt > 0.0);
+        let v = match prev {
+            Some(p) => q_d.iter().zip(p).map(|(&q, &p0)| ((f64::from(q) - f64::from(p0)) / dt) as f32).collect(),
+            None => vec![0.0; dof],
+        };
+        (q_d.to_vec(), v)
     }
 }
 
@@ -457,7 +493,10 @@ pub struct ValidatedFallback {
 pub struct TrackingOutput {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
+    /// 1: the shaped lead toward its target; 0: the shaped withdrawal toward zero lead.
     pub multiplier: f32,
+    /// True when the lead candidate failed validation and this is its withdrawal.
+    pub withdrawn: bool,
     pub sweep_evals_used: usize,
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     pub ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
@@ -596,19 +635,31 @@ impl crate::supervisor::SupervisorInner {
         self.compute_position_lead_output_with_limits(dt, jt, &limits)
     }
 
-    /// Compute and validate the combined joint vector for Phase 1 position-lead tracking
-    /// against explicit `active_limits`.
+    /// Compute and validate the combined joint vector for position-lead tracking against the
+    /// motion caps `active_limits`.
     ///
     /// Pure read-only evaluation (`&self`): never mutates live escape bookkeeping
     /// (`servo_ws_min_depths` or `tracking.ws_min_depths`) or nominal state during candidate checks.
     ///
+    /// Limits: `active_limits` (the motion's caps) bound the NOMINAL reference `q_d`; a nominal
+    /// step above them is rejected. The issued output `q_d + lead` of a lead joint is bound by
+    /// `|v_out| <= min(v_phys, v_cap + lag * a_cap)`, `|a_out| <= a_phys` (profile joint limits),
+    /// `|lead| <= max_lead_rad` and `|lead_k - lead_{k-1}| <= lag * a_cap * dt`; joints without
+    /// lead keep the motion caps. The lead is shaped (second order, braking at `a_phys / 2`)
+    /// toward `lag * v_d`, so it stays continuous at motion start, stop, reversal and saturation.
+    ///
+    /// Candidates: the shaped lead (`multiplier` 1), then the shaped withdrawal toward zero lead
+    /// under the same bounds (`multiplier` 0). A lead-only failure therefore withdraws the lead
+    /// instead of failing the motion; an error is returned only for a nominal violation or when
+    /// the withdrawal itself fails validation.
+    ///
     /// Segment contracts:
-    /// - Prev-issued segment (`prev_q -> q_cand`): joint position limits, active motion velocity
-    ///   and acceleration limits (planned/servo/policy/power-governor caps, no multiplicative
-    ///   inflation), and workspace/keep-out sweep using revision-tagged persistent escape depths.
+    /// - Prev-issued segment (`prev_q -> q_cand`): joint position limits, the output velocity
+    ///   and acceleration limits above, and workspace/keep-out sweep using revision-tagged
+    ///   persistent escape depths.
     /// - Measured segment (`q_m -> q_cand`, when feedback is fresh): swept workspace, keep-outs,
     ///   link capsules and self-collision along the physical chord from `q_m` to `q_cand`, plus
-    ///   the streaming directional `servo_max_lead_rad` allowance (all multipliers including 0).
+    ///   the streaming directional `servo_max_lead_rad` allowance (every candidate).
     ///   Step velocity/acceleration limits are NOT applied to `(q_cand - q_m) / dt` because
     ///   `q_cand - q_m` includes normal steady-state plant lag.
     pub fn compute_position_lead_output_with_limits(
@@ -633,8 +684,6 @@ impl crate::supervisor::SupervisorInner {
         use crate::safety::SafetyError;
         use crate::supervisor::MAX_KEEPOUT_EVALS_PER_TICK;
 
-        const LEAD_MULTIPLIERS: &[f32] = &[1.0, 0.5, 0.25, 0.125, 0.0];
-        const ZERO_ONLY: &[f32] = &[0.0];
 
         let dof = self.config.dof;
         if !dt.is_finite() || dt <= 0.0
@@ -773,24 +822,174 @@ impl crate::supervisor::SupervisorInner {
             None
         };
 
-        // 4. Try multipliers 1, 1/2, 1/4, 1/8, 0 in order on the combined joint vector,
-        // sharing one per-tick workspace subdivision budget across all attempts and both segments.
-        let multipliers = if has_desired_lead { LEAD_MULTIPLIERS } else { ZERO_ONLY };
+        // 4. Nominal reference check. The motion's caps (`active_limits`) bound the NOMINAL
+        // reference; only a nominal violation is a motion fault (as the zero-lead candidate of
+        // Phase 1). The previous nominal comes from the nominal history; without it the
+        // previous issued output counts as nominal (zero lead). An unknown history seeded
+        // from the measurement trusts the reference velocity and treats the measured offset
+        // as lead to withdraw.
+        let dtf = dt;
+        let unknown = self.tracking.history_state == TrackingHistoryState::Unknown;
+        let (nom_q_prev, nom_v_prev): (Vec<f64>, Vec<f64>) = match (&self.tracking.last_nominal, unknown) {
+            (Some((nq, nv)), false) if nq.len() == dof && nv.len() == dof => (
+                nq.iter().map(|&q| f64::from(q)).collect(),
+                nv.iter().map(|&v| f64::from(v)).collect(),
+            ),
+            (_, true) => {
+                // Seeded at the measurement: a lead joint whose measured offset from the
+                // reference is within its max_lead takes that offset as lead to withdraw;
+                // every other joint is checked from the measurement (Phase 1).
+                let mut nq: Vec<f64> = prev_q.iter().map(|&q| f64::from(q)).collect();
+                let mut nv = vec![0.0_f64; dof];
+                for (k, &j) in arm_indices.iter().enumerate() {
+                    let jc = &jt.joints[k];
+                    let ref_prev = f64::from(self.commanded_positions[j]) - f64::from(self.commanded_velocities[j]) * dtf;
+                    if jc.strategy == TrackingStrategy::PositionLead
+                        && jc.lag_s > 0.0
+                        && (nq[j] - ref_prev).abs() <= f64::from(jc.max_lead_rad)
+                    {
+                        nq[j] = ref_prev;
+                        nv[j] = f64::from(self.commanded_velocities[j]);
+                    }
+                }
+                (nq, nv)
+            }
+            _ => (
+                prev_q.iter().map(|&q| f64::from(q)).collect(),
+                (0..dof).map(|i| prev_v.map_or(0.0, |pv| f64::from(pv[i]))).collect(),
+            ),
+        };
+        let mut v_nom = vec![0.0_f64; dof];
+        let mut a_nom = vec![0.0_f64; dof];
+        for &j in &arm_indices {
+            let lim = &active_limits[j];
+            v_nom[j] = (f64::from(self.commanded_positions[j]) - nom_q_prev[j]) / dtf;
+            a_nom[j] = (v_nom[j] - nom_v_prev[j]) / dtf;
+            if !v_nom[j].is_finite() || v_nom[j].abs() > f64::from(lim.max_velocity) + 1e-4 {
+                return Err(TrackingReject::JointLimit(format!(
+                    "joint {} nominal velocity {:.3} rad/s exceeds limit {:.3}",
+                    j + 1,
+                    v_nom[j],
+                    lim.max_velocity
+                )));
+            }
+            if !a_nom[j].is_finite() || a_nom[j].abs() > f64::from(lim.max_acceleration) + 1e-3 {
+                return Err(TrackingReject::JointLimit(format!(
+                    "joint {} nominal acceleration {:.3} rad/s^2 exceeds limit {:.3}",
+                    j + 1,
+                    a_nom[j],
+                    lim.max_acceleration
+                )));
+            }
+        }
+
+        // 5. Output (issued) limits and the lead window per arm joint. With lead strategy
+        // and lag > 0 the issued target may exceed the nominal speed cap by the lead's own
+        // rate, never the profile joint limits:
+        //   |v_out| <= min(v_phys, v_cap + lag * a_cap),  |a_out| <= a_phys,
+        //   |lead_k - lead_{k-1}| <= lag * a_cap * dt,
+        // where v_cap / a_cap are the active motion caps and v_phys / a_phys the profile
+        // joint limits. Without lead the output limits are the motion caps (Phase 1).
+        let mut out_lim: Vec<(f64, f64)> = vec![(0.0, 0.0); dof];
+        let mut window: Vec<(f64, f64)> = vec![(0.0, 0.0); dof];
+        let mut lead_prev = vec![0.0_f64; dof];
+        for (k, &j) in arm_indices.iter().enumerate() {
+            let jc = &jt.joints[k];
+            let cap = &active_limits[j];
+            let phys = &self.config.limits[j];
+            let lag = if jc.strategy == TrackingStrategy::PositionLead { f64::from(jc.lag_s) } else { 0.0 };
+            let (v_lim, a_lim) = if lag > 0.0 {
+                (
+                    f64::from(phys.max_velocity).min(f64::from(cap.max_velocity) + lag * f64::from(cap.max_acceleration)),
+                    f64::from(phys.max_acceleration),
+                )
+            } else {
+                (f64::from(cap.max_velocity), f64::from(cap.max_acceleration))
+            };
+            out_lim[j] = (v_lim, a_lim);
+            let qd = f64::from(self.commanded_positions[j]);
+            let qp = f64::from(prev_q[j]);
+            let vp = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
+            lead_prev[j] = qp - nom_q_prev[j];
+            let base = qp - qd;
+            let mut lo = (base - v_lim * dtf).max(base + (vp - a_lim * dtf) * dtf);
+            let mut hi = (base + v_lim * dtf).min(base + (vp + a_lim * dtf) * dtf);
+            if lag > 0.0 {
+                let step = lag * f64::from(cap.max_acceleration) * dtf;
+                lo = lo.max(lead_prev[j] - step);
+                hi = hi.min(lead_prev[j] + step);
+            }
+            window[j] = (lo, hi);
+        }
+
+        // Hard bounds of the lead per arm joint, each with the rate at which it moves:
+        // +-max(max_lead, |lead|) (static) and, while streaming with fresh feedback, the
+        // measured-lead allowance `q_m +- servo_max_lead_rad - q_d` (moving with
+        // `v_m - v_nom`). Upper bounds first, lower bounds second.
+        type Bound = (f64, f64);
+        let mut bounds: Vec<(Vec<Bound>, Vec<Bound>)> = vec![(Vec::new(), Vec::new()); dof];
+        for (k, &j) in arm_indices.iter().enumerate() {
+            let b = f64::from(jt.joints[k].max_lead_rad).max(lead_prev[j].abs());
+            let (ups, downs) = &mut bounds[j];
+            ups.push((b, 0.0));
+            downs.push((-b, 0.0));
+            if in_streaming && fresh_meas {
+                let sl = f64::from(self.config.servo_max_lead_rad);
+                let meas = f64::from(self.measured_positions[j]);
+                let qd = f64::from(self.commanded_positions[j]);
+                let vm = self.measured_velocities.get(j).copied().filter(|v| v.is_finite()).map_or(0.0, f64::from);
+                let rate = vm - v_nom[j];
+                ups.push(((meas + sl - qd).max(0.0), rate));
+                downs.push(((meas - sl - qd).min(0.0), rate));
+            }
+        }
+
+        // Second-order shaped step of the lead toward `target`: braking at half the output
+        // acceleration limit toward the target and toward each (moving) bound, so the lead is
+        // continuous at motion start, stop, reversal and saturation; then clamped to the
+        // dynamics window and the hard bounds.
+        let shaped = |target: &[f32]| -> Vec<f32> {
+            let mut q_cand = self.commanded_positions.clone();
+            for &j in &arm_indices {
+                let l0 = lead_prev[j];
+                let brake = 0.5 * out_lim[j].1;
+                let (ups, downs) = &bounds[j];
+                let b_hi = ups.iter().map(|b| b.0).fold(f64::INFINITY, f64::min);
+                let b_lo = downs.iter().map(|b| b.0).fold(f64::NEG_INFINITY, f64::max);
+                let t = f64::from(target[j]).clamp(b_lo.min(b_hi), b_hi);
+                let e = t - l0;
+                let mut r = e.signum() * (e.abs() / dtf).min((2.0 * brake * e.abs()).sqrt());
+                for &(hi, rate) in ups {
+                    r = r.min(rate + (2.0 * brake * (hi - l0).max(0.0)).sqrt());
+                }
+                for &(lo, rate) in downs {
+                    r = r.max(rate - (2.0 * brake * (l0 - lo).max(0.0)).sqrt());
+                }
+                let (lo, hi) = window[j];
+                let mut l = l0 + r * dtf;
+                l = if lo <= hi { l.clamp(lo, hi) } else { 0.5 * (lo + hi) };
+                l = l.min(b_hi).max(b_lo.min(b_hi));
+                let lim = &self.config.limits[j];
+                q_cand[j] = ((f64::from(self.commanded_positions[j]) + l) as f32).clamp(lim.min_position, lim.max_position);
+            }
+            q_cand
+        };
+
+        // 6. Candidates: the shaped lead toward its target, then (when that output fails
+        // validation) the shaped withdrawal of the lead toward plain position output, under
+        // the same bounds. Each candidate is checked as a combined joint vector, sharing one
+        // per-tick workspace subdivision budget across candidates and both segments.
+        let zero_target = vec![0.0_f32; dof];
+        let mut candidates: Vec<(f32, Vec<f32>)> = Vec::with_capacity(2);
+        if has_desired_lead {
+            candidates.push((1.0, shaped(&base_lead)));
+        }
+        candidates.push((0.0, shaped(&zero_target)));
         let mut last_err: Option<TrackingReject> = None;
         let budget_start = *budget;
 
-        'cand: for &m in multipliers {
-            let mut q_cand = self.commanded_positions.clone();
-            if m != 0.0 {
-                for &j in &arm_indices {
-                    let l = base_lead[j];
-                    if l != 0.0 {
-                        let lim = &self.config.limits[j];
-                        q_cand[j] = (q_cand[j] + m * l).clamp(lim.min_position, lim.max_position);
-                    }
-                }
-            }
-
+        let lead_tried = candidates.len() > 1;
+        'cand: for (m, q_cand) in candidates {
             // Per-joint position, directional allowance, velocity, and acceleration checks.
             for &j in &arm_indices {
                 let lim = &active_limits[j];
@@ -835,24 +1034,21 @@ impl crate::supervisor::SupervisorInner {
                         }
                     }
                 }
+                let (v_lim_out, a_lim_out) = out_lim[j];
                 let v_cand = (f64::from(q) - f64::from(prev_q[j])) / dt;
                 let v_prev_j = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
                 let a_cand = (v_cand - v_prev_j) / dt;
-                let v_lim = f64::from(lim.max_velocity) + 1e-4;
-                let a_lim = f64::from(lim.max_acceleration) + 1e-3;
-                if !v_cand.is_finite() || v_cand.abs() > v_lim {
+                if !v_cand.is_finite() || v_cand.abs() > v_lim_out + 1e-4 {
                     last_err = Some(TrackingReject::JointLimit(format!(
-                        "joint {} output velocity {v_cand:.3} rad/s exceeds limit {:.3}",
-                        j + 1,
-                        lim.max_velocity
+                        "joint {} output velocity {v_cand:.3} rad/s exceeds limit {v_lim_out:.3}",
+                        j + 1
                     )));
                     continue 'cand;
                 }
-                if !a_cand.is_finite() || a_cand.abs() > a_lim {
+                if !a_cand.is_finite() || a_cand.abs() > a_lim_out + 1e-3 {
                     last_err = Some(TrackingReject::JointLimit(format!(
-                        "joint {} output acceleration {a_cand:.3} rad/s^2 exceeds limit {:.3}",
-                        j + 1,
-                        lim.max_acceleration
+                        "joint {} output acceleration {a_cand:.3} rad/s^2 exceeds limit {a_lim_out:.3}",
+                        j + 1
                     )));
                     continue 'cand;
                 }
@@ -901,6 +1097,7 @@ impl crate::supervisor::SupervisorInner {
                 positions: q_cand,
                 velocities: v_out,
                 multiplier: m,
+                withdrawn: lead_tried && m == 0.0,
                 sweep_evals_used: budget_start.saturating_sub(*budget),
                 ws_min_depths: committed_ws_min_d,
                 ws_keepout_min_depths: None,
@@ -1093,6 +1290,7 @@ impl crate::supervisor::SupervisorInner {
             positions: q_next,
             velocities: v_out,
             multiplier: 0.0,
+            withdrawn: false,
             sweep_evals_used: budget_start.saturating_sub(*budget),
             ws_min_depths: committed_ws_min_d,
             ws_keepout_min_depths: committed_keepout_min_d,

@@ -767,8 +767,9 @@ fn lead_limits_and_withdrawal() {
         inner.commanded_velocities[0] = 0.020 / 0.68;
         inner.commanded_velocities[1] = 0.020 / 0.65;
         let jt_ref = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt_ref).expect("should back off to smaller multiplier");
-        assert!(out.multiplier < 1.0 && out.multiplier > 0.0, "expected reduced multiplier (1/2..1/8), got {}", out.multiplier);
+        // The lead candidate enters the box: the lead is withdrawn (shaped, here from zero).
+        let out = inner.compute_position_lead_output(DT, &jt_ref).expect("should withdraw the lead");
+        assert_eq!(out.multiplier, 0.0, "expected the withdrawal candidate, got {}", out.multiplier);
         // Combined output must clear the keepout box.
         let ws = inner.config.workspace.as_ref().unwrap();
         assert_eq!(inner.config.arm_model.workspace_violation(&out.positions, ws, &inner.config.camera_mount).total, 0.0);
@@ -812,7 +813,7 @@ fn lead_limits_and_withdrawal() {
         let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
         assert!((q_out - obs.commanded_positions[0]).abs() <= 1e-6, "stale feedback must suppress lead, got q_out={q_out} vs q_d={}", obs.commanded_positions[0]);
 
-        // Subcase d2: large active lead + stale feedback -> snapping back to nominal exceeds accel limit -> fault!
+        // Subcase d2: large active lead + stale feedback -> shaped withdrawal, no fault.
         let cfg2 = ArmConfig {
             lease_timeout_ms: 600_000,
             workspace: None,
@@ -838,22 +839,27 @@ fn lead_limits_and_withdrawal() {
         let lead_big = prev_confirmed[0] - inner2.commanded_positions[0];
         assert!(lead_big > 0.015, "expected large active lead, got {lead_big}");
 
+        // Stale feedback requests zero lead: the lead is withdrawn smoothly (bounded rate and
+        // acceleration), the motion continues, no fault (the Phase 1 one-tick drop faulted).
         let writes_before = drv2.with(|s| s.written.len());
         drv2.with(|s| s.feedback_age = Duration::from_millis(150));
-        let obs2 = inner2.tick(DT);
-        assert!(matches!(obs2.safety_state, SafetyState::Fault(_)), "unsafe stale withdrawal must fault, got {:?}", obs2.safety_state);
-        assert_eq!(obs2.fault.as_ref().map(|f| f.code), Some(FaultCode::JointLimit));
-        assert!(inner2.active_trajectory.is_none(), "motion must be terminated");
-        // B2: with stale (150 ms) feedback, fallback must preserve the last confirmed safe output
-        // rather than writing a hold synthesized from the stale 150 ms-old measured sample!
-        assert_eq!(inner2.tracking.last_issued_positions.as_deref(), Some(prev_confirmed.as_slice()));
-        let fallback_written = drv2.with(|s| s.written[writes_before][0].position);
-        assert!(
-            (fallback_written - prev_confirmed[0]).abs() <= 1e-6,
-            "stale-feedback fallback must hold last confirmed output {}, got {fallback_written} (stale q_m={})",
-            prev_confirmed[0],
-            obs2.positions[0]
-        );
+        let mut prev_lead = lead_big;
+        for k in 0..40 {
+            let obs2 = inner2.tick(DT);
+            assert!(obs2.safety_state.is_operational(), "stale withdrawal tick {k} must not fault: {:?}", obs2.safety_state);
+            let q_out = drv2.with(|s| s.written.last().unwrap()[0].position);
+            let lead = q_out - obs2.commanded_positions[0];
+            assert!(lead <= prev_lead + 1e-6 && lead >= -1e-6, "tick {k}: lead {lead} must shrink monotonically from {prev_lead}");
+            prev_lead = lead;
+        }
+        assert!(prev_lead.abs() <= 1e-5, "lead must be withdrawn within 0.8 s, still {prev_lead}");
+        let frames = drv2.with(|s| s.written[writes_before - 2..].to_vec());
+        for w in frames.windows(3) {
+            let v1 = f64::from(w[1][0].position - w[0][0].position) / DT;
+            let v2 = f64::from(w[2][0].position - w[1][0].position) / DT;
+            assert!(v2.abs() <= 2.0 + 1e-4 && ((v2 - v1) / DT).abs() <= 5.0 + 1e-2, "issued v {v2:.4} a {:.3}", (v2 - v1) / DT);
+        }
+        drv2.with(|s| s.feedback_age = Duration::ZERO);
     }
 
     // --- (e) Unsafe return to nominal (keep-out between last_issued and nominal q_d) ---
@@ -1446,15 +1452,21 @@ fn tracking_active_limits_and_measured_segment_contract() {
         cfg.limits[0].max_acceleration = 100.0;
         let q0 = [0.0_f32; 7];
         let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        // At v_d = 0.015 rad/s, base_lead = 0.0102 rad.
-        // Full lead (m=1) over DT=0.02s gives v_cand = 0.0102/0.02 = 0.51 rad/s (> 0.09 cap, < 2.0 raw!).
-        // Only m=1/8 gives lead=0.001275 -> v_cand = 0.064 rad/s <= 0.09 cap!
+        // The motion cap (0.09 rad/s) bounds the NOMINAL reference. The issued output may
+        // exceed it by the lead's own rate, bounded by min(v_phys, v_cap + lag * a_cap)
+        // (= min(2.0, 0.09 + 0.68 * 100) = 2.0 rad/s here).
+        // At v_d = 0.015 rad/s, base_lead = 0.0102 rad -> 0.51 rad/s issued in one tick.
         inner.commanded_velocities[0] = 0.015;
         let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale down to fit active speed cap");
-        assert!(out.multiplier < 1.0, "full lead must be rejected by active speed_cap, got m={}", out.multiplier);
+        let out = inner.compute_position_lead_output(DT, &jt).expect("lead within the output bound");
+        assert_eq!(out.multiplier, 1.0);
         let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
-        assert!(v_out <= 0.09 + 1e-4, "issued speed {v_out} exceeded active planned cap 0.09");
+        assert!((out.positions[0] - 0.0102).abs() < 1e-5, "lead {}", out.positions[0]);
+        assert!(v_out <= 2.0 + 1e-4, "issued speed {v_out} exceeded the physical bound 2.0");
+        // A nominal reference faster than the motion cap is rejected (nominal violation).
+        inner.commanded_positions[0] = (0.10 * DT) as f32; // 0.10 rad/s > 0.09 cap
+        let err = inner.compute_position_lead_output(DT, &jt).expect_err("nominal above the cap");
+        assert!(format!("{err:?}").contains("nominal velocity"), "{err:?}");
     }
 
     // 2. Measured-segment keep-out contract: prev_q -> q_cand is clear, but q_m -> q_cand cuts a keep-out box.
@@ -1512,12 +1524,15 @@ fn tracking_active_limits_and_measured_segment_contract() {
         let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         inner.servo_target = Some(vec![0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         inner.servo_stream_active = true;
-        inner.commanded_velocities[0] = 0.02; // base_lead = 0.0136 -> full lead v = 0.68 > 0.10 servo cap
+        inner.commanded_velocities[0] = 0.02; // base_lead = 0.0136 -> 0.68 rad/s issued > 0.10 servo cap
         let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale lead to fit servo cap");
-        assert!(out.multiplier < 1.0, "full lead must be rejected by servo_max_velocity, got m={}", out.multiplier);
+        let out = inner.compute_position_lead_output(DT, &jt).expect("lead within the output bound");
+        assert_eq!(out.multiplier, 1.0);
         let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
-        assert!(v_out <= 0.10 + 1e-4, "streaming speed {v_out} exceeded servo_max_velocity 0.10");
+        assert!(v_out <= 2.0 + 1e-4, "streaming speed {v_out} exceeded the physical bound 2.0");
+        // The nominal stream reference is still bound by servo_max_velocity.
+        inner.commanded_positions[0] = (0.12 * DT) as f32;
+        assert!(inner.compute_position_lead_output(DT, &jt).is_err(), "nominal above servo_max_velocity");
     }
 }
 
@@ -4415,4 +4430,390 @@ fn tracking_rest_reference_age_spans_oldest_reference_reply() {
         TrackingHistoryState::Unknown,
         "the reference's oldest reply is 110 ms before the current sample: no evidence"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Real-arm incident 2026-11-22 (rebot-teleop 1.5.0-rc2, B601-DM): J1-only position lead
+// (lag 0.68 s, max 0.03 rad), joint-space move_to between (0.255, 0.08, 0.43) and
+// (0.255, 0.12, 0.43), pitch 41°, yaw outward, speed_scale 0.3. The first A -> B move latched
+// JOINT_LIMIT "joint 1 output velocity -0.715 rad/s exceeds limit 0.135".
+//
+// Reusable before a real-arm enable (docs/simulation.md, "Joint tracking A/B check"):
+//   scripts/tracking_lead_sim.sh [profile.json] [plant taus]
+// = REBOT_TRACKING_PROFILE=<profile.json> REBOT_TRACKING_PLANT_TAU=0.68,0.65,0.71,0.17,0,0,0 \
+//   cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture
+// ---------------------------------------------------------------------------------------------
+
+const B601_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json");
+
+/// The profile of the A/B run: `$REBOT_TRACKING_PROFILE` (its `joint_tracking` as written) or
+/// the shipped B601-DM kit profile with J1 = position_lead (lag 0.68 s, 0.03 rad), J2..J6
+/// position, as on the device for the incident. `enabled` overrides `joint_tracking.enabled`.
+fn b601_ab_profile(enabled: bool) -> ArmConfig {
+    let path = std::env::var("REBOT_TRACKING_PROFILE").ok().filter(|p| !p.is_empty());
+    let custom = path.is_some();
+    let path = path.unwrap_or_else(|| B601_PROFILE.to_string());
+    let mut config: ArmConfig = serde_json::from_reader(std::fs::File::open(&path).unwrap()).unwrap();
+    config.validate().unwrap();
+    let jt = config.joint_tracking.get_or_insert_with(JointTrackingConfig::rebot_dm);
+    if !custom {
+        for (i, j) in jt.joints.iter_mut().enumerate() {
+            j.strategy = if i == 0 { TrackingStrategy::PositionLead } else { TrackingStrategy::Position };
+        }
+        jt.joints[0].lag_s = 0.68;
+        jt.joints[0].max_lead_rad = 0.03;
+    }
+    if let Ok(v) = std::env::var("REBOT_TRACKING_MAX_LEAD") {
+        if !v.trim().is_empty() {
+            let max_lead: f32 = v.trim().parse().expect("REBOT_TRACKING_MAX_LEAD (rad)");
+            for j in jt.joints.iter_mut().filter(|j| j.strategy == TrackingStrategy::PositionLead) {
+                j.max_lead_rad = max_lead;
+            }
+        }
+    }
+    jt.enabled = enabled;
+    config.validate().unwrap();
+    config.lease_timeout_ms = 600_000;
+    config
+}
+
+/// First-order POS_VEL lag plant per joint: `$REBOT_TRACKING_PLANT_TAU` (comma separated, s)
+/// or the B601-DM measured seeds (J1..J4 0.68, 0.65, 0.71, 0.17; J5, J6, gripper instant).
+fn b601_lag_plant(dof: usize) -> Vec<f32> {
+    let mut tau: Vec<f32> = match std::env::var("REBOT_TRACKING_PLANT_TAU") {
+        Ok(v) if !v.trim().is_empty() => v.split(',').map(|x| x.trim().parse().expect("plant tau")).collect(),
+        _ => vec![0.68, 0.65, 0.71, 0.17, 0.0, 0.0, 0.0],
+    };
+    tau.resize(dof, 0.0);
+    tau
+}
+
+/// Per-tick sample of an A/B run.
+#[derive(Debug, Clone)]
+struct AbSample {
+    dt: f64,
+    phase: String,
+    q_d: Vec<f32>,
+    v_d: Vec<f32>,
+    q_out: Vec<f32>,
+    q_m: Vec<f32>,
+    fault: Option<String>,
+}
+
+/// Start the joint-space `move_to` of the incident (yaw outward, pitch 41°, speed_scale 0.3).
+fn b601_joint_move(inner: &mut SupervisorInner, xyz: [f64; 3]) -> u64 {
+    let body = serde_json::json!({
+        "position": xyz,
+        "orientation": {"rpy": [0.0, 41.0_f64.to_radians(), 0.0]},
+        "yaw": "outward",
+        "path": "joint",
+        "speed_scale": 0.3,
+    });
+    let (spec, _speed, tag) = armd::motion::parse_move_to(&body).unwrap();
+    let input = inner.plan_input().unwrap();
+    let (goal, opts) = armd::motion::resolve_goal_opts(&input, &spec);
+    let seeds = armd::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
+    let q = armd::motion::solve_goal_joints(&input, &goal, opts, &seeds).unwrap();
+    inner.install_joint_goal(&input, &q, 0.3, "move_to", tag, None).unwrap().0
+}
+
+/// home -> A, then A -> B -> A three times with 3 s holds, on the lag plant, through
+/// `SupervisorInner::tick` (the real output path). `dts` cycles the tick period (control-loop
+/// jitter). Stops at the first fault.
+fn b601_ab_run(enabled: bool, dts: &[f64]) -> (ArmConfig, Vec<AbSample>, u64) {
+    const A: [f64; 3] = [0.255, 0.08, 0.43];
+    const B: [f64; 3] = [0.255, 0.12, 0.43];
+    let cfg = b601_ab_profile(enabled);
+    let q0 = cfg.home_positions.clone();
+    let (mut inner, drv) = rig_at(cfg.clone(), &q0, b601_lag_plant(q0.len()));
+    let mut samples = Vec::new();
+    let mut k = 0usize;
+    let mut phase = |inner: &mut SupervisorInner, name: &str, target: [f64; 3]| -> bool {
+        b601_joint_move(inner, target);
+        let mut hold = 0usize;
+        for _ in 0..4000 {
+            let dt = dts[k % dts.len()];
+            k += 1;
+            let obs = inner.tick(dt);
+            let q_out = drv.with(|s| s.written.last().map(|w| w.iter().map(|t| t.position).collect()).unwrap_or_default());
+            let fault = inner.safety.state().is_stopped().then(|| format!("{:?} {:?}", inner.safety.state(), obs.fault));
+            samples.push(AbSample {
+                dt,
+                phase: name.to_string(),
+                q_d: obs.commanded_positions.clone(),
+                v_d: inner.commanded_velocities.clone(),
+                q_out,
+                q_m: obs.positions.clone(),
+                fault: fault.clone(),
+            });
+            if fault.is_some() {
+                return false;
+            }
+            if inner.active_trajectory.is_none() {
+                hold += 1;
+                if hold >= 150 {
+                    return true;
+                }
+            }
+        }
+        panic!("{name}: motion did not finish");
+    };
+    if phase(&mut inner, "home_a", A) {
+        'outer: for rep in 0..3 {
+            for (name, tgt) in [("AB", B), ("BA", A)] {
+                if !phase(&mut inner, &format!("move{rep}{name}"), tgt) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let withdrawals = inner.tracking.withdrawal_ticks;
+    (cfg, samples, withdrawals)
+}
+
+/// Peaks of the issued output over a whole run for joint `j`: |v_out|, |a_out| (rad/s,
+/// rad/s^2, from consecutive issued frames and the tick periods), |lead| = |q_out - q_d| and
+/// |delta lead| per tick (mrad).
+fn b601_issued_peaks(samples: &[AbSample], j: usize) -> (f64, f64, f64, f64) {
+    let (mut v_pk, mut a_pk, mut l_pk, mut dl_pk) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut v_prev, mut l_prev) = (0.0_f64, 0.0_f64);
+    for w in samples.windows(2) {
+        let (p, c) = (&w[0], &w[1]);
+        let v = f64::from(c.q_out[j] - p.q_out[j]) / c.dt;
+        let lead = f64::from(c.q_out[j] - c.q_d[j]);
+        v_pk = v_pk.max(v.abs());
+        a_pk = a_pk.max(((v - v_prev) / c.dt).abs());
+        l_pk = l_pk.max(lead.abs());
+        dl_pk = dl_pk.max((lead - l_prev).abs());
+        v_prev = v;
+        l_prev = lead;
+    }
+    (v_pk, a_pk, l_pk * 1000.0, dl_pk * 1000.0)
+}
+
+/// Per-joint A/B statistics over the A <-> B moves (mrad): moving RMS and peak of q_m - q_d
+/// while the reference moves, endpoint error 1 s after each reference stop, moves completed.
+#[derive(Debug)]
+struct AbStats {
+    rms: f64,
+    peak: f64,
+    end_max: f64,
+    ends: Vec<f64>,
+    moves: usize,
+    faults: Vec<String>,
+}
+
+fn b601_ab_stats(samples: &[AbSample], j: usize) -> AbStats {
+    let is_move = |s: &&AbSample| s.phase.starts_with("move");
+    let err: Vec<f64> = samples
+        .iter()
+        .filter(is_move)
+        .filter(|s| s.v_d[j].abs() > 1e-6)
+        .map(|s| f64::from(s.q_m[j] - s.q_d[j]) * 1000.0)
+        .collect();
+    let rms = (err.iter().map(|e| e * e).sum::<f64>() / err.len().max(1) as f64).sqrt();
+    let peak = err.iter().fold(0.0_f64, |a, e| a.max(e.abs()));
+    let mut names: Vec<&str> = samples.iter().filter(is_move).map(|s| s.phase.as_str()).collect();
+    names.dedup();
+    let mut ends = Vec::new();
+    let mut moves = 0;
+    for name in &names {
+        let ph: Vec<&AbSample> = samples.iter().filter(|s| s.phase == *name).collect();
+        if let Some(stop) = ph.iter().rposition(|s| s.v_d[j] != 0.0) {
+            if let Some(s) = ph.get(stop + 51) {
+                moves += 1;
+                ends.push((f64::from(s.q_m[j] - s.q_d[j]) * 10_000.0).round() / 10.0);
+            }
+        }
+    }
+    let end_max = ends.iter().fold(0.0_f64, |a, e| a.max(e.abs()));
+    let faults = samples.iter().filter_map(|s| s.fault.clone()).collect();
+    AbStats { rms, peak, end_max, ends, moves, faults }
+}
+
+/// Motion caps of a joint-space move at `speed_scale` (`SupervisorInner::joint_goal_limits`).
+fn b601_speed_scale_limits(inner: &SupervisorInner, speed_scale: f32) -> Vec<armd::model::JointLimit> {
+    let g = inner.config.gripper_index();
+    let mut l = inner.planning_limits();
+    for (i, x) in l.iter_mut().enumerate() {
+        if Some(i) != g {
+            x.max_velocity *= speed_scale;
+        }
+    }
+    l
+}
+
+/// Acceptance and reusable pre-enable check: the incident's joint-space A <-> B sequence on the
+/// lag plant, tracking off vs on. On: no fault, all six moves, every lead joint's moving RMS
+/// error at least 30% lower than off (`$REBOT_TRACKING_MIN_RMS_REDUCTION_PCT`), no higher peak
+/// or endpoint error, peak |v_out| at most 1.5 x the peak with tracking off, peak |lead| within
+/// max_lead (`$REBOT_TRACKING_MAX_LEAD` overrides it for every lead joint), and every issued frame
+/// within the output contract (|v_out| <= min(v_phys, v_cap + lag a_cap), |a_out| <= a_phys,
+/// |lead| <= max_lead, |delta lead| <= lag a_cap dt). Tick periods jitter 18..26 ms.
+#[test]
+fn tracking_lead_b601_joint_move_ab() {
+    let dts = [0.020, 0.018, 0.022, 0.020, 0.026, 0.019];
+    let (_, off, wd_off) = b601_ab_run(false, &dts);
+    let (cfg, on, wd_on) = b601_ab_run(true, &dts);
+    let min_red: f64 = std::env::var("REBOT_TRACKING_MIN_RMS_REDUCTION_PCT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map_or(30.0, |v| v.trim().parse().expect("REBOT_TRACKING_MIN_RMS_REDUCTION_PCT"));
+    let jt = cfg.joint_tracking.clone().unwrap();
+    let arm = cfg.arm_joint_indices();
+    let lead_joints: Vec<usize> = arm
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| jt.joints[*k].strategy == TrackingStrategy::PositionLead && jt.joints[*k].lag_s > 0.0)
+        .map(|(_, &j)| j)
+        .collect();
+    assert!(!lead_joints.is_empty(), "profile has no position_lead joint with lag_s > 0");
+    eprintln!("tracking A/B (mrad; moving RMS / peak of q_m - q_d, error 1 s after each stop):");
+    let mut failures = Vec::new();
+    for &j in &lead_joints {
+        let (s_off, s_on) = (b601_ab_stats(&off, j), b601_ab_stats(&on, j));
+        let red = (1.0 - s_on.rms / s_off.rms) * 100.0;
+        eprintln!(
+            "  J{} off: rms {:.1} peak {:.1} ends {:?} moves {} faults {}",
+            j + 1, s_off.rms, s_off.peak, s_off.ends, s_off.moves, s_off.faults.len()
+        );
+        eprintln!(
+            "  J{} on : rms {:.1} peak {:.1} ends {:?} moves {} faults {:?} | RMS -{red:.1}%",
+            j + 1, s_on.rms, s_on.peak, s_on.ends, s_on.moves, s_on.faults.first()
+        );
+        if !s_off.faults.is_empty() { failures.push(format!("J{}: tracking off faulted: {:?}", j + 1, s_off.faults.first())); }
+        if !s_on.faults.is_empty() { failures.push(format!("J{}: tracking on faulted: {:?}", j + 1, s_on.faults.first())); }
+        if (s_off.moves, s_on.moves) != (6, 6) { failures.push(format!("J{}: moves off {} on {} (need 6)", j + 1, s_off.moves, s_on.moves)); }
+        if red < min_red { failures.push(format!("J{}: moving RMS reduction {red:.1}% < {min_red}%", j + 1)); }
+        if s_on.peak > s_off.peak + 1e-6 { failures.push(format!("J{}: peak error grew {:.1} -> {:.1}", j + 1, s_off.peak, s_on.peak)); }
+        if s_on.end_max > s_off.end_max + 0.5 { failures.push(format!("J{}: endpoint error grew {:.1} -> {:.1}", j + 1, s_off.end_max, s_on.end_max)); }
+    }
+    eprintln!("issued output peaks (|v_out| rad/s, |a_out| rad/s^2, |lead| mrad, |delta lead| mrad/tick); withdrawal ticks off {wd_off} on {wd_on}:");
+    for (k, &j) in arm.iter().enumerate() {
+        let max_lead_mrad = f64::from(jt.joints[k].max_lead_rad) * 1000.0;
+        let p_off = b601_issued_peaks(&off, j);
+        let p_on = b601_issued_peaks(&on, j);
+        for (tag, p) in [("off", p_off), ("on ", p_on)] {
+            eprintln!(
+                "  J{} {tag}: v_out {:.4}  a_out {:.3}  lead {:.2}  dlead {:.3}{}",
+                j + 1, p.0, p.1, p.2, p.3,
+                if lead_joints.contains(&j) && tag == "on " { format!("  (max_lead {max_lead_mrad:.1})") } else { String::new() }
+            );
+        }
+        if p_on.0 > 1.5 * p_off.0 + 1e-6 {
+            failures.push(format!("J{}: peak |v_out| on {:.4} > 1.5 x off {:.4}", j + 1, p_on.0, p_off.0));
+        }
+        if p_on.2 > max_lead_mrad + 1e-2 && lead_joints.contains(&j) {
+            failures.push(format!("J{}: peak |lead| {:.3} mrad > max_lead {max_lead_mrad:.3}", j + 1, p_on.2));
+        }
+    }
+    assert!(failures.is_empty(), "tracking A/B check failed:\n  {}", failures.join("\n  "));
+    // Output contract on every issued frame (arm joints).
+    let caps = {
+        let probe = b601_ab_profile(true);
+        b601_speed_scale_limits(&SupervisorInner::new(probe), 0.3)
+    };
+    for (k, &j) in arm.iter().enumerate() {
+        let jc = &jt.joints[k];
+        let lag = if jc.strategy == TrackingStrategy::PositionLead { f64::from(jc.lag_s) } else { 0.0 };
+        let (v_cap, a_cap) = (f64::from(caps[j].max_velocity), f64::from(caps[j].max_acceleration));
+        let (v_phys, a_phys) = (f64::from(cfg.limits[j].max_velocity), f64::from(cfg.limits[j].max_acceleration));
+        let v_lim = if lag > 0.0 { v_phys.min(v_cap + lag * a_cap) } else { v_cap };
+        let a_lim = if lag > 0.0 { a_phys } else { a_cap };
+        let mut v_prev = 0.0_f64;
+        let mut lead_prev = 0.0_f64;
+        for w in on.windows(2) {
+            let (p, c) = (&w[0], &w[1]);
+            let v = f64::from(c.q_out[j] - p.q_out[j]) / c.dt;
+            let lead = f64::from(c.q_out[j] - c.q_d[j]);
+            assert!(v.abs() <= v_lim + 1e-3, "J{} issued v {v:.4} > {v_lim:.4} ({})", j + 1, c.phase);
+            assert!(((v - v_prev) / c.dt).abs() <= a_lim + 0.05, "J{} issued a {:.3} > {a_lim} ({})", j + 1, (v - v_prev) / c.dt, c.phase);
+            assert!(lead.abs() <= f64::from(jc.max_lead_rad) + 1e-5, "J{} lead {lead:.5} ({})", j + 1, c.phase);
+            if lag > 0.0 {
+                assert!((lead - lead_prev).abs() <= lag * a_cap * c.dt + 1e-5, "J{} lead step {:.5}", j + 1, lead - lead_prev);
+            }
+            v_prev = v;
+            lead_prev = lead;
+        }
+    }
+}
+
+/// Regression of the incident's fault path, at the evaluator: tick 11 of the first A -> B move
+/// (B601-DM kit profile, J1 lead 0.68 s / 0.03 rad, speed_scale 0.3 -> J1 cap 0.135 rad/s).
+/// Phase 1 validated the issued output (nominal 0.0228 rad/s + lead growth 0.68 * a_d) against
+/// the NOMINAL cap: full lead gave 0.1356 rad/s > 0.135, multipliers 1/2..0 dropped the 13.2 mrad
+/// lead in one tick (down to -0.639 rad/s) and the JOINT_LIMIT fault latched. Now the full
+/// lead passes (issued speed above the nominal cap, within min(v_phys, v_cap + lag a_cap)), and
+/// when the lead candidate fails (here: a keep-out on its chord) the lead is withdrawn at the
+/// shaped rate instead of in one tick; only a nominal violation is rejected.
+#[test]
+fn tracking_lead_incident_2026_11_22_regression() {
+    let mut cfg = b601_ab_profile(true);
+    let q0 = cfg.home_positions.clone();
+    cfg.workspace = None;
+    let (mut inner, _drv) = rig_at(cfg.clone(), &q0, vec![0.0; q0.len()]);
+    let limits = b601_speed_scale_limits(&inner, 0.3);
+    assert!((limits[0].max_velocity - 0.135).abs() < 1e-6, "J1 cap {}", limits[0].max_velocity);
+    let jt = inner.config.joint_tracking.clone().unwrap();
+    // State after tick 10 of the reproduction (measured from b601 run): nominal q_d, issued
+    // q_d + 13.2 mrad, issued velocity 0.130 rad/s.
+    let (qd_prev, vd_prev, issued_prev, v_issued) = (0.30516776_f32, 0.01941255_f32, 0.3183683_f32, 0.13038_f32);
+    let (qd, vd) = (0.30558_f32, 0.02279_f32);
+    let mut issued = q0.clone();
+    issued[0] = issued_prev;
+    let mut v_out = vec![0.0_f32; q0.len()];
+    v_out[0] = v_issued;
+    let mut nominal = q0.clone();
+    nominal[0] = qd_prev;
+    let mut v_nom = vec![0.0_f32; q0.len()];
+    v_nom[0] = vd_prev + 0.0;
+    inner.tracking.record_issued(issued.clone(), v_out.clone());
+    inner.tracking.last_nominal = Some((nominal.clone(), {
+        let mut v = v_nom.clone();
+        v[0] = ((f64::from(qd_prev) - 0.30481303) / DT) as f32;
+        v
+    }));
+    inner.commanded_positions[0] = qd;
+    inner.commanded_velocities[0] = vd;
+    inner.measured_positions[0] = 0.3053666;
+    let out = inner.compute_position_lead_output_with_limits(DT, &jt, &limits).expect("incident tick must pass");
+    let v = f64::from(out.positions[0] - issued_prev) / DT;
+    let lead = out.positions[0] - qd;
+    eprintln!("incident tick: m={} lead={lead:.5} v_out={v:.4} (nominal cap 0.135)", out.multiplier);
+    // Phase 1 arithmetic of this tick: full lead lag * v_d gave 0.1356 rad/s > 0.135 (rejected),
+    // the zero-lead candidate -0.639 rad/s (rejected) -> fault.
+    let phase1_full = (f64::from(qd) + 0.68 * f64::from(vd) - f64::from(issued_prev)) / DT;
+    let phase1_zero = f64::from(qd - issued_prev) / DT;
+    assert!(phase1_full > 0.135 && phase1_zero < -0.6, "{phase1_full} {phase1_zero}");
+    assert_eq!(out.multiplier, 1.0);
+    assert!(v > 0.0 && v <= 2.0, "issued {v} within the physical bound");
+    assert!((lead - 0.68 * vd).abs() < 2e-3, "lead {lead} must stay near lag * v_d = {}", 0.68 * vd);
+
+    // The lead candidate's chord enters a keep-out box: withdrawal at the shaped rate, not
+    // a one-tick drop (Phase 1: -0.639 rad/s, fault).
+    let ws_cfg = b601_ab_profile(true);
+    let mut q_lead = q0.clone();
+    q_lead[0] = qd + lead;
+    let p_lead = ws_cfg.arm_model.fk_f32(&q_lead).unwrap().p;
+    let mut ws = ws_cfg.workspace.clone().expect("kit profile workspace").keepout_only();
+    ws.keepout_boxes.push(KeepoutBox {
+        name: "lead_tip".into(),
+        min_m: [p_lead[0] as f32 - 0.0005, p_lead[1] as f32 - 0.0005, p_lead[2] as f32 - 0.0005],
+        max_m: [p_lead[0] as f32 + 0.0005, p_lead[1] as f32 + 0.0005, p_lead[2] as f32 + 0.0005],
+    });
+    inner.config.workspace = Some(ws);
+    inner.workspace_revision += 1;
+    let out = inner.compute_position_lead_output_with_limits(DT, &jt, &limits).expect("withdrawal must pass");
+    let v = f64::from(out.positions[0] - issued_prev) / DT;
+    let a = (v - f64::from(v_issued)) / DT;
+    eprintln!("withdrawal tick: m={} lead={:.5} v_out={v:.4} a_out={a:.3}", out.multiplier, out.positions[0] - qd);
+    assert_eq!(out.multiplier, 0.0);
+    assert!(a.abs() <= 5.0 + 1e-3 && v.abs() <= 2.0, "withdrawal v {v:.4} a {a:.3} must stay within the profile limits");
+    assert!((out.positions[0] - qd) > 0.010, "lead must not drop in one tick");
+
+    // A nominal violation is still rejected (motion caps bound the nominal reference).
+    inner.config.workspace = None;
+    inner.commanded_positions[0] = qd_prev + (0.14 * DT) as f32;
+    let err = inner.compute_position_lead_output_with_limits(DT, &jt, &limits).expect_err("nominal 0.14 > 0.135");
+    assert!(format!("{err:?}").contains("nominal velocity"), "{err:?}");
 }

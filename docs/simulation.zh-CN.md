@@ -208,6 +208,47 @@ v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 0 --camer
 
 `grip_pixel_model` [0.503, −0.327] 在画面外，因此 `grip_pixel_norm` 保持不变，抓取以相机朝下方式采集。抓取：`done`，夹持，3 次对中修正，方块抬起 0.100 m。角点噪声按帧抽取，各次运行数值不同（另两次：fx 800.33 / 800.64，偏移 0.07 / 0.13 mm，旋转 0.038° / 0.028°）。仅为仿真结果，未在真机上运行。
 
+## 关节跟踪 A/B 检查（position lead）
+
+在真机上启用 `joint_tracking` 之前、以及修改跟踪代码或 profile 中的 `joint_tracking` 后运行。不访问设备。
+
+```bash
+scripts/tracking_lead_sim.sh                                   # kit profile，J1 = position_lead（lag 0.68 s，0.03 rad）
+scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json        # 从设备复制的 B601-DM profile，joint_tracking 按文件内容
+scripts/tracking_lead_sim.sh /path/to/rebot-b601dm.json 0.68,0.65,0.71,0.17,0,0,0   # 被控对象时间常数 J1..J7（s）
+scripts/tracking_lead_sim.sh "" "" 0.005 10                   # 所有 lead 关节 max_lead_rad 0.005，RMS 降幅 >= 10 % 即通过
+```
+
+脚本执行 `cargo test --locked --test test_joint_tracking tracking_lead_b601_joint_move_ab -- --nocapture --exact`（环境变量 `REBOT_TRACKING_PROFILE`、`REBOT_TRACKING_PLANT_TAU`、`REBOT_TRACKING_MAX_LEAD`、`REBOT_TRACKING_MIN_RMS_REDUCTION_PCT`；参数为空时用默认值）。测试调用 `SupervisorInner::tick`（armd 的输出路径），被控对象为逐关节一阶 POS_VEL 滞后 `dq/dt = (q_out − q) / τ`，默认 τ 为 B601-DM 拟合值 J1..J4 0.68、0.65、0.71、0.17 s。`rebot-sim` 不模拟这一滞后（见「未仿真 / 限制」），所以该检查不用 `armd --follower sim`。动作序列：home → A，然后 A → B → A 三次，每次停 3 s；A = (0.255, 0.08, 0.43)，B = (0.255, 0.12, 0.43)，pitch 41°，`yaw: "outward"`，`path: "joint"`，`speed_scale` 0.3；控制周期在 18–26 ms 之间轮换。跟踪关闭、开启各跑一次，按每个 lead 关节输出参考运动期间 q_m − q_d 的 RMS 和峰值（mrad）以及每次停止后 1 s 的误差；按每个臂关节输出关闭 / 开启时的下发速度 |v_out| 与加速度 |a_out| 峰值（由相邻下发帧计算）、|lead| 峰值、每 tick |Δlead| 峰值；以及每次运行的收回 tick 数（`TrackingRuntime::withdrawal_ticks`：lead 候选未通过、改发收回的 tick）。以下任一情况判失败：
+
+- 出现任何故障，或完成的 A ↔ B 动作少于 6 次；
+- 运动 RMS 降幅低于 30 %（或指定的最小值），或峰值误差、终点误差高于跟踪关闭时；
+- 跟踪开启时 |v_out| 峰值超过关闭时峰值的 1.5 倍，或 |lead| 峰值超过 `max_lead_rad`；
+- 有下发帧违反下述输出约束。
+
+position lead 输出约束（`src/tracking.rs`，`compute_position_lead_output_with_limits_and_budget`）：
+
+- 动作限速（`speed_scale`、servo / policy 限速、功率调节）约束名义参考 q_d。名义步长超限时拒绝，与之前相同。
+- 下发 q_out = q_d + lead。每个 lead 关节（`position_lead`，`lag_s` > 0）：|v_out| ≤ min(v_phys, v_cap + lag_s · a_cap)，|a_out| ≤ a_phys，|lead| ≤ `max_lead_rad`，|lead_k − lead_(k−1)| ≤ lag_s · a_cap · dt。v_cap / a_cap 为动作限值，v_phys / a_phys 为 profile 关节限值。无 lead 的关节仍用动作限值。
+- lead 向目标 lag_s · v_d 变化，以 a_phys / 2 向目标、向 ±`max_lead_rad`、以及流式控制时向实测超前余量 q_m ± `servo_max_lead_rad` 制动；在动作开始、停止、反向和饱和时连续。
+- lead 输出校验不通过（动力学、keep-out 扫掠、流式余量、力矩保持）时，armd 在相同约束下把 lead 向零收回并继续动作。只有名义参考违规，或收回本身不通过（例如其弦线穿过 keep-out），才走原有的故障 / 保持路径。
+
+对应事故（2026-11-22，rebot-teleop 1.5.0-rc2，B601-DM，仅 J1 = `position_lead`）：第一次 A → B 锁存 `JOINT_LIMIT` "joint 1 output velocity -0.715 rad/s exceeds limit 0.135"。Phase 1 用名义限速校验下发输出：动作第 11 个 tick（v_d 0.023 rad/s，lead 13.2 mrad）完整 lead 需要 0.1356 rad/s（名义 0.023 + lead 增长 0.68 · a_d），超过 0.135；倍率 ½ … 0 在一个 tick 内撤掉 lead（测试台中倍率 0 为 −0.639 rad/s，真机 −0.715 rad/s），所有候选都不通过。回归测试：`tracking_lead_incident_2026_11_22_regression`。
+
+结果（spark，2026-11-22，默认参数）：
+
+| J1，mrad | 运动 RMS | 峰值 | 停止后 1 s 误差 | 故障 | 完成动作 |
+|---|---|---|---|---|---|
+| 跟踪关闭 | 43.0 | 63.4 | ±9.3 | 0 | 6 |
+| 跟踪开启 | 25.2（−41.5 %） | 39.9 | ±4.8 | 0 | 6 |
+| 真机，关闭（2026-11-22） | 43 | 69 | | 0 | 6 |
+| 修复前，开启（测试台） | | | | 第一次 A → B 即 JOINT_LIMIT | 0 |
+| 开启，`max_lead_rad` 0.005 | 39.8（−7.6 %） | 59.3 | ±8.4 | 0 | 6 |
+
+同一组运行中 J1 下发输出峰值（J2..J6 关闭 / 开启相同）：关闭 |v_out| 0.135 rad/s，|a_out| 0.26 rad/s²；开启（0.03 rad）|v_out| 0.190，|a_out| 4.37，|lead| 30.0 mrad，|Δlead| 3.90 mrad/tick；开启（0.005 rad）|v_out| 0.135，|a_out| 3.12，|lead| 5.0 mrad，|Δlead| 1.52 mrad/tick。收回 tick 数：所有运行均为 0。`max_lead_rad` 0.005 时默认检查因 30 % RMS 条件失败。
+
+被控对象是固定 τ 的一阶模型，不含摩擦、回差、随负载变化的滞后以及电机自身的 POS_VEL 环路。检查通过不代表 lead 在真机上安全或有效；真机需要按关节跟踪规范做设备验证（只开 J1，操作员在机旁，关闭 / 开启对比）。
+
 ## 摩擦辨识（`rebot-sysid`）
 
 `rebot-sysid`（`sim/mujoco/src/rebot_sim/sysid.py`，`sim/mujoco` uv 项目的命令行脚本）通过 armd 辨识 J1..J6 各关节的库仑摩擦与粘滞摩擦，并给出碰撞阈值建议。它在 PC 上运行（numpy / matplotlib），以普通 WebSocket 客户端（`websockets`）连接 armd，reCamera 上无需安装任何东西。同一命令可用于 `armd --follower sim` 和真机。
