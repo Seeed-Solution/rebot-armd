@@ -249,6 +249,9 @@ pub struct SupervisorInner {
     pub temperatures: Vec<f32>,
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
+    /// True while a servo/policy stream owns output, including its braking tail after
+    /// `servo_target` is cleared by stop, timeout, or dirty-jump discard.
+    pub servo_stream_active: bool,
     pub servo_settled_ticks: Vec<u32>,
     /// Per joint, while the servo lead cap holds it: when the current run started and
     /// the measured position then (blocked detection, [`SERVO_BLOCKED_PROGRESS_RAD`]).
@@ -564,6 +567,7 @@ impl SupervisorInner {
             temperatures: vec![25.0; dof],
             target_positions,
             servo_target: None,
+            servo_stream_active: false,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
             motor_errors: Vec::new(),
@@ -1274,6 +1278,7 @@ impl SupervisorInner {
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
@@ -1867,6 +1872,7 @@ impl SupervisorInner {
             self.unload_settle = None;
             self.watchdog_park = None;
             self.servo_target = None;
+            self.servo_stream_active = false;
             self.servo_ws_min_depths = None;
 
             let state = self.safety.set_torque(true)?;
@@ -1957,6 +1963,7 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         match policy {
             StopPolicy::NormalUnload => {
@@ -2165,6 +2172,7 @@ impl SupervisorInner {
         self.gripper_stall_sign = 0.0;
         self.gripper_prev_hw_overload = false;
         self.stop_motion();
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             self.commanded_positions = self.measured_positions.clone();
@@ -2294,6 +2302,7 @@ impl SupervisorInner {
         }
         self.pending_rearm = true;
         self.stop_motion();
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         // Reset at the measured position; never retain a residual old trajectory target.
         self.commanded_positions = self.measured_positions.clone();
@@ -2570,6 +2579,7 @@ impl SupervisorInner {
         self.active_trajectory = None;
         self.servo_target = None; self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         self.target_positions = hold_pos.clone();
         self.commanded_positions = hold_pos;
@@ -2756,6 +2766,7 @@ impl SupervisorInner {
         // 2. Store servo target for tick(dt) to step with actual dt and velocity limits
         self.target_positions = targets.clone();
         self.servo_target = Some(targets);
+        self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
         Ok(())
@@ -4131,6 +4142,7 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
@@ -4911,15 +4923,18 @@ impl SupervisorInner {
             None => {}
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Arm(mut out))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
                 self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Replay(mut out, phase, t_s))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
                     if a.id == id && a.is_running() {
@@ -4931,6 +4946,7 @@ impl SupervisorInner {
             }
             Some((action_id, Stepped::Quintic(mut point, finished, progress))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut point.positions, &mut point.velocities);
                 self.commanded_positions = point.positions;
                 self.commanded_velocities = point.velocities;
@@ -5112,6 +5128,7 @@ impl SupervisorInner {
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                                 self.servo_ws_min_depths = None;
+                                self.servo_stream_active = false;
                             }
                         }
                     }
@@ -5161,6 +5178,7 @@ impl SupervisorInner {
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
                     self.servo_ws_min_depths = None;
+                    self.servo_stream_active = false;
                 }
             }
         }
@@ -6023,6 +6041,7 @@ impl SupervisorInner {
 
         self.target_positions = targets.clone();
         self.servo_target = Some(targets.clone());
+        self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {

@@ -244,6 +244,7 @@ impl SupervisorInner {
             }
         }
         self.stop_motion();
+        self.servo_stream_active = false;
         self.tracking.invalidate();
         for i in 0..ARM {
             self.commanded_positions[i] = pose[i];

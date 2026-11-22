@@ -262,7 +262,7 @@ impl crate::supervisor::SupervisorInner {
         let fresh_meas = self.hardware_feedback_fresh(Duration::from_millis(100))
             && self.measured_positions.len() == dof
             && self.measured_positions.iter().all(|q| q.is_finite());
-        let in_streaming = self.servo_target.is_some();
+        let in_streaming = self.servo_target.is_some() || self.servo_stream_active;
         let in_hold = self.collision.hold.is_some() || self.servo_blocked_hold;
 
         // 1. Per-joint base position lead (arm joints only; gripper is strictly bypassed).
@@ -406,11 +406,14 @@ impl crate::supervisor::SupervisorInner {
                     )));
                     continue 'cand;
                 }
-                if in_streaming && fresh_meas && m != 0.0 && base_lead[j] != 0.0 {
+                if in_streaming && fresh_meas {
                     let stream_lead = self.config.servo_max_lead_rad;
                     let meas = self.measured_positions[j];
-                    if (base_lead[j] > 0.0 && q > meas + stream_lead + 1e-5)
-                        || (base_lead[j] < 0.0 && q < meas - stream_lead - 1e-5)
+                    let vd = self.commanded_velocities[j];
+                    let advancing_pos = q > prev_q[j] + 1e-6 || vd > 1e-6;
+                    let advancing_neg = q < prev_q[j] - 1e-6 || vd < -1e-6;
+                    if (advancing_pos && q > meas + stream_lead + 1e-5)
+                        || (advancing_neg && q < meas - stream_lead - 1e-5)
                     {
                         last_err = Some(TrackingReject::JointLimit(format!(
                             "joint {} candidate {q:.4} rad exceeds streaming measured-lead allowance around {meas:.4}",

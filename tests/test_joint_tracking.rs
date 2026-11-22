@@ -1107,3 +1107,95 @@ fn tracking_escape_depths_persist_across_ticks() {
     }
     assert!(reversed_rejected, "slight multi-tick reversal toward obstacle must be rejected");
 }
+
+/// M2: Measured-lead allowance remains active through stream braking (first stop frame,
+/// timeout frame, and every braking tick) and is checked for every multiplier including 0.
+#[test]
+fn tracking_stream_braking_enforces_measured_lead_allowance() {
+    for trigger in ["stop", "timeout"] {
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.servo_max_velocity = Some(vec![Some(0.25), Some(0.25), Some(0.25), Some(1.0), Some(1.0), Some(1.0), None]);
+        cfg.following_error.persistence_ms = 5_000;
+        let q0 = [0.0_f32; 7];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let stream_lead = inner.config.servo_max_lead_rad; // 0.20 rad
+        // Pin J1 at 0.0 and stream toward +0.25 until near the boundary with positive velocity.
+        drv.with(|s| s.pinned[0] = Some(0.0));
+        let epoch = inner.safety.epoch_id();
+        let mut reached_near = false;
+        for _ in 0..80 {
+            let mut tgt = inner.commanded_positions.clone();
+            tgt[0] = (tgt[0] + 0.05).min(0.25);
+            inner.servo(tgt, epoch).unwrap();
+            let obs = inner.tick(DT);
+            let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
+            assert!(
+                q_out <= obs.positions[0] + stream_lead + 1e-4,
+                "{trigger}: streaming q_out {q_out} exceeded boundary {}",
+                obs.positions[0] + stream_lead
+            );
+            if inner.commanded_positions[0] >= stream_lead - 0.025 && inner.commanded_velocities[0] > 0.02 {
+                reached_near = true;
+                break;
+            }
+        }
+        assert!(reached_near, "{trigger}: failed to reach near boundary with positive velocity");
+        assert!(inner.servo_stream_active);
+
+        // Trigger stream end while velocity is still positive near the measured-lead boundary.
+        if trigger == "stop" {
+            inner.stop_motion();
+        } else {
+            inner.last_motion_frame = std::time::Instant::now() - Duration::from_secs(1);
+        }
+
+        // First stop/timeout frame and every braking frame must keep servo_stream_active
+        // until velocity hits zero, and never emit q_out past q_m + servo_max_lead_rad.
+        let mut saw_braking_with_stream_active = false;
+        for k in 0..40 {
+            let obs = inner.tick(DT);
+            let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
+            assert!(
+                q_out <= obs.positions[0] + stream_lead + 1e-4,
+                "{trigger}: braking tick {k} q_out {q_out} exceeded boundary {}",
+                obs.positions[0] + stream_lead
+            );
+            if inner.commanded_velocities[0].abs() > 0.0 {
+                assert!(inner.servo_stream_active, "{trigger}: stream ownership dropped while braking");
+                saw_braking_with_stream_active = true;
+            } else {
+                assert!(!inner.servo_stream_active, "{trigger}: stream ownership should clear after braking ends");
+                break;
+            }
+        }
+        assert!(saw_braking_with_stream_active, "{trigger}: expected at least one braking tick with active velocity");
+    }
+
+    // Multiplier 0 must also be rejected if q_d itself advances past q_m + servo_max_lead_rad during braking.
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let q0 = [0.0_f32; 7];
+    let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+    let stream_lead = inner.config.servo_max_lead_rad;
+    inner.servo_stream_active = true;
+    inner.servo_target = None; // braking
+    inner.measured_positions[0] = 0.0;
+    inner.commanded_positions[0] = stream_lead + 0.01;
+    inner.commanded_velocities[0] = 0.02; // still advancing in + direction past boundary
+    inner.tracking.record_issued(vec![stream_lead, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vec![0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    inner.config.limits[0].max_acceleration = 100.0;
+    let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
+    assert!(
+        inner.compute_position_lead_output(DT, &jt).is_err(),
+        "multiplier 0 must be rejected when advancing past measured-lead boundary during braking"
+    );
+}
