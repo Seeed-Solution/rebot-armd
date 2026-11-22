@@ -1838,7 +1838,8 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     let pass1_match_ms = ms(t_p1_match);
     #[cfg(feature = "mview-profile")]
     let t_p1_solve = Instant::now();
-    let r1 = refine_poses(&cams, reference, &first, table_z, pp);
+    // with the texture, pass one only steers pass two (statuses and cameras): no diagnostics
+    let r1 = refine_poses_with(&cams, reference, &first, table_z, pp, prep.is_none());
     #[cfg(feature = "mview-profile")]
     let pass1_solve_ms = ms(t_p1_solve);
     #[cfg(feature = "mview-profile")]
@@ -1899,6 +1900,12 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
 
 /// Refine the rotations of every view but `reference` from `corrs` (see the module doc).
 pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams) -> PoseRefinement {
+    refine_poses_with(cams, reference, corrs, table_z, pp, true)
+}
+
+/// [`refine_poses`]; without `diagnostics` the per-view `rms_before_px` / `rms_after_px` are None
+/// (the fixed-camera solve and the rms passes are skipped; cameras and statuses are the same).
+fn refine_poses_with(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams, diagnostics: bool) -> PoseRefinement {
     let t0 = Instant::now();
     let nv = cams.len();
     let mut prob = Problem { corrs, active: corrs.iter().map(|c| vec![true; c.obs.len()]).collect(), table_z,
@@ -1919,17 +1926,27 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
         let mut k = 0;
         fixed.iter().map(|f| if f.is_none() { k += 1; Some(k - 1) } else { None }).collect()
     };
-    let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+    // every solve starts from the kinematic cameras and these points
+    let x_init = init_points(cams, corrs, table_z);
+    let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: x_init.clone() };
     let mut st = fresh();
     let mut rejected = vec![[0.0; 3]; nv];
+    // the observations and free views of round 0's solve
+    let mut round0: Option<(Vec<Vec<bool>>, Vec<Option<usize>>)> = None;
     // round 0: solve and drop the outliers; then solve until no free view exceeds the cap
     for round in 0..4 {
-        st = fresh();
         let free = free_of(&fixed);
-        if free.iter().all(Option::is_none) { break; }
-        lm_role("round", round);
-        prob.solve(&mut st, &free);
+        if free.iter().all(Option::is_none) { st = fresh(); break; }
+        // round 1 with round 0's observations and free views is round 0's solve (same start): reuse it
+        let same_as_round0 = round == 1 && round0.as_ref().is_some_and(|(a, f)| *a == prob.active && *f == free);
+        prof_count("lm.round_reused", u64::from(same_as_round0));
+        if !same_as_round0 {
+            st = fresh();
+            lm_role("round", round);
+            prob.solve(&mut st, &free);
+        }
         if round == 0 {
+            round0 = Some((prob.active.clone(), free));
             for (i, c) in corrs.iter().enumerate() {
                 for (k, (a, q)) in c.obs.iter().enumerate() {
                     if st.cams[*a].project(&st.x[i]).is_none_or(|p| (p[0] - q[0]).hypot(p[1] - q[1]) > pp.outlier_px) { prob.active[i][k] = false; }
@@ -1952,14 +1969,15 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
     }
     if free_of(&fixed).iter().all(Option::is_none) { st = fresh(); }
     // before: the same observations triangulated with the kinematic cameras (no coplanarity)
-    let before = {
+    let (before, after) = if diagnostics {
         let pb = Problem { corrs, active: prob.active.clone(), table_z, plane_w: 0.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
-        let mut s0 = State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+        let mut s0 = fresh();
         lm_role("before", 0);
         pb.solve(&mut s0, &vec![None; nv]);
-        pb.rms(&s0, nv)
+        (pb.rms(&s0, nv), prob.rms(&st, nv))
+    } else {
+        (vec![None; nv], vec![None; nv])
     };
-    let after = prob.rms(&st, nv);
     let views = (0..nv).map(|a| {
         let (n, nm) = count(&prob, a);
         let w = if fixed[a] == Some("correction_too_large") { rejected[a] } else { st.w[a] };
@@ -2036,6 +2054,129 @@ mod tests {
         assert_eq!((r.views[1].status, r.views[2].status), ("correction_too_large", "correction_too_large"), "{:?}", r.views);
         assert!((r.views[1].correction_mrad - 1.5).abs() < 0.2, "{:?}", r.views[1]);
         assert_eq!(r.cams, kin.to_vec());
+    }
+
+    /// The refine_poses of before the shared initial points, the round-0 reuse and the
+    /// diagnostics switch (oracle for the equivalence tests).
+    fn refine_poses_oracle(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: f64, pp: &PoseParams) -> (Vec<Camera>, Vec<ViewRefine>) {
+        let nv = cams.len();
+        let mut prob = Problem { corrs, active: corrs.iter().map(|c| vec![true; c.obs.len()]).collect(), table_z,
+            plane_w: pp.plane_px_per_mm * 1000.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
+        let count = |prob: &Problem, a: usize| -> (usize, usize) {
+            let mut n = (0, 0);
+            for (i, c) in corrs.iter().enumerate() {
+                if c.obs.iter().enumerate().any(|(k, o)| o.0 == a && prob.active[i][k]) && prob.active[i].iter().filter(|x| **x).count() >= 2 {
+                    n.0 += 1;
+                    if c.marker { n.1 += 1; }
+                }
+            }
+            n
+        };
+        let mut fixed: Vec<Option<&'static str>> = (0..nv).map(|a| (a == reference).then_some("reference")).collect();
+        for a in 0..nv { if fixed[a].is_none() && count(&prob, a).0 < pp.min_points { fixed[a] = Some("too_few_points"); } }
+        let free_of = |fixed: &[Option<&'static str>]| -> Vec<Option<usize>> {
+            let mut k = 0;
+            fixed.iter().map(|f| if f.is_none() { k += 1; Some(k - 1) } else { None }).collect()
+        };
+        let fresh = || State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+        let mut st = fresh();
+        let mut rejected = vec![[0.0; 3]; nv];
+        for round in 0..4 {
+            st = fresh();
+            let free = free_of(&fixed);
+            if free.iter().all(Option::is_none) { break; }
+            prob.solve(&mut st, &free);
+            if round == 0 {
+                for (i, c) in corrs.iter().enumerate() {
+                    for (k, (a, q)) in c.obs.iter().enumerate() {
+                        if st.cams[*a].project(&st.x[i]).is_none_or(|p| (p[0] - q[0]).hypot(p[1] - q[1]) > pp.outlier_px) { prob.active[i][k] = false; }
+                    }
+                    if prob.active[i].iter().filter(|x| **x).count() < 2 { prob.active[i].iter_mut().for_each(|x| *x = false); }
+                }
+                for a in 0..nv { if fixed[a].is_none() && count(&prob, a).0 < pp.min_points { fixed[a] = Some("too_few_points"); } }
+                continue;
+            }
+            let mut changed = false;
+            for a in 0..nv {
+                if fixed[a].is_none() && kinematics::norm(&st.w[a]) > pp.max_correction_rad {
+                    fixed[a] = Some("correction_too_large");
+                    rejected[a] = st.w[a];
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+            if round == 3 { st = fresh(); let free = free_of(&fixed); if free.iter().any(Option::is_some) { prob.solve(&mut st, &free); } }
+        }
+        if free_of(&fixed).iter().all(Option::is_none) { st = fresh(); }
+        let before = {
+            let pb = Problem { corrs, active: prob.active.clone(), table_z, plane_w: 0.0, prior_rad: pp.prior_rad, huber_px: pp.huber_px, marker_weight: pp.marker_weight };
+            let mut s0 = State { cams: cams.to_vec(), w: vec![[0.0; 3]; nv], x: init_points(cams, corrs, table_z) };
+            pb.solve(&mut s0, &vec![None; nv]);
+            pb.rms(&s0, nv)
+        };
+        let after = prob.rms(&st, nv);
+        let views = (0..nv).map(|a| {
+            let (n, nm) = count(&prob, a);
+            let w = if fixed[a] == Some("correction_too_large") { rejected[a] } else { st.w[a] };
+            ViewRefine {
+                status: fixed[a].unwrap_or("refined"),
+                rot_mrad: w.map(|v| v * 1000.0), correction_mrad: kinematics::norm(&w) * 1000.0,
+                n_points: n, n_marker_corners: nm, rms_before_px: before[a], rms_after_px: after[a],
+            }
+        }).collect();
+        (st.cams, views)
+    }
+
+    /// Bitwise equality with the oracle: unchanged mask (round-0 reuse), changed mask (outliers),
+    /// all views fixed, marker-only, and cap rejections in round 1 and later rounds; without
+    /// diagnostics only the rms fields differ (None).
+    #[test]
+    fn refine_poses_matches_oracle_bitwise() {
+        let look = [0.30, 0.0, 0.0];
+        let truth = [cam_at([0.30, 0.0, 0.45], look), cam_at([0.30, -0.04, 0.45], look), cam_at([0.30, 0.04, 0.45], look), cam_at([0.34, 0.0, 0.45], look)];
+        let mut kin = truth;
+        kin[1].r = mat_mul(&rodrigues(&[0.0015, 0.0, 0.0]), &kin[1].r);
+        kin[2].r = mat_mul(&rodrigues(&[0.0, -0.001, 0.0011]), &kin[2].r);
+        kin[3].r = mat_mul(&rodrigues(&[0.0, 0.0006, -0.0021]), &kin[3].r);
+        let grid = |marker: bool| -> Vec<Corr> {
+            let mut corrs = Vec::new();
+            for i in 0..8 {
+                for j in 0..6 {
+                    let x = [0.22 + 0.022 * f64::from(i), -0.10 + 0.04 * f64::from(j), if marker { 0.003 } else { 0.0 }];
+                    let obs: Vec<(usize, [f64; 2])> = truth.iter().enumerate().filter_map(|(k, c)| c.project(&x).map(|q| (k, q))).collect();
+                    corrs.push(Corr { obs, on_table: !marker, marker });
+                }
+            }
+            corrs
+        };
+        let clean = grid(false);
+        let mut outliers = clean.clone();
+        outliers[3].obs[1].1[0] += 6.0;
+        outliers[10].obs[2].1[1] -= 9.0;
+        outliers[20].obs[3].1[0] -= 7.0;
+        let markers = grid(true);
+        let cap = |c: f64| PoseParams { max_correction_rad: c, ..PoseParams::default() };
+        let cases: Vec<(&str, &[Corr], PoseParams)> = vec![
+            ("unchanged_mask", &clean, PoseParams::default()),
+            ("changed_mask", &outliers, PoseParams::default()),
+            ("all_fixed", &clean[..8], PoseParams::default()),
+            ("marker_only", &markers, PoseParams::default()),
+            ("cap_round1_unchanged", &clean, cap(0.0013)),
+            ("cap_round1_changed", &outliers, cap(0.0013)),
+            ("cap_later_rounds", &clean, cap(0.0019)),
+            ("cap_all", &outliers, cap(0.0001)),
+        ];
+        for (name, corrs, pp) in cases {
+            let (cams, views) = refine_poses_oracle(&kin, 0, corrs, 0.0, &pp);
+            let r = refine_poses(&kin, 0, corrs, 0.0, &pp);
+            assert_eq!(r.cams, cams, "{name}");
+            assert_eq!(r.views, views, "{name}");
+            let nd = refine_poses_with(&kin, 0, corrs, 0.0, &pp, false);
+            assert_eq!(nd.cams, cams, "{name}");
+            for (a, b) in nd.views.iter().zip(&views) {
+                assert_eq!(*a, ViewRefine { rms_before_px: None, rms_after_px: None, ..*b }, "{name}");
+            }
+        }
     }
 
     #[test]
