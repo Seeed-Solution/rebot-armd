@@ -861,8 +861,16 @@ pub struct GrayFormatDescriptor {
 }
 
 impl GrayFormatDescriptor {
-    fn parse(v: &Value) -> Option<Self> {
-        let g = v.get("gray_frames")?.as_object()?;
+    /// `gray_frames` of a `GET /api/mode` body: `Ok(None)` when not advertised, `Err` when
+    /// advertised but malformed (a wrong type, arity or a missing required field), which must not
+    /// be read as "absent".
+    fn parse_advertised(v: &Value) -> Result<Option<Self>, String> {
+        let Some(g) = v.get("gray_frames") else { return Ok(None) };
+        Self::parse(g).map(Some).ok_or_else(|| format!("malformed gray_frames descriptor: {g}"))
+    }
+
+    fn parse(g: &Value) -> Option<Self> {
+        let g = g.as_object()?;
         let parse_u_array = |k: &str, len: usize| -> Option<Vec<usize>> {
             let a = g.get(k)?.as_array()?;
             if a.len() != len { return None; }
@@ -962,8 +970,8 @@ pub struct ModeInfo {
     pub depth_available: bool,
     /// `available.gray` (loopback peers only on rebot-vision).
     pub gray_available: bool,
-    /// `gray_frames` format descriptor when advertised.
-    pub gray_format: Option<GrayFormatDescriptor>,
+    /// `gray_frames` format descriptor: `Ok(None)` when not advertised, `Err` when malformed.
+    pub gray_format: Result<Option<GrayFormatDescriptor>, String>,
     /// True when the upstream detector endpoint is on loopback (local device).
     pub upstream_loopback: bool,
     /// `depth_model.metric`.
@@ -1046,7 +1054,7 @@ impl ModeInfo {
             return Self {
                 reported: false, per_request_pipelines: false, yolo_available: true,
                 aruco_available: false, depth_available: false, gray_available: false,
-                gray_format: None, upstream_loopback: true, depth_metric: false,
+                gray_format: Ok(None), upstream_loopback: true, depth_metric: false,
                 model_kind: None, vision: Ok(None), models: None,
             };
         };
@@ -1062,7 +1070,7 @@ impl ModeInfo {
             aruco_available: avail("aruco").unwrap_or(false),
             depth_available: avail("depth").unwrap_or(false),
             gray_available: avail("gray").unwrap_or(false),
-            gray_format: GrayFormatDescriptor::parse(v),
+            gray_format: GrayFormatDescriptor::parse_advertised(v),
             upstream_loopback: true,
             depth_metric: v.get("depth_model").and_then(|d| d.get("metric")).and_then(Value::as_bool).unwrap_or(false),
             model_kind: v.get("model").and_then(|m| m.get("kind")).and_then(Value::as_str).map(str::to_string),
@@ -1083,7 +1091,7 @@ impl ModeInfo {
         Ok(Self {
             reported: per_request_pipelines || matches!(vision, Ok(Some(_))),
             per_request_pipelines, yolo_available: true, aruco_available, depth_available,
-            gray_available, gray_format: None, upstream_loopback: true, depth_metric: false,
+            gray_available, gray_format: Ok(None), upstream_loopback: true, depth_metric: false,
             model_kind: None, vision, models: None,
         })
     }
@@ -1354,6 +1362,9 @@ pub fn parse_gray_frame_with_format(
     let wait_mono_ms = req_u64("wait_mono_ms")?;
     let grab_mono_ms = req_u64("grab_mono_ms")?;
     let stored_mono_ms = req_u64("stored_mono_ms")?;
+    if stored_mono_ms < grab_mono_ms {
+        return Err(proto(format!("RGF1 stored_mono_ms {stored_mono_ms} precedes grab_mono_ms {grab_mono_ms}")));
+    }
     let convert_ms = v
         .get("convert_ms")
         .and_then(Value::as_f64)
@@ -4620,7 +4631,7 @@ mod tests {
         assert!(!legacy.reported && legacy.vision == Ok(None));
         let full = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "enabled": true, "per_request_pipelines": true,
             "model": {"kind": "segment"}, "available": {"depth": true}, "depth_model": {"metric": true}})));
-        assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, yolo_available: true, aruco_available: false, depth_available: true, gray_available: false, gray_format: None, upstream_loopback: true, depth_metric: true,
+        assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, yolo_available: true, aruco_available: false, depth_available: true, gray_available: false, gray_format: Ok(None), upstream_loopback: true, depth_metric: true,
             model_kind: Some("segment".into()), vision: Ok(Some(VisionMode { mode: "yolo".into(), enabled: true })), models: None });
         // available.depth is read independently of depth_model.metric
         let depth_off = ModeInfo::parse(Some(&serde_json::json!({"available": {"depth": false}, "depth_model": {"metric": true}})));
@@ -5941,6 +5952,7 @@ mod tests {
             { let mut h = base_hdr(); h["crop"] = serde_json::json!([0, 140, 640]); h },      // wrong arity
             { let mut h = base_hdr(); h["convert_ms"] = serde_json::json!(-1.0); h },
             { let mut h = base_hdr(); h["stored_mono_ms"] = serde_json::json!(-5); h },
+            { let mut h = base_hdr(); h["stored_mono_ms"] = serde_json::json!(100u64); h }, // stored before grab (101)
             { let mut h = base_hdr(); h["stride"] = serde_json::json!(648); h },
             { let mut h = base_hdr(); h["width"] = serde_json::json!(320); h["stride"] = serde_json::json!(320); h },
             { let mut h = base_hdr(); h["height"] = serde_json::json!(u64::MAX); h },
@@ -5989,14 +6001,36 @@ mod tests {
             }
         })));
         assert!(m.per_request_pipelines && m.aruco_available && m.gray_available);
-        assert_eq!(m.gray_format, Some(GrayFormatDescriptor {
+        assert_eq!(m.gray_format, Ok(Some(GrayFormatDescriptor {
             encoding: "RGF1".into(), format: "gray8".into(), width: 640, height: 360, stride: 640, ring: 4, exposure_qualified: false,
             frame_size: Some([640, 640]), crop: Some([0, 140, 640, 360]),
             luma: Some(GRAY_V1_LUMA.into()), luma_range: Some(GRAY_V1_LUMA_RANGE.into()),
-        }));
-        assert!(m.gray_format.as_ref().unwrap().is_supported_v1());
+        })));
+        assert!(m.gray_format.as_ref().unwrap().as_ref().unwrap().is_supported_v1());
         let old = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "per_request_pipelines": true, "available": {"yolo": true, "aruco": true}})));
-        assert!(old.aruco_available && !old.gray_available && old.gray_format.is_none());
+        assert!(old.aruco_available && !old.gray_available && old.gray_format == Ok(None));
+        // An advertised but malformed descriptor is an error, not "absent".
+        let good = serde_json::json!({
+            "encoding": "RGF1", "format": "gray8", "width": 640, "height": 360, "stride": 640,
+            "frame_size": [640, 640], "crop": [0, 140, 640, 360], "ring": 4
+        });
+        for (key, bad) in [
+            ("width", serde_json::json!("640")), ("crop", serde_json::json!([0, 140, 640])),
+            ("frame_size", serde_json::json!(null)), ("luma", serde_json::json!(1)), ("ring", serde_json::json!(-1)),
+        ] {
+            let mut g = good.clone();
+            g[key] = bad;
+            let m = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "per_request_pipelines": true,
+                "available": {"gray": true}, "gray_frames": g})));
+            assert!(m.gray_format.is_err(), "{key}: {:?}", m.gray_format);
+        }
+        let mut no_enc = good.clone();
+        no_enc.as_object_mut().unwrap().remove("encoding");
+        for g in [no_enc, serde_json::json!(null), serde_json::json!([1, 2])] {
+            let m = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "per_request_pipelines": true,
+                "available": {"gray": true}, "gray_frames": g})));
+            assert!(m.gray_format.is_err(), "{:?}", m.gray_format);
+        }
 
         for lo in ["http://127.0.0.1:8090", "http://127.0.0.2:8090", "http://localhost:8090", "http://[::1]:8090"] {
             assert!(DetectorUpstream::parse(lo).unwrap().is_loopback(), "{lo}");

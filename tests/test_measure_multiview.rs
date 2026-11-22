@@ -1305,3 +1305,30 @@ async fn gray_trigger_timeout_resamples_sample_a() {
     let spread_mrad = v0["snapshot_tries_mrad"][0].as_f64().unwrap();
     assert!(spread_mrad < 0.2, "expected near-zero spread on retaken bracket, got {spread_mrad}");
 }
+
+#[test]
+fn malformed_gray_descriptor_does_not_select_gray() {
+    let mode = |gray_frames: Option<serde_json::Value>| {
+        let mut v = json!({"mode": "yolo", "per_request_pipelines": true, "available": {"yolo": true, "gray": true}});
+        if let Some(g) = gray_frames { v["gray_frames"] = g; }
+        armd::grasp::ModeInfo::parse(Some(&v))
+    };
+    let good = json!({"encoding": "RGF1", "format": "gray8", "width": 640, "height": 360, "stride": 640,
+        "frame_size": [640, 640], "crop": [0, 140, 640, 360], "ring": 4});
+    assert_eq!(mm::select_frame_source(&mode(Some(good.clone()))), mm::FrameSource::Gray);
+    // Absent descriptor (older provider advertising available.gray only): gray with the fixed v1 contract.
+    assert_eq!(mm::select_frame_source(&mode(None)), mm::FrameSource::Gray);
+    let mut bad = good.clone();
+    bad["crop"] = json!([0, 140, 640]);
+    assert_eq!(mm::select_frame_source(&mode(Some(bad))), mm::FrameSource::Snapshot);
+    let mut bad = good.clone();
+    bad["width"] = json!("640");
+    assert_eq!(mm::select_frame_source(&mode(Some(bad))), mm::FrameSource::Snapshot);
+    assert_eq!(mm::select_frame_source(&mode(Some(json!("RGF1")))), mm::FrameSource::Snapshot);
+    let mut unsupported = good;
+    unsupported["stride"] = json!(704);
+    assert_eq!(mm::select_frame_source(&mode(Some(unsupported))), mm::FrameSource::Snapshot);
+    let mut remote = mode(None);
+    remote.upstream_loopback = false;
+    assert_eq!(mm::select_frame_source(&remote), mm::FrameSource::Snapshot);
+}

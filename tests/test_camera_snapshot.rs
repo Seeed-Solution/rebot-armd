@@ -91,7 +91,7 @@ async fn http_detection_source_gray_negotiation_and_strict_fetch() {
 
     let mode = src.mode_info().await.unwrap();
     assert!(mode.per_request_pipelines && mode.aruco_available && mode.gray_available && mode.upstream_loopback);
-    assert_eq!(mode.gray_format.as_ref().map(|g| (g.width, g.height, g.stride, g.ring)), Some((640, 360, 640, 4)));
+    assert_eq!(mode.gray_format.as_ref().ok().and_then(Option::as_ref).map(|g| (g.width, g.height, g.stride, g.ring)), Some((640, 360, 640, 4)));
 
     let trig = src.trigger_gray(&["yolo", "gray"], 1000).await.unwrap().expect("trigger result");
     assert_eq!(trig.instance_id.as_deref(), Some("rv-golden-0001"));

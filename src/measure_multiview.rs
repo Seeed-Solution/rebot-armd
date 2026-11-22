@@ -1593,6 +1593,18 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn Detectio
     tracing::info!("measure_multiview {id} ended: {a:?}");
 }
 
+/// The run's image source: gray when the provider advertises it on a loopback upstream and its
+/// `gray_frames` descriptor is absent (fixed v1 contract) or a supported v1 descriptor. A
+/// malformed or unsupported descriptor selects the JPEG snapshot path.
+pub fn select_frame_source(mode: &grasp::ModeInfo) -> FrameSource {
+    let descriptor_ok = match &mode.gray_format {
+        Ok(None) => true,
+        Ok(Some(fmt)) => fmt.is_supported_v1(),
+        Err(_) => false,
+    };
+    if mode.gray_available && mode.upstream_loopback && descriptor_ok { FrameSource::Gray } else { FrameSource::Snapshot }
+}
+
 /// Return to the start joints when asked (a failure there ends the action with its own code).
 async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     if !plan.request.return_to_start { return Ok(()); }
@@ -1622,15 +1634,11 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
             }
         }
     };
-    let frame_source = if mode.gray_available
-        && mode.upstream_loopback
-        && mode.gray_format.as_ref().is_none_or(grasp::GrayFormatDescriptor::is_supported_v1)
-    {
-        FrameSource::Gray
-    } else {
-        FrameSource::Snapshot
+    let frame_source = select_frame_source(&mode);
+    let negotiated_gray_format = match (&mode.gray_format, frame_source) {
+        (Ok(fmt), FrameSource::Gray) => fmt.clone(),
+        _ => None,
     };
-    let negotiated_gray_format = if frame_source == FrameSource::Gray { mode.gray_format.clone() } else { None };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
     let first = capture(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
