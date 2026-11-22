@@ -379,17 +379,6 @@ pub(crate) struct IsaProbe {
     pub kernel_release: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UnversionedVAllowlistEntry {
-    pub dt_compatible: &'static str,
-    pub uarch: &'static str,
-    pub kernel_release: &'static str,
-}
-
-/// Additional `(dt_compatible, uarch, kernel_release)` tuples for unversioned `v` boards beyond
-/// the captured `cvitek,cv181x` device rule in `detect_backend_with_allowlist`.
-const UNVERSIONED_V_ALLOWLIST: &[UnversionedVAllowlistEntry] = &[];
-
 static ACTIVE_SELECTION: OnceLock<BackendSelection> = OnceLock::new();
 
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
@@ -425,7 +414,7 @@ fn active_selection() -> &'static BackendSelection {
         } else {
             IsaProbe::default()
         };
-        detect_backend_with_allowlist(env_ref, HAS_COMPILED_XTHEAD071, &probe, UNVERSIONED_V_ALLOWLIST)
+        detect_backend(env_ref, HAS_COMPILED_XTHEAD071, &probe)
     })
 }
 
@@ -553,7 +542,7 @@ fn is_rvv1_subext_name(seg: &str) -> bool {
 fn classify_v_version(ver: IsaVersion) -> RiscvVExt {
     match ver {
         IsaVersion::None => RiscvVExt::Unversioned,
-        IsaVersion::Parts(0, Some(7), None | Some(1)) => RiscvVExt::Draft0p7,
+        IsaVersion::Parts(0, Some(7), None) => RiscvVExt::Draft0p7,
         IsaVersion::Parts(maj, min, _) => RiscvVExt::OtherVersion(maj, min),
     }
 }
@@ -755,20 +744,10 @@ fn sanitize_field(s: &str, max_bytes: usize) -> String {
     }
 }
 
-fn is_supported_sg2002_dt(compat: &[&str]) -> bool {
-    compat.iter().any(|&c| {
-        matches!(
-            c,
-            "sophgo,sg2002" | "cvitek,sg2002" | "cvitek,cv181x" | "thead,c906"
-        )
-    })
-}
-
-pub(crate) fn detect_backend_with_allowlist(
+pub(crate) fn detect_backend(
     env: Option<Result<&str, ()>>,
     has_compiled_kernel: bool,
     probe: &IsaProbe,
-    allowlist: &[UnversionedVAllowlistEntry],
 ) -> BackendSelection {
     match env {
         Some(Ok("scalar")) => {
@@ -884,97 +863,75 @@ pub(crate) fn detect_backend_with_allowlist(
 
     let v_ext = first_v.expect("harts is non-empty");
     let uarch = first_uarch.flatten();
-    let dt_compat = probe
-        .dt_compatible
-        .as_deref()
-        .map(parse_dt_compatibles)
-        .unwrap_or_default();
 
     match v_ext {
-        RiscvVExt::Draft0p7 => {
-            if let Some(u) = uarch {
-                if u != "thead,c906" {
-                    return BackendSelection {
-                        backend: NccBackendKind::Scalar,
-                        reason: "uarch:unsupported".to_string(),
-                    };
-                }
-            }
-            if uarch == Some("thead,c906") || is_supported_sg2002_dt(&dt_compat) {
-                BackendSelection {
-                    backend: NccBackendKind::Xthead071,
-                    reason: "detect:hwcap_v+isa_v0p7".to_string(),
-                }
-            } else {
-                BackendSelection {
-                    backend: NccBackendKind::Scalar,
-                    reason: "hw:unrecognized_for_v0p7".to_string(),
-                }
-            }
+        RiscvVExt::Draft0p7 | RiscvVExt::Unversioned => {}
+        RiscvVExt::OtherVersion(_, _) | RiscvVExt::Rvv1Subext => {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "isa:non_0p7_v".to_string(),
+            };
         }
-        RiscvVExt::Unversioned => {
-            if probe.dt_compatible.is_none() {
-                return BackendSelection {
-                    backend: NccBackendKind::Scalar,
-                    reason: "dt:missing".to_string(),
-                };
-            }
-            if let Some(u) = uarch {
-                if u != "thead,c906" {
-                    return BackendSelection {
-                        backend: NccBackendKind::Scalar,
-                        reason: "uarch:unsupported".to_string(),
-                    };
-                }
-            }
-            if dt_compat.contains(&"cvitek,cv181x") {
-                return BackendSelection {
-                    backend: NccBackendKind::Xthead071,
-                    reason: "detect:hwcap_v+isa_v+dt_cvitek_cv181x".to_string(),
-                };
-            }
-            let kr_trimmed = probe.kernel_release.as_deref().map(str::trim);
-            let allowed = uarch.is_some()
-                && kr_trimmed.is_some()
-                && allowlist.iter().any(|entry| {
-                    Some(entry.uarch) == uarch
-                        && kr_trimmed == Some(entry.kernel_release)
-                        && dt_compat.contains(&entry.dt_compatible)
-                });
-            if allowed {
-                BackendSelection {
-                    backend: NccBackendKind::Xthead071,
-                    reason: "detect:hwcap_v+unversioned_v_allowlist".to_string(),
-                }
-            } else {
-                let isa_s = sanitize_field(first_isa_raw, 64);
-                let uarch_s = uarch.map_or_else(|| "-".to_string(), |u| sanitize_field(u, 48));
-                let compat_joined = if dt_compat.is_empty() {
-                    "-".to_string()
-                } else {
-                    sanitize_field(&dt_compat.join("|"), 64)
-                };
-                let os_s = kr_trimmed.map_or_else(|| "-".to_string(), |k| sanitize_field(k, 48));
-                BackendSelection {
-                    backend: NccBackendKind::Scalar,
-                    reason: format!(
-                        "isa:unversioned_v(isa={isa_s};uarch={uarch_s};compat={compat_joined};osrelease={os_s})"
-                    ),
-                }
-            }
+        RiscvVExt::Conflict => {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "isa:conflicting_v".to_string(),
+            };
         }
-        RiscvVExt::OtherVersion(_, _) | RiscvVExt::Rvv1Subext => BackendSelection {
+        RiscvVExt::None => {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "isa:no_v".to_string(),
+            };
+        }
+    }
+
+    let Some(raw_dt) = probe.dt_compatible.as_deref() else {
+        return BackendSelection {
             backend: NccBackendKind::Scalar,
-            reason: "isa:non_0p7_v".to_string(),
-        },
-        RiscvVExt::Conflict => BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "isa:conflicting_v".to_string(),
-        },
-        RiscvVExt::None => BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "isa:no_v".to_string(),
-        },
+            reason: "dt:missing".to_string(),
+        };
+    };
+    let dt_compat = parse_dt_compatibles(raw_dt);
+
+    if let Some(u) = uarch {
+        if u != "thead,c906" {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "uarch:unsupported".to_string(),
+            };
+        }
+    }
+
+    if dt_compat.contains(&"cvitek,cv181x") {
+        let reason = match v_ext {
+            RiscvVExt::Draft0p7 => "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x",
+            RiscvVExt::Unversioned => "detect:hwcap_v+isa_v+dt_cvitek_cv181x",
+            _ => unreachable!("checked above"),
+        };
+        return BackendSelection {
+            backend: NccBackendKind::Xthead071,
+            reason: reason.to_string(),
+        };
+    }
+
+    let isa_s = sanitize_field(first_isa_raw, 64);
+    let uarch_s = uarch.map_or_else(|| "-".to_string(), |u| sanitize_field(u, 48));
+    let compat_joined = if dt_compat.is_empty() {
+        "-".to_string()
+    } else {
+        sanitize_field(&dt_compat.join("|"), 64)
+    };
+    let os_s = probe
+        .kernel_release
+        .as_deref()
+        .map(str::trim)
+        .map_or_else(|| "-".to_string(), |k| sanitize_field(k, 48));
+    BackendSelection {
+        backend: NccBackendKind::Scalar,
+        reason: format!(
+            "dt:unsupported_compatible(isa={isa_s};uarch={uarch_s};compat={compat_joined};osrelease={os_s})"
+        ),
     }
 }
 
@@ -1434,7 +1391,7 @@ mod tests {
         IsaProbe {
             auxv: Some(encode_auxv(&[(16, 1u64 << 21), (0, 0)])),
             cpuinfo: Some(format!("processor\t: 0\nhart\t\t: 0\nisa\t\t: {isa}\nuarch\t\t: thead,c906\n")),
-            dt_compatible: Some(b"sipeed,licheerv-nano\0sophgo,sg2002\0".to_vec()),
+            dt_compatible: Some(b"cvitek,cv181x\0".to_vec()),
             kernel_release: Some("5.10.4-tag-\n".to_string()),
         }
     }
@@ -1579,17 +1536,16 @@ mod tests {
             "rv64i2p0m2p0a2p0f2p0d2p0c2p0v0p7",
             "rv64i2p0_m2p0_a2p0_f2p0_d2p0_c2p0_v0p7_zvamo0p7_zvlsseg0p7",
             "rv64imafdc_v0p7_xtheadba",
-            "rv64imafdcv0p7p1",
         ] {
             let probe = valid_sg2002_probe(isa);
-            let sel_none = detect_backend_with_allowlist(None, true, &probe, &[]);
+            let sel_none = detect_backend(None, true, &probe);
             assert_eq!(sel_none.backend, NccBackendKind::Xthead071, "isa={isa}: {sel_none:?}");
-            assert_eq!(sel_none.reason, "detect:hwcap_v+isa_v0p7");
+            assert_eq!(sel_none.reason, "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x");
 
-            let sel_auto = detect_backend_with_allowlist(Some(Ok("auto")), true, &probe, &[]);
+            let sel_auto = detect_backend(Some(Ok("auto")), true, &probe);
             assert_eq!(sel_auto.backend, NccBackendKind::Xthead071);
 
-            let sel_scalar = detect_backend_with_allowlist(Some(Ok("scalar")), true, &probe, &[]);
+            let sel_scalar = detect_backend(Some(Ok("scalar")), true, &probe);
             assert_eq!(sel_scalar.backend, NccBackendKind::Scalar);
             assert_eq!(sel_scalar.reason, "env:scalar");
 
@@ -1599,14 +1555,27 @@ mod tests {
                 ("foo", "env:unknown:foo"),
                 ("", "env:unknown:<empty>"),
             ] {
-                let sel_unk = detect_backend_with_allowlist(Some(Ok(val)), true, &probe, &[]);
+                let sel_unk = detect_backend(Some(Ok(val)), true, &probe);
                 assert_eq!(sel_unk.backend, NccBackendKind::Scalar);
                 assert_eq!(sel_unk.reason, expected);
             }
-            let sel_non_utf8 = detect_backend_with_allowlist(Some(Err(())), true, &probe, &[]);
+            let sel_non_utf8 = detect_backend(Some(Err(())), true, &probe);
             assert_eq!(sel_non_utf8.backend, NccBackendKind::Scalar);
             assert_eq!(sel_non_utf8.reason, "env:unknown:non_utf8");
         }
+
+        // `cvitek,cv181x` + `rv64imafdcv0p7` also matches when `uarch` is absent.
+        let mut no_uarch = valid_sg2002_probe("rv64imafdcv0p7");
+        no_uarch.cpuinfo = Some("processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdcv0p7\n".to_string());
+        let sel_no_uarch = detect_backend(None, true, &no_uarch);
+        assert_eq!(sel_no_uarch.backend, NccBackendKind::Xthead071);
+        assert_eq!(sel_no_uarch.reason, "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x");
+
+        // `v0p7p1` is NOT exact `v0p7` and must be rejected to Scalar.
+        let p_0p7p1 = valid_sg2002_probe("rv64imafdcv0p7p1");
+        let sel_0p7p1 = detect_backend(None, true, &p_0p7p1);
+        assert_eq!(sel_0p7p1.backend, NccBackendKind::Scalar);
+        assert_eq!(sel_0p7p1.reason, "isa:non_0p7_v");
     }
 
     #[test]
@@ -1616,63 +1585,65 @@ mod tests {
         // Missing / bad / no-V auxv / AT_NULL before AT_HWCAP.
         let mut p = base.clone();
         p.auxv = None;
-        assert_eq!(detect_backend_with_allowlist(None, true, &p, &[]).backend, NccBackendKind::Scalar);
+        assert_eq!(detect_backend(None, true, &p).backend, NccBackendKind::Scalar);
 
         p.auxv = Some(vec![0u8; 10]); // truncated
-        assert_eq!(detect_backend_with_allowlist(None, true, &p, &[]).backend, NccBackendKind::Scalar);
+        assert_eq!(detect_backend(None, true, &p).backend, NccBackendKind::Scalar);
 
         p.auxv = Some(encode_auxv(&[(16, 0), (0, 0)])); // V bit 21 unset
-        assert_eq!(detect_backend_with_allowlist(None, true, &p, &[]).backend, NccBackendKind::Scalar);
+        assert_eq!(detect_backend(None, true, &p).backend, NccBackendKind::Scalar);
 
         p.auxv = Some(encode_auxv(&[(0, 0), (16, 1u64 << 21)])); // AT_NULL before AT_HWCAP
-        assert_eq!(detect_backend_with_allowlist(None, true, &p, &[]).backend, NccBackendKind::Scalar);
+        assert_eq!(detect_backend(None, true, &p).backend, NccBackendKind::Scalar);
 
-        // Plain unversioned `v` rejected without allowlist, accepted only on exact allowlist match.
+        // `thead,c906` + `rv64imafdcv0p7` without `cvitek,cv181x` (e.g. `sophgo,sg2002` or missing DT) -> Scalar.
+        let mut sg2002_only = base.clone();
+        sg2002_only.dt_compatible = Some(b"sipeed,licheerv-nano\0sophgo,sg2002\0".to_vec());
+        let sel_sg2002 = detect_backend(None, true, &sg2002_only);
+        assert_eq!(sel_sg2002.backend, NccBackendKind::Scalar);
+        assert!(sel_sg2002.reason.starts_with("dt:unsupported_compatible("), "{sel_sg2002:?}");
+        assert!(sel_sg2002.reason.contains("sophgo,sg2002"), "{sel_sg2002:?}");
+        assert!(sel_sg2002.reason.contains("thead,c906"), "{sel_sg2002:?}");
+        assert!(sel_sg2002.reason.contains("5.10.4-tag-"), "{sel_sg2002:?}");
+
+        let mut missing_dt_v0p7 = base.clone();
+        missing_dt_v0p7.dt_compatible = None;
+        let sel_missing_dt = detect_backend(None, true, &missing_dt_v0p7);
+        assert_eq!(sel_missing_dt.backend, NccBackendKind::Scalar);
+        assert_eq!(sel_missing_dt.reason, "dt:missing");
+
+        // Substring trap `cvitek,cv181x-rev2` + `rv64imafdcv0p7` -> Scalar.
+        let mut substr_trap = base.clone();
+        substr_trap.dt_compatible = Some(b"cvitek,cv181x-rev2\0".to_vec());
+        let sel_substr = detect_backend(None, true, &substr_trap);
+        assert_eq!(sel_substr.backend, NccBackendKind::Scalar);
+        assert!(sel_substr.reason.starts_with("dt:unsupported_compatible("), "{sel_substr:?}");
+
+        // Plain unversioned `v` accepted with `cvitek,cv181x`, rejected without it.
         for plain_isa in ["rv64imafdcv", "rv64imafdcvsu"] {
             let p_plain = valid_sg2002_probe(plain_isa);
-            let sel = detect_backend_with_allowlist(None, true, &p_plain, &[]);
-            assert_eq!(sel.backend, NccBackendKind::Scalar);
-            assert!(sel.reason.starts_with("isa:unversioned_v("), "{sel:?}");
-            assert!(sel.reason.contains("sophgo,sg2002"), "{sel:?}");
-            assert!(sel.reason.contains("thead,c906"), "{sel:?}");
-            assert!(sel.reason.contains("5.10.4-tag-"), "{sel:?}");
+            let sel = detect_backend(None, true, &p_plain);
+            assert_eq!(sel.backend, NccBackendKind::Xthead071);
+            assert_eq!(sel.reason, "detect:hwcap_v+isa_v+dt_cvitek_cv181x");
 
-            let allow = [UnversionedVAllowlistEntry {
-                dt_compatible: "sophgo,sg2002",
-                uarch: "thead,c906",
-                kernel_release: "5.10.4-tag-",
-            }];
-            assert_eq!(
-                detect_backend_with_allowlist(None, true, &p_plain, &allow).backend,
-                NccBackendKind::Xthead071
-            );
-
-            // Mismatched kernel / compat / uarch rejected even with allowlist.
-            let mut bad_kern = p_plain.clone();
-            bad_kern.kernel_release = Some("6.6.0".to_string());
-            assert_eq!(
-                detect_backend_with_allowlist(None, true, &bad_kern, &allow).backend,
-                NccBackendKind::Scalar
-            );
+            let mut non_cv181x = p_plain.clone();
+            non_cv181x.dt_compatible = Some(b"sophgo,sg2002\0".to_vec());
+            let sel_non = detect_backend(None, true, &non_cv181x);
+            assert_eq!(sel_non.backend, NccBackendKind::Scalar);
+            assert!(sel_non.reason.starts_with("dt:unsupported_compatible("), "{sel_non:?}");
 
             let mut bad_compat = p_plain.clone();
-            bad_compat.dt_compatible = Some(b"sophgo,sg2002-rev2\0".to_vec());
-            assert_eq!(
-                detect_backend_with_allowlist(None, true, &bad_compat, &allow).backend,
-                NccBackendKind::Scalar
-            );
+            bad_compat.dt_compatible = Some(b"cvitek,cv181x-rev2\0".to_vec());
+            assert_eq!(detect_backend(None, true, &bad_compat).backend, NccBackendKind::Scalar);
 
             let mut bad_uarch = p_plain.clone();
             bad_uarch.cpuinfo = Some(format!("processor : 0\nisa : {plain_isa}\nuarch : thead,c910\n"));
-            assert_eq!(
-                detect_backend_with_allowlist(None, true, &bad_uarch, &allow).backend,
-                NccBackendKind::Scalar
-            );
+            assert_eq!(detect_backend(None, true, &bad_uarch).backend, NccBackendKind::Scalar);
         }
 
         // T-Head vendor alone without v0p7.
         let p_vendor = valid_sg2002_probe("rv64imafdc_xtheadcmo");
-        assert_eq!(detect_backend_with_allowlist(None, true, &p_vendor, &[]).backend, NccBackendKind::Scalar);
+        assert_eq!(detect_backend(None, true, &p_vendor).backend, NccBackendKind::Scalar);
 
         // RVV 1.0 and conflicting strings.
         for rvv1_isa in [
@@ -1686,7 +1657,7 @@ mod tests {
         ] {
             let p_rvv1 = valid_sg2002_probe(rvv1_isa);
             assert_eq!(
-                detect_backend_with_allowlist(None, true, &p_rvv1, &[]).backend,
+                detect_backend(None, true, &p_rvv1).backend,
                 NccBackendKind::Scalar,
                 "must reject {rvv1_isa}"
             );
@@ -1703,16 +1674,16 @@ mod tests {
             mixed.cpuinfo = Some(format!(
                 "processor : 0\nisa : rv64imafdcv0p7\nuarch : thead,c906\n\n{second_hart}"
             ));
-            let sel = detect_backend_with_allowlist(None, true, &mixed, &[]);
+            let sel = detect_backend(None, true, &mixed);
             assert_eq!(sel.backend, NccBackendKind::Scalar);
             assert_eq!(sel.reason, "cpuinfo:mixed_harts");
         }
 
-        // Non-SG2002/C906 uarch even with v0p7 and SG2002 DT compatible.
+        // Non-SG2002/C906 uarch even with v0p7 and cvitek,cv181x DT compatible.
         let mut wrong_uarch = base.clone();
         wrong_uarch.cpuinfo = Some("processor : 0\nisa : rv64imafdcv0p7\nuarch : sifive,u74\n".to_string());
         assert_eq!(
-            detect_backend_with_allowlist(None, true, &wrong_uarch, &[]).backend,
+            detect_backend(None, true, &wrong_uarch).backend,
             NccBackendKind::Scalar
         );
 
@@ -1723,14 +1694,14 @@ mod tests {
         );
         let mut no_uarch_bad_dt = base.clone();
         no_uarch_bad_dt.cpuinfo = Some("processor : 0\nisa : rv64imafdcv0p7\n".to_string());
-        no_uarch_bad_dt.dt_compatible = Some(b"sophgo,sg2002-rev2\0".to_vec());
+        no_uarch_bad_dt.dt_compatible = Some(b"cvitek,cv181x-rev2\0".to_vec());
         assert_eq!(
-            detect_backend_with_allowlist(None, true, &no_uarch_bad_dt, &[]).backend,
+            detect_backend(None, true, &no_uarch_bad_dt).backend,
             NccBackendKind::Scalar
         );
         no_uarch_bad_dt.dt_compatible = Some(b"vendor,board\0cvitek,cv181x\0".to_vec());
         assert_eq!(
-            detect_backend_with_allowlist(None, true, &no_uarch_bad_dt, &[]).backend,
+            detect_backend(None, true, &no_uarch_bad_dt).backend,
             NccBackendKind::Xthead071
         );
     }
@@ -1747,19 +1718,19 @@ mod tests {
             kernel_release: Some("5.10.4-tag-\n".to_string()),
         };
 
-        let sel = detect_backend_with_allowlist(None, true, &recamera, &[]);
+        let sel = detect_backend(None, true, &recamera);
         assert_eq!(sel.backend, NccBackendKind::Xthead071);
         assert_eq!(sel.reason, "detect:hwcap_v+isa_v+dt_cvitek_cv181x");
 
-        let sel_auto = detect_backend_with_allowlist(Some(Ok("auto")), true, &recamera, &[]);
+        let sel_auto = detect_backend(Some(Ok("auto")), true, &recamera);
         assert_eq!(sel_auto.backend, NccBackendKind::Xthead071);
         assert_eq!(sel_auto.reason, "detect:hwcap_v+isa_v+dt_cvitek_cv181x");
 
-        let sel_scalar = detect_backend_with_allowlist(Some(Ok("scalar")), true, &recamera, &[]);
+        let sel_scalar = detect_backend(Some(Ok("scalar")), true, &recamera);
         assert_eq!(sel_scalar.backend, NccBackendKind::Scalar);
         assert_eq!(sel_scalar.reason, "env:scalar");
 
-        let sel_no_kernel = detect_backend_with_allowlist(None, false, &recamera, &[]);
+        let sel_no_kernel = detect_backend(None, false, &recamera);
         assert_eq!(sel_no_kernel.backend, NccBackendKind::Scalar);
         assert_eq!(sel_no_kernel.reason, "scalar-only");
 
@@ -1770,7 +1741,7 @@ mod tests {
                 .to_string(),
         );
         with_c906_uarch.dt_compatible = Some(b"seeed,recamera\0cvitek,cv181x\0".to_vec());
-        let sel_c906 = detect_backend_with_allowlist(None, true, &with_c906_uarch, &[]);
+        let sel_c906 = detect_backend(None, true, &with_c906_uarch);
         assert_eq!(sel_c906.backend, NccBackendKind::Xthead071);
         assert_eq!(sel_c906.reason, "detect:hwcap_v+isa_v+dt_cvitek_cv181x");
 
@@ -1783,14 +1754,17 @@ mod tests {
         ] {
             let mut p = recamera.clone();
             p.dt_compatible = Some(other_compat.to_vec());
-            let sel_neg = detect_backend_with_allowlist(None, true, &p, &[]);
+            let sel_neg = detect_backend(None, true, &p);
             assert_eq!(
                 sel_neg.backend,
                 NccBackendKind::Scalar,
                 "must reject compat={:?}: {sel_neg:?}",
                 String::from_utf8_lossy(other_compat)
             );
-            assert!(sel_neg.reason.starts_with("isa:unversioned_v("), "{sel_neg:?}");
+            assert!(
+                sel_neg.reason.starts_with("dt:unsupported_compatible("),
+                "{sel_neg:?}"
+            );
         }
 
         // RVV 1.0 markers on `cvitek,cv181x` must be rejected.
@@ -1805,7 +1779,7 @@ mod tests {
             p.cpuinfo = Some(format!(
                 "processor\t: 0\nhart\t\t: 0\nisa\t\t: {rvv1_isa}\nmmu\t\t: sv39\n"
             ));
-            let sel_neg = detect_backend_with_allowlist(None, true, &p, &[]);
+            let sel_neg = detect_backend(None, true, &p);
             assert_eq!(
                 sel_neg.backend,
                 NccBackendKind::Scalar,
@@ -1816,15 +1790,18 @@ mod tests {
         // Missing / unreadable DT and empty DT with `rv64imafdvcsu` must be rejected.
         let mut missing_dt = recamera.clone();
         missing_dt.dt_compatible = None;
-        let sel_missing_dt = detect_backend_with_allowlist(None, true, &missing_dt, &[]);
+        let sel_missing_dt = detect_backend(None, true, &missing_dt);
         assert_eq!(sel_missing_dt.backend, NccBackendKind::Scalar);
         assert_eq!(sel_missing_dt.reason, "dt:missing");
 
         let mut empty_dt = recamera.clone();
         empty_dt.dt_compatible = Some(Vec::new());
-        let sel_empty_dt = detect_backend_with_allowlist(None, true, &empty_dt, &[]);
+        let sel_empty_dt = detect_backend(None, true, &empty_dt);
         assert_eq!(sel_empty_dt.backend, NccBackendKind::Scalar);
-        assert!(sel_empty_dt.reason.starts_with("isa:unversioned_v("), "{sel_empty_dt:?}");
+        assert!(
+            sel_empty_dt.reason.starts_with("dt:unsupported_compatible("),
+            "{sel_empty_dt:?}"
+        );
 
         // Mixed harts on `cvitek,cv181x` must be rejected.
         for second_hart in [
@@ -1835,7 +1812,7 @@ mod tests {
             mixed.cpuinfo = Some(format!(
                 "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdvcsu\nmmu\t\t: sv39\n\n{second_hart}"
             ));
-            let sel_mixed = detect_backend_with_allowlist(None, true, &mixed, &[]);
+            let sel_mixed = detect_backend(None, true, &mixed);
             assert_eq!(sel_mixed.backend, NccBackendKind::Scalar);
             assert_eq!(sel_mixed.reason, "cpuinfo:mixed_harts");
         }
@@ -1846,14 +1823,14 @@ mod tests {
             "processor\t: 0\nhart\t\t: 0\nisa\t\t: rv64imafdvcsu\nuarch\t\t: sifive,u74\n"
                 .to_string(),
         );
-        let sel_uarch = detect_backend_with_allowlist(None, true, &wrong_uarch, &[]);
+        let sel_uarch = detect_backend(None, true, &wrong_uarch);
         assert_eq!(sel_uarch.backend, NccBackendKind::Scalar);
         assert_eq!(sel_uarch.reason, "uarch:unsupported");
 
         // Missing HWCAP V bit 21 on `cvitek,cv181x` with `rv64imafdvcsu` must be rejected.
         let mut no_hwcap = recamera.clone();
         no_hwcap.auxv = Some(encode_auxv(&[(16, 0), (0, 0)]));
-        let sel_no_hwcap = detect_backend_with_allowlist(None, true, &no_hwcap, &[]);
+        let sel_no_hwcap = detect_backend(None, true, &no_hwcap);
         assert_eq!(sel_no_hwcap.backend, NccBackendKind::Scalar);
         assert_eq!(sel_no_hwcap.reason, "auxv:no_v_hwcap");
     }
