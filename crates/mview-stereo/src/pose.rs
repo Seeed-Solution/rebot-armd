@@ -2648,7 +2648,7 @@ mod tests {
                 &mut scalar_scratch,
             );
             let mut backends = vec![active];
-            if cfg!(not(mview_has_xthead071)) {
+            if cfg!(not(all(feature = "xthead-ncc", mview_has_xthead071))) {
                 backends.push(NccBackend::Xthead071);
             }
             for backend in backends {

@@ -9,10 +9,10 @@ use crate::{Gray, PATCH_R};
 /// Maximum patch radius supported by the half-grid integer-moment kernel (`33x33` patch).
 pub(crate) const HALF_GRID_MAX_R: usize = 16;
 
-/// Compiled-in RVV 0.7.1 archive availability (enabled by `build.rs` on `riscv64gc-unknown-linux-musl`).
-const HAS_COMPILED_XTHEAD071: bool = cfg!(mview_has_xthead071);
+/// Compiled-in RVV 0.7.1 archive availability (enabled by feature `xthead-ncc` and `build.rs` on `riscv64gc-unknown-linux-musl`).
+const HAS_COMPILED_XTHEAD071: bool = cfg!(all(feature = "xthead-ncc", mview_has_xthead071));
 
-#[cfg(mview_has_xthead071)]
+#[cfg(all(feature = "xthead-ncc", mview_has_xthead071))]
 mod ffi {
     extern "C" {
         pub(crate) fn mvs071_coarse_dots(
@@ -1003,7 +1003,7 @@ impl NccBackend {
         let count = out.len();
         let view = validate_coarse_dots(img, x0, y0, a, n, count, out)?;
         match self {
-            #[cfg(mview_has_xthead071)]
+            #[cfg(all(feature = "xthead-ncc", mview_has_xthead071))]
             Self::Xthead071 => {
                 // SAFETY: `validate_coarse_dots` verified `a.len() == n * n`,
                 // `out.len() == count > 0`, and `PatchView` bounds for `(n + count - 1) x n`
@@ -1022,7 +1022,7 @@ impl NccBackend {
                 record_coarse_dots(NccBackendKind::Xthead071, count as u64);
                 Ok(())
             }
-            #[cfg(not(mview_has_xthead071))]
+            #[cfg(not(all(feature = "xthead-ncc", mview_has_xthead071)))]
             Self::Xthead071 => {
                 if n == 5 {
                     coarse_dots_scalar::<5>(&view, a, n, out);
@@ -1055,7 +1055,7 @@ impl NccBackend {
     ) -> Result<(u32, u32, f32), PatchError> {
         let view = validate_half_moments(img, x0, y0, a, n, phase)?;
         match self {
-            #[cfg(mview_has_xthead071)]
+            #[cfg(all(feature = "xthead-ncc", mview_has_xthead071))]
             Self::Xthead071 => {
                 let mut sum_raw = 0u32;
                 let mut sumsq_raw = 0u32;
@@ -1079,7 +1079,7 @@ impl NccBackend {
                 record_half_moments(NccBackendKind::Xthead071);
                 Ok((sum_raw, sumsq_raw, dot))
             }
-            #[cfg(not(mview_has_xthead071))]
+            #[cfg(not(all(feature = "xthead-ncc", mview_has_xthead071)))]
             Self::Xthead071 => {
                 let res = half_moments_scalar_dispatch(&view, a, n, phase);
                 record_half_moments(NccBackendKind::Scalar);

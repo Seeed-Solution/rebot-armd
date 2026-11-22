@@ -21,6 +21,7 @@ policy-tract = ["policy-runtime", "dep:tract-onnx"]
 # device package (scripts/build_deb.sh builds the default features)
 mview-replay = []
 mview-profile = ["mview-stereo/mview-profile"]
+xthead-ncc = ["mview-stereo/xthead-ncc"]
 
 [[bin]]
 name = "mview-replay"

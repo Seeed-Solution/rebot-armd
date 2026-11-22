@@ -8,6 +8,7 @@ publish = false
 
 [features]
 mview-profile = []
+xthead-ncc = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
