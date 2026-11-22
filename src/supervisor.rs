@@ -2927,7 +2927,7 @@ impl SupervisorInner {
         let duration = traj.duration;
         let id = self.begin_action(kind, tag);
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)).with_motion_limits(limits.to_vec()));
 
         Ok((self.safety.epoch_id(), id, duration))
     }
@@ -3604,7 +3604,7 @@ impl SupervisorInner {
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
         let duration = traj.duration;
         self.quintic_settle = None;
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)).with_motion_limits(limits.to_vec()));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + crate::motion::SETTLE_MAX_S)
     }

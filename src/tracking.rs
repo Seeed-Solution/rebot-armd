@@ -349,7 +349,19 @@ impl crate::supervisor::SupervisorInner {
         let mut limits = if self.servo_target.is_some() || self.servo_stream_active {
             self.servo_limits()
         } else {
-            self.planning_limits()
+            let mut base = self.planning_limits();
+            if let Some(mlim) = self
+                .active_trajectory
+                .as_ref()
+                .and_then(|a| a.motion_limits.as_ref())
+                .filter(|v| v.len() == base.len())
+            {
+                for (l, m) in base.iter_mut().zip(mlim.iter()) {
+                    l.max_velocity = l.max_velocity.min(m.max_velocity);
+                    l.max_acceleration = l.max_acceleration.min(m.max_acceleration);
+                }
+            }
+            base
         };
         if time_scale.is_finite() && time_scale < 1.0 {
             let scale = time_scale.clamp(0.0, 1.0) as f32;
@@ -759,6 +771,22 @@ impl crate::supervisor::SupervisorInner {
                     }
                     if (pq - h.hold_q) * h.sign <= 1e-6 && (q_final - h.hold_q) * h.sign > 1e-5 {
                         q_final = h.hold_q;
+                    }
+                    // Recheck both velocity and acceleration after torque-hold clamping.
+                    let v_final = (f64::from(q_final) - f64::from(pq)) / dt;
+                    let v_prev_j = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
+                    let a_final = (v_final - v_prev_j) / dt;
+                    if !v_final.is_finite()
+                        || v_final.abs() > f64::from(lim.max_velocity) + 1e-4
+                        || !a_final.is_finite()
+                        || a_final.abs() > f64::from(lim.max_acceleration) + 1e-3
+                    {
+                        return Err(TrackingReject::JointLimit(format!(
+                            "joint {} torque-hold ramp-out dynamics exceeded (v={v_final:.3}/{:.3}, a={a_final:.3}/{:.3})",
+                            j + 1,
+                            lim.max_velocity,
+                            lim.max_acceleration
+                        )));
                     }
                 }
             }

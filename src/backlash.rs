@@ -433,7 +433,9 @@ mod runtime {
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
-                self.active_trajectory = Some(ActiveTrajectory::with_approach(active.action_id, active.reference, seg));
+                let mut wrapped = ActiveTrajectory::with_approach(active.action_id, active.reference, seg);
+                wrapped.motion_limits = active.motion_limits;
+                self.active_trajectory = Some(wrapped);
             }
             self.target_positions = target;
             if let Some(s) = seg_scale { self.note_action_power_scale(id, s); }
@@ -474,7 +476,9 @@ mod runtime {
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
-                self.active_trajectory = Some(ActiveTrajectory::with_approach(active.action_id, active.reference, seg));
+                let mut wrapped = ActiveTrajectory::with_approach(active.action_id, active.reference, seg);
+                wrapped.motion_limits = active.motion_limits;
+                self.active_trajectory = Some(wrapped);
             }
             self.target_positions = target;
             if let Some(s) = seg_scale { self.note_action_power_scale(id, s); }
@@ -507,7 +511,9 @@ mod runtime {
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
-                self.active_trajectory = Some(ActiveTrajectory::with_approach(active.action_id, active.reference, seg));
+                let mut wrapped = ActiveTrajectory::with_approach(active.action_id, active.reference, seg);
+                wrapped.motion_limits = active.motion_limits;
+                self.active_trajectory = Some(wrapped);
             }
             self.target_positions = target;
             if let Some(s) = seg_scale { self.note_action_power_scale(id, s); }

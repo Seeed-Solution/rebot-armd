@@ -3225,7 +3225,6 @@ fn tracking_park_keepout_ramp_and_fallback_persist_escape_depths() {
 
         let limits = inner.active_tracking_limits(DT, 1.0);
         // Step outward over 6 ticks (escaping > 5 mm while still inside the 30 mm deep keep-out).
-        let mut last_pos = q0.to_vec();
         for _ in 0..6 {
             let out = inner
                 .compute_lead_ramp_out(DT, &limits, true)
@@ -3234,8 +3233,7 @@ fn tracking_park_keepout_ramp_and_fallback_persist_escape_depths() {
                 out.ws_keepout_min_depths.is_some(),
                 "park keep-out ramp must produce revision-tagged ws_keepout_min_depths"
             );
-            last_pos = out.positions.clone();
-            inner.measured_positions = last_pos.clone();
+            inner.measured_positions = out.positions.clone();
             inner.tracking.record_issued_with_ws_depths(
                 out.positions,
                 out.velocities,
@@ -3293,6 +3291,69 @@ fn tracking_park_keepout_ramp_and_fallback_persist_escape_depths() {
         assert!(
             inner.tracking.ws_min_depths.is_some(),
             "rejection fallback must commit updated ws_min_depths instead of None"
+        );
+    }
+}
+
+/// Review 2 M4: `active_tracking_limits` honors `speed_scale` on planned trajectories,
+/// and `compute_lead_ramp_out` rechecks acceleration after torque-hold clamping.
+#[test]
+fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+
+    // 1. `install_joint_goal` with `speed_scale = 0.25` tightens `active_tracking_limits`.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.workspace = None;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let base_v = inner.planning_limits()[0].max_velocity;
+        let inp = inner.plan_input().unwrap();
+        let mut goal = [0.0_f64; 6];
+        for i in 0..6 {
+            goal[i] = f64::from(q0[i]);
+        }
+        goal[0] += 0.20;
+        inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+        let active = inner.active_tracking_limits(DT, 1.0);
+        assert!(
+            (active[0].max_velocity - base_v * 0.25).abs() < 1e-4,
+            "active_tracking_limits must apply speed_scale 0.25 ({} vs expected {})",
+            active[0].max_velocity,
+            base_v * 0.25
+        );
+    }
+
+    // 2. Torque-hold ramp-out rechecks acceleration after clamping `q_final = pq`.
+    {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.workspace = None;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        let mut prev_q = q0.to_vec();
+        prev_q[0] = 0.020;
+        let mut prev_v = vec![0.0; 7];
+        prev_v[0] = 0.40; // Clamping q_final = pq yields a = -20 rad/s^2 > max_acceleration!
+        inner.tracking.record_issued(prev_q, prev_v);
+        inner.commanded_positions[0] = 0.0;
+        inner.torque_guard.hold = Some(armd::torque_guard::TorqueHold {
+            joint: 0,
+            sign: 1.0,
+            hold_q: 0.020,
+            torque_nm: 15.0,
+            threshold_nm: 10.0,
+            since_s: 0.0,
+            anchor_q: 0.020,
+            push_in: false,
+            retreat: armd::torque_guard::Retreat::default(),
+        });
+        let limits = inner.active_tracking_limits(DT, 1.0);
+        let res = inner.compute_lead_ramp_out(DT, &limits, false);
+        assert!(
+            res.is_err(),
+            "torque-hold clamp violating max_acceleration must be rejected, got {res:?}"
         );
     }
 }
