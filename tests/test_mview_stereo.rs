@@ -390,6 +390,7 @@ fn shared_half_images_and_cameras_match_copied_views() {
     }
     let strip = |mut s: mview_stereo::Stats| { (s.pyramid_ms, s.features_ms, s.sweep_ms, s.refine_ms, s.triangulate_ms, s.total_ms) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0); s };
     let halves = mview_stereo::half_images(&views);
+    let prepared = |h: &[mview_stereo::Gray]| mview_stereo::Prepared::from_halves(h.to_vec());
     for reference in [offsets.iter().position(|o| o[0] == 0.0 && o[1] == 0.0).unwrap(), 0] {
         let bx = render::box_px(&scene, &b, &views[reference].cam);
         let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
@@ -398,20 +399,23 @@ fn shared_half_images_and_cameras_match_copied_views() {
         let pp = mview_stereo::PoseParams::default();
         for texture in [true, false] {
             let a = mview_stereo::refine_views(&views, reference, bx, &[], 0.0, &[], texture, &pp);
-            let s = mview_stereo::refine_views_with_halves(&views, &halves, reference, bx, &[], 0.0, &[], texture, &pp);
-            assert_eq!((&a.cams, &a.views, a.n_corrs), (&s.cams, &s.views, s.n_corrs), "reference {reference} texture {texture}");
-            let s2 = mview_stereo::refine_views_with_halves(&views, &halves[..2], reference, bx, &[], 0.0, &[], texture, &pp);
+            let s2 = mview_stereo::refine_views_prepared(&views, &prepared(&halves[..2]), reference, bx, &[], 0.0, &[], texture, &pp);
             assert_eq!((&a.cams, &a.views), (&s2.cams, &s2.views));
             let copied: Vec<View> = views.iter().zip(&a.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
             let r0 = mview_stereo::reconstruct(&copied, reference, region, bx, &p);
+            // pose then reconstruction on one Prepared (the corner map handed over when texture),
+            // also with short half images (rebuilt)
             for hv in [&halves[..], &halves[..3]] {
-                let r1 = mview_stereo::reconstruct_shared(&views, Some(&a.cams), hv, reference, region, bx, &p);
+                let pr = prepared(hv);
+                let s = mview_stereo::refine_views_prepared(&views, &pr, reference, bx, &[], 0.0, &[], texture, &pp);
+                assert_eq!((&a.cams, &a.views, a.n_corrs), (&s.cams, &s.views, s.n_corrs), "reference {reference} texture {texture}");
+                let r1 = mview_stereo::reconstruct_prepared(&views, Some(&a.cams), &pr, reference, region, bx, &p);
                 assert!(r0.points.len() > 20, "{:?}", r0.stats);
                 assert_eq!((&r0.points, &r0.outcomes, strip(r0.stats)), (&r1.points, &r1.outcomes, strip(r1.stats)), "reference {reference}");
             }
         }
         let r0 = mview_stereo::reconstruct(&views, reference, region, bx, &p);
-        let r1 = mview_stereo::reconstruct_shared(&views, None, &halves, reference, region, bx, &p);
+        let r1 = mview_stereo::reconstruct_prepared(&views, None, &prepared(&halves), reference, region, bx, &p);
         assert_eq!((&r0.points, &r0.outcomes, strip(r0.stats)), (&r1.points, &r1.outcomes, strip(r1.stats)));
     }
 }

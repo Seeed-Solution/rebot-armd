@@ -59,7 +59,7 @@ pub use ncc_backend::{
     backend_diagnostics, kernel_counts, reset_kernel_counts, BackendDiagnostics, KernelCallCounts,
     NccBackendKind,
 };
-pub use pose::{marker_corrs, refine_poses, refine_views, refine_views_with_halves, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
+pub use pose::{marker_corrs, refine_poses, refine_views, refine_views_prepared, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
 #[cfg(feature = "mview-profile")]
 pub use pose::{PosePassProfile, PoseProfile};
 
@@ -816,9 +816,29 @@ fn stream_corner_row<const SUB_OLD: bool, const EMIT_LAM: bool>(
     }
 }
 
+/// The corner response (smaller eigenvalue of the 5x5 structure tensor) of [`features`] over the
+/// pixels x0..x0+rw, y0..y0+rh of one image. The tensor sums are exact in f32 for 8-bit images
+/// (multiples of 1/4 below 2^22), so a sub-rectangle of a larger map is bitwise the map of the
+/// sub-rectangle.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CornerMap {
+    x0: usize,
+    y0: usize,
+    rw: usize,
+    rh: usize,
+    lam: Vec<f32>,
+}
+
 /// Corners in `region` (quotas inside / outside `inner`) and edge points in `edge_region` (see the
 /// module doc).
 pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params) -> Vec<Feature> {
+    features_shared(img, region, inner, edge_region, p, None, None)
+}
+
+/// [`features`] reading the corner response from `map_in` (of the same image) when it covers the
+/// region, and storing the region's map in `map_out`.
+pub(crate) fn features_shared(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params,
+    map_in: Option<&CornerMap>, map_out: Option<&mut Option<CornerMap>>) -> Vec<Feature> {
     let m = PATCH_R + 4;
     let x0 = (region[0].floor().max(0.0) as usize).max(m);
     let y0 = (region[1].floor().max(0.0) as usize).max(m);
@@ -836,6 +856,32 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     } else {
         (Vec::new(), Vec::new())
     };
+    let shared = map_in.filter(|mp| mp.x0 <= x0 && mp.y0 <= y0 && x0 + rw <= mp.x0 + mp.rw && y0 + rh <= mp.y0 + mp.rh);
+    let mut lam;
+    let mut max_l = 0.0f32;
+    if let Some(mp) = shared {
+        prof_count("features.map_shared", 1);
+        lam = Vec::with_capacity(rw * rh);
+        for j in 0..rh {
+            let o = (y0 - mp.y0 + j) * mp.rw + x0 - mp.x0;
+            lam.extend_from_slice(&mp.lam[o..o + rw]);
+        }
+        // as the streamed maximum: every response in row order, from 0
+        for &l in &lam { max_l = max_l.max(l); }
+        if need_edges {
+            for j in 0..gh {
+                let y = gy0 + j;
+                let row_c = &img.px[y * img.w + gx0 - 1..][..gw + 2];
+                let row_u = &img.px[(y - 1) * img.w + gx0..][..gw];
+                let row_d = &img.px[(y + 1) * img.w + gx0..][..gw];
+                let (gx_slice, gy_slice) = (&mut gxv[j * gw..(j + 1) * gw], &mut gyv[j * gw..(j + 1) * gw]);
+                for i in 0..gw {
+                    gx_slice[i] = 0.5 * (f32::from(row_c[i + 2]) - f32::from(row_c[i]));
+                    gy_slice[i] = 0.5 * (f32::from(row_d[i]) - f32::from(row_u[i]));
+                }
+            }
+        }
+    } else {
     let (mut gx_row, mut gy_row) = if need_edges {
         (Vec::new(), Vec::new())
     } else {
@@ -844,8 +890,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     // separable 5x5 box sums of gx^2, gy^2, gx gy streamed by row
     let mut hs_ring = vec![[0.0f32; 3]; 5 * rw];
     let mut vacc = vec![[0.0f32; 3]; rw];
-    let mut lam = vec![0.0f32; rw * rh];
-    let mut max_l = 0.0f32;
+    lam = vec![0.0f32; rw * rh];
     for j in 0..gh {
         let (gx_slice, gy_slice) = if need_edges {
             (&mut gxv[j * gw..(j + 1) * gw], &mut gyv[j * gw..(j + 1) * gw])
@@ -872,6 +917,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
             stream_corner_row::<true, true>(gx_slice, gy_slice, ring_row, &mut vacc, lam_row, &mut max_l);
         }
     }
+    }
     t_map.stop("features.map_ms");
     let t_sel = ProfT::start();
     // corners: relative and absolute floors (a 5x5 window of 2-grey-level gradients is no corner)
@@ -885,6 +931,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
             if local_max { cand.push((l, x0 + i, y0 + j)); }
         }
     }
+    if let Some(o) = map_out { *o = Some(CornerMap { x0, y0, rw, rh, lam }); }
     cand.sort_by(|a, b| b.0.total_cmp(&a.0));
     if p.corner_cell_px > 0 {
         // by rank within the cell, then strength: a high-contrast pattern (black and white codes)
@@ -1040,9 +1087,35 @@ struct PView<'a> {
     half: &'a Gray,
 }
 
-/// The half-resolution image ([`Gray::half`]) of every view, for [`refine_views_with_halves`]
-/// and [`reconstruct_shared`].
+/// The half-resolution image ([`Gray::half`]) of every view.
 pub fn half_images(views: &[View]) -> Vec<Gray> { views.iter().map(|v| v.img.half()).collect() }
+
+/// What the pose refinement and the reconstruction of one set of views share
+/// ([`refine_views_prepared`], [`reconstruct_prepared`]): the half-resolution image of every
+/// view, and the reference view's corner response map, left by the pose refinement's feature
+/// selection and taken (released) by the reconstruction's.
+#[derive(Debug, Default)]
+pub struct Prepared {
+    pub halves: Vec<Gray>,
+    ref_map: std::sync::Mutex<Option<(usize, CornerMap)>>,
+}
+
+impl Prepared {
+    /// For `views` (the same views must be passed to the prepared calls).
+    pub fn new(views: &[View]) -> Self { Self { halves: half_images(views), ref_map: Default::default() } }
+
+    /// With half images built elsewhere (`halves[i]` = `views[i].img.half()`; another length is rebuilt).
+    pub fn from_halves(halves: Vec<Gray>) -> Self { Self { halves, ref_map: Default::default() } }
+
+    pub(crate) fn put_ref_map(&self, reference: usize, map: CornerMap) {
+        if let Ok(mut g) = self.ref_map.lock() { *g = Some((reference, map)); }
+    }
+
+    pub(crate) fn take_ref_map(&self, reference: usize) -> Option<CornerMap> {
+        let mut g = self.ref_map.lock().ok()?;
+        match g.take() { Some((r, m)) if r == reference => Some(m), _ => None }
+    }
+}
 
 enum SweepEnd { NoPeak, Ambiguous }
 
@@ -1335,17 +1408,19 @@ pub fn reconstruct(views: &[View], reference: usize, region: [f64; 4], object_bo
 /// triangulation (the tests add localisation noise with it).
 pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
     perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
-    reconstruct_impl(views, None, None, reference, region, object_box, p, perturb)
+    reconstruct_impl(views, None, None, None, reference, region, object_box, p, perturb)
 }
 
 /// [`reconstruct`] with the cameras `cams` (None: the views' cameras; e.g. the refined ones of
-/// [`refine_views_with_halves`]) and the views' half-resolution images `halves`
-/// ([`half_images`]; built here when of another length): no image is copied or built twice.
-pub fn reconstruct_shared(views: &[View], cams: Option<&[Camera]>, halves: &[Gray], reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params) -> Reconstruction {
-    reconstruct_impl(views, cams, Some(halves), reference, region, object_box, p, |_, q| q)
+/// [`refine_views_prepared`]) and the images prepared for these `views` (half images, rebuilt
+/// when of another length; the reference corner map when the pose refinement left one): no
+/// image is copied or built twice.
+pub fn reconstruct_prepared(views: &[View], cams: Option<&[Camera]>, prep: &Prepared, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params) -> Reconstruction {
+    let map = prep.take_ref_map(reference);
+    reconstruct_impl(views, cams, Some(&prep.halves), map.as_ref(), reference, region, object_box, p, |_, q| q)
 }
 
-fn reconstruct_impl(views: &[View], cams: Option<&[Camera]>, halves: Option<&[Gray]>, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
+fn reconstruct_impl(views: &[View], cams: Option<&[Camera]>, halves: Option<&[Gray]>, ref_map: Option<&CornerMap>, reference: usize, region: [f64; 4], object_box: [f64; 4], p: &Params,
     mut perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
     let t_all = Instant::now();
     let mut rec = Reconstruction::default();
@@ -1379,7 +1454,7 @@ fn reconstruct_impl(views: &[View], cams: Option<&[Camera]>, halves: Option<&[Gr
     let edge_region = [object_box[0] - EDGE_REGION_GROW * bw - 4.0, object_box[1] - EDGE_REGION_GROW * bh - 4.0,
         object_box[2] + EDGE_REGION_GROW * bw + 4.0, object_box[3] + EDGE_REGION_GROW * bh + 4.0];
     let t0 = Instant::now();
-    let feats = features(rv.full, region, object_box, edge_region, p);
+    let feats = features_shared(rv.full, region, object_box, edge_region, p, ref_map, None);
     rec.stats.features_ms = ms(t0);
     rec.stats.features = feats.len();
     rec.stats.corners = feats.iter().filter(|f| f.normal.is_none()).count();
@@ -1954,6 +2029,44 @@ mod tests {
             }
         }
         assert!(hits > 0, "no array with both valid and invalid samples");
+    }
+
+    /// A corner map of a larger region read for a sub-region gives bitwise the features computed
+    /// from the image: random, smooth and saturated images, regions at the image borders,
+    /// cropped edge regions and the pose and reconstruction parameters.
+    #[test]
+    fn shared_corner_map_gives_bitwise_the_computed_features() {
+        let (w, h) = (200, 140);
+        let mut sat = lcg_image(w, h, 21, false);
+        for v in sat.px.iter_mut() { *v = if *v > 127 { 255 } else { 0 }; }
+        let imgs = [lcg_image(w, h, 13, false), lcg_image(w, h, 17, true), sat];
+        let mut rec_p = Params::new(0.0);
+        rec_p.exclude_px = Some([150.0, 100.0, 200.0, 140.0]);
+        let mut pose_p = Params::new(0.0);
+        (pose_p.max_object_features, pose_p.max_table_features, pose_p.max_edge_features, pose_p.min_feature_dist_px, pose_p.corner_rel_floor, pose_p.corner_cell_px) = (0, 600, 0, 8.0, 0.01, 0);
+        let full = [0.0, 0.0, w as f64 - 1.0, h as f64 - 1.0];
+        for img in &imgs {
+            let mut map = None;
+            let a = features_shared(img, full, [60.0, 40.0, 90.0, 80.0], [0.0; 4], &pose_p, None, Some(&mut map));
+            assert_eq!(a, features(img, full, [60.0, 40.0, 90.0, 80.0], [0.0; 4], &pose_p));
+            let map = map.unwrap();
+            let mut n = 0;
+            for (region, bx) in [([30.5, 20.2, 150.7, 110.0], [60.0, 40.0, 100.0, 80.0]), ([0.0, 0.0, 199.0, 139.0], [80.0, 50.0, 120.0, 90.0]),
+                ([150.0, 90.0, 260.0, 200.0], [170.0, 100.0, 190.0, 130.0]), ([-20.0, -5.0, 40.0, 30.0], [5.0, 5.0, 20.0, 20.0])] {
+                let edge = [bx[0] - 12.0, bx[1] - 12.0, bx[2] + 12.0, bx[3] + 12.0];
+                for p in [&rec_p, &pose_p] {
+                    let exp = features(img, region, bx, edge, p);
+                    let got = features_shared(img, region, bx, edge, p, Some(&map), None);
+                    assert_eq!(got.len(), exp.len());
+                    for (g, e) in got.iter().zip(&exp) {
+                        assert_eq!((g.x, g.y, g.normal.map(|v| v.map(f64::to_bits)), g.side.to_bits(), g.strength.to_bits()),
+                            (e.x, e.y, e.normal.map(|v| v.map(f64::to_bits)), e.side.to_bits(), e.strength.to_bits()));
+                    }
+                    n += exp.len();
+                }
+            }
+            assert!(n > 100, "{n}");
+        }
     }
 
     #[test]

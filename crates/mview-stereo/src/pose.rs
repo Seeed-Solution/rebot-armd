@@ -1201,12 +1201,13 @@ struct TexturePrep<'h> {
 
 impl<'h> TexturePrep<'h> {
     fn new(views: &[View], ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
-        Self::with_halves(views, None, ref_cam, reference, object_box, exclude, table_z)
+        Self::prepared(views, None, ref_cam, reference, object_box, exclude, table_z)
     }
 
-    /// [`TexturePrep::new`] with the views' half-resolution images (`halves[i]` = `views[i].img.half()`;
-    /// built here when None or of another length).
-    fn with_halves(views: &[View], halves: Option<&'h [Gray]>, ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+    /// [`TexturePrep::new`] with the images prepared for `views` (half images, rebuilt when of
+    /// another length); leaves the reference corner map there for the reconstruction.
+    fn prepared(views: &[View], prep: Option<&'h Prepared>, ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+        let halves = prep.map(|pr| pr.halves.as_slice());
         if reference >= views.len() || views.len() < 2 {
             return Self { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() };
         }
@@ -1225,8 +1226,10 @@ impl<'h> TexturePrep<'h> {
         // afterwards, so the quota is taken twice
         p.max_table_features *= 2;
         let t = ProfT::start();
-        let raw_feats: Vec<Feature> = features(&rv.img, full, grown, [0.0; 4], &p).into_iter()
+        let mut map = None;
+        let raw_feats: Vec<Feature> = features_shared(&rv.img, full, grown, [0.0; 4], &p, None, prep.is_some().then_some(&mut map)).into_iter()
             .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
+        if let (Some(pr), Some(m)) = (prep, map) { pr.put_ref_map(reference, m); }
         t.stop("prep.features_ms");
         let t = ProfT::start();
         let halves: std::borrow::Cow<'h, [Gray]> = match halves {
@@ -1826,13 +1829,13 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     refine_views_impl(views, None, reference, object_box, exclude, table_z, extra, texture, pp)
 }
 
-/// [`refine_views`] with the views' half-resolution images ([`half_images`]), shared with
-/// [`reconstruct_shared`] so that they are built once.
-pub fn refine_views_with_halves(views: &[View], halves: &[Gray], reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
-    refine_views_impl(views, Some(halves), reference, object_box, exclude, table_z, extra, texture, pp)
+/// [`refine_views`] with the images prepared for `views` ([`Prepared`]), shared with
+/// [`reconstruct_prepared`] so that they are built once.
+pub fn refine_views_prepared(views: &[View], prep: &Prepared, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+    refine_views_impl(views, Some(prep), reference, object_box, exclude, table_z, extra, texture, pp)
 }
 
-fn refine_views_impl(views: &[View], halves: Option<&[Gray]>, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
+fn refine_views_impl(views: &[View], prep_imgs: Option<&Prepared>, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, extra: &[Corr], texture: bool, pp: &PoseParams) -> PoseRefinement {
     let t0 = Instant::now();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
@@ -1841,7 +1844,7 @@ fn refine_views_impl(views: &[View], halves: Option<&[Gray]>, reference: usize, 
     #[cfg(feature = "mview-profile")]
     let t_prep = Instant::now();
     let prep = texture.then(|| match cams.get(reference) {
-        Some(rc) => TexturePrep::with_halves(views, halves, rc, reference, object_box, exclude, table_z),
+        Some(rc) => TexturePrep::prepared(views, prep_imgs, rc, reference, object_box, exclude, table_z),
         None => TexturePrep { reference, halves: std::borrow::Cow::Owned(Vec::new()), feats: Vec::new() },
     });
     #[cfg(feature = "mview-profile")]
