@@ -5536,10 +5536,18 @@ impl SupervisorInner {
                     // writes until fresh post-recovery feedback confirms every joint's baseline.
                 } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
                     // Rejection-fallback braking ramp, also while the rejection fault is latched.
-                    // The rejected motion's caps (`FallbackRamp::limits`) stay in force.
+                    // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
+                    // by the current power governor limit; the ramp keeps its original caps.
                     let ramp = self.tracking.fallback_ramp.clone().expect("checked above");
+                    let governed = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut tick_ramp = ramp.clone();
+                    for (l, g) in tick_ramp.limits.iter_mut().zip(&governed) {
+                        l.max_velocity = l.max_velocity.min(g.max_velocity);
+                        l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
+                    }
                     let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
-                    let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                    let mut pending = self.tracking_fallback_compute(tick_ramp, servo_dt, &mut tick_sweep_budget);
+                    pending.ramp = ramp;
                     output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
                     self.tracking.last_tick_sweep_evals =
                         MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);

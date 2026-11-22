@@ -4201,3 +4201,57 @@ fn tracking_rest_reference_survives_staggered_joint_replies() {
         "a stationary arm with 2 ms reply spread must reach rest evidence once a period has passed (seeded at {seeded_at:?})"
     );
 }
+
+/// Review 5 #3: the braking fallback keeps the rejected motion's caps AND follows the power
+/// governor: when the governor scale drops mid-fallback, the next braking ticks respect the
+/// lowered velocity limit (never below what the joint can brake to within a_max).
+#[test]
+fn tracking_braking_fallback_follows_governor_scale_drop() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.workspace = None;
+    cfg.power_budget = None; // the test sets the governor scale by hand
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]);
+    let base_v = f64::from(inner.planning_limits()[0].max_velocity);
+    let max_a = f64::from(inner.planning_limits()[0].max_acceleration);
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 {
+        goal[i] = f64::from(q0[i]);
+    }
+    goal[0] += 0.20;
+    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+    for _ in 0..60 {
+        assert!(inner.tick(DT).safety_state.is_operational());
+    }
+    let mut prev = inner.tracking.last_issued_positions.clone().unwrap();
+    let prev_v = inner.tracking.last_issued_velocities.clone().unwrap();
+    prev[0] += 0.030;
+    inner.tracking.record_issued(prev.clone(), prev_v.clone());
+    let idx0 = drv.with(|s| s.written.len());
+    let obs = inner.tick(DT);
+    assert!(obs.fault.as_ref().is_some_and(|f| f.message.contains("Joint tracking output rejected")), "{:?}", obs.fault);
+    for _ in 0..5 {
+        inner.tick(DT);
+    }
+    let idx_drop = drv.with(|s| s.written.len());
+    let scale = 0.2_f64;
+    inner.power.gov.scale = scale as f32;
+    for _ in 0..40 {
+        inner.tick(DT);
+    }
+    let frames = drv.with(|s| s.written[idx0..].to_vec());
+    let steps = issued_velocity_steps(&frames, 0, prev[0], prev_v[0]);
+    let drop_k = idx_drop - idx0;
+    assert!(steps[drop_k - 1].0.abs() > base_v * scale + 1e-3, "fallback must be faster than the new governor cap before the drop");
+    for k in drop_k..steps.len() {
+        let allowed = (base_v * scale).max(steps[k - 1].0.abs() - 0.9 * max_a * DT);
+        assert!(
+            steps[k].0.abs() <= allowed + 1e-3,
+            "fallback frame {k} after the governor drop: J1 {:.4} rad/s above {allowed:.4}",
+            steps[k].0
+        );
+    }
+}
