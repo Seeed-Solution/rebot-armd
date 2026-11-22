@@ -489,6 +489,9 @@ pub struct SupervisorInner {
     /// When true (inside ArmSupervisor::tick), zero_check(store_offset=true) defers disk persist
     /// and memory commit until after the lock is released.
     pub defer_zero_check_persist: bool,
+    /// Phase marks of the running tick ([`Self::tick_phase`]); µs per phase.
+    tick_phase_mark: Option<Instant>,
+    tick_phases_us: [u32; 5],
     /// Action id whose zero_check(store_offset=true) disk persist is currently in flight.
     pub zero_check_persisting: Option<u64>,
     /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
@@ -732,6 +735,8 @@ impl SupervisorInner {
             grasp_setup_revision: 1,
             grasp_setup_needs_camera_sync: false,
             defer_zero_check_persist: false,
+            tick_phase_mark: None,
+            tick_phases_us: [0; 5],
             zero_check_persisting: None,
             pending_zero_check_persist: None,
             operator_auth_enforced: false,
@@ -1716,6 +1721,16 @@ impl SupervisorInner {
         self.pending_rearm = false;
         self.disable_pending = false;
         Ok(())
+    }
+
+    /// Adds the time since the previous mark to phase `i` of the running tick (no-op
+    /// outside `ArmSupervisor::tick`).
+    fn tick_phase(&mut self, i: usize) {
+        if let Some(mark) = self.tick_phase_mark {
+            let now = Instant::now();
+            self.tick_phases_us[i] = self.tick_phases_us[i].saturating_add(crate::diagnostics::tick::us(now - mark));
+            self.tick_phase_mark = Some(now);
+        }
     }
 
     /// How long `obs` (computed now by [`Self::current_observation`]) stays correct with
@@ -5189,6 +5204,7 @@ impl SupervisorInner {
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);
         }
+        self.tick_phase(0);
         // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
         // tracking output history and suspend compensated writes until fresh post-recovery
         // feedback confirms a clean baseline across every joint.
@@ -6211,6 +6227,7 @@ impl SupervisorInner {
         }
         self.mit_maybe_activate();
         let gravity_output_enabled = self.gravity_output_enabled();
+        self.tick_phase(1);
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
@@ -6451,6 +6468,7 @@ impl SupervisorInner {
             }
         }
 
+        self.tick_phase(2);
         if let Some(error) = output_error {
             tick_output_accepted = false;
             self.stop_motion();
@@ -6577,6 +6595,7 @@ impl SupervisorInner {
         // Tracking off: settle completion does not wait for an accepted output (e4f72b6).
         self.reconcile_action(servo_dt, tick_output_accepted || !tracking_enabled);
         self.expire_motion_limit();
+        self.tick_phase(3);
         let obs = self.current_observation();
 
         // 5. Record frame if episode recording is active
@@ -7781,15 +7800,22 @@ impl ArmSupervisor {
     }
 
     async fn tick_shared(&self, dt: f64) -> Arc<ArmObservation> {
-        use crate::diagnostics::tick::us;
+        use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, log, locked) = {
+        let usage_start = UsageMark::now();
+        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
+            let usage_locked = UsageMark::now();
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;
+            inner.tick_phases_us = [0; 5];
+            inner.tick_phase_mark = Some(Instant::now());
             let obs = Arc::new(inner.tick(dt));
+            inner.tick_phase(4);
+            inner.tick_phase_mark = None;
+            let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
             let pending_zc = inner.pending_zero_check_persist.take();
             let control_hz = inner.config.control_frequency_hz;
@@ -7797,9 +7823,10 @@ impl ArmSupervisor {
             let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
                 .min(inner.observation_valid_for(&obs));
             self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
-            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, log, locked)
+            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, phases, log, locked, usage_locked)
         };
         let released = Instant::now();
+        let usage_released = UsageMark::now();
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
@@ -8042,6 +8069,10 @@ impl ArmSupervisor {
             reader_acquire_us: us(log.reader_acquire),
             writer_acquire_us: us(log.writer_acquire),
             stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            phases: crate::diagnostics::tick::LockPhases {
+                rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
+            },
+            usage: crate::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released),
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),
             late,
