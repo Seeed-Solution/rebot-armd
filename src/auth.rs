@@ -78,6 +78,14 @@ fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
+fn parse_nonzero_port(port_str: &str) -> Option<u16> {
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let p: u16 = port_str.parse().ok()?;
+    (p != 0).then_some(p)
+}
+
 fn parse_authority(raw: &str, default_scheme: &str) -> Option<(String, u16)> {
     let default_p = default_port(default_scheme)?;
     if raw.is_empty()
@@ -88,21 +96,12 @@ fn parse_authority(raw: &str, default_scheme: &str) -> Option<(String, u16)> {
     }
     if let Some(after_open) = raw.strip_prefix('[') {
         let close_idx = after_open.find(']')?;
-        let host_raw = &after_open[..close_idx];
-        let ip: std::net::Ipv6Addr = host_raw.parse().ok()?;
+        let ip: std::net::Ipv6Addr = after_open[..close_idx].parse().ok()?;
         let rest = &after_open[close_idx + 1..];
         let port = if rest.is_empty() {
             default_p
         } else {
-            let port_str = rest.strip_prefix(':')?;
-            if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let p: u16 = port_str.parse().ok()?;
-            if p == 0 {
-                return None;
-            }
-            p
+            parse_nonzero_port(rest.strip_prefix(':')?)?
         };
         return Some((ip.to_string(), port));
     }
@@ -111,21 +110,24 @@ fn parse_authority(raw: &str, default_scheme: &str) -> Option<(String, u16)> {
     }
     if let Some((host_raw, port_str)) = raw.split_once(':') {
         // Reject unbracketed IPv6 or extra colons
-        if host_raw.is_empty()
-            || port_str.is_empty()
-            || port_str.contains(':')
-            || !port_str.bytes().all(|b| b.is_ascii_digit())
-        {
+        if host_raw.is_empty() || port_str.contains(':') {
             return None;
         }
-        let p: u16 = port_str.parse().ok()?;
-        if p == 0 {
-            return None;
-        }
-        Some((host_raw.to_ascii_lowercase(), p))
+        let port = parse_nonzero_port(port_str)?;
+        Some((host_raw.to_ascii_lowercase(), port))
     } else {
         Some((raw.to_ascii_lowercase(), default_p))
     }
+}
+
+fn resolve_public_origin(configured: Option<&str>) -> Option<String> {
+    if let Some(v) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(v.to_string());
+    }
+    std::env::var("REBOT_PUBLIC_ORIGIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Parse an HTTP `Origin` header (`scheme://host[:port]`) into a normalized `(scheme, host, effective_port)`.
@@ -170,16 +172,7 @@ pub fn validate_origin_headers(headers: &HeaderMap, configured_public_origin: Op
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok());
 
-    let env_origin;
-    let public_raw = match configured_public_origin.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(v) => Some(v),
-        None => {
-            env_origin = std::env::var("REBOT_PUBLIC_ORIGIN").ok();
-            env_origin.as_deref().map(str::trim).filter(|s| !s.is_empty())
-        }
-    };
-
-    if let Some(pub_raw) = public_raw {
+    if let Some(pub_raw) = resolve_public_origin(configured_public_origin) {
         if pub_raw.eq_ignore_ascii_case("http") || pub_raw.eq_ignore_ascii_case("https") {
             let expected_scheme = pub_raw.to_ascii_lowercase();
             return host_hdr
@@ -296,15 +289,7 @@ impl OperatorAuth {
     /// OR when trusted-proxy forwarding (`with_trust_forwarded_proto(true)` / `REBOT_TRUST_FORWARDED_PROTO`) is enabled
     /// and the forwarded headers indicate `https`.
     pub fn should_set_secure_cookie(&self, headers: &HeaderMap) -> bool {
-        let env_origin;
-        let public_raw = match self.0.public_origin.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(v) => Some(v),
-            None => {
-                env_origin = std::env::var("REBOT_PUBLIC_ORIGIN").ok();
-                env_origin.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            }
-        };
-        if let Some(pub_raw) = public_raw {
+        if let Some(pub_raw) = resolve_public_origin(self.0.public_origin.as_deref()) {
             let pub_is_https = pub_raw.eq_ignore_ascii_case("https")
                 || parse_origin(pub_raw.trim_end_matches('/')).is_some_and(|o| o.scheme == "https");
             if pub_is_https {
@@ -422,30 +407,26 @@ impl OperatorAuth {
     pub fn extract_credential(headers: &HeaderMap) -> AuthCredential {
         if headers.contains_key(axum::http::header::AUTHORIZATION) {
             for value in headers.get_all(axum::http::header::AUTHORIZATION) {
-                if let Ok(s) = value.to_str() {
-                    if s.len() >= 6 && s[..6].eq_ignore_ascii_case("bearer") {
-                        let rest = &s[6..];
-                        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                            let tok = rest.trim();
-                            if !tok.is_empty() {
-                                return AuthCredential::Bearer(Some(tok.to_string()));
-                            }
-                            return AuthCredential::Bearer(None);
-                        }
-                    }
+                let Ok(s) = value.to_str() else { continue };
+                if s.len() < 6 || !s[..6].eq_ignore_ascii_case("bearer") {
+                    continue;
+                }
+                let rest = &s[6..];
+                if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                    let tok = rest.trim();
+                    return AuthCredential::Bearer((!tok.is_empty()).then(|| tok.to_string()));
                 }
             }
             return AuthCredential::Bearer(None);
         }
+        let cookie_prefix = format!("{SESSION_COOKIE_NAME}=");
         for value in headers.get_all(axum::http::header::COOKIE) {
-            if let Ok(s) = value.to_str() {
-                for part in s.split(';') {
-                    let part = part.trim();
-                    if let Some(val) = part.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")) {
-                        let tok = val.trim();
-                        if !tok.is_empty() {
-                            return AuthCredential::Cookie(tok.to_string());
-                        }
+            let Ok(s) = value.to_str() else { continue };
+            for part in s.split(';').map(str::trim) {
+                if let Some(val) = part.strip_prefix(&cookie_prefix) {
+                    let tok = val.trim();
+                    if !tok.is_empty() {
+                        return AuthCredential::Cookie(tok.to_string());
                     }
                 }
             }
@@ -466,26 +447,19 @@ impl OperatorAuth {
 
 fn is_https_forwarded(headers: &HeaderMap) -> bool {
     for val in headers.get_all("x-forwarded-proto") {
-        if let Ok(s) = val.to_str() {
-            if s.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")) {
-                return true;
-            }
+        let Ok(s) = val.to_str() else { continue };
+        if s.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")) {
+            return true;
         }
     }
     for val in headers.get_all(axum::http::header::FORWARDED) {
-        if let Ok(s) = val.to_str() {
-            for elem in s.split(',') {
-                for dir in elem.split(';') {
-                    let dir = dir.trim();
-                    if let Some((k, v)) = dir.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("proto") {
-                            let v = v.trim().trim_matches('"');
-                            if v.eq_ignore_ascii_case("https") {
-                                return true;
-                            }
-                        }
-                    }
-                }
+        let Ok(s) = val.to_str() else { continue };
+        for dir in s.split(',').flat_map(|elem| elem.split(';')) {
+            let Some((k, v)) = dir.trim().split_once('=') else { continue };
+            if k.trim().eq_ignore_ascii_case("proto")
+                && v.trim().trim_matches('"').eq_ignore_ascii_case("https")
+            {
+                return true;
             }
         }
     }

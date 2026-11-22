@@ -87,6 +87,20 @@ def _validate_dr_float(name: str, val: Any, *, min_val: float = 0.0, max_val: fl
     return f
 
 
+_DR_RANGE_SPECS: tuple[tuple[str, float, float], ...] = (
+    ("light_diffuse_range", 0.0, 10.0),
+    ("light_specular_range", 0.0, 10.0),
+    ("light_ambient_range", 0.0, 10.0),
+)
+_DR_FLOAT_SPECS: tuple[tuple[str, float, float], ...] = (
+    ("light_ambient_delta", 0.0, 1.0),
+    ("light_pos_jitter_m", 0.0, 5.0),
+    ("camera_jitter_m", 0.0, 1.0),
+    ("camera_jitter_deg", 0.0, 180.0),
+    ("latency_ms", 0.0, 5000.0),
+)
+
+
 @dataclass(frozen=True)
 class DomainRandomizationConfig:
     """Deterministic, seed-driven Domain Randomization config for rebot-sim (disabled by default)."""
@@ -104,42 +118,18 @@ class DomainRandomizationConfig:
     latency_ms_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.enabled, bool):
-            raise ValueError(f"enabled must be a bool, got {type(self.enabled).__name__}")
-        if not isinstance(self.lighting, bool):
-            raise ValueError(f"lighting must be a bool, got {type(self.lighting).__name__}")
-        object.__setattr__(
-            self, "light_diffuse_range",
-            _validate_dr_range("light_diffuse_range", self.light_diffuse_range, min_val=0.0, max_val=10.0),
-        )
-        object.__setattr__(
-            self, "light_specular_range",
-            _validate_dr_range("light_specular_range", self.light_specular_range, min_val=0.0, max_val=10.0),
-        )
-        object.__setattr__(
-            self, "light_ambient_range",
-            _validate_dr_range("light_ambient_range", self.light_ambient_range, min_val=0.0, max_val=10.0),
-        )
-        object.__setattr__(
-            self, "light_ambient_delta",
-            _validate_dr_float("light_ambient_delta", self.light_ambient_delta, min_val=0.0, max_val=1.0),
-        )
-        object.__setattr__(
-            self, "light_pos_jitter_m",
-            _validate_dr_float("light_pos_jitter_m", self.light_pos_jitter_m, min_val=0.0, max_val=5.0),
-        )
-        object.__setattr__(
-            self, "camera_jitter_m",
-            _validate_dr_float("camera_jitter_m", self.camera_jitter_m, min_val=0.0, max_val=1.0),
-        )
-        object.__setattr__(
-            self, "camera_jitter_deg",
-            _validate_dr_float("camera_jitter_deg", self.camera_jitter_deg, min_val=0.0, max_val=180.0),
-        )
-        object.__setattr__(
-            self, "latency_ms",
-            _validate_dr_float("latency_ms", self.latency_ms, min_val=0.0, max_val=5000.0),
-        )
+        for fname in ("enabled", "lighting"):
+            val = getattr(self, fname)
+            if not isinstance(val, bool):
+                raise ValueError(f"{fname} must be a bool, got {type(val).__name__}")
+        for fname, min_val, max_val in _DR_RANGE_SPECS:
+            object.__setattr__(
+                self, fname, _validate_dr_range(fname, getattr(self, fname), min_val=min_val, max_val=max_val)
+            )
+        for fname, min_val, max_val in _DR_FLOAT_SPECS:
+            object.__setattr__(
+                self, fname, _validate_dr_float(fname, getattr(self, fname), min_val=min_val, max_val=max_val)
+            )
         if self.latency_ms_range is not None:
             object.__setattr__(
                 self, "latency_ms_range",
@@ -1439,6 +1429,24 @@ def _degraded_response(sim) -> tuple[int, dict]:
     return 503, body
 
 
+_DEGRADED_ROUTES = frozenset(
+    {
+        ("GET", "/sim/camera"),
+        ("POST", "/api/detect"),
+        ("GET", "/api/detections"),
+        ("POST", "/api/trigger"),
+        ("GET", "/api/results/latest"),
+        ("POST", "/sim/scene"),
+        ("POST", "/sim/scene/prepare"),
+    }
+)
+
+
+def _validate_optional_seed(seed: Any) -> None:
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0):
+        raise ValueError("seed must be a non-negative integer or null")
+
+
 class PerceptionServer:
     """HTTP routes over a Perception state and the simulator (reset / state / camera info)."""
 
@@ -1455,15 +1463,7 @@ class PerceptionServer:
         self, method: str, path: str, qs: dict, body: dict
     ) -> tuple[int, dict]:
         p = self.p
-        if _is_degraded(self.sim) and (
-            (path == "/sim/camera" and method == "GET")
-            or (path == "/api/detect" and method == "POST")
-            or (path == "/api/detections" and method == "GET")
-            or (path == "/api/trigger" and method == "POST")
-            or (path == "/api/results/latest" and method == "GET")
-            or (path == "/sim/scene" and method == "POST")
-            or (path == "/sim/scene/prepare" and method == "POST")
-        ):
+        if _is_degraded(self.sim) and (method, path) in _DEGRADED_ROUTES:
             return _degraded_response(self.sim)
         if (path == "/api/mode" or path == "/api/status") and method == "GET":
             with p.cond:
@@ -1614,10 +1614,7 @@ class PerceptionServer:
                 }
         if path == "/sim/reset" and method == "POST":
             seed = body.get("seed")
-            if seed is not None and (
-                isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
-            ):
-                raise ValueError("seed must be a non-negative integer or null")
+            _validate_optional_seed(seed)
             if "dr" in body:
                 dr_cfg = DomainRandomizationConfig.from_dict(body.get("dr"))
                 if not hasattr(self.sim, "request_reset"):
@@ -1643,10 +1640,7 @@ class PerceptionServer:
                     return 404, {"error": "not found"}
                 has_seed = "seed" in body
                 seed = body.get("seed")
-                if seed is not None and (
-                    isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
-                ):
-                    raise ValueError("seed must be a non-negative integer or null")
+                _validate_optional_seed(seed)
                 dr_body = {k: v for k, v in body.items() if k != "seed"}
                 dr_cfg = DomainRandomizationConfig.from_dict(dr_body)
                 return 200, self.sim.set_dr(dr_cfg, seed=seed, use_seed=has_seed)
@@ -2535,6 +2529,58 @@ class CameraRig:
             self.dr_summary = None
             self._dr_latency_ms = 0.0
 
+    def _snapshot_cam_gen_locked(self, state_override=None) -> dict:
+        return {
+            "tx_id": self.camera_tx_id,
+            "state": state_override if state_override is not None else self.state,
+            "model": self.model,
+            "data": self.data,
+            "scene": self.scene,
+            "labels": self.labels,
+            "renderer": getattr(self, "renderer", None),
+            "seg_renderer": getattr(self, "seg_renderer", None),
+            "scene_ref": self.cfg.get("scene"),
+            "tool_ref": self.cfg.get("tool"),
+            "objects_str": self.cfg.get("objects"),
+            "dr": self.dr,
+            "dr_summary": self.dr_summary,
+            "dr_seed": self.dr_seed,
+            "dr_generation": self.dr_generation,
+            "dr_latency_ms": self._dr_latency_ms,
+        }
+
+    def _finish_cam_generation_swap_locked(self) -> None:
+        self.physics_step = None
+        self._clear_delayed_queue()
+        self.perception.clear_latest()
+        for stream in self.streams.values():
+            with stream.lock:
+                stream.want_idr = True
+
+    def _restore_cam_gen_locked(self, prev: dict) -> dict:
+        to_close = {
+            "state": self.state,
+            "renderer": getattr(self, "renderer", None),
+            "seg_renderer": getattr(self, "seg_renderer", None),
+        }
+        self.state = prev["state"]
+        self.model = prev["model"]
+        self.data = prev["data"]
+        self.scene = prev["scene"]
+        self.labels = prev["labels"]
+        self.renderer = prev["renderer"]
+        self.seg_renderer = prev["seg_renderer"]
+        self.cfg["scene"] = prev["scene_ref"]
+        self.cfg["tool"] = prev["tool_ref"]
+        self.cfg["objects"] = prev["objects_str"]
+        self.dr = prev["dr"]
+        self.dr_summary = prev["dr_summary"]
+        self.dr_seed = prev["dr_seed"]
+        self.dr_generation = prev["dr_generation"]
+        self._dr_latency_ms = prev["dr_latency_ms"]
+        self._finish_cam_generation_swap_locked()
+        return to_close
+
     def _commit_staged_camera_tx(self, req: dict) -> None:
         err_box = req["err_box"]
         tx_id = req["tx_id"]
@@ -2550,24 +2596,7 @@ class CameraRig:
                 hook = getattr(self, "_before_camera_commit_hook", None)
                 if hook is not None:
                     hook(staged)
-                prev_gen = {
-                    "tx_id": self.camera_tx_id,
-                    "state": self.state,
-                    "model": self.model,
-                    "data": self.data,
-                    "scene": self.scene,
-                    "labels": self.labels,
-                    "renderer": getattr(self, "renderer", None),
-                    "seg_renderer": getattr(self, "seg_renderer", None),
-                    "scene_ref": self.cfg.get("scene"),
-                    "tool_ref": self.cfg.get("tool"),
-                    "objects_str": self.cfg.get("objects"),
-                    "dr": self.dr,
-                    "dr_summary": self.dr_summary,
-                    "dr_seed": self.dr_seed,
-                    "dr_generation": self.dr_generation,
-                    "dr_latency_ms": self._dr_latency_ms,
-                }
+                prev_gen = self._snapshot_cam_gen_locked()
 
                 self.state = staged["state"]
                 self.model = staged["model"]
@@ -2579,13 +2608,8 @@ class CameraRig:
                 self.cfg["scene"] = staged["scene_ref"]
                 self.cfg["tool"] = staged["tool_ref"]
                 self.cfg["objects"] = staged["objects_str"]
-                self.physics_step = None
                 self._refresh_dr_for_current_model_locked()
-                self._clear_delayed_queue()
-                self.perception.clear_latest()
-                for stream in self.streams.values():
-                    with stream.lock:
-                        stream.want_idr = True
+                self._finish_cam_generation_swap_locked()
                 self._prev_cam_gen = prev_gen
                 self.camera_committed_tx_id = tx_id
                 self._staged_cam_tx = None
@@ -2618,32 +2642,7 @@ class CameraRig:
                 hook = getattr(self, "_before_camera_abort_hook", None)
                 if hook is not None:
                     hook(prev)
-                to_close = {
-                    "state": self.state,
-                    "renderer": getattr(self, "renderer", None),
-                    "seg_renderer": getattr(self, "seg_renderer", None),
-                }
-                self.state = prev["state"]
-                self.model = prev["model"]
-                self.data = prev["data"]
-                self.scene = prev["scene"]
-                self.labels = prev["labels"]
-                self.renderer = prev["renderer"]
-                self.seg_renderer = prev["seg_renderer"]
-                self.cfg["scene"] = prev["scene_ref"]
-                self.cfg["tool"] = prev["tool_ref"]
-                self.cfg["objects"] = prev["objects_str"]
-                self.dr = prev["dr"]
-                self.dr_summary = prev["dr_summary"]
-                self.dr_seed = prev["dr_seed"]
-                self.dr_generation = prev["dr_generation"]
-                self._dr_latency_ms = prev["dr_latency_ms"]
-                self.physics_step = None
-                self._clear_delayed_queue()
-                self.perception.clear_latest()
-                for stream in self.streams.values():
-                    with stream.lock:
-                        stream.want_idr = True
+                to_close = self._restore_cam_gen_locked(prev)
                 self._prev_cam_gen = None
                 self.camera_committed_tx_id = None
                 req["done"].set()
@@ -2688,32 +2687,7 @@ class CameraRig:
             prev = self._legacy_prev_cam
             self._legacy_prev_cam = None
             if prev is not None:
-                to_close = {
-                    "state": self.state,
-                    "renderer": getattr(self, "renderer", None),
-                    "seg_renderer": getattr(self, "seg_renderer", None),
-                }
-                self.state = prev["state"]
-                self.model = prev["model"]
-                self.data = prev["data"]
-                self.scene = prev["scene"]
-                self.labels = prev["labels"]
-                self.renderer = prev["renderer"]
-                self.seg_renderer = prev["seg_renderer"]
-                self.cfg["scene"] = prev["scene_ref"]
-                self.cfg["tool"] = prev["tool_ref"]
-                self.cfg["objects"] = prev["objects_str"]
-                self.dr = prev["dr"]
-                self.dr_summary = prev["dr_summary"]
-                self.dr_seed = prev["dr_seed"]
-                self.dr_generation = prev["dr_generation"]
-                self._dr_latency_ms = prev["dr_latency_ms"]
-                self.physics_step = None
-                self._clear_delayed_queue()
-                self.perception.clear_latest()
-                for stream in self.streams.values():
-                    with stream.lock:
-                        stream.want_idr = True
+                to_close = self._restore_cam_gen_locked(prev)
             req["done"].set()
         if to_close is not None:
             self._close_staged_cam(to_close)
@@ -2721,6 +2695,22 @@ class CameraRig:
     @staticmethod
     def _strip_internal(res: dict) -> dict:
         return {k: v for k, v in res.items() if not k.startswith("_")}
+
+    def _enter_degraded_split(self, tx_id: str, err_msg: str) -> tuple[int, dict]:
+        self.activation_state = "DEGRADED_SPLIT"
+        self.active_tx_id = tx_id
+        try:
+            self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": err_msg}), timeout=1.0)
+        except Exception:
+            pass
+        return 503, {
+            "error": err_msg,
+            "code": "SIM_ACTIVATION_DEGRADED",
+            "state": "DEGRADED_SPLIT",
+            "tx_id": tx_id,
+            "physics_tx_id": tx_id,
+            "camera_tx_id": self.camera_tx_id,
+        }
 
     def prepare_scene(self, body: dict) -> tuple[int, dict]:
         if not self._tx_lock.acquire(blocking=False):
@@ -2776,39 +2766,10 @@ class CameraRig:
         try:
             fin = self.link.call(("tx_finalize", {"tx_id": tx_id}), timeout=1.0)
         except Exception as exc:
-            self.activation_state = "DEGRADED_SPLIT"
-            self.active_tx_id = tx_id
-            try:
-                self.link.call(("tx_mark_degraded", {"tx_id": tx_id, "error": str(exc)}), timeout=1.0)
-            except Exception:
-                pass
-            return 503, {
-                "error": str(exc),
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": tx_id,
-                "physics_tx_id": tx_id,
-                "camera_tx_id": self.camera_tx_id,
-            }
+            return self._enter_degraded_split(tx_id, str(exc))
         fin_status = int(fin.get("_http_status", 200))
         if fin_status != 200 or "error" in fin:
-            self.activation_state = "DEGRADED_SPLIT"
-            self.active_tx_id = tx_id
-            try:
-                self.link.call(
-                    ("tx_mark_degraded", {"tx_id": tx_id, "error": str(fin.get("error", "finalize failed"))}),
-                    timeout=1.0,
-                )
-            except Exception:
-                pass
-            return 503, {
-                "error": str(fin.get("error", "finalize failed")),
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": tx_id,
-                "physics_tx_id": tx_id,
-                "camera_tx_id": self.camera_tx_id,
-            }
+            return self._enter_degraded_split(tx_id, str(fin.get("error", "finalize failed")))
         self.active_tx_id = tx_id
         self.camera_tx_id = tx_id
         self.activation_state = "COMMITTED"
@@ -3079,23 +3040,7 @@ class CameraRig:
                     )
                     return
 
-                prev_cam = {
-                    "state": old_state,
-                    "model": self.model,
-                    "data": self.data,
-                    "scene": self.scene,
-                    "labels": self.labels,
-                    "renderer": getattr(self, "renderer", None),
-                    "seg_renderer": getattr(self, "seg_renderer", None),
-                    "scene_ref": self.cfg.get("scene"),
-                    "tool_ref": self.cfg.get("tool"),
-                    "objects_str": self.cfg.get("objects"),
-                    "dr": self.dr,
-                    "dr_summary": self.dr_summary,
-                    "dr_seed": self.dr_seed,
-                    "dr_generation": self.dr_generation,
-                    "dr_latency_ms": self._dr_latency_ms,
-                }
+                prev_cam = self._snapshot_cam_gen_locked(state_override=old_state)
 
                 self.state = new_state
                 self.model, self.data, self.scene, self.labels = (
@@ -3110,13 +3055,8 @@ class CameraRig:
                     tool_ref,
                     objects_str,
                 )
-                self.physics_step = None
                 self._refresh_dr_for_current_model_locked()
-                self._clear_delayed_queue()
-                self.perception.clear_latest()
-                for stream in self.streams.values():
-                    with stream.lock:
-                        stream.want_idr = True
+                self._finish_cam_generation_swap_locked()
                 if defer_close:
                     self._legacy_prev_cam = prev_cam
                 else:
@@ -3455,6 +3395,15 @@ class CameraRig:
             return True
 
     def run(self, parent_pid: int) -> None:
+        reload_ops = {
+            "stage": self._stage_camera_tx,
+            "commit_staged": self._commit_staged_camera_tx,
+            "finalize_cam": self._finalize_camera_tx,
+            "restore_prev_cam": self._restore_prev_camera_tx,
+            "abort_staged": self._abort_staged_camera_tx,
+            "close_legacy_prev": self._close_legacy_prev_cam,
+            "restore_legacy_prev": self._restore_legacy_prev_cam,
+        }
         period = 1.0 / self.fps
         next_capture_t = time.perf_counter()
         while os.getppid() == parent_pid:
@@ -3465,21 +3414,9 @@ class CameraRig:
             if req is not None:
                 if isinstance(req, dict) and "op" in req:
                     if not req.get("cancelled"):
-                        op = req["op"]
-                        if op == "stage":
-                            self._stage_camera_tx(req)
-                        elif op == "commit_staged":
-                            self._commit_staged_camera_tx(req)
-                        elif op == "finalize_cam":
-                            self._finalize_camera_tx(req)
-                        elif op == "restore_prev_cam":
-                            self._restore_prev_camera_tx(req)
-                        elif op == "abort_staged":
-                            self._abort_staged_camera_tx(req)
-                        elif op == "close_legacy_prev":
-                            self._close_legacy_prev_cam(req)
-                        elif op == "restore_legacy_prev":
-                            self._restore_legacy_prev_cam(req)
+                        handler = reload_ops.get(req["op"])
+                        if handler is not None:
+                            handler(req)
                     req["done"].set()
                 elif isinstance(req, dict):
                     self._apply_reload(req)

@@ -796,17 +796,111 @@ class Simulator:
             oldest = next(iter(self._committed_tx_payloads))
             self._committed_tx_payloads.pop(oldest, None)
 
+    def _degraded_split_reply(self, *, include_robot: bool = True) -> dict:
+        out = {
+            "_http_status": 503,
+            "error": "SIM_ACTIVATION_DEGRADED",
+            "code": "SIM_ACTIVATION_DEGRADED",
+            "state": "DEGRADED_SPLIT",
+            "tx_id": self.active_tx_id,
+            "camera_tx_id": self.camera_tx_id,
+        }
+        if include_robot:
+            out["robot"] = self.robot_id
+        return out
+
+    @staticmethod
+    def _validate_tx_params(
+        params: Any, *, missing_code: str = "INVALID_TX_ID", state: str | None = None
+    ) -> tuple[str | None, dict | None]:
+        def _err(code: str, msg: str) -> dict:
+            out: dict = {"_http_status": 400, "error": msg, "code": code}
+            if state is not None:
+                out["state"] = state
+            return out
+
+        if not isinstance(params, dict):
+            return None, _err("INVALID_REQUEST", "request body must be a JSON object")
+        tx_id = params.get("tx_id")
+        if not isinstance(tx_id, str) or not tx_id.strip():
+            return None, _err(missing_code, "tx_id must be a non-empty string")
+        return tx_id.strip(), None
+
+    def _check_req_robot(self, req_robot: Any, *, state: str | None = None) -> dict | None:
+        if req_robot is None:
+            return None
+        norm_req = normalize_robot_id(req_robot) if isinstance(req_robot, str) else None
+        if norm_req == self.robot_id:
+            return None
+        out: dict = {
+            "_http_status": 400,
+            "error": f"Robot {req_robot!r} is incompatible with running robot {self.robot_id!r}",
+            "code": "ROBOT_INCOMPATIBLE",
+            "expected_robot": self.robot_id,
+            "got_robot": req_robot,
+        }
+        if state is not None:
+            out["state"] = state
+        return out
+
+    def _check_pack_robots(self, kind_label: str, pack_id: str, robots: list[str]) -> dict | None:
+        if not robots:
+            return None
+        allowed = {normalize_robot_id(r) for r in robots}
+        if self.robot_id in allowed:
+            return None
+        return {
+            "_http_status": 400,
+            "error": f"{kind_label} {pack_id!r} does not support robot {self.robot_id!r}",
+            "code": "ROBOT_INCOMPATIBLE",
+            "expected_robot": self.robot_id,
+            "got_robot": robots,
+            "state": "ABORTED",
+        }
+
+    @staticmethod
+    def _check_expected_digest(kind_label: str, expected: Any, actual: str | None) -> None:
+        if expected is None:
+            return
+        if not isinstance(expected, str):
+            raise PackValidationError(f"{kind_label.lower()}_digest must be a string or null", code="DIGEST_MISMATCH")
+        if expected.strip() and (actual is None or actual != expected.strip().lower()):
+            raise PackValidationError(
+                f"{kind_label} digest mismatch: expected {expected!r}, got {actual!r}",
+                code="DIGEST_MISMATCH",
+            )
+
+    def _tx_active_summary(
+        self,
+        *,
+        state: str | None = None,
+        tx_key: str = "tx_id",
+        tx_val: str | None = None,
+        include_camera_tx: bool = False,
+    ) -> dict:
+        out: dict = {
+            "_http_status": 200,
+            "ok": True,
+        }
+        if state is not None:
+            out["state"] = state
+        out[tx_key] = self.active_tx_id if tx_val is None else tx_val
+        if include_camera_tx:
+            out["camera_tx_id"] = self.camera_tx_id
+        out.update(
+            {
+                "robot": self.robot_id,
+                "scene": self.scene_pack.id if self.scene_pack else "default",
+                "tool": self.tool_pack.id,
+                "scene_digest": self.active_scene_digest,
+                "tool_digest": self.active_tool_digest,
+            }
+        )
+        return out
+
     def _tx_prepare_locked(self, params: dict) -> dict:
         if self.activation_state == "DEGRADED_SPLIT":
-            return {
-                "_http_status": 503,
-                "error": "SIM_ACTIVATION_DEGRADED",
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": self.active_tx_id,
-                "camera_tx_id": self.camera_tx_id,
-                "robot": self.robot_id,
-            }
+            return self._degraded_split_reply(include_robot=True)
         if self.activation_state == "COMMITTING":
             return {
                 "_http_status": 409,
@@ -814,55 +908,28 @@ class Simulator:
                 "code": "TX_BUSY",
                 "state": "ABORTED",
             }
-        if not isinstance(params, dict):
-            return {
-                "_http_status": 400,
-                "error": "request body must be a JSON object",
-                "code": "INVALID_REQUEST",
-                "state": "ABORTED",
-            }
-        tx_id = params.get("tx_id")
-        if not isinstance(tx_id, str) or not tx_id.strip():
-            return {
-                "_http_status": 400,
-                "error": "tx_id must be a non-empty string",
-                "code": "INVALID_TX_ID",
-                "state": "ABORTED",
-            }
-        tx_id = tx_id.strip()
+        tx_id, err = self._validate_tx_params(params, state="ABORTED")
+        if err is not None:
+            return err
+        assert tx_id is not None
 
-        req_robot = params.get("robot")
-        if req_robot is not None:
-            norm_req = normalize_robot_id(req_robot) if isinstance(req_robot, str) else None
-            if norm_req != self.robot_id:
-                return {
-                    "_http_status": 400,
-                    "error": f"Robot {req_robot!r} is incompatible with running robot {self.robot_id!r}",
-                    "code": "ROBOT_INCOMPATIBLE",
-                    "expected_robot": self.robot_id,
-                    "got_robot": req_robot,
-                    "state": "ABORTED",
-                }
+        robot_err = self._check_req_robot(params.get("robot"), state="ABORTED")
+        if robot_err is not None:
+            return robot_err
 
         scene_param = params.get("scene")
         tool_param = params.get("tool")
         scene_dir = params.get("scene_dir")
         tool_dir = params.get("tool_dir")
 
-        if scene_param is not None and not is_valid_pack_slug(scene_param):
-            return {
-                "_http_status": 400,
-                "error": f"invalid scene slug: {scene_param!r}",
-                "code": "INVALID_PACK",
-                "state": "ABORTED",
-            }
-        if tool_param is not None and not is_valid_pack_slug(tool_param):
-            return {
-                "_http_status": 400,
-                "error": f"invalid tool slug: {tool_param!r}",
-                "code": "INVALID_PACK",
-                "state": "ABORTED",
-            }
+        for label, param in (("scene", scene_param), ("tool", tool_param)):
+            if param is not None and not is_valid_pack_slug(param):
+                return {
+                    "_http_status": 400,
+                    "error": f"invalid {label} slug: {param!r}",
+                    "code": "INVALID_PACK",
+                    "state": "ABORTED",
+                }
 
         if scene_dir is not None:
             if not isinstance(scene_dir, str) or not scene_dir.strip():
@@ -953,48 +1020,17 @@ class Simulator:
                     f"Tool pack id {tool_pack.id!r} does not match requested {tool_param!r}",
                     code="INVALID_PACK",
                 )
-            if scene_pack is not None and scene_pack.robots:
-                allowed = {normalize_robot_id(r) for r in scene_pack.robots}
-                if self.robot_id not in allowed:
-                    return {
-                        "_http_status": 400,
-                        "error": f"Scene {scene_pack.id!r} does not support robot {self.robot_id!r}",
-                        "code": "ROBOT_INCOMPATIBLE",
-                        "expected_robot": self.robot_id,
-                        "got_robot": scene_pack.robots,
-                        "state": "ABORTED",
-                    }
-            if tool_pack.robots:
-                allowed = {normalize_robot_id(r) for r in tool_pack.robots}
-                if self.robot_id not in allowed:
-                    return {
-                        "_http_status": 400,
-                        "error": f"Tool {tool_pack.id!r} does not support robot {self.robot_id!r}",
-                        "code": "ROBOT_INCOMPATIBLE",
-                        "expected_robot": self.robot_id,
-                        "got_robot": tool_pack.robots,
-                        "state": "ABORTED",
-                    }
+            if scene_pack is not None:
+                robot_compat = self._check_pack_robots("Scene", scene_pack.id, scene_pack.robots)
+                if robot_compat is not None:
+                    return robot_compat
+            robot_compat = self._check_pack_robots("Tool", tool_pack.id, tool_pack.robots)
+            if robot_compat is not None:
+                return robot_compat
             actual_scene_digest = scene_pack.digest if scene_pack is not None else None
             actual_tool_digest = tool_pack.digest if tool_pack is not None else None
-            if exp_scene_digest is not None:
-                if not isinstance(exp_scene_digest, str):
-                    raise PackValidationError("scene_digest must be a string or null", code="DIGEST_MISMATCH")
-                if exp_scene_digest.strip():
-                    if actual_scene_digest is None or actual_scene_digest != exp_scene_digest.strip().lower():
-                        raise PackValidationError(
-                            f"Scene digest mismatch: expected {exp_scene_digest!r}, got {actual_scene_digest!r}",
-                            code="DIGEST_MISMATCH",
-                        )
-            if exp_tool_digest is not None:
-                if not isinstance(exp_tool_digest, str):
-                    raise PackValidationError("tool_digest must be a string or null", code="DIGEST_MISMATCH")
-                if exp_tool_digest.strip():
-                    if actual_tool_digest is None or actual_tool_digest != exp_tool_digest.strip().lower():
-                        raise PackValidationError(
-                            f"Tool digest mismatch: expected {exp_tool_digest!r}, got {actual_tool_digest!r}",
-                            code="DIGEST_MISMATCH",
-                        )
+            self._check_expected_digest("Scene", exp_scene_digest, actual_scene_digest)
+            self._check_expected_digest("Tool", exp_tool_digest, actual_tool_digest)
         except PackValidationError as exc:
             return {
                 "_http_status": exc.status,
@@ -1122,20 +1158,10 @@ class Simulator:
         return out
 
     def _tx_commit_physics_locked(self, params: dict) -> dict:
-        if not isinstance(params, dict):
-            return {
-                "_http_status": 400,
-                "error": "request body must be a JSON object",
-                "code": "INVALID_REQUEST",
-            }
-        tx_id = params.get("tx_id")
-        if not isinstance(tx_id, str) or not tx_id.strip():
-            return {
-                "_http_status": 400,
-                "error": "tx_id must be a non-empty string",
-                "code": "INVALID_TX_ID",
-            }
-        tx_id = tx_id.strip()
+        tx_id, err = self._validate_tx_params(params)
+        if err is not None:
+            return err
+        assert tx_id is not None
         if self.activation_state == "COMMITTING":
             return {
                 "_http_status": 409,
@@ -1143,15 +1169,7 @@ class Simulator:
                 "code": "TX_BUSY",
             }
         if self.activation_state == "DEGRADED_SPLIT":
-            return {
-                "_http_status": 503,
-                "error": "SIM_ACTIVATION_DEGRADED",
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": self.active_tx_id,
-                "camera_tx_id": self.camera_tx_id,
-                "robot": self.robot_id,
-            }
+            return self._degraded_split_reply(include_robot=True)
         if self._staged_tx is None or self._staged_tx["tx_id"] != tx_id:
             return {
                 "_http_status": 409,
@@ -1197,32 +1215,17 @@ class Simulator:
                 "code": "PHYSICS_COMMIT_FAILED",
                 "state": "ABORTED",
             }
-        return {
-            "_http_status": 200,
-            "ok": True,
-            "tx_id": tx_id,
-            "robot": self.robot_id,
-            "scene": self.scene_pack.id if self.scene_pack else "default",
-            "tool": self.tool_pack.id,
-            "scene_digest": self.active_scene_digest,
-            "tool_digest": self.active_tool_digest,
-        }
+        return self._tx_active_summary(tx_val=tx_id)
 
     def _tx_mark_degraded_locked(self, params: dict) -> dict:
         tx_id = str(params.get("tx_id") or "")
         err = str(params.get("error") or "camera commit failed")
         self.active_tx_id = tx_id or self.active_tx_id
         self.activation_state = "DEGRADED_SPLIT"
-        return {
-            "_http_status": 503,
-            "error": err,
-            "code": "SIM_ACTIVATION_DEGRADED",
-            "state": "DEGRADED_SPLIT",
-            "tx_id": self.active_tx_id,
-            "physics_tx_id": self.active_tx_id,
-            "camera_tx_id": self.camera_tx_id,
-            "robot": self.robot_id,
-        }
+        out = self._degraded_split_reply(include_robot=True)
+        out["error"] = err
+        out["physics_tx_id"] = self.active_tx_id
+        return out
 
     def _tx_finalize_locked(self, params: dict) -> dict:
         tx_id = params.get("tx_id")
@@ -1247,18 +1250,7 @@ class Simulator:
         self.camera_tx_id = tx_id
         self.activation_state = "COMMITTED"
         self._staged_tx = None
-        return {
-            "_http_status": 200,
-            "ok": True,
-            "state": "COMMITTED",
-            "tx_id": self.active_tx_id,
-            "camera_tx_id": self.camera_tx_id,
-            "robot": self.robot_id,
-            "scene": self.scene_pack.id if self.scene_pack else "default",
-            "tool": self.tool_pack.id,
-            "scene_digest": self.active_scene_digest,
-            "tool_digest": self.active_tool_digest,
-        }
+        return self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
 
     def _tx_rollback_physics_locked(self, params: dict) -> dict:
         tx_id = params.get("tx_id")
@@ -1294,34 +1286,15 @@ class Simulator:
                 pass
         self._staged_tx = None
         self.activation_state = "COMMITTED"
-        return {
-            "_http_status": 200,
-            "ok": True,
-            "state": "ABORTED",
-            "restored_tx_id": self.active_tx_id,
-            "camera_tx_id": self.camera_tx_id,
-            "robot": self.robot_id,
-            "scene": self.scene_pack.id if self.scene_pack else "default",
-            "tool": self.tool_pack.id,
-            "scene_digest": self.active_scene_digest,
-            "tool_digest": self.active_tool_digest,
-        }
+        return self._tx_active_summary(
+            state="ABORTED", tx_key="restored_tx_id", include_camera_tx=True
+        )
 
     def _tx_commit_locked(self, params: dict) -> dict:
-        if not isinstance(params, dict):
-            return {
-                "_http_status": 400,
-                "error": "request body must be a JSON object",
-                "code": "INVALID_REQUEST",
-            }
-        tx_id = params.get("tx_id")
-        if not isinstance(tx_id, str) or not tx_id.strip():
-            return {
-                "_http_status": 400,
-                "error": "tx_id must be a non-empty string",
-                "code": "INVALID_TX_ID",
-            }
-        tx_id = tx_id.strip()
+        tx_id, err = self._validate_tx_params(params)
+        if err is not None:
+            return err
+        assert tx_id is not None
         phase = params.get("phase", "all")
         if not isinstance(phase, str) or phase not in {"all", "camera_only", "rollback_physics"}:
             return {
@@ -1343,18 +1316,7 @@ class Simulator:
             and self.camera_tx_id == tx_id
             and self.activation_state == "COMMITTED"
         ):
-            return {
-                "_http_status": 200,
-                "ok": True,
-                "state": "COMMITTED",
-                "tx_id": self.active_tx_id,
-                "camera_tx_id": self.camera_tx_id,
-                "robot": self.robot_id,
-                "scene": self.scene_pack.id if self.scene_pack else "default",
-                "tool": self.tool_pack.id,
-                "scene_digest": self.active_scene_digest,
-                "tool_digest": self.active_tool_digest,
-            }
+            return self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
 
         if phase == "rollback_physics":
             return self._tx_rollback_physics_locked({"tx_id": tx_id})
@@ -1370,17 +1332,10 @@ class Simulator:
                     "error": f"tx {tx_id!r} is not in DEGRADED_SPLIT",
                     "code": "TX_NOT_PREPARED",
                 }
-            if self._camera_commit_cb is not None:
-                try:
-                    self._camera_commit_cb(self._staged_tx.get("staged_cam"))
-                except Exception as exc:
-                    return self._tx_mark_degraded_locked({"tx_id": tx_id, "error": str(exc)})
-            return self._tx_finalize_locked({"tx_id": tx_id})
-
-        # phase == "all"
-        phys = self._tx_commit_physics_locked({"tx_id": tx_id})
-        if phys.get("_http_status", 200) != 200:
-            return phys
+        else:
+            phys = self._tx_commit_physics_locked({"tx_id": tx_id})
+            if phys.get("_http_status", 200) != 200:
+                return phys
 
         if self._camera_commit_cb is not None:
             try:
@@ -1391,20 +1346,10 @@ class Simulator:
         return self._tx_finalize_locked({"tx_id": tx_id})
 
     def _tx_abort_locked(self, params: dict) -> dict:
-        if not isinstance(params, dict):
-            return {
-                "_http_status": 400,
-                "error": "request body must be a JSON object",
-                "code": "INVALID_REQUEST",
-            }
-        tx_id = params.get("tx_id")
-        if not isinstance(tx_id, str) or not tx_id.strip():
-            return {
-                "_http_status": 400,
-                "error": "tx_id must be a non-empty string",
-                "code": "MISSING_TX_ID",
-            }
-        tx_id = tx_id.strip()
+        tx_id, err = self._validate_tx_params(params, missing_code="MISSING_TX_ID")
+        if err is not None:
+            return err
+        assert tx_id is not None
         if self.activation_state == "COMMITTING":
             return {
                 "_http_status": 409,
@@ -1412,15 +1357,7 @@ class Simulator:
                 "code": "TX_BUSY",
             }
         if self.activation_state == "DEGRADED_SPLIT":
-            return {
-                "_http_status": 503,
-                "error": "SIM_ACTIVATION_DEGRADED",
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": self.active_tx_id,
-                "camera_tx_id": self.camera_tx_id,
-                "robot": self.robot_id,
-            }
+            return self._degraded_split_reply(include_robot=True)
         if self._staged_tx is not None and self._staged_tx.get("tx_id") == tx_id:
             self._cleanup_staged_tx_locked()
             self._close_old_shared_locked()
@@ -1432,57 +1369,35 @@ class Simulator:
         cleaned = {k: v for k, v in res.items() if not k.startswith("_")}
         return status, cleaned
 
-    def prepare_scene(self, params: dict) -> tuple[int, dict]:
+    def _run_tx_locked(self, fn, params: dict, *, busy_state: str | None = None) -> tuple[int, dict]:
         if not self._tx_lock.acquire(blocking=False):
-            return 409, {"error": "transaction in progress", "code": "TX_BUSY", "state": "ABORTED"}
+            err = {"error": "transaction in progress", "code": "TX_BUSY"}
+            if busy_state is not None:
+                err["state"] = busy_state
+            return 409, err
         try:
             with self.lock:
-                return self._public_tx_reply(self._tx_prepare_locked(params))
+                return self._public_tx_reply(fn(params))
         finally:
             self._tx_lock.release()
+
+    def prepare_scene(self, params: dict) -> tuple[int, dict]:
+        return self._run_tx_locked(self._tx_prepare_locked, params, busy_state="ABORTED")
 
     def commit_scene(self, params: dict) -> tuple[int, dict]:
-        if not self._tx_lock.acquire(blocking=False):
-            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
-        try:
-            with self.lock:
-                return self._public_tx_reply(self._tx_commit_locked(params))
-        finally:
-            self._tx_lock.release()
+        return self._run_tx_locked(self._tx_commit_locked, params)
 
     def abort_scene(self, params: dict) -> tuple[int, dict]:
-        if not self._tx_lock.acquire(blocking=False):
-            return 409, {"error": "transaction in progress", "code": "TX_BUSY"}
-        try:
-            with self.lock:
-                return self._public_tx_reply(self._tx_abort_locked(params))
-        finally:
-            self._tx_lock.release()
+        return self._run_tx_locked(self._tx_abort_locked, params)
 
     def _prepare_scene_locked(self, params: dict) -> dict:
         if self.activation_state == "DEGRADED_SPLIT":
-            return {
-                "_http_status": 503,
-                "error": "SIM_ACTIVATION_DEGRADED",
-                "code": "SIM_ACTIVATION_DEGRADED",
-                "state": "DEGRADED_SPLIT",
-                "tx_id": self.active_tx_id,
-                "camera_tx_id": self.camera_tx_id,
-            }
+            return self._degraded_split_reply(include_robot=False)
         if not isinstance(params, dict):
             return {"error": "request body must be a JSON object"}
-        req_robot = params.get("robot")
-        if req_robot is not None:
-            norm_req = normalize_robot_id(req_robot) if isinstance(req_robot, str) else None
-            if norm_req != self.robot_id:
-                return {
-                    "_http_status": 400,
-                    "error": f"Robot {req_robot!r} is incompatible with running robot {self.robot_id!r}",
-                    "code": "ROBOT_INCOMPATIBLE",
-                    "expected_robot": self.robot_id,
-                    "got_robot": req_robot,
-                    "state": "ABORTED",
-                }
+        robot_err = self._check_req_robot(params.get("robot"), state="ABORTED")
+        if robot_err is not None:
+            return robot_err
         if "scene" in params and params["scene"] is not None:
             if not is_valid_pack_slug(params["scene"]):
                 return {"error": f"invalid scene slug: {params['scene']!r}", "code": "INVALID_PACK"}
@@ -1818,11 +1733,31 @@ class Simulator:
 
     def service_camera(self) -> None:
         """Answer the camera process's /sim requests (physics thread)."""
+        zero_arg_ops = {
+            "dr_get": self.get_dr,
+            "scene_get": self._scene_info_locked,
+            "scene_commit": self._commit_scene_locked,
+            "scene_abort": self._abort_scene_locked,
+        }
+        one_arg_ops = {
+            "scene_prepare": self._prepare_scene_locked,
+            "tx_prepare": self._tx_prepare_locked,
+            "tx_commit": self._tx_commit_locked,
+            "tx_commit_physics": self._tx_commit_physics_locked,
+            "tx_mark_degraded": self._tx_mark_degraded_locked,
+            "tx_finalize": self._tx_finalize_locked,
+            "tx_rollback_physics": self._tx_rollback_physics_locked,
+            "tx_abort": self._tx_abort_locked,
+        }
         try:
             while self.cam_conn is not None and self.cam_conn.poll():
                 msg = self.cam_conn.recv()
                 rid, op = msg[0], msg[1]
-                if op == "reset":
+                if op in zero_arg_ops:
+                    self.cam_conn.send((rid, zero_arg_ops[op]()))
+                elif op in one_arg_ops:
+                    self.cam_conn.send((rid, one_arg_ops[op](msg[2])))
+                elif op == "reset":
                     dr_arg = msg[3] if len(msg) > 3 else None
                     self.cam_conn.send((rid, self._reset_locked(msg[2], dr=dr_arg)))
                 elif op == "dr_set":
@@ -1830,34 +1765,10 @@ class Simulator:
                     seed_arg = msg[3] if len(msg) > 3 else None
                     use_seed_arg = bool(msg[4]) if len(msg) > 4 else False
                     self.cam_conn.send((rid, self.set_dr(dr_arg, seed=seed_arg, use_seed=use_seed_arg)))
-                elif op == "dr_get":
-                    self.cam_conn.send((rid, self.get_dr()))
-                elif op == "scene_get":
-                    self.cam_conn.send((rid, self._scene_info_locked()))
-                elif op == "scene_prepare":
-                    self.cam_conn.send((rid, self._prepare_scene_locked(msg[2])))
-                elif op == "scene_commit":
-                    self.cam_conn.send((rid, self._commit_scene_locked()))
-                elif op == "scene_abort":
-                    self.cam_conn.send((rid, self._abort_scene_locked()))
                 elif op == "scene_load":
                     self.cam_conn.send(
                         (rid, self._load_scene_locked(msg[2], include_shm=True))
                     )
-                elif op == "tx_prepare":
-                    self.cam_conn.send((rid, self._tx_prepare_locked(msg[2])))
-                elif op == "tx_commit":
-                    self.cam_conn.send((rid, self._tx_commit_locked(msg[2])))
-                elif op == "tx_commit_physics":
-                    self.cam_conn.send((rid, self._tx_commit_physics_locked(msg[2])))
-                elif op == "tx_mark_degraded":
-                    self.cam_conn.send((rid, self._tx_mark_degraded_locked(msg[2])))
-                elif op == "tx_finalize":
-                    self.cam_conn.send((rid, self._tx_finalize_locked(msg[2])))
-                elif op == "tx_rollback_physics":
-                    self.cam_conn.send((rid, self._tx_rollback_physics_locked(msg[2])))
-                elif op == "tx_abort":
-                    self.cam_conn.send((rid, self._tx_abort_locked(msg[2])))
                 elif op == "io_get":
                     io = (
                         self.scene.io_state(self.data)

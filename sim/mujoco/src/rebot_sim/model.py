@@ -136,6 +136,31 @@ def arm_body_ids(model: mujoco.MjModel) -> set[int]:
     return ids
 
 
+_SIBLING_JAW_PAIRS = (
+    ("finger_left", "finger_right"),
+    ("cup_jaw_left", "cup_jaw_right"),
+)
+
+
+def _sibling_jaw_pairs(body_names: set[str]) -> set[tuple[str, str]]:
+    return {
+        _canonical_pair(left, right)
+        for left, right in _SIBLING_JAW_PAIRS
+        if left in body_names and right in body_names
+    }
+
+
+def _validate_real_float(
+    name: str, val: Any, *, non_negative: bool = False, positive: bool = False
+) -> float:
+    if isinstance(val, bool) or not isinstance(val, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a real number, got {type(val).__name__}")
+    out = float(val)
+    if not math.isfinite(out) or (non_negative and out < 0.0) or (positive and out <= 0.0):
+        raise ValueError(f"{name} out of range or non-finite, got {val!r}")
+    return out
+
+
 def default_excluded_adjacent_pairs(
     model: mujoco.MjModel,
     *,
@@ -153,14 +178,8 @@ def default_excluded_adjacent_pairs(
             if pid in ids and pid != bid:
                 excluded.add(_canonical_pair(names[pid], names[bid]))
 
-    name_set = set(names.values())
     if include_sibling_jaws:
-        for left, right in (
-            ("finger_left", "finger_right"),
-            ("cup_jaw_left", "cup_jaw_right"),
-        ):
-            if left in name_set and right in name_set:
-                excluded.add(_canonical_pair(left, right))
+        excluded |= _sibling_jaw_pairs(set(names.values()))
 
     return excluded
 
@@ -274,12 +293,7 @@ def enable_self_collision_spec(
     if cfg.exclude_adjacent:
         excludes |= adjacent_pairs
     if cfg.exclude_sibling_jaws:
-        for left, right in (
-            ("finger_left", "finger_right"),
-            ("cup_jaw_left", "cup_jaw_right"),
-        ):
-            if left in body_names and right in body_names:
-                excludes.add(_canonical_pair(left, right))
+        excludes |= _sibling_jaw_pairs(body_names)
     if cfg.excluded_pairs:
         excludes |= set(cfg.excluded_pairs)
 
@@ -323,25 +337,10 @@ class TorqueNoiseConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise ValueError(f"enabled must be a bool, got {type(self.enabled).__name__}")
-        if isinstance(self.std_nm, bool) or not isinstance(self.std_nm, (int, float, np.integer, np.floating)):
-            raise ValueError(f"std_nm must be a real number, got {type(self.std_nm).__name__}")
-        if isinstance(self.bias_nm, bool) or not isinstance(self.bias_nm, (int, float, np.integer, np.floating)):
-            raise ValueError(f"bias_nm must be a real number, got {type(self.bias_nm).__name__}")
-        std = float(self.std_nm)
-        bias = float(self.bias_nm)
-        if not math.isfinite(std) or std < 0.0:
-            raise ValueError(f"std_nm must be finite and >= 0.0, got {self.std_nm!r}")
-        if not math.isfinite(bias):
-            raise ValueError(f"bias_nm must be finite, got {self.bias_nm!r}")
-        object.__setattr__(self, "std_nm", std)
-        object.__setattr__(self, "bias_nm", bias)
+        object.__setattr__(self, "std_nm", _validate_real_float("std_nm", self.std_nm, non_negative=True))
+        object.__setattr__(self, "bias_nm", _validate_real_float("bias_nm", self.bias_nm))
         if self.clip_nm is not None:
-            if isinstance(self.clip_nm, bool) or not isinstance(self.clip_nm, (int, float, np.integer, np.floating)):
-                raise ValueError(f"clip_nm must be a real number or None, got {type(self.clip_nm).__name__}")
-            clip = float(self.clip_nm)
-            if not math.isfinite(clip) or clip <= 0.0:
-                raise ValueError(f"clip_nm must be finite and > 0.0, got {self.clip_nm!r}")
-            object.__setattr__(self, "clip_nm", clip)
+            object.__setattr__(self, "clip_nm", _validate_real_float("clip_nm", self.clip_nm, positive=True))
 
 
 def apply_torque_noise(

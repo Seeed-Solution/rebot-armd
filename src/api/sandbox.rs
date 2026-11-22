@@ -2290,6 +2290,110 @@ pub struct UploadSceneRequest {
     pub assets: Option<HashMap<String, serde_json::Value>>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_and_write_pack<M: serde::de::DeserializeOwned + serde::Serialize>(
+    root: &Path,
+    kind: &str,
+    dir_name: &str,
+    json_name: &str,
+    primary_json: Option<(&str, &serde_json::Value)>,
+    primary_xml: Option<(&str, &str)>,
+    files: Option<HashMap<String, serde_json::Value>>,
+    assets: Option<HashMap<String, serde_json::Value>>,
+    override_id: Option<String>,
+    required_elem: Option<&str>,
+    parse_meta: fn(&M) -> (&str, &str, &[serde_json::Value]),
+    set_id: fn(&mut M, String),
+) -> Result<(String, serde_json::Value), (StatusCode, &'static str, String)> {
+    let mut file_map = extract_files_map(files, primary_json, primary_xml, assets)
+        .map_err(|(sc, msg)| (sc, "INVALID_PACK", msg))?;
+
+    for key in file_map.keys() {
+        if is_urdf_path(key) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "UNSUPPORTED_FORMAT",
+                format!("URDF files are not supported: '{key}'"),
+            ));
+        }
+    }
+
+    let json_bytes = file_map
+        .get(json_name)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Missing {json_name}")))?;
+
+    let mut manifest_val: serde_json::Value = serde_json::from_slice(json_bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid {json_name}: {e}")))?;
+
+    let mut manifest: M = serde_json::from_value(manifest_val.clone())
+        .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid {json_name}: {e}")))?;
+
+    let pack_id = override_id.unwrap_or_else(|| parse_meta(&manifest).0.to_string());
+    if !validate_pack_id(&pack_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "INVALID_ID",
+            format!("Invalid {kind} pack id '{pack_id}'"),
+        ));
+    }
+    if is_reserved_builtin_id(kind, &pack_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "RESERVED_ID",
+            format!("Cannot overwrite reserved builtin {kind} '{pack_id}'"),
+        ));
+    }
+    if parse_meta(&manifest).0 != pack_id {
+        set_id(&mut manifest, pack_id.clone());
+        if let Some(obj) = manifest_val.as_object_mut() {
+            obj.insert("id".into(), serde_json::Value::String(pack_id.clone()));
+        }
+        let rewritten = serde_json::to_vec_pretty(&manifest_val).map_err(|e| {
+            (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Failed to serialize {json_name}: {e}"))
+        })?;
+        file_map.insert(json_name.into(), rewritten);
+    }
+
+    let btree: BTreeMap<String, Vec<u8>> =
+        file_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let (_, primary_xml_rel, manifest_assets) = parse_meta(&manifest);
+    verify_pack_assets_in_map(&btree, manifest_assets)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
+    let digest = validate_pack_map(primary_xml_rel, required_elem, &btree)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
+
+    let target_dir = root.join(dir_name).join(&pack_id);
+    let total_pack_bytes: u64 = file_map.values().map(|v| v.len() as u64).sum();
+    enforce_sandbox_quota(
+        root,
+        dir_name,
+        &target_dir,
+        total_pack_bytes,
+        MAX_CUSTOM_PACKS_PER_KIND,
+        MAX_SANDBOX_STORAGE_BYTES,
+    )
+    .map_err(|(sc, msg)| (sc, "QUOTA_EXCEEDED", msg))?;
+
+    let written_digest = write_pack_atomically(&target_dir, &file_map, MAX_PACK_TOTAL_BYTES as u64)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "WRITE_FAILED", e))?;
+    debug_assert_eq!(digest, written_digest);
+
+    let mut file_names: Vec<String> = file_map.keys().cloned().collect();
+    file_names.sort();
+
+    Ok((
+        pack_id.clone(),
+        serde_json::json!({
+            "id": pack_id,
+            "sha256": digest,
+            "pack_digest": digest,
+            "path": target_dir.to_string_lossy(),
+            "manifest": manifest,
+            "files": file_names,
+        }),
+    ))
+}
+
 /// POST /api/v1/sandbox/scenes
 pub async fn upload_scene(
     Extension(state): Extension<Arc<SandboxState>>,
@@ -2305,84 +2409,24 @@ pub async fn upload_scene(
     }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
-    let res = tokio::task::spawn_blocking(move || -> Result<(String, serde_json::Value), (StatusCode, &'static str, String)> {
+    let res = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let primary_json = payload.scene_json.as_ref().map(|v| ("scene.json", v));
         let primary_xml = payload.world_xml.as_deref().map(|v| ("world.xml", v));
-
-        let file_map = extract_files_map(payload.files, primary_json, primary_xml, payload.assets)
-            .map_err(|(sc, msg)| (sc, "INVALID_PACK", msg))?;
-
-        for key in file_map.keys() {
-            if is_urdf_path(key) {
-                return Err((StatusCode::BAD_REQUEST, "UNSUPPORTED_FORMAT", format!("URDF files are not supported: '{key}'")));
-            }
-        }
-
-        let scene_json_bytes = file_map
-            .get("scene.json")
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "INVALID_PACK", "Missing scene.json".to_string()))?;
-
-        let mut manifest_val: serde_json::Value = serde_json::from_slice(scene_json_bytes)
-            .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid scene.json: {e}")))?;
-
-        let mut manifest: SceneManifest = serde_json::from_value(manifest_val.clone())
-            .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid scene.json: {e}")))?;
-
-        let mut file_map = file_map;
-        let pack_id = payload.id.unwrap_or(manifest.id.clone());
-        if !validate_pack_id(&pack_id) {
-            return Err((StatusCode::BAD_REQUEST, "INVALID_ID", format!("Invalid scene pack id '{pack_id}'")));
-        }
-        if is_reserved_builtin_id("scene", &pack_id) {
-            return Err((StatusCode::BAD_REQUEST, "RESERVED_ID", format!("Cannot overwrite reserved builtin scene '{pack_id}'")));
-        }
-        if manifest.id != pack_id {
-            manifest.id = pack_id.clone();
-            if let Some(obj) = manifest_val.as_object_mut() {
-                obj.insert("id".into(), serde_json::Value::String(pack_id.clone()));
-            }
-            let rewritten = serde_json::to_vec_pretty(&manifest_val)
-                .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Failed to serialize scene.json: {e}")))?;
-            file_map.insert("scene.json".into(), rewritten);
-        }
-
-        let btree: BTreeMap<String, Vec<u8>> = file_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        verify_pack_assets_in_map(&btree, &manifest.assets)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
-        let digest = validate_pack_map(&manifest.world_xml, Some("worldbody"), &btree)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
-
-        let target_dir = root.join("scenes").join(&pack_id);
-        let total_pack_bytes: u64 = file_map.values().map(|v| v.len() as u64).sum();
-        enforce_sandbox_quota(
+        validate_and_write_pack::<SceneManifest>(
             &root,
+            "scene",
             "scenes",
-            &target_dir,
-            total_pack_bytes,
-            MAX_CUSTOM_PACKS_PER_KIND,
-            MAX_SANDBOX_STORAGE_BYTES,
+            "scene.json",
+            primary_json,
+            primary_xml,
+            payload.files,
+            payload.assets,
+            payload.id,
+            Some("worldbody"),
+            |m| (&m.id, &m.world_xml, &m.assets),
+            |m, id| m.id = id,
         )
-        .map_err(|(sc, msg)| (sc, "QUOTA_EXCEEDED", msg))?;
-
-        let written_digest = write_pack_atomically(&target_dir, &file_map, MAX_PACK_TOTAL_BYTES as u64)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "WRITE_FAILED", e))?;
-        debug_assert_eq!(digest, written_digest);
-
-        let mut file_names: Vec<String> = file_map.keys().cloned().collect();
-        file_names.sort();
-
-        Ok((
-            pack_id.clone(),
-            serde_json::json!({
-                "id": pack_id,
-                "sha256": digest,
-                "pack_digest": digest,
-                "path": target_dir.to_string_lossy(),
-                "manifest": manifest,
-                "files": file_names,
-            }),
-        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Blocking task failed: {e}")}))))?;
@@ -2423,84 +2467,24 @@ pub async fn upload_tool(
     }
     let root = state.root.clone();
     let permit = permit_slot.and_then(|Extension(slot)| slot.0.lock().ok().and_then(|mut g| g.take()));
-    let res = tokio::task::spawn_blocking(move || -> Result<(String, serde_json::Value), (StatusCode, &'static str, String)> {
+    let res = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let primary_json = payload.tool_json.as_ref().map(|v| ("tool.json", v));
         let primary_xml = payload.tool_xml.as_deref().map(|v| ("tool.xml", v));
-
-        let file_map = extract_files_map(payload.files, primary_json, primary_xml, payload.assets)
-            .map_err(|(sc, msg)| (sc, "INVALID_PACK", msg))?;
-
-        for key in file_map.keys() {
-            if is_urdf_path(key) {
-                return Err((StatusCode::BAD_REQUEST, "UNSUPPORTED_FORMAT", format!("URDF files are not supported: '{key}'")));
-            }
-        }
-
-        let tool_json_bytes = file_map
-            .get("tool.json")
-            .ok_or_else(|| (StatusCode::BAD_REQUEST, "INVALID_PACK", "Missing tool.json".to_string()))?;
-
-        let mut manifest_val: serde_json::Value = serde_json::from_slice(tool_json_bytes)
-            .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid tool.json: {e}")))?;
-
-        let mut manifest: ToolManifest = serde_json::from_value(manifest_val.clone())
-            .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Invalid tool.json: {e}")))?;
-
-        let mut file_map = file_map;
-        let pack_id = payload.id.unwrap_or(manifest.id.clone());
-        if !validate_pack_id(&pack_id) {
-            return Err((StatusCode::BAD_REQUEST, "INVALID_ID", format!("Invalid tool pack id '{pack_id}'")));
-        }
-        if is_reserved_builtin_id("tool", &pack_id) {
-            return Err((StatusCode::BAD_REQUEST, "RESERVED_ID", format!("Cannot overwrite reserved builtin tool '{pack_id}'")));
-        }
-        if manifest.id != pack_id {
-            manifest.id = pack_id.clone();
-            if let Some(obj) = manifest_val.as_object_mut() {
-                obj.insert("id".into(), serde_json::Value::String(pack_id.clone()));
-            }
-            let rewritten = serde_json::to_vec_pretty(&manifest_val)
-                .map_err(|e| (StatusCode::BAD_REQUEST, "INVALID_PACK", format!("Failed to serialize tool.json: {e}")))?;
-            file_map.insert("tool.json".into(), rewritten);
-        }
-
-        let btree: BTreeMap<String, Vec<u8>> = file_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        verify_pack_assets_in_map(&btree, &manifest.assets)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
-        let digest = validate_pack_map(&manifest.tool_xml, None, &btree)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.code(), e.message().to_string()))?;
-
-        let target_dir = root.join("tools").join(&pack_id);
-        let total_pack_bytes: u64 = file_map.values().map(|v| v.len() as u64).sum();
-        enforce_sandbox_quota(
+        validate_and_write_pack::<ToolManifest>(
             &root,
+            "tool",
             "tools",
-            &target_dir,
-            total_pack_bytes,
-            MAX_CUSTOM_PACKS_PER_KIND,
-            MAX_SANDBOX_STORAGE_BYTES,
+            "tool.json",
+            primary_json,
+            primary_xml,
+            payload.files,
+            payload.assets,
+            payload.id,
+            None,
+            |m| (&m.id, &m.tool_xml, &m.assets),
+            |m, id| m.id = id,
         )
-        .map_err(|(sc, msg)| (sc, "QUOTA_EXCEEDED", msg))?;
-
-        let written_digest = write_pack_atomically(&target_dir, &file_map, MAX_PACK_TOTAL_BYTES as u64)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, "WRITE_FAILED", e))?;
-        debug_assert_eq!(digest, written_digest);
-
-        let mut file_names: Vec<String> = file_map.keys().cloned().collect();
-        file_names.sort();
-
-        Ok((
-            pack_id.clone(),
-            serde_json::json!({
-                "id": pack_id,
-                "sha256": digest,
-                "pack_digest": digest,
-                "path": target_dir.to_string_lossy(),
-                "manifest": manifest,
-                "files": file_names,
-            }),
-        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Blocking task failed: {e}")}))))?;
@@ -3334,6 +3318,57 @@ enum SimTransportError {
     Timeout,
 }
 
+fn tx_json_err(
+    status: StatusCode,
+    code: &'static str,
+    tx_id: &str,
+    msg: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": msg.into(),
+            "code": code,
+            "tx_id": tx_id,
+        })),
+    )
+}
+
+fn code_json_err(
+    status: StatusCode,
+    code: &'static str,
+    msg: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": msg.into(),
+            "code": code,
+        })),
+    )
+}
+
+fn extract_remote_tx_and_state(val: &serde_json::Value) -> (Option<&str>, &str) {
+    let remote_tx = val
+        .get("tx_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let remote_state = val
+        .get("activation_state")
+        .or_else(|| val.get("state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    (remote_tx, remote_state)
+}
+
+async fn abort_local_tx(state: &SandboxState, tx_id: &str) {
+    let mut tx_w = state.tx_state.write().await;
+    *tx_w = ActivationTxState::Aborted {
+        tx_id: tx_id.to_string(),
+    };
+}
+
 async fn sim_tx_call(
     upstream: &DetectorUpstream,
     method: Method,
@@ -3354,23 +3389,13 @@ async fn sim_best_effort_abort(upstream: &DetectorUpstream, tx_id: &str, timeout
     let _ = sim_tx_call(upstream, Method::POST, "/sim/scene/abort", Some(&abort_body), timeout).await;
 }
 
-fn check_required_upstream_robot_match(
-    val: &serde_json::Value,
+fn check_robot_field_matches(
+    robot_val: &serde_json::Value,
     running_robot: &str,
-    missing_code: &'static str,
-    tx_id: &str,
-    context_label: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let robot_val = val.get("robot").filter(|v| !v.is_null()).ok_or_else(|| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim {context_label} ACK missing non-empty 'robot' field"),
-                "code": missing_code,
-                "tx_id": tx_id,
-            })),
-        )
-    })?;
+) -> Result<Option<String>, (StatusCode, Json<serde_json::Value>)> {
+    if robot_val.is_null() {
+        return Ok(None);
+    }
     let upstream_raw = robot_val.as_str().ok_or_else(|| {
         robot_incompatible_error(
             format!("rebot-sim returned non-string robot field {robot_val}"),
@@ -3379,17 +3404,9 @@ fn check_required_upstream_robot_match(
             std::slice::from_ref(&running_robot.to_string()),
         )
     })?;
-    if upstream_raw.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim {context_label} ACK returned empty 'robot' field"),
-                "code": missing_code,
-                "tx_id": tx_id,
-            })),
-        ));
-    }
-    if normalize_robot_id(upstream_raw).as_deref() != Some(running_robot) {
+    if !upstream_raw.trim().is_empty()
+        && normalize_robot_id(upstream_raw).as_deref() != Some(running_robot)
+    {
         return Err(robot_incompatible_error(
             format!(
                 "rebot-sim upstream reported robot '{upstream_raw}', incompatible with running armd robot '{running_robot}'"
@@ -3399,22 +3416,48 @@ fn check_required_upstream_robot_match(
             std::slice::from_ref(&running_robot.to_string()),
         ));
     }
-    Ok(())
+    Ok(Some(upstream_raw.to_string()))
 }
 
-fn verify_prepare_ack(
-    body: &[u8],
-    expected_tx_id: &str,
+fn check_required_upstream_robot_match(
+    val: &serde_json::Value,
     running_robot: &str,
+    missing_code: &'static str,
+    tx_id: &str,
+    context_label: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let val = serde_json::from_slice::<serde_json::Value>(body).map_err(|e| {
-        (
+    let Some(robot_val) = val.get("robot").filter(|v| !v.is_null()) else {
+        return Err(tx_json_err(
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim prepare returned invalid JSON: {e}"),
-                "code": "SIM_INVALID_PREPARE_ACK",
-                "tx_id": expected_tx_id,
-            })),
+            missing_code,
+            tx_id,
+            format!("rebot-sim {context_label} ACK missing non-empty 'robot' field"),
+        ));
+    };
+    match check_robot_field_matches(robot_val, running_robot)? {
+        Some(raw) if !raw.trim().is_empty() => Ok(()),
+        _ => Err(tx_json_err(
+            StatusCode::BAD_GATEWAY,
+            missing_code,
+            tx_id,
+            format!("rebot-sim {context_label} ACK returned empty 'robot' field"),
+        )),
+    }
+}
+
+fn parse_and_check_tx_ack(
+    body: &[u8],
+    expected_state: &str,
+    code: &'static str,
+    expected_tx_id: &str,
+    context_label: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<serde_json::Value>)> {
+    let val = serde_json::from_slice::<serde_json::Value>(body).map_err(|e| {
+        tx_json_err(
+            StatusCode::BAD_GATEWAY,
+            code,
+            expected_tx_id,
+            format!("rebot-sim {context_label} returned invalid JSON: {e}"),
         )
     })?;
     let state_str = val
@@ -3422,27 +3465,38 @@ fn verify_prepare_ack(
         .or_else(|| val.get("activation_state"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if !state_str.eq_ignore_ascii_case("PREPARED") {
-        return Err((
+    if !state_str.eq_ignore_ascii_case(expected_state) {
+        return Err(tx_json_err(
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim prepare ACK missing state=PREPARED (got {state_str:?})"),
-                "code": "SIM_INVALID_PREPARE_ACK",
-                "tx_id": expected_tx_id,
-            })),
+            code,
+            expected_tx_id,
+            format!("rebot-sim {context_label} ACK missing state={expected_state} (got {state_str:?})"),
         ));
     }
     let resp_tx = val.get("tx_id").and_then(|v| v.as_str()).unwrap_or("");
     if resp_tx != expected_tx_id {
-        return Err((
+        return Err(tx_json_err(
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim prepare ACK tx_id mismatch: expected '{expected_tx_id}', got '{resp_tx}'"),
-                "code": "SIM_INVALID_PREPARE_ACK",
-                "tx_id": expected_tx_id,
-            })),
+            code,
+            expected_tx_id,
+            format!("rebot-sim {context_label} ACK tx_id mismatch: expected '{expected_tx_id}', got '{resp_tx}'"),
         ));
     }
+    Ok(val)
+}
+
+fn verify_prepare_ack(
+    body: &[u8],
+    expected_tx_id: &str,
+    running_robot: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let val = parse_and_check_tx_ack(
+        body,
+        "PREPARED",
+        "SIM_INVALID_PREPARE_ACK",
+        expected_tx_id,
+        "prepare",
+    )?;
     check_required_upstream_robot_match(
         &val,
         running_robot,
@@ -3456,46 +3510,22 @@ fn check_upstream_robot_match(
     resp_bytes: &[u8],
     running_robot: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if let Ok(resp_val) = serde_json::from_slice::<serde_json::Value>(resp_bytes) {
-        if let Some(robot_val) = resp_val.get("robot") {
-            if !robot_val.is_null() {
-                let upstream_raw = robot_val.as_str().ok_or_else(|| {
-                    robot_incompatible_error(
-                        format!("rebot-sim returned non-string robot field {robot_val}"),
-                        running_robot,
-                        None,
-                        std::slice::from_ref(&running_robot.to_string()),
-                    )
-                })?;
-                if !upstream_raw.trim().is_empty()
-                    && normalize_robot_id(upstream_raw).as_deref() != Some(running_robot)
-                {
-                    return Err(robot_incompatible_error(
-                        format!(
-                            "rebot-sim upstream reported robot '{upstream_raw}', incompatible with running armd robot '{running_robot}'"
-                        ),
-                        running_robot,
-                        Some(upstream_raw),
-                        std::slice::from_ref(&running_robot.to_string()),
-                    ));
-                }
-            }
-        }
+    let Ok(resp_val) = serde_json::from_slice::<serde_json::Value>(resp_bytes) else {
+        return Ok(());
+    };
+    if let Some(robot_val) = resp_val.get("robot") {
+        check_robot_field_matches(robot_val, running_robot)?;
     }
     Ok(())
 }
 
 fn is_degraded_response(body: &[u8]) -> bool {
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
-        let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        let state = val
-            .get("activation_state")
-            .or_else(|| val.get("state"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        return code == "SIM_ACTIVATION_DEGRADED" || state.eq_ignore_ascii_case("DEGRADED_SPLIT");
-    }
-    false
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
+    let (_, state) = extract_remote_tx_and_state(&val);
+    code == "SIM_ACTIVATION_DEGRADED" || state.eq_ignore_ascii_case("DEGRADED_SPLIT")
 }
 
 fn extract_remote_tx_id(body: &[u8]) -> Option<String> {
@@ -3527,36 +3557,28 @@ fn verify_ack_digest_field(
                 .filter(|s| !s.is_empty());
             match actual {
                 Some(got) if got == exp => Ok(()),
-                Some(got) => Err((
+                Some(got) => Err(tx_json_err(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("rebot-sim commit ACK {field} mismatch: expected '{exp}', got '{got}'"),
-                        "code": "SIM_INVALID_COMMIT_ACK",
-                        "tx_id": expected_tx_id,
-                    })),
+                    "SIM_INVALID_COMMIT_ACK",
+                    expected_tx_id,
+                    format!("rebot-sim commit ACK {field} mismatch: expected '{exp}', got '{got}'"),
                 )),
-                None => Err((
+                None => Err(tx_json_err(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("rebot-sim commit ACK missing required {field} '{exp}'"),
-                        "code": "SIM_INVALID_COMMIT_ACK",
-                        "tx_id": expected_tx_id,
-                    })),
+                    "SIM_INVALID_COMMIT_ACK",
+                    expected_tx_id,
+                    format!("rebot-sim commit ACK missing required {field} '{exp}'"),
                 )),
             }
         }
         None => {
-            if let Some(d_val) = val.get(field) {
-                if !d_val.is_null() {
-                    return Err((
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "error": format!("rebot-sim commit ACK unexpected non-null {field}: {d_val}"),
-                            "code": "SIM_INVALID_COMMIT_ACK",
-                            "tx_id": expected_tx_id,
-                        })),
-                    ));
-                }
+            if let Some(d_val) = val.get(field).filter(|v| !v.is_null()) {
+                return Err(tx_json_err(
+                    StatusCode::BAD_GATEWAY,
+                    "SIM_INVALID_COMMIT_ACK",
+                    expected_tx_id,
+                    format!("rebot-sim commit ACK unexpected non-null {field}: {d_val}"),
+                ));
             }
             Ok(())
         }
@@ -3570,42 +3592,13 @@ fn verify_commit_ack(
     expected_scene_digest: Option<&str>,
     expected_tool_digest: Option<&str>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let val = serde_json::from_slice::<serde_json::Value>(body).map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim commit returned invalid JSON: {e}"),
-                "code": "SIM_INVALID_COMMIT_ACK",
-                "tx_id": expected_tx_id,
-            })),
-        )
-    })?;
-    let state_str = val
-        .get("state")
-        .or_else(|| val.get("activation_state"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if !state_str.eq_ignore_ascii_case("COMMITTED") {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim commit ACK missing state=COMMITTED (got {state_str:?})"),
-                "code": "SIM_INVALID_COMMIT_ACK",
-                "tx_id": expected_tx_id,
-            })),
-        ));
-    }
-    let resp_tx = val.get("tx_id").and_then(|v| v.as_str()).unwrap_or("");
-    if resp_tx != expected_tx_id {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": format!("rebot-sim commit ACK tx_id mismatch: expected '{expected_tx_id}', got '{resp_tx}'"),
-                "code": "SIM_INVALID_COMMIT_ACK",
-                "tx_id": expected_tx_id,
-            })),
-        ));
-    }
+    let val = parse_and_check_tx_ack(
+        body,
+        "COMMITTED",
+        "SIM_INVALID_COMMIT_ACK",
+        expected_tx_id,
+        "commit",
+    )?;
     if let Some(robot) = running_robot {
         check_required_upstream_robot_match(
             &val,
@@ -4010,6 +4003,379 @@ async fn converge_degraded_split(
     Err(degraded_split_http_error(&split_tx_id, detail))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn activate_committed_response(
+    mode: &str,
+    running_robot: &str,
+    scene_id: &str,
+    tool_id: &str,
+    policy_id: &Option<String>,
+    final_auto_start: bool,
+    final_seed: u64,
+    final_reset_seq: u64,
+    final_io_seq: u64,
+    tx_id: &str,
+    scene_digest: &Option<String>,
+    tool_digest: &Option<String>,
+    scene_manifest: &SceneManifest,
+    tool_manifest: &ToolManifest,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "mode": mode,
+        "robot": running_robot,
+        "active_scene": scene_id,
+        "active_tool": tool_id,
+        "active_policy": policy_id,
+        "auto_start_policy": final_auto_start,
+        "seed": final_seed,
+        "reset_seq": final_reset_seq,
+        "io_seq": final_io_seq,
+        "tx_id": tx_id,
+        "activation_state": "COMMITTED",
+        "scene_digest": scene_digest,
+        "tool_digest": tool_digest,
+        "scene_manifest": scene_manifest,
+        "tool_manifest": tool_manifest,
+    }))
+}
+
+async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let existing_tx = state.tx_state.read().await.clone();
+    match existing_tx {
+        ActivationTxState::DegradedSplit { ref tx_id, ref detail, .. } => {
+            Err(degraded_split_http_error(tx_id, detail))
+        }
+        ActivationTxState::Unknown {
+            ref tx_id,
+            ref prev_tx_id,
+            ref prev_scene,
+            ref prev_tool,
+            ref prev_policy,
+            ref prev_mode,
+            prev_seed,
+            prev_auto_start_policy,
+            ref prev_cached_mjcf,
+            ref prev_scene_digest,
+            ref prev_tool_digest,
+            ref target_scene,
+            ref target_tool,
+            ref target_policy,
+            target_seed,
+            target_auto_start_policy,
+            ref target_composed_mjcf,
+            ref target_scene_digest,
+            ref target_tool_digest,
+        } => {
+            let unknown_err = || {
+                tx_json_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SIM_ACTIVATION_UNKNOWN",
+                    tx_id,
+                    "Previous sim activation is in UNKNOWN state",
+                )
+            };
+            let Ok(sim_url) = sim_upstream_url() else {
+                return Err(unknown_err());
+            };
+            let Ok(upstream) = DetectorUpstream::parse(&sim_url) else {
+                return Err(unknown_err());
+            };
+            let Ok(resp) = sim_tx_call(&upstream, Method::GET, "/sim/state", None, state.sim_timeouts.reconcile).await else {
+                return Err(unknown_err());
+            };
+            if !resp.status.is_success() {
+                return Err(unknown_err());
+            }
+            let Ok(sim_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) else {
+                return Err(unknown_err());
+            };
+            let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
+            if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+                commit_local_active_state(
+                    state,
+                    "sim",
+                    target_scene,
+                    target_tool,
+                    target_policy.clone(),
+                    Some(target_seed),
+                    Some(target_auto_start_policy),
+                    target_composed_mjcf.clone(),
+                    tx_id,
+                    target_scene_digest.clone(),
+                    target_tool_digest.clone(),
+                )
+                .await;
+                return Ok(());
+            }
+            if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                let own_snap = TxSnapshot {
+                    tx_id: tx_id.clone(),
+                    prev_tx_id: prev_tx_id.clone(),
+                    prev_scene: prev_scene.clone(),
+                    prev_tool: prev_tool.clone(),
+                    prev_policy: prev_policy.clone(),
+                    prev_mode: prev_mode.clone(),
+                    prev_seed,
+                    prev_auto_start_policy,
+                    prev_cached_mjcf: prev_cached_mjcf.clone(),
+                    prev_scene_digest: prev_scene_digest.clone(),
+                    prev_tool_digest: prev_tool_digest.clone(),
+                    target_scene: target_scene.clone(),
+                    target_tool: target_tool.clone(),
+                    target_policy: target_policy.clone(),
+                    target_seed,
+                    target_auto_start_policy,
+                    target_composed_mjcf: target_composed_mjcf.clone(),
+                    target_scene_digest: target_scene_digest.clone(),
+                    target_tool_digest: target_tool_digest.clone(),
+                };
+                if remote_tx == Some(tx_id.as_str()) {
+                    let detail = String::from_utf8_lossy(&resp.body).to_string();
+                    let mut tx_w = state.tx_state.write().await;
+                    *tx_w = own_snap.into_degraded(tx_id.clone(), true, detail);
+                    return Err(degraded_split_http_error(
+                        tx_id,
+                        "Previous sim activation is in DEGRADED_SPLIT; call /api/v1/sandbox/recover-split first",
+                    ));
+                }
+                let owner_tx = remote_tx
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("foreign-split-{tx_id}"));
+                let foreign_msg = format!(
+                    "Remote sim is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
+                );
+                let mut tx_w = state.tx_state.write().await;
+                *tx_w = foreign_degraded_from_sim_val(&own_snap, owner_tx.clone(), &sim_val, foreign_msg.clone());
+                return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
+            }
+            if remote_state.eq_ignore_ascii_case("COMMITTING") {
+                return Err(tx_json_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SIM_ACTIVATION_UNKNOWN",
+                    tx_id,
+                    "Previous sim activation is still COMMITTING",
+                ));
+            }
+            if remote_state.eq_ignore_ascii_case("ABORTED")
+                || (remote_tx.is_some() && remote_tx != Some(tx_id.as_str()))
+            {
+                restore_tx_state_after_rollback(
+                    state,
+                    remote_tx.map(str::to_string),
+                    prev_tx_id.clone(),
+                    prev_scene_digest.clone(),
+                    prev_tool_digest.clone(),
+                    tx_id,
+                )
+                .await;
+                return Ok(());
+            }
+            Err(unknown_err())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_legacy_sim_activate(
+    state: &SandboxState,
+    upstream: &DetectorUpstream,
+    sim_url: &str,
+    tx_id: &str,
+    running_robot: &str,
+    scene_id: &str,
+    tool_id: &str,
+    target_seed: u64,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // B2 + M02 + m01: Legacy fallback: GET /sim/state MUST return exact 200 OK,
+    // valid JSON, and matching non-empty robot; any error sets Aborted.
+    let state_resp = match sim_tx_call(upstream, Method::GET, "/sim/state", None, state.sim_timeouts.reconcile).await {
+        Ok(r) => r,
+        Err(SimTransportError::Timeout) => {
+            abort_local_tx(state, tx_id).await;
+            return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
+                "error": format!("Timeout querying legacy rebot-sim /sim/state at {sim_url}"),
+                "sim_url": sim_url,
+            }))));
+        }
+        Err(SimTransportError::ConnectOrIo(e)) => {
+            abort_local_tx(state, tx_id).await;
+            return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": format!("Cannot query legacy rebot-sim /sim/state at {sim_url}: {e}"),
+                "sim_url": sim_url,
+            }))));
+        }
+    };
+    if state_resp.status != StatusCode::OK {
+        abort_local_tx(state, tx_id).await;
+        let status = if state_resp.status.is_server_error() {
+            state_resp.status
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        let err_msg = String::from_utf8_lossy(&state_resp.body).to_string();
+        return Err((status, Json(serde_json::json!({
+            "error": format!("Legacy rebot-sim /sim/state failed ({}): {err_msg}", state_resp.status),
+            "code": "SIM_STATE_UNAVAILABLE",
+            "sim_url": sim_url,
+        }))));
+    }
+    let state_val: serde_json::Value = match serde_json::from_slice(&state_resp.body) {
+        Ok(v) => v,
+        Err(e) => {
+            abort_local_tx(state, tx_id).await;
+            return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+                "error": format!("Legacy rebot-sim /sim/state returned invalid JSON: {e}"),
+                "code": "SIM_STATE_INVALID",
+                "sim_url": sim_url,
+            }))));
+        }
+    };
+    let Some(remote_robot_raw) = state_val
+        .get("robot")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        abort_local_tx(state, tx_id).await;
+        return Err(robot_incompatible_error(
+            "Legacy rebot-sim /sim/state missing non-empty 'robot' field".into(),
+            running_robot,
+            None,
+            std::slice::from_ref(&running_robot.to_string()),
+        ));
+    };
+    if normalize_robot_id(remote_robot_raw).as_deref() != Some(running_robot) {
+        abort_local_tx(state, tx_id).await;
+        return Err(robot_incompatible_error(
+            format!(
+                "rebot-sim upstream /sim/state reported robot '{remote_robot_raw}', incompatible with running armd robot '{running_robot}'"
+            ),
+            running_robot,
+            Some(remote_robot_raw),
+            std::slice::from_ref(&running_robot.to_string()),
+        ));
+    }
+
+    let legacy_bytes = serde_json::to_vec(&serde_json::json!({
+        "scene": scene_id,
+        "tool": tool_id,
+        "seed": target_seed,
+        "robot": running_robot,
+    }))
+    .unwrap_or_default();
+
+    let resp_bytes = match sim_post_with_timeout(
+        upstream,
+        sim_url,
+        "/sim/scene",
+        &legacy_bytes,
+        state.sim_timeouts.commit,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            abort_local_tx(state, tx_id).await;
+            return Err(e);
+        }
+    };
+    if let Err(e) = check_upstream_robot_match(&resp_bytes, running_robot) {
+        abort_local_tx(state, tx_id).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Reconciles an ambiguous commit ACK via `GET /sim/state`.
+/// Returns `Ok(Some(committed_tuple))` if converged via `DEGRADED_SPLIT`, `Ok(None)` if committed cleanly.
+async fn reconcile_lost_commit_ack(
+    state: &SandboxState,
+    upstream: &DetectorUpstream,
+    running_robot: &str,
+    snap: TxSnapshot,
+) -> Result<Option<(bool, u64, u64, u64)>, (StatusCode, Json<serde_json::Value>)> {
+    let tx_id = snap.tx_id.clone();
+    {
+        let mut tx_w = state.tx_state.write().await;
+        *tx_w = snap.clone().into_unknown();
+    }
+    let Ok(sresp) = sim_tx_call(upstream, Method::GET, "/sim/state", None, state.sim_timeouts.reconcile).await else {
+        return Err(tx_json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SIM_ACTIVATION_UNKNOWN",
+            &tx_id,
+            "Sim commit ACK lost and /sim/state reconciliation failed",
+        ));
+    };
+    if !sresp.status.is_success() {
+        return Err(tx_json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SIM_ACTIVATION_UNKNOWN",
+            &tx_id,
+            "Sim commit ACK lost and /sim/state reconciliation failed",
+        ));
+    }
+    let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body).unwrap_or(serde_json::Value::Null);
+    let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
+    if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+        return Ok(None);
+    }
+    if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+        let detail = String::from_utf8_lossy(&sresp.body).to_string();
+        if remote_tx == Some(tx_id.as_str()) {
+            let committed = converge_degraded_split(state, upstream, running_robot, snap, &detail).await?;
+            return Ok(Some(committed));
+        }
+        // B01: Foreign split owner -> adopt with target_matches_tx = false,
+        // never graft foreign tx_id onto our target config.
+        let owner_tx = remote_tx
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("foreign-split-{tx_id}"));
+        let foreign_msg = format!(
+            "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
+        );
+        {
+            let mut tx_w = state.tx_state.write().await;
+            *tx_w = foreign_degraded_from_sim_val(&snap, owner_tx.clone(), &sim_val, foreign_msg.clone());
+        }
+        return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
+    }
+    if remote_state.eq_ignore_ascii_case("COMMITTING") {
+        return Err(tx_json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SIM_ACTIVATION_UNKNOWN",
+            &tx_id,
+            "Sim commit still COMMITTING during /sim/state reconciliation",
+        ));
+    }
+    if remote_state.eq_ignore_ascii_case("ABORTED")
+        || (remote_tx.is_some() && remote_tx != Some(tx_id.as_str()))
+    {
+        restore_tx_state_after_rollback(
+            state,
+            remote_tx.map(str::to_string),
+            snap.prev_tx_id,
+            snap.prev_scene_digest,
+            snap.prev_tool_digest,
+            &tx_id,
+        )
+        .await;
+        return Err(tx_json_err(
+            StatusCode::BAD_GATEWAY,
+            "SIM_COMMIT_ABORTED",
+            &tx_id,
+            "Sim commit aborted according to /sim/state reconciliation",
+        ));
+    }
+    Err(tx_json_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SIM_ACTIVATION_UNKNOWN",
+        &tx_id,
+        "Sim commit ACK lost and /sim/state is ambiguous",
+    ))
+}
+
 /// POST /api/v1/sandbox/activate
 pub async fn activate(
     State(supervisor): State<Arc<crate::supervisor::ArmSupervisor>>,
@@ -4024,189 +4390,7 @@ pub async fn activate(
     let _act_guard = state.activate_lock.lock().await;
 
     // 1. Refuse any new activation while SandboxState is DEGRADED_SPLIT (or reconcile Unknown first).
-    {
-        let existing_tx = state.tx_state.read().await.clone();
-        match existing_tx {
-            ActivationTxState::DegradedSplit { ref tx_id, ref detail, .. } => {
-                return Err(degraded_split_http_error(tx_id, detail));
-            }
-            ActivationTxState::Unknown {
-                ref tx_id,
-                ref prev_tx_id,
-                ref prev_scene,
-                ref prev_tool,
-                ref prev_policy,
-                ref prev_mode,
-                prev_seed,
-                prev_auto_start_policy,
-                ref prev_cached_mjcf,
-                ref prev_scene_digest,
-                ref prev_tool_digest,
-                ref target_scene,
-                ref target_tool,
-                ref target_policy,
-                target_seed,
-                target_auto_start_policy,
-                ref target_composed_mjcf,
-                ref target_scene_digest,
-                ref target_tool_digest,
-            } => {
-                let mut reconciled = false;
-                if let Ok(sim_url) = sim_upstream_url() {
-                    if let Ok(upstream) = DetectorUpstream::parse(&sim_url) {
-                        if let Ok(resp) = sim_tx_call(
-                            &upstream,
-                            Method::GET,
-                            "/sim/state",
-                            None,
-                            state.sim_timeouts.reconcile,
-                        )
-                        .await
-                        {
-                            if resp.status.is_success() {
-                                if let Ok(sim_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
-                                    let remote_tx = sim_val
-                                        .get("tx_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(str::trim)
-                                        .filter(|s| !s.is_empty());
-                                    let remote_state = sim_val
-                                        .get("activation_state")
-                                        .or_else(|| sim_val.get("state"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if remote_tx == Some(tx_id.as_str())
-                                        && remote_state.eq_ignore_ascii_case("COMMITTED")
-                                    {
-                                        commit_local_active_state(
-                                            &state,
-                                            "sim",
-                                            target_scene,
-                                            target_tool,
-                                            target_policy.clone(),
-                                            Some(target_seed),
-                                            Some(target_auto_start_policy),
-                                            target_composed_mjcf.clone(),
-                                            tx_id,
-                                            target_scene_digest.clone(),
-                                            target_tool_digest.clone(),
-                                        )
-                                        .await;
-                                        reconciled = true;
-                                    } else if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
-                                        // M1 + B01: transition local state to DegradedSplit before returning 503,
-                                        // never adopting a foreign tx_id onto our own target config.
-                                        if remote_tx == Some(tx_id.as_str()) {
-                                            let detail = String::from_utf8_lossy(&resp.body).to_string();
-                                            let mut tx_w = state.tx_state.write().await;
-                                            *tx_w = ActivationTxState::DegradedSplit {
-                                                tx_id: tx_id.clone(),
-                                                prev_tx_id: prev_tx_id.clone(),
-                                                prev_scene: prev_scene.clone(),
-                                                prev_tool: prev_tool.clone(),
-                                                prev_policy: prev_policy.clone(),
-                                                prev_mode: prev_mode.clone(),
-                                                prev_seed,
-                                                prev_auto_start_policy,
-                                                prev_cached_mjcf: prev_cached_mjcf.clone(),
-                                                prev_scene_digest: prev_scene_digest.clone(),
-                                                prev_tool_digest: prev_tool_digest.clone(),
-                                                target_scene: target_scene.clone(),
-                                                target_tool: target_tool.clone(),
-                                                target_policy: target_policy.clone(),
-                                                target_seed,
-                                                target_auto_start_policy,
-                                                target_composed_mjcf: target_composed_mjcf.clone(),
-                                                target_scene_digest: target_scene_digest.clone(),
-                                                target_tool_digest: target_tool_digest.clone(),
-                                                target_matches_tx: true,
-                                                detail,
-                                            };
-                                            return Err(degraded_split_http_error(
-                                                tx_id,
-                                                "Previous sim activation is in DEGRADED_SPLIT; call /api/v1/sandbox/recover-split first",
-                                            ));
-                                        }
-                                        let owner_tx = remote_tx
-                                            .map(str::to_string)
-                                            .unwrap_or_else(|| format!("foreign-split-{}", tx_id));
-                                        let foreign_msg = format!(
-                                            "Remote sim is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
-                                        );
-                                        let foreign_snap = TxSnapshot {
-                                            tx_id: tx_id.clone(),
-                                            prev_tx_id: prev_tx_id.clone(),
-                                            prev_scene: prev_scene.clone(),
-                                            prev_tool: prev_tool.clone(),
-                                            prev_policy: prev_policy.clone(),
-                                            prev_mode: prev_mode.clone(),
-                                            prev_seed,
-                                            prev_auto_start_policy,
-                                            prev_cached_mjcf: prev_cached_mjcf.clone(),
-                                            prev_scene_digest: prev_scene_digest.clone(),
-                                            prev_tool_digest: prev_tool_digest.clone(),
-                                            target_scene: String::new(),
-                                            target_tool: String::new(),
-                                            target_policy: None,
-                                            target_seed: prev_seed,
-                                            target_auto_start_policy: prev_auto_start_policy,
-                                            target_composed_mjcf: String::new(),
-                                            target_scene_digest: None,
-                                            target_tool_digest: None,
-                                        };
-                                        {
-                                            let mut tx_w = state.tx_state.write().await;
-                                            *tx_w = foreign_degraded_from_sim_val(
-                                                &foreign_snap,
-                                                owner_tx.clone(),
-                                                &sim_val,
-                                                foreign_msg.clone(),
-                                            );
-                                        }
-                                        return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
-                                    } else if remote_state.eq_ignore_ascii_case("COMMITTING") {
-                                        // M2: remote is still committing -> keep Unknown
-                                        return Err((
-                                            StatusCode::SERVICE_UNAVAILABLE,
-                                            Json(serde_json::json!({
-                                                "error": "Previous sim activation is still COMMITTING",
-                                                "code": "SIM_ACTIVATION_UNKNOWN",
-                                                "tx_id": tx_id,
-                                            })),
-                                        ));
-                                    } else if remote_state.eq_ignore_ascii_case("ABORTED")
-                                        || (remote_tx.is_some() && remote_tx != Some(tx_id.as_str()))
-                                    {
-                                        restore_tx_state_after_rollback(
-                                            &state,
-                                            remote_tx.map(str::to_string),
-                                            prev_tx_id.clone(),
-                                            prev_scene_digest.clone(),
-                                            prev_tool_digest.clone(),
-                                            tx_id,
-                                        )
-                                        .await;
-                                        reconciled = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if !reconciled {
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": "Previous sim activation is in UNKNOWN state",
-                            "code": "SIM_ACTIVATION_UNKNOWN",
-                            "tx_id": tx_id,
-                        })),
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
+    reconcile_unknown_tx(&state).await?;
 
     // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
     let running_robot = running_robot_id(&supervisor).await;
@@ -4348,147 +4532,28 @@ pub async fn activate(
         .await
         {
             Ok(resp) if resp.status == StatusCode::NOT_FOUND => {
-                // B2 + M02 + m01: Legacy fallback: GET /sim/state MUST return exact 200 OK,
-                // valid JSON, and matching non-empty robot; any error sets Aborted.
-                let state_resp = match sim_tx_call(
-                    &upstream,
-                    Method::GET,
-                    "/sim/state",
-                    None,
-                    state.sim_timeouts.reconcile,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(SimTransportError::Timeout) => {
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                        return Err((
-                            StatusCode::GATEWAY_TIMEOUT,
-                            Json(serde_json::json!({
-                                "error": format!("Timeout querying legacy rebot-sim /sim/state at {sim_url}"),
-                                "sim_url": sim_url,
-                            })),
-                        ));
-                    }
-                    Err(SimTransportError::ConnectOrIo(e)) => {
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Cannot query legacy rebot-sim /sim/state at {sim_url}: {e}"),
-                                "sim_url": sim_url,
-                            })),
-                        ));
-                    }
-                };
-                if state_resp.status != StatusCode::OK {
-                    let mut tx_w = state.tx_state.write().await;
-                    *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                    let status = if state_resp.status.is_server_error() {
-                        state_resp.status
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    };
-                    let err_msg = String::from_utf8_lossy(&state_resp.body).to_string();
-                    return Err((
-                        status,
-                        Json(serde_json::json!({
-                            "error": format!("Legacy rebot-sim /sim/state failed ({}): {err_msg}", state_resp.status),
-                            "code": "SIM_STATE_UNAVAILABLE",
-                            "sim_url": sim_url,
-                        })),
-                    ));
-                }
-                let state_val: serde_json::Value = match serde_json::from_slice(&state_resp.body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                        return Err((
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Legacy rebot-sim /sim/state returned invalid JSON: {e}"),
-                                "code": "SIM_STATE_INVALID",
-                                "sim_url": sim_url,
-                            })),
-                        ));
-                    }
-                };
-                let remote_robot_raw = match state_val
-                    .get("robot")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(r) => r,
-                    None => {
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                        return Err(robot_incompatible_error(
-                            "Legacy rebot-sim /sim/state missing non-empty 'robot' field".into(),
-                            &running_robot,
-                            None,
-                            std::slice::from_ref(&running_robot),
-                        ));
-                    }
-                };
-                if normalize_robot_id(remote_robot_raw).as_deref() != Some(running_robot.as_str()) {
-                    let mut tx_w = state.tx_state.write().await;
-                    *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                    return Err(robot_incompatible_error(
-                        format!(
-                            "rebot-sim upstream /sim/state reported robot '{remote_robot_raw}', incompatible with running armd robot '{running_robot}'"
-                        ),
-                        &running_robot,
-                        Some(remote_robot_raw),
-                        std::slice::from_ref(&running_robot),
-                    ));
-                }
-
-                let legacy_bytes = serde_json::to_vec(&serde_json::json!({
-                    "scene": scene_id,
-                    "tool": tool_id,
-                    "seed": target_seed,
-                    "robot": running_robot,
-                }))
-                .unwrap_or_default();
-
-                let resp_bytes = match sim_post_with_timeout(
+                run_legacy_sim_activate(
+                    &state,
                     &upstream,
                     &sim_url,
-                    "/sim/scene",
-                    &legacy_bytes,
-                    state.sim_timeouts.commit,
+                    &tx_id,
+                    &running_robot,
+                    &scene_id,
+                    &tool_id,
+                    target_seed,
                 )
-                .await
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                        return Err(e);
-                    }
-                };
-                if let Err(e) = check_upstream_robot_match(&resp_bytes, &running_robot) {
-                    let mut tx_w = state.tx_state.write().await;
-                    *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                    return Err(e);
-                }
+                .await?;
             }
             Ok(resp) if resp.status == StatusCode::OK => {
                 if let Err(err) = verify_prepare_ack(&resp.body, &tx_id, &running_robot) {
                     sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                    let mut tx_w = state.tx_state.write().await;
-                    *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                    abort_local_tx(&state, &tx_id).await;
                     return Err(err);
                 }
                 {
                     let mut tx_w = state.tx_state.write().await;
                     *tx_w = ActivationTxState::Prepared { tx_id: tx_id.clone() };
                 }
-
                 {
                     let mut tx_w = state.tx_state.write().await;
                     *tx_w = ActivationTxState::Committing { tx_id: tx_id.clone() };
@@ -4563,34 +4628,31 @@ pub async fn activate(
                         let (final_auto_start, final_seed, final_reset_seq, final_io_seq) =
                             converge_degraded_split(&state, &upstream, &running_robot, snap, &detail)
                                 .await?;
-                        return Ok(Json(serde_json::json!({
-                            "mode": mode,
-                            "robot": running_robot,
-                            "active_scene": scene_id,
-                            "active_tool": tool_id,
-                            "active_policy": policy_id,
-                            "auto_start_policy": final_auto_start,
-                            "seed": final_seed,
-                            "reset_seq": final_reset_seq,
-                            "io_seq": final_io_seq,
-                            "tx_id": tx_id,
-                            "activation_state": "COMMITTED",
-                            "scene_digest": scene_digest,
-                            "tool_digest": tool_digest,
-                            "scene_manifest": scene_manifest,
-                            "tool_manifest": tool_manifest,
-                        })));
+                        return Ok(activate_committed_response(
+                            &mode,
+                            &running_robot,
+                            &scene_id,
+                            &tool_id,
+                            &policy_id,
+                            final_auto_start,
+                            final_seed,
+                            final_reset_seq,
+                            final_io_seq,
+                            &tx_id,
+                            &scene_digest,
+                            &tool_digest,
+                            &scene_manifest,
+                            &tool_manifest,
+                        ));
                     }
                     CommitOutcome::VerifyRejected(err) => {
                         sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                        abort_local_tx(&state, &tx_id).await;
                         return Err(err);
                     }
                     CommitOutcome::FailedHttp(status, err_msg) => {
                         sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                        let mut tx_w = state.tx_state.write().await;
-                        *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                        abort_local_tx(&state, &tx_id).await;
                         return Err((
                             status,
                             Json(serde_json::json!({
@@ -4601,138 +4663,25 @@ pub async fn activate(
                         ));
                     }
                     CommitOutcome::NeedReconcile => {
+                        if let Some((final_auto_start, final_seed, final_reset_seq, final_io_seq)) =
+                            reconcile_lost_commit_ack(&state, &upstream, &running_robot, snap).await?
                         {
-                            let mut tx_w = state.tx_state.write().await;
-                            *tx_w = snap.clone().into_unknown();
-                        }
-                        match sim_tx_call(
-                            &upstream,
-                            Method::GET,
-                            "/sim/state",
-                            None,
-                            state.sim_timeouts.reconcile,
-                        )
-                        .await
-                        {
-                            Ok(sresp) if sresp.status.is_success() => {
-                                let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body)
-                                    .unwrap_or(serde_json::Value::Null);
-                                let remote_tx = sim_val
-                                    .get("tx_id")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty());
-                                let remote_state = sim_val
-                                    .get("activation_state")
-                                    .or_else(|| sim_val.get("state"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                if remote_tx == Some(tx_id.as_str())
-                                    && remote_state.eq_ignore_ascii_case("COMMITTED")
-                                {
-                                    // Remote committed cleanly
-                                } else if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
-                                    let detail = String::from_utf8_lossy(&sresp.body).to_string();
-                                    if remote_tx == Some(tx_id.as_str()) {
-                                        let (
-                                            final_auto_start,
-                                            final_seed,
-                                            final_reset_seq,
-                                            final_io_seq,
-                                        ) = converge_degraded_split(
-                                            &state,
-                                            &upstream,
-                                            &running_robot,
-                                            snap,
-                                            &detail,
-                                        )
-                                        .await?;
-                                        return Ok(Json(serde_json::json!({
-                                            "mode": mode,
-                                            "robot": running_robot,
-                                            "active_scene": scene_id,
-                                            "active_tool": tool_id,
-                                            "active_policy": policy_id,
-                                            "auto_start_policy": final_auto_start,
-                                            "seed": final_seed,
-                                            "reset_seq": final_reset_seq,
-                                            "io_seq": final_io_seq,
-                                            "tx_id": tx_id,
-                                            "activation_state": "COMMITTED",
-                                            "scene_digest": scene_digest,
-                                            "tool_digest": tool_digest,
-                                            "scene_manifest": scene_manifest,
-                                            "tool_manifest": tool_manifest,
-                                        })));
-                                    }
-                                    // B01: Foreign split owner -> adopt with target_matches_tx = false,
-                                    // never graft foreign tx_id onto our target config.
-                                    let owner_tx = remote_tx
-                                        .map(str::to_string)
-                                        .unwrap_or_else(|| format!("foreign-split-{tx_id}"));
-                                    let foreign_msg = format!(
-                                        "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
-                                    );
-                                    {
-                                        let mut tx_w = state.tx_state.write().await;
-                                        *tx_w = foreign_degraded_from_sim_val(
-                                            &snap,
-                                            owner_tx.clone(),
-                                            &sim_val,
-                                            foreign_msg.clone(),
-                                        );
-                                    }
-                                    return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
-                                } else if remote_state.eq_ignore_ascii_case("COMMITTING") {
-                                    return Err((
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        Json(serde_json::json!({
-                                            "error": "Sim commit still COMMITTING during /sim/state reconciliation",
-                                            "code": "SIM_ACTIVATION_UNKNOWN",
-                                            "tx_id": tx_id,
-                                        })),
-                                    ));
-                                } else if remote_state.eq_ignore_ascii_case("ABORTED")
-                                    || (remote_tx.is_some() && remote_tx != Some(tx_id.as_str()))
-                                {
-                                    restore_tx_state_after_rollback(
-                                        &state,
-                                        remote_tx.map(str::to_string),
-                                        prev_tx_id.clone(),
-                                        prev_scene_digest.clone(),
-                                        prev_tool_digest.clone(),
-                                        &tx_id,
-                                    )
-                                    .await;
-                                    return Err((
-                                        StatusCode::BAD_GATEWAY,
-                                        Json(serde_json::json!({
-                                            "error": "Sim commit aborted according to /sim/state reconciliation",
-                                            "code": "SIM_COMMIT_ABORTED",
-                                            "tx_id": tx_id,
-                                        })),
-                                    ));
-                                } else {
-                                    return Err((
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        Json(serde_json::json!({
-                                            "error": "Sim commit ACK lost and /sim/state is ambiguous",
-                                            "code": "SIM_ACTIVATION_UNKNOWN",
-                                            "tx_id": tx_id,
-                                        })),
-                                    ));
-                                }
-                            }
-                            _ => {
-                                return Err((
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    Json(serde_json::json!({
-                                        "error": "Sim commit ACK lost and /sim/state reconciliation failed",
-                                        "code": "SIM_ACTIVATION_UNKNOWN",
-                                        "tx_id": tx_id,
-                                    })),
-                                ));
-                            }
+                            return Ok(activate_committed_response(
+                                &mode,
+                                &running_robot,
+                                &scene_id,
+                                &tool_id,
+                                &policy_id,
+                                final_auto_start,
+                                final_seed,
+                                final_reset_seq,
+                                final_io_seq,
+                                &tx_id,
+                                &scene_digest,
+                                &tool_digest,
+                                &scene_manifest,
+                                &tool_manifest,
+                            ));
                         }
                     }
                 }
@@ -4740,15 +4689,12 @@ pub async fn activate(
             Ok(resp) if resp.status.is_success() => {
                 // M09: non-200 2xx (e.g. 202 Accepted) is NOT a valid prepare ACK
                 sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                return Err((
+                abort_local_tx(&state, &tx_id).await;
+                return Err(tx_json_err(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("rebot-sim prepare returned unexpected 2xx status {}", resp.status),
-                        "code": "SIM_INVALID_PREPARE_ACK",
-                        "tx_id": tx_id,
-                    })),
+                    "SIM_INVALID_PREPARE_ACK",
+                    &tx_id,
+                    format!("rebot-sim prepare returned unexpected 2xx status {}", resp.status),
                 ));
             }
             Ok(resp) if resp.status == StatusCode::SERVICE_UNAVAILABLE && is_degraded_response(&resp.body) => {
@@ -4781,8 +4727,7 @@ pub async fn activate(
                     || resp.status == StatusCode::UNPROCESSABLE_ENTITY =>
             {
                 sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                abort_local_tx(&state, &tx_id).await;
                 let parsed = serde_json::from_slice::<serde_json::Value>(&resp.body).ok();
                 let upstream_code = parsed
                     .as_ref()
@@ -4802,19 +4747,11 @@ pub async fn activate(
                             .map(str::to_string)
                     })
                     .unwrap_or_else(|| String::from_utf8_lossy(&resp.body).to_string());
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": msg,
-                        "code": code,
-                        "tx_id": tx_id,
-                    })),
-                ));
+                return Err(tx_json_err(StatusCode::BAD_REQUEST, code, &tx_id, msg));
             }
             Ok(resp) => {
                 sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                abort_local_tx(&state, &tx_id).await;
                 let err_msg = String::from_utf8_lossy(&resp.body).to_string();
                 return Err((
                     resp.status,
@@ -4825,27 +4762,23 @@ pub async fn activate(
                     })),
                 ));
             }
-            Err(SimTransportError::ConnectOrIo(e)) => {
+            Err(err) => {
                 sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
+                abort_local_tx(&state, &tx_id).await;
+                let (status, msg) = match err {
+                    SimTransportError::ConnectOrIo(e) => (
+                        StatusCode::BAD_GATEWAY,
+                        format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
+                    ),
+                    SimTransportError::Timeout => (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!("Timeout during rebot-sim prepare at {sim_url}"),
+                    ),
+                };
                 return Err((
-                    StatusCode::BAD_GATEWAY,
+                    status,
                     Json(serde_json::json!({
-                        "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
-                        "sim_url": sim_url,
-                        "tx_id": tx_id,
-                    })),
-                ));
-            }
-            Err(SimTransportError::Timeout) => {
-                sim_best_effort_abort(&upstream, &tx_id, state.sim_timeouts.abort).await;
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = ActivationTxState::Aborted { tx_id: tx_id.clone() };
-                return Err((
-                    StatusCode::GATEWAY_TIMEOUT,
-                    Json(serde_json::json!({
-                        "error": format!("Timeout during rebot-sim prepare at {sim_url}"),
+                        "error": msg,
                         "sim_url": sim_url,
                         "tx_id": tx_id,
                     })),
@@ -4869,23 +4802,22 @@ pub async fn activate(
     )
     .await;
 
-    Ok(Json(serde_json::json!({
-        "mode": mode,
-        "robot": running_robot,
-        "active_scene": scene_id,
-        "active_tool": tool_id,
-        "active_policy": policy_id,
-        "auto_start_policy": final_auto_start,
-        "seed": final_seed,
-        "reset_seq": final_reset_seq,
-        "io_seq": final_io_seq,
-        "tx_id": tx_id,
-        "activation_state": "COMMITTED",
-        "scene_digest": scene_digest,
-        "tool_digest": tool_digest,
-        "scene_manifest": scene_manifest,
-        "tool_manifest": tool_manifest,
-    })))
+    Ok(activate_committed_response(
+        &mode,
+        &running_robot,
+        &scene_id,
+        &tool_id,
+        &policy_id,
+        final_auto_start,
+        final_seed,
+        final_reset_seq,
+        final_io_seq,
+        &tx_id,
+        &scene_digest,
+        &tool_digest,
+        &scene_manifest,
+        &tool_manifest,
+    ))
 }
 
 /// POST /api/v1/sandbox/recover-split
@@ -4898,12 +4830,10 @@ pub async fn recover_split(
         "replay_camera" => "camera_only",
         "rollback_physics" => "rollback_physics",
         other => {
-            return Err((
+            return Err(code_json_err(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("Invalid recovery action '{other}'; expected 'replay_camera' or 'rollback_physics'"),
-                    "code": "INVALID_ACTION",
-                })),
+                "INVALID_ACTION",
+                format!("Invalid recovery action '{other}'; expected 'replay_camera' or 'rollback_physics'"),
             ));
         }
     };
@@ -4980,51 +4910,34 @@ pub async fn recover_split(
             )
             .await
             .map_err(|_| {
-                (
+                code_json_err(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("Cannot query rebot-sim /sim/state at {sim_url}"),
-                        "code": "SIM_STATE_UNAVAILABLE",
-                    })),
+                    "SIM_STATE_UNAVAILABLE",
+                    format!("Cannot query rebot-sim /sim/state at {sim_url}"),
                 )
             })?;
             if !sresp.status.is_success() {
-                return Err((
+                return Err(code_json_err(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "Sandbox is not in DEGRADED_SPLIT state",
-                        "code": "NOT_DEGRADED",
-                    })),
+                    "NOT_DEGRADED",
+                    "Sandbox is not in DEGRADED_SPLIT state",
                 ));
             }
             let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body)
                 .unwrap_or(serde_json::Value::Null);
-            let remote_state = sim_val
-                .get("activation_state")
-                .or_else(|| sim_val.get("state"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let remote_tx = sim_val
-                .get("tx_id")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
+            let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
             if !remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
-                return Err((
+                return Err(code_json_err(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "Sandbox is not in DEGRADED_SPLIT state",
-                        "code": "NOT_DEGRADED",
-                    })),
+                    "NOT_DEGRADED",
+                    "Sandbox is not in DEGRADED_SPLIT state",
                 ));
             }
             let adopted_tx = remote_tx.ok_or_else(|| {
-                (
+                code_json_err(
                     StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": "Remote /sim/state reports DEGRADED_SPLIT without tx_id",
-                        "code": "SIM_STATE_INVALID",
-                    })),
+                    "SIM_STATE_INVALID",
+                    "Remote /sim/state reports DEGRADED_SPLIT without tx_id",
                 )
             })?;
             let prev_active = state.active.read().await.clone();
@@ -5091,12 +5004,10 @@ pub async fn recover_split(
             )
         }
         _ => {
-            return Err((
+            return Err(code_json_err(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "Sandbox is not in DEGRADED_SPLIT state",
-                    "code": "NOT_DEGRADED",
-                })),
+                "NOT_DEGRADED",
+                "Sandbox is not in DEGRADED_SPLIT state",
             ));
         }
     };
@@ -5356,68 +5267,12 @@ fn inject_tx_state_fields(obj: &mut serde_json::Value, tx_state: &ActivationTxSt
     }
 }
 
-/// GET /api/v1/sandbox/state
-pub async fn get_state(
-    Extension(state): Extension<Arc<SandboxState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let current = state.active.read().await.clone();
-    let tx_state = state.tx_state.read().await.clone();
-
-    if current.mode == "sim" {
-        let sim_url = sim_upstream_url().unwrap_or_default();
-        if let Ok(upstream) = DetectorUpstream::parse(&sim_url) {
-            let req_fut = proxy::upstream_request(&upstream, Method::GET, "/sim/state", None);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
-                Ok(Ok(resp)) => {
-                    if resp.status.is_success() {
-                        if let Ok(sim_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
-                            let mut out = serde_json::json!({
-                                "mode": current.mode,
-                                "active_scene": current.active_scene,
-                                "active_tool": current.active_tool,
-                                "active_policy": current.active_policy,
-                                "seed": current.seed,
-                                "reset_seq": current.reset_seq,
-                                "io_seq": current.io_seq,
-                                "desired_io": current.desired_io,
-                                "sim_reachable": true,
-                                "sim_state": sim_val,
-                                "telemetry": current.telemetry,
-                                "updated_at_ms": current.updated_at_ms,
-                            });
-                            inject_tx_state_fields(&mut out, &tx_state);
-                            return Ok(Json(out));
-                        }
-                    }
-                }
-                Ok(Err(_)) => {
-                    // Fallback to unreachable below
-                }
-                Err(_elapsed) => {
-                    return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
-                        "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
-                        "sim_url": sim_url,
-                    }))));
-                }
-            }
-        }
-        let mut out = serde_json::json!({
-            "mode": current.mode,
-            "active_scene": current.active_scene,
-            "active_tool": current.active_tool,
-            "active_policy": current.active_policy,
-            "seed": current.seed,
-            "reset_seq": current.reset_seq,
-            "io_seq": current.io_seq,
-            "desired_io": current.desired_io,
-            "sim_reachable": false,
-            "telemetry": current.telemetry,
-            "updated_at_ms": current.updated_at_ms,
-        });
-        inject_tx_state_fields(&mut out, &tx_state);
-        return Ok(Json(out));
-    }
-
+fn build_state_response(
+    current: &ActiveState,
+    tx_state: &ActivationTxState,
+    sim_reachable: Option<bool>,
+    sim_state: Option<serde_json::Value>,
+) -> Json<serde_json::Value> {
     let mut out = serde_json::json!({
         "mode": current.mode,
         "active_scene": current.active_scene,
@@ -5430,8 +5285,46 @@ pub async fn get_state(
         "telemetry": current.telemetry,
         "updated_at_ms": current.updated_at_ms,
     });
-    inject_tx_state_fields(&mut out, &tx_state);
-    Ok(Json(out))
+    if let Some(reachable) = sim_reachable {
+        out["sim_reachable"] = serde_json::json!(reachable);
+    }
+    if let Some(sv) = sim_state {
+        out["sim_state"] = sv;
+    }
+    inject_tx_state_fields(&mut out, tx_state);
+    Json(out)
+}
+
+/// GET /api/v1/sandbox/state
+pub async fn get_state(
+    Extension(state): Extension<Arc<SandboxState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let current = state.active.read().await.clone();
+    let tx_state = state.tx_state.read().await.clone();
+
+    if current.mode != "sim" {
+        return Ok(build_state_response(&current, &tx_state, None, None));
+    }
+
+    let sim_url = sim_upstream_url().unwrap_or_default();
+    if let Ok(upstream) = DetectorUpstream::parse(&sim_url) {
+        let req_fut = proxy::upstream_request(&upstream, Method::GET, "/sim/state", None);
+        match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
+            Ok(Ok(resp)) if resp.status.is_success() => {
+                if let Ok(sim_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
+                    return Ok(build_state_response(&current, &tx_state, Some(true), Some(sim_val)));
+                }
+            }
+            Ok(_) => {}
+            Err(_elapsed) => {
+                return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
+                    "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
+                    "sim_url": sim_url,
+                }))));
+            }
+        }
+    }
+    Ok(build_state_response(&current, &tx_state, Some(false), None))
 }
 
 #[derive(Debug, Deserialize)]

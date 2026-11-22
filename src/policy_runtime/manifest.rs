@@ -706,6 +706,42 @@ fn parse_detector_vision_spec(
     })
 }
 
+fn parse_positive_usize(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<usize, PolicyError> {
+    let raw = obj
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|&v| v >= 1)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest(format!("vision.{field} must be an integer >= 1"))
+        })?;
+    usize::try_from(raw)
+        .map_err(|_| PolicyError::InvalidManifest(format!("vision.{field} exceeds platform usize")))
+}
+
+fn parse_bounded_u64(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+    max: u64,
+) -> Result<u64, PolicyError> {
+    let val = obj
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest(format!(
+                "vision.{field} must be an integer in 1..={max}"
+            ))
+        })?;
+    if !(1..=max).contains(&val) {
+        return Err(PolicyError::InvalidManifest(format!(
+            "vision.{field} must be in 1..={max}, got {val}"
+        )));
+    }
+    Ok(val)
+}
+
 fn parse_video_embedding_spec(
     obj: &serde_json::Map<String, Value>,
     state_dim: usize,
@@ -717,27 +753,8 @@ fn parse_video_embedding_spec(
         )));
     }
 
-    let embedding_dim_u64 = obj
-        .get("embedding_dim")
-        .and_then(Value::as_u64)
-        .filter(|&d| d >= 1)
-        .ok_or_else(|| {
-            PolicyError::InvalidManifest("vision.embedding_dim must be an integer >= 1".into())
-        })?;
-    let embedding_dim = usize::try_from(embedding_dim_u64).map_err(|_| {
-        PolicyError::InvalidManifest("vision.embedding_dim exceeds platform usize".into())
-    })?;
-
-    let history_len_u64 = obj
-        .get("history_len")
-        .and_then(Value::as_u64)
-        .filter(|&t| t >= 1)
-        .ok_or_else(|| {
-            PolicyError::InvalidManifest("vision.history_len must be an integer >= 1".into())
-        })?;
-    let history_len = usize::try_from(history_len_u64).map_err(|_| {
-        PolicyError::InvalidManifest("vision.history_len exceeds platform usize".into())
-    })?;
+    let embedding_dim = parse_positive_usize(obj, "embedding_dim")?;
+    let history_len = parse_positive_usize(obj, "history_len")?;
 
     let vision_width = embedding_dim.checked_mul(history_len).ok_or_else(|| {
         PolicyError::InvalidManifest(format!(
@@ -753,33 +770,8 @@ fn parse_video_embedding_spec(
         )));
     }
 
-    let max_staleness_ms = obj
-        .get("max_staleness_ms")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            PolicyError::InvalidManifest(format!(
-                "vision.max_staleness_ms must be an integer in 1..={MAX_VISION_STALENESS_MS}"
-            ))
-        })?;
-    if !(1..=MAX_VISION_STALENESS_MS).contains(&max_staleness_ms) {
-        return Err(PolicyError::InvalidManifest(format!(
-            "vision.max_staleness_ms must be in 1..={MAX_VISION_STALENESS_MS}, got {max_staleness_ms}"
-        )));
-    }
-
-    let max_window_span_ms = obj
-        .get("max_window_span_ms")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            PolicyError::InvalidManifest(format!(
-                "vision.max_window_span_ms must be an integer in 1..={MAX_VIDEO_WINDOW_SPAN_MS}"
-            ))
-        })?;
-    if !(1..=MAX_VIDEO_WINDOW_SPAN_MS).contains(&max_window_span_ms) {
-        return Err(PolicyError::InvalidManifest(format!(
-            "vision.max_window_span_ms must be in 1..={MAX_VIDEO_WINDOW_SPAN_MS}, got {max_window_span_ms}"
-        )));
-    }
+    let max_staleness_ms = parse_bounded_u64(obj, "max_staleness_ms", MAX_VISION_STALENESS_MS)?;
+    let max_window_span_ms = parse_bounded_u64(obj, "max_window_span_ms", MAX_VIDEO_WINDOW_SPAN_MS)?;
     if history_len > 1 && max_window_span_ms < max_staleness_ms {
         return Err(PolicyError::InvalidManifest(format!(
             "vision.max_window_span_ms ({max_window_span_ms}) must be >= vision.max_staleness_ms ({max_staleness_ms}) when history_len ({history_len}) > 1"

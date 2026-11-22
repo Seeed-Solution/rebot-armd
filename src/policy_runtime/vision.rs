@@ -955,26 +955,18 @@ impl VideoEmbeddingHub {
                 ),
             });
         }
-        if let Some(ref bound) = inner.bound {
-            if req.embedding.len() != bound.spec.embedding_dim {
+        let expected_dim = inner
+            .bound
+            .as_ref()
+            .map(|b| b.spec.embedding_dim)
+            .or_else(|| inner.frames.front().map(|f| f.embedding.len()));
+        if let Some(exp) = expected_dim {
+            if req.embedding.len() != exp {
                 return Err(EmbeddingIngestError {
                     status: 400,
                     code: "EMBEDDING_DIM_MISMATCH",
                     message: format!(
-                        "expected embedding length {}, got {}",
-                        bound.spec.embedding_dim,
-                        req.embedding.len()
-                    ),
-                });
-            }
-        } else if let Some(first) = inner.frames.front() {
-            if req.embedding.len() != first.embedding.len() {
-                return Err(EmbeddingIngestError {
-                    status: 400,
-                    code: "EMBEDDING_DIM_MISMATCH",
-                    message: format!(
-                        "expected embedding length {}, got {}",
-                        first.embedding.len(),
+                        "expected embedding length {exp}, got {}",
                         req.embedding.len()
                     ),
                 });
@@ -1279,27 +1271,23 @@ pub fn extract_embedding_window_features(
                 frame.frame_id
             ));
         }
-        if let Some(ref norm) = spec.embedding_norm {
-            for i in 0..d {
-                let v = (frame.embedding[i] - norm.mean[i]) / norm.std[i];
-                if !v.is_finite() {
-                    return Err(format!(
-                        "normalized embedding[{i}] on frame {} is non-finite",
-                        frame.frame_id
-                    ));
-                }
-                out.push(v);
+        for (i, &raw) in frame.embedding.iter().enumerate() {
+            let v = match spec.embedding_norm {
+                Some(ref norm) => (raw - norm.mean[i]) / norm.std[i],
+                None => raw,
+            };
+            if !v.is_finite() {
+                let prefix = if spec.embedding_norm.is_some() {
+                    "normalized "
+                } else {
+                    ""
+                };
+                return Err(format!(
+                    "{prefix}embedding[{i}] on frame {} is non-finite",
+                    frame.frame_id
+                ));
             }
-        } else {
-            for (i, &v) in frame.embedding.iter().enumerate() {
-                if !v.is_finite() {
-                    return Err(format!(
-                        "embedding[{i}] on frame {} is non-finite",
-                        frame.frame_id
-                    ));
-                }
-                out.push(v);
-            }
+            out.push(v);
         }
     }
     Ok(out)

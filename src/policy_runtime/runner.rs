@@ -1249,13 +1249,9 @@ pub fn spawn_policy_runner(
             // acquiring the synchronous hub commit lock (consistent lock order, no `.await`
             // while holding `HubCommitGuard`).
             let active_gate = inner.active_policy_release_gate(action_id).cloned();
-            let sandbox_scene_tool = if active_gate.is_some() {
-                match sandbox.as_ref() {
-                    Some(s) => Some(s.active_scene_and_tool().await),
-                    None => None,
-                }
-            } else {
-                None
+            let sandbox_scene_tool = match (active_gate.is_some(), sandbox.as_ref()) {
+                (true, Some(s)) => Some(s.active_scene_and_tool().await),
+                _ => None,
             };
 
             // Synchronous target-commit checks under the supervisor write lock.
@@ -1263,7 +1259,7 @@ pub fn spawn_policy_runner(
             inner.record_policy_step_timing(action_id, infer_us, step_us);
 
             let detector_post_vision_age_ms = if video_embedding_spec.is_none() {
-                if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
+                let post_age = if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
                     let age_ms = Instant::now()
                         .saturating_duration_since(vis_cap)
                         .as_millis()
@@ -1290,11 +1286,7 @@ pub fn spawn_policy_runner(
                     Some(age_ms)
                 } else {
                     None
-                }
-            } else {
-                None
-            };
-            if video_embedding_spec.is_none() {
+                };
                 if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
                     if spec.require_model_generation {
                         if let Some(latest_frame) = col.latest() {
@@ -1322,7 +1314,10 @@ pub fn spawn_policy_runner(
                         }
                     }
                 }
-            }
+                post_age
+            } else {
+                None
+            };
             if let Some(gate) = active_gate {
                 if let Some(ref emb) = video_embedding_spec {
                     if let Err(msg) = verify_embedding_release_gate(&gate, emb) {

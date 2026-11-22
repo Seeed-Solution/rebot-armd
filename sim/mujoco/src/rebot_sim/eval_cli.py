@@ -63,6 +63,19 @@ def _validate_non_negative_float(name: str, val: Any) -> float:
     return out
 
 
+def _validate_int_bound(name: str, val: Any, *, min_val: int) -> int:
+    if isinstance(val, bool) or not isinstance(val, int) or val < min_val:
+        kind = "positive" if min_val == 1 else f">= {min_val}"
+        raise ValueError(f"{name} must be a {kind} int, got {val!r}")
+    return val
+
+
+def _validate_bool_field(name: str, val: Any) -> bool:
+    if not isinstance(val, bool):
+        raise ValueError(f"{name} must be a bool, got {type(val).__name__}")
+    return val
+
+
 class _TrackedObs(dict):
     """Observation dict that records whether visual/camera fields were read by a policy."""
 
@@ -107,54 +120,26 @@ class SimEvalConfig:
     output: str | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.seeds, bool) or not isinstance(self.seeds, int) or self.seeds <= 0:
-            raise ValueError(f"seeds must be a positive int, got {self.seeds!r}")
-        if (
-            isinstance(self.start_seed, bool)
-            or not isinstance(self.start_seed, int)
-            or self.start_seed < 0
-        ):
-            raise ValueError(f"start_seed must be a non-negative int, got {self.start_seed!r}")
+        _validate_int_bound("seeds", self.seeds, min_val=1)
+        _validate_int_bound("start_seed", self.start_seed, min_val=0)
         norm_robot = normalize_robot_id(self.robot)
         if norm_robot not in ("b601dm", "so-arm101"):
             raise ValueError(f"robot must be 'b601dm' or 'so-arm101', got {self.robot!r}")
         object.__setattr__(self, "robot", norm_robot)
-        if not isinstance(self.dr_lighting, bool):
-            raise ValueError(f"dr_lighting must be a bool, got {type(self.dr_lighting).__name__}")
-        object.__setattr__(
-            self,
-            "dr_camera_jitter_m",
-            _validate_non_negative_float("dr_camera_jitter_m", self.dr_camera_jitter_m),
-        )
-        object.__setattr__(
-            self,
-            "dr_camera_jitter_deg",
-            _validate_non_negative_float("dr_camera_jitter_deg", self.dr_camera_jitter_deg),
-        )
-        object.__setattr__(
-            self,
-            "torque_noise_std",
-            _validate_non_negative_float("torque_noise_std", self.torque_noise_std),
-        )
+        _validate_bool_field("dr_lighting", self.dr_lighting)
+        for fname in ("dr_camera_jitter_m", "dr_camera_jitter_deg", "torque_noise_std"):
+            object.__setattr__(self, fname, _validate_non_negative_float(fname, getattr(self, fname)))
         if not _is_real_scalar(self.torque_noise_bias) or not math.isfinite(float(self.torque_noise_bias)):
             raise ValueError(f"torque_noise_bias must be finite, got {self.torque_noise_bias!r}")
         object.__setattr__(self, "torque_noise_bias", float(self.torque_noise_bias))
-        if (
-            isinstance(self.max_steps, bool)
-            or not isinstance(self.max_steps, int)
-            or self.max_steps <= 0
-        ):
-            raise ValueError(f"max_steps must be a positive int, got {self.max_steps!r}")
+        _validate_int_bound("max_steps", self.max_steps, min_val=1)
         cdt = _validate_non_negative_float("control_dt", self.control_dt)
         sdt = _validate_non_negative_float("sim_dt", self.sim_dt)
         if cdt <= 0.0 or sdt <= 0.0:
             raise ValueError("control_dt and sim_dt must be > 0.0")
         object.__setattr__(self, "control_dt", cdt)
         object.__setattr__(self, "sim_dt", sdt)
-        if not isinstance(self.self_collision, bool):
-            raise ValueError(
-                f"self_collision must be a bool, got {type(self.self_collision).__name__}"
-            )
+        _validate_bool_field("self_collision", self.self_collision)
         if self.fail_on_self_collision is None:
             object.__setattr__(self, "fail_on_self_collision", self.self_collision)
         elif not isinstance(self.fail_on_self_collision, bool):
@@ -163,18 +148,8 @@ class SimEvalConfig:
             )
         elif not self.self_collision and self.fail_on_self_collision:
             raise ValueError("fail_on_self_collision=True requires self_collision=True")
-        if (
-            isinstance(self.render_width, bool)
-            or not isinstance(self.render_width, int)
-            or self.render_width <= 0
-        ):
-            raise ValueError(f"render_width must be a positive int, got {self.render_width!r}")
-        if (
-            isinstance(self.render_height, bool)
-            or not isinstance(self.render_height, int)
-            or self.render_height <= 0
-        ):
-            raise ValueError(f"render_height must be a positive int, got {self.render_height!r}")
+        _validate_int_bound("render_width", self.render_width, min_val=1)
+        _validate_int_bound("render_height", self.render_height, min_val=1)
         if self.output is not None:
             object.__setattr__(self, "output", str(self.output))
 

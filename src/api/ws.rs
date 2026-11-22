@@ -676,11 +676,7 @@ impl WsAuth {
         s.token = token;
         let status = s.auth.status(s.token.as_deref());
         if s.explicit_auth {
-            s.explicit_authed = if s.auth.is_enforced() {
-                status.role == crate::auth::Role::Operator
-            } else {
-                true
-            };
+            s.explicit_authed = !s.auth.is_enforced() || status.role == crate::auth::Role::Operator;
         }
         status
     }

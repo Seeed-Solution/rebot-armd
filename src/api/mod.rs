@@ -402,56 +402,48 @@ async fn same_origin(
 }
 
 #[cfg(feature = "policy-runtime")]
+fn is_non_loopback_forwarded_addr(raw: &str) -> bool {
+    let ip_str = raw
+        .strip_prefix('[')
+        .and_then(|s| s.split(']').next())
+        .unwrap_or_else(|| {
+            if raw.matches(':').count() == 1 {
+                raw.split(':').next().unwrap_or(raw)
+            } else {
+                raw
+            }
+        });
+    !ip_str
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+#[cfg(feature = "policy-runtime")]
 fn header_forwarded_non_loopback(headers: &axum::http::HeaderMap) -> bool {
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        for part in xff.split(',') {
-            let trimmed = part.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let ip_str = trimmed
-                .strip_prefix('[')
-                .and_then(|s| s.split(']').next())
-                .unwrap_or_else(|| {
-                    if trimmed.matches(':').count() == 1 {
-                        trimmed.split(':').next().unwrap_or(trimmed)
-                    } else {
-                        trimmed
-                    }
-                });
-            if !ip_str
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-            {
-                return true;
-            }
+        if xff
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(is_non_loopback_forwarded_addr)
+        {
+            return true;
         }
     }
-    if let Some(fwd) = headers.get(axum::http::header::FORWARDED).and_then(|v| v.to_str().ok()) {
-        for elem in fwd.split(',') {
-            for dir in elem.split(';') {
-                if let Some((k, v)) = dir.trim().split_once('=') {
-                    if k.trim().eq_ignore_ascii_case("for") {
-                        let raw = v.trim().trim_matches('"');
-                        let ip_str = raw
-                            .strip_prefix('[')
-                            .and_then(|s| s.split(']').next())
-                            .unwrap_or_else(|| {
-                                if raw.matches(':').count() == 1 {
-                                    raw.split(':').next().unwrap_or(raw)
-                                } else {
-                                    raw
-                                }
-                            });
-                        if !ip_str
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback())
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
+    let Some(fwd) = headers
+        .get(axum::http::header::FORWARDED)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    for dir in fwd.split(',').flat_map(|elem| elem.split(';')) {
+        let Some((k, v)) = dir.trim().split_once('=') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("for")
+            && is_non_loopback_forwarded_addr(v.trim().trim_matches('"'))
+        {
+            return true;
         }
     }
     false
@@ -507,6 +499,12 @@ where
 }
 
 #[cfg(feature = "policy-runtime")]
+fn embedding_err_to_api(e: crate::policy_runtime::vision::EmbeddingIngestError) -> rest::ApiError {
+    let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
+    rest::ApiError(status, e.message, e.code.to_string())
+}
+
+#[cfg(feature = "policy-runtime")]
 async fn post_vision_clock_handshake(
     axum::Extension(hub): axum::Extension<
         Arc<crate::policy_runtime::vision::VideoEmbeddingHub>,
@@ -521,10 +519,7 @@ async fn post_vision_clock_handshake(
     let socket_same_host = infer_same_host(peer_addr, &headers);
     hub.clock_handshake(req, socket_same_host)
         .map(axum::Json)
-        .map_err(|e| {
-            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
-            rest::ApiError(status, e.message, e.code.to_string())
-        })
+        .map_err(embedding_err_to_api)
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -539,8 +534,5 @@ async fn post_vision_embedding(
 > {
     hub.ingest_embedding(req)
         .map(axum::Json)
-        .map_err(|e| {
-            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
-            rest::ApiError(status, e.message, e.code.to_string())
-        })
+        .map_err(embedding_err_to_api)
 }

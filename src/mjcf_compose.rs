@@ -377,6 +377,41 @@ fn parse_finite_f32(tok: &str, ctx: &str) -> Result<f32, PackValidationError> {
     Ok(v)
 }
 
+fn parse_exact_floats<'a>(
+    parts: impl Iterator<Item = &'a str>,
+    min_count: usize,
+    max_count: usize,
+    path: &str,
+    err_msg: impl FnOnce() -> String,
+) -> Result<(), PackValidationError> {
+    let mut count = 0usize;
+    for tok in parts {
+        count += 1;
+        if count > max_count {
+            return Err(PackValidationError::InvalidPack(err_msg()));
+        }
+        parse_finite_f32(tok, path)?;
+    }
+    if count < min_count {
+        return Err(PackValidationError::InvalidPack(err_msg()));
+    }
+    Ok(())
+}
+
+fn check_mesh_budgets(mesh_count: usize, total_vertices: usize) -> Result<(), PackValidationError> {
+    if mesh_count > MAX_MESH_FILES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
+        )));
+    }
+    if total_vertices > MAX_TOTAL_MESH_VERTICES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "Total mesh vertices ({total_vertices}) exceed budget of {MAX_TOTAL_MESH_VERTICES}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_ascii_stl(path: &str, text: &str) -> Result<usize, PackValidationError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum AsciiStlState {
@@ -413,15 +448,9 @@ fn validate_ascii_stl(path: &str, text: &str) -> Result<usize, PackValidationErr
                         "ASCII STL '{path}': expected 'facet normal'"
                     )));
                 }
-                let coords: Vec<&str> = parts.collect();
-                if coords.len() != 3 {
-                    return Err(PackValidationError::InvalidPack(format!(
-                        "ASCII STL '{path}': 'facet normal' requires 3 floats"
-                    )));
-                }
-                for c in coords {
-                    parse_finite_f32(c, path)?;
-                }
+                parse_exact_floats(parts, 3, 3, path, || {
+                    format!("ASCII STL '{path}': 'facet normal' requires 3 floats")
+                })?;
                 state = AsciiStlState::InFacet;
             }
             (AsciiStlState::InFacet, "outer") => {
@@ -438,15 +467,9 @@ fn validate_ascii_stl(path: &str, text: &str) -> Result<usize, PackValidationErr
                         "ASCII STL '{path}': facet loop has more than 3 vertices"
                     )));
                 }
-                let coords: Vec<&str> = parts.collect();
-                if coords.len() != 3 {
-                    return Err(PackValidationError::InvalidPack(format!(
-                        "ASCII STL '{path}': 'vertex' requires 3 floats"
-                    )));
-                }
-                for c in coords {
-                    parse_finite_f32(c, path)?;
-                }
+                parse_exact_floats(parts, 3, 3, path, || {
+                    format!("ASCII STL '{path}': 'vertex' requires 3 floats")
+                })?;
                 vertex_count += 1;
                 if vertex_count > MAX_TOTAL_MESH_VERTICES {
                     return Err(PackValidationError::InvalidPack(format!(
@@ -646,15 +669,9 @@ pub fn validate_obj_bytes(path: &str, bytes: &[u8]) -> Result<usize, PackValidat
                 )));
             }
             "v" => {
-                let coords: Vec<&str> = parts.collect();
-                if coords.len() != 3 && coords.len() != 4 {
-                    return Err(PackValidationError::InvalidPack(format!(
-                        "OBJ '{path}' line {line_no}: 'v' requires 3 or 4 floats"
-                    )));
-                }
-                for c in coords {
-                    parse_finite_f32(c, path)?;
-                }
+                parse_exact_floats(parts, 3, 4, path, || {
+                    format!("OBJ '{path}' line {line_no}: 'v' requires 3 or 4 floats")
+                })?;
                 vertex_count += 1;
                 if vertex_count > MAX_TOTAL_MESH_VERTICES {
                     return Err(PackValidationError::InvalidPack(format!(
@@ -663,38 +680,27 @@ pub fn validate_obj_bytes(path: &str, bytes: &[u8]) -> Result<usize, PackValidat
                 }
             }
             "vn" => {
-                let coords: Vec<&str> = parts.collect();
-                if coords.len() != 3 {
-                    return Err(PackValidationError::InvalidPack(format!(
-                        "OBJ '{path}' line {line_no}: 'vn' requires 3 floats"
-                    )));
-                }
-                for c in coords {
-                    parse_finite_f32(c, path)?;
-                }
+                parse_exact_floats(parts, 3, 3, path, || {
+                    format!("OBJ '{path}' line {line_no}: 'vn' requires 3 floats")
+                })?;
                 vn_count += 1;
             }
             "vt" => {
-                let coords: Vec<&str> = parts.collect();
-                if !(1..=3).contains(&coords.len()) {
-                    return Err(PackValidationError::InvalidPack(format!(
-                        "OBJ '{path}' line {line_no}: 'vt' requires 1..=3 floats"
-                    )));
-                }
-                for c in coords {
-                    parse_finite_f32(c, path)?;
-                }
+                parse_exact_floats(parts, 1, 3, path, || {
+                    format!("OBJ '{path}' line {line_no}: 'vt' requires 1..=3 floats")
+                })?;
                 vt_count += 1;
             }
             "f" => {
-                let verts: Vec<&str> = parts.collect();
-                if verts.len() < 3 {
+                let mut f_count = 0usize;
+                for vtok in parts {
+                    f_count += 1;
+                    validate_obj_face_vertex(vtok, vertex_count, vt_count, vn_count, path, line_no)?;
+                }
+                if f_count < 3 {
                     return Err(PackValidationError::InvalidPack(format!(
                         "OBJ '{path}' line {line_no}: 'f' requires at least 3 vertices"
                     )));
-                }
-                for vtok in verts {
-                    validate_obj_face_vertex(vtok, vertex_count, vt_count, vn_count, path, line_no)?;
                 }
             }
             "g" | "o" | "s" | "usemtl" => {}
@@ -780,17 +786,8 @@ pub fn validate_pack_map(
             let req = if rel == primary_xml_rel { required_elem } else { None };
             let summary = validate_xml_and_collect_summary_for_path(rel, xml_str, req)?;
             mesh_count = mesh_count.saturating_add(summary.inline_mesh_count);
-            if mesh_count > MAX_MESH_FILES {
-                return Err(PackValidationError::InvalidPack(format!(
-                    "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
-                )));
-            }
             total_vertices = total_vertices.saturating_add(summary.inline_vertex_count);
-            if total_vertices > MAX_TOTAL_MESH_VERTICES {
-                return Err(PackValidationError::InvalidPack(format!(
-                    "Total mesh vertices ({total_vertices}) exceed budget of {MAX_TOTAL_MESH_VERTICES}"
-                )));
-            }
+            check_mesh_budgets(mesh_count, total_vertices)?;
             for asset_ref in &summary.refs {
                 if is_urdf_path(&asset_ref.path) {
                     return Err(PackValidationError::UnsupportedFormat(format!(
@@ -815,14 +812,9 @@ pub fn validate_pack_map(
         let lower = rel.to_ascii_lowercase();
         let is_stl = lower.ends_with(".stl");
         let is_obj = lower.ends_with(".obj");
-        let is_referenced_mesh = mesh_refs.contains(rel);
-        if is_stl || is_obj || is_referenced_mesh {
+        if is_stl || is_obj || mesh_refs.contains(rel) {
             mesh_count += 1;
-            if mesh_count > MAX_MESH_FILES {
-                return Err(PackValidationError::InvalidPack(format!(
-                    "Pack exceeds maximum of {MAX_MESH_FILES} mesh files/definitions"
-                )));
-            }
+            check_mesh_budgets(mesh_count, total_vertices)?;
             let verts = if is_stl {
                 validate_stl_bytes(rel, bytes)?
             } else if is_obj {
@@ -833,11 +825,7 @@ pub fn validate_pack_map(
                 )));
             };
             total_vertices = total_vertices.saturating_add(verts);
-            if total_vertices > MAX_TOTAL_MESH_VERTICES {
-                return Err(PackValidationError::InvalidPack(format!(
-                    "Total mesh vertices ({total_vertices}) exceed budget of {MAX_TOTAL_MESH_VERTICES}"
-                )));
-            }
+            check_mesh_budgets(mesh_count, total_vertices)?;
         }
     }
 

@@ -288,7 +288,7 @@ def _validate_ascii_stl(data: bytes, label: str, vertex_budget_used: int) -> int
     return verts
 
 
-def _validate_stl_file(path: Path, label: str, vertex_budget_used: int) -> int:
+def _read_mesh_bytes(path: Path, label: str) -> bytes:
     try:
         size = path.stat().st_size
     except OSError as exc:
@@ -298,7 +298,11 @@ def _validate_stl_file(path: Path, label: str, vertex_budget_used: int) -> int:
             f"Mesh {label} size {size} exceeds {MAX_SINGLE_MESH_BYTES} bytes",
             code="PACK_TOO_LARGE",
         )
-    data = path.read_bytes()
+    return path.read_bytes()
+
+
+def _validate_stl_file(path: Path, label: str, vertex_budget_used: int) -> int:
+    data = _read_mesh_bytes(path, label)
     # Distinguish binary vs ASCII STL: check exact binary STL length BEFORE startswith(b"solid")
     if len(data) >= 84:
         tri_count = struct.unpack_from("<I", data, 80)[0]
@@ -315,17 +319,25 @@ def _validate_stl_file(path: Path, label: str, vertex_budget_used: int) -> int:
     return _validate_binary_stl(data, label, vertex_budget_used)
 
 
-def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        raise PackValidationError(f"Cannot stat mesh {label}: {exc}", code="INVALID_PACK") from None
-    if size > MAX_SINGLE_MESH_BYTES:
+_OBJ_VEC_SPECS: dict[str, tuple[str, tuple[int, ...]]] = {
+    "v": ("vertex", (4, 5)),
+    "vn": ("normal", (4,)),
+    "vt": ("texcoord", (2, 3, 4)),
+}
+
+
+def _check_obj_index(
+    raw_idx: int, total_count: int, cur_count: int, kind: str, label: str
+) -> None:
+    if (raw_idx > 0 and raw_idx > total_count) or (raw_idx < 0 and -raw_idx > cur_count):
         raise PackValidationError(
-            f"Mesh {label} size {size} exceeds {MAX_SINGLE_MESH_BYTES} bytes",
-            code="PACK_TOO_LARGE",
+            f"Out-of-bounds {kind} index {raw_idx} in OBJ {label}",
+            code="INVALID_PACK",
         )
-    raw = path.read_bytes()
+
+
+def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
+    raw = _read_mesh_bytes(path, label)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -335,7 +347,7 @@ def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
     verts = 0
     vt_count = 0
     vn_count = 0
-    faces: list[tuple[int, list[str]]] = []
+    faces: list[tuple[int, int, int, list[str]]] = []
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -351,20 +363,11 @@ def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
                 f"Forbidden directive {directive!r} in OBJ {label}",
                 code="INVALID_PACK",
             )
-        if directive in {"v", "vn", "vt"}:
-            if directive == "v" and len(parts) not in (4, 5):
+        if directive in _OBJ_VEC_SPECS:
+            kind_name, valid_lens = _OBJ_VEC_SPECS[directive]
+            if len(parts) not in valid_lens:
                 raise PackValidationError(
-                    f"Invalid vertex line in OBJ {label}: {stripped!r}",
-                    code="INVALID_PACK",
-                )
-            if directive == "vn" and len(parts) != 4:
-                raise PackValidationError(
-                    f"Invalid normal line in OBJ {label}: {stripped!r}",
-                    code="INVALID_PACK",
-                )
-            if directive == "vt" and len(parts) not in (2, 3, 4):
-                raise PackValidationError(
-                    f"Invalid texcoord line in OBJ {label}: {stripped!r}",
+                    f"Invalid {kind_name} line in OBJ {label}: {stripped!r}",
                     code="INVALID_PACK",
                 )
             try:
@@ -388,7 +391,7 @@ def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
                     )
             elif directive == "vt":
                 vt_count += 1
-            elif directive == "vn":
+            else:
                 vn_count += 1
         elif directive == "f":
             if len(parts) < 4:
@@ -404,44 +407,30 @@ def _validate_obj_file(path: Path, label: str, vertex_budget_used: int) -> int:
                         code="INVALID_PACK",
                     )
                 for p in idx_parts:
-                    if p:
-                        try:
-                            val = int(p)
-                        except ValueError:
-                            raise PackValidationError(
-                                f"Invalid face index {tok!r} in OBJ {label}",
-                                code="INVALID_PACK",
-                            ) from None
-                        if val == 0:
-                            raise PackValidationError(
-                                f"Zero face index {tok!r} in OBJ {label}",
-                                code="INVALID_PACK",
-                            )
-            faces.append((verts, vt_count, vn_count, parts[1:]))  # type: ignore[arg-type]
+                    if not p:
+                        continue
+                    try:
+                        val = int(p)
+                    except ValueError:
+                        raise PackValidationError(
+                            f"Invalid face index {tok!r} in OBJ {label}",
+                            code="INVALID_PACK",
+                        ) from None
+                    if val == 0:
+                        raise PackValidationError(
+                            f"Zero face index {tok!r} in OBJ {label}",
+                            code="INVALID_PACK",
+                        )
+            faces.append((verts, vt_count, vn_count, parts[1:]))
 
-    for cur_v, cur_vt, cur_vn, ftoks in faces:  # type: ignore[misc]
+    for cur_v, cur_vt, cur_vn, ftoks in faces:
         for tok in ftoks:
             idx_parts = tok.split("/")
-            v_idx = int(idx_parts[0])
-            if (v_idx > 0 and v_idx > verts) or (v_idx < 0 and -v_idx > cur_v):
-                raise PackValidationError(
-                    f"Out-of-bounds vertex index {v_idx} in OBJ {label}",
-                    code="INVALID_PACK",
-                )
+            _check_obj_index(int(idx_parts[0]), verts, cur_v, "vertex", label)
             if len(idx_parts) >= 2 and idx_parts[1]:
-                vt_idx = int(idx_parts[1])
-                if (vt_idx > 0 and vt_idx > vt_count) or (vt_idx < 0 and -vt_idx > cur_vt):
-                    raise PackValidationError(
-                        f"Out-of-bounds texcoord index {vt_idx} in OBJ {label}",
-                        code="INVALID_PACK",
-                    )
+                _check_obj_index(int(idx_parts[1]), vt_count, cur_vt, "texcoord", label)
             if len(idx_parts) == 3 and idx_parts[2]:
-                vn_idx = int(idx_parts[2])
-                if (vn_idx > 0 and vn_idx > vn_count) or (vn_idx < 0 and -vn_idx > cur_vn):
-                    raise PackValidationError(
-                        f"Out-of-bounds normal index {vn_idx} in OBJ {label}",
-                        code="INVALID_PACK",
-                    )
+                _check_obj_index(int(idx_parts[2]), vn_count, cur_vn, "normal", label)
     return verts
 
 
@@ -691,24 +680,14 @@ def validate_xml_file_security(
     return referenced_meshes, inline_mesh_count, verts_added, all_referenced_files
 
 
-def compute_pack_digest(pack_dir: Path | str) -> str:
-    """Compute deterministic SHA-256 hex digest over sorted relative paths and file bytes."""
-    root = Path(pack_dir).resolve()
-    if root.is_file():
-        h = hashlib.sha256()
-        data = root.read_bytes()
-        h.update(root.name.encode("utf-8"))
-        h.update(b"\x00")
-        h.update(len(data).to_bytes(8, "little"))
-        h.update(data)
-        return h.hexdigest()
-
-    files = _walk_pack_files(root, check_urdf=False)
+def _hash_pack_entries(
+    entries: list[tuple[str, Path]], *, max_file_bytes: int | None = None
+) -> str:
     h = hashlib.sha256()
-    for rel, resolved in files:
-        if resolved.stat().st_size > MAX_PACK_TOTAL_BYTES:
+    for rel, resolved in entries:
+        if max_file_bytes is not None and resolved.stat().st_size > max_file_bytes:
             raise PackValidationError(
-                f"File {rel} exceeds max pack size {MAX_PACK_TOTAL_BYTES} bytes",
+                f"File {rel} exceeds max pack size {max_file_bytes} bytes",
                 code="PACK_TOO_LARGE",
             )
         data = resolved.read_bytes()
@@ -717,6 +696,15 @@ def compute_pack_digest(pack_dir: Path | str) -> str:
         h.update(len(data).to_bytes(8, "little"))
         h.update(data)
     return h.hexdigest()
+
+
+def compute_pack_digest(pack_dir: Path | str) -> str:
+    """Compute deterministic SHA-256 hex digest over sorted relative paths and file bytes."""
+    root = Path(pack_dir).resolve()
+    if root.is_file():
+        return _hash_pack_entries([(root.name, root)])
+    files = _walk_pack_files(root, check_urdf=False)
+    return _hash_pack_entries(files, max_file_bytes=MAX_PACK_TOTAL_BYTES)
 
 
 def _compute_standalone_xml_digest(xml_path: Path, ref_files: list[Path]) -> str:
@@ -730,14 +718,7 @@ def _compute_standalone_xml_digest(xml_path: Path, ref_files: list[Path]) -> str
         seen.add(rp)
         entries.append((rp.relative_to(root).as_posix(), rp))
     entries.sort(key=lambda item: item[0])
-    h = hashlib.sha256()
-    for rel, resolved in entries:
-        data = resolved.read_bytes()
-        h.update(rel.encode("utf-8"))
-        h.update(b"\x00")
-        h.update(len(data).to_bytes(8, "little"))
-        h.update(data)
-    return h.hexdigest()
+    return _hash_pack_entries(entries)
 
 
 def _validate_standalone_xml(xml_path: Path) -> str:
@@ -770,6 +751,18 @@ def _validate_standalone_xml(xml_path: Path) -> str:
     return _compute_standalone_xml_digest(xml_path, all_refs)
 
 
+def _extract_manifest_asset(entry: Any) -> tuple[str | None, bool]:
+    if isinstance(entry, str):
+        return entry, True
+    if not isinstance(entry, dict):
+        return None, True
+    required = bool(entry.get("required", True))
+    for k in ("path", "target", "filename"):
+        if isinstance(entry.get(k), str) and entry[k].strip():
+            return entry[k], required
+    return None, required
+
+
 def validate_pack_security(
     pack_dir: Path | str,
     kind: str,
@@ -796,7 +789,8 @@ def validate_pack_security(
             f"Pack path is not a directory: {pack_dir}", code="INVALID_PACK"
         )
 
-    manifest_name = "scene.json" if kind in {"scene", "scenes"} else "tool.json"
+    is_scene = kind in {"scene", "scenes"}
+    manifest_name = "scene.json" if is_scene else "tool.json"
     if manifest is None and (root / manifest_name).is_file():
         manifest_file = _check_contained(root, root / manifest_name, manifest_name)
         if manifest_file.stat().st_size > MAX_MANIFEST_BYTES:
@@ -828,8 +822,7 @@ def validate_pack_security(
     mesh_files: dict[Path, str] = {}
     xml_files: list[Path] = []
     for rel, resolved in walked_files:
-        size = resolved.stat().st_size
-        total_bytes += size
+        total_bytes += resolved.stat().st_size
         if total_bytes > MAX_PACK_TOTAL_BYTES:
             raise PackValidationError(
                 f"Total pack size {total_bytes} exceeds budget {MAX_PACK_TOTAL_BYTES} bytes",
@@ -850,39 +843,29 @@ def validate_pack_security(
     # Validate required manifest assets
     if isinstance(manifest, dict) and isinstance(manifest.get("assets"), list):
         for entry in manifest["assets"]:
-            required = True
-            rel_asset = None
-            if isinstance(entry, str):
-                rel_asset = entry
-            elif isinstance(entry, dict):
-                required = bool(entry.get("required", True))
-                for k in ("path", "target", "filename"):
-                    if isinstance(entry.get(k), str) and entry[k].strip():
-                        rel_asset = entry[k]
-                        break
-            if rel_asset is not None:
-                if _is_unsafe_rel_path(rel_asset):
-                    raise PackValidationError(
-                        f"Unsafe asset path {rel_asset!r} in {manifest_name}",
-                        code="PATH_ESCAPE",
-                    )
-                if required:
-                    resolved_asset = _check_contained(
-                        root, root / rel_asset.strip(), f"manifest asset {rel_asset!r}"
-                    )
-                    if not resolved_asset.is_file():
-                        raise PackValidationError(
-                            f"Required manifest asset not found: {rel_asset!r}",
-                            code="INVALID_PACK",
-                        )
+            rel_asset, required = _extract_manifest_asset(entry)
+            if rel_asset is None:
+                continue
+            if _is_unsafe_rel_path(rel_asset):
+                raise PackValidationError(
+                    f"Unsafe asset path {rel_asset!r} in {manifest_name}",
+                    code="PATH_ESCAPE",
+                )
+            if not required:
+                continue
+            resolved_asset = _check_contained(
+                root, root / rel_asset.strip(), f"manifest asset {rel_asset!r}"
+            )
+            if not resolved_asset.is_file():
+                raise PackValidationError(
+                    f"Required manifest asset not found: {rel_asset!r}",
+                    code="INVALID_PACK",
+                )
 
     # Primary XML check
-    default_xml = "world.xml" if kind in {"scene", "scenes"} else "tool.xml"
-    xml_rel = (
-        str(manifest.get("world_xml" if kind in {"scene", "scenes"} else "tool_xml", default_xml))
-        if isinstance(manifest, dict)
-        else default_xml
-    )
+    default_xml = "world.xml" if is_scene else "tool.xml"
+    xml_key = "world_xml" if is_scene else "tool_xml"
+    xml_rel = str(manifest.get(xml_key, default_xml)) if isinstance(manifest, dict) else default_xml
     if _is_unsafe_rel_path(xml_rel):
         raise PackValidationError(
             f"Unsafe XML path {xml_rel!r} in {manifest_name}", code="PATH_ESCAPE"
@@ -1135,6 +1118,30 @@ def _infer_tool_joints_from_xml(
     return driven, coupled, actuator_name
 
 
+def _load_manifest_json(path: Path, filename: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected {filename} or .xml file in {path.parent}")
+    if path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise PackValidationError(
+            f"{filename} size exceeds {MAX_MANIFEST_BYTES} bytes", code="PACK_TOO_LARGE"
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise PackValidationError(f"Invalid {filename}: {exc}", code="INVALID_PACK") from None
+    if not isinstance(data, dict):
+        raise PackValidationError(f"{filename} must be a JSON object", code="INVALID_PACK")
+    return data
+
+
+def _pack_root_dir(source_ref: str, xml_path: Path) -> Path:
+    return (
+        Path(source_ref)
+        if source_ref and Path(source_ref).is_dir()
+        else xml_path.parent
+    )
+
+
 def load_tool_pack(ref: str | Path | None, *, prefer_disk: bool = False) -> ToolPack:
     """Load a preset tool ('default', 'suction', 'screwdriver'), pack dir, tool.json, or raw XML."""
     raw = str(ref).strip() if ref is not None else "default"
@@ -1222,18 +1229,7 @@ def load_tool_pack(ref: str | Path | None, *, prefer_disk: bool = False) -> Tool
     tool_json = (
         path if path.is_file() and path.name == "tool.json" else path / "tool.json"
     )
-    if not tool_json.is_file():
-        raise FileNotFoundError(f"Expected tool.json or .xml file in {path}")
-    if tool_json.stat().st_size > MAX_MANIFEST_BYTES:
-        raise PackValidationError(
-            f"tool.json size exceeds {MAX_MANIFEST_BYTES} bytes", code="PACK_TOO_LARGE"
-        )
-    try:
-        data = json.loads(tool_json.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        raise PackValidationError(f"Invalid tool.json: {exc}", code="INVALID_PACK") from None
-    if not isinstance(data, dict):
-        raise PackValidationError("tool.json must be a JSON object", code="INVALID_PACK")
+    data = _load_manifest_json(tool_json, "tool.json")
     tool_dir = tool_json.parent
     digest = validate_pack_security(tool_dir, "tool", manifest=data)
     tool_xml = _resolve_within(tool_dir, str(data.get("tool_xml", "tool.xml")))
@@ -1353,18 +1349,7 @@ def load_scene_pack(
     scene_json = (
         path if path.is_file() and path.name == "scene.json" else path / "scene.json"
     )
-    if not scene_json.is_file():
-        raise FileNotFoundError(f"Expected scene.json or .xml in {path}")
-    if scene_json.stat().st_size > MAX_MANIFEST_BYTES:
-        raise PackValidationError(
-            f"scene.json size exceeds {MAX_MANIFEST_BYTES} bytes", code="PACK_TOO_LARGE"
-        )
-    try:
-        data = json.loads(scene_json.read_text(encoding="utf-8"))
-    except ValueError as exc:
-        raise PackValidationError(f"Invalid scene.json: {exc}", code="INVALID_PACK") from None
-    if not isinstance(data, dict):
-        raise PackValidationError("scene.json must be a JSON object", code="INVALID_PACK")
+    data = _load_manifest_json(scene_json, "scene.json")
     scene_dir = scene_json.parent
     digest = validate_pack_security(scene_dir, "scene", manifest=data)
     world_xml = _resolve_within(scene_dir, str(data.get("world_xml", "world.xml")))
@@ -1415,11 +1400,7 @@ def compose_spec(
 
         if scene_pack is not None:
             _delete_named(spec, "bodies", ["cube"])
-            scene_root = (
-                Path(scene_pack.source_ref)
-                if scene_pack.source_ref and Path(scene_pack.source_ref).is_dir()
-                else scene_pack.world_xml_path.parent
-            )
+            scene_root = _pack_root_dir(scene_pack.source_ref, scene_pack.world_xml_path)
             ref_meshes, _, _, _ = validate_xml_file_security(scene_pack.world_xml_path, scene_root)
             has_local_meshes = bool(ref_meshes) or (
                 bool(scene_pack.source_ref)
@@ -1460,11 +1441,7 @@ def compose_spec(
             if tool_pack.tool_spec_xml is not None:
                 tool_spec = mujoco.MjSpec.from_string(tool_pack.tool_spec_xml)
             elif tool_pack.tool_xml_path is not None:
-                tool_root = (
-                    Path(tool_pack.source_ref)
-                    if tool_pack.source_ref and Path(tool_pack.source_ref).is_dir()
-                    else tool_pack.tool_xml_path.parent
-                )
+                tool_root = _pack_root_dir(tool_pack.source_ref, tool_pack.tool_xml_path)
                 validate_xml_file_security(tool_pack.tool_xml_path, tool_root)
                 tool_spec = mujoco.MjSpec.from_file(str(tool_pack.tool_xml_path))
             else:
