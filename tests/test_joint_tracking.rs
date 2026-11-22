@@ -3181,3 +3181,118 @@ fn tracking_final_braking_tick_keeps_stream_ownership_through_residual_ramp() {
     assert!(cleared, "servo_stream_active must clear once residual lead finishes ramping");
     assert!(!drv.with(|s| s.written.is_empty()));
 }
+
+/// Review 2 M3: Park keep-out ramp persists revision-tagged escape depths across ticks
+/// (rejecting a slight reversal back toward a keep-out box), and rejection fallback commits
+/// updated `ws_min_depths` instead of `None`.
+#[test]
+fn tracking_park_keepout_ramp_and_fallback_persist_escape_depths() {
+    use armd::model::KeepoutBox;
+
+    // 1. Park keep-out ramp-out persists `ws_keepout_min_depths` across ticks.
+    {
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let ee0 = cfg.arm_model.fk_f32(&q0).unwrap().p;
+        // Place a z half-space keep-out box covering ee0.z (penetration depth = 0.03 m).
+        let mut ws = cfg.workspace.clone().unwrap();
+        ws.check_points_end_m = vec![[0.0, 0.0, 0.0]];
+        ws.link_capsules.clear();
+        ws.self_collision_enabled = false;
+        ws.self_collision_pairs.clear();
+        ws.keepout_boxes.push(KeepoutBox {
+            name: "park_keepout".into(),
+            min_m: [-2.0, -2.0, -2.0],
+            max_m: [2.0, 2.0, (ee0[2] + 0.03) as f32],
+        });
+        cfg.workspace = Some(ws);
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+
+        // Determine which direction on J2 raises EE z (escapes keep-out).
+        let mut q_plus = q0.to_vec();
+        q_plus[1] += 0.02;
+        let ee_plus = inner.config.arm_model.fk_f32(&q_plus).unwrap().p;
+        let dir = if ee_plus[2] > ee0[2] { 1.0_f32 } else { -1.0_f32 };
+
+        // Start park ramp at q0 with residual lead pointing in the escaping direction.
+        inner.pending_normal_unload = true;
+        inner.commanded_positions = q0.to_vec();
+        inner.commanded_positions[1] = q0[1] + dir * 0.050;
+        inner.measured_positions = q0.to_vec();
+        inner.tracking.record_issued(q0.to_vec(), vec![0.0; 7]);
+
+        let limits = inner.active_tracking_limits(DT, 1.0);
+        // Step outward over 6 ticks (escaping > 5 mm while still inside the 30 mm deep keep-out).
+        let mut last_pos = q0.to_vec();
+        for _ in 0..6 {
+            let out = inner
+                .compute_lead_ramp_out(DT, &limits, true)
+                .expect("park keep-out escape step must succeed");
+            assert!(
+                out.ws_keepout_min_depths.is_some(),
+                "park keep-out ramp must produce revision-tagged ws_keepout_min_depths"
+            );
+            last_pos = out.positions.clone();
+            inner.measured_positions = last_pos.clone();
+            inner.tracking.record_issued_with_ws_depths(
+                out.positions,
+                out.velocities,
+                out.ws_min_depths,
+                out.ws_keepout_min_depths,
+            );
+        }
+        assert!(inner.tracking.ws_keepout_min_depths.is_some());
+
+        // Reverse back toward the keep-out (deeper than `last_pos`, still shallower than tick 0).
+        inner.commanded_positions[1] = q0[1];
+        let mut rejected = false;
+        for _ in 0..6 {
+            match inner.compute_lead_ramp_out(DT, &limits, true) {
+                Ok(out) => {
+                    inner.measured_positions = out.positions.clone();
+                    inner.tracking.record_issued_with_ws_depths(
+                        out.positions,
+                        out.velocities,
+                        out.ws_min_depths,
+                        out.ws_keepout_min_depths,
+                    );
+                }
+                Err(_) => {
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            rejected,
+            "reversing back into keep-out during park ramp must be rejected by persisted escape depths"
+        );
+    }
+
+    // 2. Rejection fallback commits non-None `ws_min_depths` when workspace policy is active.
+    {
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 600_000;
+        cfg.joint_tracking = Some(lead_config(true, 0.68));
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+
+        // Set prev_confirmed close enough to q0 (0.002 rad) that direct fallback hold validates,
+        // and trigger a tracking rejection by shrinking limits[0].max_velocity temporarily or
+        // via a large desired step.
+        let mut prev = q0.to_vec();
+        prev[0] = 0.030;
+        inner.tracking.record_issued(prev, vec![0.0; 7]);
+        let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &q0, &[0.0; 7], Some(0.2), &inner.config.limits).unwrap();
+        let _ = inner.safety.mark_motion_started();
+        inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+        let obs = inner.tick(DT);
+        assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
+        assert!(
+            inner.tracking.ws_min_depths.is_some(),
+            "rejection fallback must commit updated ws_min_depths instead of None"
+        );
+    }
+}

@@ -176,6 +176,9 @@ pub struct TrackingRuntime {
     /// Persistent monotonic workspace escape baseline for issued tracking outputs,
     /// tagged with `workspace_revision` and committed only after a successful write.
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    /// Persistent monotonic keep-out-only escape baseline used during park (`NormalUnload`)
+    /// residual lead ramp-out, tagged with `workspace_revision`.
+    pub ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     /// True while compensated output is suspended following an autonomous driver
     /// recovery write (e.g. Damiao 45 ms POS_VEL hold) until fresh post-recovery
     /// feedback confirms every joint's baseline.
@@ -197,6 +200,7 @@ impl TrackingRuntime {
             self.last_issued_positions = Some(positions.to_vec());
             self.last_issued_velocities = Some(vec![0.0; positions.len()]);
             self.ws_min_depths = None;
+            self.ws_keepout_min_depths = None;
             self.recovery_suspended = false;
             self.recovery_joints.clear();
         } else {
@@ -222,6 +226,7 @@ impl TrackingRuntime {
     /// never suffer an unchecked step on resume.
     pub fn suspend_for_recovery(&mut self, joints: &[usize], at: std::time::Instant) {
         self.ws_min_depths = None;
+        self.ws_keepout_min_depths = None;
         self.recovery_suspended = true;
         for &j in joints {
             if let Some(entry) = self.recovery_joints.iter_mut().find(|(idx, _)| *idx == j) {
@@ -239,6 +244,7 @@ impl TrackingRuntime {
         self.recovery_suspended = false;
         self.recovery_joints.clear();
         self.ws_min_depths = None;
+        self.ws_keepout_min_depths = None;
         if let Some(prev_q) = self.last_issued_positions.as_mut() {
             let dof = prev_q.len();
             let prev_v = self
@@ -276,10 +282,23 @@ impl TrackingRuntime {
         velocities: Vec<f32>,
         ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     ) {
+        self.record_issued_with_ws_depths(positions, velocities, ws_min_depths, None);
+    }
+
+    /// Record a successfully issued output vector and commit both full-workspace and
+    /// park keep-out-only escape depths.
+    pub fn record_issued_with_ws_depths(
+        &mut self,
+        positions: Vec<f32>,
+        velocities: Vec<f32>,
+        ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+        ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    ) {
         self.history_state = TrackingHistoryState::Issued;
         self.last_issued_positions = Some(positions);
         self.last_issued_velocities = Some(velocities);
         self.ws_min_depths = ws_min_depths;
+        self.ws_keepout_min_depths = ws_keepout_min_depths;
     }
 
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
@@ -288,6 +307,7 @@ impl TrackingRuntime {
         self.last_issued_positions = None;
         self.last_issued_velocities = None;
         self.ws_min_depths = None;
+        self.ws_keepout_min_depths = None;
     }
 }
 
@@ -317,6 +337,7 @@ pub struct TrackingOutput {
     pub multiplier: f32,
     pub sweep_evals_used: usize,
     pub ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    pub ws_keepout_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -656,6 +677,7 @@ impl crate::supervisor::SupervisorInner {
                 multiplier: m,
                 sweep_evals_used: budget_start.saturating_sub(*budget),
                 ws_min_depths: committed_ws_min_d,
+                ws_keepout_min_depths: None,
             });
         }
 
@@ -760,6 +782,7 @@ impl crate::supervisor::SupervisorInner {
 
         let budget_start = *budget;
         let mut committed_ws_min_d = None;
+        let mut committed_keepout_min_d = None;
         if let Some((ws, cam)) = self.workspace_policy() {
             let keepout_ws = keepout_only.then(|| ws.keepout_only());
             let ws_ref = keepout_ws.as_ref().unwrap_or(ws);
@@ -769,10 +792,14 @@ impl crate::supervisor::SupervisorInner {
                 let mut c_prev = eval.alloc_buf();
                 eval.eval_into(prev_q, &mut c_prev, "tracking_ramp_out")
                     .map_err(|f| TrackingReject::Workspace(SafetyError::from_workspace(f)))?;
-                let mut local_min_d = match &self.tracking.ws_min_depths {
+                let cached_depths = if keepout_only {
+                    &self.tracking.ws_keepout_min_depths
+                } else {
+                    &self.tracking.ws_min_depths
+                };
+                let mut local_min_d = match cached_depths {
                     Some((rev, md))
-                        if !keepout_only
-                            && *rev == self.workspace_revision
+                        if *rev == self.workspace_revision
                             && md.as_slice().len() == eval.total_slots =>
                     {
                         md.clone()
@@ -809,7 +836,9 @@ impl crate::supervisor::SupervisorInner {
                         return Err(TrackingReject::Workspace(SafetyError::from_workspace(f)));
                     }
                 }
-                if !keepout_only {
+                if keepout_only {
+                    committed_keepout_min_d = Some((self.workspace_revision, local_min_d));
+                } else {
                     committed_ws_min_d = Some((self.workspace_revision, local_min_d));
                 }
             }
@@ -824,6 +853,7 @@ impl crate::supervisor::SupervisorInner {
             multiplier: 0.0,
             sweep_evals_used: budget_start.saturating_sub(*budget),
             ws_min_depths: committed_ws_min_d,
+            ws_keepout_min_depths: committed_keepout_min_d,
         })
     }
 
