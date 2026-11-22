@@ -189,9 +189,19 @@ void VisionControl::notify_locked() {
     const bool proc = processing_locked();
     const int gate = gate_locked();
     if (proc == reported_proc_ && gate == reported_gate_) return;
+    const bool prev_proc = reported_proc_;
+    const int prev_gate = reported_gate_;
     reported_proc_ = proc;
     reported_gate_ = gate;
-    if (on_change_) on_change_(proc, gate);
+    if (!on_change_) return;
+    try {
+        on_change_(proc, gate);
+    } catch (...) {
+        // not reported: the next notification calls the callback again
+        reported_proc_ = prev_proc;
+        reported_gate_ = prev_gate;
+        throw;
+    }
 }
 
 int VisionControl::camera_fps() const {
@@ -710,9 +720,14 @@ bool VisionControl::take_swap(SwapRequest& out) {
         return false;
     }
     SwapRequest taken = swap_req_;  // may throw: a failed copy leaves the swap Pending
-    out = std::move(taken);
     swap_ = SwapState::Running;
-    notify_locked();
+    try {
+        notify_locked();  // the camera-gate callback can throw
+    } catch (...) {
+        swap_ = SwapState::Pending;  // not taken: the next frame takes it again
+        throw;
+    }
+    out = std::move(taken);
     return true;
 }
 

@@ -56,7 +56,8 @@ inline void clear_depth_meta(ModelSet& s) noexcept {
  * `load_detector(entry, kind, mask)` installs the detector and returns true (setting `kind` to a
  * static name of at most kSlotKindCapacity characters and `mask`), false on a load failure;
  * `load_depth(entry)` likewise. `unload_detector()` / `unload_depth()` must not throw.
- * `resident` is the frame thread's resident set. Returns the new model generation.
+ * `resident` is the frame thread's resident set. `failed_out` gets the failed slots ("detector",
+ * "depth") or "exception" when the swap ended by an exception. Returns the new model generation.
  */
 template <class LoadDetector, class LoadDepth, class UnloadDetector, class UnloadDepth>
 uint64_t run_model_swap(VisionControl& ctl, const SwapRequest& s, ModelSet& resident, LoadDetector&& load_detector,
@@ -112,6 +113,12 @@ uint64_t run_model_swap(VisionControl& ctl, const SwapRequest& s, ModelSet& resi
         if (failed_out) *failed_out = failed;
         return ctl.finish_swap(std::move(commit), error);
     } catch (...) {
+        if (failed_out) {
+            try {
+                failed_out->assign("exception");  // fits a default string's inline capacity
+            } catch (...) {
+            }
+        }
         if (det_touched) {
             unload_detector();
             clear_detector_meta(resident);
