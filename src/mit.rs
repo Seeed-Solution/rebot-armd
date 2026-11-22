@@ -856,7 +856,26 @@ impl crate::supervisor::SupervisorInner {
             return Err(format!("MIT tracking hands back ({why}) only at rest with fresh feedback"));
         }
         let joints = self.mit.joints.clone();
-        let hold = self.mit_hold_targets(&joints, &self.mit.last_ff.clone());
+        let mut hold = self.mit_hold_targets(&joints, &self.mit.last_ff.clone());
+        // the MIT side of the hold is what a rollback sends while the mode is uncertain: the
+        // same decoded-field effort bound as every MIT frame, slewed from the last tau_ff; when it
+        // cannot be met nothing is sent and the group is cancelled
+        let g = match self.mit_gravity() {
+            Ok(g) => g,
+            Err(e) => { self.mit_lose(format!("MIT hand back ({why}): {e}"), crate::safety::FaultCode::BusLoss); return Err(e); }
+        };
+        let dt = 1.0 / self.config.control_frequency_hz.max(1) as f32;
+        for &j in &joints {
+            let last = self.mit.last_ff.get(j).copied().unwrap_or(0.0);
+            match self.mit_frame(j, self.measured_positions[j], 0.0, 0.0, true, g[j], Some((last, dt))) {
+                Ok((frame, _)) => hold[j] = frame,
+                Err(e) => {
+                    let msg = format!("MIT hand back ({why}) refused: the rollback hold of J{} does not fit the effort bound ({e})", j + 1);
+                    self.mit_lose(msg.clone(), crate::safety::FaultCode::BusLoss);
+                    return Err(msg);
+                }
+            }
+        }
         let modes = vec![crate::driver::JointMode::Position; self.config.dof];
         let (res, uncertain) = {
             let Some(d) = self.driver.as_ref() else { return Err("no driver".into()) };

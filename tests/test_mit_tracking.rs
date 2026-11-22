@@ -1174,3 +1174,30 @@ fn mit_timeout_write_never_sent_is_not_uncertain() {
     assert_eq!((f["applied"].clone(), f["uncertain"].clone(), f["not_attempted"].clone()), (json!([]), json!([]), json!([5])), "{f:?}");
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 0);
 }
+
+/// Review round 4, #3: the hand back's rollback hold (an MIT frame at the measured pose with the
+/// hold gains) obeys the decoded effort bound: when it cannot, the hand back sends nothing and the
+/// group is cancelled (BUS_LOSS) instead of sending an unchecked MIT hold while the mode is
+/// uncertain. Here the joint sits 1.7 mrad off its command while creeping at -0.044 rad/s: the
+/// tracking frame is feasible (its terms cancel), the hold at the measured pose is not.
+/// (1.5 mrad off its command while creeping at -0.037 rad/s.)
+#[test]
+fn mit_hand_back_rollback_hold_obeys_the_decoded_bound() {
+    let mut cfg = mit_config_j4();
+    { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.effort_limit_nm = 0.007; j4.gravity_scale = 0.0; }
+    let (mut inner, bus) = active_rig(cfg, 0.0);
+    let qc = inner.commanded_positions[3];
+    bus.with(|s| { s.follow_commands = false; s.motors[3].q = qc + 0.00147; s.motors[3].v = -0.0366; s.push_all_feedback(); });
+    for _ in 0..3 { bus.with(|s| s.push_all_feedback()); inner.tick(DT); }
+    assert!(inner.mit_active() && !inner.safety.state().is_stopped(), "tracking frame infeasible: {:?}", inner.safety.fault());
+    bus.with(|s| s.fail_tx_ids = vec![0x104]); // the forward POS_VEL hold fails at once -> rollback with its MIT hold
+    bus.clear_log();
+    inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
+    let (q_m, v_m) = (inner.measured_positions[3], inner.measured_velocities[3]);
+    for (p, v, kp, kd, t) in mit_frames(&bus.tx_log(), 4) {
+        let total = kp * (p - q_m) + kd * (v - v_m) + t;
+        assert!(total.abs() <= 0.007 + 1e-6, "MIT hold with decoded effort {total} beyond the limit 0.007 sent during the hand back");
+    }
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    assert_eq!(inner.safety.fault().map(|f| f.code), Some(armd::FaultCode::BusLoss));
+}
