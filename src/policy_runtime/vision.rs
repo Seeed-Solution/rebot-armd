@@ -440,6 +440,8 @@ pub struct EmbeddingIngestRequest {
     pub producer_epoch: u64,
     pub frame_id: u64,
     pub captured_at_ms: i64,
+    #[serde(default, alias = "window_start_ms", alias = "clip_oldest_captured_at_ms")]
+    pub oldest_captured_at_ms: Option<i64>,
     pub embedding: Vec<f64>,
     pub encoder_artifact_sha256: String,
     pub preprocess_config_sha256: String,
@@ -453,6 +455,7 @@ pub struct EmbeddingIngestResponse {
     pub frame_id: u64,
     pub producer_epoch: u64,
     pub mapped_captured_at_ms: u64,
+    pub mapped_oldest_captured_at_ms: u64,
     pub window_len: usize,
     pub history_len: usize,
     pub window_ready: bool,
@@ -482,6 +485,8 @@ pub struct EmbeddingFrame {
     pub handshake_generation: u64,
     pub captured_at_ms: i64,
     pub mapped_at_ms: u64,
+    pub oldest_captured_at_ms: i64,
+    pub oldest_mapped_at_ms: u64,
     pub embedding: Vec<f32>,
     pub encoder_artifact_sha256: String,
     pub preprocess_config_sha256: String,
@@ -493,6 +498,7 @@ pub struct EmbeddingWindowSnapshot {
     pub features: Vec<f32>,
     pub newest_frame_id: u64,
     pub newest_mapped_at_ms: u64,
+    pub newest_oldest_mapped_at_ms: u64,
     pub effective_uncertainty_ms: u64,
     pub producer_epoch: u64,
     pub model_generation: Option<u64>,
@@ -612,16 +618,19 @@ impl EmbeddingHubInner {
         let oldest = self
             .frames
             .iter()
-            .map(|f| f.mapped_at_ms)
+            .map(|f| f.oldest_mapped_at_ms)
             .min()
             .expect("non-empty");
-        let newest = self
+        let newest_oldest = self
             .frames
-            .iter()
-            .map(|f| f.mapped_at_ms)
-            .max()
-            .expect("non-empty");
-        self.window_newest_deadline_ms = Some(newest.saturating_add(staleness).saturating_sub(unc));
+            .back()
+            .expect("non-empty")
+            .oldest_mapped_at_ms;
+        self.window_newest_deadline_ms = Some(
+            newest_oldest
+                .saturating_add(staleness)
+                .saturating_sub(unc),
+        );
         self.window_oldest_deadline_ms = Some(oldest.saturating_add(span).saturating_sub(unc));
     }
 
@@ -762,7 +771,9 @@ impl VideoEmbeddingHub {
                 .as_ref()
                 .map_or(0, |h| h.effective_uncertainty_ms());
             while let Some(front) = inner.frames.front() {
-                if now_ms.saturating_sub(front.mapped_at_ms).saturating_add(unc)
+                if now_ms
+                    .saturating_sub(front.oldest_mapped_at_ms)
+                    .saturating_add(unc)
                     > spec.max_window_span_ms
                 {
                     inner.frames.pop_front();
@@ -1204,17 +1215,29 @@ impl VideoEmbeddingHub {
         }
 
         // 6. Bilateral timestamp check (before any window mutation!)
-        let mapped_i128 = (req.captured_at_ms as i128) + (hs.clock_offset_ms as i128);
+        let oldest_raw = req.oldest_captured_at_ms.unwrap_or(req.captured_at_ms);
+        if oldest_raw > req.captured_at_ms {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CLIP_BOUNDS",
+                message: format!(
+                    "oldest_captured_at_ms ({oldest_raw}) exceeds captured_at_ms ({})",
+                    req.captured_at_ms
+                ),
+            });
+        }
+        let mapped_newest_i128 = (req.captured_at_ms as i128) + (hs.clock_offset_ms as i128);
+        let mapped_oldest_i128 = (oldest_raw as i128) + (hs.clock_offset_ms as i128);
         let now_i128 = now_ms as i128;
         let future_slack = hs
             .effective_uncertainty_ms()
             .min(MAX_FUTURE_SKEW_CAP_MS) as i128;
-        if mapped_i128 > now_i128 + future_slack {
+        if mapped_newest_i128 > now_i128 + future_slack {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "FUTURE_FRAME",
                 message: format!(
-                    "mapped capture timestamp {mapped_i128} ms exceeds now ({now_i128} ms) + uncertainty slack ({future_slack} ms)"
+                    "mapped capture timestamp {mapped_newest_i128} ms exceeds now ({now_i128} ms) + uncertainty slack ({future_slack} ms)"
                 ),
             });
         }
@@ -1223,50 +1246,53 @@ impl VideoEmbeddingHub {
             .bound
             .as_ref()
             .map_or(MAX_VISION_STALENESS_MS, |b| b.effective_staleness_ms);
-        if mapped_i128 < 0
-            || (now_i128 - mapped_i128) + (unc as i128) > (staleness_budget as i128)
+        if mapped_oldest_i128 < 0
+            || mapped_newest_i128 < 0
+            || (now_i128 - mapped_oldest_i128) + (unc as i128) > (staleness_budget as i128)
         {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "STALE_FRAME",
                 message: format!(
-                    "frame age ({} + {unc}) ms exceeds staleness budget {staleness_budget} ms",
-                    now_i128 - mapped_i128
+                    "clip oldest endpoint age ({} + {unc}) ms exceeds staleness budget {staleness_budget} ms",
+                    now_i128 - mapped_oldest_i128
                 ),
             });
         }
-        let mapped_ms = mapped_i128 as u64;
-
-        // Monotonic mapped_at_ms check (A2): prevent interior older timestamps from evading max_window_span_ms.
-        if let Some(last_frame) = inner.frames.back() {
-            if mapped_ms < last_frame.mapped_at_ms {
-                return Err(EmbeddingIngestError {
-                    status: 400,
-                    code: "NON_MONOTONIC_TIMESTAMP",
-                    message: format!(
-                        "mapped capture timestamp {mapped_ms} ms is older than previous frame's {} ms",
-                        last_frame.mapped_at_ms
-                    ),
-                });
-            }
-        }
+        let mapped_ms = mapped_newest_i128 as u64;
+        let oldest_mapped_ms = mapped_oldest_i128 as u64;
 
         let history_len = inner.bound.as_ref().map_or(UNBOUND_RING_CAP, |b| b.spec.history_len);
         let span_limit = inner
             .bound
             .as_ref()
             .map_or(MAX_VIDEO_WINDOW_SPAN_MS, |b| b.spec.max_window_span_ms);
-        if history_len == 1
-            && (now_i128 - mapped_i128) + (unc as i128) > (span_limit as i128)
+        if (now_i128 - mapped_oldest_i128) + (unc as i128) > (span_limit as i128)
+            || (mapped_newest_i128 - mapped_oldest_i128) > (span_limit as i128)
         {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "STALE_FRAME",
                 message: format!(
-                    "frame age ({} + {unc}) ms exceeds max_window_span_ms {span_limit} ms",
-                    now_i128 - mapped_i128
+                    "clip span/age exceeds max_window_span_ms {span_limit} ms"
                 ),
             });
+        }
+
+        // Monotonic mapped_at_ms & oldest_mapped_at_ms check (A2): prevent interior older timestamps from evading max_window_span_ms.
+        if let Some(last_frame) = inner.frames.back() {
+            if mapped_ms < last_frame.mapped_at_ms
+                || oldest_mapped_ms < last_frame.oldest_mapped_at_ms
+            {
+                return Err(EmbeddingIngestError {
+                    status: 400,
+                    code: "NON_MONOTONIC_TIMESTAMP",
+                    message: format!(
+                        "mapped capture timestamps ({oldest_mapped_ms}..={mapped_ms} ms) regress before previous frame ({}..={} ms)",
+                        last_frame.oldest_mapped_at_ms, last_frame.mapped_at_ms
+                    ),
+                });
+            }
         }
 
         // 7. All validations passed — update ring buffer and deadlines atomically.
@@ -1285,7 +1311,11 @@ impl VideoEmbeddingHub {
         }
 
         while let Some(front) = inner.frames.front() {
-            if now_ms.saturating_sub(front.mapped_at_ms).saturating_add(unc) > span_limit {
+            if now_ms
+                .saturating_sub(front.oldest_mapped_at_ms)
+                .saturating_add(unc)
+                > span_limit
+            {
                 inner.frames.pop_front();
             } else {
                 break;
@@ -1300,6 +1330,8 @@ impl VideoEmbeddingHub {
             handshake_generation: hs.handshake_generation,
             captured_at_ms: req.captured_at_ms,
             mapped_at_ms: mapped_ms,
+            oldest_captured_at_ms: oldest_raw,
+            oldest_mapped_at_ms: oldest_mapped_ms,
             embedding: emb_f32,
             encoder_artifact_sha256: enc_sha,
             preprocess_config_sha256: prep_sha,
@@ -1320,6 +1352,7 @@ impl VideoEmbeddingHub {
             frame_id: req.frame_id,
             producer_epoch: req.producer_epoch,
             mapped_captured_at_ms: mapped_ms,
+            mapped_oldest_captured_at_ms: oldest_mapped_ms,
             window_len,
             history_len: target_len,
             window_ready: window_len >= target_len,
@@ -1393,9 +1426,9 @@ impl VideoEmbeddingHub {
             return EmbeddingSampleDecision::Hold;
         }
 
-        let oldest_mapped = window_slice
+        let window_oldest_mapped = window_slice
             .iter()
-            .map(|f| f.mapped_at_ms)
+            .map(|f| f.oldest_mapped_at_ms)
             .min()
             .expect("history_len >= 1");
         let newest_frame = window_slice.last().expect("history_len >= 1");
@@ -1406,14 +1439,18 @@ impl VideoEmbeddingHub {
             .expect("history_len >= 1");
 
         let unc = hs.effective_uncertainty_ms();
-        let newest_dl = newest_mapped
+        let newest_dl = newest_frame
+            .oldest_mapped_at_ms
             .saturating_add(eff_staleness)
             .saturating_sub(unc);
-        let oldest_dl = oldest_mapped
+        let oldest_dl = window_oldest_mapped
             .saturating_add(spec.max_window_span_ms)
             .saturating_sub(unc);
 
-        if now_ms > newest_dl || now_ms > oldest_dl {
+        if now_ms > newest_dl
+            || now_ms > oldest_dl
+            || newest_mapped.saturating_sub(window_oldest_mapped) > spec.max_window_span_ms
+        {
             return match spec.on_stale {
                 VisionStalePolicy::Hold => EmbeddingSampleDecision::Hold,
                 VisionStalePolicy::Stop => EmbeddingSampleDecision::Stop {
@@ -1439,6 +1476,7 @@ impl VideoEmbeddingHub {
             features,
             newest_frame_id: newest_frame.frame_id,
             newest_mapped_at_ms: newest_frame.mapped_at_ms,
+            newest_oldest_mapped_at_ms: newest_frame.oldest_mapped_at_ms,
             effective_uncertainty_ms: unc,
             producer_epoch: newest_frame.producer_epoch,
             model_generation: inner.model_generation,

@@ -733,6 +733,7 @@ async fn positive_t1_video_model_commits_cleanly() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 500_000,
+        oldest_captured_at_ms: None,
         embedding: vec![1.0, -0.5, 0.25, 2.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1226,6 +1227,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: None,
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1243,6 +1245,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
         producer_epoch: 1,
         frame_id: 2,
         captured_at_ms: f2_ts as i64,
+        oldest_captured_at_ms: None,
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1637,6 +1640,7 @@ fn b1_excessive_server_measured_rtt_rejected_without_clobbering_active_state() {
         producer_epoch: 1,
         frame_id: 1,
         captured_at_ms: 200_000,
+        oldest_captured_at_ms: None,
         embedding: vec![1.0, 2.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1889,6 +1893,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
             producer_epoch: 1,
             frame_id: 1,
             captured_at_ms: 1_000_000 - 46,
+            oldest_captured_at_ms: None,
             embedding: vec![1.0, 1.0],
             encoder_artifact_sha256: sha_a(),
             preprocess_config_sha256: sha_b(),
@@ -1903,6 +1908,7 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
         producer_epoch: 1,
         frame_id: 2,
         captured_at_ms: 1_000_000 - 40,
+        oldest_captured_at_ms: None,
         embedding: vec![1.0, 1.0],
         encoder_artifact_sha256: sha_a(),
         preprocess_config_sha256: sha_b(),
@@ -1970,6 +1976,247 @@ async fn b1_oldest_plausible_age_enforced_at_ingest_and_pre_commit() {
 
     // Advance by 6 ms: nominal age = 46 <= 50, but 46 + 5 = 51 > 50 -> pre-commit rejects!
     hub.advance_test_now_ms(6);
+
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(non_home_writes.load(Ordering::SeqCst), 0);
+    let obs = sup.get_observation().await;
+    let pol = obs.policy.expect("policy obs");
+    assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
+    assert_eq!(pol.steps, 0);
+}
+
+#[tokio::test]
+async fn b2_http_ingest_enforces_oldest_endpoint_staleness_and_bounds() {
+    let sup = Arc::new(ArmSupervisor::new(make_6dof_config()));
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(500_000));
+    let addr = spawn_http_server(sup.clone(), OperatorAuth::disabled()).await;
+    let client = reqwest::Client::new();
+
+    let hs_resp = http_two_step_handshake(&client, addr, None, None, 1, 500_000, 1, Some(1), None).await;
+    assert_eq!(hs_resp.status(), reqwest::StatusCode::OK);
+    let hs_json: serde_json::Value = hs_resp.json().await.unwrap();
+    assert_eq!(hs_json["effective_uncertainty_ms"], 2);
+    let hs_gen = hs_json["handshake_generation"].as_u64().unwrap();
+
+    hub.bind_policy(
+        1,
+        VideoEmbeddingSpec {
+            embedding_dim: 2,
+            history_len: 1,
+            max_staleness_ms: 50,
+            max_window_span_ms: 200,
+            fps_staleness_budget_ms: Some(50),
+            encoder_artifact_sha256: sha_a(),
+            preprocess_config_sha256: sha_b(),
+            embedding_norm: None,
+            on_stale: armd::policy_runtime::VisionStalePolicy::Stop,
+        },
+        10.0,
+    );
+
+    // Invalid bounds: oldest_captured_at_ms > captured_at_ms -> 400 INVALID_CLIP_BOUNDS
+    let bad_bounds = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": hs_gen,
+            "producer_epoch": 1,
+            "frame_id": 1,
+            "captured_at_ms": 499_990,
+            "oldest_captured_at_ms": 499_995,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_bounds.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        bad_bounds.json::<serde_json::Value>().await.unwrap()["code"],
+        "INVALID_CLIP_BOUNDS"
+    );
+
+    // Newest endpoint is fresh (age 5 ms), but oldest endpoint age 80 + unc 2 = 82 > eff_staleness 50 -> 400 STALE_FRAME
+    let stale_oldest = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": hs_gen,
+            "producer_epoch": 1,
+            "frame_id": 2,
+            "captured_at_ms": 499_995,
+            "oldest_captured_at_ms": 499_920,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_oldest.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        stale_oldest.json::<serde_json::Value>().await.unwrap()["code"],
+        "STALE_FRAME"
+    );
+
+    // Accepted when oldest endpoint age 48 + unc 2 = 50 <= 50
+    let ok_clip = client
+        .post(format!("http://{addr}/api/v1/vision/embedding"))
+        .json(&serde_json::json!({
+            "handshake_generation": hs_gen,
+            "producer_epoch": 1,
+            "frame_id": 3,
+            "captured_at_ms": 499_995,
+            "oldest_captured_at_ms": 499_952,
+            "embedding": [1.0, 2.0],
+            "encoder_artifact_sha256": sha_a(),
+            "preprocess_config_sha256": sha_b()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_clip.status(), reqwest::StatusCode::OK);
+    let ok_json: serde_json::Value = ok_clip.json().await.unwrap();
+    assert_eq!(ok_json["mapped_oldest_captured_at_ms"], 499_952);
+}
+
+#[tokio::test]
+async fn b2_mid_inference_temporal_clip_oldest_endpoint_expires_blocks_commit() {
+    let layers = make_linear_layers(8, 6, vec![0.05; 48]);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 10.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 100,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 100,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    // Handshake with unc = 2 (server=1, producer=1)
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    assert_eq!(hs.effective_uncertainty_ms, 2);
+
+    // Clip [oldest=999_910, newest=1_000_000].
+    // eff_staleness = 100, unc = 2 -> exact deadline = 999_910 + 100 - 2 = 1_000_008.
+    // Newest endpoint deadline would be 1_000_098 (plenty of slack).
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: Some(999_910),
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: Some(1),
+    })
+    .unwrap();
+
+    // Advance to the exact oldest-endpoint deadline so sampling succeeds.
+    hub.set_test_now_ms(Some(1_000_008));
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 10);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        10.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-b2").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-b2".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_b2".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        10.0,
+        compute_policy_deadline(Some(2.0)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    // Advance by 1 ms: oldest endpoint expires (1_000_009 > 1_000_008) while newest (age 9+2=11 <= 100) is fresh!
+    hub.set_test_now_ms(Some(1_000_009));
 
     {
         let (lock, cvar) = &*allow_finish;

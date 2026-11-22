@@ -1127,7 +1127,7 @@ pub fn spawn_policy_runner(
                                 None,
                                 Some(win.newest_frame_id),
                                 Some(ticket),
-                                Some((win.newest_mapped_at_ms, win.effective_uncertainty_ms)),
+                                Some((win.newest_oldest_mapped_at_ms, win.effective_uncertainty_ms)),
                             )
                         }
                         EmbeddingSampleDecision::Hold => {
