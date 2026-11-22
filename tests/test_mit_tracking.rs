@@ -20,6 +20,10 @@ fn b601_limits() -> Vec<DamiaoLimits> {
     ArmConfig::rebot_dm().damiao_ranges.unwrap().iter().map(|r| r.limits()).collect()
 }
 
+/// Bus with a deterministic clock shared with the driver: freshness and reply timeouts do not
+/// depend on wall-clock load.
+fn clocked_bus() -> FakeBus { FakeBus::with_clock(&b601_limits(), armd::transport::MockClock::new()) }
+
 fn driver_on(bus: &FakeBus) -> DamiaoArmDriver<FakeBus> {
     DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap()
 }
@@ -70,7 +74,7 @@ fn with_record(inner: &mut SupervisorInner, rec: MitQualificationFile) {
 
 #[test]
 fn mit_timeout_commissioning_writes_ram_only_and_confirms_with_a_separate_read() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     bus.with(|s| s.tx_log.clear());
     let res = d.commission_motor_timeout(&[3], 2000).expect("commissioning");
@@ -95,36 +99,35 @@ fn mit_timeout_commissioning_writes_ram_only_and_confirms_with_a_separate_read()
 
 #[test]
 fn mit_timeout_commissioning_refusals() {
-    let limits = b601_limits();
     // torque on
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     d.set_torque(true).unwrap();
     assert!(d.commission_motor_timeout(&[3], 2000).is_err());
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 0);
     // acknowledgement carries another value
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     bus.with(|s| s.motors[3].ack_value_override = Some(1000));
     assert!(d.commission_motor_timeout(&[3], 2000).unwrap_err().to_string().contains("acknowledged"));
     // no acknowledgement
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     bus.with(|s| s.motors[3].no_write_ack = true);
     assert!(d.commission_motor_timeout(&[3], 2000).unwrap_err().to_string().contains("acknowledge"));
     // acknowledged but not stored: the separate read disagrees
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     bus.with(|s| s.motors[3].ignore_reg_writes = true);
     assert!(d.commission_motor_timeout(&[3], 2000).unwrap_err().to_string().contains("readback"));
     // replies on a CAN ID other than the reported MST_ID
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     bus.with(|s| s.motors[3].reply_id = 0x24);
     assert!(d.commission_motor_timeout(&[3], 2000).is_err());
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 0, "no write before the identity matches");
     // out-of-range counts and silent motor
-    let bus = FakeBus::new(&limits);
+    let bus = clocked_bus();
     let mut d = disabled_driver(&bus);
     assert!(d.commission_motor_timeout(&[3], 0).is_err());
     assert!(d.commission_motor_timeout(&[3], mit::MAX_TIMEOUT_COUNTS + 1).is_err());
@@ -135,7 +138,7 @@ fn mit_timeout_commissioning_refusals() {
 
 #[test]
 fn mit_timeout_command_through_the_supervisor_is_torque_off_only() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     let d = disabled_driver(&bus);
     let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
     inner.lease_enabled = false;
@@ -157,7 +160,7 @@ fn mit_timeout_command_through_the_supervisor_is_torque_off_only() {
 
 /// Supervisor with the Damiao driver on the fake bus and the MIT J4 profile.
 fn mit_rig(timeout_on_motor: u32, rec: Option<MitQualificationFile>) -> (SupervisorInner, FakeBus) {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, timeout_on_motor));
     let d = disabled_driver(&bus);
     let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
@@ -224,7 +227,7 @@ fn mit_gate_passes_qualified_hardware_and_rechecks_on_every_arm() {
 fn mit_not_requested_sends_no_register_reads_at_arm() {
     // the Phase 1 profile (tracking off) and an enabled position-lead profile: no readback
     for jt in [None, Some(JointTrackingConfig::rebot_dm()), Some(JointTrackingConfig { enabled: true, ..JointTrackingConfig::rebot_dm() })] {
-        let bus = FakeBus::new(&b601_limits());
+        let bus = clocked_bus();
         let d = disabled_driver(&bus);
         let cfg = ArmConfig { lease_timeout_ms: 600_000, workspace: None, joint_tracking: jt, ..ArmConfig::rebot_dm() };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
@@ -341,6 +344,26 @@ fn active_rig(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus) {
     inner.tick(DT);
     assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
     (inner, bus)
+}
+
+/// `active_rig` on a bus with a fake clock (deadline tests independent of wall-clock load).
+fn active_rig_clocked(cfg: ArmConfig, zero_j4: f32) -> (SupervisorInner, FakeBus, armd::transport::MockClock) {
+    let clock = armd::transport::MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i] + if i == 3 { zero_j4 } else { 0.0 }; });
+    let mut d = disabled_driver(&bus);
+    d.check_mapping_ranges();
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    if zero_j4 != 0.0 { inner.set_joint_zero_offsets(&[0.0, 0.0, 0.0, zero_j4, 0.0, 0.0, 0.0]).unwrap(); }
+    inner.tick(DT);
+    inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
+    with_record(&mut inner, record_j4_zero(2000, zero_j4));
+    inner.set_torque(true).unwrap();
+    inner.tick(DT);
+    inner.tick(DT);
+    assert!(inner.mit_active(), "handover: {:?}", inner.mit.handover_error);
+    (inner, bus, clock)
 }
 
 fn mit_frames(log: &[armd::transport::CanFrame], id: u16) -> Vec<(f32, f32, f32, f32, f32)> {
@@ -949,7 +972,7 @@ fn mit_moving_park_brakes_hands_back_then_parks() {
 /// which joint is uncertain (write sent, not confirmed) and which were not attempted.
 #[test]
 fn mit_timeout_batch_failure_reports_applied_and_uncertain_joints() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     let d = disabled_driver(&bus);
     let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
     inner.lease_enabled = false;
@@ -964,7 +987,7 @@ fn mit_timeout_batch_failure_reports_applied_and_uncertain_joints() {
     assert_eq!(bus.with(|s| s.motors[3].reg_u32(damiao::RID_TIMEOUT)), 2000);
     assert_eq!(bus.with(|s| s.motors[5].reg_u32(damiao::RID_TIMEOUT)), 0);
     // a failure before any write: nothing applied, nothing uncertain
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     let d = disabled_driver(&bus);
     let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
     inner.lease_enabled = false;
@@ -976,22 +999,21 @@ fn mit_timeout_batch_failure_reports_applied_and_uncertain_joints() {
 }
 
 /// Review #14: a feedback age or output gap close to (but under) the 45 ms deadline is counted
-/// and logged as a near miss; the group stays active.
+/// and logged as a near miss; the group stays active. Deterministic: the bus and driver share a
+/// fake clock, and the supervisor's MIT bookkeeping uses the driver's clock.
 #[test]
 fn mit_near_misses_are_counted_without_cancelling() {
-    for attempt in 0..3 {
-        let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
-        for _ in 0..3 { inner.tick(DT); }
-        bus.with(|s| s.motors[3].silent = true);
-        std::thread::sleep(std::time::Duration::from_millis(38));
-        bus.with(|s| s.motors[3].silent = false);
-        inner.tick(DT);
-        if inner.mit.owner == mit::MitOwner::Lost { eprintln!("attempt {attempt}: scheduler crossed 45 ms, retry"); continue; }
-        assert!(inner.mit_active());
-        assert!(inner.mit.near_misses >= 1, "near miss not counted");
-        return;
-    }
-    panic!("could not stay under 45 ms in three attempts");
+    let (mut inner, bus, clock) = active_rig_clocked(mit_config_j4(), 0.0);
+    for _ in 0..3 { inner.tick(DT); }
+    bus.with(|s| s.motors[3].silent = true);
+    clock.advance(std::time::Duration::from_millis(38));
+    inner.tick(DT);
+    assert!(inner.mit_active(), "{:?}", inner.mit.lost_reason);
+    assert!(inner.mit.near_misses >= 1, "near miss not counted");
+    // J4 stays silent past the deadline: cancelled
+    clock.advance(std::time::Duration::from_millis(50));
+    inner.tick(DT);
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
 }
 
 /// Review round 3, #6: the fence is armed before the first MIT-capable switch frame. A handover
@@ -1141,7 +1163,7 @@ fn mit_trip_during_hand_back_latches_bus_loss() {
 /// retries ran out) is not reported as sent-but-unconfirmed.
 #[test]
 fn mit_timeout_write_never_sent_is_not_uncertain() {
-    let bus = FakeBus::new(&b601_limits());
+    let bus = clocked_bus();
     let d = disabled_driver(&bus);
     let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
     inner.lease_enabled = false;

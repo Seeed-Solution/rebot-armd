@@ -677,7 +677,7 @@ impl crate::supervisor::SupervisorInner {
             match &res {
                 Some(Ok(())) => {
                     self.mit.last_ff = ff;
-                    self.mit.last_output = Some(std::time::Instant::now());
+                    self.mit.last_output = Some(self.mit_now());
                 }
                 Some(Err(e)) => self.mit_lose(format!("MIT batch write failed: {e}"), crate::safety::FaultCode::BusLoss),
                 None => {}
@@ -709,6 +709,12 @@ impl crate::supervisor::SupervisorInner {
 
     /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
     /// and the gap since the last flushed dynamic batch, each against [`MIT_DEADLINE`].
+    /// Time of the MIT deadline bookkeeping: the driver's clock (the transport's deterministic
+    /// clock in tests, the system clock otherwise), the same one that dates the feedback ages.
+    fn mit_now(&self) -> std::time::Instant {
+        self.driver.as_ref().and_then(|d| d.lock().ok()).map_or_else(std::time::Instant::now, |drv| drv.clock_now())
+    }
+
     /// Fault code of a cancelled group: BUS_LOSS when the driver's deadline fence tripped (a
     /// transport loss, wherever it was detected), otherwise a hardware fault (mode uncertain).
     fn mit_loss_code(&self) -> crate::safety::FaultCode {
@@ -734,7 +740,8 @@ impl crate::supervisor::SupervisorInner {
             Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
             None => (None, Vec::new()),
         };
-        let gap = self.mit.last_output.map(|t| t.elapsed());
+        let now = self.mit_now();
+        let gap = self.mit.last_output.map(|t| now.saturating_duration_since(t));
         let reason = if let Some(t) = trip { Some(format!("driver deadline fence: {t}")) }
             else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
                 Some(format!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1))
@@ -824,7 +831,7 @@ impl crate::supervisor::SupervisorInner {
                 self.mit.owner = MitOwner::Active;
                 self.mit.joints = joints.clone();
                 self.mit.last_ff = ff;
-                self.mit.last_output = Some(std::time::Instant::now());
+                self.mit.last_output = Some(self.mit_now());
                 self.mit.handover_error = None;
                 tracing::warn!("MIT tracking owns joints {:?}", joints.iter().map(|j| j + 1).collect::<Vec<_>>());
             }
@@ -878,7 +885,7 @@ impl crate::supervisor::SupervisorInner {
                     self.mit_lose(msg.clone(), code);
                 } else {
                     // switched back to MIT with the hold: still the owner
-                    self.mit.last_output = Some(std::time::Instant::now());
+                    self.mit.last_output = Some(self.mit_now());
                     self.safety.trigger_fault_coded(crate::safety::FaultCode::HardwareFault, crate::safety::FaultReason::Other(msg.clone()));
                 }
                 self.mit.handover_error = Some(msg.clone());

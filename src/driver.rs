@@ -265,6 +265,9 @@ pub trait ArmDriver: Send {
     /// next confirmed enable; no autonomous frame is sent for `holdoff`.
     fn set_mit_deadline_fence(&mut self, _deadline: Option<Duration>, _holdoff: Duration) {}
 
+    /// Current time of the driver's clock (the transport's deterministic clock in tests).
+    fn clock_now(&self) -> Instant { Instant::now() }
+
     /// Why the MIT deadline fence tripped (None = not tripped).
     fn mit_fence_trip(&self) -> Option<String> { None }
 
@@ -2960,6 +2963,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
+
+    fn clock_now(&self) -> Instant { self.now() }
 
     fn acknowledge_mit_fence_trip(&mut self) {
         if self.mit_fence_trip.is_some() { self.mit_fence_acked = true; }
