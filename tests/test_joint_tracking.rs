@@ -1328,11 +1328,16 @@ fn tracking_stream_braking_enforces_measured_lead_allowance() {
                 "{trigger}: braking tick {k} q_out {q_out} exceeded boundary {}",
                 obs.positions[0] + stream_lead
             );
-            if inner.commanded_velocities[0].abs() > 0.0 {
-                assert!(inner.servo_stream_active, "{trigger}: stream ownership dropped while braking");
-                saw_braking_with_stream_active = true;
+            let has_residual = inner
+                .tracking
+                .has_residual_lead(&inner.commanded_positions, &inner.config.arm_joint_indices());
+            if inner.commanded_velocities[0].abs() > 0.0 || has_residual {
+                assert!(inner.servo_stream_active, "{trigger}: stream ownership dropped while braking/ramping");
+                if inner.commanded_velocities[0].abs() > 0.0 {
+                    saw_braking_with_stream_active = true;
+                }
             } else {
-                assert!(!inner.servo_stream_active, "{trigger}: stream ownership should clear after braking ends");
+                assert!(!inner.servo_stream_active, "{trigger}: stream ownership should clear after braking & ramp end");
                 break;
             }
         }
@@ -3111,4 +3116,68 @@ fn tracking_reenable_already_torqued_checks_stationarity_and_preserves_history()
             "re-enabling a moving arm with unknown history must NOT seed Stationary"
         );
     }
+}
+
+/// Review 2 M2: Final braking tick (when nominal velocity hits 0.0 while residual lead remains)
+/// must retain `servo_stream_active` through the residual ramp so streaming limits and
+/// measured-lead allowance stay enforced until residual lead reaches zero.
+#[test]
+fn tracking_final_braking_tick_keeps_stream_ownership_through_residual_ramp() {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.workspace = None;
+    cfg.servo_max_lead_rad = 0.25;
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]);
+
+    // Establish active stream ownership (`servo_stream_active == true`) and active residual lead.
+    let epoch = inner.safety.epoch_id();
+    let mut tgt = q0.to_vec();
+    tgt[0] += 0.05;
+    inner.servo(tgt, epoch).unwrap();
+    let obs = inner.tick(DT);
+    assert!(obs.safety_state.is_operational(), "stream start faulted: {:?}", obs.fault);
+    assert!(inner.servo_stream_active);
+
+    // Put the stream at the exact final braking tick: nominal velocity 0.04 rad/s (decelerates to
+    // 0.0 in 1 tick) while issued output carries +0.025 rad active residual lead.
+    let mut issued = inner.commanded_positions.clone();
+    issued[0] += 0.025;
+    let mut issued_v = vec![0.0; 7];
+    issued_v[0] = 0.04;
+    inner.tracking.record_issued(issued, issued_v);
+    inner.servo_target = None;
+    inner.commanded_velocities[0] = 0.04;
+    let lead_before = inner.tracking.last_issued_positions.as_ref().unwrap()[0] - inner.commanded_positions[0];
+    assert!(lead_before >= 0.015, "expected active stream lead, got {lead_before:.4}");
+
+    let obs = inner.tick(DT);
+    assert!(obs.safety_state.is_operational(), "final braking tick faulted: {:?}", obs.fault);
+    assert_eq!(inner.commanded_velocities[0], 0.0, "nominal velocity reached 0 on final braking tick");
+    let residual_after_final_brake =
+        (inner.tracking.last_issued_positions.as_ref().unwrap()[0] - inner.commanded_positions[0]).abs();
+    assert!(
+        residual_after_final_brake > 1e-3,
+        "residual lead should still be ramping after 1 tick (got {residual_after_final_brake:.5})"
+    );
+    assert!(
+        inner.servo_stream_active,
+        "servo_stream_active must stay TRUE while residual lead is still ramping out"
+    );
+
+    // Pin measured position and verify stream ownership clears ONLY once residual lead reaches 0.
+    let mut cleared = false;
+    for _ in 0..20 {
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational());
+        if !inner.servo_stream_active {
+            let rem = (inner.tracking.last_issued_positions.as_ref().unwrap()[0] - inner.commanded_positions[0]).abs();
+            assert!(rem <= 1e-4, "stream ownership cleared while residual lead {rem:.5} remained");
+            cleared = true;
+            break;
+        }
+    }
+    assert!(cleared, "servo_stream_active must clear once residual lead finishes ramping");
+    assert!(!drv.with(|s| s.written.is_empty()));
 }

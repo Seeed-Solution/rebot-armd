@@ -5240,7 +5240,14 @@ impl SupervisorInner {
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                                 self.servo_ws_min_depths = None;
-                                self.servo_stream_active = false;
+                                let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                                    && self.tracking.has_residual_lead(
+                                        &self.commanded_positions,
+                                        &self.config.arm_joint_indices(),
+                                    );
+                                if !keep_stream {
+                                    self.servo_stream_active = false;
+                                }
                             }
                         }
                     }
@@ -5291,7 +5298,15 @@ impl SupervisorInner {
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
                     self.servo_ws_min_depths = None;
-                    self.servo_stream_active = false;
+                    let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                        && (braking
+                            || self.tracking.has_residual_lead(
+                                &self.commanded_positions,
+                                &self.config.arm_joint_indices(),
+                            ));
+                    if !keep_stream {
+                        self.servo_stream_active = false;
+                    }
                 }
             }
         }
@@ -5586,6 +5601,18 @@ impl SupervisorInner {
                 self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
             }
             tracing::error!("Control output failed: {error}");
+        }
+
+        if self.servo_stream_active
+            && self.servo_target.is_none()
+            && (self.safety.state().is_stopped()
+                || (self.commanded_velocities.iter().all(|&v| v == 0.0)
+                    && !self.tracking.has_residual_lead(
+                        &self.commanded_positions,
+                        &self.config.arm_joint_indices(),
+                    )))
+        {
+            self.servo_stream_active = false;
         }
 
         let tick_output_accepted = !tick_output_rejected && !self.safety.state().is_stopped();
