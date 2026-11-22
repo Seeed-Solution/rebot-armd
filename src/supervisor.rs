@@ -7782,9 +7782,11 @@ impl ArmSupervisor {
 
     async fn tick_shared(&self, dt: f64) -> Arc<ArmObservation> {
         let started = Instant::now();
-        let (obs, wait, lock_held, control_hz, pending_zc) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, others) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
+            // No other guard exists now: the log is complete up to the guard waited for.
+            let log = self.inner.take_log().unwrap_or_default();
             inner.defer_zero_check_persist = true;
             let obs = Arc::new(inner.tick(dt));
             inner.defer_zero_check_persist = false;
@@ -7794,10 +7796,9 @@ impl ArmSupervisor {
             let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
                 .min(inner.observation_valid_for(&obs));
             self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
-            (obs, locked - started, locked.elapsed(), control_hz, pending_zc)
+            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, log)
         };
         let released = Instant::now();
-        let others = self.inner.take_maxima();
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
