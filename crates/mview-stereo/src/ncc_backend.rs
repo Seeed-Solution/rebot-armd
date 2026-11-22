@@ -1,7 +1,10 @@
 //! NCC backend selection, checked patch views, ISA detection, scalar oracle, and diagnostics.
 
+use std::borrow::Cow;
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 use std::cell::Cell;
 use std::fmt;
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 use std::sync::OnceLock;
 
 use crate::{Gray, PATCH_R};
@@ -10,6 +13,7 @@ use crate::{Gray, PATCH_R};
 pub(crate) const HALF_GRID_MAX_R: usize = 16;
 
 /// Compiled-in RVV 0.7.1 archive availability (enabled by feature `xthead-ncc` and `build.rs` on `riscv64gc-unknown-linux-musl`).
+#[cfg(any(test, feature = "xthead-ncc", feature = "mview-profile"))]
 const HAS_COMPILED_XTHEAD071: bool = cfg!(all(feature = "xthead-ncc", mview_has_xthead071));
 
 #[cfg(all(feature = "xthead-ncc", mview_has_xthead071))]
@@ -72,10 +76,11 @@ pub struct KernelCallCounts {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct BackendDiagnostics {
     pub backend: &'static str,
-    pub reason: String,
+    pub reason: Cow<'static, str>,
     pub counts: KernelCallCounts,
 }
 
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 thread_local! {
     static KERNEL_COUNTS: Cell<KernelCallCounts> = const {
         Cell::new(KernelCallCounts {
@@ -92,31 +97,65 @@ thread_local! {
 }
 
 /// Reset the calling thread's kernel call counters to zero.
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 pub fn reset_kernel_counts() {
     KERNEL_COUNTS.with(|c| c.set(KernelCallCounts::default()));
 }
 
+/// Reset the calling thread's kernel call counters to zero (no-op without `xthead-ncc` or `mview-profile`).
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+pub fn reset_kernel_counts() {}
+
 /// Read the calling thread's kernel call counters.
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 pub fn kernel_counts() -> KernelCallCounts {
     KERNEL_COUNTS.with(Cell::get)
 }
 
+/// Read the calling thread's kernel call counters (always zero without `xthead-ncc` or `mview-profile`).
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+pub fn kernel_counts() -> KernelCallCounts {
+    KernelCallCounts::default()
+}
+
 /// Report the active backend, selection reason, and current thread's kernel call counts.
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 pub fn backend_diagnostics() -> BackendDiagnostics {
     let sel = active_selection();
     BackendDiagnostics {
         backend: sel.backend.as_str(),
-        reason: sel.reason.clone(),
+        reason: Cow::Borrowed(sel.reason.as_str()),
         counts: kernel_counts(),
     }
 }
 
+/// Report the active backend, static build reason, and zero kernel counts when built without
+/// `xthead-ncc` or `mview-profile`.
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+pub fn backend_diagnostics() -> BackendDiagnostics {
+    BackendDiagnostics {
+        backend: NccBackendKind::Scalar.as_str(),
+        reason: Cow::Borrowed("scalar (built without xthead-ncc)"),
+        counts: KernelCallCounts::default(),
+    }
+}
+
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn record_coarse_dots(kind: NccBackendKind, cells: u64) {
     record_coarse_dots_batch(kind, 1, cells);
 }
 
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+#[allow(dead_code)]
+pub(crate) fn record_coarse_dots(_kind: NccBackendKind, _cells: u64) {}
+
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 #[inline]
 pub(crate) fn record_coarse_dots_batch(kind: NccBackendKind, calls: u64, cells: u64) {
     if calls == 0 && cells == 0 {
@@ -138,6 +177,12 @@ pub(crate) fn record_coarse_dots_batch(kind: NccBackendKind, calls: u64, cells: 
     });
 }
 
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+#[allow(dead_code)]
+pub(crate) fn record_coarse_dots_batch(_kind: NccBackendKind, _calls: u64, _cells: u64) {}
+
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 #[inline]
 pub(crate) fn record_half_moments(kind: NccBackendKind) {
     KERNEL_COUNTS.with(|c| {
@@ -150,6 +195,11 @@ pub(crate) fn record_half_moments(kind: NccBackendKind) {
     });
 }
 
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+pub(crate) fn record_half_moments(_kind: NccBackendKind) {}
+
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 #[inline]
 pub(crate) fn record_patch_moments(kind: NccBackendKind) {
     KERNEL_COUNTS.with(|c| {
@@ -161,6 +211,10 @@ pub(crate) fn record_patch_moments(kind: NccBackendKind) {
         c.set(cur);
     });
 }
+
+#[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+#[inline(always)]
+pub(crate) fn record_patch_moments(_kind: NccBackendKind) {}
 
 // ---- Checked patch views ----
 
@@ -365,23 +419,580 @@ pub(crate) fn validate_patch_moments<'a>(
 
 // ---- Once-per-process dispatch & RVV 0.7.1 ISA detection ----
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BackendSelection {
-    pub(crate) backend: NccBackendKind,
-    pub(crate) reason: String,
+#[cfg(any(test, feature = "xthead-ncc", feature = "mview-profile"))]
+mod isa_detect {
+    use super::NccBackendKind;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct BackendSelection {
+        pub(crate) backend: NccBackendKind,
+        pub(crate) reason: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub(crate) struct IsaProbe {
+        pub auxv: Option<Vec<u8>>,
+        pub cpuinfo: Option<String>,
+        pub dt_compatible: Option<Vec<u8>>,
+        pub kernel_release: Option<String>,
+    }
+
+    /// Parse Linux `/proc/self/auxv` 64-bit LE `(key, val)` pairs up to `AT_NULL` (`k == 0`)
+    /// and return whether `AT_HWCAP` (`k == 16`) has bit 21 (`'V' - 'A'`) set.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn parse_hwcap_v(auxv: &[u8]) -> Result<bool, &'static str> {
+        if auxv.is_empty() {
+            return Err("auxv:empty");
+        }
+        if !auxv.len().is_multiple_of(16) {
+            return Err("auxv:truncated");
+        }
+        let mut hwcap_v = None;
+        for chunk in auxv.chunks_exact(16) {
+            let k = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let v = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+            if k == 0 {
+                return Ok(hwcap_v.unwrap_or(false));
+            }
+            if k == 16 {
+                hwcap_v = Some((v & (1u64 << 21)) != 0);
+            }
+        }
+        Err("auxv:missing_at_null")
+    }
+
+    /// Split NUL-delimited `/proc/device-tree/compatible` bytes into UTF-8 entries, dropping empty
+    /// trailing entries. Returns an empty vector if any non-empty entry is not valid UTF-8.
+    pub(crate) fn parse_dt_compatibles(raw: &[u8]) -> Vec<&str> {
+        let mut out = Vec::new();
+        for entry in raw.split(|&b| b == 0) {
+            if entry.is_empty() {
+                continue;
+            }
+            let Ok(s) = std::str::from_utf8(entry) else {
+                return Vec::new();
+            };
+            out.push(s);
+        }
+        out
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum RiscvVExt {
+        None,
+        Draft0p7,
+        Unversioned,
+        OtherVersion(u32, Option<u32>),
+        Rvv1Subext,
+        Conflict,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum IsaVersion {
+        None,
+        MajorMinor(u32, Option<u32>),
+    }
+
+    /// Consume `<digits>(p<digits>)?` starting at `bytes[pos]`. Only treats `'p'` as a version
+    /// separator when immediately followed by an ASCII digit so `i2p0p` still parses `p` later.
+    fn parse_version_suffix(bytes: &[u8], pos: &mut usize) -> Result<IsaVersion, &'static str> {
+        if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
+            return Ok(IsaVersion::None);
+        }
+        let read_digits = |p: &mut usize| -> Result<u32, &'static str> {
+            let start = *p;
+            while *p < bytes.len() && bytes[*p].is_ascii_digit() {
+                *p += 1;
+            }
+            std::str::from_utf8(&bytes[start..*p])
+                .map_err(|_| "isa:version_overflow")?
+                .parse::<u32>()
+                .map_err(|_| "isa:version_overflow")
+        };
+        let major = read_digits(pos)?;
+        let mut minor = None;
+        if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
+            *pos += 1;
+            minor = Some(read_digits(pos)?);
+            if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
+                return Err("isa:extra_version_component");
+            }
+        }
+        Ok(IsaVersion::MajorMinor(major, minor))
+    }
+
+    /// Validate an optional trailing `<digits>(p<digits>)*` version suffix on a multi-letter
+    /// (`z*`/`x*`/`s*`) extension segment so overflow and extra components are rejected uniformly.
+    fn validate_multi_ext_version(ext: &str) -> Result<(), &'static str> {
+        let bytes = ext.as_bytes();
+        let mut i = bytes.len();
+        if i == 0 || !bytes[i - 1].is_ascii_digit() {
+            return Ok(());
+        }
+        loop {
+            while i > 0 && bytes[i - 1].is_ascii_digit() {
+                i -= 1;
+            }
+            if i >= 2 && bytes[i - 1] == b'p' && bytes[i - 2].is_ascii_digit() {
+                i -= 1;
+                continue;
+            }
+            break;
+        }
+        let mut pos = i;
+        let _ = parse_version_suffix(bytes, &mut pos)?;
+        debug_assert_eq!(pos, bytes.len());
+        Ok(())
+    }
+
+    fn is_single_letter_ext(b: u8) -> bool {
+        matches!(
+            b,
+            b'm' | b'a'
+                | b'f'
+                | b'd'
+                | b'c'
+                | b'b'
+                | b'k'
+                | b'j'
+                | b'p'
+                | b'v'
+                | b'h'
+                | b'n'
+                | b'q'
+                | b'l'
+                | b't'
+                | b's'
+                | b'u'
+        )
+    }
+
+    fn is_rvv1_subext_name(seg: &str) -> bool {
+        let is_zve = seg
+            .strip_prefix("zve")
+            .is_some_and(|r| r.as_bytes().first().is_some_and(u8::is_ascii_digit));
+        let is_zvl = seg
+            .strip_prefix("zvl")
+            .is_some_and(|r| r.as_bytes().first().is_some_and(u8::is_ascii_digit));
+        is_zve || is_zvl
+    }
+
+    fn classify_v_version(ver: IsaVersion) -> RiscvVExt {
+        match ver {
+            IsaVersion::None => RiscvVExt::Unversioned,
+            IsaVersion::MajorMinor(0, Some(7)) => RiscvVExt::Draft0p7,
+            IsaVersion::MajorMinor(maj, min) => RiscvVExt::OtherVersion(maj, min),
+        }
+    }
+
+    fn record_v_ext(cur: &mut RiscvVExt, next: RiscvVExt) {
+        match (*cur, next) {
+            (RiscvVExt::None, n) => *cur = n,
+            (RiscvVExt::Conflict, _) | (_, RiscvVExt::Conflict) => *cur = RiscvVExt::Conflict,
+            _ => *cur = RiscvVExt::Conflict,
+        }
+    }
+
+    /// Strictly parse a RISC-V `isa` string and classify its vector extension identity.
+    pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
+        let lower = isa.trim().to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("rv64") else {
+            return Err("isa:not_rv64");
+        };
+        if rest.is_empty() {
+            return Err("isa:empty_after_rv64");
+        }
+
+        let mut segments = rest.split('_');
+        let seg0 = segments.next().ok_or("isa:empty")?;
+        if seg0.is_empty() {
+            return Err("isa:empty_base_segment");
+        }
+
+        let mut v_ext = RiscvVExt::None;
+        let mut rvv1_subext = false;
+
+        // Parse seg0: base letter ('i' | 'e' | 'g') + single-letter extensions (optionally versioned),
+        // stopping cleanly if a multi-letter z*/x*/s* suffix appears without '_' at the end of seg0.
+        let b0 = seg0.as_bytes();
+        if !matches!(b0[0], b'i' | b'e' | b'g') {
+            return Err("isa:invalid_base");
+        }
+        let mut pos = 1usize;
+        let _base_ver = parse_version_suffix(b0, &mut pos)?;
+        while pos < b0.len() {
+            let ch = b0[pos];
+            if matches!(ch, b'z' | b'x') {
+                let tail = &seg0[pos..];
+                if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return Err("isa:invalid_multi_ext");
+                }
+                validate_multi_ext_version(tail)?;
+                if is_rvv1_subext_name(tail) {
+                    rvv1_subext = true;
+                }
+                break;
+            }
+            if ch == b's' {
+                let single_s = pos + 1 == b0.len()
+                    || b0[pos + 1].is_ascii_digit()
+                    || (b0[pos + 1] == b'u' && (pos + 2 == b0.len() || b0[pos + 2].is_ascii_digit()));
+                if !single_s {
+                    let tail = &seg0[pos..];
+                    if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                        return Err("isa:invalid_multi_ext");
+                    }
+                    validate_multi_ext_version(tail)?;
+                    break;
+                }
+            }
+            if !is_single_letter_ext(ch) {
+                return Err("isa:invalid_single_ext");
+            }
+            pos += 1;
+            let ver = parse_version_suffix(b0, &mut pos)?;
+            if ch == b'v' {
+                record_v_ext(&mut v_ext, classify_v_version(ver));
+            }
+        }
+
+        // Parse remaining underscore-separated segments.
+        for seg in segments {
+            if seg.is_empty() {
+                return Err("isa:empty_segment");
+            }
+            let sb = seg.as_bytes();
+            if !sb[0].is_ascii_lowercase() || !seg.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return Err("isa:invalid_segment_chars");
+            }
+            if matches!(sb[0], b'z' | b'x') {
+                if seg.len() < 2 {
+                    return Err("isa:short_multi_ext");
+                }
+                validate_multi_ext_version(seg)?;
+                if is_rvv1_subext_name(seg) {
+                    rvv1_subext = true;
+                }
+            } else if sb[0] == b's' && seg.len() > 1 && !sb[1].is_ascii_digit() {
+                // Multi-letter supervisor extension such as sstc, svpbmt.
+                validate_multi_ext_version(seg)?;
+            } else {
+                if !is_single_letter_ext(sb[0]) {
+                    return Err("isa:invalid_single_ext");
+                }
+                let mut p = 1usize;
+                let ver = parse_version_suffix(sb, &mut p)?;
+                if p != sb.len() {
+                    return Err("isa:trailing_garbage");
+                }
+                if sb[0] == b'v' {
+                    record_v_ext(&mut v_ext, classify_v_version(ver));
+                }
+            }
+        }
+
+        if rvv1_subext {
+            match v_ext {
+                RiscvVExt::None => return Ok(RiscvVExt::Rvv1Subext),
+                RiscvVExt::OtherVersion(_, _) => return Ok(v_ext),
+                _ => return Ok(RiscvVExt::Conflict),
+            }
+        }
+        Ok(v_ext)
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct HartInfo<'a> {
+        saw_processor: bool,
+        isa: Option<&'a str>,
+        uarch: Option<&'a str>,
+        duplicate_conflict: bool,
+    }
+
+    fn parse_cpuinfo_harts(cpuinfo: &str) -> Vec<HartInfo<'_>> {
+        let mut harts = Vec::new();
+        let mut cur = HartInfo::default();
+        let mut has_fields = false;
+
+        for raw_line in cpuinfo.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                if has_fields {
+                    harts.push(cur);
+                    cur = HartInfo::default();
+                    has_fields = false;
+                }
+                continue;
+            }
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("processor") {
+                if cur.saw_processor {
+                    harts.push(cur);
+                    cur = HartInfo::default();
+                }
+                cur.saw_processor = true;
+                has_fields = true;
+            } else if key.eq_ignore_ascii_case("isa") {
+                has_fields = true;
+                if let Some(prev) = cur.isa {
+                    if prev != val {
+                        cur.duplicate_conflict = true;
+                    }
+                } else {
+                    cur.isa = Some(val);
+                }
+            } else if key.eq_ignore_ascii_case("uarch") {
+                has_fields = true;
+                if let Some(prev) = cur.uarch {
+                    if prev != val {
+                        cur.duplicate_conflict = true;
+                    }
+                } else {
+                    cur.uarch = Some(val);
+                }
+            } else {
+                has_fields = true;
+            }
+        }
+        if has_fields {
+            harts.push(cur);
+        }
+        harts
+    }
+
+    fn sanitize_field(s: &str, max_bytes: usize) -> String {
+        let cleaned: String = s
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_graphic() && !matches!(c, ';' | '(' | ')') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if cleaned.is_empty() {
+            return "-".to_string();
+        }
+        if cleaned.len() <= max_bytes {
+            cleaned
+        } else {
+            cleaned[..max_bytes].to_string()
+        }
+    }
+
+    pub(crate) fn detect_backend(
+        env: Option<Result<&str, ()>>,
+        has_compiled_kernel: bool,
+        probe: &IsaProbe,
+    ) -> BackendSelection {
+        match env {
+            Some(Ok("scalar")) => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "env:scalar".to_string(),
+                };
+            }
+            Some(Ok("auto")) | None => {}
+            Some(Ok(other)) => {
+                let tag = if other.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    sanitize_field(other, 48)
+                };
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: format!("env:unknown:{tag}"),
+                };
+            }
+            Some(Err(())) => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "env:unknown:non_utf8".to_string(),
+                };
+            }
+        }
+
+        if !has_compiled_kernel {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "scalar-only".to_string(),
+            };
+        }
+
+        let Some(auxv) = probe.auxv.as_deref() else {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "auxv:missing".to_string(),
+            };
+        };
+        match parse_hwcap_v(auxv) {
+            Ok(true) => {}
+            Ok(false) => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "auxv:no_v_hwcap".to_string(),
+                };
+            }
+            Err(err) => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: err.to_string(),
+                };
+            }
+        }
+
+        let Some(cpuinfo) = probe.cpuinfo.as_deref() else {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "cpuinfo:missing".to_string(),
+            };
+        };
+        let harts = parse_cpuinfo_harts(cpuinfo);
+        if harts.is_empty() {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "cpuinfo:no_harts".to_string(),
+            };
+        }
+
+        let mut first_v: Option<RiscvVExt> = None;
+        let mut first_uarch: Option<Option<&str>> = None;
+        let mut first_isa_raw: &str = "";
+
+        for hart in &harts {
+            if hart.duplicate_conflict {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "cpuinfo:conflicting_hart".to_string(),
+                };
+            }
+            let Some(isa_str) = hart.isa else {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "cpuinfo:missing_isa".to_string(),
+                };
+            };
+            let parsed = match parse_riscv_isa(isa_str) {
+                Ok(v) => v,
+                Err(err) => {
+                    return BackendSelection {
+                        backend: NccBackendKind::Scalar,
+                        reason: err.to_string(),
+                    };
+                }
+            };
+            match first_v {
+                None => {
+                    first_v = Some(parsed);
+                    first_uarch = Some(hart.uarch);
+                    first_isa_raw = isa_str;
+                }
+                Some(ref v0)
+                    if *v0 != parsed
+                        || first_uarch != Some(hart.uarch)
+                        || !first_isa_raw.trim().eq_ignore_ascii_case(isa_str.trim()) =>
+                {
+                    return BackendSelection {
+                        backend: NccBackendKind::Scalar,
+                        reason: "cpuinfo:mixed_harts".to_string(),
+                    };
+                }
+                Some(_) => {}
+            }
+        }
+
+        let v_ext = first_v.expect("harts is non-empty");
+        let uarch = first_uarch.flatten();
+
+        match v_ext {
+            RiscvVExt::Draft0p7 | RiscvVExt::Unversioned => {}
+            RiscvVExt::OtherVersion(_, _) | RiscvVExt::Rvv1Subext => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "isa:non_0p7_v".to_string(),
+                };
+            }
+            RiscvVExt::Conflict => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "isa:conflicting_v".to_string(),
+                };
+            }
+            RiscvVExt::None => {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "isa:no_v".to_string(),
+                };
+            }
+        }
+
+        let Some(raw_dt) = probe.dt_compatible.as_deref() else {
+            return BackendSelection {
+                backend: NccBackendKind::Scalar,
+                reason: "dt:missing".to_string(),
+            };
+        };
+        let dt_compat = parse_dt_compatibles(raw_dt);
+
+        if let Some(u) = uarch {
+            if u != "thead,c906" {
+                return BackendSelection {
+                    backend: NccBackendKind::Scalar,
+                    reason: "uarch:unsupported".to_string(),
+                };
+            }
+        }
+
+        if dt_compat.contains(&"cvitek,cv181x") {
+            let reason = match v_ext {
+                RiscvVExt::Draft0p7 => "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x",
+                RiscvVExt::Unversioned => "detect:hwcap_v+isa_v+dt_cvitek_cv181x",
+                _ => unreachable!("checked above"),
+            };
+            return BackendSelection {
+                backend: NccBackendKind::Xthead071,
+                reason: reason.to_string(),
+            };
+        }
+
+        let isa_s = sanitize_field(first_isa_raw, 64);
+        let uarch_s = uarch.map_or_else(|| "-".to_string(), |u| sanitize_field(u, 48));
+        let compat_joined = if dt_compat.is_empty() {
+            "-".to_string()
+        } else {
+            sanitize_field(&dt_compat.join("|"), 64)
+        };
+        let os_s = probe
+            .kernel_release
+            .as_deref()
+            .map(str::trim)
+            .map_or_else(|| "-".to_string(), |k| sanitize_field(k, 48));
+        BackendSelection {
+            backend: NccBackendKind::Scalar,
+            reason: format!(
+                "dt:unsupported_compatible(isa={isa_s};uarch={uarch_s};compat={compat_joined};osrelease={os_s})"
+            ),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct IsaProbe {
-    pub auxv: Option<Vec<u8>>,
-    pub cpuinfo: Option<String>,
-    pub dt_compatible: Option<Vec<u8>>,
-    pub kernel_release: Option<String>,
-}
+#[cfg(any(test, feature = "xthead-ncc", feature = "mview-profile"))]
+use isa_detect::*;
 
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 static ACTIVE_SELECTION: OnceLock<BackendSelection> = OnceLock::new();
 
-#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+#[cfg(all(
+    any(feature = "xthead-ncc", feature = "mview-profile"),
+    target_os = "linux",
+    target_arch = "riscv64"
+))]
 fn read_os_probe() -> IsaProbe {
     IsaProbe {
         auxv: std::fs::read("/proc/self/auxv").ok(),
@@ -391,11 +1002,15 @@ fn read_os_probe() -> IsaProbe {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "riscv64")))]
+#[cfg(all(
+    any(feature = "xthead-ncc", feature = "mview-profile"),
+    not(all(target_os = "linux", target_arch = "riscv64"))
+))]
 fn read_os_probe() -> IsaProbe {
     IsaProbe::default()
 }
 
+#[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
 fn active_selection() -> &'static BackendSelection {
     ACTIVE_SELECTION.get_or_init(|| {
         let env = match std::env::var("MVIEW_NCC_BACKEND") {
@@ -418,565 +1033,30 @@ fn active_selection() -> &'static BackendSelection {
     })
 }
 
-/// Parse Linux `/proc/self/auxv` 64-bit LE `(key, val)` pairs up to `AT_NULL` (`k == 0`)
-/// and return whether `AT_HWCAP` (`k == 16`) has bit 21 (`'V' - 'A'`) set.
-pub(crate) fn parse_hwcap_v(auxv: &[u8]) -> Result<bool, &'static str> {
-    if auxv.is_empty() {
-        return Err("auxv:empty");
-    }
-    if !auxv.len().is_multiple_of(16) {
-        return Err("auxv:truncated");
-    }
-    let mut hwcap_v = None;
-    for chunk in auxv.chunks_exact(16) {
-        let k = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let v = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
-        if k == 0 {
-            return Ok(hwcap_v.unwrap_or(false));
-        }
-        if k == 16 {
-            hwcap_v = Some((v & (1u64 << 21)) != 0);
-        }
-    }
-    Err("auxv:missing_at_null")
-}
-
-/// Split NUL-delimited `/proc/device-tree/compatible` bytes into UTF-8 entries, dropping empty
-/// trailing entries. Returns an empty vector if any non-empty entry is not valid UTF-8.
-pub(crate) fn parse_dt_compatibles(raw: &[u8]) -> Vec<&str> {
-    let mut out = Vec::new();
-    for entry in raw.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let Ok(s) = std::str::from_utf8(entry) else {
-            return Vec::new();
-        };
-        out.push(s);
-    }
-    out
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RiscvVExt {
-    None,
-    Draft0p7,
-    Unversioned,
-    OtherVersion(u32, Option<u32>),
-    Rvv1Subext,
-    Conflict,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IsaVersion {
-    None,
-    MajorMinor(u32, Option<u32>),
-}
-
-/// Consume `<digits>(p<digits>)?` starting at `bytes[pos]`. Only treats `'p'` as a version
-/// separator when immediately followed by an ASCII digit so `i2p0p` still parses `p` later.
-fn parse_version_suffix(bytes: &[u8], pos: &mut usize) -> Result<IsaVersion, &'static str> {
-    if *pos >= bytes.len() || !bytes[*pos].is_ascii_digit() {
-        return Ok(IsaVersion::None);
-    }
-    let read_digits = |p: &mut usize| -> Result<u32, &'static str> {
-        let start = *p;
-        while *p < bytes.len() && bytes[*p].is_ascii_digit() {
-            *p += 1;
-        }
-        std::str::from_utf8(&bytes[start..*p])
-            .map_err(|_| "isa:version_overflow")?
-            .parse::<u32>()
-            .map_err(|_| "isa:version_overflow")
-    };
-    let major = read_digits(pos)?;
-    let mut minor = None;
-    if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
-        *pos += 1;
-        minor = Some(read_digits(pos)?);
-        if *pos + 1 < bytes.len() && bytes[*pos] == b'p' && bytes[*pos + 1].is_ascii_digit() {
-            return Err("isa:extra_version_component");
-        }
-    }
-    Ok(IsaVersion::MajorMinor(major, minor))
-}
-
-/// Validate an optional trailing `<digits>(p<digits>)*` version suffix on a multi-letter
-/// (`z*`/`x*`/`s*`) extension segment so overflow and extra components are rejected uniformly.
-fn validate_multi_ext_version(ext: &str) -> Result<(), &'static str> {
-    let bytes = ext.as_bytes();
-    let mut i = bytes.len();
-    if i == 0 || !bytes[i - 1].is_ascii_digit() {
-        return Ok(());
-    }
-    loop {
-        while i > 0 && bytes[i - 1].is_ascii_digit() {
-            i -= 1;
-        }
-        if i >= 2 && bytes[i - 1] == b'p' && bytes[i - 2].is_ascii_digit() {
-            i -= 1;
-            continue;
-        }
-        break;
-    }
-    let mut pos = i;
-    let _ = parse_version_suffix(bytes, &mut pos)?;
-    debug_assert_eq!(pos, bytes.len());
-    Ok(())
-}
-
-fn is_single_letter_ext(b: u8) -> bool {
-    matches!(
-        b,
-        b'm' | b'a'
-            | b'f'
-            | b'd'
-            | b'c'
-            | b'b'
-            | b'k'
-            | b'j'
-            | b'p'
-            | b'v'
-            | b'h'
-            | b'n'
-            | b'q'
-            | b'l'
-            | b't'
-            | b's'
-            | b'u'
-    )
-}
-
-fn is_rvv1_subext_name(seg: &str) -> bool {
-    let is_zve = seg
-        .strip_prefix("zve")
-        .is_some_and(|r| r.as_bytes().first().is_some_and(u8::is_ascii_digit));
-    let is_zvl = seg
-        .strip_prefix("zvl")
-        .is_some_and(|r| r.as_bytes().first().is_some_and(u8::is_ascii_digit));
-    is_zve || is_zvl
-}
-
-fn classify_v_version(ver: IsaVersion) -> RiscvVExt {
-    match ver {
-        IsaVersion::None => RiscvVExt::Unversioned,
-        IsaVersion::MajorMinor(0, Some(7)) => RiscvVExt::Draft0p7,
-        IsaVersion::MajorMinor(maj, min) => RiscvVExt::OtherVersion(maj, min),
-    }
-}
-
-fn record_v_ext(cur: &mut RiscvVExt, next: RiscvVExt) {
-    match (*cur, next) {
-        (RiscvVExt::None, n) => *cur = n,
-        (RiscvVExt::Conflict, _) | (_, RiscvVExt::Conflict) => *cur = RiscvVExt::Conflict,
-        _ => *cur = RiscvVExt::Conflict,
-    }
-}
-
-/// Strictly parse a RISC-V `isa` string and classify its vector extension identity.
-pub(crate) fn parse_riscv_isa(isa: &str) -> Result<RiscvVExt, &'static str> {
-    let lower = isa.trim().to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("rv64") else {
-        return Err("isa:not_rv64");
-    };
-    if rest.is_empty() {
-        return Err("isa:empty_after_rv64");
-    }
-
-    let mut segments = rest.split('_');
-    let seg0 = segments.next().ok_or("isa:empty")?;
-    if seg0.is_empty() {
-        return Err("isa:empty_base_segment");
-    }
-
-    let mut v_ext = RiscvVExt::None;
-    let mut rvv1_subext = false;
-
-    // Parse seg0: base letter ('i' | 'e' | 'g') + single-letter extensions (optionally versioned),
-    // stopping cleanly if a multi-letter z*/x*/s* suffix appears without '_' at the end of seg0.
-    let b0 = seg0.as_bytes();
-    if !matches!(b0[0], b'i' | b'e' | b'g') {
-        return Err("isa:invalid_base");
-    }
-    let mut pos = 1usize;
-    let _base_ver = parse_version_suffix(b0, &mut pos)?;
-    while pos < b0.len() {
-        let ch = b0[pos];
-        if matches!(ch, b'z' | b'x') {
-            let tail = &seg0[pos..];
-            if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                return Err("isa:invalid_multi_ext");
-            }
-            validate_multi_ext_version(tail)?;
-            if is_rvv1_subext_name(tail) {
-                rvv1_subext = true;
-            }
-            break;
-        }
-        if ch == b's' {
-            let single_s = pos + 1 == b0.len()
-                || b0[pos + 1].is_ascii_digit()
-                || (b0[pos + 1] == b'u' && (pos + 2 == b0.len() || b0[pos + 2].is_ascii_digit()));
-            if !single_s {
-                let tail = &seg0[pos..];
-                if tail.len() < 2 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                    return Err("isa:invalid_multi_ext");
-                }
-                validate_multi_ext_version(tail)?;
-                break;
-            }
-        }
-        if !is_single_letter_ext(ch) {
-            return Err("isa:invalid_single_ext");
-        }
-        pos += 1;
-        let ver = parse_version_suffix(b0, &mut pos)?;
-        if ch == b'v' {
-            record_v_ext(&mut v_ext, classify_v_version(ver));
-        }
-    }
-
-    // Parse remaining underscore-separated segments.
-    for seg in segments {
-        if seg.is_empty() {
-            return Err("isa:empty_segment");
-        }
-        let sb = seg.as_bytes();
-        if !sb[0].is_ascii_lowercase() || !seg.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err("isa:invalid_segment_chars");
-        }
-        if matches!(sb[0], b'z' | b'x') {
-            if seg.len() < 2 {
-                return Err("isa:short_multi_ext");
-            }
-            validate_multi_ext_version(seg)?;
-            if is_rvv1_subext_name(seg) {
-                rvv1_subext = true;
-            }
-        } else if sb[0] == b's' && seg.len() > 1 && !sb[1].is_ascii_digit() {
-            // Multi-letter supervisor extension such as sstc, svpbmt.
-            validate_multi_ext_version(seg)?;
-        } else {
-            if !is_single_letter_ext(sb[0]) {
-                return Err("isa:invalid_single_ext");
-            }
-            let mut p = 1usize;
-            let ver = parse_version_suffix(sb, &mut p)?;
-            if p != sb.len() {
-                return Err("isa:trailing_garbage");
-            }
-            if sb[0] == b'v' {
-                record_v_ext(&mut v_ext, classify_v_version(ver));
-            }
-        }
-    }
-
-    if rvv1_subext {
-        match v_ext {
-            RiscvVExt::None => return Ok(RiscvVExt::Rvv1Subext),
-            RiscvVExt::OtherVersion(_, _) => return Ok(v_ext),
-            _ => return Ok(RiscvVExt::Conflict),
-        }
-    }
-    Ok(v_ext)
-}
-
-#[derive(Debug, Clone, Default)]
-struct HartInfo<'a> {
-    saw_processor: bool,
-    isa: Option<&'a str>,
-    uarch: Option<&'a str>,
-    duplicate_conflict: bool,
-}
-
-fn parse_cpuinfo_harts(cpuinfo: &str) -> Vec<HartInfo<'_>> {
-    let mut harts = Vec::new();
-    let mut cur = HartInfo::default();
-    let mut has_fields = false;
-
-    for raw_line in cpuinfo.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            if has_fields {
-                harts.push(cur);
-                cur = HartInfo::default();
-                has_fields = false;
-            }
-            continue;
-        }
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let key = k.trim();
-        let val = v.trim();
-        if key.eq_ignore_ascii_case("processor") {
-            if cur.saw_processor {
-                harts.push(cur);
-                cur = HartInfo::default();
-            }
-            cur.saw_processor = true;
-            has_fields = true;
-        } else if key.eq_ignore_ascii_case("isa") {
-            has_fields = true;
-            if let Some(prev) = cur.isa {
-                if prev != val {
-                    cur.duplicate_conflict = true;
-                }
-            } else {
-                cur.isa = Some(val);
-            }
-        } else if key.eq_ignore_ascii_case("uarch") {
-            has_fields = true;
-            if let Some(prev) = cur.uarch {
-                if prev != val {
-                    cur.duplicate_conflict = true;
-                }
-            } else {
-                cur.uarch = Some(val);
-            }
-        } else {
-            has_fields = true;
-        }
-    }
-    if has_fields {
-        harts.push(cur);
-    }
-    harts
-}
-
-fn sanitize_field(s: &str, max_bytes: usize) -> String {
-    let cleaned: String = s
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_graphic() && !matches!(c, ';' | '(' | ')') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        return "-".to_string();
-    }
-    if cleaned.len() <= max_bytes {
-        cleaned
-    } else {
-        cleaned[..max_bytes].to_string()
-    }
-}
-
-pub(crate) fn detect_backend(
-    env: Option<Result<&str, ()>>,
-    has_compiled_kernel: bool,
-    probe: &IsaProbe,
-) -> BackendSelection {
-    match env {
-        Some(Ok("scalar")) => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "env:scalar".to_string(),
-            };
-        }
-        Some(Ok("auto")) | None => {}
-        Some(Ok(other)) => {
-            let tag = if other.is_empty() {
-                "<empty>".to_string()
-            } else {
-                sanitize_field(other, 48)
-            };
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: format!("env:unknown:{tag}"),
-            };
-        }
-        Some(Err(())) => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "env:unknown:non_utf8".to_string(),
-            };
-        }
-    }
-
-    if !has_compiled_kernel {
-        return BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "scalar-only".to_string(),
-        };
-    }
-
-    let Some(auxv) = probe.auxv.as_deref() else {
-        return BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "auxv:missing".to_string(),
-        };
-    };
-    match parse_hwcap_v(auxv) {
-        Ok(true) => {}
-        Ok(false) => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "auxv:no_v_hwcap".to_string(),
-            };
-        }
-        Err(err) => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: err.to_string(),
-            };
-        }
-    }
-
-    let Some(cpuinfo) = probe.cpuinfo.as_deref() else {
-        return BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "cpuinfo:missing".to_string(),
-        };
-    };
-    let harts = parse_cpuinfo_harts(cpuinfo);
-    if harts.is_empty() {
-        return BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "cpuinfo:no_harts".to_string(),
-        };
-    }
-
-    let mut first_v: Option<RiscvVExt> = None;
-    let mut first_uarch: Option<Option<&str>> = None;
-    let mut first_isa_raw: &str = "";
-
-    for hart in &harts {
-        if hart.duplicate_conflict {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "cpuinfo:conflicting_hart".to_string(),
-            };
-        }
-        let Some(isa_str) = hart.isa else {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "cpuinfo:missing_isa".to_string(),
-            };
-        };
-        let parsed = match parse_riscv_isa(isa_str) {
-            Ok(v) => v,
-            Err(err) => {
-                return BackendSelection {
-                    backend: NccBackendKind::Scalar,
-                    reason: err.to_string(),
-                };
-            }
-        };
-        match first_v {
-            None => {
-                first_v = Some(parsed);
-                first_uarch = Some(hart.uarch);
-                first_isa_raw = isa_str;
-            }
-            Some(ref v0)
-                if *v0 != parsed
-                    || first_uarch != Some(hart.uarch)
-                    || !first_isa_raw.trim().eq_ignore_ascii_case(isa_str.trim()) =>
-            {
-                return BackendSelection {
-                    backend: NccBackendKind::Scalar,
-                    reason: "cpuinfo:mixed_harts".to_string(),
-                };
-            }
-            Some(_) => {}
-        }
-    }
-
-    let v_ext = first_v.expect("harts is non-empty");
-    let uarch = first_uarch.flatten();
-
-    match v_ext {
-        RiscvVExt::Draft0p7 | RiscvVExt::Unversioned => {}
-        RiscvVExt::OtherVersion(_, _) | RiscvVExt::Rvv1Subext => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "isa:non_0p7_v".to_string(),
-            };
-        }
-        RiscvVExt::Conflict => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "isa:conflicting_v".to_string(),
-            };
-        }
-        RiscvVExt::None => {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "isa:no_v".to_string(),
-            };
-        }
-    }
-
-    let Some(raw_dt) = probe.dt_compatible.as_deref() else {
-        return BackendSelection {
-            backend: NccBackendKind::Scalar,
-            reason: "dt:missing".to_string(),
-        };
-    };
-    let dt_compat = parse_dt_compatibles(raw_dt);
-
-    if let Some(u) = uarch {
-        if u != "thead,c906" {
-            return BackendSelection {
-                backend: NccBackendKind::Scalar,
-                reason: "uarch:unsupported".to_string(),
-            };
-        }
-    }
-
-    if dt_compat.contains(&"cvitek,cv181x") {
-        let reason = match v_ext {
-            RiscvVExt::Draft0p7 => "detect:hwcap_v+isa_v0p7+dt_cvitek_cv181x",
-            RiscvVExt::Unversioned => "detect:hwcap_v+isa_v+dt_cvitek_cv181x",
-            _ => unreachable!("checked above"),
-        };
-        return BackendSelection {
-            backend: NccBackendKind::Xthead071,
-            reason: reason.to_string(),
-        };
-    }
-
-    let isa_s = sanitize_field(first_isa_raw, 64);
-    let uarch_s = uarch.map_or_else(|| "-".to_string(), |u| sanitize_field(u, 48));
-    let compat_joined = if dt_compat.is_empty() {
-        "-".to_string()
-    } else {
-        sanitize_field(&dt_compat.join("|"), 64)
-    };
-    let os_s = probe
-        .kernel_release
-        .as_deref()
-        .map(str::trim)
-        .map_or_else(|| "-".to_string(), |k| sanitize_field(k, 48));
-    BackendSelection {
-        backend: NccBackendKind::Scalar,
-        reason: format!(
-            "dt:unsupported_compatible(isa={isa_s};uarch={uarch_s};compat={compat_joined};osrelease={os_s})"
-        ),
-    }
-}
-
 // ---- Injectable NccBackend & scalar implementations ----
 
 /// Selectable NCC kernel backend (injectable in unit tests; cached per process via `active()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NccBackend {
     Scalar,
+    #[cfg(any(test, feature = "xthead-ncc", feature = "mview-profile"))]
     Xthead071,
 }
 
 impl NccBackend {
+    #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
     #[inline]
     pub(crate) fn active() -> Self {
         match active_selection().backend {
             NccBackendKind::Scalar => Self::Scalar,
             NccBackendKind::Xthead071 => Self::Xthead071,
         }
+    }
+
+    #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+    #[inline(always)]
+    pub(crate) const fn active() -> Self {
+        Self::Scalar
     }
 
     #[inline]
@@ -990,6 +1070,7 @@ impl NccBackend {
     pub(crate) const fn kind(self) -> NccBackendKind {
         match self {
             Self::Scalar => NccBackendKind::Scalar,
+            #[cfg(any(test, feature = "xthead-ncc", feature = "mview-profile"))]
             Self::Xthead071 => NccBackendKind::Xthead071,
         }
     }
@@ -1025,7 +1106,10 @@ impl NccBackend {
                 record_coarse_dots(NccBackendKind::Xthead071, count as u64);
                 Ok(())
             }
-            #[cfg(not(all(feature = "xthead-ncc", mview_has_xthead071)))]
+            #[cfg(all(
+                any(test, feature = "xthead-ncc", feature = "mview-profile"),
+                not(all(feature = "xthead-ncc", mview_has_xthead071))
+            ))]
             Self::Xthead071 => {
                 if n == 5 {
                     coarse_dots_scalar::<5>(&view, a, n, out);
@@ -1082,7 +1166,10 @@ impl NccBackend {
                 record_half_moments(NccBackendKind::Xthead071);
                 Ok((sum_raw, sumsq_raw, dot))
             }
-            #[cfg(not(all(feature = "xthead-ncc", mview_has_xthead071)))]
+            #[cfg(all(
+                any(test, feature = "xthead-ncc", feature = "mview-profile"),
+                not(all(feature = "xthead-ncc", mview_has_xthead071))
+            ))]
             Self::Xthead071 => {
                 let res = half_moments_scalar_dispatch(&view, a, n, phase);
                 record_half_moments(NccBackendKind::Scalar);
@@ -1106,14 +1193,11 @@ impl NccBackend {
         n: usize,
         bilerp: Option<[f32; 4]>,
     ) -> Result<(f64, f64, f32), PatchError> {
+        let _ = self;
         let view = validate_patch_moments(img, x0, y0, a, weights, n, bilerp)?;
-        match self {
-            Self::Scalar | Self::Xthead071 => {
-                let res = patch_moments_scalar(&view, a, weights, n, bilerp);
-                record_patch_moments(NccBackendKind::Scalar);
-                Ok(res)
-            }
-        }
+        let res = patch_moments_scalar(&view, a, weights, n, bilerp);
+        record_patch_moments(NccBackendKind::Scalar);
+        Ok(res)
     }
 }
 
@@ -1375,9 +1459,15 @@ mod tests {
         let active = NccBackend::active();
         let initial = backend_diagnostics();
         assert_eq!(initial.backend, active.kind().as_str());
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
         if !HAS_COMPILED_XTHEAD071 {
             assert_eq!(initial.backend, "scalar");
             assert_eq!(initial.reason, "scalar-only");
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(initial.backend, "scalar");
+            assert_eq!(initial.reason, "scalar (built without xthead-ncc)");
         }
         assert_eq!(initial.counts, KernelCallCounts::default());
         assert_eq!(NccBackendKind::Scalar.as_str(), "scalar");
@@ -1391,14 +1481,22 @@ mod tests {
 
         let mid = backend_diagnostics();
         assert_eq!(mid.backend, active.kind().as_str());
-        assert_eq!(mid.counts.coarse_dots_scalar, 4);
-        assert_eq!(mid.counts.coarse_cells_scalar, 17);
-        assert_eq!(mid.counts.half_moments_scalar, 2);
-        assert_eq!(mid.counts.patch_moments_scalar, 1);
-        assert_eq!(mid.counts.coarse_dots_xthead071, 0);
-        assert_eq!(mid.counts.coarse_cells_xthead071, 0);
-        assert_eq!(mid.counts.half_moments_xthead071, 0);
-        assert_eq!(mid.counts.patch_moments_xthead071, 0);
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            assert_eq!(mid.counts.coarse_dots_scalar, 4);
+            assert_eq!(mid.counts.coarse_cells_scalar, 17);
+            assert_eq!(mid.counts.half_moments_scalar, 2);
+            assert_eq!(mid.counts.patch_moments_scalar, 1);
+            assert_eq!(mid.counts.coarse_dots_xthead071, 0);
+            assert_eq!(mid.counts.coarse_cells_xthead071, 0);
+            assert_eq!(mid.counts.half_moments_xthead071, 0);
+            assert_eq!(mid.counts.patch_moments_xthead071, 0);
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(mid.reason, "scalar (built without xthead-ncc)");
+            assert_eq!(mid.counts, KernelCallCounts::default());
+        }
 
         reset_kernel_counts();
         assert_eq!(kernel_counts(), KernelCallCounts::default());
@@ -2052,6 +2150,7 @@ mod tests {
         let mut out = vec![0.0f32; 17];
         active.coarse_dots(&img, 2, 4, &a5, 5, &mut out).unwrap();
         let counts = kernel_counts();
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
         match active {
             NccBackend::Scalar => {
                 assert_eq!(counts.coarse_dots_scalar, 1);
@@ -2071,6 +2170,8 @@ mod tests {
                 }
             }
         }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        assert_eq!(counts, KernelCallCounts::default());
     }
 
     #[test]
@@ -2140,6 +2241,7 @@ mod tests {
             active.half_moments(&img, 2, 3, &a9, 9, phase).unwrap();
         }
         let counts = kernel_counts();
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
         match active {
             NccBackend::Scalar => {
                 assert_eq!(counts.half_moments_scalar, 4);
@@ -2155,5 +2257,7 @@ mod tests {
                 }
             }
         }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        assert_eq!(counts, KernelCallCounts::default());
     }
 }

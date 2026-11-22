@@ -2188,18 +2188,26 @@ mod tests {
         assert!(ncc(&img, &t, 1.0, 1.0, true).is_none());
 
         let counts = kernel_counts();
-        match ncc_backend::NccBackend::active() {
-            ncc_backend::NccBackend::Scalar => {
-                assert_eq!(counts.half_moments_scalar, 1);
-                assert_eq!(counts.half_moments_xthead071, 0);
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            match ncc_backend::NccBackend::active() {
+                ncc_backend::NccBackend::Scalar => {
+                    assert_eq!(counts.half_moments_scalar, 1);
+                    assert_eq!(counts.half_moments_xthead071, 0);
+                }
+                ncc_backend::NccBackend::Xthead071 => {
+                    assert_eq!(counts.half_moments_xthead071, 1);
+                    assert_eq!(counts.half_moments_scalar, 0);
+                }
             }
-            ncc_backend::NccBackend::Xthead071 => {
-                assert_eq!(counts.half_moments_xthead071, 1);
-                assert_eq!(counts.half_moments_scalar, 0);
-            }
+            assert_eq!(counts.patch_moments_scalar, 1);
+            assert_eq!(counts.patch_moments_xthead071, 0);
         }
-        assert_eq!(counts.patch_moments_scalar, 1);
-        assert_eq!(counts.patch_moments_xthead071, 0);
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(counts, KernelCallCounts::default());
+            assert_eq!(backend_diagnostics().reason, "scalar (built without xthead-ncc)");
+        }
 
         reset_kernel_counts();
         assert_eq!(kernel_counts(), KernelCallCounts::default());
@@ -2238,6 +2246,7 @@ mod tests {
                 reset_kernel_counts();
                 let got = ncc_half_grid(&img, &t, x, y);
                 let counts = kernel_counts();
+                #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
                 match active {
                     NccBackend::Scalar => {
                         assert_eq!(counts.half_moments_scalar, 1);
@@ -2247,6 +2256,11 @@ mod tests {
                         assert_eq!(counts.half_moments_xthead071, 1);
                         assert_eq!(counts.half_moments_scalar, 0);
                     }
+                }
+                #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+                {
+                    let _ = active;
+                    assert_eq!(counts, KernelCallCounts::default());
                 }
                 let direct_scalar = ncc_half_grid_with_backend(scalar, &img, &t, x, y);
                 assert!(got.is_some());
@@ -2279,9 +2293,14 @@ mod tests {
         reset_kernel_counts();
         let got17 = ncc_half_grid(&img, &t17, 20.5, 20.5);
         let c17 = kernel_counts();
-        assert_eq!(c17.half_moments_scalar, 0);
-        assert_eq!(c17.half_moments_xthead071, 0);
-        assert_eq!(c17.patch_moments_scalar, 1);
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            assert_eq!(c17.half_moments_scalar, 0);
+            assert_eq!(c17.half_moments_xthead071, 0);
+            assert_eq!(c17.patch_moments_scalar, 1);
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        assert_eq!(c17, KernelCallCounts::default());
         assert_ncc_eq(got17, ncc(&img, &t17, 20.5, 20.5, true));
 
         // Weighted template & arbitrary-phase fallback.
@@ -2291,9 +2310,14 @@ mod tests {
         let got_w = ncc_half_grid(&img, &tw, 20.5, 20.0);
         let got_arb = ncc_half_grid(&img, &t4, 20.25, 20.75);
         let c_fb = kernel_counts();
-        assert_eq!(c_fb.half_moments_scalar, 0);
-        assert_eq!(c_fb.half_moments_xthead071, 0);
-        assert_eq!(c_fb.patch_moments_scalar, 2);
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            assert_eq!(c_fb.half_moments_scalar, 0);
+            assert_eq!(c_fb.half_moments_xthead071, 0);
+            assert_eq!(c_fb.patch_moments_scalar, 2);
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        assert_eq!(c_fb, KernelCallCounts::default());
         assert_ncc_eq(got_w, ncc(&img, &tw, 20.5, 20.0, true));
         assert_ncc_eq(got_arb, ncc(&img, &t4, 20.25, 20.75, true));
 

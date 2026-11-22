@@ -448,8 +448,12 @@ fn fill_coarse_scores<const N: usize>(
     let sw = f64::from(t.sw);
     let var_floor = 1e-3 * sw;
     let max_run = (vx1 - vx0 + 1) as usize;
-    coarse_dots.resize(max_run, 0.0);
-    coarse_vars.resize(max_run, 0.0);
+    if coarse_dots.len() < max_run {
+        coarse_dots.resize(max_run, 0.0);
+    }
+    if coarse_vars.len() < max_run {
+        coarse_vars.resize(max_run, 0.0);
+    }
     #[cfg(feature = "mview-profile")]
     let (mut cells_cached, mut cells_flat, mut cells_dotted) = (0u64, 0u64, 0u64);
 
@@ -2471,6 +2475,7 @@ mod tests {
         assert!(res.n_corrs > 0);
         let diag = backend_diagnostics();
         assert_eq!(diag.backend, active.kind().as_str());
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
         match active {
             crate::ncc_backend::NccBackend::Scalar => {
                 assert!(diag.counts.coarse_dots_scalar > 0);
@@ -2488,6 +2493,12 @@ mod tests {
                 assert!(diag.counts.half_moments_xthead071 > 0);
                 assert_eq!(diag.counts.half_moments_scalar, 0);
             }
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(diag.backend, "scalar");
+            assert_eq!(diag.reason, "scalar (built without xthead-ncc)");
+            assert_eq!(diag.counts, KernelCallCounts::default());
         }
 
         reset_kernel_counts();
@@ -2678,6 +2689,7 @@ mod tests {
                 }
                 if backend == active {
                     let counts = kernel_counts();
+                    #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
                     match active {
                         NccBackend::Scalar => {
                             assert!(counts.coarse_dots_scalar > 0, "{label}: expected scalar calls");
@@ -2706,6 +2718,8 @@ mod tests {
                             }
                         }
                     }
+                    #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+                    assert_eq!(counts, KernelCallCounts::default());
                 }
             }
         }

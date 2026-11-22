@@ -1462,12 +1462,24 @@ mod tests {
         let c = compute(&views, 1, ref_box_px, 0.0, PoseRefine::Off, &[]);
 
         assert_eq!(c.ncc_backend.backend, "scalar");
-        assert!(!c.ncc_backend.reason.is_empty(), "reason should be non-empty");
-        assert!(
-            c.ncc_backend.counts.coarse_dots_scalar > 0 || c.ncc_backend.counts.patch_moments_scalar > 0,
-            "expected scalar NCC kernel counts > 0, got {:?}",
-            c.ncc_backend.counts
-        );
+        #[cfg(any(feature = "xthead-ncc", feature = "mview-profile"))]
+        {
+            assert!(!c.ncc_backend.reason.is_empty(), "reason should be non-empty");
+            assert!(
+                c.ncc_backend.counts.coarse_dots_scalar > 0 || c.ncc_backend.counts.patch_moments_scalar > 0,
+                "expected scalar NCC kernel counts > 0, got {:?}",
+                c.ncc_backend.counts
+            );
+        }
+        #[cfg(not(any(feature = "xthead-ncc", feature = "mview-profile")))]
+        {
+            assert_eq!(c.ncc_backend.reason, "scalar (built without xthead-ncc)");
+            assert_eq!(
+                c.ncc_backend.counts,
+                mview_stereo::KernelCallCounts::default(),
+                "expected zero kernel counts when built without xthead-ncc or mview-profile"
+            );
+        }
 
         let arm = crate::chain::ArmModel::default();
         let setup = GraspSetup { image_size_px: [w as f64, h as f64], fx_px: fx, fy_px: fy, cx_px: Some(cx), cy_px: Some(cy), ..GraspSetup::default() };
