@@ -1313,3 +1313,34 @@ fn mit_expiry_recovery_honours_an_estop_arriving_mid_recovery() {
     assert!(r.is_err(), "the recovery reported success with an E-stop pending: {r:?}");
     assert_eq!(*inner.safety.state(), armd::SafetyState::EStop, "{:?}", inner.safety.state());
 }
+
+/// Round 6, #3: after a hand back fails and the rollback to MIT is confirmed, the next frame's
+/// 15 N·m/s slew is relative to the tau_ff the rollback frame really carried: consecutive J4
+/// frames never step by more than 15 dt, also when the clamp then pulls the other way.
+#[test]
+fn mit_rollback_tau_is_the_slew_reference_of_the_next_frame() {
+    let mut cfg = mit_config_j4();
+    { let j4 = &mut cfg.joint_tracking.as_mut().unwrap().joints[3]; j4.effort_limit_nm = 0.6; }
+    let (mut inner, bus) = active_rig(cfg, 0.0);
+    let qc = inner.commanded_positions[3];
+    // the joint sits 33 mrad above its command: pd ~ -0.4 N·m, tau_ff held up at -L - pd ~ -0.2
+    bus.with(|s| { s.follow_commands = false; s.motors[3].v = 0.0; });
+    for d in [0.01_f32, 0.02, 0.0333, 0.0333, 0.0333, 0.0333] {
+        bus.with(|s| { s.motors[3].q = qc + d; s.push_all_feedback(); });
+        inner.tick(DT);
+    }
+    assert!(inner.mit_active() && !inner.safety.state().is_stopped(), "{:?}", inner.safety.fault());
+    bus.clear_log();
+    // the forward hand back gets a wrong acknowledgement once; the rollback to MIT is confirmed
+    bus.with(|s| s.motors[3].ack_value_override_once = Some(99));
+    inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
+    assert!(inner.mit_active(), "rollback kept MIT: {:?}", inner.mit.handover_error);
+    // the clamp now pulls the other way (the joint sits farther above its command)
+    for _ in 0..3 { bus.with(|s| { s.motors[3].q = qc + 0.0417; s.push_all_feedback(); }); inner.tick(DT); }
+    let lsb_t = 20.0 / 4095.0;
+    let frames = mit_frames(&bus.tx_log(), 4);
+    assert!(frames.len() >= 2, "{frames:?}");
+    for w in frames.windows(2) {
+        assert!((w[1].4 - w[0].4).abs() <= 15.0 * DT as f32 + lsb_t + 1e-4, "tau_ff stepped {} -> {} (frames {frames:?})", w[0].4, w[1].4);
+    }
+}

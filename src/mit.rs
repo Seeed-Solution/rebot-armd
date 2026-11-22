@@ -915,7 +915,11 @@ impl crate::supervisor::SupervisorInner {
                     let code = self.mit_loss_code();
                     self.mit_lose(msg.clone(), code);
                 } else {
-                    // switched back to MIT with the hold: still the owner
+                    // switched back to MIT with the hold: still the owner; the rollback hold is what the
+                    // motors now execute, so its tau_ff is the reference of the next frame's slew
+                    for &j in &joints {
+                        if let (Some(t), Some(slot)) = (hold[j].torque, self.mit.last_ff.get_mut(j)) { *slot = t; }
+                    }
                     self.mit.last_output = Some(self.mit_now());
                     self.safety.trigger_fault_coded(crate::safety::FaultCode::HardwareFault, crate::safety::FaultReason::Other(msg.clone()));
                 }
