@@ -229,6 +229,11 @@ pub trait ArmDriver: Send {
     /// Joint indices that received an autonomous driver recovery write during
     /// `read_joint_states` since the previous call, clearing the record.
     fn take_recovery_writes(&mut self) -> Vec<usize> { Vec::new() }
+
+    /// Strict control-mode handover (joint tracking enabled): a mode switch is confirmed
+    /// only when its hold frames and the bus flush also succeed. Off (default) keeps the
+    /// pre-tracking behaviour, where a matching mode acknowledgement confirms the switch.
+    fn set_strict_mode_handover(&mut self, _strict: bool) {}
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -2035,6 +2040,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// Joints that received an autonomous recovery write during `read_joint_states`
     /// since the supervisor last queried `take_recovery_writes`.
     recovery_written_joints: Vec<usize>,
+    /// `ArmDriver::set_strict_mode_handover`; false keeps the e4f72b6 `write_modes`.
+    strict_mode_handover: bool,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2072,6 +2079,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             register_replies: Vec::new(),
             range_check: None,
             recovery_written_joints: Vec::new(),
+            strict_mode_handover: false,
         }
     }
 
@@ -2269,9 +2277,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Write CTRL_MODE for `joints` (each followed at once by `hold` in the new mode)
-    /// and wait for the write acknowledgements. A joint is confirmed only when the mode
-    /// write, every hold frame transmit, the bus flush, and the matching register reply
-    /// all succeed. Returns the joints that were not confirmed.
+    /// and wait for the write acknowledgements. Returns the joints that were not confirmed.
+    ///
+    /// With `strict_mode_handover` (joint tracking enabled) a joint is confirmed only when
+    /// the mode write, every hold frame transmit, the bus flush and the matching register
+    /// reply all succeed. Without it the matching reply alone confirms the joint, as before
+    /// joint tracking (e4f72b6): hold transmit and flush errors are ignored.
     fn write_modes(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool) -> Vec<usize> {
         self.register_replies.clear();
         let mut unsent = Vec::new();
@@ -2293,17 +2304,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             };
             let mut all_holds_ok = true;
             for frame in frames {
-                if self.transmit_with_retry(&frame).is_ok() {
+                let sent = self.transmit_with_retry(&frame).is_ok();
+                if sent || !self.strict_mode_handover {
                     self.last_target_frames[i] = Some(frame);
-                } else {
-                    all_holds_ok = false;
                 }
+                all_holds_ok &= sent;
             }
-            if !all_holds_ok {
+            if !all_holds_ok && self.strict_mode_handover {
                 hold_failed.push(i);
             }
         }
-        let flush_ok = self.can.flush().is_ok();
+        let flush_ok = self.can.flush().is_ok() || !self.strict_mode_handover;
         let sent: Vec<usize> = joints.iter().copied().filter(|i| !unsent.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = sent.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
         let replies = self.await_register_replies(&expected);
@@ -2315,7 +2326,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 self.joint_modes[i] = Some(modes[i]);
             } else {
-                self.joint_modes[i] = None;
+                if self.strict_mode_handover {
+                    self.joint_modes[i] = None;
+                }
                 failed.push(i);
             }
         }
@@ -2489,6 +2502,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn take_recovery_writes(&mut self) -> Vec<usize> {
         std::mem::take(&mut self.recovery_written_joints)
+    }
+
+    fn set_strict_mode_handover(&mut self, strict: bool) {
+        self.strict_mode_handover = strict;
     }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {

@@ -64,6 +64,8 @@ struct TrackingTestState {
     fail_mode_switch: bool,
     /// Reported `DriverCapabilities::velocity_feedback` (default true).
     velocity_feedback: bool,
+    /// Last `set_strict_mode_handover` value received.
+    strict_mode_handover: Option<bool>,
 }
 
 impl TrackingTestState {
@@ -89,6 +91,7 @@ impl TrackingTestState {
             mode_hold_frames: Vec::new(),
             fail_mode_switch: false,
             velocity_feedback: true,
+            strict_mode_handover: None,
         }
     }
 }
@@ -222,6 +225,9 @@ impl ArmDriver for TrackingTestDriver {
     }
     fn supports_mit_mode_switch(&self) -> bool {
         true
+    }
+    fn set_strict_mode_handover(&mut self, strict: bool) {
+        self.0.lock().unwrap().strict_mode_handover = Some(strict);
     }
     fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut s = self.0.lock().unwrap();
@@ -1924,9 +1930,12 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         }
     };
 
+    // Subcases A and B apply with tracking enabled (strict mode handover, set by
+    // `SupervisorInner::with_driver`); A2/B2 below keep the e4f72b6 behaviour with tracking off.
     // Subcase A: mode write acks, but MIT hold transmit fails -> must reject switch!
     {
         let mut drv = DamiaoArmDriver::new(make_can(true, false), vec![1]);
+        drv.set_strict_mode_handover(true);
         drv.set_torque(true).unwrap();
         let res = drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.2, 0.0, 30.0, 1.0, 0.0)]);
         assert!(drv.can_mut().mode_write_seen, "CTRL_MODE write must have been sent");
@@ -1937,11 +1946,40 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
     // Subcase B: mode write and hold transmit succeed, but flush fails -> must reject switch!
     {
         let mut drv = DamiaoArmDriver::new(make_can(false, true), vec![1]);
+        drv.set_strict_mode_handover(true);
         drv.set_torque(true).unwrap();
         let res = drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.2, 0.0, 30.0, 1.0, 0.0)]);
         assert!(drv.can_mut().mode_write_seen, "CTRL_MODE write must have been sent before flush failure");
         assert!(res.is_err(), "mode acknowledged with failed flush must fail set_joint_modes");
         assert!(drv.joint_modes_uncertain(), "failed flush must leave joint mode uncertain");
+    }
+
+    // Review 3 T2: tracking off -> e4f72b6 behaviour: a matching mode ACK confirms the switch
+    // even when the hold transmit (A2) or the flush (B2) failed. Checked on a bare driver and
+    // through `SupervisorInner::with_driver` with tracking off (none / disabled) and on.
+    for (fail_hold, fail_flush) in [(true, false), (false, true)] {
+        let mut drv = DamiaoArmDriver::new(make_can(fail_hold, fail_flush), vec![1]);
+        drv.set_torque(true).unwrap();
+        let res = drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.2, 0.0, 30.0, 1.0, 0.0)]);
+        assert!(drv.can_mut().mode_write_seen);
+        assert!(res.is_ok(), "tracking off (hold {fail_hold}, flush {fail_flush}): e4f72b6 accepts the ACK, got {res:?}");
+        assert!(!drv.joint_modes_uncertain(), "tracking off: the acknowledged mode is confirmed as in e4f72b6");
+
+    }
+    for (label, jt, strict) in [
+        ("tracking none", None, false),
+        ("tracking disabled", Some(JointTrackingConfig::rebot_dm()), false),
+        ("tracking enabled", Some(lead_config(true, 0.68)), true),
+    ] {
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let cfg = ArmConfig { joint_tracking: jt, ..ArmConfig::rebot_dm() };
+        let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+        let _inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+        assert_eq!(
+            drv.with(|s| s.strict_mode_handover),
+            Some(strict),
+            "{label}: with_driver must select strict mode handover only with tracking enabled"
+        );
     }
 
     // 2. Gravity-comp handback requires fresh stationary feedback before ownership transfer.
@@ -2741,10 +2779,26 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
         .expect("enter MIT before simulated interruption");
     drv.set_torque(false).expect("disable while in MIT");
     assert!(!drv.is_enabled());
+    let _ = drv.can_mut().take_tx_frames();
     drv.set_torque(true)
         .expect("re-arm after interrupted MIT session must restore POS_VEL with dual-hold and succeed");
     assert!(drv.is_enabled());
     assert!(!drv.joint_modes_uncertain());
+    // Review 3 T2: the restored mode is POS_VEL, written (with its dual hold) before the enable.
+    let tx = drv.can_mut().take_tx_frames();
+    let mode_write = damiao::build_set_control_mode_frame(1, damiao::CTRL_MODE_POS_VEL);
+    let mode_at = tx.iter().position(|f| f.id == mode_write.id && f.data == mode_write.data)
+        .expect("re-arm must write CTRL_MODE = POS_VEL");
+    let enable = damiao::build_enable_frame(1);
+    let enable_at = tx.iter().position(|f| f.id == enable.id && f.data == enable.data).expect("re-arm must send enable");
+    assert!(mode_at < enable_at, "CTRL_MODE = POS_VEL (frame {mode_at}) must precede the enable (frame {enable_at})");
+    assert!(
+        !tx.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_CTRL_MODE
+            && f.data[4..8] != damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        "re-arm must not write any other control mode"
+    );
+    let hold_frames = tx[mode_at + 1..enable_at].iter().filter(|f| f.id == 0x101 || f.id == 1).count();
+    assert!(hold_frames >= 2, "dual hold (POS_VEL + MIT) follows the mode write before the enable, got {hold_frames}");
 }
 
 /// Review 2 New: When Damiao recovery `can.transmit` returns `Err`, the failed transmit

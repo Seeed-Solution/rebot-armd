@@ -875,6 +875,7 @@ impl SupervisorInner {
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_gripper_index(self.config.gripper_index());
+        driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
         if driver.capabilities().load_feedback {
             self.loads = vec![f32::NAN; self.config.dof];
         }
@@ -6698,6 +6699,7 @@ impl ArmSupervisor {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
             driver.set_gripper_index(inner.config.gripper_index());
+            driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
             if driver.capabilities().load_feedback {
                 inner.loads = vec![f32::NAN; inner.config.dof];
             }
