@@ -5083,6 +5083,14 @@ impl SupervisorInner {
             true
         };
         let mut approach_started: Option<u64> = None;
+        // A planned motion's caps outlive its reference: kept from the tick it finishes
+        // until it has settled (cleared after the output below).
+        let tracking_enabled = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+        let caps_before_step = if tracking_enabled {
+            self.active_trajectory.as_ref().and_then(|a| a.motion_limits.clone())
+        } else {
+            None
+        };
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -5177,6 +5185,12 @@ impl SupervisorInner {
                         if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
                     }
                 }
+            }
+        }
+
+        if let Some(caps) = caps_before_step {
+            if self.active_trajectory.is_none() {
+                self.tracking.retained_motion_limits = Some(caps);
             }
         }
 
@@ -5664,6 +5678,13 @@ impl SupervisorInner {
 
         if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
             self.note_tracking_position_sample();
+            let settled = self.active_trajectory.is_none()
+                && self.quintic_settle.is_none()
+                && self.tracking.fallback_ramp.is_none()
+                && !self.tracking.has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices());
+            if settled {
+                self.tracking.retained_motion_limits = None;
+            }
         }
 
         if let Some(error) = output_error {

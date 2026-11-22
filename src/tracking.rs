@@ -203,6 +203,9 @@ pub struct TrackingRuntime {
     /// its newest joint sample: stationarity evidence for drivers without velocity
     /// feedback (`SupervisorInner::tracking_stationary_evidence`).
     pub position_sample: Option<(std::time::Instant, Vec<f32>)>,
+    /// Motion caps (`ActiveTrajectory::motion_limits`) of a planned motion whose reference
+    /// finished, kept in force until it has settled and its residual lead is ramped out.
+    pub retained_motion_limits: Option<Vec<crate::model::JointLimit>>,
 }
 
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
@@ -449,18 +452,19 @@ impl crate::supervisor::SupervisorInner {
     }
 
     /// Applicable per-joint output limits for the active motion (planned speed cap,
-    /// servo/policy speed cap, and power-governor time scaling).
+    /// servo/policy speed cap, and power-governor time scaling). A finished planned motion's
+    /// caps apply until it has settled (`TrackingRuntime::retained_motion_limits`).
     pub fn active_tracking_limits(&self, dt: f64, time_scale: f64) -> Vec<crate::model::JointLimit> {
         let gripper_idx = self.config.gripper_index();
         let mut limits = if self.servo_target.is_some() || self.servo_stream_active {
             self.servo_limits()
         } else {
             let mut base = self.planning_limits();
-            if let Some(mlim) = self
-                .active_trajectory
-                .as_ref()
-                .and_then(|a| a.motion_limits.as_ref())
-                .filter(|v| v.len() == base.len())
+            let caps = match self.active_trajectory.as_ref() {
+                Some(a) => a.motion_limits.as_ref(),
+                None => self.tracking.retained_motion_limits.as_ref(),
+            };
+            if let Some(mlim) = caps.filter(|v| v.len() == base.len())
             {
                 for (l, m) in base.iter_mut().zip(mlim.iter()) {
                     l.max_velocity = l.max_velocity.min(m.max_velocity);

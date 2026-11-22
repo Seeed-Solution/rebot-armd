@@ -3808,3 +3808,53 @@ fn tracking_seeds_only_on_positive_stationarity_evidence() {
         assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "velocity feedback at rest is evidence");
     }
 }
+
+/// Review 3 M4: the speed_scale caps of a planned motion stay in force on the tick its
+/// reference finishes and until it has settled (no residual lead), so the final lead
+/// withdrawal is checked against the scaled limits, not the generic planning limits.
+#[test]
+fn tracking_keeps_motion_caps_through_final_tick_and_settling() {
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.lease_timeout_ms = 600_000;
+    cfg.workspace = None;
+    cfg.joint_tracking = Some(lead_config(true, 0.68));
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05]);
+    let scaled_v = inner.planning_limits()[0].max_velocity * 0.25;
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 {
+        goal[i] = f64::from(q0[i]);
+    }
+    goal[0] += 0.20;
+    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+
+    let mut finished_at = None;
+    for k in 0..800 {
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational(), "tick {k}: {:?}", obs.fault);
+        if inner.active_trajectory.is_none() {
+            let settling = inner.quintic_settle.is_some()
+                || inner.tracking.has_residual_lead(&inner.commanded_positions, &inner.config.arm_joint_indices());
+            if finished_at.is_none() {
+                finished_at = Some(k);
+            }
+            let active = inner.active_tracking_limits(DT, 1.0);
+            if settling || finished_at == Some(k) {
+                assert!(
+                    (active[0].max_velocity - scaled_v).abs() < 1e-5,
+                    "tick {k} (finished at {finished_at:?}): active cap {} instead of the speed_scale cap {scaled_v}",
+                    active[0].max_velocity
+                );
+            } else {
+                break;
+            }
+        }
+    }
+    assert!(finished_at.is_some(), "the motion must finish");
+    let frames = drv.with(|s| s.written.clone());
+    for (k, w) in frames.windows(2).enumerate() {
+        let v = (f64::from(w[1][0].position) - f64::from(w[0][0].position)) / DT;
+        assert!(v.abs() <= f64::from(scaled_v) + 1e-3, "frame {k}: J1 issued {v:.4} rad/s above the scaled cap {scaled_v}");
+    }
+}
