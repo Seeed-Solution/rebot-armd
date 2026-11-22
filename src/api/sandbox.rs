@@ -1343,6 +1343,7 @@ struct StatEntry {
     is_dir: bool,
     len: u64,
     mtime_nanos: i128,
+    ctime_nanos: i128,
     ino: u64,
 }
 
@@ -1350,6 +1351,7 @@ struct StatEntry {
 struct PackStatFingerprint {
     roots: Vec<PathBuf>,
     absent_watch_dirs: Vec<PathBuf>,
+    extra_files: Vec<(PathBuf, Option<StatEntry>)>,
     entries: Vec<StatEntry>,
     dir_listing_count: usize,
 }
@@ -1365,6 +1367,19 @@ fn metadata_ino(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
+#[cfg(unix)]
+fn metadata_ctime_nanos(meta: &std::fs::Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(meta.ctime())
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i128::from(meta.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn metadata_ctime_nanos(_meta: &std::fs::Metadata) -> i128 {
+    0
+}
+
 fn metadata_mtime_nanos(meta: &std::fs::Metadata) -> i128 {
     meta.modified()
         .ok()
@@ -1373,6 +1388,18 @@ fn metadata_mtime_nanos(meta: &std::fs::Metadata) -> i128 {
             Err(e) => i128::try_from(e.duration().as_nanos()).ok().map(|v| -v),
         })
         .unwrap_or(0)
+}
+
+fn stat_entry_for_path(path: &Path) -> Option<StatEntry> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(StatEntry {
+        path: path.to_path_buf(),
+        is_dir: meta.is_dir(),
+        len: meta.len(),
+        mtime_nanos: metadata_mtime_nanos(&meta),
+        ctime_nanos: metadata_ctime_nanos(&meta),
+        ino: metadata_ino(&meta),
+    })
 }
 
 impl PackStatFingerprint {
@@ -1396,6 +1423,7 @@ impl PackStatFingerprint {
                 is_dir: true,
                 len: dir_meta.len(),
                 mtime_nanos: metadata_mtime_nanos(&dir_meta),
+                ctime_nanos: metadata_ctime_nanos(&dir_meta),
                 ino: metadata_ino(&dir_meta),
             });
             let rd = std::fs::read_dir(dir).ok()?;
@@ -1410,6 +1438,7 @@ impl PackStatFingerprint {
                     is_dir,
                     len: meta.len(),
                     mtime_nanos: metadata_mtime_nanos(&meta),
+                    ctime_nanos: metadata_ctime_nanos(&meta),
                     ino: metadata_ino(&meta),
                 });
                 if is_dir {
@@ -1429,11 +1458,23 @@ impl PackStatFingerprint {
         Some((entries, listing_count))
     }
 
-    fn collect(roots: Vec<PathBuf>, absent_watch_dirs: Vec<PathBuf>) -> Self {
+    fn collect(
+        roots: Vec<PathBuf>,
+        absent_watch_dirs: Vec<PathBuf>,
+        extra_watch_paths: Vec<PathBuf>,
+    ) -> Self {
         let (entries, dir_listing_count) = Self::collect_entries(&roots).unwrap_or_default();
+        let extra_files = extra_watch_paths
+            .into_iter()
+            .map(|p| {
+                let st = stat_entry_for_path(&p);
+                (p, st)
+            })
+            .collect();
         Self {
             roots,
             absent_watch_dirs,
+            extra_files,
             entries,
             dir_listing_count,
         }
@@ -1442,6 +1483,11 @@ impl PackStatFingerprint {
     fn matches_disk(&self) -> bool {
         for p in &self.absent_watch_dirs {
             if std::fs::symlink_metadata(p).is_ok() {
+                return false;
+            }
+        }
+        for (p, expected) in &self.extra_files {
+            if stat_entry_for_path(p) != *expected {
                 return false;
             }
         }
@@ -2155,6 +2201,57 @@ impl SandboxState {
         }
         let dir = self.root.join("policies").join(id);
         dir.is_dir().then_some(dir)
+    }
+
+    fn collect_pack_pre_fingerprint(
+        &self,
+        scene_id: &str,
+        tool_id: &str,
+        policy_id: Option<&str>,
+        base_xml: &str,
+    ) -> PackStatFingerprint {
+        let mut roots = Vec::new();
+        let mut absent_watch_dirs = Vec::new();
+
+        for (kind_singular, kind_dir, id) in [
+            ("scene", "scenes", scene_id),
+            ("tool", "tools", tool_id),
+        ] {
+            if is_reserved_builtin_id(kind_singular, id) {
+                absent_watch_dirs.push(self.root.join(kind_dir).join(id));
+                if id != "default" {
+                    for root in self.effective_builtin_roots() {
+                        let candidate = root.join(kind_dir).join(id);
+                        if let Ok(canon) = check_safe_pack_dir(&root, &candidate) {
+                            roots.push(canon);
+                        } else if std::fs::symlink_metadata(&candidate).is_err() {
+                            absent_watch_dirs.push(candidate);
+                        }
+                    }
+                }
+            } else {
+                let pack_root = self.root.join(kind_dir);
+                let dir = pack_root.join(id);
+                if let Ok(canon) = check_safe_pack_dir(&pack_root, &dir) {
+                    roots.push(canon);
+                } else if std::fs::symlink_metadata(&dir).is_err() {
+                    absent_watch_dirs.push(dir);
+                }
+            }
+        }
+
+        if let Some(pid) = policy_id {
+            let policies_root = self.root.join("policies");
+            let dir = policies_root.join(pid);
+            if let Ok(canon) = check_safe_pack_dir(&policies_root, &dir) {
+                roots.push(canon);
+            } else if std::fs::symlink_metadata(&dir).is_err() {
+                absent_watch_dirs.push(dir);
+            }
+        }
+
+        let extra_watch_paths = collect_base_mesh_watch_paths(base_xml);
+        PackStatFingerprint::collect(roots, absent_watch_dirs, extra_watch_paths)
     }
 }
 
@@ -3513,22 +3610,23 @@ fn is_safe_base_mesh_file(file: &str) -> bool {
         .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
-    let Ok(doc) = roxmltree::Document::parse(base_mjcf_xml) else {
-        return BaseMeshInspection {
-            meshdir: None,
-            base_assets: Vec::new(),
-            missing_base_assets: Vec::new(),
-            note: None,
-        };
-    };
+struct BaseMeshCandidate {
+    file: String,
+    mjcf_path: String,
+    candidate_rel: Option<String>,
+    candidate_path: Option<PathBuf>,
+    canon_file: Option<PathBuf>,
+}
 
+fn resolve_base_mesh_candidates(base_mjcf_xml: &str) -> (Option<String>, Vec<BaseMeshCandidate>) {
+    let Ok(doc) = roxmltree::Document::parse(base_mjcf_xml) else {
+        return (None, Vec::new());
+    };
     let meshdir = doc
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "compiler")
         .and_then(|n| n.attribute("meshdir"))
         .map(|s| s.to_string());
-
     let canon_asset_root = base_assets_dir().and_then(|d| d.canonicalize().ok());
     let meshdir_leaf = meshdir
         .as_deref()
@@ -3537,9 +3635,7 @@ fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
         .filter(|leaf| is_safe_relative_path(leaf))
         .map(|s| s.to_string());
 
-    let mut base_assets = Vec::new();
-    let mut missing_base_assets = Vec::new();
-
+    let mut candidates = Vec::new();
     for node in doc.descendants() {
         if node.is_element() && node.tag_name().name() == "mesh" {
             if let Some(file) = node.attribute("file").map(str::trim).filter(|s| !s.is_empty()) {
@@ -3549,61 +3645,110 @@ fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
                     }
                     _ => file.to_string(),
                 };
-
-                let (local_exists, candidate_rel, sha256, size_bytes) = if is_safe_base_mesh_file(file) {
+                let (candidate_rel, candidate_path, canon_file) = if is_safe_base_mesh_file(file) {
                     let rel = match meshdir_leaf.as_deref() {
                         Some(leaf) => format!("{leaf}/{file}"),
                         None => file.to_string(),
                     };
-                    let canon_file = if is_safe_relative_path(&rel) && is_safe_base_asset_ext(&rel) {
-                        canon_asset_root.as_ref().and_then(|root| {
-                            root.join(&rel)
+                    if is_safe_relative_path(&rel) && is_safe_base_asset_ext(&rel) {
+                        if let Some(ref root) = canon_asset_root {
+                            let cand = root.join(&rel);
+                            let canon = cand
                                 .canonicalize()
                                 .ok()
-                                .filter(|f| f.starts_with(root) && f.is_file())
-                        })
+                                .filter(|f| f.starts_with(root) && f.is_file());
+                            (Some(rel), Some(cand), canon)
+                        } else {
+                            (Some(rel), None, None)
+                        }
                     } else {
-                        None
-                    };
-                    let file_meta = canon_file
-                        .as_deref()
-                        .and_then(|f| std::fs::read(f).ok())
-                        .map(|bytes| (sha256_hex(&bytes), bytes.len() as u64));
-                    match file_meta {
-                        Some((digest, len)) => (true, Some(rel), Some(digest), Some(len)),
-                        None => (false, Some(rel), None, None),
+                        (Some(rel), None, None)
                     }
                 } else {
-                    (false, None, None, None)
+                    (None, None, None)
                 };
-
-                let resolved_url = if local_exists {
-                    candidate_rel
-                        .as_ref()
-                        .map(|rel| format!("/api/v1/sandbox/base-assets/{rel}"))
-                } else {
-                    None
-                };
-
-                let http_accessible = resolved_url.is_some();
-                if !http_accessible || !local_exists {
-                    missing_base_assets.push(mjcf_path.clone());
-                }
-
-                base_assets.push(serde_json::json!({
-                    "file": file,
-                    "meshdir": meshdir,
-                    "mjcf_path": mjcf_path,
-                    "memfs_path": mjcf_path,
-                    "path": candidate_rel,
-                    "local_exists": local_exists,
-                    "http_accessible": http_accessible,
-                    "url": resolved_url,
-                    "sha256": sha256,
-                    "size_bytes": size_bytes,
-                }));
+                candidates.push(BaseMeshCandidate {
+                    file: file.to_string(),
+                    mjcf_path,
+                    candidate_rel,
+                    candidate_path,
+                    canon_file,
+                });
             }
         }
+    }
+    (meshdir, candidates)
+}
+
+fn collect_base_mesh_watch_paths(base_mjcf_xml: &str) -> Vec<PathBuf> {
+    let (_, candidates) = resolve_base_mesh_candidates(base_mjcf_xml);
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for c in candidates {
+        if let Some(cand) = c.candidate_path {
+            if seen.insert(cand.clone()) {
+                paths.push(cand);
+            }
+        }
+        if let Some(canon) = c.canon_file {
+            if seen.insert(canon.clone()) {
+                paths.push(canon);
+            }
+        }
+    }
+    paths
+}
+
+fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
+    let (meshdir, candidates) = resolve_base_mesh_candidates(base_mjcf_xml);
+    if meshdir.is_none() && candidates.is_empty() && roxmltree::Document::parse(base_mjcf_xml).is_err() {
+        return BaseMeshInspection {
+            meshdir: None,
+            base_assets: Vec::new(),
+            missing_base_assets: Vec::new(),
+            note: None,
+        };
+    }
+
+    let mut base_assets = Vec::new();
+    let mut missing_base_assets = Vec::new();
+
+    for cand in candidates {
+        let file_meta = cand
+            .canon_file
+            .as_deref()
+            .and_then(|f| std::fs::read(f).ok())
+            .map(|bytes| (sha256_hex(&bytes), bytes.len() as u64));
+        let (local_exists, sha256, size_bytes) = match file_meta {
+            Some((digest, len)) => (true, Some(digest), Some(len)),
+            None => (false, None, None),
+        };
+
+        let resolved_url = if local_exists {
+            cand.candidate_rel
+                .as_ref()
+                .map(|rel| format!("/api/v1/sandbox/base-assets/{rel}"))
+        } else {
+            None
+        };
+
+        let http_accessible = resolved_url.is_some();
+        if !http_accessible || !local_exists {
+            missing_base_assets.push(cand.mjcf_path.clone());
+        }
+
+        base_assets.push(serde_json::json!({
+            "file": cand.file,
+            "meshdir": meshdir,
+            "mjcf_path": cand.mjcf_path,
+            "memfs_path": cand.mjcf_path,
+            "path": cand.candidate_rel,
+            "local_exists": local_exists,
+            "http_accessible": http_accessible,
+            "url": resolved_url,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }));
     }
 
     let note = if !missing_base_assets.is_empty() {
@@ -4058,26 +4203,23 @@ fn degraded_split_http_error(tx_id: &str, detail: &str) -> (StatusCode, Json<ser
 struct ActivationBundleSnapshot {
     robot: String,
     scene_id: String,
-    scene_dir: Option<PathBuf>,
     scene_manifest: SceneManifest,
     scene_digest: Option<String>,
     scene_files: Option<BTreeMap<String, Vec<u8>>>,
     tool_id: String,
-    tool_dir: Option<PathBuf>,
     tool_manifest: ToolManifest,
     tool_digest: Option<String>,
     tool_files: Option<BTreeMap<String, Vec<u8>>>,
     policy_id: Option<String>,
-    policy_dir: Option<PathBuf>,
     policy_manifest: Option<PolicyManifest>,
     base_xml: String,
     composed_xml: String,
+    pre_fp: PackStatFingerprint,
 }
 
 fn build_cached_bundle_from_snapshot(
-    sandbox_root: &Path,
     mut snap: ActivationBundleSnapshot,
-) -> Arc<CachedBundle> {
+) -> Result<Arc<CachedBundle>, (StatusCode, Json<serde_json::Value>)> {
     snap.scene_manifest.assets = normalize_manifest_assets(
         snap.scene_files.as_ref(),
         Some(&snap.scene_manifest.world_xml),
@@ -4090,31 +4232,21 @@ fn build_cached_bundle_from_snapshot(
     );
     let composed_xml_sha256 = sha256_hex(snap.composed_xml.as_bytes());
     let mesh_info = inspect_base_mesh_assets(&snap.base_xml);
+    if !snap.pre_fp.matches_disk() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Pack files modified on disk during bundle build",
+                "code": "INVALID_PACK",
+            })),
+        ));
+    }
     let policy_model_url = snap
         .policy_manifest
         .as_ref()
         .map(|pm| format!("/api/v1/sandbox/policies/{}/files/{}", pm.id, pm.model_file));
 
-    let mut roots = Vec::new();
-    if let Some(d) = snap.scene_dir {
-        roots.push(d);
-    }
-    if let Some(d) = snap.tool_dir {
-        roots.push(d);
-    }
-    if let Some(d) = snap.policy_dir {
-        roots.push(d);
-    }
-    let mut absent_watch_dirs = Vec::new();
-    if is_reserved_builtin_id("scene", &snap.scene_id) {
-        absent_watch_dirs.push(sandbox_root.join("scenes").join(&snap.scene_id));
-    }
-    if is_reserved_builtin_id("tool", &snap.tool_id) {
-        absent_watch_dirs.push(sandbox_root.join("tools").join(&snap.tool_id));
-    }
-    let stat_fingerprint = PackStatFingerprint::collect(roots, absent_watch_dirs);
-
-    Arc::new(CachedBundle {
+    Ok(Arc::new(CachedBundle {
         cache_id: NEXT_BUNDLE_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         robot: snap.robot,
         active_scene: snap.scene_id,
@@ -4132,8 +4264,8 @@ fn build_cached_bundle_from_snapshot(
         base_assets: mesh_info.base_assets,
         missing_base_assets: mesh_info.missing_base_assets,
         base_assets_note: mesh_info.note,
-        stat_fingerprint,
-    })
+        stat_fingerprint: snap.pre_fp,
+    }))
 }
 
 fn build_bundle_from_disk(
@@ -4157,20 +4289,27 @@ fn build_bundle_from_disk(
     state
         .peak_concurrent_rebuilds
         .fetch_max(active_now, Ordering::SeqCst);
+    let base_xml = get_base_robot_xml_for_robot(running_robot)?;
+    let pre_fp = state.collect_pack_pre_fingerprint(
+        &current.active_scene,
+        &current.active_tool,
+        current.active_policy.as_deref(),
+        &base_xml,
+    );
     let delay_ms = state.bundle_rebuild_delay_ms.load(Ordering::Relaxed);
     if delay_ms > 0 {
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
 
     let ResolvedPack {
-        canon_dir: scene_dir,
+        canon_dir: _scene_dir,
         manifest: scene_manifest,
         xml: sw,
         digest: scene_digest,
         files: scene_files,
     } = state.resolve_scene_checked_full(&current.active_scene)?;
     let ResolvedPack {
-        canon_dir: tool_dir,
+        canon_dir: _tool_dir,
         manifest: tool_manifest,
         xml: tw,
         digest: tool_digest,
@@ -4202,39 +4341,33 @@ fn build_bundle_from_disk(
         }
     }
 
-    let (policy_manifest, policy_dir) = if let Some(ref p) = current.active_policy {
+    let policy_manifest = if let Some(ref p) = current.active_policy {
         let pm = state.resolve_policy_checked(p, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
         validate_policy_robot_compatibility(running_robot, &pm)?;
-        (Some(pm), state.policy_dir(p))
+        Some(pm)
     } else {
-        (None, None)
+        None
     };
 
-    let base_xml = get_base_robot_xml_for_robot(running_robot)?;
     let composed_xml = compose_mjcf_checked(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
         .map_err(|e| PackFileError::from(e).into_http_error("INVALID_PACK", "MJCF composition failed"))?;
 
-    Ok(build_cached_bundle_from_snapshot(
-        &state.root,
-        ActivationBundleSnapshot {
-            robot: running_robot.to_string(),
-            scene_id: current.active_scene.clone(),
-            scene_dir,
-            scene_manifest,
-            scene_digest,
-            scene_files,
-            tool_id: current.active_tool.clone(),
-            tool_dir,
-            tool_manifest,
-            tool_digest,
-            tool_files,
-            policy_id: current.active_policy.clone(),
-            policy_dir,
-            policy_manifest,
-            base_xml,
-            composed_xml,
-        },
-    ))
+    build_cached_bundle_from_snapshot(ActivationBundleSnapshot {
+        robot: running_robot.to_string(),
+        scene_id: current.active_scene.clone(),
+        scene_manifest,
+        scene_digest,
+        scene_files,
+        tool_id: current.active_tool.clone(),
+        tool_manifest,
+        tool_digest,
+        tool_files,
+        policy_id: current.active_policy.clone(),
+        policy_manifest,
+        base_xml,
+        composed_xml,
+        pre_fp,
+    })
 }
 
 fn render_bundle_json(cached: &CachedBundle, current: &ActiveState) -> serde_json::Value {
@@ -4414,11 +4547,12 @@ async fn commit_local_active_state(
     }
     state.persist().await;
     if let Some(snap) = bundle_snapshot {
-        let root = state.root.clone();
-        if let Ok(cached) =
-            tokio::task::spawn_blocking(move || build_cached_bundle_from_snapshot(&root, snap)).await
+        if let Ok(Ok(cached)) =
+            tokio::task::spawn_blocking(move || build_cached_bundle_from_snapshot(snap)).await
         {
             state.insert_cached_bundle(cached).await;
+        } else {
+            state.invalidate_bundle_cache_all().await;
         }
     } else {
         state.invalidate_bundle_cache_all().await;
@@ -5037,6 +5171,30 @@ pub async fn activate(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid tool pack id '{tool_id}'")}))));
     }
 
+    // M21: Determine target policy ID and validate ID format before collecting pre-read fingerprint.
+    let (policy_id, policy_missing_status, policy_missing_code) = match payload.policy {
+        Some(Some(ref pid)) => {
+            if !validate_pack_id(pid) {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid policy pack id '{pid}'")}))));
+            }
+            (Some(pid.clone()), StatusCode::NOT_FOUND, "POLICY_NOT_FOUND")
+        }
+        Some(None) => (None, StatusCode::NOT_FOUND, "POLICY_NOT_FOUND"),
+        None => (
+            prev_active.active_policy.clone(),
+            StatusCode::CONFLICT,
+            "ACTIVE_POLICY_MISSING",
+        ),
+    };
+
+    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
+    let pre_fp = state.collect_pack_pre_fingerprint(
+        &scene_id,
+        &tool_id,
+        policy_id.as_deref(),
+        &base_xml,
+    );
+
     let ResolvedPack {
         canon_dir: scene_dir,
         manifest: scene_manifest,
@@ -5060,28 +5218,14 @@ pub async fn activate(
     )?;
 
     // M21: Validate policy completely BEFORE prepare (never run fallible disk checks after remote commit).
-    let (policy_id, policy_manifest, policy_dir) = match payload.policy {
-        Some(Some(ref pid)) => {
-            if !validate_pack_id(pid) {
-                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid policy pack id '{pid}'")}))));
-            }
-            let pm = state.resolve_policy_checked(pid, StatusCode::NOT_FOUND, "POLICY_NOT_FOUND")?;
-            validate_policy_robot_compatibility(&running_robot, &pm)?;
-            (Some(pid.clone()), Some(pm), state.policy_dir(pid))
-        }
-        Some(None) => (None, None, None),
-        None => {
-            if let Some(ref pid) = prev_active.active_policy {
-                let pm = state.resolve_policy_checked(pid, StatusCode::CONFLICT, "ACTIVE_POLICY_MISSING")?;
-                validate_policy_robot_compatibility(&running_robot, &pm)?;
-                (Some(pid.clone()), Some(pm), state.policy_dir(pid))
-            } else {
-                (None, None, None)
-            }
-        }
+    let policy_manifest = if let Some(ref pid) = policy_id {
+        let pm = state.resolve_policy_checked(pid, policy_missing_status, policy_missing_code)?;
+        validate_policy_robot_compatibility(&running_robot, &pm)?;
+        Some(pm)
+    } else {
+        None
     };
 
-    let base_xml = get_base_robot_xml_for_robot(&running_robot)?;
     let composed = compose_mjcf_checked(
         &base_xml,
         Some(&scene_world_xml),
@@ -5090,23 +5234,31 @@ pub async fn activate(
     )
     .map_err(|e| PackFileError::from(e).into_http_error("INVALID_PACK", "MJCF composition failed"))?;
 
+    if !pre_fp.matches_disk() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "Pack files modified on disk during bundle build",
+                "code": "INVALID_PACK",
+            })),
+        ));
+    }
+
     let bundle_snapshot = ActivationBundleSnapshot {
         robot: running_robot.clone(),
         scene_id: scene_id.clone(),
-        scene_dir: scene_dir.clone(),
         scene_manifest: scene_manifest.clone(),
         scene_digest: scene_digest.clone(),
         scene_files,
         tool_id: tool_id.clone(),
-        tool_dir: tool_dir.clone(),
         tool_manifest: tool_manifest.clone(),
         tool_digest: tool_digest.clone(),
         tool_files,
         policy_id: policy_id.clone(),
-        policy_dir,
         policy_manifest,
         base_xml,
         composed_xml: composed.clone(),
+        pre_fp,
     };
 
     let target_seed = payload.seed.unwrap_or(prev_active.seed);
@@ -7532,5 +7684,58 @@ mod tests {
         assert_eq!(tool_assets[0]["path"], "meshes/jaw.stl");
         assert_eq!(tool_assets[0]["sha256"].as_str(), Some(sha256_hex(tool_stl).as_str()));
         assert_eq!(tool_assets[0]["size_bytes"], tool_stl.len() as u64);
+    }
+
+    #[test]
+    fn pack_stat_fingerprint_tracks_extra_files_and_ctime_with_preserved_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pack_dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let present_mesh = tmp.path().join("present_mesh.stl");
+        let missing_mesh = tmp.path().join("missing_mesh.stl");
+        std::fs::write(&present_mesh, b"AAAA").unwrap();
+        let orig_mtime = std::fs::metadata(&present_mesh).unwrap().modified().unwrap();
+
+        let fp = PackStatFingerprint::collect(
+            vec![pack_dir.clone()],
+            Vec::new(),
+            vec![present_mesh.clone(), missing_mesh.clone()],
+        );
+        assert!(fp.matches_disk(), "fresh fingerprint must match disk");
+
+        // In-place overwrite preserving byte length and mtime still changes ctime.
+        std::thread::sleep(Duration::from_millis(5));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&present_mesh)
+                .unwrap();
+            f.write_all(b"BBBB").unwrap();
+            f.set_modified(orig_mtime).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&present_mesh).unwrap().modified().unwrap(),
+            orig_mtime
+        );
+        assert!(
+            !fp.matches_disk(),
+            "in-place same-len mtime-preserving update on extra_files must invalidate fingerprint via ctime"
+        );
+
+        // Creating a previously missing extra_file also invalidates the fingerprint.
+        let fp2 = PackStatFingerprint::collect(
+            vec![pack_dir],
+            Vec::new(),
+            vec![present_mesh, missing_mesh.clone()],
+        );
+        assert!(fp2.matches_disk());
+        std::fs::write(&missing_mesh, b"NEW").unwrap();
+        assert!(
+            !fp2.matches_disk(),
+            "creating a previously missing extra_file must invalidate fingerprint"
+        );
     }
 }
