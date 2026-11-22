@@ -815,32 +815,42 @@ pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Respon
 
 /// `GET /api/v1/poses`: stored named poses (no lease).
 pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    let inner = supervisor.inner().read().await;
-    let default_joint_names = inner
-        .poses
-        .list
-        .joint_names
-        .clone()
-        .unwrap_or_else(|| inner.joint_names());
-    let poses: Vec<serde_json::Value> = inner
-        .poses
-        .list
+    let (list, revision, default_joint_names) = {
+        let inner = supervisor.inner().read().await;
+        let default_joint_names = inner
+            .poses
+            .list
+            .joint_names
+            .clone()
+            .unwrap_or_else(|| inner.joint_names());
+        (
+            inner.poses.list.clone(),
+            inner.poses.revision,
+            default_joint_names,
+        )
+    };
+    let poses: Vec<serde_json::Value> = list
         .poses
         .iter()
         .map(|p| crate::poses::pose_response_value(p, &default_joint_names))
         .collect();
-    let mut resp = serde_json::to_value(crate::poses::PoseListResponse {
-        list: inner.poses.list.clone(),
-        revision: inner.poses.revision,
-    })
-    .unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(obj) = resp.as_object_mut() {
-        obj.insert("poses".into(), serde_json::Value::Array(poses));
-        if !obj.contains_key("joint_names") {
-            obj.insert("joint_names".into(), serde_json::json!(default_joint_names));
-        }
+    let mut obj = serde_json::Map::new();
+    if let Some(profile_id) = list.profile_id {
+        obj.insert("profile_id".into(), serde_json::Value::String(profile_id));
     }
-    Json(resp).into_response()
+    if let Some(arm_dof) = list.arm_dof {
+        obj.insert("arm_dof".into(), serde_json::json!(arm_dof));
+    }
+    if let Some(gripper_joint) = list.gripper_joint {
+        obj.insert("gripper_joint".into(), serde_json::json!(gripper_joint));
+    }
+    obj.insert(
+        "joint_names".into(),
+        serde_json::json!(list.joint_names.unwrap_or(default_joint_names)),
+    );
+    obj.insert("poses".into(), serde_json::Value::Array(poses));
+    obj.insert("revision".into(), serde_json::json!(revision));
+    Json(serde_json::Value::Object(obj)).into_response()
 }
 
 /// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).

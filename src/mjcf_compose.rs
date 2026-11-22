@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_XML_BYTES: usize = 524_288; // 512 KiB
 pub const MAX_XML_DEPTH: usize = 32;
+pub const MAX_XML_ELEMENTS: usize = 4_096;
+pub const MAX_PACK_BODIES: usize = 512;
+pub const MAX_PACK_GEOMS: usize = 1_024;
 pub const MAX_PACK_TOTAL_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 pub const MAX_MESH_FILE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 pub const MAX_MESH_FILES: usize = 16;
@@ -132,6 +135,64 @@ pub struct XmlValidationSummary {
     pub refs: Vec<XmlAssetRef>,
     pub inline_mesh_count: usize,
     pub inline_vertex_count: usize,
+    pub element_count: usize,
+    pub body_count: usize,
+    pub geom_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct XmlElementCounts {
+    elements: usize,
+    bodies: usize,
+    geoms: usize,
+}
+
+impl XmlElementCounts {
+    fn add(self, other: Self) -> Self {
+        Self {
+            elements: self.elements.saturating_add(other.elements),
+            bodies: self.bodies.saturating_add(other.bodies),
+            geoms: self.geoms.saturating_add(other.geoms),
+        }
+    }
+}
+
+fn check_element_budgets(counts: XmlElementCounts, ctx: &str) -> Result<(), PackValidationError> {
+    if counts.elements > MAX_XML_ELEMENTS {
+        return Err(PackValidationError::InvalidPack(format!(
+            "{ctx}: XML element count {} exceeds budget of {MAX_XML_ELEMENTS}",
+            counts.elements
+        )));
+    }
+    if counts.bodies > MAX_PACK_BODIES {
+        return Err(PackValidationError::InvalidPack(format!(
+            "{ctx}: body count {} exceeds budget of {MAX_PACK_BODIES}",
+            counts.bodies
+        )));
+    }
+    if counts.geoms > MAX_PACK_GEOMS {
+        return Err(PackValidationError::InvalidPack(format!(
+            "{ctx}: geom count {} exceeds budget of {MAX_PACK_GEOMS}",
+            counts.geoms
+        )));
+    }
+    Ok(())
+}
+
+fn is_forbidden_xml_tag(tag_lower: &str) -> bool {
+    matches!(
+        tag_lower,
+        "include"
+            | "plugin"
+            | "custom"
+            | "extension"
+            | "replicate"
+            | "frame"
+            | "composite"
+            | "flexcomp"
+            | "attach"
+            | "model"
+    )
 }
 
 fn xml_parent_dir(xml_rel: &str) -> &str {
@@ -171,6 +232,8 @@ fn pass1_xml_security<'a>(
     node: roxmltree::Node<'a, 'a>,
     depth: usize,
     dirs: &mut CompilerDirs,
+    counts: &mut XmlElementCounts,
+    ctx: &str,
 ) -> Result<(), PackValidationError> {
     if !node.is_element() {
         return Ok(());
@@ -188,11 +251,19 @@ fn pass1_xml_security<'a>(
             "URDF content (<{tag}>) is not supported; expected MJCF <mujoco>"
         )));
     }
-    if matches!(tag_lower.as_str(), "include" | "plugin" | "custom" | "extension") {
+    if is_forbidden_xml_tag(&tag_lower) {
         return Err(PackValidationError::InvalidPack(format!(
             "Forbidden XML construct <{tag}>"
         )));
     }
+
+    counts.elements = counts.elements.saturating_add(1);
+    if tag_lower == "body" {
+        counts.bodies = counts.bodies.saturating_add(1);
+    } else if tag_lower == "geom" {
+        counts.geoms = counts.geoms.saturating_add(1);
+    }
+    check_element_budgets(*counts, ctx)?;
 
     for attr in node.attributes() {
         let aname = attr.name();
@@ -231,7 +302,7 @@ fn pass1_xml_security<'a>(
 
     for child in node.children() {
         if child.is_element() {
-            pass1_xml_security(child, depth + 1, dirs)?;
+            pass1_xml_security(child, depth + 1, dirs, counts, ctx)?;
         }
     }
     Ok(())
@@ -332,7 +403,8 @@ pub fn validate_xml_and_collect_summary_for_path(
         .map_err(|e| PackValidationError::InvalidPack(format!("XML parse failure in '{xml_rel}': {e}")))?;
 
     let mut dirs = CompilerDirs::default();
-    pass1_xml_security(doc.root_element(), 1, &mut dirs)?;
+    let mut counts = XmlElementCounts::default();
+    pass1_xml_security(doc.root_element(), 1, &mut dirs, &mut counts, xml_rel)?;
 
     if let Some(req) = required_elem {
         if !doc.descendants().any(|n| n.is_element() && n.tag_name().name() == req) {
@@ -342,7 +414,12 @@ pub fn validate_xml_and_collect_summary_for_path(
         }
     }
 
-    let mut summary = XmlValidationSummary::default();
+    let mut summary = XmlValidationSummary {
+        element_count: counts.elements,
+        body_count: counts.bodies,
+        geom_count: counts.geoms,
+        ..Default::default()
+    };
     let parent = xml_parent_dir(xml_rel);
     pass2_collect_refs(doc.root_element(), parent, &dirs, &mut summary)?;
     Ok(summary)
@@ -777,6 +854,7 @@ pub fn validate_pack_map(
     let mut mesh_refs = std::collections::BTreeSet::new();
     let mut mesh_count: usize = 0;
     let mut total_vertices: usize = 0;
+    let mut pack_counts = XmlElementCounts::default();
 
     for (rel, bytes) in files {
         if rel == primary_xml_rel || rel.to_ascii_lowercase().ends_with(".xml") {
@@ -785,6 +863,12 @@ pub fn validate_pack_map(
             })?;
             let req = if rel == primary_xml_rel { required_elem } else { None };
             let summary = validate_xml_and_collect_summary_for_path(rel, xml_str, req)?;
+            pack_counts = pack_counts.add(XmlElementCounts {
+                elements: summary.element_count,
+                bodies: summary.body_count,
+                geoms: summary.geom_count,
+            });
+            check_element_budgets(pack_counts, "pack XML files")?;
             mesh_count = mesh_count.saturating_add(summary.inline_mesh_count);
             total_vertices = total_vertices.saturating_add(summary.inline_vertex_count);
             check_mesh_budgets(mesh_count, total_vertices)?;
@@ -1111,18 +1195,31 @@ fn find_free_body_names(doc: &roxmltree::Document) -> Vec<String> {
     names
 }
 
-pub fn compose_mjcf(
+fn count_doc_elements_and_check_forbidden(
+    doc: &roxmltree::Document,
+    ctx: &str,
+) -> Result<XmlElementCounts, PackValidationError> {
+    let mut dirs = CompilerDirs::default();
+    let mut counts = XmlElementCounts::default();
+    pass1_xml_security(doc.root_element(), 1, &mut dirs, &mut counts, ctx)?;
+    Ok(counts)
+}
+
+pub fn compose_mjcf_checked(
     base_xml: &str,
     scene_world_xml: Option<&str>,
     tool_manifest: Option<&ToolManifest>,
     tool_xml: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, PackValidationError> {
     let base_doc = roxmltree::Document::parse(base_xml)
-        .map_err(|e| format!("Base MJCF is invalid XML: {e}"))?;
+        .map_err(|e| PackValidationError::InvalidPack(format!("Base MJCF is invalid XML: {e}")))?;
 
     let scene_doc = if let Some(s) = scene_world_xml {
         if !s.trim().is_empty() {
-            Some(roxmltree::Document::parse(s).map_err(|e| format!("Scene world XML is invalid: {e}"))?)
+            Some(
+                roxmltree::Document::parse(s)
+                    .map_err(|e| PackValidationError::InvalidPack(format!("Scene world XML is invalid: {e}")))?,
+            )
         } else {
             None
         }
@@ -1132,13 +1229,28 @@ pub fn compose_mjcf(
 
     let tool_doc = if let Some(t) = tool_xml {
         if !t.trim().is_empty() {
-            Some(roxmltree::Document::parse(t).map_err(|e| format!("Tool XML is invalid: {e}"))?)
+            Some(
+                roxmltree::Document::parse(t)
+                    .map_err(|e| PackValidationError::InvalidPack(format!("Tool XML is invalid: {e}")))?,
+            )
         } else {
             None
         }
     } else {
         None
     };
+
+    let scene_counts = if let Some(ref sd) = scene_doc {
+        count_doc_elements_and_check_forbidden(sd, "scene XML")?
+    } else {
+        XmlElementCounts::default()
+    };
+    let tool_counts = if let Some(ref td) = tool_doc {
+        count_doc_elements_and_check_forbidden(td, "tool XML")?
+    } else {
+        XmlElementCounts::default()
+    };
+    check_element_budgets(scene_counts.add(tool_counts), "combined scene + tool packs")?;
 
     let mut edits: Vec<XmlEdit> = Vec::new();
 
@@ -1246,7 +1358,9 @@ pub fn compose_mjcf(
             }
         }
         if !attached && !tool_worldbody_xml.is_empty() {
-            return Err(format!("Could not find attach body <body name=\"{attach_name}\"> in base XML"));
+            return Err(PackValidationError::InvalidPack(format!(
+                "Could not find attach body <body name=\"{attach_name}\"> in base XML"
+            )));
         }
 
         // Update TCP site pos if specified
@@ -1506,9 +1620,19 @@ pub fn compose_mjcf(
 
     // Validation: verify valid XML document
     roxmltree::Document::parse(&composed)
-        .map_err(|e| format!("Composed MJCF failed XML validation: {e}"))?;
+        .map_err(|e| PackValidationError::InvalidPack(format!("Composed MJCF failed XML validation: {e}")))?;
 
     Ok(composed)
+}
+
+pub fn compose_mjcf(
+    base_xml: &str,
+    scene_world_xml: Option<&str>,
+    tool_manifest: Option<&ToolManifest>,
+    tool_xml: Option<&str>,
+) -> Result<String, String> {
+    compose_mjcf_checked(base_xml, scene_world_xml, tool_manifest, tool_xml)
+        .map_err(|e| e.to_string())
 }
 
 pub fn builtin_tool_preset(id: &str) -> Option<(ToolManifest, &'static str)> {

@@ -1057,6 +1057,9 @@ pub fn spawn_policy_runner(
         };
         let run_started_at = Instant::now();
         let mut locked_generation: Option<u64> = None;
+        let mut locked_continuity_epoch: Option<u64> = embedding_hub
+            .as_ref()
+            .and_then(|h| h.active_continuity_epoch());
 
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1098,7 +1101,7 @@ pub fn spawn_policy_runner(
             };
             let base_input_age_ms = prop_age_range_ms.map(|(_, max_prop)| max_prop);
 
-            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_ms) =
+            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_and_unc_ms) =
                 if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
                     let Some(lease_gen) = snap_lease_gen else {
                         let mut inner = supervisor.inner().write().await;
@@ -1109,8 +1112,13 @@ pub fn spawn_policy_runner(
                         );
                         break;
                     };
-                    match hub.sample_window(emb_spec, emb_run_started_ms) {
+                    match hub.sample_window_with_continuity(
+                        emb_spec,
+                        emb_run_started_ms,
+                        locked_continuity_epoch,
+                    ) {
                         EmbeddingSampleDecision::Ready(win) => {
+                            locked_continuity_epoch.get_or_insert(win.handshake_continuity_epoch);
                             let ticket = InferenceTicket::new(
                                 action_id,
                                 lease_gen,
@@ -1127,7 +1135,7 @@ pub fn spawn_policy_runner(
                                 None,
                                 Some(win.newest_frame_id),
                                 Some(ticket),
-                                Some(win.newest_mapped_at_ms),
+                                Some((win.newest_oldest_mapped_at_ms, win.effective_uncertainty_ms)),
                             )
                         }
                         EmbeddingSampleDecision::Hold => {
@@ -1346,9 +1354,50 @@ pub fn spawn_policy_runner(
             // calibration hashing / release-gate / deployment checks, and immediately commit
             // `policy_step_with_vision` with zero intervening work.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
+            let mut hold_step = false;
+            let hold_on_stale = video_embedding_spec
+                .as_ref()
+                .is_some_and(|s| s.on_stale == VisionStalePolicy::Hold);
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
                     Ok(now_ms) => Some(now_ms),
+                    Err(TicketViolation::ClockHandshakeGenerationMismatch { expected, actual }) => {
+                        if actual != 0 && guard.is_unbroken_active_renewal(expected) {
+                            hold_step = true;
+                            None
+                        } else {
+                            let now_armd_ms = guard.live_ticket_state().now_armd_ms;
+                            if now_armd_ms > ticket.clock_handshake_expires_at_ms() {
+                                let exp_violation = TicketViolation::ClockHandshakeExpired {
+                                    now_ms: now_armd_ms,
+                                    expires_at_ms: ticket.clock_handshake_expires_at_ms(),
+                                };
+                                inner.fail_policy_run(
+                                    action_id,
+                                    exp_violation.code(),
+                                    exp_violation.message(),
+                                );
+                            } else {
+                                let violation = TicketViolation::ClockHandshakeGenerationMismatch {
+                                    expected,
+                                    actual,
+                                };
+                                inner.fail_policy_run(
+                                    action_id,
+                                    violation.code(),
+                                    violation.message(),
+                                );
+                            }
+                            break;
+                        }
+                    }
+                    Err(
+                        TicketViolation::WindowNewestExpired { .. }
+                        | TicketViolation::WindowOldestExpired { .. },
+                    ) if hold_on_stale => {
+                        hold_step = true;
+                        None
+                    }
                     Err(violation) => {
                         inner.fail_policy_run(action_id, violation.code(), violation.message());
                         break;
@@ -1357,8 +1406,14 @@ pub fn spawn_policy_runner(
             } else {
                 None
             };
-            let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) = (emb_commit_now_ms, emb_mapped_ms) {
-                Some(now_ms.saturating_sub(mapped_ms))
+            if hold_step {
+                inner.hold_policy_run(action_id);
+                continue;
+            }
+            let post_vision_age_ms = if let (Some(now_ms), Some((mapped_ms, unc_ms))) =
+                (emb_commit_now_ms, emb_mapped_and_unc_ms)
+            {
+                Some(now_ms.saturating_sub(mapped_ms).saturating_add(unc_ms))
             } else {
                 detector_post_vision_age_ms
             };

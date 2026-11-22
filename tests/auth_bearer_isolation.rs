@@ -848,3 +848,190 @@ async fn async_config_commit_observes_midflight_ws_auth_demotion() {
     assert_eq!(rest["revision"], 1);
     assert_eq!(rest["poses"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_origin_rejects_arbitrary_host_match_fallback_and_allows_loopback_proxy() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let auth = OperatorAuth::enforced("123456", 1800)
+        .with_public_origin(Some("https://robot.example.com".to_string()));
+    let addr = spawn_auth_server(sup.clone(), auth).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let port = addr.port();
+
+    // 1. Accepts configured public_origin on HTTP POST and WS upgrade
+    let ok_pub = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .header(HOST, "robot.example.com")
+        .header(ORIGIN, "https://robot.example.com")
+        .json(&json!({"pin": "123456", "set_cookie": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_pub.status(), 200);
+
+    let mut ws_pub = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+    ws_pub.headers_mut().insert(HOST, "robot.example.com".parse().unwrap());
+    ws_pub.headers_mut().insert(ORIGIN, "https://robot.example.com".parse().unwrap());
+    assert!(connect_async(ws_pub).await.is_ok());
+
+    // 2. Accepts local loopback console proxy (Host: 127.0.0.1:<port>, Origin: http://127.0.0.1:<port>)
+    let ok_loopback = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .header(HOST, format!("127.0.0.1:{port}"))
+        .header(ORIGIN, format!("http://127.0.0.1:{port}"))
+        .json(&json!({"pin": "123456", "set_cookie": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_loopback.status(), 200);
+
+    let mut ws_loopback = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+    ws_loopback.headers_mut().insert(HOST, format!("127.0.0.1:{port}").parse().unwrap());
+    ws_loopback.headers_mut().insert(ORIGIN, format!("http://127.0.0.1:{port}").parse().unwrap());
+    assert!(connect_async(ws_loopback).await.is_ok());
+
+    // 3. Rejects arbitrary Host-match fallback (evil.example) and non-approved device IP (192.168.42.1)
+    for (host_val, origin_val) in [
+        (format!("evil.example:{port}"), format!("http://evil.example:{port}")),
+        (format!("192.168.42.1:{port}"), format!("http://192.168.42.1:{port}")),
+    ] {
+        let rej_http = client
+            .post(format!("{base}/api/v1/auth/unlock"))
+            .header(HOST, &host_val)
+            .header(ORIGIN, &origin_val)
+            .json(&json!({"pin": "123456", "set_cookie": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rej_http.status(), 403, "HTTP POST must reject {origin_val}");
+
+        let mut ws_rej = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+        ws_rej.headers_mut().insert(HOST, host_val.parse().unwrap());
+        ws_rej.headers_mut().insert(ORIGIN, origin_val.parse().unwrap());
+        let err = connect_async(ws_rej).await.unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status(), 403, "WS upgrade must reject {origin_val}");
+            }
+            other => panic!("expected HTTP 403 for {origin_val}, got {other:?}"),
+        }
+    }
+
+    // 4. Bare scheme-only public origin ("https" / "http") fails closed (no arbitrary Host-match fallback)
+    let mut bare_hdrs = HeaderMap::new();
+    bare_hdrs.insert(HOST, "evil.example:8765".parse().unwrap());
+    bare_hdrs.insert(ORIGIN, "https://evil.example:8765".parse().unwrap());
+    assert!(!validate_origin_headers(&bare_hdrs, Some("https")));
+    bare_hdrs.insert(ORIGIN, "http://evil.example:8765".parse().unwrap());
+    assert!(!validate_origin_headers(&bare_hdrs, Some("http")));
+
+    // 5. Credential-free native request (no Origin header, no bearer/cookie) to operator-gated endpoint -> 403 OPERATOR_REQUIRED
+    let no_cred = client
+        .post(format!("{base}/api/v1/sandbox/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_cred.status(), 403);
+    let no_cred_body: Value = no_cred.json().await.unwrap();
+    assert_eq!(no_cred_body["code"], "OPERATOR_REQUIRED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_device_mode_and_explicit_allowed_origins() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let auth = OperatorAuth::enforced("123456", 1800);
+    let addr = spawn_auth_server(sup.clone(), auth).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+    let port = addr.port();
+
+    // 1. Default device mode accepts direct device IP same-origin on HTTP POST and WS upgrade
+    let ok_dev = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .header(HOST, "192.168.42.1:8765")
+        .header(ORIGIN, "http://192.168.42.1:8765")
+        .json(&json!({"pin": "123456", "set_cookie": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_dev.status(), 200);
+
+    let mut ws_dev = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+    ws_dev.headers_mut().insert(HOST, "192.168.42.1:8765".parse().unwrap());
+    ws_dev.headers_mut().insert(ORIGIN, "http://192.168.42.1:8765".parse().unwrap());
+    assert!(connect_async(ws_dev).await.is_ok());
+
+    // 2. Default device mode accepts reCamera console proxy (127.0.0.1:<port>) on HTTP POST and WS upgrade
+    let ok_proxy = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .header(HOST, format!("127.0.0.1:{port}"))
+        .header(ORIGIN, format!("http://127.0.0.1:{port}"))
+        .json(&json!({"pin": "123456", "set_cookie": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_proxy.status(), 200);
+
+    let mut ws_proxy = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+    ws_proxy.headers_mut().insert(HOST, format!("127.0.0.1:{port}").parse().unwrap());
+    ws_proxy.headers_mut().insert(ORIGIN, format!("http://127.0.0.1:{port}").parse().unwrap());
+    assert!(connect_async(ws_proxy).await.is_ok());
+
+    // 3. Default device mode rejects cross-origin and wrong-scheme with 403
+    for (host_val, origin_val) in [
+        ("192.168.42.1:8765", "http://evil.example:8765"),
+        ("192.168.42.1:8765", "https://192.168.42.1:8765"),
+    ] {
+        let rej = client
+            .post(format!("{base}/api/v1/auth/unlock"))
+            .header(HOST, host_val)
+            .header(ORIGIN, origin_val)
+            .json(&json!({"pin": "123456", "set_cookie": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rej.status(), 403, "expected 403 for {origin_val}");
+
+        let mut ws_rej = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+        ws_rej.headers_mut().insert(HOST, host_val.parse().unwrap());
+        ws_rej.headers_mut().insert(ORIGIN, origin_val.parse().unwrap());
+        let err = connect_async(ws_rej).await.unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => assert_eq!(resp.status(), 403),
+            other => panic!("expected HTTP 403 for {origin_val}, got {other:?}"),
+        }
+    }
+
+    // 4. Explicitly approved allowed_origins works with public_origin, unless shadowing public_origin scheme
+    let sup_allowed = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let auth_allowed = OperatorAuth::enforced("123456", 1800)
+        .with_public_origin(Some("https://robot.example.com".to_string()))
+        .with_allowed_origins(vec![
+            parse_origin("http://192.168.42.1:8765").unwrap(),
+            parse_origin("http://robot.example.com:443").unwrap(),
+            parse_origin("http://robot.example.com").unwrap(),
+        ]);
+    let addr_allowed = spawn_auth_server(sup_allowed, auth_allowed).await;
+    let ok_lan = client
+        .post(format!("http://{addr_allowed}/api/v1/auth/unlock"))
+        .header(HOST, "192.168.42.1:8765")
+        .header(ORIGIN, "http://192.168.42.1:8765")
+        .json(&json!({"pin": "123456", "set_cookie": false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_lan.status(), 200);
+
+    for shadow_origin in ["http://robot.example.com", "http://robot.example.com:443"] {
+        let rej_shadow = client
+            .post(format!("http://{addr_allowed}/api/v1/auth/unlock"))
+            .header(HOST, "robot.example.com")
+            .header(ORIGIN, shadow_origin)
+            .json(&json!({"pin": "123456", "set_cookie": false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rej_shadow.status(), 403, "shadowing origin {shadow_origin} must be rejected");
+    }
+}

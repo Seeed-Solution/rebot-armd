@@ -19,7 +19,10 @@ use tower::ServiceExt;
 
 use armd::api::create_router_with_sandbox;
 use armd::api::sandbox::{normalize_robot_id, ActivationTxState, SandboxState, SimTxTimeouts};
-use armd::mjcf_compose::{compute_pack_digest, MAX_XML_BYTES};
+use armd::mjcf_compose::{
+    compose_mjcf, compute_pack_digest, FALLBACK_BASE_XML, MAX_PACK_BODIES, MAX_PACK_GEOMS,
+    MAX_XML_BYTES, MAX_XML_ELEMENTS,
+};
 use armd::{ArmConfig, ArmSupervisor, OperatorAuth};
 
 static SIM_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2466,6 +2469,662 @@ async fn sandbox_m09_prepare_ack_rejects_202_missing_state_or_wrong_tx_id() {
         assert!(*aborted.lock().unwrap(), "{case}: abort must be called");
         assert!(matches!(*state.tx_state.read().await, ActivationTxState::Aborted { .. }));
     }
+}
+
+#[tokio::test]
+async fn sandbox_bundle_cache_hits_after_activate_and_reflects_live_mutable_fields() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="cached_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "cached_scene",
+            "scene_json": {"id": "cached_scene", "name": "Cached Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_bytes) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "cached_scene", "tool": "default", "seed": 100})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let initial_rebuilds = state.bundle_rebuild_count();
+    assert_eq!(initial_rebuilds, 0, "activate must populate bundle cache without extra rebuild");
+
+    for _ in 0..5 {
+        let (st, bundle) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+        assert_eq!(st, StatusCode::OK, "{bundle}");
+        assert_eq!(bundle["seed"], 100);
+        assert_eq!(bundle["reset_seq"], 0);
+        assert!(bundle["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+    assert_eq!(
+        state.bundle_rebuild_count(),
+        initial_rebuilds,
+        "repeated GET /bundle calls must hit cache with 0 rebuilds"
+    );
+
+    // Mutate live fields (seed/reset_seq via reset, desired_io via io)
+    let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/reset", Some(json!({"seed": 777}))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send_json(&app, "POST", "/api/v1/sandbox/io", Some(json!({"vacuum": true}))).await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, bundle2) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::OK, "{bundle2}");
+    assert_eq!(bundle2["seed"], 777);
+    assert_eq!(bundle2["reset_seq"], 1);
+    assert_eq!(bundle2["desired_io"]["vacuum"], true);
+    assert_eq!(
+        state.bundle_rebuild_count(),
+        initial_rebuilds,
+        "live field updates must not invalidate immutable bundle cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_bundle_concurrent_cold_gets_coalesce_into_single_rebuild() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="cold_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/cold_scene"),
+        "cold_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    // Cold SandboxState with active_scene pointing to disk pack (no prior activate in memory)
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "cold_scene".to_string();
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let app_c = app.clone();
+        handles.push(tokio::spawn(async move {
+            send_json(&app_c, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+    for h in handles {
+        let (st, body) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert!(body["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+    assert!(
+        state.bundle_rebuild_count() <= 1,
+        "concurrent cold GETs must coalesce into at most 1 rebuild, got {}",
+        state.bundle_rebuild_count()
+    );
+}
+
+#[tokio::test]
+async fn sandbox_bundle_rejects_same_byte_size_valid_replacement_tampering_on_disk() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_v1 = valid_asymmetric_stl();
+    let stl_v2 = make_binary_stl(&[
+        (
+            [0.0, 0.0, 1.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.0, 0.07, 0.02]],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.03, 0.0, 0.06]],
+        ),
+    ]);
+    assert_eq!(stl_v1.len(), stl_v2.len(), "test requires identical byte length");
+    assert_ne!(stl_v1, stl_v2);
+
+    let world_xml = r#"<mujoco model="tamper_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "tamper_scene",
+            "scene_json": {"id": "tamper_scene", "name": "Tamper Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_v1) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "tamper_scene", "tool": "default"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Replace STL via temp file + rename (same byte length, valid STL, different content & inode)
+    let target_stl = tmp.path().join("scenes/tamper_scene/meshes/asym.stl");
+    let tmp_stl = tmp.path().join("scenes/tamper_scene/meshes/.asym.stl.tmp");
+    std::fs::write(&tmp_stl, &stl_v2).unwrap();
+    std::fs::rename(&tmp_stl, &target_stl).unwrap();
+
+    let (st, err) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["code"], "INVALID_PACK", "{err}");
+}
+
+#[tokio::test]
+async fn sandbox_m5_rejects_expansion_tags_and_enforces_single_and_combined_element_budgets() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    // 1. Reject expansion/forbidden XML constructs on both Boundary 1 and Boundary 2
+    let expansion_cases = [
+        ("replicate", r#"<mujoco><worldbody><replicate count="10"><body name="r"/></replicate></worldbody></mujoco>"#),
+        ("frame", r#"<mujoco><worldbody><frame pos="0 0 0"><body name="f"/></frame></worldbody></mujoco>"#),
+        ("include", r#"<mujoco><include file="other.xml"/><worldbody/></mujoco>"#),
+        ("composite", r#"<mujoco><worldbody><composite type="grid" count="2 2 1"/></worldbody></mujoco>"#),
+        ("flexcomp", r#"<mujoco><worldbody><flexcomp name="fx" type="grid" count="2 2 1"/></worldbody></mujoco>"#),
+        ("attach", r#"<mujoco><worldbody><attach model="m" body="b"/></worldbody></mujoco>"#),
+        ("model", r#"<mujoco><asset><model name="m" file="sub.xml"/></asset><worldbody/></mujoco>"#),
+    ];
+    for (name, xml) in expansion_cases {
+        let id = format!("exp_{name}");
+        let (st, body) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/scenes",
+            Some(json!({
+                "id": id,
+                "scene_json": {"id": id, "name": name, "world_xml": "world.xml"},
+                "world_xml": xml
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "Boundary 1 ({name}): {body}");
+        assert_eq!(body["code"], "INVALID_PACK", "Boundary 1 ({name}): {body}");
+
+        let disk_id = format!("disk_exp_{name}");
+        write_disk_scene(&tmp.path().join("scenes").join(&disk_id), &disk_id, xml, &[]);
+        assert_boundary2_rejected(&state, &app, &disk_id).await;
+    }
+
+    // 2. Accept exact MAX_PACK_BODIES and MAX_PACK_GEOMS, reject limit + 1
+    let make_bodies_xml = |n: usize| {
+        let mut s = String::from("<mujoco><worldbody>");
+        for i in 0..n {
+            s.push_str(&format!(r#"<body name="b{i}"/>"#));
+        }
+        s.push_str("</worldbody></mujoco>");
+        s
+    };
+    let make_geoms_xml = |n: usize| {
+        let mut s = String::from("<mujoco><worldbody>");
+        for i in 0..n {
+            s.push_str(&format!(r#"<geom name="g{i}" type="box" size="0.01 0.01 0.01"/>"#));
+        }
+        s.push_str("</worldbody></mujoco>");
+        s
+    };
+
+    let (st, ok_bodies) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "exact_bodies",
+            "scene_json": {"id": "exact_bodies", "name": "Exact Bodies", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_bodies_xml(MAX_PACK_BODIES)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ok_bodies}");
+
+    let (st, over_bodies) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "over_bodies",
+            "scene_json": {"id": "over_bodies", "name": "Over Bodies", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_bodies_xml(MAX_PACK_BODIES + 1)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{over_bodies}");
+    assert_eq!(over_bodies["code"], "INVALID_PACK");
+
+    let (st, ok_geoms) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "exact_geoms",
+            "scene_json": {"id": "exact_geoms", "name": "Exact Geoms", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_geoms_xml(MAX_PACK_GEOMS)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ok_geoms}");
+
+    let (st, over_geoms) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "over_geoms",
+            "scene_json": {"id": "over_geoms", "name": "Over Geoms", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": make_geoms_xml(MAX_PACK_GEOMS + 1)
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{over_geoms}");
+    assert_eq!(over_geoms["code"], "INVALID_PACK");
+
+    // 3. Combined scene (300 bodies) + tool (250 bodies) = 550 > 512: each uploads fine individually,
+    //    but compose_mjcf AND POST /activate reject before compilation!
+    let scene_300 = make_bodies_xml(300);
+    let tool_250 = make_bodies_xml(250);
+    assert_eq!(MAX_XML_ELEMENTS, 4_096);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "scene_300_bodies",
+            "scene_json": {"id": "scene_300_bodies", "name": "Scene 300", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": scene_300
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/tools",
+        Some(json!({
+            "id": "tool_250_bodies",
+            "tool_json": {"id": "tool_250_bodies", "name": "Tool 250", "kind": "gripper", "tool_xml": "tool.xml", "robots": ["b601dm"]},
+            "tool_xml": tool_250
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Direct compose_mjcf rejects combined overflow
+    assert!(compose_mjcf(FALLBACK_BASE_XML, Some(&scene_300), None, Some(&tool_250)).is_err());
+
+    // Activate rejects combined overflow with 400 INVALID_PACK
+    let (st, err_act) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "scene_300_bodies", "tool": "tool_250_bodies"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err_act}");
+    assert_eq!(err_act["code"], "INVALID_PACK", "{err_act}");
+}
+
+#[tokio::test]
+async fn sandbox_m07_concurrent_warm_bundle_gets_coalesce_stat_walks() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="warm_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/warm_scene"),
+        "warm_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "warm_scene".to_string();
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    // Cold GET warms the bundle cache.
+    let (st0, body0) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st0, StatusCode::OK, "{body0}");
+    assert_eq!(state.bundle_rebuild_count(), 1);
+    let expected_sha = body0["composed_xml_sha256"].as_str().unwrap().to_string();
+
+    // Concurrent burst of 12 warm GETs must coalesce onto 1 stat walk and 0 rebuilds.
+    state.set_stat_walk_delay_ms(80);
+    let walks_before = state.bundle_stat_walk_count();
+    let rebuilds_before = state.bundle_rebuild_count();
+    let barrier = Arc::new(tokio::sync::Barrier::new(12));
+    let mut handles = Vec::new();
+    for _ in 0..12 {
+        let app_c = app.clone();
+        let b_c = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            b_c.wait().await;
+            send_json(&app_c, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+    for h in handles {
+        let (st, body) = h.await.unwrap();
+        assert_eq!(st, StatusCode::OK, "{body}");
+        assert_eq!(body["composed_xml_sha256"].as_str(), Some(expected_sha.as_str()));
+    }
+    assert_eq!(state.bundle_rebuild_count(), rebuilds_before);
+    assert_eq!(
+        state.bundle_stat_walk_count() - walks_before,
+        1,
+        "12 concurrent warm GETs must coalesce onto 1 stat walk"
+    );
+
+    // Sequential GET after burst must still run a fresh stat check (not stale-cached).
+    state.set_stat_walk_delay_ms(0);
+    let (st_seq, _) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st_seq, StatusCode::OK);
+    assert_eq!(state.bundle_stat_walk_count() - walks_before, 2);
+}
+
+#[tokio::test]
+async fn sandbox_m08_recover_split_shares_rebuild_semaphore_with_cold_get_bundle() {
+    let _env_guard = SIM_ENV_LOCK.lock().await;
+    let _upload_guard = UPLOAD_LOCK.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let stl_bytes = valid_asymmetric_stl();
+    let world_xml = r#"<mujoco model="split_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    write_disk_scene(
+        &tmp.path().join("scenes/split_scene"),
+        "split_scene",
+        world_xml,
+        &[("meshes/asym.stl", &stl_bytes)],
+    );
+
+    let commit_done = Arc::new(tokio::sync::Notify::new());
+    let commit_done_c = commit_done.clone();
+
+    let mock_sim = axum::Router::new()
+        .route(
+            "/sim/scene/commit",
+            post(move || {
+                let commit_done_c = commit_done_c.clone();
+                async move {
+                    commit_done_c.notify_waiters();
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "ok": true,
+                            "state": "COMMITTED",
+                            "tx_id": "tx-m08",
+                            "camera_tx_id": "tx-m08",
+                            "robot": "b601dm",
+                            "scene": "split_scene",
+                            "tool": "default"
+                        })),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/sim/state",
+            get(|| async move {
+                axum::Json(json!({
+                    "tx_id": "tx-m08",
+                    "activation_state": "DEGRADED_SPLIT",
+                    "robot": "b601dm",
+                    "scene": "split_scene",
+                    "tool": "default"
+                }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+    std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    state.active.write().await.active_scene = "split_scene".to_string();
+    state.set_bundle_rebuild_delay_ms(80);
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let notified = commit_done.notified();
+    let app_rec = app.clone();
+    let rec_handle = tokio::spawn(async move {
+        send_json(
+            &app_rec,
+            "POST",
+            "/api/v1/sandbox/recover-split",
+            Some(json!({"action": "replay_camera"})),
+        )
+        .await
+    });
+
+    // Wait until recover_split receives 200 from /sim/scene/commit and enters build_bundle_from_disk,
+    // then fire concurrent cold GET /api/v1/sandbox/bundle requests against the empty cache.
+    notified.await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut get_handles = Vec::new();
+    for _ in 0..4 {
+        let app_get = app.clone();
+        get_handles.push(tokio::spawn(async move {
+            send_json(&app_get, "GET", "/api/v1/sandbox/bundle", None).await
+        }));
+    }
+
+    let (st_rec, body_rec) = rec_handle.await.unwrap();
+    assert_eq!(st_rec, StatusCode::OK, "{body_rec}");
+    assert_eq!(body_rec["state"], "COMMITTED", "{body_rec}");
+
+    for h in get_handles {
+        let (st_get, body_get) = h.await.unwrap();
+        assert_eq!(st_get, StatusCode::OK, "{body_get}");
+        assert!(body_get["composed_xml"].as_str().unwrap().contains("asym.stl"));
+    }
+
+    std::env::remove_var("ARMD_SIM_URL");
+    server.abort();
+
+    assert_eq!(
+        state.peak_concurrent_rebuilds(),
+        1,
+        "recover_split and cold GET /bundle must share bundle_rebuild_sem so peak_concurrent_rebuilds == 1"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_bundle_invalidates_cache_on_inplace_same_length_mtime_preserving_overwrite() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_v1 = valid_asymmetric_stl();
+    let stl_v2 = make_binary_stl(&[
+        (
+            [0.0, 0.0, 1.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.0, 0.07, 0.02]],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.03, 0.0, 0.06]],
+        ),
+    ]);
+    assert_eq!(stl_v1.len(), stl_v2.len());
+    assert_ne!(stl_v1, stl_v2);
+
+    let world_xml = r#"<mujoco model="mtime_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "mtime_scene",
+            "scene_json": {"id": "mtime_scene", "name": "Mtime Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_v1) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/activate",
+        Some(json!({"mode": "wasm", "scene": "mtime_scene", "tool": "default"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // Warm the cache via GET /bundle.
+    let (st, bundle) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::OK, "{bundle}");
+
+    // Overwrite meshes/asym.stl IN-PLACE with identical length and restore exact original mtime.
+    let target_stl = tmp.path().join("scenes/mtime_scene/meshes/asym.stl");
+    let orig_mtime = std::fs::metadata(&target_stl).unwrap().modified().unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&target_stl)
+            .unwrap();
+        f.write_all(&stl_v2).unwrap();
+        f.set_modified(orig_mtime).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&target_stl).unwrap().modified().unwrap(),
+        orig_mtime
+    );
+
+    let (st, err) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["code"], "INVALID_PACK", "{err}");
+}
+
+#[tokio::test]
+async fn sandbox_bundle_cold_rebuild_rejects_mid_build_modification_without_caching() {
+    let _guard = UPLOAD_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let empty_builtins = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        SandboxState::new(tmp.path().to_path_buf())
+            .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+    );
+    let app = app_for(ArmConfig::rebot_dm(), state.clone());
+
+    let stl_v1 = valid_asymmetric_stl();
+    let stl_v2 = make_binary_stl(&[
+        (
+            [0.0, 0.0, 1.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.0, 0.07, 0.02]],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [[0.0, 0.0, 0.0], [0.09, 0.0, 0.0], [0.03, 0.0, 0.06]],
+        ),
+    ]);
+
+    let world_xml = r#"<mujoco model="midbuild_world"><compiler meshdir="meshes"/><asset><mesh name="asym" file="asym.stl"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="asym"/></body></worldbody></mujoco>"#;
+    let (st, _) = send_json(
+        &app,
+        "POST",
+        "/api/v1/sandbox/scenes",
+        Some(json!({
+            "id": "midbuild_scene",
+            "scene_json": {"id": "midbuild_scene", "name": "Midbuild Scene", "world_xml": "world.xml", "robots": ["b601dm"]},
+            "world_xml": world_xml,
+            "assets": {
+                "meshes/asym.stl": { "encoding": "base64", "data": b64_encode(&stl_v1) }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    state.active.write().await.active_scene = "midbuild_scene".to_string();
+    state.set_bundle_rebuild_delay_ms(80);
+
+    let app_get = app.clone();
+    let get_handle = tokio::spawn(async move {
+        send_json(&app_get, "GET", "/api/v1/sandbox/bundle", None).await
+    });
+
+    // Wait until cold build has collected pre_fp and entered its sleep window, then mutate disk.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let target_stl = tmp.path().join("scenes/midbuild_scene/meshes/asym.stl");
+    std::fs::write(&target_stl, &stl_v2).unwrap();
+
+    let (st, err) = get_handle.await.unwrap();
+    assert!(
+        matches!(st, StatusCode::CONFLICT | StatusCode::BAD_REQUEST),
+        "unexpected status {st}: {err}"
+    );
+    assert_eq!(err["code"], "INVALID_PACK", "{err}");
+
+    // Cache must NOT have been populated with a mismatched entry: restoring v1 and re-querying rebuilds cleanly.
+    state.set_bundle_rebuild_delay_ms(0);
+    std::fs::write(&target_stl, &stl_v1).unwrap();
+    let (st2, body2) = send_json(&app, "GET", "/api/v1/sandbox/bundle", None).await;
+    assert_eq!(st2, StatusCode::OK, "{body2}");
+    assert!(body2["composed_xml"].as_str().unwrap().contains("asym.stl"));
 }
 
 

@@ -357,6 +357,8 @@ pub const DEFAULT_HANDSHAKE_TTL_MS: u64 = 60_000;
 pub const MAX_SAME_HOST_UNCERTAINTY_MS: u64 = 5;
 pub const MAX_REMOTE_UNCERTAINTY_MS: u64 = 25;
 pub const MAX_FUTURE_SKEW_CAP_MS: u64 = 25;
+const CHALLENGE_TTL_MS: u64 = 5_000;
+const MAX_PENDING_CHALLENGES: usize = 16;
 const UNBOUND_RING_CAP: usize = 8;
 
 static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -391,12 +393,16 @@ pub struct ClockHandshakeState {
 
 impl ClockHandshakeState {
     pub fn effective_uncertainty_ms(&self) -> u64 {
-        self.server_uncertainty_ms.max(self.producer_uncertainty_ms)
+        self.server_uncertainty_ms.saturating_add(self.producer_uncertainty_ms)
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClockHandshakeRequest {
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub challenge_id: Option<String>,
     #[serde(default)]
     pub producer_epoch: u64,
     #[serde(default, alias = "client_monotonic_ms")]
@@ -413,6 +419,8 @@ pub struct ClockHandshakeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClockHandshakeResponse {
+    pub phase: String,
+    pub challenge_id: Option<String>,
     pub handshake_generation: u64,
     pub producer_epoch: u64,
     pub same_host: bool,
@@ -423,6 +431,7 @@ pub struct ClockHandshakeResponse {
     pub server_monotonic_ms: u64,
     pub handshake_expires_at_ms: u64,
     pub ttl_ms: u64,
+    pub measured_rtt_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -431,6 +440,8 @@ pub struct EmbeddingIngestRequest {
     pub producer_epoch: u64,
     pub frame_id: u64,
     pub captured_at_ms: i64,
+    #[serde(default, alias = "window_start_ms", alias = "clip_oldest_captured_at_ms")]
+    pub oldest_captured_at_ms: Option<i64>,
     pub embedding: Vec<f64>,
     pub encoder_artifact_sha256: String,
     pub preprocess_config_sha256: String,
@@ -444,6 +455,7 @@ pub struct EmbeddingIngestResponse {
     pub frame_id: u64,
     pub producer_epoch: u64,
     pub mapped_captured_at_ms: u64,
+    pub mapped_oldest_captured_at_ms: u64,
     pub window_len: usize,
     pub history_len: usize,
     pub window_ready: bool,
@@ -473,6 +485,8 @@ pub struct EmbeddingFrame {
     pub handshake_generation: u64,
     pub captured_at_ms: i64,
     pub mapped_at_ms: u64,
+    pub oldest_captured_at_ms: i64,
+    pub oldest_mapped_at_ms: u64,
     pub embedding: Vec<f32>,
     pub encoder_artifact_sha256: String,
     pub preprocess_config_sha256: String,
@@ -484,11 +498,14 @@ pub struct EmbeddingWindowSnapshot {
     pub features: Vec<f32>,
     pub newest_frame_id: u64,
     pub newest_mapped_at_ms: u64,
+    pub newest_oldest_mapped_at_ms: u64,
+    pub effective_uncertainty_ms: u64,
     pub producer_epoch: u64,
     pub model_generation: Option<u64>,
     pub invalidation_generation: u64,
     pub clock_handshake_generation: u64,
     pub clock_handshake_expires_at_ms: u64,
+    pub handshake_continuity_epoch: u64,
     pub window_newest_deadline_ms: u64,
     pub window_oldest_deadline_ms: u64,
     pub policy_instance_id: Option<u64>,
@@ -513,6 +530,8 @@ pub struct LiveEmbeddingTicketState {
     pub invalidation_generation: u64,
     pub clock_handshake_generation: u64,
     pub clock_handshake_expires_at_ms: u64,
+    pub handshake_continuity_epoch: u64,
+    pub continuous_renewal_floor_gen: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -522,17 +541,34 @@ struct BoundEmbeddingPolicy {
     effective_staleness_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingClockChallenge {
+    challenge_id: String,
+    server_sent_ms: u64,
+    expires_at_ms: u64,
+    producer_epoch: u64,
+    t0_ms: i64,
+    socket_same_host: bool,
+    issued_at_hs_gen: u64,
+}
+
 #[derive(Debug)]
 struct EmbeddingHubInner {
     test_now_ms: Option<u64>,
     default_handshake_ttl_ms: u64,
     handshake_generation: u64,
+    handshake_continuity_epoch: u64,
     handshake: Option<ClockHandshakeState>,
+    refill_started_at_ms: Option<u64>,
+    continuous_renewal_floor_gen: u64,
+    pending_challenges: VecDeque<PendingClockChallenge>,
+    next_challenge_seq: u64,
     bound: Option<BoundEmbeddingPolicy>,
     invalidation_generation: u64,
     producer_epoch: Option<u64>,
     last_frame_id: Option<u64>,
-    model_generation: Option<u64>,
+    producer_model_generation: Option<u64>,
+    server_model_epoch: u64,
     last_frame_model_generation: Option<u64>,
     has_seen_frame_in_epoch: bool,
     frames: VecDeque<EmbeddingFrame>,
@@ -546,12 +582,18 @@ impl Default for EmbeddingHubInner {
             test_now_ms: None,
             default_handshake_ttl_ms: DEFAULT_HANDSHAKE_TTL_MS,
             handshake_generation: 0,
+            handshake_continuity_epoch: 0,
             handshake: None,
+            refill_started_at_ms: None,
+            continuous_renewal_floor_gen: 0,
+            pending_challenges: VecDeque::new(),
+            next_challenge_seq: 0,
             bound: None,
             invalidation_generation: 0,
             producer_epoch: None,
             last_frame_id: None,
-            model_generation: None,
+            producer_model_generation: None,
+            server_model_epoch: 0,
             last_frame_model_generation: None,
             has_seen_frame_in_epoch: false,
             frames: VecDeque::new(),
@@ -580,20 +622,27 @@ impl EmbeddingHubInner {
             .bound
             .as_ref()
             .map_or(MAX_VIDEO_WINDOW_SPAN_MS, |b| b.spec.max_window_span_ms);
+        let unc = self
+            .handshake
+            .as_ref()
+            .map_or(0, |h| h.effective_uncertainty_ms());
         let oldest = self
             .frames
             .iter()
-            .map(|f| f.mapped_at_ms)
+            .map(|f| f.oldest_mapped_at_ms)
             .min()
             .expect("non-empty");
-        let newest = self
+        let newest_oldest = self
             .frames
-            .iter()
-            .map(|f| f.mapped_at_ms)
-            .max()
-            .expect("non-empty");
-        self.window_newest_deadline_ms = Some(newest.saturating_add(staleness));
-        self.window_oldest_deadline_ms = Some(oldest.saturating_add(span));
+            .back()
+            .expect("non-empty")
+            .oldest_mapped_at_ms;
+        self.window_newest_deadline_ms = Some(
+            newest_oldest
+                .saturating_add(staleness)
+                .saturating_sub(unc),
+        );
+        self.window_oldest_deadline_ms = Some(oldest.saturating_add(span).saturating_sub(unc));
     }
 
     fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
@@ -606,10 +655,12 @@ impl EmbeddingHubInner {
             now_armd_ms,
             policy_instance_id: self.bound.as_ref().map(|b| b.policy_instance_id),
             producer_epoch: self.producer_epoch,
-            model_generation: self.model_generation,
+            model_generation: Some(self.server_model_epoch),
             invalidation_generation: self.invalidation_generation,
             clock_handshake_generation,
             clock_handshake_expires_at_ms,
+            handshake_continuity_epoch: self.handshake_continuity_epoch,
+            continuous_renewal_floor_gen: self.continuous_renewal_floor_gen,
         }
     }
 }
@@ -623,6 +674,26 @@ pub struct HubCommitGuard<'a> {
 impl<'a> HubCommitGuard<'a> {
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
         self.inner.live_ticket_state()
+    }
+
+    pub fn is_unbroken_active_renewal(&self, ticket_hs_gen: u64) -> bool {
+        let Some(ref live_hs) = self.inner.handshake else {
+            return false;
+        };
+        let now_ms = self.inner.now_ms();
+        let floor = self.inner.continuous_renewal_floor_gen;
+        if live_hs.handshake_generation == 0
+            || floor == 0
+            || now_ms > live_hs.handshake_expires_at_ms
+            || live_hs.handshake_generation != self.inner.handshake_generation
+        {
+            return false;
+        }
+        if floor <= live_hs.handshake_generation {
+            ticket_hs_gen >= floor && ticket_hs_gen <= live_hs.handshake_generation
+        } else {
+            ticket_hs_gen >= floor || ticket_hs_gen <= live_hs.handshake_generation
+        }
     }
 }
 
@@ -669,6 +740,16 @@ impl VideoEmbeddingHub {
         inner.handshake.clone()
     }
 
+    pub fn active_continuity_epoch(&self) -> Option<u64> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now_ms = inner.now_ms();
+        inner
+            .handshake
+            .as_ref()
+            .filter(|hs| now_ms <= hs.handshake_expires_at_ms)
+            .map(|_| inner.handshake_continuity_epoch)
+    }
+
     pub fn window_len(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.frames.len()
@@ -693,13 +774,23 @@ impl VideoEmbeddingHub {
 
     pub fn bump_invalidation_generation(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+        inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         inner.invalidation_generation
     }
 
     pub fn set_model_generation(&self, gen: Option<u64>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.model_generation = gen;
+        if inner.producer_model_generation != gen {
+            inner.producer_model_generation = gen;
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
+        }
+    }
+
+    pub fn set_counters_for_test(&self, server_model_epoch: u64, invalidation_generation: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.server_model_epoch = server_model_epoch;
+        inner.invalidation_generation = invalidation_generation;
     }
 
     pub fn set_producer_epoch(&self, epoch: u64) {
@@ -710,8 +801,11 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+            inner.producer_model_generation = None;
+            inner.refill_started_at_ms = None;
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.recompute_deadlines();
-            inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         }
     }
 
@@ -728,8 +822,16 @@ impl VideoEmbeddingHub {
             inner.frames.clear();
             // Do NOT reset `last_frame_id` for the active `producer_epoch` (A9).
         } else {
+            let unc = inner
+                .handshake
+                .as_ref()
+                .map_or(0, |h| h.effective_uncertainty_ms());
             while let Some(front) = inner.frames.front() {
-                if now_ms.saturating_sub(front.mapped_at_ms) > spec.max_window_span_ms {
+                if now_ms
+                    .saturating_sub(front.oldest_mapped_at_ms)
+                    .saturating_add(unc)
+                    > spec.max_window_span_ms
+                {
                     inner.frames.pop_front();
                 } else {
                     break;
@@ -744,8 +846,10 @@ impl VideoEmbeddingHub {
             spec,
             effective_staleness_ms,
         });
-        inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
-        inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+        inner.refill_started_at_ms = None;
+        inner.continuous_renewal_floor_gen = inner.handshake_generation;
+        inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+        inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         inner.recompute_deadlines();
     }
 
@@ -757,8 +861,9 @@ impl VideoEmbeddingHub {
             .is_some_and(|b| b.policy_instance_id == policy_instance_id)
         {
             inner.bound = None;
-            inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
-            inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         }
     }
 
@@ -767,10 +872,113 @@ impl VideoEmbeddingHub {
         req: ClockHandshakeRequest,
         socket_same_host: bool,
     ) -> Result<ClockHandshakeResponse, EmbeddingIngestError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now_ms = inner.now_ms();
+        match req.phase.as_deref() {
+            None | Some("init") if req.challenge_id.is_none() => {
+                self.clock_handshake_init(req, socket_same_host)
+            }
+            Some("init") => Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CHALLENGE",
+                message: "challenge_id must not be set during init phase".into(),
+            }),
+            None | Some("confirm") => self.clock_handshake_confirm(req, socket_same_host),
+            Some(other) => Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CHALLENGE",
+                message: format!("unsupported handshake phase '{other}'"),
+            }),
+        }
+    }
 
+    pub fn clock_handshake_init(
+        &self,
+        req: ClockHandshakeRequest,
+        socket_same_host: bool,
+    ) -> Result<ClockHandshakeResponse, EmbeddingIngestError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let producer_monotonic_ms = req.producer_monotonic_ms.ok_or_else(|| EmbeddingIngestError {
+            status: 400,
+            code: "MISSING_PRODUCER_TIMESTAMP",
+            message: "producer_monotonic_ms (or client_monotonic_ms) is required".into(),
+        })?;
+        if let Some(cur_epoch) = inner.producer_epoch {
+            if req.producer_epoch < cur_epoch {
+                return Err(EmbeddingIngestError {
+                    status: 409,
+                    code: "PRODUCER_EPOCH_STALE",
+                    message: format!(
+                        "producer_epoch {} is older than active epoch {cur_epoch}",
+                        req.producer_epoch
+                    ),
+                });
+            }
+        }
+        if req.ttl_ms == Some(0) {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_TTL",
+                message: "handshake ttl_ms must be >= 1".into(),
+            });
+        }
+
+        let s1 = inner.now_ms();
+        let expires_at_ms = s1.saturating_add(CHALLENGE_TTL_MS);
+
+        // Evict expired challenges first, then oldest to enforce the 16-slot cap.
+        inner
+            .pending_challenges
+            .retain(|c| s1 <= c.expires_at_ms);
+        while inner.pending_challenges.len() >= MAX_PENDING_CHALLENGES {
+            inner.pending_challenges.pop_front();
+        }
+
+        inner.next_challenge_seq = inner.next_challenge_seq.wrapping_add(1);
+        let challenge_id = format!("hs-{s1}-{}", inner.next_challenge_seq);
+        let issued_at_hs_gen = inner.handshake_generation;
+        inner.pending_challenges.push_back(PendingClockChallenge {
+            challenge_id: challenge_id.clone(),
+            server_sent_ms: s1,
+            expires_at_ms,
+            producer_epoch: req.producer_epoch,
+            t0_ms: producer_monotonic_ms,
+            socket_same_host,
+            issued_at_hs_gen,
+        });
+
+        Ok(ClockHandshakeResponse {
+            phase: "challenge".into(),
+            challenge_id: Some(challenge_id),
+            handshake_generation: 0,
+            producer_epoch: req.producer_epoch,
+            same_host: socket_same_host,
+            clock_offset_ms: 0,
+            server_uncertainty_ms: 0,
+            producer_uncertainty_ms: 0,
+            effective_uncertainty_ms: 0,
+            server_monotonic_ms: s1,
+            handshake_expires_at_ms: expires_at_ms,
+            ttl_ms: 0,
+            measured_rtt_ms: None,
+        })
+    }
+
+    pub fn clock_handshake_confirm(
+        &self,
+        req: ClockHandshakeRequest,
+        socket_same_host: bool,
+    ) -> Result<ClockHandshakeResponse, EmbeddingIngestError> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let challenge_id = req
+            .challenge_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CHALLENGE",
+                message: "challenge_id is required to confirm clock handshake".into(),
+            })?;
+        let t1 = req.producer_monotonic_ms.ok_or_else(|| EmbeddingIngestError {
             status: 400,
             code: "MISSING_PRODUCER_TIMESTAMP",
             message: "producer_monotonic_ms (or client_monotonic_ms) is required".into(),
@@ -783,21 +991,67 @@ impl VideoEmbeddingHub {
             }
         })?;
 
-        let rtt_unc = req.rtt_ms.map_or(0, |r| r.div_ceil(2));
-        let server_uncertainty_ms = req.server_uncertainty_ms.unwrap_or(0).max(rtt_unc);
-        let effective_uncertainty_ms = server_uncertainty_ms.max(producer_uncertainty_ms);
-        let max_allowed = if socket_same_host {
-            MAX_SAME_HOST_UNCERTAINTY_MS
-        } else {
-            MAX_REMOTE_UNCERTAINTY_MS
-        };
-        if effective_uncertainty_ms > max_allowed {
+        let s2 = inner.now_ms();
+        let pos = inner
+            .pending_challenges
+            .iter()
+            .position(|c| c.challenge_id == challenge_id)
+            .ok_or_else(|| EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CHALLENGE",
+                message: format!("unknown or already-consumed challenge_id '{challenge_id}'"),
+            })?;
+        let challenge = inner.pending_challenges.remove(pos).expect("valid index");
+
+        if s2 > challenge.expires_at_ms {
             return Err(EmbeddingIngestError {
                 status: 400,
-                code: "UNCERTAINTY_EXCEEDED",
+                code: "CHALLENGE_EXPIRED",
                 message: format!(
-                    "effective clock uncertainty {effective_uncertainty_ms} ms exceeds {} limit ({max_allowed} ms)",
-                    if socket_same_host { "same-host" } else { "remote live" }
+                    "clock handshake challenge expired at {} ms (now {s2} ms)",
+                    challenge.expires_at_ms
+                ),
+            });
+        }
+        if challenge.issued_at_hs_gen != inner.handshake_generation {
+            return Err(EmbeddingIngestError {
+                status: 409,
+                code: "CHALLENGE_STALE",
+                message: format!(
+                    "clock handshake challenge issued at generation {} is stale (active {})",
+                    challenge.issued_at_hs_gen, inner.handshake_generation
+                ),
+            });
+        }
+        if let Some(cur_epoch) = inner.producer_epoch {
+            if req.producer_epoch < cur_epoch {
+                return Err(EmbeddingIngestError {
+                    status: 409,
+                    code: "PRODUCER_EPOCH_STALE",
+                    message: format!(
+                        "producer_epoch {} is older than active epoch {cur_epoch}",
+                        req.producer_epoch
+                    ),
+                });
+            }
+        }
+        if req.producer_epoch != challenge.producer_epoch {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CHALLENGE",
+                message: format!(
+                    "producer_epoch {} does not match challenge epoch {}",
+                    req.producer_epoch, challenge.producer_epoch
+                ),
+            });
+        }
+        if t1 < challenge.t0_ms {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "NON_MONOTONIC_TIMESTAMP",
+                message: format!(
+                    "confirm producer_monotonic_ms ({t1}) is earlier than init ({})",
+                    challenge.t0_ms
                 ),
             });
         }
@@ -814,25 +1068,49 @@ impl VideoEmbeddingHub {
             None => inner.default_handshake_ttl_ms.min(DEFAULT_HANDSHAKE_TTL_MS),
         };
 
-        if let Some(cur_epoch) = inner.producer_epoch {
-            if req.producer_epoch < cur_epoch {
-                return Err(EmbeddingIngestError {
-                    status: 409,
-                    code: "PRODUCER_EPOCH_STALE",
-                    message: format!(
-                        "producer_epoch {} is older than active epoch {cur_epoch}",
-                        req.producer_epoch
-                    ),
-                });
-            }
-        }
-
-        let clock_offset_ms = ((now_ms as i128) - (producer_monotonic_ms as i128))
+        let same_host = socket_same_host && challenge.socket_same_host;
+        let server_rtt_ms = s2.saturating_sub(challenge.server_sent_ms);
+        let client_elapsed_ms = ((t1 as i128) - (challenge.t0_ms as i128)).max(0) as u64;
+        let client_rtt_ms = req.rtt_ms.unwrap_or(0).max(client_elapsed_ms);
+        let s_mid = challenge.server_sent_ms.saturating_add(server_rtt_ms / 2);
+        let clock_offset_ms = ((s_mid as i128) - (t1 as i128))
             .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
-        inner.handshake_generation = inner.handshake_generation.saturating_add(1);
+        let rtt_half = server_rtt_ms.div_ceil(2).max(client_rtt_ms.div_ceil(2));
+        let server_uncertainty_ms = req.server_uncertainty_ms.unwrap_or(0).max(rtt_half).max(1);
+        let max_allowed = if same_host {
+            MAX_SAME_HOST_UNCERTAINTY_MS
+        } else {
+            MAX_REMOTE_UNCERTAINTY_MS
+        };
+        let effective_uncertainty_ms = server_uncertainty_ms
+            .checked_add(producer_uncertainty_ms)
+            .ok_or_else(|| EmbeddingIngestError {
+                status: 400,
+                code: "UNCERTAINTY_EXCEEDED",
+                message: "effective clock uncertainty overflowed".into(),
+            })?;
+        if effective_uncertainty_ms > max_allowed {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "UNCERTAINTY_EXCEEDED",
+                message: format!(
+                    "effective clock uncertainty {effective_uncertainty_ms} ms exceeds {} limit ({max_allowed} ms)",
+                    if same_host { "same-host" } else { "remote live" }
+                ),
+            });
+        }
+
+        let unbroken_renewal = inner.handshake.as_ref().is_some_and(|prev_hs| {
+            inner.producer_epoch == Some(req.producer_epoch)
+                && prev_hs.producer_epoch == req.producer_epoch
+                && s2 <= prev_hs.handshake_expires_at_ms
+        });
+
+        let next_gen = inner.handshake_generation.wrapping_add(1);
+        inner.handshake_generation = if next_gen == 0 { 1 } else { next_gen };
         let gen = inner.handshake_generation;
-        let expires_at = now_ms.saturating_add(ttl_ms);
+        let expires_at = s2.saturating_add(ttl_ms);
 
         // Clear any frames mapped under the previous handshake/offset (A7).
         inner.frames.clear();
@@ -843,6 +1121,20 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+            inner.producer_model_generation = None;
+        }
+
+        if unbroken_renewal {
+            if inner.continuous_renewal_floor_gen == 0 {
+                inner.continuous_renewal_floor_gen = gen;
+            }
+            if inner.refill_started_at_ms.is_none() {
+                inner.refill_started_at_ms = Some(s2);
+            }
+        } else {
+            inner.handshake_continuity_epoch = inner.handshake_continuity_epoch.wrapping_add(1);
+            inner.continuous_renewal_floor_gen = gen;
+            inner.refill_started_at_ms = None;
         }
 
         inner.handshake = Some(ClockHandshakeState {
@@ -855,16 +1147,19 @@ impl VideoEmbeddingHub {
         });
 
         Ok(ClockHandshakeResponse {
+            phase: "confirmed".into(),
+            challenge_id: None,
             handshake_generation: gen,
             producer_epoch: req.producer_epoch,
-            same_host: socket_same_host,
+            same_host,
             clock_offset_ms,
             server_uncertainty_ms,
             producer_uncertainty_ms,
             effective_uncertainty_ms,
-            server_monotonic_ms: now_ms,
+            server_monotonic_ms: s2,
             handshake_expires_at_ms: expires_at,
             ttl_ms,
+            measured_rtt_ms: Some(server_rtt_ms),
         })
     }
 
@@ -1000,64 +1295,88 @@ impl VideoEmbeddingHub {
         }
 
         // 6. Bilateral timestamp check (before any window mutation!)
-        let mapped_i128 = (req.captured_at_ms as i128) + (hs.clock_offset_ms as i128);
+        let oldest_raw = req.oldest_captured_at_ms.ok_or_else(|| EmbeddingIngestError {
+            status: 400,
+            code: "MISSING_OLDEST_TIMESTAMP",
+            message: "oldest_captured_at_ms is required on embedding ingest".into(),
+        })?;
+        if oldest_raw > req.captured_at_ms {
+            return Err(EmbeddingIngestError {
+                status: 400,
+                code: "INVALID_CLIP_BOUNDS",
+                message: format!(
+                    "oldest_captured_at_ms ({oldest_raw}) exceeds captured_at_ms ({})",
+                    req.captured_at_ms
+                ),
+            });
+        }
+        let mapped_newest_i128 = (req.captured_at_ms as i128) + (hs.clock_offset_ms as i128);
+        let mapped_oldest_i128 = (oldest_raw as i128) + (hs.clock_offset_ms as i128);
         let now_i128 = now_ms as i128;
         let future_slack = hs
             .effective_uncertainty_ms()
             .min(MAX_FUTURE_SKEW_CAP_MS) as i128;
-        if mapped_i128 > now_i128 + future_slack {
+        if mapped_newest_i128 > now_i128 + future_slack {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "FUTURE_FRAME",
                 message: format!(
-                    "mapped capture timestamp {mapped_i128} ms exceeds now ({now_i128} ms) + uncertainty slack ({future_slack} ms)"
+                    "mapped capture timestamp {mapped_newest_i128} ms exceeds now ({now_i128} ms) + uncertainty slack ({future_slack} ms)"
                 ),
             });
         }
+        let unc = hs.effective_uncertainty_ms();
         let staleness_budget = inner
             .bound
             .as_ref()
             .map_or(MAX_VISION_STALENESS_MS, |b| b.effective_staleness_ms);
-        if mapped_i128 < 0 || (now_i128 - mapped_i128) > (staleness_budget as i128) {
+        if mapped_oldest_i128 < 0
+            || mapped_newest_i128 < 0
+            || (now_i128 - mapped_oldest_i128) + (unc as i128) > (staleness_budget as i128)
+        {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "STALE_FRAME",
                 message: format!(
-                    "frame age {} ms exceeds staleness budget {staleness_budget} ms",
-                    now_i128 - mapped_i128
+                    "clip oldest endpoint age ({} + {unc}) ms exceeds staleness budget {staleness_budget} ms",
+                    now_i128 - mapped_oldest_i128
                 ),
             });
         }
-        let mapped_ms = mapped_i128 as u64;
-
-        // Monotonic mapped_at_ms check (A2): prevent interior older timestamps from evading max_window_span_ms.
-        if let Some(last_frame) = inner.frames.back() {
-            if mapped_ms < last_frame.mapped_at_ms {
-                return Err(EmbeddingIngestError {
-                    status: 400,
-                    code: "NON_MONOTONIC_TIMESTAMP",
-                    message: format!(
-                        "mapped capture timestamp {mapped_ms} ms is older than previous frame's {} ms",
-                        last_frame.mapped_at_ms
-                    ),
-                });
-            }
-        }
+        let mapped_ms = mapped_newest_i128 as u64;
+        let oldest_mapped_ms = mapped_oldest_i128 as u64;
 
         let history_len = inner.bound.as_ref().map_or(UNBOUND_RING_CAP, |b| b.spec.history_len);
         let span_limit = inner
             .bound
             .as_ref()
             .map_or(MAX_VIDEO_WINDOW_SPAN_MS, |b| b.spec.max_window_span_ms);
-        if history_len == 1 && now_ms.saturating_sub(mapped_ms) > span_limit {
+        if (now_i128 - mapped_oldest_i128) + (unc as i128) > (span_limit as i128)
+            || (mapped_newest_i128 - mapped_oldest_i128) > (span_limit as i128)
+        {
             return Err(EmbeddingIngestError {
                 status: 400,
                 code: "STALE_FRAME",
                 message: format!(
-                    "frame age {} ms exceeds max_window_span_ms {span_limit} ms",
-                    now_ms.saturating_sub(mapped_ms)
+                    "clip span/age exceeds max_window_span_ms {span_limit} ms"
                 ),
             });
+        }
+
+        // Monotonic mapped_at_ms & oldest_mapped_at_ms check (A2): prevent interior older timestamps from evading max_window_span_ms.
+        if let Some(last_frame) = inner.frames.back() {
+            if mapped_ms < last_frame.mapped_at_ms
+                || oldest_mapped_ms < last_frame.oldest_mapped_at_ms
+            {
+                return Err(EmbeddingIngestError {
+                    status: 400,
+                    code: "NON_MONOTONIC_TIMESTAMP",
+                    message: format!(
+                        "mapped capture timestamps ({oldest_mapped_ms}..={mapped_ms} ms) regress before previous frame ({}..={} ms)",
+                        last_frame.oldest_mapped_at_ms, last_frame.mapped_at_ms
+                    ),
+                });
+            }
         }
 
         // 7. All validations passed — update ring buffer and deadlines atomically.
@@ -1066,17 +1385,22 @@ impl VideoEmbeddingHub {
         if !inner.has_seen_frame_in_epoch {
             inner.has_seen_frame_in_epoch = true;
             inner.last_frame_model_generation = req.model_generation;
-            if inner.model_generation.is_none() {
-                inner.model_generation = req.model_generation;
-            }
+            inner.producer_model_generation = req.model_generation;
         } else if inner.last_frame_model_generation != req.model_generation {
             inner.frames.clear();
             inner.last_frame_model_generation = req.model_generation;
-            inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
+            inner.producer_model_generation = req.model_generation;
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
         }
 
         while let Some(front) = inner.frames.front() {
-            if now_ms.saturating_sub(front.mapped_at_ms) > span_limit {
+            if now_ms
+                .saturating_sub(front.oldest_mapped_at_ms)
+                .saturating_add(unc)
+                > span_limit
+            {
                 inner.frames.pop_front();
             } else {
                 break;
@@ -1091,6 +1415,8 @@ impl VideoEmbeddingHub {
             handshake_generation: hs.handshake_generation,
             captured_at_ms: req.captured_at_ms,
             mapped_at_ms: mapped_ms,
+            oldest_captured_at_ms: oldest_raw,
+            oldest_mapped_at_ms: oldest_mapped_ms,
             embedding: emb_f32,
             encoder_artifact_sha256: enc_sha,
             preprocess_config_sha256: prep_sha,
@@ -1111,6 +1437,7 @@ impl VideoEmbeddingHub {
             frame_id: req.frame_id,
             producer_epoch: req.producer_epoch,
             mapped_captured_at_ms: mapped_ms,
+            mapped_oldest_captured_at_ms: oldest_mapped_ms,
             window_len,
             history_len: target_len,
             window_ready: window_len >= target_len,
@@ -1124,14 +1451,31 @@ impl VideoEmbeddingHub {
         spec: &VideoEmbeddingSpec,
         run_started_ms: u64,
     ) -> EmbeddingSampleDecision {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sample_window_with_continuity(spec, run_started_ms, None)
+    }
+
+    pub fn sample_window_with_continuity(
+        &self,
+        spec: &VideoEmbeddingSpec,
+        run_started_ms: u64,
+        expected_continuity_epoch: Option<u64>,
+    ) -> EmbeddingSampleDecision {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = expected_continuity_epoch {
+            if inner.handshake_continuity_epoch != exp {
+                return EmbeddingSampleDecision::Stop {
+                    reason: "HANDSHAKE_EXPIRED",
+                    message: "Clock handshake expired and re-established out of continuity between control ticks".into(),
+                };
+            }
+        }
         let now_ms = inner.now_ms();
         let eff_staleness = inner
             .bound
             .as_ref()
             .map_or_else(|| spec.effective_staleness_ms(), |b| b.effective_staleness_ms);
 
-        let Some(ref hs) = inner.handshake else {
+        let Some(hs) = inner.handshake.clone() else {
             if now_ms.saturating_sub(run_started_ms) <= eff_staleness {
                 return EmbeddingSampleDecision::Hold;
             }
@@ -1152,7 +1496,8 @@ impl VideoEmbeddingHub {
         }
 
         if inner.frames.len() < spec.history_len {
-            if now_ms.saturating_sub(run_started_ms) <= spec.max_window_span_ms {
+            let refill_anchor = inner.refill_started_at_ms.unwrap_or(run_started_ms);
+            if now_ms.saturating_sub(refill_anchor) <= spec.max_window_span_ms {
                 return EmbeddingSampleDecision::Hold;
             }
             return match spec.on_stale {
@@ -1184,9 +1529,9 @@ impl VideoEmbeddingHub {
             return EmbeddingSampleDecision::Hold;
         }
 
-        let oldest_mapped = window_slice
+        let window_oldest_mapped = window_slice
             .iter()
-            .map(|f| f.mapped_at_ms)
+            .map(|f| f.oldest_mapped_at_ms)
             .min()
             .expect("history_len >= 1");
         let newest_frame = window_slice.last().expect("history_len >= 1");
@@ -1196,10 +1541,19 @@ impl VideoEmbeddingHub {
             .max()
             .expect("history_len >= 1");
 
-        let newest_dl = newest_mapped.saturating_add(eff_staleness);
-        let oldest_dl = oldest_mapped.saturating_add(spec.max_window_span_ms);
+        let unc = hs.effective_uncertainty_ms();
+        let newest_dl = newest_frame
+            .oldest_mapped_at_ms
+            .saturating_add(eff_staleness)
+            .saturating_sub(unc);
+        let oldest_dl = window_oldest_mapped
+            .saturating_add(spec.max_window_span_ms)
+            .saturating_sub(unc);
 
-        if now_ms > newest_dl || now_ms > oldest_dl {
+        if now_ms > newest_dl
+            || now_ms > oldest_dl
+            || newest_mapped.saturating_sub(window_oldest_mapped) > spec.max_window_span_ms
+        {
             return match spec.on_stale {
                 VisionStalePolicy::Hold => EmbeddingSampleDecision::Hold,
                 VisionStalePolicy::Stop => EmbeddingSampleDecision::Stop {
@@ -1221,19 +1575,24 @@ impl VideoEmbeddingHub {
             }
         };
 
-        EmbeddingSampleDecision::Ready(EmbeddingWindowSnapshot {
+        let snapshot = EmbeddingWindowSnapshot {
             features,
             newest_frame_id: newest_frame.frame_id,
             newest_mapped_at_ms: newest_frame.mapped_at_ms,
+            newest_oldest_mapped_at_ms: newest_frame.oldest_mapped_at_ms,
+            effective_uncertainty_ms: unc,
             producer_epoch: newest_frame.producer_epoch,
-            model_generation: inner.model_generation,
+            model_generation: Some(inner.server_model_epoch),
             invalidation_generation: inner.invalidation_generation,
             clock_handshake_generation: hs.handshake_generation,
             clock_handshake_expires_at_ms: hs.handshake_expires_at_ms,
+            handshake_continuity_epoch: inner.handshake_continuity_epoch,
             window_newest_deadline_ms: newest_dl,
             window_oldest_deadline_ms: oldest_dl,
             policy_instance_id: inner.bound.as_ref().map(|b| b.policy_instance_id),
-        })
+        };
+        inner.refill_started_at_ms = None;
+        EmbeddingSampleDecision::Ready(snapshot)
     }
 
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
