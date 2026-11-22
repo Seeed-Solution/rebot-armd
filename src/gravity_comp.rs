@@ -237,6 +237,9 @@ impl SupervisorInner {
             if let Err(e) = drv.set_joint_modes(&modes, &hold) {
                 let uncertain = drv.joint_modes_uncertain();
                 drop(drv);
+                // Mode switch (and any rollback dual-hold) already wrote hold frames to the bus;
+                // never keep a stale pre-entry `last_issued_positions` as tracking baseline.
+                self.tracking.invalidate();
                 if uncertain {
                     self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
                 }
@@ -244,6 +247,8 @@ impl SupervisorInner {
             }
         }
         self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
         for i in 0..ARM {
             self.commanded_positions[i] = pose[i];
             self.commanded_velocities[i] = 0.0;
@@ -293,6 +298,7 @@ impl SupervisorInner {
             self.commanded_positions[i] = hold[i];
             self.commanded_velocities[i] = 0.0;
         }
+        self.tracking.invalidate();
         self.target_positions = self.commanded_positions.clone();
         let at = self.start_time.elapsed().as_secs_f64();
         if code == "REQUESTED" || code == "STOPPED" {
@@ -437,11 +443,25 @@ impl SupervisorInner {
                 self.target_positions = self.commanded_positions.clone();
             }
             GravityCompPhase::Exiting { hold, elapsed_s } => {
-                let exit_hold = self.gravity_comp.as_ref().map_or(0.1, |r| r.policy.exit_hold_ms as f64 / 1000.0);
+                let (exit_hold, max_age_ms, max_vel) = self.gravity_comp.as_ref().map_or((0.1, 100, 0.05), |r| {
+                    (r.policy.exit_hold_ms as f64 / 1000.0, r.policy.feedback_max_age_ms, r.policy.entry_max_velocity)
+                });
                 let elapsed = elapsed_s + dt;
                 if elapsed + 1e-9 < exit_hold {
                     if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::Exiting { hold, elapsed_s: elapsed }; }
                 } else {
+                    let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+                    if tracking_active {
+                        let fresh = self.feedback_numeric_valid
+                            && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms));
+                        let stationary = self.gravity_comp_is_stationary(max_vel);
+                        // When tracking will take over POS_VEL output, wait for the arm to settle
+                        // under the stiff MIT hold before transferring ownership (bounded by exit_hold + 1.0 s).
+                        if fresh && !stationary && elapsed < exit_hold + 1.0 {
+                            if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::Exiting { hold, elapsed_s: elapsed }; }
+                            return;
+                        }
+                    }
                     self.gravity_comp_switch_back(hold);
                 }
             }
@@ -456,18 +476,49 @@ impl SupervisorInner {
         }
     }
 
+    fn gravity_comp_is_stationary(&self, max_vel: f32) -> bool {
+        let has_vel = self
+            .driver
+            .as_ref()
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback));
+        if !has_vel {
+            return true;
+        }
+        self.measured_velocities.len() >= ARM
+            && self.measured_velocities[..ARM]
+                .iter()
+                .all(|v| v.is_finite() && v.abs() <= max_vel)
+    }
+
     fn gravity_comp_switch_back(&mut self, hold: [f32; ARM]) {
+        let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+        let (max_age_ms, max_vel) = self
+            .gravity_comp
+            .as_ref()
+            .map_or((100, 0.05), |r| (r.policy.feedback_max_age_ms, r.policy.entry_max_velocity));
+        let fresh = !tracking_active
+            || (self.feedback_numeric_valid
+                && self.hardware_feedback_fresh(Duration::from_millis(max_age_ms))
+                && self.measured_positions.len() >= ARM
+                && self.measured_positions[..ARM].iter().all(|q| q.is_finite()));
+        let stationary = !tracking_active || self.gravity_comp_is_stationary(max_vel);
         let gripper = self.commanded_positions[ARM];
-        let result = match &self.driver {
-            None => Ok(()),
-            Some(d) => match d.lock() {
-                Ok(mut drv) => {
-                    let mut hold_targets: Vec<JointTarget> = hold.iter().map(|&p| JointTarget::position(p)).collect();
-                    hold_targets.push(JointTarget::position(gripper));
-                    drv.set_joint_modes(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
-                }
-                Err(_) => Err("driver lock poisoned".into()),
-            },
+        let result = if !fresh {
+            Err(format!("fresh feedback (<= {max_age_ms} ms) required before switching back to POS_VEL"))
+        } else if !stationary {
+            Err(format!("arm not stationary (limit {max_vel} rad/s) before switching back to POS_VEL"))
+        } else {
+            match &self.driver {
+                None => Ok(()),
+                Some(d) => match d.lock() {
+                    Ok(mut drv) => {
+                        let mut hold_targets: Vec<JointTarget> = hold.iter().map(|&p| JointTarget::position(p)).collect();
+                        hold_targets.push(JointTarget::position(gripper));
+                        drv.set_joint_modes(&[JointMode::Position; ARM + 1], &hold_targets).map_err(|e| e.to_string())
+                    }
+                    Err(_) => Err("driver lock poisoned".into()),
+                },
+            }
         };
         match result {
             Ok(()) => {
@@ -479,6 +530,11 @@ impl SupervisorInner {
                 self.target_positions = self.commanded_positions.clone();
                 self.commanded_accelerations.fill(0.0);
                 self.following_error_since = None;
+                if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                    self.tracking.seed(&self.commanded_positions);
+                } else {
+                    self.tracking.invalidate();
+                }
                 self.safety.mark_motion_finished();
                 tracing::info!("Gravity compensation off: POS_VEL hold at {hold:?}");
             }

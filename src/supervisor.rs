@@ -225,6 +225,17 @@ pub struct HeldObject {
     pub spill_safe: bool,
 }
 
+/// Action completion captured during trajectory stepping and published only after
+/// that tick's output passes tracking validation and is written to the driver.
+struct DeferredActionDone {
+    action_id: Option<u64>,
+    macro_sub: bool,
+    settled: Option<bool>,
+    holding: Option<bool>,
+    gripper_gap_rad: Option<f32>,
+    clear_releasing: bool,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
@@ -249,6 +260,9 @@ pub struct SupervisorInner {
     pub temperatures: Vec<f32>,
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
+    /// True while a servo/policy stream owns output, including its braking tail after
+    /// `servo_target` is cleared by stop, timeout, or dirty-jump discard.
+    pub servo_stream_active: bool,
     pub servo_settled_ticks: Vec<u32>,
     /// Per joint, while the servo lead cap holds it: when the current run started and
     /// the measured position then (blocked detection, [`SERVO_BLOCKED_PROGRESS_RAD`]).
@@ -410,6 +424,8 @@ pub struct SupervisorInner {
     pub collision: crate::collision::CollisionGuard,
     /// Torque-saturation guard state (`src/torque_guard.rs`).
     pub torque_guard: crate::torque_guard::TorqueGuard,
+    /// Joint tracking output history (`src/tracking.rs`).
+    pub tracking: crate::tracking::TrackingRuntime,
     /// Supply-current estimate (`src/power.rs`).
     pub power: crate::power::PowerMonitor,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
@@ -562,6 +578,7 @@ impl SupervisorInner {
             temperatures: vec![25.0; dof],
             target_positions,
             servo_target: None,
+            servo_stream_active: false,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
             motor_errors: Vec::new(),
@@ -654,6 +671,7 @@ impl SupervisorInner {
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
             torque_guard: crate::torque_guard::TorqueGuard::default(),
+            tracking: crate::tracking::TrackingRuntime::default(),
             power: crate::power::PowerMonitor::default(),
             follower: None,
             base_gripper_policy,
@@ -768,6 +786,7 @@ impl SupervisorInner {
             return Err(format!("joint zero needs {} finite offsets", self.config.dof));
         }
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
+        self.tracking.invalidate();
         if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
         if let Some(d) = self.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
@@ -856,6 +875,7 @@ impl SupervisorInner {
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_gripper_index(self.config.gripper_index());
+        driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
         if driver.capabilities().load_feedback {
             self.loads = vec![f32::NAN; self.config.dof];
         }
@@ -1264,19 +1284,31 @@ impl SupervisorInner {
         self.servo_blocked_hold = true;
     }
 
-    /// End every motion and hold the measured pose (clamped to the limits) with torque on;
-    /// the gripper keeps its command so that a held object stays held.
-    pub(crate) fn hold_measured_pose(&mut self) {
-        let gripper_idx = self.config.gripper_index();
-        let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
-        self.stop_motion();
+    /// The command `hold_measured_pose` holds: the measured pose clamped to the limits
+    /// (the current command when a measurement is not finite), the gripper keeping its command.
+    pub(crate) fn measured_hold_pose(&self) -> Vec<f32> {
+        let mut hold = self.commanded_positions.clone();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
+            for (i, (c, m)) in hold.iter_mut().zip(&self.measured_positions).enumerate() {
                 let l = &self.config.limits[i];
                 *c = m.clamp(l.min_position, l.max_position);
             }
         }
-        if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) { self.commanded_positions[g] = c; }
+        if let Some(g) = self.config.gripper_index() {
+            if let (Some(c), Some(&cmd)) = (hold.get_mut(g), self.commanded_positions.get(g)) {
+                *c = cmd;
+            }
+        }
+        hold
+    }
+
+    /// End every motion and hold the measured pose (clamped to the limits) with torque on;
+    /// the gripper keeps its command so that a held object stays held.
+    pub(crate) fn hold_measured_pose(&mut self) {
+        self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        self.commanded_positions = self.measured_hold_pose();
         self.target_positions = self.commanded_positions.clone();
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
@@ -1416,6 +1448,8 @@ impl SupervisorInner {
     /// A successful transport write is not confirmation that torque was removed.
     fn request_disable(&mut self) -> Result<(), SafetyError> {
         self.disable_pending = true;
+        self.tracking.invalidate();
+        self.tracking.clear_recovery_suspension();
         self.last_disable_attempt = Some(Instant::now());
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
@@ -1850,12 +1884,45 @@ impl SupervisorInner {
             }
             self.commanded_velocities = vec![0.0; self.config.dof];
             self.commanded_accelerations.fill(0.0);
+            if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                let arm_indices = self.config.arm_joint_indices();
+                let has_vel_fb = self.driver.as_ref().is_none_or(|d| {
+                    d.lock().is_ok_and(|drv| drv.capabilities().velocity_feedback)
+                });
+                // Positive evidence only: without velocity feedback a single sample cannot show
+                // rest; the history stays Unknown until two samples do (plain output meanwhile).
+                let arm_stationary = has_vel_fb
+                    && arm_indices.iter().all(|&j| {
+                        self.measured_velocities
+                            .get(j)
+                            .is_some_and(|v| v.is_finite() && v.abs() <= crate::tracking::STATIONARY_VELOCITY_RAD_S)
+                    });
+                let aligned_with_issued = !self
+                    .tracking
+                    .has_residual_lead(&self.commanded_positions, &arm_indices);
+                if was_torqued && self.tracking.last_issued_positions.is_some() {
+                    if arm_stationary && aligned_with_issued {
+                        self.tracking.seed(&self.commanded_positions);
+                    } else {
+                        // Already torqued and moving or holding active lead: preserve real
+                        // issued history so the next tick ramps smoothly instead of jumping.
+                        self.tracking.ws_min_depths = None;
+                    }
+                } else if arm_stationary {
+                    self.tracking.seed(&self.commanded_positions);
+                } else {
+                    self.tracking.invalidate();
+                }
+            } else {
+                self.tracking.invalidate();
+            }
             if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             self.active_trajectory = None;
             self.pending_normal_unload = false;
             self.unload_settle = None;
             self.watchdog_park = None;
             self.servo_target = None;
+            self.servo_stream_active = false;
             self.servo_ws_min_depths = None;
 
             let state = self.safety.set_torque(true)?;
@@ -1946,6 +2013,12 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
+        // M1: keep output history across NormalUnload so park ramps any residual lead out smoothly
+        // instead of dropping active lead in a single tick.
+        if policy != StopPolicy::NormalUnload {
+            self.tracking.invalidate();
+        }
         match policy {
             StopPolicy::NormalUnload => {
                 if self.handover_settling_since.is_some() {
@@ -2053,6 +2126,7 @@ impl SupervisorInner {
                 self.pending_normal_unload = false;
                 self.unload_settle = None;
                 self.is_torqued = false;
+                self.tracking.invalidate();
                 self.active_trajectory = None;
                 self.reset_gripper_stall();
                 self.commanded_velocities = vec![0.0; self.config.dof];
@@ -2153,6 +2227,8 @@ impl SupervisorInner {
         self.gripper_stall_sign = 0.0;
         self.gripper_prev_hw_overload = false;
         self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             self.commanded_positions = self.measured_positions.clone();
             self.target_positions = self.measured_positions.clone();
@@ -2281,6 +2357,9 @@ impl SupervisorInner {
         }
         self.pending_rearm = true;
         self.stop_motion();
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
+        self.tracking.clear_recovery_suspension();
         // Reset at the measured position; never retain a residual old trajectory target.
         self.commanded_positions = self.measured_positions.clone();
         self.target_positions = self.measured_positions.clone();
@@ -2345,6 +2424,13 @@ impl SupervisorInner {
             true
         };
 
+        let tracking_settled = !self.config.joint_tracking.as_ref().is_some_and(|jt| {
+            jt.enabled
+                && self
+                    .tracking
+                    .has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices())
+        });
+
         (self.safety.state() == &SafetyState::Armed || self.safety.state() == &SafetyState::Idle)
             && self.active_trajectory.is_none()
             && self.servo_target.is_none()
@@ -2352,6 +2438,7 @@ impl SupervisorInner {
             && self.commanded_velocities.iter().all(|v| *v == 0.0)
             && self.hardware_feedback_fresh(Duration::from_millis(100))
             && velocity_settled
+            && tracking_settled
     }
 
     pub fn is_fully_settled_armed_hold(&self) -> bool {
@@ -2556,6 +2643,8 @@ impl SupervisorInner {
         self.active_trajectory = None;
         self.servo_target = None; self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
         self.target_positions = hold_pos.clone();
         self.commanded_positions = hold_pos;
         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -2741,6 +2830,7 @@ impl SupervisorInner {
         // 2. Store servo target for tick(dt) to step with actual dt and velocity limits
         self.target_positions = targets.clone();
         self.servo_target = Some(targets);
+        self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
         Ok(())
@@ -2850,7 +2940,7 @@ impl SupervisorInner {
         let duration = traj.duration;
         let id = self.begin_action(kind, tag);
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)).with_motion_limits(limits.to_vec()));
 
         Ok((self.safety.epoch_id(), id, duration))
     }
@@ -3527,7 +3617,7 @@ impl SupervisorInner {
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
         let duration = traj.duration;
         self.quintic_settle = None;
-        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)).with_motion_limits(limits.to_vec()));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + crate::motion::SETTLE_MAX_S)
     }
@@ -3846,7 +3936,7 @@ impl SupervisorInner {
     }
 
     /// Single place that ends a running action whose reference went away (spec 2.3).
-    fn reconcile_action(&mut self, dt: f64) {
+    fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, kind) = (action.id, action.kind.clone());
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
@@ -3892,6 +3982,7 @@ impl SupervisorInner {
             let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
             // a joint-space sub-motion (sequence pose step) settles before it counts as done
             if !superseded && !run.stop_requested && run.sub == SubState::Running && self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+                if !tick_output_accepted { return; }
                 let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
                 if let Some(settled) = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel)) {
                     self.quintic_settle = None;
@@ -3929,6 +4020,7 @@ impl SupervisorInner {
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
                 return;
             }
+            if !tick_output_accepted { return; }
             let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
             let result = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel));
             if let Some(settled) = result {
@@ -3943,8 +4035,11 @@ impl SupervisorInner {
         }
     }
 
-    /// Apply one executor step of a Path / Gripper reference.
-    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) {
+    /// Apply one executor step of a Path / Gripper / Replay reference.
+    /// With tracking enabled, returns a deferred completion payload on `StepStatus::Done` so
+    /// `"done"` is only published after that tick's output has been validated and written
+    /// to the driver; with tracking off it publishes at once (e4f72b6) and returns None.
+    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) -> Option<DeferredActionDone> {
         self.commanded_positions = out.positions;
         self.commanded_velocities = out.velocities;
         if out.clear_gripper_stall {
@@ -3957,25 +4052,44 @@ impl SupervisorInner {
             if a.id == id && a.is_running() && !macro_sub { a.progress = out.progress; }
         }
         match out.status {
-            StepStatus::Running => {}
+            StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
-                if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
-                    self.releasing = false;
-                    self.held = None;
+                if !self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                    // Tracking off: publish completion now, before this tick's driver write,
+                    // exactly as before joint tracking (e4f72b6).
+                    if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
+                        self.releasing = false;
+                        self.held = None;
+                    }
+                    self.active_trajectory = None;
+                    self.commanded_velocities.fill(0.0);
+                    self.target_positions = self.commanded_positions.clone();
+                    if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
+                    if macro_sub {
+                        if let Some(m) = self.macro_run.as_mut() {
+                            m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
+                        }
+                    } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+                    return None;
                 }
+                let clear_releasing = self.releasing
+                    && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)));
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
-                if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
-                if macro_sub {
-                    if let Some(m) = self.macro_run.as_mut() {
-                        m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
-                    }
-                } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+                Some(DeferredActionDone {
+                    action_id,
+                    macro_sub,
+                    settled,
+                    holding,
+                    gripper_gap_rad,
+                    clear_releasing,
+                })
             }
             StepStatus::Failed { code, message } => {
                 if code == "TRACKING_STALL" {
                     self.stop_motion();
+                    self.tracking.invalidate();
                     if self.measured_positions.iter().all(|q| q.is_finite()) {
                         self.commanded_positions = self.measured_positions.clone();
                     }
@@ -3989,6 +4103,7 @@ impl SupervisorInner {
                 if macro_sub {
                     if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
                 } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                None
             }
         }
     }
@@ -4100,6 +4215,97 @@ impl SupervisorInner {
         Some((q_next64 as f32, v_final64 as f32, reached))
     }
 
+    /// Write one rejection-fallback step (`tracking_fallback_compute`) and keep the braking
+    /// ramp going while the output is not at rest. When no step is feasible,
+    /// latch a fault and send no frame this tick; the command stays on the last issued
+    /// output so the following fault-hold frames repeat what the motors already hold.
+    /// Returns a driver write error.
+    fn apply_tracking_fallback_step(
+        &mut self,
+        pending: crate::tracking::PendingFallback,
+        gravity_output_enabled: bool,
+    ) -> Option<String> {
+        let crate::tracking::PendingFallback { step, ramp, prev_confirmed, other_depths } = pending;
+        match step {
+            Ok(fb) => {
+                self.commanded_positions = fb.positions.clone();
+                self.target_positions = fb.positions.clone();
+                self.commanded_velocities = fb.velocities.clone();
+                self.commanded_accelerations.fill(0.0);
+                let targets: Vec<JointTarget> = fb
+                    .positions
+                    .iter()
+                    .zip(fb.velocities.iter())
+                    .enumerate()
+                    .map(|(i, (&p, &v))| JointTarget {
+                        position: p,
+                        velocity: Some(v),
+                        torque: if gravity_output_enabled {
+                            self.gravity_torques_ramped.get(i).copied()
+                        } else {
+                            Some(0.0)
+                        },
+                        kp: None,
+                        kd: None,
+                    })
+                    .collect();
+                let write_res = self
+                    .driver
+                    .as_ref()
+                    .and_then(|d| d.lock().ok())
+                    .map(|mut driver| driver.write_joint_targets(&targets));
+                match write_res {
+                    Some(Ok(())) => {
+                        let done = fb.done;
+                        if done {
+                            self.commanded_velocities.fill(0.0);
+                        }
+                        // Commit the step's escape depths to the workspace it was checked
+                        // against; the other workspace's depths stay as they were.
+                        let (full, park) = if ramp.keepout_only {
+                            (other_depths, fb.ws_min_depths)
+                        } else {
+                            (fb.ws_min_depths, other_depths)
+                        };
+                        self.tracking.record_issued_with_ws_depths(fb.positions, fb.velocities, full, park);
+                        self.tracking.fallback_ramp = (!done).then_some(ramp);
+                        None
+                    }
+                    Some(Err(e)) => {
+                        self.tracking.invalidate();
+                        Some(e.to_string())
+                    }
+                    None => {
+                        self.tracking.invalidate();
+                        None
+                    }
+                }
+            }
+            Err(why) => {
+                tracing::error!("Joint tracking fallback cannot brake within the limits ({why}): no frame sent");
+                if let Some(pq) = prev_confirmed.as_deref().filter(|p| p.len() == self.commanded_positions.len()) {
+                    let gripper_idx = self.config.gripper_index();
+                    for (i, (c, &p)) in self.commanded_positions.iter_mut().zip(pq).enumerate() {
+                        if Some(i) != gripper_idx {
+                            *c = p;
+                        }
+                    }
+                }
+                self.target_positions = self.commanded_positions.clone();
+                self.commanded_velocities.fill(0.0);
+                self.commanded_accelerations.fill(0.0);
+                self.tracking.invalidate();
+                if !self.safety.state().is_stopped() {
+                    self.safety.trigger_fault_coded(
+                        FaultCode::ServoNoBrake,
+                        FaultReason::Other(format!("Joint tracking fallback cannot brake within the limits: {why}")),
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// An already infeasible state cannot satisfy both acceleration and joint
     /// limits. Latch a fault and retain holding torque; normal smoothing does
     /// not apply to this exceptional safety interruption.
@@ -4115,6 +4321,8 @@ impl SupervisorInner {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
+        self.servo_stream_active = false;
+        self.tracking.invalidate();
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
         self.target_positions = self.commanded_positions.clone();
@@ -4313,14 +4521,20 @@ impl SupervisorInner {
         let mut invalid_feedback = false;
         let mut motor_errors = None;
         let mut driver_torque_lost = false;
+        let mut recovered_joints = Vec::new();
+        let mut recovery_ages: Option<Vec<Option<Duration>>> = None;
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             if let Ok(mut driver) = d.lock() {
                 if let Ok(states) = driver.read_joint_states() {
+                    recovered_joints = driver.take_recovery_writes();
                     let loads = driver.joint_loads();
                     self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref());
                     invalid_feedback = !self.feedback_numeric_valid;
                     let ages = driver.feedback_ages();
+                    if !recovered_joints.is_empty() || self.tracking.recovery_suspended {
+                        recovery_ages = Some(ages.clone());
+                    }
                     if self.feedback_numeric_valid && ages.len() == self.config.dof && driver.is_feedback_valid() {
                         self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
                             .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
@@ -4353,12 +4567,63 @@ impl SupervisorInner {
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);
         }
+        // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
+        // tracking output history and suspend compensated writes until fresh post-recovery
+        // feedback confirms a clean baseline across every joint.
+        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+            if !recovered_joints.is_empty() {
+                tracing::warn!(
+                    "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
+                    recovered_joints.iter().map(|i| i + 1).collect::<Vec<_>>()
+                );
+                self.tracking.suspend_for_recovery(&recovered_joints, Instant::now());
+                self.stop_motion();
+                self.servo_stream_active = false;
+            } else if self.tracking.recovery_suspended && self.feedback_numeric_valid {
+                const RECOVERY_FRESH_BOUND: Duration = Duration::from_millis(45);
+                let all_fresh_post_recovery = recovery_ages.as_ref().is_some_and(|ages| {
+                    ages.len() == self.config.dof
+                        && ages.iter().all(|a| a.is_some_and(|age| age < RECOVERY_FRESH_BOUND))
+                        && self.tracking.recovery_joints.iter().all(|&(j, since)| {
+                            ages.get(j)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|age| age <= since.elapsed())
+                        })
+                }) && self.measured_positions.len() == self.config.dof
+                    && self.measured_positions.iter().all(|q| q.is_finite());
+                if all_fresh_post_recovery {
+                    let gripper_idx = self.config.gripper_index();
+                    let recovered: Vec<usize> = self
+                        .tracking
+                        .recovery_joints
+                        .iter()
+                        .map(|&(j, _)| j)
+                        .collect();
+                    let mut recovered_updates = Vec::with_capacity(recovered.len());
+                    for &j in &recovered {
+                        if j < self.config.dof && Some(j) != gripper_idx {
+                            let l = &self.config.limits[j];
+                            let clamped = self.measured_positions[j].clamp(l.min_position, l.max_position);
+                            self.commanded_positions[j] = clamped;
+                            self.target_positions[j] = clamped;
+                            recovered_updates.push((j, clamped));
+                        }
+                    }
+                    self.commanded_velocities.fill(0.0);
+                    self.commanded_accelerations.fill(0.0);
+                    self.tracking.resume_from_recovery(&recovered_updates);
+                }
+            }
+        }
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
+            self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             self.safety.trigger_fault_coded(FaultCode::InvalidTelemetry, FaultReason::Other("Invalid hardware telemetry".into()));
         } else if driver_torque_lost && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
+            self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
@@ -4377,6 +4642,7 @@ impl SupervisorInner {
         if (!dt.is_finite() || dt <= 0.0 || dt > CONTROL_DEADLINE.as_secs_f64())
             && self.is_torqued && self.safety.state().is_operational() {
             self.stop_motion();
+            self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
@@ -4700,6 +4966,7 @@ impl SupervisorInner {
                         self.active_trajectory = None;
                         self.servo_target = None; self.servo_settled_ticks.fill(0);
                         self.servo_ws_min_depths = None;
+                        self.tracking.invalidate();
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -4788,6 +5055,7 @@ impl SupervisorInner {
                     self.enter_servo_blocked_hold(joint, "tracking error above the bound");
                 } else if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
                     self.stop_motion();
+                    self.tracking.invalidate();
                     self.commanded_positions = self.measured_positions.clone();
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
@@ -4835,6 +5103,14 @@ impl SupervisorInner {
             true
         };
         let mut approach_started: Option<u64> = None;
+        // A planned motion's caps outlive its reference: kept from the tick it finishes
+        // until it has settled (cleared after the output below).
+        let tracking_enabled = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+        let caps_before_step = if tracking_enabled {
+            self.active_trajectory.as_ref().and_then(|a| a.motion_limits.clone())
+        } else {
+            None
+        };
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -4885,19 +5161,23 @@ impl SupervisorInner {
                 a.phase = Some("approach".into());
             }
         }
+        let mut deferred_done: Option<DeferredActionDone> = None;
         match stepped {
             None => {}
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
-                self.apply_action_step(action_id, out);
+                self.servo_stream_active = false;
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Arm(mut out))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
-                self.apply_action_step(action_id, out);
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Replay(mut out, phase, t_s))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
                     if a.id == id && a.is_running() {
@@ -4905,10 +5185,11 @@ impl SupervisorInner {
                         a.t_s = Some(t_s as f32);
                     }
                 }
-                self.apply_action_step(action_id, out);
+                deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Quintic(mut point, finished, progress))) => {
                 reference_stepped = true;
+                self.servo_stream_active = false;
                 self.gripper_hold_filter(&mut point.positions, &mut point.velocities);
                 self.commanded_positions = point.positions;
                 self.commanded_velocities = point.velocities;
@@ -4924,6 +5205,12 @@ impl SupervisorInner {
                         if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
                     }
                 }
+            }
+        }
+
+        if let Some(caps) = caps_before_step {
+            if self.active_trajectory.is_none() {
+                self.tracking.retained_motion_limits = Some(caps);
             }
         }
 
@@ -5090,6 +5377,14 @@ impl SupervisorInner {
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                                 self.servo_ws_min_depths = None;
+                                let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                                    && self.tracking.has_residual_lead(
+                                        &self.commanded_positions,
+                                        &self.config.arm_joint_indices(),
+                                    );
+                                if !keep_stream {
+                                    self.servo_stream_active = false;
+                                }
                             }
                         }
                     }
@@ -5102,6 +5397,8 @@ impl SupervisorInner {
             && self.active_trajectory.is_none()
             && !self.pending_normal_unload
             && self.gravity_comp.is_none()
+            && !self.tracking.recovery_suspended
+            && self.tracking.fallback_ramp.is_none()
             && !self.safety.state().is_stopped()
         {
             // A stale/dropped target requests zero velocity. The same feasible
@@ -5139,6 +5436,15 @@ impl SupervisorInner {
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
                     self.servo_ws_min_depths = None;
+                    let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
+                        && (braking
+                            || self.tracking.has_residual_lead(
+                                &self.commanded_positions,
+                                &self.config.arm_joint_indices(),
+                            ));
+                    if !keep_stream {
+                        self.servo_stream_active = false;
+                    }
                 }
             }
         }
@@ -5152,9 +5458,12 @@ impl SupervisorInner {
 
         let feedback_fresh = self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
         if self.driver.is_some() && self.is_torqued {
-            if !feedback_fresh { self.output_suspended = true; }
-            else if self.output_suspended {
+            if !feedback_fresh {
+                self.output_suspended = true;
+                self.tracking.invalidate();
+            } else if self.output_suspended {
                 self.stop_motion();
+                self.tracking.invalidate();
                 self.commanded_positions = self.measured_positions.clone();
                 self.target_positions = self.measured_positions.clone();
                 self.commanded_velocities.fill(0.0);
@@ -5169,14 +5478,20 @@ impl SupervisorInner {
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
+        let mut tick_output_accepted = false;
         if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
+            if self.driver.is_none() {
+                tick_output_accepted = true;
+            } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
                 if let Ok(mut driver) = d.lock() {
                     if driver.enable_state() != EnableState::Disabled {
-                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                        match driver.write_joint_targets(&targets) {
+                            Ok(()) => tick_output_accepted = true,
+                            Err(e) => output_error = Some(e.to_string()),
+                        }
                     }
                 }
             }
@@ -5185,33 +5500,225 @@ impl SupervisorInner {
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
             if send_to_bus {
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let targets: Vec<JointTarget> = self
-                            .commanded_positions
-                            .iter()
-                            .zip(self.commanded_velocities.iter())
-                            .enumerate()
-                            .map(|(i, (&p, &v))| JointTarget {
-                                position: p,
-                                velocity: Some(v),
-                                torque: if gravity_output_enabled {
-                                    self.gravity_torques_ramped.get(i).copied()
-                                } else {
-                                    Some(0.0)
-                                },
-                                kp: None,
-                                kd: None,
-                            })
-                            .collect();
-                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
+                let arm_indices = self.config.arm_joint_indices();
+                let has_residual = tracking_active
+                    && self.tracking.has_residual_lead(&self.commanded_positions, &arm_indices);
+                let holding_residual = !reference_stepped
+                    && self.active_trajectory.is_none()
+                    && self.servo_target.is_none()
+                    && self.commanded_velocities.iter().all(|&v| v.abs() <= 1e-6);
+                let ramp_out_handover = tracking_active
+                    && self.driver.is_some()
+                    && !self.safety.state().is_stopped()
+                    && (self.pending_normal_unload
+                        || self.handover_settling_since.is_some()
+                        || self.torque_guard.hold.is_some()
+                        || holding_residual)
+                    && has_residual;
+                // Unknown history: plain nominal output until the arm is confirmed at rest.
+                let tracking_owned = tracking_active
+                    && self.driver.is_some()
+                    && !self.safety.state().is_stopped()
+                    && !self.pending_normal_unload
+                    && (self.tracking.history_state != crate::tracking::TrackingHistoryState::Unknown
+                        || self.tracking_stationary_evidence());
+
+                if tracking_active
+                    && self.tracking.fallback_ramp.is_some()
+                    && (self.active_trajectory.is_some() || self.servo_target.is_some() || self.pending_normal_unload)
+                {
+                    // A new motion or park took over from the issued (braking) state.
+                    self.tracking.fallback_ramp = None;
+                }
+                if tracking_active && self.tracking.recovery_suspended {
+                    // Driver emitted an autonomous recovery write; suspend supervisor target
+                    // writes until fresh post-recovery feedback confirms every joint's baseline.
+                } else if tracking_active && self.driver.is_some() && self.tracking.fallback_ramp.is_some() {
+                    // Rejection-fallback braking ramp, also while the rejection fault is latched.
+                    // The rejected motion's caps (`FallbackRamp::limits`) stay in force, tightened
+                    // by the current power governor limit; the ramp keeps its original caps.
+                    let ramp = self.tracking.fallback_ramp.clone().expect("checked above");
+                    let governed = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut tick_ramp = ramp.clone();
+                    for (l, g) in tick_ramp.limits.iter_mut().zip(&governed) {
+                        l.max_velocity = l.max_velocity.min(g.max_velocity);
+                        l.max_acceleration = l.max_acceleration.min(g.max_acceleration);
+                    }
+                    let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
+                    let mut pending = self.tracking_fallback_compute(tick_ramp, servo_dt, &mut tick_sweep_budget);
+                    pending.ramp = ramp;
+                    output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                    self.tracking.last_tick_sweep_evals =
+                        MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
+                } else if ramp_out_handover || tracking_owned {
+                    let jt = self.config.joint_tracking.as_ref().unwrap();
+                    let active_limits = self.active_tracking_limits(servo_dt, time_scale);
+                    let mut tick_sweep_budget = MAX_KEEPOUT_EVALS_PER_TICK;
+                    let eval_res = if ramp_out_handover {
+                        self.compute_lead_ramp_out_with_budget(
+                            servo_dt,
+                            &active_limits,
+                            self.pending_normal_unload,
+                            &mut tick_sweep_budget,
+                        )
+                    } else if self.handover_settling_since.is_some() {
+                        // Moving lease handover with lead already ramped out: validate nominal
+                        // handover hold/braking without adding new lead.
+                        let mut zero_jt = jt.clone();
+                        for j in &mut zero_jt.joints {
+                            j.strategy = crate::tracking::TrackingStrategy::Position;
+                        }
+                        self.compute_position_lead_output_with_limits_and_budget(
+                            servo_dt,
+                            &zero_jt,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
+                    } else {
+                        self.compute_position_lead_output_with_limits_and_budget(
+                            servo_dt,
+                            jt,
+                            &active_limits,
+                            &mut tick_sweep_budget,
+                        )
+                    };
+                    match eval_res {
+                        Ok(out) => {
+                            let targets: Vec<JointTarget> = out
+                                .positions
+                                .iter()
+                                .zip(self.commanded_velocities.iter())
+                                .enumerate()
+                                .map(|(i, (&p, &v))| JointTarget {
+                                    position: p,
+                                    velocity: Some(v),
+                                    torque: if gravity_output_enabled {
+                                        self.gravity_torques_ramped.get(i).copied()
+                                    } else {
+                                        Some(0.0)
+                                    },
+                                    kp: None,
+                                    kd: None,
+                                })
+                                .collect();
+                            let write_res = self
+                                .driver
+                                .as_ref()
+                                .and_then(|d| d.lock().ok())
+                                .map(|mut driver| driver.write_joint_targets(&targets));
+                            match write_res {
+                                Some(Ok(())) => {
+                                    self.tracking.record_issued_with_ws_depths(
+                                        out.positions,
+                                        out.velocities,
+                                        out.ws_min_depths,
+                                        out.ws_keepout_min_depths,
+                                    );
+                                    tick_output_accepted = true;
+                                }
+                                Some(Err(e)) => {
+                                    self.tracking.invalidate();
+                                    output_error = Some(e.to_string());
+                                }
+                                None => self.tracking.invalidate(),
+                            }
+                        }
+                        Err(reject) => {
+                            let was_streaming = self.servo_target.is_some() || self.servo_stream_active;
+                            // Rejection fallback: evaluated from the intact history and park
+                            // state BEFORE the hold below invalidates them. It brakes the issued
+                            // output toward the measured hold within the active limits (continued
+                            // on later ticks by `fallback_ramp`), or latches a fault without
+                            // sending a frame when no step is feasible.
+                            let ramp = crate::tracking::FallbackRamp {
+                                hold: self.measured_hold_pose(),
+                                keepout_only: self.pending_normal_unload,
+                                limits: active_limits.clone(),
+                            };
+                            let pending = self.tracking_fallback_compute(ramp, servo_dt, &mut tick_sweep_budget);
+                            match reject {
+                                crate::tracking::TrackingReject::Workspace(ws_err) if was_streaming => {
+                                    self.enter_servo_keepout_hold(&ws_err);
+                                }
+                                crate::tracking::TrackingReject::Workspace(ws_err) => {
+                                    tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
+                                    self.hold_measured_pose();
+                                    self.macro_run = None;
+                                    self.safety.trigger_fault_coded(
+                                        FaultCode::Other,
+                                        FaultReason::Other(format!("Joint tracking output rejected: {ws_err}")),
+                                    );
+                                }
+                                crate::tracking::TrackingReject::JointLimit(msg) => {
+                                    tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
+                                    self.hold_measured_pose();
+                                    self.macro_run = None;
+                                    self.safety.trigger_fault_coded(
+                                        FaultCode::JointLimit,
+                                        FaultReason::Other(format!("Joint tracking output rejected: {msg}")),
+                                    );
+                                }
+                            }
+                            output_error = self.apply_tracking_fallback_step(pending, gravity_output_enabled);
+                        }
+                    }
+                    self.tracking.last_tick_sweep_evals =
+                        MAX_KEEPOUT_EVALS_PER_TICK.saturating_sub(tick_sweep_budget);
+                } else {
+                    if tracking_active {
+                        self.tracking.invalidate();
+                    }
+                    if let Some(ref d) = self.driver {
+                        if let Ok(mut driver) = d.lock() {
+                            let targets: Vec<JointTarget> = self
+                                .commanded_positions
+                                .iter()
+                                .zip(self.commanded_velocities.iter())
+                                .enumerate()
+                                .map(|(i, (&p, &v))| JointTarget {
+                                    position: p,
+                                    velocity: Some(v),
+                                    torque: if gravity_output_enabled {
+                                        self.gravity_torques_ramped.get(i).copied()
+                                    } else {
+                                        Some(0.0)
+                                    },
+                                    kp: None,
+                                    kd: None,
+                                })
+                                .collect();
+                            match driver.write_joint_targets(&targets) {
+                                Ok(()) => tick_output_accepted = true,
+                                Err(e) => output_error = Some(e.to_string()),
+                            }
+                        }
+                    } else {
+                        tick_output_accepted = true;
                     }
                 }
+            } else {
+                self.tracking.invalidate();
+            }
+        } else {
+            self.tracking.invalidate();
+        }
+
+        if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+            self.note_tracking_position_sample();
+            let settled = self.active_trajectory.is_none()
+                && self.quintic_settle.is_none()
+                && self.tracking.fallback_ramp.is_none()
+                && !self.tracking.has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices());
+            if settled {
+                self.tracking.retained_motion_limits = None;
             }
         }
 
         if let Some(error) = output_error {
+            tick_output_accepted = false;
             self.stop_motion();
+            self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             if self.measured_positions.iter().all(|q| q.is_finite()) {
                 self.commanded_positions = self.measured_positions.clone();
@@ -5221,6 +5728,51 @@ impl SupervisorInner {
                 self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
             }
             tracing::error!("Control output failed: {error}");
+        }
+
+        if self.servo_stream_active
+            && self.servo_target.is_none()
+            && (self.safety.state().is_stopped()
+                || (self.commanded_velocities.iter().all(|&v| v == 0.0)
+                    && !self.tracking.has_residual_lead(
+                        &self.commanded_positions,
+                        &self.config.arm_joint_indices(),
+                    )))
+        {
+            self.servo_stream_active = false;
+        }
+
+        let tick_output_accepted = tick_output_accepted && !self.safety.state().is_stopped();
+        if let Some(done) = deferred_done {
+            if tick_output_accepted {
+                if done.clear_releasing {
+                    self.releasing = false;
+                    self.held = None;
+                }
+                if !self.pending_normal_unload {
+                    self.safety.mark_motion_finished();
+                }
+                if done.macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Done(SubDone {
+                            settled: done.settled,
+                            holding: done.holding,
+                            gripper_gap_rad: done.gripper_gap_rad,
+                            at: Instant::now(),
+                        });
+                    }
+                } else if let Some(id) = done.action_id {
+                    self.finish_action(
+                        id,
+                        "done",
+                        None,
+                        None,
+                        done.settled,
+                        done.holding,
+                        done.gripper_gap_rad,
+                    );
+                }
+            }
         }
 
         // If in simulation (no hardware driver attached), mirror commanded into measured
@@ -5286,7 +5838,8 @@ impl SupervisorInner {
             }
         }
 
-        self.reconcile_action(servo_dt);
+        // Tracking off: settle completion does not wait for an accepted output (e4f72b6).
+        self.reconcile_action(servo_dt, tick_output_accepted || !tracking_enabled);
         self.expire_motion_limit();
         let obs = self.current_observation();
 
@@ -5888,6 +6441,7 @@ impl SupervisorInner {
 
         self.target_positions = targets.clone();
         self.servo_target = Some(targets.clone());
+        self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
@@ -6173,6 +6727,7 @@ impl ArmSupervisor {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
             driver.set_gripper_index(inner.config.gripper_index());
+            driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
             if driver.capabilities().load_feedback {
                 inner.loads = vec![f32::NAN; inner.config.dof];
             }

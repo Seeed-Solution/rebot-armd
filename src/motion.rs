@@ -1259,14 +1259,20 @@ pub struct ActiveTrajectory {
     pub then: Option<MultiJointQuinticTrajectory>,
     /// Progress mapping while a two-leg motion runs: (seconds before this leg, total seconds).
     pub span: Option<(f64, f64)>,
+    /// Per-joint velocity/acceleration limits used when planning this trajectory (e.g. after `speed_scale`).
+    pub motion_limits: Option<Vec<JointLimit>>,
 }
 
 impl ActiveTrajectory {
     pub fn new(action_id: Option<u64>, reference: Reference) -> Self {
-        Self { action_id, reference, then: None, span: None }
+        Self { action_id, reference, then: None, span: None, motion_limits: None }
     }
     pub fn quintic(traj: MultiJointQuinticTrajectory, action_id: Option<u64>) -> Self {
         Self::new(action_id, Reference::Quintic(traj))
+    }
+    pub fn with_motion_limits(mut self, limits: Vec<JointLimit>) -> Self {
+        self.motion_limits = Some(limits);
+        self
     }
     /// `reference` followed by the short segment `then` (same-side approach).
     pub fn with_approach(action_id: Option<u64>, reference: Reference, then: MultiJointQuinticTrajectory) -> Self {

@@ -75,6 +75,8 @@ fn so_arm101_config() -> ArmConfig {
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;
+    // Clear the B601-DM Damiao joint_tracking seed alongside the other Damiao fields.
+    c.joint_tracking = None;
     c.load_arm_model(None).unwrap();
     c.validate().unwrap();
     c
@@ -117,6 +119,8 @@ fn config_6_plus_0() -> ArmConfig {
     c.servo_max_velocity = None;
     c.resting_pose = None;
     c.power_budget = None;
+    // Clear the B601-DM Damiao joint_tracking seed alongside the other Damiao fields.
+    c.joint_tracking = None;
     c.load_arm_model(None).unwrap();
     c.validate().unwrap();
     c

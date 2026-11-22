@@ -1,0 +1,10 @@
+{
+  "source_commit": "e4f72b64f9d95c1b11d9f42d60c9c00130ce5a30",
+  "short_commit": "e4f72b6",
+  "command": "sh tests/fixtures/generate_tracking_off_e4f72b6.sh e4f72b6",
+  "generator": "tests/fixtures/gen_tracking_off_e4f72b6.rs",
+  "fixture": "tests/fixtures/tracking_off_e4f72b6_trace.json",
+  "frames": 1282,
+  "obs": 1292,
+  "sha256": "fa6b6f118ff980966ecc0356853ffa340cf2b4871f57e2bc9cd9858552f1a4b6"
+}

@@ -342,7 +342,18 @@ impl SupervisorInner {
             self.finish_action(id, "failed", Some("TORQUE_LIMIT"), Some(message), None, None, None);
         }
         self.macro_run = None;
+        // M1: preserve previous tracking output across the torque-guard backoff so active
+        // lead ramps smoothly in the relieving direction instead of dropping in one tick.
+        let preserved_tracking = self
+            .config
+            .joint_tracking
+            .as_ref()
+            .is_some_and(|jt| jt.enabled)
+            .then(|| self.tracking.clone());
         self.hold_measured_pose();
+        if let Some(prev) = preserved_tracking {
+            self.tracking = prev;
+        }
         self.note_motion_limit(MotionLimitReason::Torque, Some(j));
         if let Some(h) = self.torque_guard.hold.as_mut() {
             let l = &self.config.limits[j];

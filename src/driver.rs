@@ -104,6 +104,13 @@ pub trait ArmDriver: Send {
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
 
+    /// Receive instant of each joint's latest feedback sample. Drivers that keep the
+    /// receive times report them directly; the default derives them from `feedback_ages`.
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        let now = Instant::now();
+        self.feedback_ages().into_iter().map(|a| a.and_then(|a| now.checked_sub(a))).collect()
+    }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -225,6 +232,15 @@ pub trait ArmDriver: Send {
 
     /// The offsets in effect at the boundary; None for a driver without it.
     fn joint_zero_offsets(&self) -> Option<Vec<f32>> { None }
+
+    /// Joint indices that received an autonomous driver recovery write during
+    /// `read_joint_states` since the previous call, clearing the record.
+    fn take_recovery_writes(&mut self) -> Vec<usize> { Vec::new() }
+
+    /// Strict control-mode handover (joint tracking enabled): a mode switch is confirmed
+    /// only when its hold frames and the bus flush also succeed. Off (default) keeps the
+    /// pre-tracking behaviour, where a matching mode acknowledgement confirms the switch.
+    fn set_strict_mode_handover(&mut self, _strict: bool) {}
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.
@@ -1177,6 +1193,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .collect()
     }
 
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -1900,6 +1918,8 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -2080,6 +2100,11 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     register_replies: Vec<damiao::RegisterReply>,
     /// Last mapping-range check (`check_mapping_ranges`); None = not run.
     range_check: Option<DriverRangeCheck>,
+    /// Joints that received an autonomous recovery write during `read_joint_states`
+    /// since the supervisor last queried `take_recovery_writes`.
+    recovery_written_joints: Vec<usize>,
+    /// `ArmDriver::set_strict_mode_handover`; false keeps the e4f72b6 `write_modes`.
+    strict_mode_handover: bool,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2116,6 +2141,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::new(),
             range_check: None,
+            recovery_written_joints: Vec::new(),
+            strict_mode_handover: false,
         }
     }
 
@@ -2314,9 +2341,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Write CTRL_MODE for `joints` (each followed at once by `hold` in the new mode)
     /// and wait for the write acknowledgements. Returns the joints that were not confirmed.
+    ///
+    /// With `strict_mode_handover` (joint tracking enabled) a joint is confirmed only when
+    /// the mode write, every hold frame transmit, the bus flush and the matching register
+    /// reply all succeed. Without it the matching reply alone confirms the joint, as before
+    /// joint tracking (e4f72b6): hold transmit and flush errors are ignored.
     fn write_modes(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool) -> Vec<usize> {
         self.register_replies.clear();
         let mut unsent = Vec::new();
+        let mut hold_failed = Vec::new();
         for &i in joints {
             let id = self.motor_ids[i];
             if self.transmit_with_retry(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
@@ -2332,20 +2365,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             } else {
                 vec![self.pos_vel_frame(i, hold[i].position)]
             };
+            let mut all_holds_ok = true;
             for frame in frames {
-                let _ = self.transmit_with_retry(&frame);
-                self.last_target_frames[i] = Some(frame);
+                let sent = self.transmit_with_retry(&frame).is_ok();
+                if sent || !self.strict_mode_handover {
+                    self.last_target_frames[i] = Some(frame);
+                }
+                all_holds_ok &= sent;
+            }
+            if !all_holds_ok && self.strict_mode_handover {
+                hold_failed.push(i);
             }
         }
-        let _ = self.can.flush();
+        let flush_ok = self.can.flush().is_ok() || !self.strict_mode_handover;
         let sent: Vec<usize> = joints.iter().copied().filter(|i| !unsent.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = sent.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
         let replies = self.await_register_replies(&expected);
         let mut failed = unsent;
         for (k, &i) in sent.iter().enumerate() {
-            if replies[k].is_some_and(|r| r.as_u32() == Self::mode_value(modes[i])) {
+            if flush_ok
+                && !hold_failed.contains(&i)
+                && replies[k].is_some_and(|r| r.as_u32() == Self::mode_value(modes[i]))
+            {
                 self.joint_modes[i] = Some(modes[i]);
             } else {
+                if self.strict_mode_handover {
+                    self.joint_modes[i] = None;
+                }
                 failed.push(i);
             }
         }
@@ -2444,6 +2490,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+
 
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
         if joint >= self.motor_ids.len() || self.control_mode != DamiaoControlMode::PosVel {
@@ -2516,6 +2564,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
+
+    fn take_recovery_writes(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.recovery_written_joints)
+    }
+
+    fn set_strict_mode_handover(&mut self, strict: bool) {
+        self.strict_mode_handover = strict;
+    }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::set_current("motor_flash", false, vec![
@@ -2956,13 +3012,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // Recovery never replays a queued motion target. A still-fresh,
                 // confirmed enabled joint may only hold its last measured pose.
                 let p = self.cached_states.get(i).map_or(0.0, |s| s.position);
+                let mut recovery_sent = false;
                 match self.joint_modes.get(i).copied().flatten().unwrap_or(self.control_mode) {
                     DamiaoControlMode::Mit if self.control_mode == DamiaoControlMode::PosVel => {
                         // A joint switched to MIT by set_joint_modes (gravity compensation):
                         // repeat the last MIT command instead of inventing gains or dropping
                         // its torque feed-forward; the supervisor owns the hold decision.
                         if let Some(frame) = self.last_target_frames[i].filter(|f| f.id == u32::from(id)) {
-                            let _ = self.can.transmit(&frame);
+                            recovery_sent = self.can.transmit(&frame).is_ok();
                         }
                     }
                     DamiaoControlMode::Mit => {
@@ -2977,7 +3034,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             0.0,
                             &self.limits[i],
                         );
-                        let _ = self.can.transmit(&frame);
+                        recovery_sent = self.can.transmit(&frame).is_ok();
                     }
                     DamiaoControlMode::PosVel => {
                         let frame = damiao::build_pos_vel_frame(
@@ -2986,8 +3043,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             p,
                             self.default_vlim.abs().clamp(0.1, 4.0),
                         );
-                        let _ = self.can.transmit(&frame);
+                        recovery_sent = self.can.transmit(&frame).is_ok();
                     }
+                }
+                if recovery_sent && !self.recovery_written_joints.contains(&i) {
+                    self.recovery_written_joints.push(i);
                 }
             }
         }
@@ -3070,6 +3130,8 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
+
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
 
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
