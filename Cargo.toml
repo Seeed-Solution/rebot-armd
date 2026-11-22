@@ -110,3 +110,9 @@ libc = "0.2"
 # opt-level 3 is 34.5 MB instead of 16.4 MB (riscv64, 2026-11-22); this crate alone adds little.
 [profile.release.package.mview-stereo]
 opt-level = 3
+
+# Fallback JPEG decode path (snapshot mode against older/remote vision providers).
+[profile.release.package.zune-jpeg]
+opt-level = 3
+[profile.release.package.zune-core]
+opt-level = 3
