@@ -1291,8 +1291,12 @@ class Simulator:
             and tx_id == self.active_tx_id == self.camera_tx_id
             and tx_id in self._committed_tx_payloads
         ):
-            self.degraded_tx_id = None
-            self.activation_state = "COMMITTED"
+            if (
+                self.activation_state != "DEGRADED_SPLIT"
+                or self.degraded_tx_id in (None, tx_id)
+            ):
+                self.degraded_tx_id = None
+                self.activation_state = "COMMITTED"
             res = self._tx_active_summary(state="COMMITTED", include_camera_tx=True)
             res["idempotent"] = True
             return res
@@ -1415,6 +1419,12 @@ class Simulator:
                     "_http_status": 409,
                     "error": f"tx {tx_id!r} is not in DEGRADED_SPLIT",
                     "code": "TX_NOT_PREPARED",
+                }
+            if self._staged_tx.get("physics_committed") is not True:
+                return {
+                    "_http_status": 409,
+                    "error": f"tx {tx_id!r} physics has not been committed",
+                    "code": "PHYSICS_NOT_COMMITTED",
                 }
         else:
             phys = self._tx_commit_physics_locked({"tx_id": tx_id})

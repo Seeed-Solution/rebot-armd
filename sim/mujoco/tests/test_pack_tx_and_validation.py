@@ -1850,3 +1850,92 @@ def test_m16_finalize_cam_timeout_tracks_pending_cleanup_and_retries_cleanly(tmp
     finally:
         cleanup()
 
+
+def test_r2_9_camera_only_rejects_uncommitted_physics_before_callback(tmp_path: Path):
+    scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+    scene_b = _write_minimal_scene(tmp_path / "scene_b", pack_id="scene_b")
+
+    sim = Simulator(_free_port(socket.SOCK_DGRAM), objects="cube", robot="b601dm")
+    cam_calls: list[str] = []
+    sim.set_camera_hooks(
+        prepare_cb=lambda info: {"tx_id": info["tx_id"]},
+        commit_cb=lambda staged: cam_calls.append(staged["tx_id"]),
+        abort_cb=lambda staged: None,
+    )
+    sim.camera_info = lambda: {"fps": 15, "tx_id": sim.camera_tx_id}  # type: ignore[attr-defined]
+    port = _free_port()
+    srv = PerceptionServer(Perception(max_fps=15), sim, "127.0.0.1", port)
+    base = f"http://127.0.0.1:{port}"
+    try:
+        assert _http_json(
+            f"{base}/sim/scene/prepare",
+            "POST",
+            {"tx_id": "tx-a", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"},
+        )[0] == 200
+        assert _http_json(f"{base}/sim/scene/commit", "POST", {"tx_id": "tx-a"})[0] == 200
+        assert cam_calls == ["tx-a"]
+        cam_calls.clear()
+
+        assert _http_json(
+            f"{base}/sim/scene/prepare",
+            "POST",
+            {"tx_id": "tx-b", "scene": "scene_b", "scene_dir": str(scene_b), "tool": "default"},
+        )[0] == 200
+
+        # Put sim into DEGRADED_SPLIT while tx-b is staged with physics_committed=False.
+        assert sim._staged_tx is not None and sim._staged_tx.get("physics_committed") is False
+        sim.activation_state = "DEGRADED_SPLIT"
+        sim.degraded_tx_id = "tx-b"
+
+        code, body = _http_json(
+            f"{base}/sim/scene/commit",
+            "POST",
+            {"tx_id": "tx-b", "phase": "camera_only"},
+        )
+        assert code == 409, body
+        assert body["code"] == "PHYSICS_NOT_COMMITTED", body
+        assert len(cam_calls) == 0, f"_camera_commit_cb must not be called: {cam_calls}"
+        assert sim.camera_tx_id == "tx-a"
+        assert sim.active_tx_id == "tx-a"
+        assert sim.activation_state == "DEGRADED_SPLIT"
+    finally:
+        srv.httpd.shutdown()
+        srv.httpd.server_close()
+        sim.close()
+
+
+def test_r2_10_idempotent_finalize_preserves_unrelated_degraded_tx_id(tmp_path: Path):
+    sim = Simulator(_free_port(socket.SOCK_DGRAM), objects="cube", robot="b601dm")
+    try:
+        scene_a = _write_minimal_scene(tmp_path / "scene_a", pack_id="scene_a")
+
+        code_p, _ = sim._public_tx_reply(
+            sim._tx_prepare_locked(
+                {"tx_id": "tx-a", "scene": "scene_a", "scene_dir": str(scene_a), "tool": "default"}
+            )
+        )
+        assert code_p == 200
+        code_c, res_c = sim._public_tx_reply(sim._tx_commit_locked({"tx_id": "tx-a"}))
+        assert code_c == 200 and res_c["state"] == "COMMITTED"
+        assert sim.active_tx_id == "tx-a" and sim.camera_tx_id == "tx-a"
+
+        # Unrelated tx-b enters DEGRADED_SPLIT (e.g., failed physics commit with lost NACK).
+        code_d, res_d = sim._public_tx_reply(
+            sim._tx_mark_degraded_locked({"tx_id": "tx-b", "error": "split fault"})
+        )
+        assert code_d == 503 and res_d["state"] == "DEGRADED_SPLIT"
+        assert sim.activation_state == "DEGRADED_SPLIT"
+        assert sim.degraded_tx_id == "tx-b"
+
+        # Delayed duplicate tx_finalize(tx-a) must return tx-a's idempotent 200 WITHOUT
+        # clearing sim.degraded_tx_id == "tx-b" or flipping activation_state out of DEGRADED_SPLIT!
+        code_f, res_f = sim._public_tx_reply(sim._tx_finalize_locked({"tx_id": "tx-a"}))
+        assert code_f == 200, res_f
+        assert res_f["idempotent"] is True
+        assert res_f["tx_id"] == "tx-a"
+        assert sim.degraded_tx_id == "tx-b"
+        assert sim.activation_state == "DEGRADED_SPLIT"
+    finally:
+        sim.close()
+
+
