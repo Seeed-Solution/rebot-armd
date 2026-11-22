@@ -685,9 +685,10 @@ VisionControl::Status VisionControl::request_swap(const SwapRequest& req, uint64
     budget = check_budget(catalogue_, after_swap(req.detector, models_.model_name),
                           after_swap(req.depth, models_.depth_model_name));
     if (!budget.ok) return Status::IonBudget;
-    swap_ = SwapState::Pending;
-    swap_req_ = req;
+    SwapRequest stored = req;  // may throw: copied before the swap is marked Pending
+    swap_req_ = std::move(stored);
     swap_error_.clear();
+    swap_ = SwapState::Pending;
     generation = models_.generation + 1;
     notify_locked();
     return Status::Ok;
@@ -705,8 +706,9 @@ bool VisionControl::take_swap(SwapRequest& out) {
         notify_locked();
         return false;
     }
+    SwapRequest taken = swap_req_;  // may throw: a failed copy leaves the swap Pending
+    out = std::move(taken);
     swap_ = SwapState::Running;
-    out = swap_req_;
     notify_locked();
     return true;
 }

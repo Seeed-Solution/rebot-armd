@@ -22,6 +22,7 @@
 #include "gray_frame.h"
 #include "http_control.h"
 #include "json.hpp"
+#include "model_catalogue.h"
 #include "vision_control.h"
 
 using namespace rv;
@@ -1061,6 +1062,70 @@ static void test_rollover_allocation_failure_is_all_or_nothing() {
     CHECK(ctl.next_frame_id(inst2) == 2 && inst2 == inst);
 }
 
+
+// Model swap under allocation failure: take_swap() copies the request before it marks the swap
+// Running, so a failed copy leaves it Pending and the next frame takes it; request_swap() stores
+// the request before it marks the swap Pending.
+static void test_swap_take_allocation_failure_keeps_pending() {
+    const std::string det_name(32, 'd');
+    VisionControl::Options o;
+    o.mode = Mode::Yolo;
+    o.yolo_available = true;
+    o.model_name = "small";
+    o.model_path = "/m/small.cvimodel";
+    std::vector<std::string> warn;
+    parse_catalogue(std::string(R"({"models": {
+        "small": {"path": "/m/small.cvimodel", "kind": "detect", "ion_mb": 4},
+        ")") + det_name + R"(": {"path": "/m/a_long_detector_model_path.cvimodel", "kind": "detect", "ion_mb": 5}}})",
+                    o.catalogue, warn);
+    VisionControl ctl(o, nullptr);
+    SwapRequest req;
+    req.detector.change = true;
+    req.detector.name = det_name;
+
+    // request_swap: each allocation fails in turn; a failure leaves the swap Idle.
+    bool requested = false;
+    for (long k = 1; k <= 64 && !requested; ++k) {
+        uint64_t gen = 0;
+        BudgetCheck budget;
+        VisionControl::Status st = VisionControl::Status::Ok;
+        const bool ok = contain_frame([&] {
+            t_alloc_countdown = k;
+            st = ctl.request_swap(req, gen, budget);
+            t_alloc_countdown = 0;
+        }, [](const char*) {});
+        t_alloc_countdown = 0;
+        if (ok) {
+            CHECK(st == VisionControl::Status::Ok);
+            requested = true;
+        } else {
+            CHECK(ctl.swap_state() == SwapState::Idle);
+        }
+    }
+    CHECK(requested && ctl.swap_state() == SwapState::Pending);
+
+    int failures = 0;
+    bool taken = false;
+    SwapRequest got;
+    for (long k = 1; k <= 64 && !taken; ++k) {
+        bool r = false;
+        const bool ok = contain_frame([&] {
+            t_alloc_countdown = k;
+            r = ctl.take_swap(got);
+            t_alloc_countdown = 0;
+        }, [&](const char*) { ++failures; });
+        t_alloc_countdown = 0;
+        if (ok) {
+            CHECK(r);
+            taken = r;
+        } else {
+            CHECK(ctl.swap_state() == SwapState::Pending);
+        }
+    }
+    CHECK(taken && failures >= 1 && ctl.swap_state() == SwapState::Running);
+    CHECK(got.detector.change && got.detector.name == det_name);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -1084,6 +1149,7 @@ int main(int argc, char** argv) {
     test_rollover_preserves_history_slots_and_drops_depth_map();
     test_frame_boundary_contains_allocation_failures();
     test_rollover_allocation_failure_is_all_or_nothing();
+    test_swap_take_allocation_failure_keeps_pending();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

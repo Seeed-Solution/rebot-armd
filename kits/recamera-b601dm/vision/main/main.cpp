@@ -716,12 +716,23 @@ int main(int argc, char** argv) {
     };
 
     app.on_started(set_ae_fixed_frame_rate).on_before_grab([&] { before_grab_ms = rv::mono_ms(); });
-    app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
+    // One frame's work; on_frame below runs it under a frame guard.
+    auto process_frame = [&](const af::VideoFrame& frame, af::Result& r) {
         const uint64_t grab_ms = rv::mono_ms();
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
-        rv::SwapRequest swap;
-        if (ctl.take_swap(swap)) apply_swap(swap);
+        // A model swap that throws (a copy, a load) is ended as failed instead of staying Running.
+        bool swap_taken = false;
+        rv::contain_frame([&] {
+            rv::SwapRequest swap;
+            if (ctl.take_swap(swap)) {
+                swap_taken = true;
+                apply_swap(swap);
+            }
+        }, [&](const char* what) {
+            MA_LOGE(TAG, "Model swap failed: %s", what);
+            if (swap_taken) model_generation = ctl.finish_swap(resident, "SWAP_FAILED");
+        });
         // PUT /api/calibration/intrinsics: applied before this frame's pipelines run
         rv::Intrinsics intr;
         uint64_t intr_rev = 0;
@@ -947,6 +958,13 @@ int main(int argc, char** argv) {
             }
         }, [&](const char* what) { MA_LOGE(TAG, "Frame dropped: %s", what); });
         if (!frame_ok) r.publish = false;
+    };
+    app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
+        // Contain anything process_frame lets through (frame plan, intrinsics, ...): no publication.
+        if (!rv::contain_frame([&] { process_frame(frame, r); },
+                               [&](const char* what) { MA_LOGE(TAG, "Frame callback failed: %s", what); })) {
+            r.publish = false;
+        }
     });
 
     const int rc = app.run();
