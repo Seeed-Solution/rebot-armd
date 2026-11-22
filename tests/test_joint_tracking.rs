@@ -3357,3 +3357,37 @@ fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
         );
     }
 }
+
+/// Review 2 M5: Failed gravity-comp entry (even with a clean rollback where modes are
+/// not uncertain) must invalidate any stale pre-entry issued baseline.
+#[test]
+fn tracking_failed_gravity_comp_entry_rollback_invalidates_old_baseline() {
+    use armd::tracking::TrackingHistoryState;
+
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+    let mut old_issued = q0.to_vec();
+    old_issued[0] += 0.020;
+    inner.tracking.record_issued(old_issued, vec![0.0; 7]);
+
+    drv.with(|s| s.fail_mode_switch = true);
+    let err = inner.enter_gravity_comp(Default::default());
+    assert!(err.is_err(), "simulated mode-switch failure must reject entry");
+    assert!(inner.gravity_comp.is_none());
+    assert!(inner.safety.state().is_operational(), "clean rollback leaves arm operational");
+    assert_eq!(
+        inner.tracking.history_state,
+        TrackingHistoryState::Unknown,
+        "failed entry rollback must invalidate stale pre-entry baseline"
+    );
+    assert!(
+        inner.tracking.last_issued_positions.is_none(),
+        "stale pre-entry issued target must not remain after rollback"
+    );
+}

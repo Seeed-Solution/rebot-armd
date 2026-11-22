@@ -237,6 +237,9 @@ impl SupervisorInner {
             if let Err(e) = drv.set_joint_modes(&modes, &hold) {
                 let uncertain = drv.joint_modes_uncertain();
                 drop(drv);
+                // Mode switch (and any rollback dual-hold) already wrote hold frames to the bus;
+                // never keep a stale pre-entry `last_issued_positions` as tracking baseline.
+                self.tracking.invalidate();
                 if uncertain {
                     self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
                 }
