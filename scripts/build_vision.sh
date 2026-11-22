@@ -34,20 +34,60 @@ mkdir -p "${OUT_DIR}"
 
 OUT_BIN="${OUT_DIR}/rebot-vision"
 OUT_MAP="${OUT_DIR}/rebot-vision.map"
-STAGE_BIN="${OUT_DIR}/.rebot-vision.tmp.$$"
-STAGE_MAP="${OUT_DIR}/.rebot-vision.map.tmp.$$"
+OUT_SHA="${OUT_DIR}/rebot-vision.sha256"
+LOCK_FILE="${OUT_DIR}/.publish.lock"
+STAGE_DIR="$(mktemp -d "${OUT_DIR}/.stage.XXXXXX")"
+STAGE_BIN="${STAGE_DIR}/rebot-vision"
+STAGE_MAP="${STAGE_DIR}/rebot-vision.map"
+STAGE_SHA="${STAGE_DIR}/rebot-vision.sha256"
+HOST_BUILD=""
 CONTAINER_WORK=""
+PUBLISHED=0
+
+file_identity() {
+    if [ ! -e "$1" ]; then
+        return 0
+    fi
+    stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null || true
+}
+
+with_publish_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        (
+            flock -x 9
+            "$@"
+        ) 9>"${LOCK_FILE}"
+    else
+        local lockdir="${LOCK_FILE}.d"
+        while ! mkdir "${lockdir}" 2>/dev/null; do sleep 0.05; done
+        "$@"
+        local rc=$?
+        rmdir "${lockdir}" 2>/dev/null || true
+        return "${rc}"
+    fi
+}
+
+PREV_INODE="$(file_identity "${OUT_BIN}")"
+
+clear_stale_if_unchanged() {
+    if [ -n "${PREV_INODE}" ] && [ "$(file_identity "${OUT_BIN}")" = "${PREV_INODE}" ]; then
+        rm -f "${OUT_BIN}" "${OUT_MAP}" "${OUT_SHA}"
+    fi
+}
 
 cleanup() {
-    rm -f "${STAGE_BIN}" "${STAGE_MAP}"
+    if [ "${PUBLISHED}" != 1 ]; then
+        with_publish_lock clear_stale_if_unchanged || true
+    fi
+    rm -rf "${STAGE_DIR}"
+    if [ -n "${HOST_BUILD}" ]; then
+        rm -rf "${HOST_BUILD}"
+    fi
     if [ -n "${CONTAINER_WORK}" ] && [ -n "${RECAMERA_DOCKER:-}" ]; then
         docker exec "${RECAMERA_DOCKER}" rm -rf "${CONTAINER_WORK}" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup EXIT
-
-# Never leave a previous artifact behind if this build fails.
-rm -f "${OUT_BIN}" "${OUT_MAP}"
 
 if [ -n "${RECAMERA_DOCKER:-}" ]; then
     C="${RECAMERA_DOCKER}"
@@ -100,26 +140,36 @@ else
     : "${SG200X_SDK_PATH:?set SG200X_SDK_PATH or RECAMERA_DOCKER}"
     : "${SSCMA_ROOT:?set SSCMA_ROOT or RECAMERA_DOCKER}"
     command -v riscv64-unknown-linux-musl-g++ >/dev/null || { echo "riscv64-unknown-linux-musl-g++ not in PATH" >&2; exit 1; }
-    B="$(mktemp -d "${OUT_DIR}/build.XXXXXX")"
-    trap 'rm -rf "$B"; cleanup' EXIT
-    cmake -S "${SRC_DIR}" -B "$B" -DCMAKE_BUILD_TYPE=Release "${UNPINNED}"
-    cmake --build "$B" -j"$(nproc)"
-    test -x "$B/rebot-vision"
-    riscv64-unknown-linux-musl-strip -o "${STAGE_BIN}" "$B/rebot-vision"
+    HOST_BUILD="$(mktemp -d "${OUT_DIR}/build.XXXXXX")"
+    cmake -S "${SRC_DIR}" -B "${HOST_BUILD}" -DCMAKE_BUILD_TYPE=Release "${UNPINNED}"
+    cmake --build "${HOST_BUILD}" -j"$(nproc)"
+    test -x "${HOST_BUILD}/rebot-vision"
+    riscv64-unknown-linux-musl-strip -o "${STAGE_BIN}" "${HOST_BUILD}/rebot-vision"
     riscv64-unknown-linux-musl-readelf -h "${STAGE_BIN}" | grep -q 'RISC-V' || {
         echo "rebot-vision artifact is not a RISC-V ELF binary" >&2
         exit 1
     }
-    if [ -f "$B/rebot-vision.map" ]; then
-        cp "$B/rebot-vision.map" "${STAGE_MAP}"
+    if [ -f "${HOST_BUILD}/rebot-vision.map" ]; then
+        cp "${HOST_BUILD}/rebot-vision.map" "${STAGE_MAP}"
     fi
 fi
 
 chmod 0755 "${STAGE_BIN}"
-mv -f "${STAGE_BIN}" "${OUT_BIN}"
-if [ -f "${STAGE_MAP}" ]; then
-    mv -f "${STAGE_MAP}" "${OUT_MAP}"
-fi
+SHA256="$(sha256sum "${STAGE_BIN}" | awk '{print $1}')"
+SIZE="$(ls -lh "${STAGE_BIN}" | awk '{print $5}')"
+printf '%s  rebot-vision\n' "${SHA256}" > "${STAGE_SHA}"
 
-SHA256="$(sha256sum "${OUT_BIN}" | awk '{print $1}')"
-echo "rebot-vision: ${OUT_BIN} ($(ls -lh "${OUT_BIN}" | awk '{print $5}'), sha256=${SHA256})"
+publish_artifacts() {
+    mv -f "${STAGE_BIN}" "${OUT_BIN}"
+    if [ -f "${STAGE_MAP}" ]; then
+        mv -f "${STAGE_MAP}" "${OUT_MAP}"
+    else
+        rm -f "${OUT_MAP}"
+    fi
+    mv -f "${STAGE_SHA}" "${OUT_SHA}"
+}
+
+with_publish_lock publish_artifacts
+PUBLISHED=1
+
+echo "rebot-vision: ${OUT_BIN} (${SIZE}, sha256=${SHA256})"
