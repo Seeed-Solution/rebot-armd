@@ -5717,12 +5717,14 @@ impl SupervisorInner {
                                 .map(|mut driver| driver.write_joint_targets(&targets));
                             match write_res {
                                 Some(Ok(())) => {
+                                    let nominal = self.tracking.nominal_entry(&self.commanded_positions, servo_dt);
                                     self.tracking.record_issued_with_ws_depths(
                                         out.positions,
                                         out.velocities,
                                         out.ws_min_depths,
                                         out.ws_keepout_min_depths,
                                     );
+                                    self.tracking.last_nominal = Some(nominal);
                                     tick_output_accepted = true;
                                 }
                                 Some(Err(e)) => {

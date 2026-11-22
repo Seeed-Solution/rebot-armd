@@ -767,8 +767,9 @@ fn lead_limits_and_withdrawal() {
         inner.commanded_velocities[0] = 0.020 / 0.68;
         inner.commanded_velocities[1] = 0.020 / 0.65;
         let jt_ref = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt_ref).expect("should back off to smaller multiplier");
-        assert!(out.multiplier < 1.0 && out.multiplier > 0.0, "expected reduced multiplier (1/2..1/8), got {}", out.multiplier);
+        // The lead candidate enters the box: the lead is withdrawn (shaped, here from zero).
+        let out = inner.compute_position_lead_output(DT, &jt_ref).expect("should withdraw the lead");
+        assert_eq!(out.multiplier, 0.0, "expected the withdrawal candidate, got {}", out.multiplier);
         // Combined output must clear the keepout box.
         let ws = inner.config.workspace.as_ref().unwrap();
         assert_eq!(inner.config.arm_model.workspace_violation(&out.positions, ws, &inner.config.camera_mount).total, 0.0);
@@ -812,7 +813,7 @@ fn lead_limits_and_withdrawal() {
         let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
         assert!((q_out - obs.commanded_positions[0]).abs() <= 1e-6, "stale feedback must suppress lead, got q_out={q_out} vs q_d={}", obs.commanded_positions[0]);
 
-        // Subcase d2: large active lead + stale feedback -> snapping back to nominal exceeds accel limit -> fault!
+        // Subcase d2: large active lead + stale feedback -> shaped withdrawal, no fault.
         let cfg2 = ArmConfig {
             lease_timeout_ms: 600_000,
             workspace: None,
@@ -838,22 +839,27 @@ fn lead_limits_and_withdrawal() {
         let lead_big = prev_confirmed[0] - inner2.commanded_positions[0];
         assert!(lead_big > 0.015, "expected large active lead, got {lead_big}");
 
+        // Stale feedback requests zero lead: the lead is withdrawn smoothly (bounded rate and
+        // acceleration), the motion continues, no fault (the Phase 1 one-tick drop faulted).
         let writes_before = drv2.with(|s| s.written.len());
         drv2.with(|s| s.feedback_age = Duration::from_millis(150));
-        let obs2 = inner2.tick(DT);
-        assert!(matches!(obs2.safety_state, SafetyState::Fault(_)), "unsafe stale withdrawal must fault, got {:?}", obs2.safety_state);
-        assert_eq!(obs2.fault.as_ref().map(|f| f.code), Some(FaultCode::JointLimit));
-        assert!(inner2.active_trajectory.is_none(), "motion must be terminated");
-        // B2: with stale (150 ms) feedback, fallback must preserve the last confirmed safe output
-        // rather than writing a hold synthesized from the stale 150 ms-old measured sample!
-        assert_eq!(inner2.tracking.last_issued_positions.as_deref(), Some(prev_confirmed.as_slice()));
-        let fallback_written = drv2.with(|s| s.written[writes_before][0].position);
-        assert!(
-            (fallback_written - prev_confirmed[0]).abs() <= 1e-6,
-            "stale-feedback fallback must hold last confirmed output {}, got {fallback_written} (stale q_m={})",
-            prev_confirmed[0],
-            obs2.positions[0]
-        );
+        let mut prev_lead = lead_big;
+        for k in 0..40 {
+            let obs2 = inner2.tick(DT);
+            assert!(obs2.safety_state.is_operational(), "stale withdrawal tick {k} must not fault: {:?}", obs2.safety_state);
+            let q_out = drv2.with(|s| s.written.last().unwrap()[0].position);
+            let lead = q_out - obs2.commanded_positions[0];
+            assert!(lead <= prev_lead + 1e-6 && lead >= -1e-6, "tick {k}: lead {lead} must shrink monotonically from {prev_lead}");
+            prev_lead = lead;
+        }
+        assert!(prev_lead.abs() <= 1e-5, "lead must be withdrawn within 0.8 s, still {prev_lead}");
+        let frames = drv2.with(|s| s.written[writes_before - 2..].to_vec());
+        for w in frames.windows(3) {
+            let v1 = f64::from(w[1][0].position - w[0][0].position) / DT;
+            let v2 = f64::from(w[2][0].position - w[1][0].position) / DT;
+            assert!(v2.abs() <= 2.0 + 1e-4 && ((v2 - v1) / DT).abs() <= 5.0 + 1e-2, "issued v {v2:.4} a {:.3}", (v2 - v1) / DT);
+        }
+        drv2.with(|s| s.feedback_age = Duration::ZERO);
     }
 
     // --- (e) Unsafe return to nominal (keep-out between last_issued and nominal q_d) ---
@@ -1446,15 +1452,21 @@ fn tracking_active_limits_and_measured_segment_contract() {
         cfg.limits[0].max_acceleration = 100.0;
         let q0 = [0.0_f32; 7];
         let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        // At v_d = 0.015 rad/s, base_lead = 0.0102 rad.
-        // Full lead (m=1) over DT=0.02s gives v_cand = 0.0102/0.02 = 0.51 rad/s (> 0.09 cap, < 2.0 raw!).
-        // Only m=1/8 gives lead=0.001275 -> v_cand = 0.064 rad/s <= 0.09 cap!
+        // The motion cap (0.09 rad/s) bounds the NOMINAL reference. The issued output may
+        // exceed it by the lead's own rate, bounded by min(v_phys, v_cap + lag * a_cap)
+        // (= min(2.0, 0.09 + 0.68 * 100) = 2.0 rad/s here).
+        // At v_d = 0.015 rad/s, base_lead = 0.0102 rad -> 0.51 rad/s issued in one tick.
         inner.commanded_velocities[0] = 0.015;
         let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale down to fit active speed cap");
-        assert!(out.multiplier < 1.0, "full lead must be rejected by active speed_cap, got m={}", out.multiplier);
+        let out = inner.compute_position_lead_output(DT, &jt).expect("lead within the output bound");
+        assert_eq!(out.multiplier, 1.0);
         let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
-        assert!(v_out <= 0.09 + 1e-4, "issued speed {v_out} exceeded active planned cap 0.09");
+        assert!((out.positions[0] - 0.0102).abs() < 1e-5, "lead {}", out.positions[0]);
+        assert!(v_out <= 2.0 + 1e-4, "issued speed {v_out} exceeded the physical bound 2.0");
+        // A nominal reference faster than the motion cap is rejected (nominal violation).
+        inner.commanded_positions[0] = (0.10 * DT) as f32; // 0.10 rad/s > 0.09 cap
+        let err = inner.compute_position_lead_output(DT, &jt).expect_err("nominal above the cap");
+        assert!(format!("{err:?}").contains("nominal velocity"), "{err:?}");
     }
 
     // 2. Measured-segment keep-out contract: prev_q -> q_cand is clear, but q_m -> q_cand cuts a keep-out box.
@@ -1512,12 +1524,15 @@ fn tracking_active_limits_and_measured_segment_contract() {
         let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         inner.servo_target = Some(vec![0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         inner.servo_stream_active = true;
-        inner.commanded_velocities[0] = 0.02; // base_lead = 0.0136 -> full lead v = 0.68 > 0.10 servo cap
+        inner.commanded_velocities[0] = 0.02; // base_lead = 0.0136 -> 0.68 rad/s issued > 0.10 servo cap
         let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
-        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale lead to fit servo cap");
-        assert!(out.multiplier < 1.0, "full lead must be rejected by servo_max_velocity, got m={}", out.multiplier);
+        let out = inner.compute_position_lead_output(DT, &jt).expect("lead within the output bound");
+        assert_eq!(out.multiplier, 1.0);
         let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
-        assert!(v_out <= 0.10 + 1e-4, "streaming speed {v_out} exceeded servo_max_velocity 0.10");
+        assert!(v_out <= 2.0 + 1e-4, "streaming speed {v_out} exceeded the physical bound 2.0");
+        // The nominal stream reference is still bound by servo_max_velocity.
+        inner.commanded_positions[0] = (0.12 * DT) as f32;
+        assert!(inner.compute_position_lead_output(DT, &jt).is_err(), "nominal above servo_max_velocity");
     }
 }
 
