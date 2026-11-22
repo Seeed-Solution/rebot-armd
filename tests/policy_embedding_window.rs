@@ -2640,3 +2640,203 @@ async fn m3_late_renewal_and_coincident_lease_or_model_change_fail_closed() {
     assert_eq!(r3, "VISION_GENERATION_CHANGED");
     assert_eq!((w3, nh3, s3), (0, 0, 0));
 }
+
+async fn run_m4_counter_case(
+    initial_counters: Option<(u64, u64)>,
+    initial_producer_model_gen: Option<u64>,
+    mid_infer_action: impl FnOnce(&VideoEmbeddingHub, u64),
+) -> (String, usize, usize, u64) {
+    let layers = make_linear_layers(8, 6, vec![0.05; 48]);
+    let dir = tempdir().unwrap();
+    let digest = write_rmlp_pack(
+        dir.path(),
+        &layers,
+        serde_json::json!({
+            "fps": 10.0,
+            "vision": {
+                "source": "video_embedding",
+                "layout": "embedding_v1",
+                "embedding_dim": 2,
+                "history_len": 1,
+                "max_staleness_ms": 300,
+                "max_window_span_ms": 300,
+                "fps_staleness_budget_ms": 300,
+                "encoder_artifact_sha256": sha_a(),
+                "preprocess_config_sha256": sha_b()
+            }
+        }),
+    );
+
+    let cfg = make_6dof_config();
+    let snapshot = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snapshot.policy_json_bytes).unwrap();
+    let inner_backend = load_backend(&snapshot, &contract).unwrap();
+    let infer_entered = Arc::new(Notify::new());
+    let allow_finish = Arc::new((Mutex::new(false), Condvar::new()));
+    let barrier_backend = Box::new(BarrierBackend {
+        inner: inner_backend,
+        infer_entered: infer_entered.clone(),
+        allow_finish: allow_finish.clone(),
+    });
+    let prepared = PreparedPolicy::from_backend(snapshot, contract, barrier_backend, &cfg).unwrap();
+
+    let writes = Arc::new(AtomicUsize::new(0));
+    let non_home_writes = Arc::new(AtomicUsize::new(0));
+    let drv = CountingRealDriver::new(vec![0.0; 6], writes.clone(), non_home_writes.clone());
+    let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(drv)));
+    sup.set_follower("so-arm101").await;
+
+    let hub = embedding_hub_for_supervisor(&sup);
+    hub.set_test_now_ms(Some(1_000_000));
+    let hs = hub_two_step_handshake(&hub, 1, 1_000_000, 1, true);
+    hub.ingest_embedding(EmbeddingIngestRequest {
+        handshake_generation: hs.handshake_generation,
+        producer_epoch: 1,
+        frame_id: 1,
+        captured_at_ms: 1_000_000,
+        oldest_captured_at_ms: None,
+        embedding: vec![1.0, 1.0],
+        encoder_artifact_sha256: sha_a(),
+        preprocess_config_sha256: sha_b(),
+        model_generation: initial_producer_model_gen,
+    })
+    .unwrap();
+
+    if let Some((sme, inv)) = initial_counters {
+        hub.set_counters_for_test(sme, inv);
+    }
+
+    let raw_gate = make_valid_release_gate(&digest, &sha_a(), &sha_b(), 10);
+    let gate = ReleaseGate::parse_and_verify(
+        &raw_gate,
+        &digest,
+        &cfg,
+        prepared.contract(),
+        10.0,
+        &ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        },
+    )
+    .unwrap();
+
+    let lease_gen = sup.acquire_lease("conn-m4").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-m4".into(),
+                lease_generation: lease_gen,
+                policy_id: "vid_m4".into(),
+                artifact_digest: digest,
+                backend: "mlp".into(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: true,
+                verified_release_gate: Some(gate),
+            })
+            .unwrap()
+    };
+
+    writes.store(0, Ordering::SeqCst);
+    non_home_writes.store(0, Ordering::SeqCst);
+
+    let runner = spawn_policy_runner(
+        sup.clone(),
+        action_id,
+        prepared,
+        10.0,
+        compute_policy_deadline(Some(2.0)).unwrap(),
+        None,
+        None,
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), infer_entered.notified())
+        .await
+        .expect("timed out waiting for BarrierBackend::infer");
+
+    mid_infer_action(&hub, hs.handshake_generation);
+
+    {
+        let (lock, cvar) = &*allow_finish;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    tokio::time::timeout(Duration::from_secs(5), runner)
+        .await
+        .expect("runner timeout")
+        .expect("runner panic");
+
+    let obs = sup.get_observation().await;
+    let pol = obs.policy.expect("policy obs");
+    (
+        pol.stop_reason.unwrap_or_default(),
+        writes.load(Ordering::SeqCst),
+        non_home_writes.load(Ordering::SeqCst),
+        pol.steps,
+    )
+}
+
+#[tokio::test]
+async fn m4_producer_model_generation_u64_max_to_1_invalidates_ticket() {
+    let (reason, writes, non_home, steps) = run_m4_counter_case(
+        None,
+        Some(u64::MAX),
+        |hub, hs_gen| {
+            hub.ingest_embedding(EmbeddingIngestRequest {
+                handshake_generation: hs_gen,
+                producer_epoch: 1,
+                frame_id: 2,
+                captured_at_ms: 1_000_000,
+                oldest_captured_at_ms: None,
+                embedding: vec![1.0, 1.0],
+                encoder_artifact_sha256: sha_a(),
+                preprocess_config_sha256: sha_b(),
+                model_generation: Some(1),
+            })
+            .unwrap();
+        },
+    )
+    .await;
+    assert_eq!(reason, "VISION_GENERATION_CHANGED");
+    assert_eq!((writes, non_home, steps), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn m4_server_counters_wrap_from_u64_max_to_0_and_still_invalidate_tickets() {
+    // Setting u64::MAX - 1 before spawn_policy_runner means bind_policy advances both to u64::MAX.
+    let (r_model, w1, nh1, s1) = run_m4_counter_case(
+        Some((u64::MAX - 1, u64::MAX - 1)),
+        Some(1),
+        |hub, _hs_gen| {
+            assert_eq!(hub.live_ticket_state().model_generation, Some(u64::MAX));
+            hub.set_model_generation(Some(2));
+            assert_eq!(hub.live_ticket_state().model_generation, Some(0));
+        },
+    )
+    .await;
+    assert_eq!(r_model, "VISION_GENERATION_CHANGED");
+    assert_eq!((w1, nh1, s1), (0, 0, 0));
+
+    let (r_inv, w2, nh2, s2) = run_m4_counter_case(
+        Some((u64::MAX - 1, u64::MAX - 1)),
+        Some(1),
+        |hub, _hs_gen| {
+            assert_eq!(hub.invalidation_generation(), u64::MAX);
+            let next = hub.bump_invalidation_generation();
+            assert_eq!(next, 0);
+        },
+    )
+    .await;
+    assert_eq!(r_inv, "WINDOW_INVALIDATED");
+    assert_eq!((w2, nh2, s2), (0, 0, 0));
+}

@@ -564,7 +564,8 @@ struct EmbeddingHubInner {
     invalidation_generation: u64,
     producer_epoch: Option<u64>,
     last_frame_id: Option<u64>,
-    model_generation: Option<u64>,
+    producer_model_generation: Option<u64>,
+    server_model_epoch: u64,
     last_frame_model_generation: Option<u64>,
     has_seen_frame_in_epoch: bool,
     frames: VecDeque<EmbeddingFrame>,
@@ -587,7 +588,8 @@ impl Default for EmbeddingHubInner {
             invalidation_generation: 0,
             producer_epoch: None,
             last_frame_id: None,
-            model_generation: None,
+            producer_model_generation: None,
+            server_model_epoch: 0,
             last_frame_model_generation: None,
             has_seen_frame_in_epoch: false,
             frames: VecDeque::new(),
@@ -649,7 +651,7 @@ impl EmbeddingHubInner {
             now_armd_ms,
             policy_instance_id: self.bound.as_ref().map(|b| b.policy_instance_id),
             producer_epoch: self.producer_epoch,
-            model_generation: self.model_generation,
+            model_generation: Some(self.server_model_epoch),
             invalidation_generation: self.invalidation_generation,
             clock_handshake_generation,
             clock_handshake_expires_at_ms,
@@ -674,11 +676,19 @@ impl<'a> HubCommitGuard<'a> {
             return false;
         };
         let now_ms = self.inner.now_ms();
-        live_hs.handshake_generation != 0
-            && now_ms <= live_hs.handshake_expires_at_ms
-            && self.inner.continuous_renewal_floor_gen != 0
-            && ticket_hs_gen >= self.inner.continuous_renewal_floor_gen
-            && live_hs.handshake_generation == self.inner.handshake_generation
+        let floor = self.inner.continuous_renewal_floor_gen;
+        if live_hs.handshake_generation == 0
+            || floor == 0
+            || now_ms > live_hs.handshake_expires_at_ms
+            || live_hs.handshake_generation != self.inner.handshake_generation
+        {
+            return false;
+        }
+        if floor <= live_hs.handshake_generation {
+            ticket_hs_gen >= floor && ticket_hs_gen <= live_hs.handshake_generation
+        } else {
+            ticket_hs_gen >= floor || ticket_hs_gen <= live_hs.handshake_generation
+        }
     }
 }
 
@@ -749,14 +759,23 @@ impl VideoEmbeddingHub {
 
     pub fn bump_invalidation_generation(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+        inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         inner.invalidation_generation
     }
 
     pub fn set_model_generation(&self, gen: Option<u64>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.model_generation = gen;
-        inner.continuous_renewal_floor_gen = inner.handshake_generation;
+        if inner.producer_model_generation != gen {
+            inner.producer_model_generation = gen;
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.continuous_renewal_floor_gen = inner.handshake_generation;
+        }
+    }
+
+    pub fn set_counters_for_test(&self, server_model_epoch: u64, invalidation_generation: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.server_model_epoch = server_model_epoch;
+        inner.invalidation_generation = invalidation_generation;
     }
 
     pub fn set_producer_epoch(&self, epoch: u64) {
@@ -767,10 +786,11 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+            inner.producer_model_generation = None;
             inner.refill_started_at_ms = None;
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.recompute_deadlines();
-            inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         }
     }
 
@@ -813,8 +833,8 @@ impl VideoEmbeddingHub {
         });
         inner.refill_started_at_ms = None;
         inner.continuous_renewal_floor_gen = inner.handshake_generation;
-        inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
-        inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+        inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+        inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         inner.recompute_deadlines();
     }
 
@@ -827,8 +847,8 @@ impl VideoEmbeddingHub {
         {
             inner.bound = None;
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
-            inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
-            inner.invalidation_generation = inner.invalidation_generation.saturating_add(1);
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
         }
     }
 
@@ -1072,7 +1092,8 @@ impl VideoEmbeddingHub {
                 && s2 <= prev_hs.handshake_expires_at_ms
         });
 
-        inner.handshake_generation = inner.handshake_generation.saturating_add(1);
+        let next_gen = inner.handshake_generation.wrapping_add(1);
+        inner.handshake_generation = if next_gen == 0 { 1 } else { next_gen };
         let gen = inner.handshake_generation;
         let expires_at = s2.saturating_add(ttl_ms);
 
@@ -1085,6 +1106,7 @@ impl VideoEmbeddingHub {
             inner.last_frame_id = None;
             inner.has_seen_frame_in_epoch = false;
             inner.last_frame_model_generation = None;
+            inner.producer_model_generation = None;
         }
 
         if unbroken_renewal {
@@ -1343,13 +1365,13 @@ impl VideoEmbeddingHub {
         if !inner.has_seen_frame_in_epoch {
             inner.has_seen_frame_in_epoch = true;
             inner.last_frame_model_generation = req.model_generation;
-            if inner.model_generation.is_none() {
-                inner.model_generation = req.model_generation;
-            }
+            inner.producer_model_generation = req.model_generation;
         } else if inner.last_frame_model_generation != req.model_generation {
             inner.frames.clear();
             inner.last_frame_model_generation = req.model_generation;
-            inner.model_generation = Some(inner.model_generation.unwrap_or(0).saturating_add(1));
+            inner.producer_model_generation = req.model_generation;
+            inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
+            inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
         }
 
@@ -1523,7 +1545,7 @@ impl VideoEmbeddingHub {
             newest_oldest_mapped_at_ms: newest_frame.oldest_mapped_at_ms,
             effective_uncertainty_ms: unc,
             producer_epoch: newest_frame.producer_epoch,
-            model_generation: inner.model_generation,
+            model_generation: Some(inner.server_model_epoch),
             invalidation_generation: inner.invalidation_generation,
             clock_handshake_generation: hs.handshake_generation,
             clock_handshake_expires_at_ms: hs.handshake_expires_at_ms,
