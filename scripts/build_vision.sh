@@ -288,6 +288,8 @@ if [ -n "${REBOT_VISION_COPY_TO:-}" ]; then
     cp -p "${GEN_DIR}/rebot-vision" "${GEN_DIR}/rebot-vision.sha256" "${REBOT_VISION_COPY_TO}/"
     if [ -f "${GEN_DIR}/rebot-vision.map" ]; then
         cp -p "${GEN_DIR}/rebot-vision.map" "${REBOT_VISION_COPY_TO}/"
+    else
+        rm -f "${REBOT_VISION_COPY_TO}/rebot-vision.map"  # not this build's
     fi
 fi
 collect_garbage

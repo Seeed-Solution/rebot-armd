@@ -75,5 +75,15 @@ for i in 1 2 3; do
     check '[ -x "${T}/copy-'"${i}"'/rebot-vision" ]'
 done
 
+# 4. A copy directory is complete for the build it receives: a map left there by an earlier
+#    build is removed when this generation has none, and copied when it has one.
+mkdir -p "${T}/copy-map"
+echo stale > "${T}/copy-map/rebot-vision.map"
+publish "no-map" REBOT_VISION_COPY_TO="${T}/copy-map"
+check '[ "$(cat "${T}/copy-map/rebot-vision")" = "no-map" ] && [ ! -e "${T}/copy-map/rebot-vision.map" ]'
+printf with-map > "${T}/mapped"; printf map-1 > "${T}/mapped.map"
+(cd "${T}" && REBOT_VISION_COPY_TO="${T}/copy-map" REBOT_VISION_PUBLISH_PREBUILT="${T}/mapped" bash "${ROOT}/scripts/build_vision.sh" >/dev/null)
+check '[ "$(cat "${T}/copy-map/rebot-vision.map")" = "map-1" ] && [ "$(cat "${OUT}/rebot-vision.map")" = "map-1" ]'
+
 if [ "${FAIL}" != 0 ]; then echo "build_vision publish tests: FAILED" >&2; exit 1; fi
 echo "build_vision publish tests: all passed"
