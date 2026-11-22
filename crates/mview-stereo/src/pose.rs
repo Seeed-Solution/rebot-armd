@@ -578,6 +578,20 @@ fn fill_coarse_window_integral(
     }
 
     let tr = t.r;
+    let (Ok(w_i32), Ok(h_i32)) = (i32::try_from(img.w), i32::try_from(img.h)) else {
+        if let Some(cr) = cached {
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
+        }
+        return;
+    };
     if 2 * tr + 3 > img.w || 2 * tr + 3 > img.h {
         if let Some(cr) = cached {
             copy_cached_overlap(
@@ -594,9 +608,9 @@ fn fill_coarse_window_integral(
     }
     let tr_i = tr as i32;
     let vx0 = (cxi - r).max(tr_i + 1);
-    let vx1 = (cxi + r).min(img.w as i32 - 2 - tr_i);
+    let vx1 = (cxi + r).min(w_i32 - 2 - tr_i);
     let vy0 = (cyi - r).max(tr_i + 1);
-    let vy1 = (cyi + r).min(img.h as i32 - 2 - tr_i);
+    let vy1 = (cyi + r).min(h_i32 - 2 - tr_i);
     if vx0 > vx1 || vy0 > vy1 {
         if let Some(cr) = cached {
             copy_cached_overlap(
@@ -632,12 +646,29 @@ fn fill_coarse_window_integral(
         }
     }
 
-    #[cfg(feature = "mview-profile")]
-    let t_int = Instant::now();
     let ix0 = (vx0 - tr_i) as usize;
     let iy0 = (vy0 - tr_i) as usize;
     let ix1 = (vx1 + tr_i) as usize;
     let iy1 = (vy1 + tr_i) as usize;
+    let rw = ix1 - ix0 + 1;
+    let rh = iy1 - iy0 + 1;
+    let Ok(roi_view) = crate::ncc_backend::PatchView::new(img, ix0, iy0, rw, rh) else {
+        if let Some(cr) = cached {
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
+        }
+        return;
+    };
+
+    #[cfg(feature = "mview-profile")]
+    let t_int = Instant::now();
     let iw = ix1 - ix0 + 2;
     let ih = iy1 - iy0 + 2;
     let total = iw * ih;
@@ -645,14 +676,13 @@ fn fill_coarse_window_integral(
     scratch.int_s2.resize(total, 0);
     scratch.int_s1[..iw].fill(0);
     scratch.int_s2[..iw].fill(0);
-    let rw = ix1 - ix0 + 1;
     for y in iy0..=iy1 {
         let row_idx = y - iy0 + 1;
         let cur = row_idx * iw;
         let prev = cur - iw;
         scratch.int_s1[cur] = 0;
         scratch.int_s2[cur] = 0;
-        let px_row = &img.px[y * img.w + ix0..][..rw];
+        let px_row = roi_view.row(y - iy0);
         let mut r1 = 0u32;
         let mut r2 = 0u64;
         for (col, &p) in px_row.iter().enumerate() {
@@ -2336,5 +2366,48 @@ mod tests {
         // Standalone refine_poses must leave profile = None.
         let standalone = refine_poses(&[cam0, cam1, cam2], 0, &[], 0.0, &PoseParams::default());
         assert!(standalone.profile.is_none());
+    }
+
+    #[test]
+    fn coarse_window_integral_and_window_peaks_reject_truncated_gray_buffers() {
+        let (w, h) = (48usize, 40usize);
+        let px: Vec<u8> = (0..w * h).map(|k| ((k * 37 + 11) % 210 + 20) as u8).collect();
+        let valid_img = Gray::new(w, h, px).unwrap();
+        let tc = make_tmpl(sample_int(&valid_img, 16, 20, COARSE_R), COARSE_R, None, 0.0).unwrap();
+        let tc_weighted = make_tmpl(
+            sample_int(&valid_img, 16, 20, COARSE_R),
+            COARSE_R,
+            Some([1.0, 0.0]),
+            1.0,
+        )
+        .unwrap();
+
+        let trunc = Gray { w, h, px: vec![128u8; 200] };
+        let mut scratch = MatchScratch::default();
+        scratch.scores.resize(13 * 13, f32::NEG_INFINITY);
+
+        reset_kernel_counts();
+        fill_coarse_window_integral(
+            &trunc,
+            &tc,
+            20,
+            20,
+            6,
+            None,
+            &mut scratch,
+            #[cfg(feature = "mview-profile")]
+            None,
+        );
+        assert!(scratch.scores.iter().all(|v| *v == f32::NEG_INFINITY));
+
+        let ((peaks, len), _) = window_peaks_cached(&trunc, &tc, [20.0, 20.0], 6, None, &mut scratch);
+        assert_eq!(len, 0);
+        assert!(peaks.iter().all(|p| *p == [0.0, 0.0]));
+
+        let ((wpeaks, wlen), _) = window_peaks_cached(&trunc, &tc_weighted, [20.0, 20.0], 6, None, &mut scratch);
+        assert_eq!(wlen, 0);
+        assert!(wpeaks.iter().all(|p| *p == [0.0, 0.0]));
+        assert!(window_peaks(&trunc, &tc, [20.0, 20.0], 6).is_empty());
+        assert_eq!(kernel_counts(), KernelCallCounts::default());
     }
 }
