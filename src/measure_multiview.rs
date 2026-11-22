@@ -126,6 +126,11 @@ const REGION_PAD_PX: f64 = 12.0;
 const TRIGGER_WAIT_MS: u64 = 1500;
 const TRIGGERS: usize = 3;
 const YOLO: &[&str] = &["yolo"];
+/// Pipelines of a capture trigger when marker corners are wanted (`pose_refine` `auto` with a
+/// provider that runs ArUco, or `aruco`).
+const YOLO_ARUCO: &[&str] = &["yolo", "aruco"];
+/// `pose_refine` `"aruco"`: marker corners each view must share with the reference view.
+pub const MIN_MARKER_CORNERS: usize = 8;
 
 fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.into()).into() }
 
@@ -145,6 +150,23 @@ impl Motion {
 /// Where the view offsets lie (`axes`): along the image x axis, or on a circle in the image plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axes { X, Xy }
+
+/// Camera rotation refinement before the reconstruction (`pose_refine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoseRefine {
+    /// Table texture outside the target box, plus ArUco marker corners when the provider returns them.
+    Auto,
+    /// ArUco marker corners only; every view needs [`MIN_MARKER_CORNERS`] shared with the
+    /// reference, else `MARKERS_UNAVAILABLE`.
+    Aruco,
+    /// The kinematic camera poses.
+    Off,
+}
+
+impl PoseRefine {
+    pub fn name(self) -> &'static str { match self { Self::Auto => "auto", Self::Aruco => "aruco", Self::Off => "off" } }
+    pub fn parse(s: &str) -> Option<Self> { match s { "auto" => Some(Self::Auto), "aruco" => Some(Self::Aruco), "off" => Some(Self::Off), _ => None } }
+}
 
 impl Axes {
     pub fn name(self) -> &'static str { match self { Self::X => "x", Self::Xy => "xy" } }
@@ -166,6 +188,7 @@ pub struct Request {
     pub return_to_start: bool,
     /// Write a debug bundle ([`debug_dir`]).
     pub debug: bool,
+    pub pose_refine: PoseRefine,
 }
 
 fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Result<f64, ArmError> {
@@ -179,7 +202,7 @@ fn num(o: &Map<String, Value>, key: &str, default: f64, lo: f64, hi: f64) -> Res
 pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
     let empty = Map::new();
     let o = match body { Value::Null => &empty, Value::Object(o) => o, _ => return Err(invalid("Command body must be an object")) };
-    const KEYS: [&str; 10] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start", "debug"];
+    const KEYS: [&str; 11] = ["label", "min_score", "target", "motion", "axes", "views", "baseline_m", "speed_scale", "return_to_start", "debug", "pose_refine"];
     if let Some(k) = o.keys().find(|k| !KEYS.contains(&k.as_str())) { return Err(invalid(format!("unknown field {k} ({})", KEYS.join(", ")))); }
     let label = match o.get("label") {
         None | Some(Value::Null) => None,
@@ -230,6 +253,11 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(invalid("debug must be a boolean")),
     };
+    let pose_refine = match o.get("pose_refine") {
+        None | Some(Value::Null) => PoseRefine::Auto,
+        Some(Value::String(s)) => PoseRefine::parse(s).ok_or_else(|| invalid("pose_refine must be \"auto\", \"aruco\" or \"off\""))?,
+        Some(_) => return Err(invalid("pose_refine must be \"auto\", \"aruco\" or \"off\"")),
+    };
 
     Ok(Request {
         label,
@@ -237,7 +265,7 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         target_box, target_frame_id, motion, axes, views,
         baseline_m: num(o, "baseline_m", DEFAULT_BASELINE_M, BASELINE_M[0], BASELINE_M[1])?,
         speed_scale: num(o, "speed_scale", DEFAULT_SPEED_SCALE, SPEED_SCALE[0], SPEED_SCALE[1])?,
-        return_to_start, debug,
+        return_to_start, debug, pose_refine,
     })
 }
 
@@ -502,6 +530,8 @@ struct Capture {
     snapshot_polls: usize,
     /// The snapshot (debug bundles only).
     jpeg: Option<Vec<u8>>,
+    /// ArUco markers of the trigger frame (camera model pixels); empty unless requested.
+    markers: Vec<mview_stereo::Marker>,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
@@ -509,7 +539,7 @@ fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE"
 /// Settle, then (bracketed by joint samples, retried while the bracket moved) a detection
 /// trigger and the first snapshot that differs from the one before the trigger. The pose is the
 /// FK of the bracket's mean joints.
-async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64) -> Result<Capture, Stop> {
+async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64, markers: bool) -> Result<Capture, Stop> {
     let settle_s = settle(ctx, plan).await?;
     let snap = || async { src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}"))) };
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
@@ -525,7 +555,8 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         let mut frame = None;
         for _ in 0..TRIGGERS {
             ctx.check().await?;
-            if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
+            let got = if markers { src.trigger_markers(YOLO_ARUCO, TRIGGER_WAIT_MS).await } else { src.trigger(YOLO, TRIGGER_WAIT_MS).await.map(|f| f.map(|f| (f, Vec::new()))) };
+            if let Some(f) = got.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
         }
         let frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
         let t_reply = Instant::now();
@@ -552,13 +583,19 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         }
         s0 = jpeg;
     }
-    let Some((jpeg, joints, bracket_a, bracket_b, mut frame, trigger_ms, snapshot_wait_ms, snapshot_polls)) = got else {
+    let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls)) = got else {
         let mrad: Vec<String> = tries.iter().map(|t| format!("{:.1}", t * 1000.0)).collect();
         return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
     };
     recheck(ctx, plan).await?;
     let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
+    // marker corners are pixels of the frame: to the camera model's image like the detections
+    let fs = frame.image_size_px;
+    if fs[0] > 0.0 && fs[1] > 0.0 {
+        let (rx, ry) = (plan.cam.size[0] / fs[0], plan.cam.size[1] / fs[1]);
+        for m in &mut marks { for c in &mut m.corners { c[0] *= rx; c[1] *= ry; } }
+    }
     grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
     let size = plan.cam.size;
     let keep = plan.request.debug.then(|| jpeg.clone());
@@ -566,7 +603,7 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
     Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
-        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep })
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -704,7 +741,7 @@ fn look_at(plan: &Plan, pose: &Pose, target: &Detection) -> Vec3 {
 
 /// Everything after the start capture, until the views are captured.
 async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps: &mut Vec<Capture>, target: &Detection,
-    fallbacks: &mut Vec<Value>, pivot: &Vec3) -> Result<(), (Stop, bool)> {
+    fallbacks: &mut Vec<Value>, pivot: &Vec3, markers: bool) -> Result<(), (Stop, bool)> {
     let pose0 = caps[0].pose;
     let cam0 = camera_at(&plan.cam, &pose0);
     let b = target.box_norm;
@@ -742,7 +779,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let cap = capture(ctx, plan, src, c, shift, margin).await.map_err(|s| (s, true))?;
+                    let cap = capture(ctx, plan, src, c, shift, margin, markers).await.map_err(|s| (s, true))?;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
                     if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
@@ -803,32 +840,53 @@ pub fn gripper_region_px(size: [f64; 2]) -> [f64; 4] {
     [g[0] * size[0], g[1] * size[1], g[2] * size[0], g[3] * size[1]]
 }
 
+/// Marker corners of each view but `reference` shared with the reference view (by marker id
+/// and corner index; ids seen twice in one view do not count).
+pub fn shared_marker_corners(markers: &[Vec<mview_stereo::Marker>], reference: usize) -> Vec<usize> {
+    let keys = |ms: &[mview_stereo::Marker]| -> std::collections::BTreeSet<i64> {
+        ms.iter().map(|m| m.id).filter(|id| ms.iter().filter(|o| o.id == *id).count() == 1).collect()
+    };
+    let r = markers.get(reference).map(|m| keys(m)).unwrap_or_default();
+    markers.iter().map(|m| 4 * keys(m).intersection(&r).count()).collect()
+}
+
 /// The reconstruction of the captures (blocking; spawn_blocking): the per-view rotation
-/// refinement, then the reconstruction with the refined cameras.
-pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64) -> Computed {
+/// refinement (`mode`; `markers` per view, camera model pixels), then the reconstruction with
+/// the refined cameras.
+pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64, mode: PoseRefine, markers: &[Vec<mview_stereo::Marker>]) -> Computed {
     let t0 = Instant::now();
     let region_px = feature_region(ref_box_px);
     let p = Params::new(table_z);
-    let pp = mview_stereo::PoseParams::default();
-    let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();
-    let pose = mview_stereo::refine_views(views, reference, ref_box_px, &exclude, table_z, &[], true, &pp);
-    let refined: Vec<View> = views.iter().zip(&pose.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
-    let rec = mview_stereo::reconstruct(&refined, reference, region_px, ref_box_px, &p);
+    let pose = (mode != PoseRefine::Off).then(|| {
+        let mut pp = mview_stereo::PoseParams::default();
+        let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();
+        let corners = mview_stereo::marker_corrs(markers, reference, ref_box_px);
+        if mode == PoseRefine::Aruco { pp.min_points = MIN_MARKER_CORNERS; }
+        mview_stereo::refine_views(views, reference, ref_box_px, &exclude, table_z, &corners, mode == PoseRefine::Auto, &pp)
+    });
+    let rec = match &pose {
+        Some(pr) => {
+            let refined: Vec<View> = views.iter().zip(&pr.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
+            mview_stereo::reconstruct(&refined, reference, region_px, ref_box_px, &p)
+        }
+        None => mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p),
+    };
     let measure = mview_stereo::measure(&rec.points, &p);
     let table = mview_stereo::table_check(&rec.points, &p);
-    Computed { measure, table, rec, region_px, pose: Some(pose), ms: t0.elapsed().as_secs_f64() * 1000.0 }
+    Computed { measure, table, rec, region_px, pose, ms: t0.elapsed().as_secs_f64() * 1000.0 }
 }
 
 /// The `pose_refine` value of the measurement (and of each view, `views`).
-pub fn pose_value(pose: &Option<mview_stereo::PoseRefinement>) -> (Value, Vec<Value>) {
+pub fn pose_value(mode: PoseRefine, pose: &Option<mview_stereo::PoseRefinement>) -> (Value, Vec<Value>) {
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
-    let Some(p) = pose else { return (json!({"applied": false}), Vec::new()); };
+    let Some(p) = pose else { return (json!({"mode": mode.name(), "applied": false}), Vec::new()); };
     let views: Vec<Value> = p.views.iter().map(|v| json!({
         "status": v.status, "correction_mrad": r2(v.correction_mrad), "rot_mrad": v.rot_mrad.map(r2),
         "n_points": v.n_points, "n_marker_corners": v.n_marker_corners,
         "rms_before_px": v.rms_before_px.map(r2), "rms_after_px": v.rms_after_px.map(r2),
     })).collect();
     (json!({
+        "mode": mode.name(),
         "applied": p.views.iter().any(|v| v.status == "refined"),
         "n_points": p.n_corrs, "n_marker_points": p.n_marker_corrs, "ms": p.ms.round(),
         "views": views,
@@ -902,6 +960,7 @@ fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_
             "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
+            "markers": v.markers.iter().map(|m| json!({"id": m.id, "corners": m.corners})).collect::<Vec<_>>(),
         })
     }).collect();
     let tz = plan.setup.table_z_m;
@@ -914,7 +973,8 @@ fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_
         "version": BUNDLE_VERSION, "action_id": id, "armd_version": env!("CARGO_PKG_VERSION"),
         "created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "request": {"motion": plan.request.motion.name(), "axes": plan.request.axes.name(), "views": plan.request.views,
-            "baseline_m": plan.request.baseline_m, "speed_scale": plan.request.speed_scale, "label": plan.request.label, "min_score": plan.request.min_score},
+            "baseline_m": plan.request.baseline_m, "speed_scale": plan.request.speed_scale, "label": plan.request.label, "min_score": plan.request.min_score,
+            "pose_refine": plan.request.pose_refine.name()},
         "intrinsics": {"fx": plan.cam.fx, "fy": plan.cam.fy, "cx": plan.cam.cx, "cy": plan.cam.cy, "size": plan.cam.size},
         "cam_mount": {"r_end_cam": mat_json(&plan.cam.rec), "offset_m": plan.cam.offset},
         "table_z_m": tz, "reference": reference, "ref_box_px": ref_box_px, "region_px": c.region_px,
@@ -942,6 +1002,10 @@ pub struct Bundle {
     pub reference: usize,
     pub ref_box_px: [f64; 4],
     pub table_z_m: f64,
+    /// ArUco markers per view (camera model pixels; empty in older bundles).
+    pub markers: Vec<Vec<mview_stereo::Marker>>,
+    /// The run's `pose_refine` (`auto` when the bundle does not say).
+    pub pose_refine: PoseRefine,
     pub doc: Value,
 }
 
@@ -957,7 +1021,9 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
     let (fx, fy, cx, cy) = (f(&i["fx"], "fx")?, f(&i["fy"], "fy")?, f(&i["cx"], "cx")?, f(&i["cy"], "cy")?);
     let size = [f(&i["size"][0], "size")?, f(&i["size"][1], "size")?];
     let mut views = Vec::new();
+    let mut markers = Vec::new();
     for (k, v) in doc["views"].as_array().ok_or("bundle: views missing")?.iter().enumerate() {
+        markers.push(grasp::parse_markers(&v["markers"]));
         let file = v["file"].as_str().ok_or("bundle: view file missing")?;
         let jpeg = std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
         let img = decode_frame(&jpeg, size)?;
@@ -969,14 +1035,18 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
         reference: doc["reference"].as_u64().ok_or("bundle: reference missing")? as usize,
         ref_box_px: [f(&b[0], "ref_box_px")?, f(&b[1], "ref_box_px")?, f(&b[2], "ref_box_px")?, f(&b[3], "ref_box_px")?],
         table_z_m: f(&doc["table_z_m"], "table_z_m")?,
-        views, doc,
+        pose_refine: doc["request"]["pose_refine"].as_str().and_then(PoseRefine::parse).unwrap_or(PoseRefine::Auto),
+        views, markers, doc,
     })
 }
 
 /// Re-run the reconstruction of a bundle (host replay; `cargo run --release --features mview-replay --bin mview-replay -- <dir>`).
-pub fn replay_bundle(dir: &std::path::Path) -> Result<(Bundle, Computed), String> {
+pub fn replay_bundle(dir: &std::path::Path) -> Result<(Bundle, Computed), String> { replay_bundle_with(dir, None) }
+
+/// [`replay_bundle`] with `pose_refine` `mode` instead of the run's.
+pub fn replay_bundle_with(dir: &std::path::Path, mode: Option<PoseRefine>) -> Result<(Bundle, Computed), String> {
     let b = read_bundle(dir)?;
-    let c = compute(&b.views, b.reference, b.ref_box_px, b.table_z_m);
+    let c = compute(&b.views, b.reference, b.ref_box_px, b.table_z_m, mode.unwrap_or(b.pose_refine), &b.markers);
     Ok((b, c))
 }
 
@@ -1018,8 +1088,18 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
         Ok(false) => return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)")),
         Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
     }
+    // marker corners for the pose refinement: requested when the provider runs ArUco
+    let markers = match plan.request.pose_refine {
+        PoseRefine::Off => false,
+        PoseRefine::Auto => src.aruco_available().await.unwrap_or(false),
+        PoseRefine::Aruco => match src.aruco_available().await {
+            Ok(true) => true,
+            Ok(false) => return Err(fail("MARKERS_UNAVAILABLE", "pose_refine \"aruco\" needs ArUco markers: the vision provider does not run the aruco pipeline")),
+            Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
+        },
+    };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
-    let first = capture(ctx, plan, src, [0.0, 0.0], [0.0, 0.0], f64::NAN).await?;
+    let first = capture(ctx, plan, src, [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
@@ -1034,7 +1114,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     }
     let mut caps = vec![first];
     let mut fallbacks = Vec::new();
-    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks, &pivot).await;
+    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks, &pivot, markers).await;
     if let Err((stop, moved)) = views_res {
         // a measurement failure goes back to the start first; a stop, fault, collision, torque
         // limit, lease loss or anything else ends the action where the arm is
@@ -1054,10 +1134,21 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let ref_det = pick_view(&target, plan.request.min_score, &caps[reference].detections, shift).unwrap_or_else(|| target.clone());
     let b = ref_det.box_norm;
     let ref_box_px = [b[0] * plan.cam.size[0], b[1] * plan.cam.size[1], b[2] * plan.cam.size[0], b[3] * plan.cam.size[1]];
+    let marks: Vec<Vec<mview_stereo::Marker>> = caps.iter().map(|c| c.markers.clone()).collect();
+    let mode = plan.request.pose_refine;
+    if mode == PoseRefine::Aruco {
+        let shared = shared_marker_corners(&marks, reference);
+        let short: Vec<String> = shared.iter().enumerate().filter(|(k, n)| *k != reference && **n < MIN_MARKER_CORNERS).map(|(k, n)| format!("view {k}: {n}")).collect();
+        if !short.is_empty() || marks.get(reference).is_none_or(|m| m.is_empty()) {
+            back_to_start(ctx, plan).await?;
+            return Ok(Some(("MARKERS_UNAVAILABLE".to_string(), format!("pose_refine \"aruco\": every view needs {MIN_MARKER_CORNERS} ArUco marker corners shared with the reference view (markers per view {:?}; shared corners {})",
+                marks.iter().map(Vec::len).collect::<Vec<_>>(), if short.is_empty() { "none in the reference view".to_string() } else { short.join(", ") }))));
+        }
+    }
     let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
     let table_z = plan.setup.table_z_m;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
-    let task = tokio::task::spawn_blocking(move || compute(&views, reference, ref_box_px, table_z));
+    let task = tokio::task::spawn_blocking(move || compute(&views, reference, ref_box_px, table_z, mode, &marks));
     let back = back_to_start(ctx, plan).await;
     let c = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
     let stats = c.rec.stats;
@@ -1066,7 +1157,8 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let mut value = measurement_value(plan, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
-    let (pose, per_view) = pose_value(&c.pose);
+    let (mut pose, per_view) = pose_value(mode, &c.pose);
+    pose["markers_requested"] = json!(markers);
     value["pose_refine"] = pose;
     if let Some(vs) = value["views"].as_array_mut() { for (v, p) in vs.iter_mut().zip(per_view) { v["pose_refine"] = p; } }
     if plan.request.debug {
@@ -1113,6 +1205,22 @@ mod tests {
             let e = crate::api::rest::ApiError::from(parse_request(&bad).unwrap_err());
             assert_eq!(e.code.as_deref(), Some("INVALID_COMMAND"), "{bad}");
         }
+    }
+
+    #[test]
+    fn pose_refine_request_and_shared_marker_corners() {
+        assert_eq!(parse_request(&Value::Null).unwrap().pose_refine, PoseRefine::Auto);
+        for m in [PoseRefine::Auto, PoseRefine::Aruco, PoseRefine::Off] {
+            assert_eq!(parse_request(&json!({"pose_refine": m.name()})).unwrap().pose_refine, m);
+        }
+        for bad in [json!({"pose_refine": "on"}), json!({"pose_refine": true})] {
+            let e = crate::api::rest::ApiError::from(parse_request(&bad).unwrap_err());
+            assert_eq!(e.code.as_deref(), Some("INVALID_COMMAND"), "{bad}");
+        }
+        let m = |id: i64| mview_stereo::Marker { id, corners: [[0.0; 2]; 4] };
+        // view 1 shares ids 1, 2; view 2 sees id 2 twice (not counted) and 3
+        let views = vec![vec![m(1), m(2), m(3)], vec![m(1), m(2), m(9)], vec![m(2), m(2), m(3)]];
+        assert_eq!(shared_marker_corners(&views, 0), vec![12, 8, 4]);
     }
 
     #[test]
