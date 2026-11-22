@@ -3807,7 +3807,9 @@ impl Orchestrator {
                 let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
                 if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit }
             }
-            None => s.max_grasp_width_m,
+            // an uncalibrated (nominal) curve narrower than the setup clamps it
+            None => inner.grasp_width_check(s.max_grasp_width_m)
+                .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)),
         }
     }
 }

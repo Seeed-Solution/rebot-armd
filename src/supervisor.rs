@@ -4080,7 +4080,18 @@ impl SupervisorInner {
         let max_w = self.config.grasp.as_ref().map(|g| g.max_grasp_width_m);
         #[cfg(target_arch = "wasm32")]
         let max_w: Option<f64> = None;
-        crate::model::validate_effective_gripper_policy_ex(&policy, lim, max_w, false)?;
+        // the jaw curve is not checked against max_grasp_width_m: a narrower curve keeps the
+        // calibration and clamps the grasp width (`grasp_width_check`)
+        crate::model::validate_effective_gripper_policy_ex(&policy, lim, None, false)?;
+        if let Some(max_w) = max_w {
+            if let crate::model::GraspWidthCheck::Clamped { curve_max_m } =
+                crate::model::check_grasp_width(&policy, max_w, false)
+            {
+                tracing::warn!(
+                    "Gripper jaw curve opens {curve_max_m:.4} m, less than max_grasp_width_m {max_w:.4} m; grasps use {curve_max_m:.4} m"
+                );
+            }
+        }
 
         self.config.gripper_policy = Some(policy);
         self.gripper_calib_offset = offset_rad;
