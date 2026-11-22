@@ -5560,9 +5560,8 @@ impl SupervisorInner {
         if self.mit.revoke_pending {
             // a refused rearm revoked MIT: hand back once the brake reached rest
             let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
-            if !self.mit_active() || self.safety.state().is_stopped() {
-                self.mit.revoke_pending = false;
-            } else if at_rest && self.mit_hand_back("authorization revoked").is_ok() {
+            if !self.mit_active() || self.safety.state().is_stopped()
+                || (at_rest && self.mit_hand_back("authorization revoked").is_ok()) {
                 self.mit.revoke_pending = false;
             }
         }
