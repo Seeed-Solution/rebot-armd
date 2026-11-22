@@ -4491,7 +4491,40 @@ async fn reconcile_unknown_tx(
             let Ok(sim_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) else {
                 return Err(unknown_err());
             };
-            let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
+            let (_, remote_state) = extract_remote_tx_and_state(&sim_val);
+            let remote_tx_owned = match parse_remote_owner_tx_id(&sim_val) {
+                Ok(tx) => tx,
+                Err(conflict_msg) => {
+                    if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                        let own_snap = TxSnapshot {
+                            tx_id: tx_id.clone(),
+                            prev_tx_id: prev_tx_id.clone(),
+                            prev_scene: prev_scene.clone(),
+                            prev_tool: prev_tool.clone(),
+                            prev_policy: prev_policy.clone(),
+                            prev_mode: prev_mode.clone(),
+                            prev_seed,
+                            prev_auto_start_policy,
+                            prev_cached_mjcf: prev_cached_mjcf.clone(),
+                            prev_scene_digest: prev_scene_digest.clone(),
+                            prev_tool_digest: prev_tool_digest.clone(),
+                            target_scene: target_scene.clone(),
+                            target_tool: target_tool.clone(),
+                            target_policy: target_policy.clone(),
+                            target_seed,
+                            target_auto_start_policy,
+                            target_composed_mjcf: target_composed_mjcf.clone(),
+                            target_scene_digest: target_scene_digest.clone(),
+                            target_tool_digest: target_tool_digest.clone(),
+                        };
+                        let mut tx_w = state.tx_state.write().await;
+                        *tx_w = foreign_degraded_from_sim_val(&own_snap, None, &sim_val, conflict_msg.clone());
+                        return Err(degraded_split_http_error(None, &conflict_msg));
+                    }
+                    return Err(unknown_err());
+                }
+            };
+            let remote_tx = remote_tx_owned.as_deref();
             if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
                 check_required_upstream_robot_match(
                     &sim_val,
@@ -4761,7 +4794,24 @@ async fn reconcile_lost_commit_ack(
         ));
     }
     let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body).unwrap_or(serde_json::Value::Null);
-    let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
+    let (_, remote_state) = extract_remote_tx_and_state(&sim_val);
+    let remote_tx_owned = match parse_remote_owner_tx_id(&sim_val) {
+        Ok(tx) => tx,
+        Err(conflict_msg) => {
+            if remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                let mut tx_w = state.tx_state.write().await;
+                *tx_w = foreign_degraded_from_sim_val(&snap, None, &sim_val, conflict_msg.clone());
+                return Err(degraded_split_http_error(None, &conflict_msg));
+            }
+            return Err(tx_json_err(
+                StatusCode::BAD_GATEWAY,
+                "SIM_STATE_INVALID",
+                &tx_id,
+                conflict_msg,
+            ));
+        }
+    };
+    let remote_tx = remote_tx_owned.as_deref();
     if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
         check_required_upstream_robot_match(
             &sim_val,
@@ -5463,7 +5513,7 @@ pub async fn recover_split(
             }
             let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body)
                 .unwrap_or(serde_json::Value::Null);
-            let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
+            let (_, remote_state) = extract_remote_tx_and_state(&sim_val);
             if !remote_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
                 return Err(code_json_err(
                     StatusCode::CONFLICT,
@@ -5471,7 +5521,10 @@ pub async fn recover_split(
                     "Sandbox is not in DEGRADED_SPLIT state",
                 ));
             }
-            let adopted_tx = remote_tx.ok_or_else(|| {
+            let remote_tx_owned = parse_remote_owner_tx_id(&sim_val).map_err(|msg| {
+                code_json_err(StatusCode::BAD_GATEWAY, "SIM_STATE_INVALID", msg)
+            })?;
+            let adopted_tx = remote_tx_owned.as_deref().ok_or_else(|| {
                 code_json_err(
                     StatusCode::BAD_GATEWAY,
                     "SIM_STATE_INVALID",

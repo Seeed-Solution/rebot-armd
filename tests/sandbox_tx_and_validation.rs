@@ -4963,4 +4963,60 @@ async fn sandbox_r9_m1_m2_m3_m1_split_owner_target_state_and_robot_null_guards()
             ));
         }
     }
+
+    // 3. Restart / rediscovery in Idle state: /sim/state returning conflicting
+    // `tx_id: "A"` and `degraded_tx_id: "B"` must reject rollback_physics with 0 commit POSTs.
+    {
+        let commit_calls = Arc::new(Mutex::new(0usize));
+        let cc = commit_calls.clone();
+        let mock_sim = axum::Router::new()
+            .route(
+                "/sim/state",
+                get(|| async {
+                    axum::Json(json!({
+                        "activation_state": "DEGRADED_SPLIT",
+                        "tx_id": "A",
+                        "degraded_tx_id": "B",
+                        "robot": "b601dm",
+                        "scene": "pcb_suction",
+                        "tool": "suction"
+                    }))
+                }),
+            )
+            .route(
+                "/sim/scene/commit",
+                post(move || {
+                    let cc = cc.clone();
+                    async move {
+                        *cc.lock().unwrap() += 1;
+                        axum::Json(json!({"ok": true, "state": "ABORTED"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+        std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_builtins = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let app = app_for(ArmConfig::rebot_dm(), state);
+        let (st, resp) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/recover-split",
+            Some(json!({"action": "rollback_physics"})),
+        )
+        .await;
+        std::env::remove_var("ARMD_SIM_URL");
+        server.abort();
+
+        assert_eq!(st, StatusCode::BAD_GATEWAY, "{resp}");
+        assert_eq!(resp["code"], "SIM_STATE_INVALID", "{resp}");
+        assert_eq!(*commit_calls.lock().unwrap(), 0, "conflicting tx_id/degraded_tx_id must send 0 commit POSTs");
+    }
 }
