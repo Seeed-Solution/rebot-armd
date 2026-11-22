@@ -1113,8 +1113,9 @@ impl crate::supervisor::SupervisorInner {
     /// Never returns a step that changes an arm joint's issued velocity by more than
     /// `a_max * dt`. `Err` means no candidate is feasible: the caller latches a fault and
     /// sends no frame. Without `prev_confirmed`, `q_hold` itself is validated (no prior
-    /// output to brake from). With stale feedback only candidate 2 is tried. Candidate 2
-    /// is swept from `prev_confirmed` only.
+    /// output to brake from). With stale feedback only candidate 2 is tried. With fresh
+    /// feedback every moving step is also swept from the measurement; candidate 2 at rest
+    /// (repeating `prev_confirmed`) is swept from `prev_confirmed` only.
     #[allow(clippy::too_many_arguments)]
     pub fn tracking_fallback_step(
         &self,
@@ -1202,10 +1203,11 @@ impl crate::supervisor::SupervisorInner {
                 last_err = e;
                 continue;
             }
-            // The braking step only shortens the continuation of the already issued output,
-            // so it is swept from `prev_confirmed` only; a step toward the hold changes
-            // direction and is also swept from the measurement.
-            let check_meas = fresh_meas && !brake_only;
+            // Every step that moves the output is also swept from the fresh measurement (a
+            // lagging arm travels from there); only a braking step at rest, which repeats
+            // `prev_confirmed`, is swept from `prev_confirmed` alone.
+            let moves = arm_indices.iter().any(|&j| (q_c[j] - pq[j]).abs() > 1e-7);
+            let check_meas = fresh_meas && (moves || !brake_only);
             match self.fallback_workspace_check(Some(pq), prev_ws_min_depths, &q_c, keepout_only, check_meas, budget) {
                 Ok(ws) => {
                     let velocities: Vec<f32> =

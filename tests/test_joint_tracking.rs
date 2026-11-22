@@ -3795,6 +3795,55 @@ fn tracking_park_rejection_fallback_keeps_park_workspace_and_depths() {
     );
 }
 
+/// Review 4 #1: a moving braking step (nonzero prior velocity) is also swept from the fresh
+/// measurement: with the arm lagging behind a keep-out box that lies only on the
+/// measured -> new-target segment, the fallback sends no frame instead of the braking step.
+#[test]
+fn tracking_braking_fallback_sweeps_measured_segment_when_moving() {
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    jt.joints[0].lag_s = 0.68;
+    let mut cfg = ArmConfig { lease_timeout_ms: 600_000, joint_tracking: Some(jt), ..ArmConfig::rebot_dm() };
+    cfg.torque_guard = None;
+    let q0 = INSPECT;
+    let mut q_box = q0;
+    q_box[0] += 0.004;
+    let p_box = cfg.arm_model.fk_f32(&q_box).unwrap().p;
+    let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+    drv.with(|s| s.pinned[0] = Some(q0[0])); // the arm lags at q0
+
+    // Issued J1 0.008 rad ahead of measured, still moving at +0.2 rad/s toward the park
+    // reference; the box sits between measured (q0) and issued, not between issued and
+    // the braking step (~q0 + 0.010).
+    let mut pq = q0.to_vec();
+    pq[0] += 0.008;
+    let mut pv = vec![0.0; 7];
+    pv[0] = 0.2;
+    inner.tracking.record_issued(pq.clone(), pv);
+    let half = 0.0008_f32;
+    let ws = inner.config.workspace.as_mut().unwrap();
+    ws.keepout_boxes.push(KeepoutBox {
+        name: "lagging".into(),
+        min_m: [p_box[0] as f32 - half, p_box[1] as f32 - half, p_box[2] as f32 - half],
+        max_m: [p_box[0] as f32 + half, p_box[1] as f32 + half, p_box[2] as f32 + half],
+    });
+    inner.workspace_revision += 1;
+    inner.pending_normal_unload = true;
+    inner.commanded_positions[0] = q0[0] + 0.012;
+    inner.target_positions = inner.commanded_positions.clone();
+
+    let idx0 = drv.with(|s| s.written.len());
+    let obs = inner.tick(DT);
+    assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "rejection must fault: {:?}", obs.safety_state);
+    assert_eq!(drv.with(|s| s.written.len()), idx0, "no braking frame may cross the keep-out from the measured pose");
+    for _ in 0..3 {
+        inner.tick(DT);
+    }
+    for (k, f) in drv.with(|s| s.written[idx0..].to_vec()).iter().enumerate() {
+        assert_eq!(f[0].position.to_bits(), pq[0].to_bits(), "fault hold frame {k} must repeat the last issued J1");
+    }
+}
+
 /// Review 3 M1: tracking seeds a stationary baseline only on positive evidence that the
 /// arm is at rest: velocity feedback within 0.05 rad/s, or (without velocity feedback) two
 /// fresh position samples at least one tick apart within 1 mrad. Until then the output is
