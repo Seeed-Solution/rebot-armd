@@ -23,6 +23,17 @@ mod ffi {
             count: usize,
             out: *mut f32,
         );
+
+        pub(crate) fn mvs071_half_moments(
+            p: *const u8,
+            stride: usize,
+            a: *const f32,
+            n: usize,
+            phase: u32,
+            sum_raw: *mut u32,
+            sumsq_raw: *mut u32,
+            dot: *mut f32,
+        );
     }
 }
 
@@ -1044,7 +1055,37 @@ impl NccBackend {
     ) -> Result<(u32, u32, f32), PatchError> {
         let view = validate_half_moments(img, x0, y0, a, n, phase)?;
         match self {
-            Self::Scalar | Self::Xthead071 => {
+            #[cfg(mview_has_xthead071)]
+            Self::Xthead071 => {
+                let mut sum_raw = 0u32;
+                let mut sumsq_raw = 0u32;
+                let mut dot = 0.0f32;
+                // SAFETY: `validate_half_moments` verified `a.len() == n * n`,
+                // `n` is odd with `n / 2 <= HALF_GRID_MAX_R`, `phase <= 3`, and `PatchView`
+                // bounds for `(n + extra_x) x (n + extra_y)` bytes starting at `view.as_ptr()`
+                // with byte stride `view.stride()`. Output pointers are distinct locals.
+                unsafe {
+                    ffi::mvs071_half_moments(
+                        view.as_ptr(),
+                        view.stride(),
+                        a.as_ptr(),
+                        n,
+                        u32::from(phase),
+                        &mut sum_raw,
+                        &mut sumsq_raw,
+                        &mut dot,
+                    );
+                }
+                record_half_moments(NccBackendKind::Xthead071);
+                Ok((sum_raw, sumsq_raw, dot))
+            }
+            #[cfg(not(mview_has_xthead071))]
+            Self::Xthead071 => {
+                let res = half_moments_scalar_dispatch(&view, a, n, phase);
+                record_half_moments(NccBackendKind::Scalar);
+                Ok(res)
+            }
+            Self::Scalar => {
                 let res = half_moments_scalar_dispatch(&view, a, n, phase);
                 record_half_moments(NccBackendKind::Scalar);
                 Ok(res)
@@ -1810,6 +1851,90 @@ mod tests {
                 } else {
                     assert_eq!(counts.coarse_dots_scalar, 1);
                     assert_eq!(counts.coarse_cells_scalar, 17);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_moments_matches_scalar_across_phases_radii_and_extremes() {
+        let (w, h) = (73usize, 73usize);
+        let mut px: Vec<u8> = (0..w * h)
+            .map(|k| ((k * 59 + (k / w) * 113 + 31) % 256) as u8)
+            .collect();
+        // Bright nearly-flat region (240..=255) and flat-255 region.
+        for y in 4..39 {
+            for x in 4..39 {
+                px[y * w + x] = 240 + (((x * 11 + y * 17) % 16) as u8);
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let flat_255 = Gray::new(w, h, vec![255u8; w * h]).unwrap();
+        let alternating_max = Gray::new(
+            w,
+            h,
+            (0..w * h)
+                .map(|k| if ((k % w) + (k / w)).is_multiple_of(2) { 255 } else { 254 })
+                .collect(),
+        )
+        .unwrap();
+        let active = NccBackend::active();
+
+        for r in [2usize, 4, 6, 9, HALF_GRID_MAX_R] {
+            let n = 2 * r + 1;
+            let mut a = Vec::with_capacity(n * n);
+            let mean = ((n * n - 1) as f32) * 0.5;
+            for i in 0..(n * n) {
+                let centered = i as f32 - mean;
+                a.push(centered * 0.0125 + if i % 3 == 0 { 0.007 } else { -0.009 });
+            }
+
+            for phase in 0..=3u8 {
+                let extra_x = usize::from(phase == 1 || phase == 3);
+                let extra_y = usize::from(phase == 2 || phase == 3);
+                for (x0, y0) in [
+                    (0usize, 0usize),
+                    (5, 5), // bright nearly-flat
+                    (3 + usize::from(phase), 7),
+                    (w - n - extra_x, h - n - extra_y), // exact bottom-right margin
+                ] {
+                    assert_half_moments_match_scalar(active, &img, x0, y0, &a, n, phase);
+                    assert_half_moments_match_scalar(active, &flat_255, x0, y0, &a, n, phase);
+                    assert_half_moments_match_scalar(active, &alternating_max, x0, y0, &a, n, phase);
+                    if !HAS_COMPILED_XTHEAD071 {
+                        assert_half_moments_match_scalar(
+                            NccBackend::Xthead071,
+                            &img,
+                            x0,
+                            y0,
+                            &a,
+                            n,
+                            phase,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Verify per-kernel counter attribution for active backend.
+        reset_kernel_counts();
+        let a9: Vec<f32> = (0..81).map(|i| (i as f32 - 40.0) * 0.02).collect();
+        for phase in 0..=3u8 {
+            active.half_moments(&img, 2, 3, &a9, 9, phase).unwrap();
+        }
+        let counts = kernel_counts();
+        match active {
+            NccBackend::Scalar => {
+                assert_eq!(counts.half_moments_scalar, 4);
+                assert_eq!(counts.half_moments_xthead071, 0);
+            }
+            NccBackend::Xthead071 => {
+                if HAS_COMPILED_XTHEAD071 {
+                    assert_eq!(counts.half_moments_xthead071, 4);
+                    assert_eq!(counts.half_moments_scalar, 0);
+                } else {
+                    assert_eq!(counts.half_moments_scalar, 4);
+                    assert_eq!(counts.half_moments_xthead071, 0);
                 }
             }
         }

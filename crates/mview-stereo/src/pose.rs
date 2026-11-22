@@ -2471,20 +2471,22 @@ mod tests {
         assert!(res.n_corrs > 0);
         let diag = backend_diagnostics();
         assert_eq!(diag.backend, active.kind().as_str());
-        assert!(diag.counts.half_moments_scalar > 0);
-        assert_eq!(diag.counts.half_moments_xthead071, 0);
         match active {
             crate::ncc_backend::NccBackend::Scalar => {
                 assert!(diag.counts.coarse_dots_scalar > 0);
                 assert!(diag.counts.coarse_cells_scalar >= diag.counts.coarse_dots_scalar);
                 assert_eq!(diag.counts.coarse_dots_xthead071, 0);
                 assert_eq!(diag.counts.coarse_cells_xthead071, 0);
+                assert!(diag.counts.half_moments_scalar > 0);
+                assert_eq!(diag.counts.half_moments_xthead071, 0);
             }
             crate::ncc_backend::NccBackend::Xthead071 => {
                 assert!(diag.counts.coarse_dots_xthead071 > 0);
                 assert!(diag.counts.coarse_cells_xthead071 >= diag.counts.coarse_dots_xthead071);
                 assert_eq!(diag.counts.coarse_dots_scalar, 0);
                 assert_eq!(diag.counts.coarse_cells_scalar, 0);
+                assert!(diag.counts.half_moments_xthead071 > 0);
+                assert_eq!(diag.counts.half_moments_scalar, 0);
             }
         }
 

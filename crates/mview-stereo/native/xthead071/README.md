@@ -13,16 +13,19 @@ invoking GCC.
 - **Compile flags**: `-march=rv64gcv0p7 -mabi=lp64d -O2 -ffp-contract=off -Wall -Wextra -Werror`
 - **Archive command**: `riscv64-unknown-linux-musl-ar rcsD libmvs_xthead071.a ncc.o`
 
-## Provenance (Commit 3: `mvs071_coarse_dots`)
+## Provenance (Commit 4: `mvs071_coarse_dots` + `mvs071_half_moments`)
 
 - **`readelf -A ncc.o`**:
   `Tag_RISCV_arch: "rv64i2p0_m2p0_a2p0_f2p0_d2p0_c2p0_v0p7_zvamo0p7_zvlsseg0p7"`
 - **`nm -u ncc.o`**: empty (no external symbol dependencies)
-- **`objdump -dr ncc.o`**: verified 0 FMA (`vfmacc`/`vfmadd`/`vfnmacc`/`vfnmadd`) instructions and no unexpected helper calls; uses `vsetvli`, `vfmv.v.f`, `vle.v`, `vwcvtu.x.x.v`, `vfwcvt.f.xu.v`, `vfmul.vf`, `vfadd.vv`, `vse.v`.
+- **`nm -g ncc.o`**: `mvs071_coarse_dots`, `mvs071_half_moments`
+- **`objdump -dr ncc.o`**: verified 0 FMA (`vfmacc`/`vfmadd`/`vfnmacc`/`vfnmadd`) instructions, 0 unordered `vfredsum.vs` instructions, and no external helper calls:
+  - `mvs071_coarse_dots`: uses `vsetvli`, `vfmv.v.f`, `vle.v`, `vwcvtu.x.x.v`, `vfwcvt.f.xu.v`, `vfmul.vf`, `vfadd.vv`, `vse.v`.
+  - `mvs071_half_moments`: specializes `n == 9` (when `vsetvl_e32m4(9) == 9`) and all four phases (`0..=3`) outside the row loop, plus a strip-mined general path for any other odd `n`; uses `vle.v`, `vwcvtu.x.x.v`, `vwaddu.vv`, `vadd.vv`, `vwaddu.wv`, `vwmulu.vv`, `vredsum.vs`, `vfwcvt.f.xu.v`, `vfmul.vf`, `vfmul.vv`, and ordered `vfredosum.vs` (8 call sites across the 4+4 specialized phase loops) for strict row-major `dot`.
 - **Raw `ncc.o` SHA-256** (identical across two independent fresh builds):
-  `908c5e2098af81ecbb280a1a6949b5fff52f7b19c561dc51ba336fc27c7f4cf0`
+  `a9839334c4fc0d841a9fc8c85883a873799fda0a854cfab2bb597de5caacd83c`
 - **`libmvs_xthead071.a` SHA-256** (identical across two independent fresh builds):
-  `1a1d7a12f50b2575cd9790de97971857298e1bed34c35b0eb75600912ce2002b`
+  `f8f427eda83de1b067bc431052143afbd3ba537db3c262fdd099c1714e1e6412`
 
 ## Verification & Rebuild
 

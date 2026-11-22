@@ -603,6 +603,17 @@ const HALF_GRID_MAX_R: usize = ncc_backend::HALF_GRID_MAX_R;
 /// for weighted templates, unsupported radii (`r > HALF_GRID_MAX_R`), or arbitrary phases.
 #[inline]
 fn ncc_half_grid(img: &Gray, t: &Tmpl, x: f64, y: f64) -> Option<f32> {
+    ncc_half_grid_with_backend(ncc_backend::NccBackend::active(), img, t, x, y)
+}
+
+#[inline]
+fn ncc_half_grid_with_backend(
+    backend: ncc_backend::NccBackend,
+    img: &Gray,
+    t: &Tmpl,
+    x: f64,
+    y: f64,
+) -> Option<f32> {
     let r = t.r;
     if t.w.is_some() || r > HALF_GRID_MAX_R {
         #[cfg(feature = "mview-profile")]
@@ -628,7 +639,7 @@ fn ncc_half_grid(img: &Gray, t: &Tmpl, x: f64, y: f64) -> Option<f32> {
     let x0 = (fx0 as usize).checked_sub(r)?;
     let y0 = (fy0 as usize).checked_sub(r)?;
     let n = 2 * r + 1;
-    let (is1, is2, dot) = ncc_backend::NccBackend::active()
+    let (is1, is2, dot) = backend
         .half_moments(img, x0, y0, &t.a, n, phase)
         .ok()?;
     #[cfg(feature = "mview-profile")]
@@ -2177,13 +2188,152 @@ mod tests {
         assert!(ncc(&img, &t, 1.0, 1.0, true).is_none());
 
         let counts = kernel_counts();
-        assert_eq!(counts.half_moments_scalar, 1);
+        match ncc_backend::NccBackend::active() {
+            ncc_backend::NccBackend::Scalar => {
+                assert_eq!(counts.half_moments_scalar, 1);
+                assert_eq!(counts.half_moments_xthead071, 0);
+            }
+            ncc_backend::NccBackend::Xthead071 => {
+                assert_eq!(counts.half_moments_xthead071, 1);
+                assert_eq!(counts.half_moments_scalar, 0);
+            }
+        }
         assert_eq!(counts.patch_moments_scalar, 1);
-        assert_eq!(counts.half_moments_xthead071, 0);
         assert_eq!(counts.patch_moments_xthead071, 0);
 
         reset_kernel_counts();
         assert_eq!(kernel_counts(), KernelCallCounts::default());
+    }
+
+    #[test]
+    fn half_grid_active_backend_matches_direct_scalar_across_all_spec_cases() {
+        use crate::ncc_backend::NccBackend;
+
+        let (w, h) = (48usize, 48usize);
+        let mut px: Vec<u8> = (0..w * h)
+            .map(|k| {
+                let (x, y) = ((k % w) as f64, (k / w) as f64);
+                (128.0
+                    + 55.0 * (0.43 * x + 0.21 * y).sin()
+                    + 40.0 * (0.29 * x - 0.51 * y).cos())
+                .round()
+                .clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        // Bright nearly-flat region (240..=255) around (20, 20) for variance cancellation check.
+        for y in 14..27 {
+            for x in 14..27 {
+                px[y * w + x] = 248 + (((x * 5 + y * 9) % 8) as u8);
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let flat_255 = Gray::new(w, h, vec![255u8; w * h]).unwrap();
+        let active = NccBackend::active();
+        let scalar = NccBackend::scalar();
+
+        // Radii 2 (n=5), 4 (n=9), 16 (n=33) across all 4 phases.
+        for r in [2usize, PATCH_R, HALF_GRID_MAX_R] {
+            let t = make_tmpl(sample_int(&img, 20, 20, r), r, None, 0.0).unwrap();
+            for (x, y) in [(20.0, 20.0), (20.5, 20.0), (20.0, 20.5), (20.5, 20.5)] {
+                reset_kernel_counts();
+                let got = ncc_half_grid(&img, &t, x, y);
+                let counts = kernel_counts();
+                match active {
+                    NccBackend::Scalar => {
+                        assert_eq!(counts.half_moments_scalar, 1);
+                        assert_eq!(counts.half_moments_xthead071, 0);
+                    }
+                    NccBackend::Xthead071 => {
+                        assert_eq!(counts.half_moments_xthead071, 1);
+                        assert_eq!(counts.half_moments_scalar, 0);
+                    }
+                }
+                let direct_scalar = ncc_half_grid_with_backend(scalar, &img, &t, x, y);
+                assert!(got.is_some());
+                assert_ncc_eq(got, direct_scalar);
+                assert_ncc_eq(got, ncc(&img, &t, x, y, true));
+
+                // Flat 255 image -> var == 0 -> Some(0.0).
+                let got_flat = ncc_half_grid(&flat_255, &t, x, y);
+                assert_eq!(got_flat, Some(0.0));
+                assert_ncc_eq(got_flat, ncc_half_grid_with_backend(scalar, &flat_255, &t, x, y));
+            }
+        }
+
+        // Bright nearly-flat patch (240..=255) with tiny-contrast template.
+        let bright_t_src: Vec<f32> = (0..81)
+            .map(|k| 244.0 + ((k * 3) % 12) as f32)
+            .collect();
+        let bright_t = make_tmpl(bright_t_src, PATCH_R, None, 0.0).unwrap();
+        for (x, y) in [(20.0, 20.0), (20.5, 20.0), (20.0, 20.5), (20.5, 20.5)] {
+            let got = ncc_half_grid(&img, &bright_t, x, y);
+            let direct_scalar = ncc_half_grid_with_backend(scalar, &img, &bright_t, x, y);
+            assert!(got.is_some() && got.unwrap().abs() > 0.0);
+            assert_ncc_eq(got, direct_scalar);
+            assert_ncc_eq(got, ncc(&img, &bright_t, x, y, true));
+        }
+
+        // Radius 17 (n=35) scalar fallback in ncc_half_grid -> dispatches via patch_moments_scalar.
+        let r17 = HALF_GRID_MAX_R + 1;
+        let t17 = make_tmpl(sample_int(&img, 20, 20, r17), r17, None, 0.0).unwrap();
+        reset_kernel_counts();
+        let got17 = ncc_half_grid(&img, &t17, 20.5, 20.5);
+        let c17 = kernel_counts();
+        assert_eq!(c17.half_moments_scalar, 0);
+        assert_eq!(c17.half_moments_xthead071, 0);
+        assert_eq!(c17.patch_moments_scalar, 1);
+        assert_ncc_eq(got17, ncc(&img, &t17, 20.5, 20.5, true));
+
+        // Weighted template & arbitrary-phase fallback.
+        let tw = make_tmpl(sample_int(&img, 20, 20, PATCH_R), PATCH_R, Some([1.0, 0.0]), 1.0).unwrap();
+        let t4 = make_tmpl(sample_int(&img, 20, 20, PATCH_R), PATCH_R, None, 0.0).unwrap();
+        reset_kernel_counts();
+        let got_w = ncc_half_grid(&img, &tw, 20.5, 20.0);
+        let got_arb = ncc_half_grid(&img, &t4, 20.25, 20.75);
+        let c_fb = kernel_counts();
+        assert_eq!(c_fb.half_moments_scalar, 0);
+        assert_eq!(c_fb.half_moments_xthead071, 0);
+        assert_eq!(c_fb.patch_moments_scalar, 2);
+        assert_ncc_eq(got_w, ncc(&img, &tw, 20.5, 20.0, true));
+        assert_ncc_eq(got_arb, ncc(&img, &t4, 20.25, 20.75, true));
+
+        // Border rejection (just outside inside(..., 1.0)) and truncated Gray.px -> None with 0 calls.
+        let trunc = Gray { w, h, px: vec![128u8; 200] };
+        reset_kernel_counts();
+        for (x, y) in [(4.0, 20.0), (4.5, 20.0), (42.5, 20.0), (20.0, 42.5)] {
+            assert_eq!(ncc_half_grid(&img, &t4, x, y), None);
+        }
+        assert_eq!(ncc_half_grid(&trunc, &t4, 20.5, 20.5), None);
+        assert_eq!(kernel_counts(), KernelCallCounts::default());
+
+        // Tie direction and iteration cap in refine_2d_pose vs refine_2d.
+        let tie_px: Vec<u8> = (0..w * h)
+            .map(|k| {
+                let x = (k % w) as f64;
+                (128.0 + 70.0 * (0.61 * x).sin() + 25.0 * (0.31 * x).cos())
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let tie_img = Gray::new(w, h, tie_px).unwrap();
+        let tie_t = make_tmpl(sample_int(&tie_img, 20, 20, PATCH_R), PATCH_R, None, 0.0).unwrap();
+        assert_refine_eq(
+            refine_2d_pose(&tie_img, &tie_t, [20.5, 20.5]),
+            refine_2d(&tie_img, &tie_t, [20.5, 20.5]),
+        );
+        // Monotonic step-away hitting 6-iteration cap -> None.
+        let mut ramp_px = vec![128u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                ramp_px[y * w + x] = ((x * 3 + y * 5) % 256) as u8;
+            }
+        }
+        let ramp_img = Gray::new(w, h, ramp_px).unwrap();
+        let ramp_t = make_tmpl(sample_int(&ramp_img, 30, 30, PATCH_R), PATCH_R, None, 0.0).unwrap();
+        assert_refine_eq(
+            refine_2d_pose(&ramp_img, &ramp_t, [20.0, 20.0]),
+            refine_2d(&ramp_img, &ramp_t, [20.0, 20.0]),
+        );
     }
 
     #[cfg(feature = "mview-profile")]
