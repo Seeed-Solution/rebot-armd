@@ -4376,3 +4376,43 @@ fn tracking_profile_loader_ignores_anything_but_enabled_true_object() {
     assert!(load(r#"{"enabled":true,"joints":[],"extra":1}"#).is_err(), "enabled block stays strict");
     assert!(load(r#"{"enabled":true,"extra":1e400}"#).is_err(), "enabled block stays strict");
 }
+
+/// Review 7 (optional): the 100 ms reference bound spans every sample the decision uses:
+/// from the oldest joint reply of the reference to the newest reply of the current sample.
+/// A reference whose newest reply is 90 ms old but whose oldest is 110 ms old is no evidence.
+#[test]
+fn tracking_rest_reference_age_spans_oldest_reference_reply() {
+    use armd::tracking::TrackingHistoryState;
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let ms = Duration::from_millis;
+    let base = std::time::Instant::now();
+    // Reference sample: joint 0 replied at base, the others 20 ms later.
+    let reference: Vec<std::time::Instant> = (0..7).map(|j| if j == 0 { base } else { base + ms(20) }).collect();
+    let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+    drv.with(|s| {
+        s.velocity_feedback = false;
+        s.feedback_instants = Some(reference.clone());
+    });
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+    inner.lease_enabled = false;
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    inner.tick(DT);
+    // Current sample: all joints at base + 110 ms (90 ms after the reference's newest reply).
+    drv.with(|s| s.feedback_instants = Some(vec![base + ms(110); 7]));
+    inner.tick(DT);
+    assert_eq!(
+        inner.tracking.history_state,
+        TrackingHistoryState::Unknown,
+        "the reference's oldest reply is 110 ms before the current sample: no evidence"
+    );
+}
