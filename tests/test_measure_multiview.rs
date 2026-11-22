@@ -9,11 +9,12 @@
 mod common;
 mod render;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armd::grasp::{BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps};
+use armd::grasp::{BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GrayFrame, GrayFrameError, GrayTriggerResult};
 use armd::kinematics::{self, Pose};
 use armd::measure_multiview as mm;
 use armd::model::KeepoutBox;
@@ -27,14 +28,14 @@ const START: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 const HEIGHT: f64 = 0.040;
 
 /// A rendered camera frame: its id (the trigger's `frame_id`), the joints it was rendered at,
-/// the JPEG, the object's box and the markers in view.
+/// the un-letterboxed gray image, the JPEG, the object's box and the markers in view.
 #[derive(Clone)]
-struct Shot { id: u64, joints: Vec<f32>, jpeg: Vec<u8>, box_norm: Option<[f64; 4]>, markers: Vec<armd::mview_stereo::Marker> }
+struct Shot { id: u64, joints: Vec<f32>, img: armd::mview_stereo::Gray, jpeg: Vec<u8>, box_norm: Option<[f64; 4]>, markers: Vec<armd::mview_stereo::Marker> }
 
 struct FakeVision {
     sup: Arc<ArmSupervisor>,
     cam: CamModel,
-    scene: Scene,
+    scene: Arc<Scene>,
     /// No detection away from the start joints.
     hide_after_start: AtomicBool,
     frame: AtomicU64,
@@ -47,6 +48,8 @@ struct FakeVision {
     freeze_snapshot: AtomicBool,
     /// Set on the first snapshot (the arm settled): the creep driver starts shaking.
     shake_on_snapshot: Mutex<Option<Arc<Mutex<Creep>>>>,
+    /// Set on the first gray trigger (since gray bypasses `/snapshot.jpg`).
+    shake_on_gray_trigger: Mutex<Option<Arc<Mutex<Creep>>>>,
     /// The creep driver's clock (stopped while rendering).
     clock: Mutex<Option<Arc<Mutex<Creep>>>>,
     /// What `/snapshot.jpg` returns: the frame of the last trigger (rendered on the first
@@ -61,6 +64,15 @@ struct FakeVision {
     /// the aruco pipeline.
     markers: Mutex<Vec<(i64, [[f64; 3]; 4])>>,
     aruco: AtomicBool,
+    /// Raw gray frames (default false so existing tests keep exercising the JPEG fallback).
+    gray: AtomicBool,
+    instance_id: Mutex<String>,
+    gray_ring: Mutex<VecDeque<Shot>>,
+    gray_fetches: AtomicU64,
+    gray_fetch_delay_ms: AtomicU64,
+    gray_fail_queue: Mutex<VecDeque<GrayFrameError>>,
+    gray_fail_after_start: Mutex<Option<GrayFrameError>>,
+    on_gray_fetch: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -91,7 +103,8 @@ impl FakeVision {
         let dj1 = f64::from(q[0] - START[0]);
         if err != 0.0 && START.iter().zip(&q).any(|(a, b)| (a - b).abs() > 1e-3) { cam.r = turned(&cam.r, 1, if dj1 < 0.0 { -err } else { err }); }
         let (w, h) = (self.cam.size[0] as usize, self.cam.size[1] as usize);
-        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, id);
+        let scene = Arc::clone(&self.scene);
+        let img = tokio::task::spawn_blocking(move || render::render(&scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, id)).await.unwrap();
         // letterbox into a w x w square, frame in the centred rows
         let top = (w - h) / 2;
         let mut sq = vec![0u8; w * w];
@@ -110,8 +123,13 @@ impl FakeVision {
             }
             Some(armd::mview_stereo::Marker { id: *id, corners })
         }).collect();
-        if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref().or(self.clock.lock().unwrap().as_ref()) { c.lock().unwrap().paused += paused.elapsed(); }
-        Shot { id, joints: q, jpeg, box_norm, markers }
+        if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref()
+            .or(self.shake_on_gray_trigger.lock().unwrap().as_ref())
+            .or(self.clock.lock().unwrap().as_ref())
+        {
+            c.lock().unwrap().paused += paused.elapsed();
+        }
+        Shot { id, joints: q, img, jpeg, box_norm, markers }
     }
 
     /// A trigger: a new frame at the current joints, which also becomes the snapshot.
@@ -119,6 +137,15 @@ impl FakeVision {
 
     /// [`Self::frame_now`] with the markers of the frame.
     async fn frame_with_markers(&self) -> (DetectionFrame, Vec<armd::mview_stereo::Marker>) {
+        self.frame_with_pipelines(&["yolo"]).await.0
+    }
+
+    async fn frame_with_pipelines(&self, pipelines: &[&str]) -> ((DetectionFrame, Vec<armd::mview_stereo::Marker>), bool) {
+        if pipelines.contains(&"gray") {
+            if let Some(c) = self.shake_on_gray_trigger.lock().unwrap().as_ref() {
+                c.lock().unwrap().shake = true;
+            }
+        }
         let d = self.trigger_delay_ms.load(Ordering::SeqCst);
         if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
         // frame ids (and noise seeds) 1, 2, ... per trigger
@@ -127,11 +154,17 @@ impl FakeVision {
         let hidden = self.hide_after_start.load(Ordering::SeqCst) && away;
         let detections = shot.box_norm.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
         let (frame_id, markers) = (shot.id, shot.markers.clone());
+        let ran_gray = pipelines.contains(&"gray") && self.gray.load(Ordering::SeqCst);
+        if ran_gray {
+            let mut ring = self.gray_ring.lock().unwrap();
+            if ring.len() >= 4 { ring.pop_front(); }
+            ring.push_back(shot.clone());
+        }
         if !self.freeze_snapshot.load(Ordering::SeqCst) { *self.snapshot.lock().unwrap() = Some(shot); }
-        (DetectionFrame {
+        ((DetectionFrame {
             frame_id, captured_at: Instant::now(), policy_captured_at: None,
             image_size_px: self.cam.size, detections, depth: None, model_generation: None,
-        }, markers)
+        }, markers), ran_gray)
     }
 }
 
@@ -149,10 +182,65 @@ impl DetectionSource for FakeVision {
         Box::pin(async move { Ok(Some(self.frame_now().await)) })
     }
     fn aruco_available(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async move { Ok(self.aruco.load(Ordering::SeqCst)) }) }
+    fn gray_available(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async move { Ok(self.gray.load(Ordering::SeqCst)) }) }
     fn trigger_markers(&self, p: &'static [&'static str], _w: u64) -> BoxFuture<'_, Result<Option<(DetectionFrame, Vec<armd::mview_stereo::Marker>)>, String>> {
         Box::pin(async move {
-            let (f, m) = self.frame_with_markers().await;
+            let ((f, m), _) = self.frame_with_pipelines(p).await;
             Ok(Some((f, if p.contains(&"aruco") { m } else { Vec::new() })))
+        })
+    }
+    fn trigger_gray(&self, p: &'static [&'static str], _w: u64) -> BoxFuture<'_, Result<Option<GrayTriggerResult>, String>> {
+        Box::pin(async move {
+            let ((frame, m), gray_ran) = self.frame_with_pipelines(p).await;
+            let markers = if p.contains(&"aruco") { m } else { Vec::new() };
+            let instance_id = Some(self.instance_id.lock().unwrap().clone());
+            Ok(Some(GrayTriggerResult { frame, markers, instance_id, gray_ran, gray_ms: gray_ran.then_some(4.5) }))
+        })
+    }
+    fn gray_frame(&self, instance_id: &str, frame_id: u64) -> BoxFuture<'_, Result<GrayFrame, GrayFrameError>> {
+        let req_inst = instance_id.to_string();
+        Box::pin(async move {
+            self.gray_fetches.fetch_add(1, Ordering::SeqCst);
+            let d = self.gray_fetch_delay_ms.load(Ordering::SeqCst);
+            if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
+            if let Some(err) = self.gray_fail_queue.lock().unwrap().pop_front() {
+                return Err(err);
+            }
+            let away = {
+                let inner = self.sup.inner().read().await;
+                START.iter().zip(&inner.measured_positions).any(|(a, b)| (a - b).abs() > 1e-3)
+            };
+            if away {
+                if let Some(err) = self.gray_fail_after_start.lock().unwrap().clone() {
+                    return Err(err);
+                }
+            }
+            let cur_inst = self.instance_id.lock().unwrap().clone();
+            if req_inst != cur_inst {
+                return Err(GrayFrameError::Expired(format!("gray frame {frame_id}: 410 FRAME_EXPIRED")));
+            }
+            let shot = {
+                let ring = self.gray_ring.lock().unwrap();
+                ring.iter().rev().find(|s| s.id == frame_id).cloned()
+            };
+            let Some(s) = shot else {
+                return Err(GrayFrameError::NotStored(format!("gray frame {frame_id}: 404 FRAME_NOT_STORED")));
+            };
+            if let Some(cb) = self.on_gray_fetch.lock().unwrap().as_ref() {
+                cb();
+            }
+            Ok(GrayFrame {
+                instance_id: cur_inst,
+                frame_id: s.id,
+                img: s.img,
+                ts_ms: 1763791234000 + s.id,
+                frame_mono_ms: 10000 + s.id,
+                wait_mono_ms: 9990 + s.id,
+                grab_mono_ms: 10002 + s.id,
+                stored_mono_ms: 10007 + s.id,
+                convert_ms: 4.5,
+                parse_ms: 0.2,
+            })
         })
     }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
@@ -212,10 +300,13 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
     scene.plain_table = plain_table;
-    let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
+    let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene: Arc::new(scene), hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
         snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
-        shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
-        rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false) });
+        shake_on_snapshot: Mutex::new(None), shake_on_gray_trigger: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
+        rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false),
+        gray: AtomicBool::new(false), instance_id: Mutex::new("rv-fake-1".into()), gray_ring: Mutex::new(VecDeque::new()),
+        gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
+        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -808,4 +899,239 @@ fn off_uses_the_kinematic_cameras() {
     println!("{:?}", pr.views);
     assert!(pr.views[1..].iter().all(|v| v.status == "refined" && v.correction_mrad < 0.3), "{:?}", pr.views);
     assert!((auto.measure.unwrap().height_m - off.measure.unwrap().height_m).abs() < 0.002);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 0, "gray path must issue zero snapshot GETs");
+    assert!(r.vision.gray_fetches.load(Ordering::SeqCst) >= 3);
+    let m = &a["measurement"];
+    assert_eq!(m["frame_source"], "gray", "{m}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
+    for v in m["views"].as_array().unwrap() {
+        assert_eq!(v["frame_source"], "gray", "{v}");
+        assert_eq!(v["instance_id"], "rv-fake-1", "{v}");
+        assert_eq!(v["decode_ms"].as_f64().unwrap(), 0.0, "{v}");
+        assert!(v["frame_fetch_ms"].as_f64().unwrap() >= 0.0, "{v}");
+        assert!(v["bracket_duration_ms"].as_f64().unwrap() >= 0.0, "{v}");
+        assert!(v["feedback_wait_b_ms"].as_f64().unwrap() >= 0.0, "{v}");
+        assert!(v["feedback_age_a_ms"].is_number() && v["feedback_age_b_ms"].is_number(), "{v}");
+    }
+    assert!(m["stats"]["frame_fetch_ms"].is_number() && m["stats"]["parse_ms"].is_number(), "{}", m["stats"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_transient_eviction_retries_with_new_bracket_and_trigger() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.gray_fail_queue.lock().unwrap().push_back(GrayFrameError::Expired("gray frame 1: 410 FRAME_EXPIRED".into()));
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 0);
+    let v0 = &a["measurement"]["views"][0];
+    assert_eq!(v0["retry_reasons"], json!(["expired"]), "{v0}");
+    assert_eq!(v0["snapshot_tries_mrad"].as_array().unwrap().len(), 1, "acquisition failures stay separate from numeric spread tries: {v0}");
+    assert!(v0["frame_id"].as_u64().unwrap() >= 2, "retried with a new trigger frame: {v0}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_permanent_failure_after_side_view_move_never_switches_and_returns_to_start() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    // Start view succeeds; side view hits permanent eviction across all tries.
+    *r.vision.gray_fail_after_start.lock().unwrap() = Some(GrayFrameError::Expired("gray frame: 410 FRAME_EXPIRED".into()));
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("DETECTION_UNAVAILABLE")), "{a}");
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 0, "must never switch to /snapshot.jpg mid-run");
+    assert!(r.at_start().await, "must return to start joints after side-view gray failure");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_motion_during_bracket_and_fetch_fails_moved() {
+    // Still while settling; on first gray trigger J4 drifts 30 mrad/s across trigger (80 ms) + fetch (60 ms) -> > 4 mrad > 2 mrad limit.
+    let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.03, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(80, Ordering::SeqCst);
+    r.vision.gray_fetch_delay_ms.store(60, Ordering::SeqCst);
+    *r.vision.shake_on_gray_trigger.lock().unwrap() = Some(creep.clone());
+    let ack = r.start(json!({"pose_refine": "off"})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 60.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 0);
+    let msg = a["message"].as_str().unwrap();
+    assert!(msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
+}
+
+struct FeedbackControl {
+    /// Optional per-joint freeze: `(joint_idx, frozen_instant, release_at, step_rad_on_release)`.
+    freeze: Option<(usize, Instant, Option<Instant>, f32)>,
+    applied_step: [f32; 7],
+    instants: [Instant; 7],
+}
+
+struct FeedbackTimingArm {
+    inner: common::TestArm,
+    ctrl: Arc<Mutex<FeedbackControl>>,
+}
+
+impl ArmDriver for FeedbackTimingArm {
+    fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
+    fn enable_state(&self) -> EnableState { self.inner.enable_state() }
+    fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
+    fn is_enabled(&self) -> bool { self.inner.is_enabled() }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        let c = self.ctrl.lock().unwrap();
+        let now = Instant::now();
+        c.instants.iter().map(|t| Some(now.saturating_duration_since(*t))).collect()
+    }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        let c = self.ctrl.lock().unwrap();
+        c.instants.iter().copied().map(Some).collect()
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let now = Instant::now();
+        let mut c = self.ctrl.lock().unwrap();
+        let mut frozen_j = None;
+        if let Some((j, frozen_at, release_at, step_rad)) = c.freeze {
+            if release_at.is_some_and(|rel| now >= rel) {
+                c.applied_step[j] += step_rad;
+                c.freeze = None;
+            } else {
+                frozen_j = Some((j, frozen_at));
+            }
+        }
+        for i in 0..7 {
+            if let Some((fj, ft)) = frozen_j {
+                if i == fj {
+                    c.instants[i] = ft;
+                    continue;
+                }
+            }
+            c.instants[i] = now;
+        }
+        let step = c.applied_step;
+        drop(c);
+        let mut s = self.inner.read_joint_states()?;
+        for (i, js) in s.iter_mut().enumerate().take(7) {
+            js.position += step[i];
+        }
+        Ok(s)
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.write_joint_targets(targets) }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn supports_mit_mode_switch(&self) -> bool { false }
+    fn set_joint_modes(&mut self, modes: &[JointMode], hold: &[JointTarget]) -> Result<(), ArmDriverError> { self.inner.set_joint_modes(modes, hold) }
+}
+
+async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
+    let (cam, _, look) = geometry(&config);
+    let sup = Arc::new(ArmSupervisor::new(config));
+    sup.inner().write().await.driver = Some(std::sync::Mutex::new(driver));
+    let scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
+    let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene: Arc::new(scene), hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
+        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
+        shake_on_snapshot: Mutex::new(None), shake_on_gray_trigger: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()),
+        rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false),
+        gray: AtomicBool::new(true), instance_id: Mutex::new("rv-fb-1".into()), gray_ring: Mutex::new(VecDeque::new()),
+        gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
+        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None) });
+    let deps = GraspDeps { source: vision.clone(), setup_path: None };
+    let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let ticker = sup.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        loop { interval.tick().await; ticker.tick(0.02).await; }
+    });
+    let (mut ws, generation) = common::controller(addr).await;
+    let epoch = sup.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let epoch = sup.get_observation().await.epoch_id;
+    Rig { sup, vision, ws, generation, epoch }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_stale() {
+    // 1. Staggered update with a real +8 mrad step on J5 delivered 80 ms AFTER fetch completed:
+    //    if armd accepted cached sample B it would see 0 mrad spread and succeed; waiting for J5's
+    //    fresh post-fetch feedback catches the 8 mrad move -> MOVED naming J5.
+    {
+        let inner_arm = common::TestArm::new();
+        inner_arm.0.lock().unwrap().q = START;
+        let now = Instant::now();
+        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
+        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+        let ctrl_cb = ctrl.clone();
+        *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
+            let t = Instant::now();
+            // J5 stays at t - 40 ms until t + 80 ms, then updates with +8 mrad step
+            ctrl_cb.lock().unwrap().freeze = Some((4, t - Duration::from_millis(40), Some(t + Duration::from_millis(80)), 0.008));
+        }));
+        let ack = r.start(json!({"pose_refine": "off"})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 60.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
+        assert!(a["message"].as_str().unwrap().contains("J5"), "{a}");
+    }
+
+    // 2. Staggered J5 update with 0 step after 70 ms: waits and succeeds, recording feedback_wait_b_ms >= 40 ms.
+    {
+        let inner_arm = common::TestArm::new();
+        inner_arm.0.lock().unwrap().q = START;
+        let now = Instant::now();
+        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
+        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+        let fired = Arc::new(AtomicBool::new(false));
+        let ctrl_cb = ctrl.clone();
+        let fired_cb = fired.clone();
+        *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
+            if !fired_cb.swap(true, Ordering::SeqCst) {
+                let t = Instant::now();
+                ctrl_cb.lock().unwrap().freeze = Some((4, t - Duration::from_millis(30), Some(t + Duration::from_millis(70)), 0.0));
+            }
+        }));
+        let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 150.0).await;
+        assert_eq!(a["state"], "done", "{a}");
+        let wait_b = a["measurement"]["views"][0]["feedback_wait_b_ms"].as_f64().unwrap();
+        assert!(wait_b >= 40.0, "expected staggered wait >= 40 ms, got {wait_b}");
+    }
+
+    // 3. Frozen J3 feedback never updates after fetch -> fails STALE_TELEMETRY.
+    {
+        let inner_arm = common::TestArm::new();
+        inner_arm.0.lock().unwrap().q = START;
+        let now = Instant::now();
+        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
+        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+        let ctrl_cb = ctrl.clone();
+        *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
+            let t = Instant::now();
+            ctrl_cb.lock().unwrap().freeze = Some((2, t - Duration::from_millis(30), None, 0.0));
+        }));
+        let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 60.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("STALE_TELEMETRY")), "{a}");
+    }
 }

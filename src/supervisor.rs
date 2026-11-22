@@ -389,6 +389,8 @@ pub struct SupervisorInner {
     pub gravity_scale: f32,
     pub gravity_torques_ramped: Vec<f32>,
     pub last_can_feedback_instant: Option<Instant>,
+    /// Monotonic hardware receive instant for each joint (same length as `measured_positions`).
+    pub joint_feedback_instants: Vec<Option<Instant>>,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
@@ -640,6 +642,7 @@ impl SupervisorInner {
             gravity_scale: 0.5,
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
+            joint_feedback_instants: vec![None; dof],
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             requested_estop_count: Arc::new(AtomicU64::new(0)),
@@ -1399,6 +1402,18 @@ impl SupervisorInner {
         }))
     }
 
+    /// Snapshot of `(measured_positions, arm_velocities, arm_feedback_instants)` read coherently
+    /// under the supervisor lock.
+    pub fn arm_feedback_snapshot(&self) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>) {
+        let arm = self.config.arm_joint_indices();
+        let vels = arm.iter().map(|&i| self.measured_velocities.get(i).copied().unwrap_or(0.0)).collect();
+        let instants = arm
+            .iter()
+            .map(|&i| self.joint_feedback_instants.get(i).copied().flatten())
+            .collect();
+        (self.measured_positions.clone(), vels, instants)
+    }
+
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
         #[cfg(feature = "policy-runtime")]
@@ -1826,6 +1841,7 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = driver.feedback_ages().into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+                self.joint_feedback_instants = driver.feedback_instants();
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -2216,6 +2232,7 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+                self.joint_feedback_instants = drv.feedback_instants();
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -2265,6 +2282,7 @@ impl SupervisorInner {
             self.feedback_numeric_valid = true;
             self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                 .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+            self.joint_feedback_instants = drv.feedback_instants();
             Self::apply_feedback(
                 &mut self.measured_positions,
                 &mut self.measured_velocities,
@@ -4326,6 +4344,7 @@ impl SupervisorInner {
                             .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
                     } else { self.last_can_feedback_instant = None; }
                     if self.feedback_numeric_valid {
+                        self.joint_feedback_instants = driver.feedback_instants();
                         Self::apply_feedback(
                             &mut self.measured_positions,
                             &mut self.measured_velocities,
@@ -4349,6 +4368,11 @@ impl SupervisorInner {
                     driver_torque_lost = true;
                 }
             }
+        } else {
+            // Driverless simulation mode: each control tick produces a fresh joint sample.
+            let now = Instant::now();
+            self.joint_feedback_instants.resize(self.config.dof, Some(now));
+            self.joint_feedback_instants.fill(Some(now));
         }
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);

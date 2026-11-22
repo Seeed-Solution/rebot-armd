@@ -124,6 +124,9 @@ pub const BRACKET_REFINED_RAD: f32 = 0.005;
 pub const SNAPSHOT_TRIES: usize = 3;
 pub const SNAPSHOT_GAP_RETRY: Duration = Duration::from_millis(500);
 pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
+/// Maximum time to wait after a gray frame fetch for every arm joint to receive fresh hardware
+/// feedback (`ts >= fetch_completed`) before failing with `STALE_TELEMETRY`.
+pub const FEEDBACK_WAIT_MAX: Duration = Duration::from_millis(500);
 /// A view's target detection: centre at most this far (normalised image units) from where the
 /// start view saw it, moved by the shift of the look-at point in that view.
 pub const TARGET_MAX_SHIFT_NORM: f64 = 0.2;
@@ -139,8 +142,30 @@ const YOLO: &[&str] = &["yolo"];
 /// Pipelines of a capture trigger when marker corners are wanted (`pose_refine` `auto` with a
 /// provider that runs ArUco, or `aruco`).
 const YOLO_ARUCO: &[&str] = &["yolo", "aruco"];
+/// Pipelines of a raw gray capture trigger (negotiated once per run when `available.gray` and
+/// loopback).
+const YOLO_GRAY: &[&str] = &["yolo", "gray"];
+const YOLO_ARUCO_GRAY: &[&str] = &["yolo", "aruco", "gray"];
 /// `pose_refine` `"aruco"`: marker corners each view must share with the reference view.
 pub const MIN_MARKER_CORNERS: usize = 8;
+
+/// Negotiated image transport for one `measure_multiview` run (selected once, never switched mid-run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSource {
+    /// Raw 8-bit grayscale via loopback `POST /api/trigger` `"gray"` + `GET /api/frame/gray` (RGF1).
+    Gray,
+    /// Legacy `/snapshot.jpg` polling + JPEG decode + letterbox center crop.
+    Snapshot,
+}
+
+impl FrameSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gray => "gray",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
 
 fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.into()).into() }
 
@@ -476,6 +501,43 @@ async fn sample(ctx: &MacroCtx) -> (Vec<f32>, Vec<f32>) {
     (inner.measured_positions.clone(), arm.iter().map(|&i| inner.measured_velocities.get(i).copied().unwrap_or(0.0)).collect())
 }
 
+/// Measured joints (all) and per-arm-joint feedback instants, read coherently under one lock.
+async fn sample_with_instants(ctx: &MacroCtx) -> (Vec<f32>, Vec<Option<Instant>>) {
+    let inner = ctx.sup.inner().read().await;
+    let (pos, _, instants) = inner.arm_feedback_snapshot();
+    (pos, instants)
+}
+
+/// Maximum feedback age (ms) among arm joints at `now`.
+fn max_feedback_age_ms(now: Instant, instants: &[Option<Instant>]) -> Option<f64> {
+    if instants.is_empty() || instants.iter().any(Option::is_none) {
+        return None;
+    }
+    instants
+        .iter()
+        .flatten()
+        .map(|t| now.saturating_duration_since(*t).as_secs_f64() * 1000.0)
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+}
+
+/// Wait until every arm joint has a hardware feedback sample acquired at or after `after`,
+/// bounded by [`FEEDBACK_WAIT_MAX`] and the action deadline / `recheck` invariants.
+/// Returns `(positions, arm_feedback_instants, wait_ms)`.
+async fn sample_fresh_after(ctx: &MacroCtx, plan: &Plan, after: Instant) -> Result<(Vec<f32>, Vec<Option<Instant>>, f64), Stop> {
+    let wait_start = Instant::now();
+    loop {
+        recheck(ctx, plan).await?;
+        let (pos, instants) = sample_with_instants(ctx).await;
+        if !instants.is_empty() && instants.iter().all(|t| t.is_some_and(|ts| ts >= after)) {
+            return Ok((pos, instants, wait_start.elapsed().as_secs_f64() * 1000.0));
+        }
+        if wait_start.elapsed() >= FEEDBACK_WAIT_MAX {
+            return Err(fail("STALE_TELEMETRY", "joint feedback did not refresh for every arm joint after capture"));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Wait until the arm is still (see [`STILL_WINDOW`]): `MIN_SETTLE_S`, then sliding windows until
 /// `MAX_SETTLE_S`. Returns the seconds it took.
 async fn settle(ctx: &MacroCtx, plan: &Plan) -> Result<f64, Stop> {
@@ -521,21 +583,31 @@ struct Capture {
     offset: [f64; 2],
     pose: Pose,
     img: Gray,
+    frame_source: FrameSource,
+    instance_id: Option<String>,
     frame_id: u64,
     detections: Vec<Detection>,
     decode_ms: f64,
+    frame_fetch_ms: f64,
+    gray_convert_ms: Option<f64>,
+    parse_ms: f64,
     /// Predicted shift of the look-at point from its start pixel, and the smallest distance of
     /// the predicted target box to the image border (px).
     shift_px: [f64; 2],
     margin_px: f64,
     /// Joints of the pose (bracket mean), the bracket samples, the bracket spread of every
-    /// snapshot try (rad) and the settle time (s).
+    /// bracketed try (rad), bracket timing metrics, retry reasons, and the settle time (s).
     joints: Vec<f32>,
     bracket: [Vec<f32>; 2],
     snapshot_tries: Vec<f32>,
+    retry_reasons: Vec<String>,
+    bracket_duration_ms: f64,
+    feedback_wait_b_ms: f64,
+    feedback_age_a_ms: Option<f64>,
+    feedback_age_b_ms: Option<f64>,
     settle_s: f64,
     /// Accepted try: the trigger's time, the time from its reply to the refreshed snapshot (ms)
-    /// and the snapshots that still returned the frame from before the trigger.
+    /// and the snapshots that still returned the frame from before the trigger (0 for gray).
     trigger_ms: f64,
     snapshot_wait_ms: f64,
     snapshot_polls: usize,
@@ -547,22 +619,168 @@ struct Capture {
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
 
-/// Settle, then (bracketed by joint samples, retried while the bracket moved) a detection
-/// trigger and the first snapshot that differs from the one before the trigger. The pose is the
-/// FK of the bracket's mean joints.
-async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64, markers: bool) -> Result<Capture, Stop> {
+fn rescale_markers_and_frame(plan: &Plan, frame: &mut grasp::DetectionFrame, marks: &mut [mview_stereo::Marker]) {
+    // marker corners are pixels of the frame: to the camera model's image like the detections
+    let fs = frame.image_size_px;
+    if fs[0] > 0.0 && fs[1] > 0.0 {
+        let (rx, ry) = (plan.cam.size[0] / fs[0], plan.cam.size[1] / fs[1]);
+        for m in marks {
+            for c in &mut m.corners {
+                c[0] *= rx;
+                c[1] *= ry;
+            }
+        }
+    }
+    grasp::rescale_frame_to_cam(frame, &plan.cam);
+}
+
+/// Settle, then capture one view via the run's negotiated [`FrameSource`] (never switched mid-run).
+async fn capture(
+    ctx: &MacroCtx,
+    plan: &Plan,
+    src: &dyn DetectionSource,
+    frame_source: FrameSource,
+    offset: [f64; 2],
+    shift_px: [f64; 2],
+    margin_px: f64,
+    markers: bool,
+) -> Result<Capture, Stop> {
+    match frame_source {
+        FrameSource::Gray => capture_gray(ctx, plan, src, offset, shift_px, margin_px, markers).await,
+        FrameSource::Snapshot => capture_snapshot(ctx, plan, src, offset, shift_px, margin_px, markers).await,
+    }
+}
+
+/// Raw gray capture using the conservative bracket:
+/// sample A is taken right before the trigger request, and sample B AFTER the gray frame has been
+/// fetched, waiting for a fresh hardware joint feedback update acquired after the fetch completed
+/// for every arm joint.
+///
+/// Rationale: the trigger returns a frame newer than the request; any pipeline latency before A is
+/// at most ~1 frame and the arm has been settled for >= 2 s with drift of a few mrad/s, so the
+/// residual is far below the bracket limit (5 mrad with pose_refine, 2 mrad off).
+async fn capture_gray(
+    ctx: &MacroCtx,
+    plan: &Plan,
+    src: &dyn DetectionSource,
+    offset: [f64; 2],
+    shift_px: [f64; 2],
+    margin_px: f64,
+    markers: bool,
+) -> Result<Capture, Stop> {
+    let settle_s = settle(ctx, plan).await?;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
+    let pipelines = if markers { YOLO_ARUCO_GRAY } else { YOLO_GRAY };
+    let (cw, ch) = (plan.cam.size[0].round() as usize, plan.cam.size[1].round() as usize);
+    let mut tries: Vec<(f32, usize)> = Vec::new();
+    let mut retry_reasons: Vec<String> = Vec::new();
+    let mut last_acq_err: Option<String> = None;
+    let mut got = None;
+
+    for k in 0..SNAPSHOT_TRIES {
+        if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
+        recheck(ctx, plan).await?;
+        let t_a = Instant::now();
+        let (a, inst_a) = sample_with_instants(ctx).await;
+        let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
+        let t_trigger = Instant::now();
+        let mut trig = None;
+        for _ in 0..TRIGGERS {
+            ctx.check().await?;
+            let res = src.trigger_gray(pipelines, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))?;
+            if let Some(r) = res { trig = Some(r); break; }
+        }
+        let trig = trig.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
+        let trigger_ms = t_trigger.elapsed().as_secs_f64() * 1000.0;
+        let Some(instance_id) = trig.instance_id.clone().filter(|s| !s.is_empty()) else {
+            return Err(fail("DETECTION_UNAVAILABLE", "gray trigger reply missing instance_id"));
+        };
+        if !trig.gray_ran {
+            retry_reasons.push("gray_not_produced".into());
+            last_acq_err = Some(format!("gray frame {}: provider did not produce gray image", trig.frame.frame_id));
+            continue;
+        }
+        let t_fetch = Instant::now();
+        let gray = match src.gray_frame(&instance_id, trig.frame.frame_id).await {
+            Ok(g) => g,
+            Err(e) if e.is_retryable() => {
+                retry_reasons.push(e.retry_reason().into());
+                last_acq_err = Some(e.to_string());
+                continue;
+            }
+            Err(e) => return Err(fail("DETECTION_UNAVAILABLE", e.to_string())),
+        };
+        let frame_fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
+        if gray.img.w != cw || gray.img.h != ch {
+            return Err(fail("DETECTION_UNAVAILABLE", format!(
+                "gray frame is {}x{}; the camera model (grasp setup image_size_px) is {cw}x{ch}",
+                gray.img.w, gray.img.h
+            )));
+        }
+        let t_fetch_done = Instant::now();
+        let (b, inst_b, feedback_wait_b_ms) = sample_fresh_after(ctx, plan, t_fetch_done).await?;
+        let t_b = Instant::now();
+        let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
+        let age_b_ms = max_feedback_age_ms(t_b, &inst_b);
+        let (spread, joint) = bracket_spread(&a, &b, &arm);
+        tries.push((spread, joint));
+        if spread <= bracket_limit {
+            let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
+            got = Some((gray, instance_id, mean, a, b, trig, trigger_ms, frame_fetch_ms, bracket_duration_ms, feedback_wait_b_ms, age_a_ms, age_b_ms));
+            break;
+        }
+        retry_reasons.push("moved".into());
+        last_acq_err = None;
+    }
+
+    let Some((gray, instance_id, joints, bracket_a, bracket_b, mut trig, trigger_ms, frame_fetch_ms, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms)) = got else {
+        if let Some(err) = last_acq_err {
+            return Err(fail("DETECTION_UNAVAILABLE", err));
+        }
+        let mrad: Vec<String> = tries.iter().map(|(t, j)| format!("J{} {:.1}", j + 1, t * 1000.0)).collect();
+        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} captures (largest joint change across each trigger and gray fetch: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
+    };
+    recheck(ctx, plan).await?;
+    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
+        .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
+    rescale_markers_and_frame(plan, &mut trig.frame, &mut trig.markers);
+    let convert_ms = trig.gray_ms.or(Some(gray.convert_ms));
+    Ok(Capture {
+        offset, pose, img: gray.img, frame_source: FrameSource::Gray, instance_id: Some(instance_id),
+        frame_id: trig.frame.frame_id, detections: trig.frame.detections, decode_ms: 0.0,
+        frame_fetch_ms, gray_convert_ms: convert_ms, parse_ms: gray.parse_ms, shift_px, margin_px,
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
+        retry_reasons, bracket_duration_ms, feedback_wait_b_ms, feedback_age_a_ms, feedback_age_b_ms,
+        settle_s, trigger_ms, snapshot_wait_ms: 0.0, snapshot_polls: 0, jpeg: None, markers: trig.markers,
+    })
+}
+
+/// Legacy JPEG snapshot path (unchanged behaviour for older or remote providers).
+async fn capture_snapshot(
+    ctx: &MacroCtx,
+    plan: &Plan,
+    src: &dyn DetectionSource,
+    offset: [f64; 2],
+    shift_px: [f64; 2],
+    margin_px: f64,
+    markers: bool,
+) -> Result<Capture, Stop> {
     let settle_s = settle(ctx, plan).await?;
     let snap = || async { src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}"))) };
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
     let mut s0 = snap().await?;
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let mut tries: Vec<(f32, usize)> = Vec::new();
+    let mut retry_reasons: Vec<String> = Vec::new();
     let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
     let mut got = None;
     for k in 0..SNAPSHOT_TRIES {
         if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
         recheck(ctx, plan).await?;
-        let (a, _) = sample(ctx).await;
+        let t_a = Instant::now();
+        let (a, inst_a) = sample_with_instants(ctx).await;
+        let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
         let t_trigger = Instant::now();
         let mut frame = None;
         for _ in 0..TRIGGERS {
@@ -585,37 +803,41 @@ async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset:
             ctx.check().await?;
         };
         let wait_ms = t_reply.elapsed().as_secs_f64() * 1000.0;
-        let (b, _) = sample(ctx).await;
+        let t_b = Instant::now();
+        let (b, inst_b) = sample_with_instants(ctx).await;
+        let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
+        let age_b_ms = max_feedback_age_ms(t_b, &inst_b);
         let (spread, joint) = bracket_spread(&a, &b, &arm);
         tries.push((spread, joint));
         if spread <= bracket_limit {
             let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
-            got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls));
+            got = Some((jpeg, mean, a, b, frame, trigger_ms, wait_ms, polls, bracket_duration_ms, age_a_ms, age_b_ms));
             break;
         }
+        retry_reasons.push("moved".into());
         s0 = jpeg;
     }
-    let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls)) = got else {
+    let Some((jpeg, joints, bracket_a, bracket_b, (mut frame, mut marks), trigger_ms, snapshot_wait_ms, snapshot_polls, bracket_duration_ms, feedback_age_a_ms, feedback_age_b_ms)) = got else {
         let mrad: Vec<String> = tries.iter().map(|(t, j)| format!("J{} {:.1}", j + 1, t * 1000.0)).collect();
         return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each trigger and snapshot: {} mrad, limit {:.1})", mrad.join(", "), bracket_limit * 1000.0)));
     };
     recheck(ctx, plan).await?;
     let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
-    // marker corners are pixels of the frame: to the camera model's image like the detections
-    let fs = frame.image_size_px;
-    if fs[0] > 0.0 && fs[1] > 0.0 {
-        let (rx, ry) = (plan.cam.size[0] / fs[0], plan.cam.size[1] / fs[1]);
-        for m in &mut marks { for c in &mut m.corners { c[0] *= rx; c[1] *= ry; } }
-    }
-    grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
+    rescale_markers_and_frame(plan, &mut frame, &mut marks);
     let size = plan.cam.size;
     let keep = plan.request.debug.then(|| jpeg.clone());
     let (img, decode_ms) = tokio::task::spawn_blocking(move || { let t0 = Instant::now(); let r = decode_frame(&jpeg, size); (r, t0.elapsed().as_secs_f64() * 1000.0) }).await
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
-    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
-        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(), settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks })
+    Ok(Capture {
+        offset, pose, img, frame_source: FrameSource::Snapshot, instance_id: None,
+        frame_id: frame.frame_id, detections: frame.detections, decode_ms, frame_fetch_ms: 0.0,
+        gray_convert_ms: None, parse_ms: 0.0, shift_px, margin_px, joints,
+        bracket: [bracket_a, bracket_b], snapshot_tries: tries.iter().map(|t| t.0).collect(),
+        retry_reasons, bracket_duration_ms, feedback_wait_b_ms: 0.0, feedback_age_a_ms, feedback_age_b_ms,
+        settle_s, trigger_ms, snapshot_wait_ms, snapshot_polls, jpeg: keep, markers: marks,
+    })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -684,17 +906,29 @@ fn is_refusal(s: &Stop) -> bool { matches!(s, Stop::Fail(code, _) if PLAN_REFUSA
 fn r4(x: f64) -> f64 { (x * 1e4).round() / 1e4 }
 
 /// The `measurement` value of the action (see docs/agent_action_api.md).
-fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
+fn measurement_value(plan: &Plan, frame_source: FrameSource, caps: &[Capture], target: &Detection, result: &Result<mview_stereo::ObjectMeasure, &'static str>,
     table: &mview_stereo::TableCheck, stats: &mview_stereo::Stats, fallbacks: &[Value], compute_ms: f64) -> Value {
     let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
     let views: Vec<Value> = caps.iter().map(|c| json!({
         "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
+        "frame_source": c.frame_source.name(),
+        "instance_id": c.instance_id,
         "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
-        "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
+        "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px),
+        "decode_ms": r2(c.decode_ms),
+        "frame_fetch_ms": r2(c.frame_fetch_ms),
+        "gray_convert_ms": c.gray_convert_ms.map(r2),
+        "parse_ms": r2(c.parse_ms),
         "joints_rad": c.joints.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>(),
         "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
+        "retry_reasons": c.retry_reasons,
         "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
-        "settle_s": (c.settle_s * 100.0).round() / 100.0,
+        "bracket_duration_ms": r2(c.bracket_duration_ms),
+        "feedback_wait_b_ms": r2(c.feedback_wait_b_ms),
+        "feedback_age_a_ms": c.feedback_age_a_ms.map(r2),
+        "feedback_age_b_ms": c.feedback_age_b_ms.map(r2),
+        "settle_s": r2(c.settle_s),
         "trigger_ms": c.trigger_ms.round(), "snapshot_wait_ms": c.snapshot_wait_ms.round(), "snapshot_polls": c.snapshot_polls,
     })).collect();
     let (objects, why) = match result {
@@ -703,19 +937,26 @@ fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: 
             "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
             "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": r1(m.yaw_deg),
             "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points, "top_method": m.top_method,
-            "reproj_rms_px": (m.reproj_rms_px * 100.0).round() / 100.0, "views_used": caps.len(),
+            "reproj_rms_px": r2(m.reproj_rms_px), "views_used": caps.len(),
         })], Value::Null),
         Err(w) => (Vec::new(), json!(w)),
     };
-    let mm = |v: Option<f64>| v.map_or(Value::Null, |x| json!((x * 100.0).round() / 100.0));
+    let mm = |v: Option<f64>| v.map_or(Value::Null, |x| json!(r2(x)));
     let mut st = serde_json::to_value(stats).unwrap_or(Value::Null);
     if let Some(o) = st.as_object_mut() {
-        for v in o.values_mut() { if let Some(x) = v.as_f64().filter(|_| !v.is_u64()) { *v = json!((x * 100.0).round() / 100.0); } }
-        o.insert("decode_ms".into(), json!((caps.iter().map(|c| c.decode_ms).sum::<f64>() * 100.0).round() / 100.0));
+        for v in o.values_mut() { if let Some(x) = v.as_f64().filter(|_| !v.is_u64()) { *v = json!(r2(x)); } }
+        o.insert("decode_ms".into(), json!(r2(caps.iter().map(|c| c.decode_ms).sum::<f64>())));
+        o.insert("frame_fetch_ms".into(), json!(r2(caps.iter().map(|c| c.frame_fetch_ms).sum::<f64>())));
+        o.insert("parse_ms".into(), json!(r2(caps.iter().map(|c| c.parse_ms).sum::<f64>())));
+        let conv_sum: f64 = caps.iter().filter_map(|c| c.gray_convert_ms).sum();
+        if caps.iter().any(|c| c.gray_convert_ms.is_some()) {
+            o.insert("gray_convert_ms".into(), json!(r2(conv_sum)));
+        }
     }
     let offsets: Vec<[f64; 2]> = caps.iter().map(|c| c.offset).collect();
     json!({
         "method": "motion_stereo",
+        "frame_source": frame_source.name(),
         "motion": plan.request.motion.name(),
         "axes": plan.request.axes.name(),
         "objects": objects,
@@ -752,7 +993,7 @@ fn look_at(plan: &Plan, pose: &Pose, target: &Detection) -> Vec3 {
 }
 
 /// Everything after the start capture, until the views are captured.
-async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps: &mut Vec<Capture>, target: &Detection,
+async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame_source: FrameSource, caps: &mut Vec<Capture>, target: &Detection,
     fallbacks: &mut Vec<Value>, pivot: &Vec3, markers: bool) -> Result<(), (Stop, bool)> {
     let pose0 = caps[0].pose;
     let cam0 = camera_at(&plan.cam, &pose0);
@@ -791,7 +1032,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, caps:
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let cap = capture(ctx, plan, src, c, shift, margin, markers).await.map_err(|s| (s, true))?;
+                    let cap = capture(ctx, plan, src, frame_source, c, shift, margin, markers).await.map_err(|s| (s, true))?;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
                     if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
@@ -1122,23 +1363,30 @@ async fn back_to_start(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
 /// with it, after the return to the start pose).
 async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> Result<Option<(String, String)>, Stop> {
     recheck(ctx, plan).await?;
-    match src.per_request_pipelines().await {
-        Ok(true) => {}
-        Ok(false) => return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)")),
-        Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
+    // Negotiate capabilities and image source ONCE for the whole run (never switch mid-run).
+    let mode = src.mode_info().await.map_err(|e| source_fail(format!("cannot reach the vision provider: {e}")))?;
+    if !mode.per_request_pipelines {
+        return Err(fail("UNSUPPORTED", "the vision provider does not take per-request pipelines (perception API 2)"));
     }
     // marker corners for the pose refinement: requested when the provider runs ArUco
     let markers = match plan.request.pose_refine {
         PoseRefine::Off => false,
-        PoseRefine::Auto => src.aruco_available().await.unwrap_or(false),
-        PoseRefine::Aruco => match src.aruco_available().await {
-            Ok(true) => true,
-            Ok(false) => return Err(fail("MARKERS_UNAVAILABLE", "pose_refine \"aruco\" needs ArUco markers: the vision provider does not run the aruco pipeline")),
-            Err(e) => return Err(source_fail(format!("cannot reach the vision provider: {e}"))),
-        },
+        PoseRefine::Auto => mode.aruco_available,
+        PoseRefine::Aruco => {
+            if mode.aruco_available {
+                true
+            } else {
+                return Err(fail("MARKERS_UNAVAILABLE", "pose_refine \"aruco\" needs ArUco markers: the vision provider does not run the aruco pipeline"));
+            }
+        }
+    };
+    let frame_source = if mode.gray_available && mode.upstream_loopback {
+        FrameSource::Gray
+    } else {
+        FrameSource::Snapshot
     };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
-    let first = capture(ctx, plan, src, [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
+    let first = capture(ctx, plan, src, frame_source, [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
@@ -1153,7 +1401,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     }
     let mut caps = vec![first];
     let mut fallbacks = Vec::new();
-    let views_res = run_views(ctx, plan, src, &mut caps, &target, &mut fallbacks, &pivot, markers).await;
+    let views_res = run_views(ctx, plan, src, frame_source, &mut caps, &target, &mut fallbacks, &pivot, markers).await;
     if let Err((stop, moved)) = views_res {
         // a measurement failure goes back to the start first; a stop, fault, collision, torque
         // limit, lease loss or anything else ends the action where the arm is
@@ -1193,7 +1441,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let stats = c.rec.stats;
     tracing::info!("measure_multiview {}: {} views, {stats:?}, {:.0} ms, {:?}", ctx.id, caps.len(), c.ms, c.measure.as_ref().map(|m| m.height_m));
     let in_box = box_heights(&c.rec.points, table_z);
-    let mut value = measurement_value(plan, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
+    let mut value = measurement_value(plan, frame_source, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
     value["table_plane"] = plane_value(&c.plane);
