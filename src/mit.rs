@@ -235,6 +235,7 @@ pub fn check_gate(cfg: &ArmConfig, record: Option<&MitQualificationFile>, zero_o
         if Some(q.profile_id.as_str()) != cfg.profile_id.as_deref() { fail(format!("record profile {} != {:?}", q.profile_id, cfg.profile_id)); }
         if cfg.joint_names.get(i) != Some(&q.joint_name) { fail(format!("record joint name {} != {:?}", q.joint_name, cfg.joint_names.get(i))); }
         let fp = zero_fingerprint(zero_offsets.get(i).copied().unwrap_or(0.0));
+        if !q.timeout_unit_verified { fail("the TIMEOUT unit and expiry are not verified on the device (timeout_unit_verified false)".into()); }
         if q.zero_fingerprint != fp { fail(format!("joint zero changed since the qualification ({} != {fp})", q.zero_fingerprint)); }
         match readback.get(n) {
             None => fail("no register readback".into()),

@@ -1787,18 +1787,22 @@ impl SupervisorInner {
             // MIT tracking (Phase 2): every arm and rearm rechecks the qualification against a fresh
             // register readback (nonzero TIMEOUT, identity, ranges); unqualified hardware refuses
             // MIT before any motion. MIT not requested: no readback, no change.
+            // A rearm while MIT owns joints hands them back first (at rest), so neither the
+            // register readback below nor the driver's enable runs under an active MIT owner
+            // (no dynamic output during the reads, no silent mode restore).
+            if self.mit_active() {
+                self.mit.armed_ok = false;
+                self.mit_hand_back("rearm").map_err(SafetyError::ClearFaultRejected)?;
+            }
             if let Err(e) = self.mit_gate() {
+                // revoked before returning: no handover until a later arm passes the gate
+                self.mit.armed_ok = false;
                 let msg = format!("MIT_UNQUALIFIED: MIT tracking refused: {e}");
                 tracing::error!("{msg}");
                 self.mit_gate_error = Some(msg.clone());
                 return Err(SafetyError::ClearFaultRejected(msg));
             }
             self.mit_gate_error = None;
-            // A rearm while MIT owns joints hands them back first (at rest), so the driver's
-            // enable never silently restores the base mode under an active MIT owner.
-            if self.mit_active() {
-                self.mit_hand_back("rearm").map_err(SafetyError::ClearFaultRejected)?;
-            }
 
             // Enable hardware torque so bus devices wake up and publish state, then verify physical feedback
             let any_driver_enabled = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.has_any_joint_enabled()));

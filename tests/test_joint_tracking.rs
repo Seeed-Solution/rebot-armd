@@ -578,7 +578,7 @@ fn mit_record_fixture() -> armd::mit::MitQualificationFile {
     serde_json::from_value(serde_json::json!({"version": 1, "joints": [{
         "profile_id": "rebot_b601dm", "joint": 4, "joint_name": "joint4", "zero_fingerprint": armd::mit::zero_fingerprint(0.0),
         "motor_id": 4, "reply_id": 20, "esc_id": 4, "mst_id": 20, "sw_ver": 942747703, "pmax": 12.5, "vmax": 30.0, "tmax": 10.0,
-        "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": false, "tested_response": "disabled",
+        "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": true, "tested_response": "disabled",
         "measured_expiry_ms": 101.0, "load_envelope": "supported", "max_kp": 15.0, "max_kd": 0.5, "effort_ceiling_nm": 4.0,
         "date": "2026-11-22T00:00:00Z", "trace_id": "t"}]})).unwrap()
 }

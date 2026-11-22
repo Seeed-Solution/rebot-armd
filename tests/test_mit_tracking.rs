@@ -56,7 +56,7 @@ fn record_j4(timeout_raw: u32) -> MitQualificationFile {
             profile_id: "rebot_b601dm".into(), joint: 4, joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
             zero_fingerprint: mit::zero_fingerprint(0.0), motor_id: 4, reply_id: 0x14, esc_id: 4, mst_id: 0x14, sw_ver: SW_VER,
             pmax: l.p_max, vmax: l.v_max, tmax: l.t_max, timeout_raw, timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
-            timeout_unit_verified: false, tested_response: "disabled".into(), measured_expiry_ms: 101.0,
+            timeout_unit_verified: true, tested_response: "disabled".into(), measured_expiry_ms: 101.0,
             load_envelope: "unloaded, supported".into(), max_kp: 15.0, max_kd: 0.5, effort_ceiling_nm: 4.0,
             date: "2026-11-22T00:00:00Z".into(), trace_id: "test".into(),
         }],
@@ -187,6 +187,7 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
         ("joint zero changed", 2000, Some(record_j4(2000)), Box::new(|inner, _| inner.set_joint_zero_offsets(&[0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0]).unwrap())),
         ("kp above the qualified ceiling", 2000, Some({ let mut r = record_j4(2000); r.joints[0].max_kp = 8.0; r }), Box::new(|_, _| {})),
         ("effort limit above the qualified ceiling", 2000, Some({ let mut r = record_j4(2000); r.joints[0].effort_ceiling_nm = 2.0; r }), Box::new(|_, _| {})),
+        ("timeout unit not verified on the device", 2000, Some({ let mut r = record_j4(2000); r.joints[0].timeout_unit_verified = false; r }), Box::new(|_, _| {})),
         ("other profile", 2000, Some({ let mut r = record_j4(2000); r.joints[0].profile_id = "so_arm101".into(); r }), Box::new(|_, _| {})),
     ];
     for (label, timeout, rec, mutate) in cases {
@@ -640,5 +641,39 @@ fn mit_hold_keys_null_is_refused_like_the_base() {
         let jt: JointTrackingConfig = serde_json::from_value(v).unwrap();
         let mut cfg = ArmConfig { joint_tracking: Some(jt), ..mit_config_j4() };
         assert!(cfg.validate().is_err(), "{key}: null accepted on slot {slot}");
+    }
+}
+
+/// Review #3: a rearm of an armed arm with MIT active hands back first (at rest), then reads the
+/// motors; a failed readback (TIMEOUT lost, motor silent) revokes the authorization before
+/// returning: MIT stays inactive afterwards and motions are refused.
+#[test]
+fn mit_failed_readback_on_rearm_revokes_authorization() {
+    for label in ["timeout zero", "silent motor"] {
+        let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+        bus.clear_log();
+        let res = if label == "timeout zero" {
+            bus.with(|s| s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 0));
+            inner.set_torque(true)
+        } else {
+            // J4 answers the hand back, then nothing (readback unanswered)
+            inner.mit_hand_back("test").unwrap();
+            bus.with(|s| s.motors[3].silent = true);
+            inner.set_torque(true)
+        };
+        assert!(res.is_err(), "{label}: rearm passed");
+        assert!(!inner.mit_active(), "{label}: MIT still owns J4");
+        assert!(!inner.mit.armed_ok, "{label}: authorization kept");
+        let log = bus.tx_log();
+        if label == "timeout zero" {
+            let back = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data)
+                .expect("hand back before the readback");
+            let read = log.iter().position(|f| f.id == 0x7FF && f.data[..4] == [4, 0, 0x33, 9]).expect("TIMEOUT readback");
+            assert!(back < read, "{label}: readback before the hand back");
+        }
+        bus.with(|s| s.motors[3].silent = false);
+        for _ in 0..5 { inner.tick(DT); }
+        assert!(!inner.mit_active(), "{label}: MIT re-activated without a passed gate");
+        assert!(inner.mit_motion_blocker().is_some(), "{label}: motions allowed");
     }
 }
