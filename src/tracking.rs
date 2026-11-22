@@ -18,6 +18,8 @@ pub const STATIONARY_VELOCITY_RAD_S: f32 = 0.05;
 /// apart that still counts as evidence of rest without velocity feedback (rad;
 /// 0.05 rad/s over a 20 ms tick).
 pub const STATIONARY_POSITION_TOL_RAD: f32 = 1.0e-3;
+/// Oldest a kept reference rest sample may be (its newest joint reply) before it is replaced.
+pub const STATIONARY_SAMPLE_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Per-joint tracking control law.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,9 +201,10 @@ pub struct TrackingRuntime {
     /// toward this hold pose within the active limits, one tick at a time, until it
     /// is at rest (also while the rejection fault is latched).
     pub fallback_ramp: Option<FallbackRamp>,
-    /// Fresh measured arm position of an earlier control tick, with the receive time of
-    /// its newest joint sample: stationarity evidence for drivers without velocity
-    /// feedback (`SupervisorInner::tracking_stationary_evidence`).
+    /// Reference rest sample: a fresh measured arm position of an earlier control tick, with
+    /// the receive time of its newest joint sample, kept while the arm stays within
+    /// tolerance of it (`SupervisorInner::note_tracking_position_sample`): stationarity
+    /// evidence for drivers without velocity feedback.
     pub position_sample: Option<(std::time::Instant, Vec<f32>)>,
     /// Motion caps (`ActiveTrajectory::motion_limits`) of a planned motion whose reference
     /// finished, kept in force until it has settled and its residual lead is ramped out.
@@ -444,17 +447,30 @@ impl crate::supervisor::SupervisorInner {
             && arm.iter().all(|&j| (self.measured_positions[j] - q_prev[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
     }
 
-    /// Record this tick's fresh measured position as the next stationarity sample
-    /// (cleared when feedback is not fresh).
+    /// Maintain the reference rest sample: keep it while it is at most
+    /// [`STATIONARY_SAMPLE_MAX_AGE`] old and this tick's fresh measurement stays within
+    /// [`STATIONARY_POSITION_TOL_RAD`] of it; otherwise replace it with this tick's sample
+    /// (cleared when feedback is not fresh). Keeping it lets a later sample lie a full
+    /// control period after it even when consecutive samples overlap (staggered replies).
     pub fn note_tracking_position_sample(&mut self) {
+        let dof = self.config.dof;
         let fresh = self.hardware_feedback_fresh(std::time::Duration::from_millis(100))
-            && self.measured_positions.len() == self.config.dof
+            && self.measured_positions.len() == dof
             && self.measured_positions.iter().all(|q| q.is_finite());
-        self.tracking.position_sample = if fresh {
-            self.feedback_instant_range().map(|(_, newest)| (newest, self.measured_positions.clone()))
-        } else {
-            None
-        };
+        if !fresh {
+            self.tracking.position_sample = None;
+            return;
+        }
+        let arm = self.config.arm_joint_indices();
+        let keep = self.tracking.position_sample.as_ref().is_some_and(|(newest, q_ref)| {
+            newest.elapsed() <= STATIONARY_SAMPLE_MAX_AGE
+                && q_ref.len() == dof
+                && arm.iter().all(|&j| (self.measured_positions[j] - q_ref[j]).abs() <= STATIONARY_POSITION_TOL_RAD)
+        });
+        if !keep {
+            self.tracking.position_sample =
+                self.feedback_instant_range().map(|(_, newest)| (newest, self.measured_positions.clone()));
+        }
     }
 
     /// Applicable per-joint output limits for the active motion (planned speed cap,

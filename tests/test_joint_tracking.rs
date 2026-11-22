@@ -66,6 +66,8 @@ struct TrackingTestState {
     velocity_feedback: bool,
     /// Last `set_strict_mode_handover` value received.
     strict_mode_handover: Option<bool>,
+    /// Per-joint reported feedback ages; overrides `feedback_age` when set.
+    feedback_ages_per_joint: Option<Vec<Duration>>,
 }
 
 impl TrackingTestState {
@@ -92,6 +94,7 @@ impl TrackingTestState {
             fail_mode_switch: false,
             velocity_feedback: true,
             strict_mode_handover: None,
+            feedback_ages_per_joint: None,
         }
     }
 }
@@ -130,7 +133,10 @@ impl ArmDriver for TrackingTestDriver {
     }
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let s = self.0.lock().unwrap();
-        vec![Some(s.feedback_age); s.dof]
+        match &s.feedback_ages_per_joint {
+            Some(ages) => ages.iter().copied().map(Some).collect(),
+            None => vec![Some(s.feedback_age); s.dof],
+        }
     }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
@@ -4148,4 +4154,50 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
         assert_eq!(act.state, "done", "{label}: e4f72b6 publishes done before the failed final-tick write");
         assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::DriverWriteFailed), "{label}: {:?}", obs.fault);
     }
+}
+
+/// Review 5 #2: a stationary arm without velocity feedback whose joints reply with a steady
+/// 2 ms spread (ticks 20 ms apart, so consecutive samples overlap to 18 ms) reaches rest
+/// evidence: the reference sample is kept across short intervals instead of being replaced
+/// every tick. Feedback timestamps are controlled through the reported ages.
+#[test]
+fn tracking_rest_reference_survives_staggered_joint_replies() {
+    use armd::tracking::TrackingHistoryState;
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(lead_config(true, 0.68)),
+        ..ArmConfig::rebot_dm()
+    };
+    let ms = Duration::from_millis;
+    // Tick k: newest joint reply (80 - 20k) ms old, every odd joint 2 ms older.
+    let ages = |k: u64| -> Vec<Duration> { (0..7u64).map(|j| ms(80 - 20 * k) + ms(2 * (j % 2))).collect() };
+    let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
+    drv.with(|s| {
+        s.velocity_feedback = false;
+        s.feedback_ages_per_joint = Some(ages(0));
+    });
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
+    inner.lease_enabled = false;
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
+    let mut seeded_at = None;
+    for k in 0..4u64 {
+        drv.with(|s| s.feedback_ages_per_joint = Some(ages(k)));
+        let obs = inner.tick(DT);
+        assert!(obs.safety_state.is_operational(), "tick {k}: {:?}", obs.fault);
+        if inner.tracking.history_state != TrackingHistoryState::Unknown {
+            seeded_at = Some(k);
+            break;
+        }
+    }
+    assert!(
+        seeded_at.is_some_and(|k| k >= 2),
+        "a stationary arm with 2 ms reply spread must reach rest evidence once a period has passed (seeded at {seeded_at:?})"
+    );
 }
