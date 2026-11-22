@@ -259,6 +259,9 @@ fn tracking_off_wire_equivalence() {
         };
         let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -4.0];
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.25, 0.25, 0.25, 0.10, 0.05, 0.05, 0.15]);
+        // m1: with tracking absent or disabled, output history must stay empty after enable/tick.
+        assert!(inner.tracking.last_issued_positions.is_none(), "history must stay empty when tracking is off");
+        assert!(inner.tracking.last_issued_velocities.is_none(), "velocity history must stay empty when tracking is off");
         let mut obs_log = Vec::new();
         let mut step = |inner: &mut SupervisorInner, n: usize| {
             for _ in 0..n {

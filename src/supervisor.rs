@@ -1856,7 +1856,11 @@ impl SupervisorInner {
             }
             self.commanded_velocities = vec![0.0; self.config.dof];
             self.commanded_accelerations.fill(0.0);
-            self.tracking.seed(&self.commanded_positions);
+            if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
+                self.tracking.seed(&self.commanded_positions);
+            } else {
+                self.tracking.invalidate();
+            }
             if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             self.active_trajectory = None;
             self.pending_normal_unload = false;
