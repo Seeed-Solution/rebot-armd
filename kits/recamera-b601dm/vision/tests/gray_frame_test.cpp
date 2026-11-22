@@ -7,15 +7,18 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "frame_guard.h"
 #include "gray_frame.h"
 #include "http_control.h"
 #include "json.hpp"
@@ -23,6 +26,17 @@
 
 using namespace rv;
 using json = nlohmann::json;
+
+
+// Allocation-failure injection for this thread only: when armed, the Nth operator new throws.
+static thread_local long t_alloc_countdown = 0;
+void* operator new(std::size_t n) {
+    if (t_alloc_countdown > 0 && --t_alloc_countdown == 0) throw std::bad_alloc();
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 
 static int g_fail = 0;
 #define CHECK(c)                                                     \
@@ -934,6 +948,75 @@ static void test_rollover_preserves_history_slots_and_drops_depth_map() {
     CHECK(map_hit.instance_id == inst1 && map_hit.frame_id == 11 && map_hit.depth_disp && map_hit.depth_disp->size() == 4);
 }
 
+
+// A bad_alloc during publication preparation or in the gray instance-id copy is contained at the
+// frame boundary (contain_frame), and publish() leaves latest_, the gray ring and the history as
+// they were. Every allocation inside publish() is failed in turn until it succeeds.
+static void test_frame_boundary_contains_allocation_failures() {
+    const std::string long_inst(48, 'i');  // beyond the small-string buffer: copying allocates
+    int contained = 0;
+    const char* reason = nullptr;
+    CHECK(!contain_frame([&] {
+        t_alloc_countdown = 1;
+        GrayFrameMeta meta;
+        meta.instance_id = long_inst;
+        t_alloc_countdown = 0;
+    }, [&](const char* w) { reason = w; ++contained; }));
+    t_alloc_countdown = 0;
+    CHECK(contained == 1 && reason && std::strcmp(reason, "allocation failed") == 0);
+    CHECK(!contain_frame([] { throw 42; }, [&](const char*) { ++contained; }));
+    CHECK(!contain_frame([] { throw std::runtime_error("boom"); },
+                         [&](const char* w) { CHECK(std::strcmp(w, "boom") == 0); ++contained; }));
+    CHECK(!contain_frame([] { throw std::runtime_error("x"); }, [](const char*) { throw 1; }));
+    CHECK(contained == 3);
+    CHECK(contain_frame([] {}, [](const char*) {}));
+
+    VisionControl::Options o;
+    o.instance_id = long_inst;
+    VisionControl ctl(o, nullptr);
+    VisionResult first;
+    first.frame_id = ctl.next_frame_id(first.instance_id);
+    first.frame_ms = mono_ms();
+    first.ran_yolo = true;
+    first.ran_gray = true;
+    ctl.publish(first, make_gray(first.instance_id, first.frame_id, 640, 360, 11));
+
+    VisionResult second;
+    second.frame_id = ctl.next_frame_id(second.instance_id);
+    second.frame_ms = first.frame_ms + 1;
+    second.ran_yolo = true;
+    second.ran_gray = true;
+    second.detections_json = std::string(256, 'd');
+    auto gray2 = make_gray(second.instance_id, second.frame_id, 640, 360, 22);
+    int failures = 0;
+    bool published = false;
+    for (long k = 1; k <= 64 && !published; ++k) {
+        std::shared_ptr<GrayFrame> g = gray2;
+        published = contain_frame([&] {
+            t_alloc_countdown = k;
+            ctl.publish(second, std::move(g));
+            t_alloc_countdown = 0;
+        }, [&](const char*) { ++failures; });
+        t_alloc_countdown = 0;
+        if (published) break;
+        VisionResult got;
+        ctl.latest(false, 0, 0, got);
+        CHECK(got.frame_id == first.frame_id && got.ran_gray);
+        std::shared_ptr<const GrayFrame> gf;
+        CHECK(ctl.get_gray(long_inst, second.frame_id, gf) == GrayRing::Lookup::NotStored);
+        CHECK(ctl.get_gray(long_inst, first.frame_id, gf) == GrayRing::Lookup::Found && gf->pixels->at(0) == 11);
+        VisionResult hist;
+        CHECK(!ctl.wait_fresh(long_inst, 0, 0, Pipelines{true, false, false, true}, 10, hist));
+        CHECK(hist.frame_id == first.frame_id);
+    }
+    CHECK(published && failures >= 1);
+    VisionResult got;
+    ctl.latest(false, 0, 0, got);
+    CHECK(got.frame_id == second.frame_id && got.detections_json.size() == 256);
+    std::shared_ptr<const GrayFrame> gf;
+    CHECK(ctl.get_gray(long_inst, second.frame_id, gf) == GrayRing::Lookup::Found && gf->pixels->at(0) == 22);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -955,6 +1038,7 @@ int main(int argc, char** argv) {
     test_depth_map_waiter_intervening_publication();
     test_gray_allocation_failure_after_conversion_and_noexcept_ring();
     test_rollover_preserves_history_slots_and_drops_depth_map();
+    test_frame_boundary_contains_allocation_failures();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;
