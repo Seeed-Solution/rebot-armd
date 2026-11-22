@@ -499,7 +499,7 @@ static bool has_valid_depth_map(const VisionResult& r) noexcept {
            r.depth_disp->size() == static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h);
 }
 
-void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray) {
+void VisionControl::publish(const VisionResult& r, std::shared_ptr<GrayFrame> gray) {
     std::shared_ptr<const GrayFrame> displaced_gray;
     VisionResult displaced_latest;
     VisionResult displaced_depth;
@@ -532,7 +532,11 @@ void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFra
 
         // 2. Commit atomically using strictly non-throwing operations into pre-allocated storage.
         if (gray_ok) {
+            GrayFrame* raw_gray = gray.get();
             displaced_gray = gray_ring_.put(std::move(gray));
+            // Stamp stored_mono_ms after ring insertion while mu_ is still held (no reader can
+            // observe the record until mu_ unlocks, after which it is only exposed as const).
+            raw_gray->stored_mono_ms = mono_ms();
         }
         displaced_latest = std::move(latest_);
         latest_ = std::move(stored);
@@ -560,6 +564,12 @@ void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFra
     gray.reset();
 }
 
+void VisionControl::current_baseline(std::string& instance_out, uint32_t& frame_id_out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    instance_out = (latest_.frame_id != 0 && !latest_.instance_id.empty()) ? latest_.instance_id : instance_id_;
+    frame_id_out = latest_.frame_id;
+}
+
 GrayRing::Lookup VisionControl::get_gray(const std::string& instance_id, uint32_t frame_id,
                                          std::shared_ptr<const GrayFrame>& out) const {
     std::lock_guard<std::mutex> lk(mu_);
@@ -580,12 +590,12 @@ std::shared_ptr<void> VisionControl::try_acquire_gray_send() {
     return nullptr;
 }
 
-bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
-                               bool require_depth_map) {
+bool VisionControl::wait_fresh(const std::string& after_instance, uint32_t after, uint64_t request_ms, Pipelines need,
+                               int wait_ms, VisionResult& out, bool require_depth_map) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
     std::unique_lock<std::mutex> lk(mu_);
-    const std::string start_instance = instance_id_;
+    const std::string start_instance = after_instance.empty() ? instance_id_ : after_instance;
     // A frame planned before this trigger was registered can be newer than request_ms but
     // lack its pipelines; the next one has them. Scanning recent_results_ newest-to-oldest
     // also preserves the qualifying result if a later non-matching frame updates latest_.
@@ -621,6 +631,11 @@ bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines ne
     }
     out = latest_;
     return true;
+}
+
+bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
+                               bool require_depth_map) {
+    return wait_fresh(std::string{}, after, request_ms, need, wait_ms, out, require_depth_map);
 }
 
 bool VisionControl::latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out) {
@@ -1173,10 +1188,9 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
         }
     }
 
-    VisionResult current;
-    ctl.latest(false, 0, 0, current);
-    const uint32_t baseline = current.frame_id;
-    const std::string baseline_instance = current.instance_id.empty() ? ctl.instance_id() : current.instance_id;
+    std::string baseline_instance;
+    uint32_t baseline = 0;
+    ctl.current_baseline(baseline_instance, baseline);
 
     // Served by the first frame newer than this request, with the requested pipelines added
     // to that frame; the camera gate opens meanwhile.
@@ -1189,7 +1203,7 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     {
         auto scope = ctl.trigger_scope(request_ms, want, has_focus ? &focus : nullptr);
         gate_ms = mono_ms();
-        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+        timeout = ctl.wait_fresh(baseline_instance, baseline, request_ms, want, wait_ms, r);
         wake_ms = mono_ms();
     }
     std::ostringstream s;
@@ -1253,17 +1267,16 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     } gate_end{ctl};
 
     const Pipelines want{false, false, true};
-    VisionResult current;
-    ctl.latest(false, 0, 0, current);
-    const uint32_t baseline = current.frame_id;
-    const std::string baseline_instance = current.instance_id.empty() ? ctl.instance_id() : current.instance_id;
+    std::string baseline_instance;
+    uint32_t baseline = 0;
+    ctl.current_baseline(baseline_instance, baseline);
     ctl.depth_map_wait(true);
     const uint64_t request_ms = mono_ms();
     VisionResult r;
     bool timeout = false;
     {
         auto scope = ctl.trigger_scope(request_ms, want, nullptr);
-        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r, /*require_depth_map=*/true);
+        timeout = ctl.wait_fresh(baseline_instance, baseline, request_ms, want, wait_ms, r, /*require_depth_map=*/true);
     }
     ctl.depth_map_wait(false);
     const bool same_inst = (r.instance_id == baseline_instance);

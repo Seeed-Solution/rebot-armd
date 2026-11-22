@@ -465,7 +465,7 @@ static void test_http_server_sockets() {
             vr.ran_yolo = p.yolo;
             vr.ran_aruco = p.aruco;
             vr.ran_depth = p.depth;
-            std::shared_ptr<const GrayFrame> gf;
+            std::shared_ptr<GrayFrame> gf;
             if (p.gray) {
                 gf = make_gray(vr.instance_id, vr.frame_id, 640, 360, static_cast<uint8_t>((vr.frame_id * 13) & 0xFF));
                 vr.ran_gray = true;
@@ -569,67 +569,105 @@ static void test_http_server_sockets() {
         CHECK(ctl.active_gray_sends() == 0);
     }
 
-    // 6. Send deadline with a stalled reader (large synthetic frame so TCP send buffer fills)
-    {
+    // 6. Send deadline with a stalled reader (20 MB synthetic frame so loopback TCP buffers fill)
+    auto make_big_gray = [&]() -> std::pair<uint32_t, size_t> {
         auto big = std::make_shared<GrayFrame>();
         big->instance_id = "rv-sock";
         big->frame_id = ctl.next_frame_id(big->instance_id);
         big->width = 4096;
-        big->height = 1024;
+        big->height = 5120;  // 20 MB > Linux loopback rmem_max + wmem_max
         big->stride = 4096;
-        big->pixels = std::make_shared<std::vector<uint8_t>>(4096u * 1024u, 0x33);
+        big->pixels = std::make_shared<std::vector<uint8_t>>(static_cast<size_t>(big->width) * big->height, 0x33);
         VisionResult vr;
         vr.instance_id = big->instance_id;
         vr.frame_id = big->frame_id;
         vr.frame_ms = mono_ms();
         vr.ran_gray = true;
-        ctl.publish(vr, big);
+        const size_t expected_total = big->pixels->size();
+        ctl.publish(vr, std::move(big));
+        return {vr.frame_id, expected_total};
+    };
 
+    auto drain_socket_bytes = [](int fd) -> size_t {
+        size_t total = 0;
+        char buf[65536];
+        for (;;) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            total += static_cast<size_t>(n);
+        }
+        return total;
+    };
+
+    {
+        const auto [big_id, expected_px] = make_big_gray();
         int stalled = connect_loopback(port, 4096);
         CHECK(stalled >= 0);
         const std::string big_req = "GET /api/frame/gray?instance_id=rv-sock&frame_id=" +
-                                    std::to_string(big->frame_id) +
+                                    std::to_string(big_id) +
                                     " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
         const auto t0 = std::chrono::steady_clock::now();
         ::send(stalled, big_req.data(), big_req.size(), MSG_NOSIGNAL);
 
-        // Wait until slot is taken or server finishes
+        // Must observe the gray send actively in flight and blocked on the slow reader
         bool saw_active = false;
-        for (int i = 0; i < 30; ++i) {
+        for (int i = 0; i < 60; ++i) {
             if (ctl.active_gray_sends() > 0) {
                 saw_active = true;
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
-        // Control plane (/api/mode) stays responsive even while a stalled gray transfer is in flight
+        CHECK(saw_active);
+        // Control plane (/api/mode) stays responsive while stalled gray transfer is in flight
         const std::string mode_resp = http_roundtrip(
             port, "GET /api/mode HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         CHECK(mode_resp.find("HTTP/1.1 200 OK\r\n") == 0);
 
-        // Wait for deadline (300 ms) to abort the stalled transfer and release the slot
-        for (int i = 0; i < 100 && ctl.active_gray_sends() != 0; ++i) {
+        // Wait for the 300 ms send deadline to expire and release the send slot
+        for (int i = 0; i < 150 && ctl.active_gray_sends() != 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(15));
         }
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         CHECK(ctl.active_gray_sends() == 0);
-        if (saw_active) {
-            CHECK(elapsed_ms < 1500);
-        }
+        CHECK(elapsed_ms >= 200 && elapsed_ms < 1500);
+        // Prove the in-flight send actually expired/aborted short of the full body
+        const size_t received = drain_socket_bytes(stalled);
+        CHECK(received > 0 && received < expected_px);
         ::close(stalled);
     }
 
-    // 7. Server shutdown completes promptly even with a stalled connection open
+    // 7. Server shutdown interrupts an actively stalled in-flight gray send well before its deadline
     {
-        int idle_client = connect_loopback(port);
-        CHECK(idle_client >= 0);
+        server.set_send_deadline_ms(5000);
+        const auto [big_id, expected_px] = make_big_gray();
+        int stalled = connect_loopback(port, 4096);
+        CHECK(stalled >= 0);
+        const std::string big_req = "GET /api/frame/gray?instance_id=rv-sock&frame_id=" +
+                                    std::to_string(big_id) +
+                                    " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        ::send(stalled, big_req.data(), big_req.size(), MSG_NOSIGNAL);
+
+        bool saw_active = false;
+        for (int i = 0; i < 100; ++i) {
+            if (ctl.active_gray_sends() > 0) {
+                saw_active = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(saw_active);
+
         const auto t0 = std::chrono::steady_clock::now();
         server.stop();
         const auto stop_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        CHECK(stop_ms < 1000);
-        ::close(idle_client);
+        CHECK(stop_ms < 1000);  // far below the 5000 ms send deadline
+        CHECK(ctl.active_gray_sends() == 0);
+        const size_t received = drain_socket_bytes(stalled);
+        CHECK(received < expected_px);
+        ::close(stalled);
     }
 
     stop_cam.store(true);
@@ -776,6 +814,51 @@ static void test_gray_allocation_failure_after_conversion_and_noexcept_ring() {
     VisionResult matched;
     CHECK(!ctl.wait_fresh(0, mono_ms(), Pipelines{false, false, false, true}, 50, matched));
     CHECK(matched.ran_gray && matched.frame_id == 11);
+
+    // 4. stored_mono_ms is stamped at publication (>= done_ms), and passing a pre-rollover
+    //    (instance, frame_id) baseline across a rollover accepts frame_id=1 of the new instance.
+    VisionControl::Options ro;
+    ro.instance_id = "rv-pre-roll";
+    ro.initial_frame_id = std::numeric_limits<uint32_t>::max() - 1u;
+    VisionControl rctl(ro, nullptr);
+    std::string inst_a;
+    const uint32_t id_a = rctl.next_frame_id(inst_a);
+    CHECK(inst_a == "rv-pre-roll" && id_a == std::numeric_limits<uint32_t>::max());
+    auto ga = make_gray(inst_a, id_a);
+    ga->stored_mono_ms = 0;  // must be stamped by publish()
+    VisionResult vra;
+    vra.instance_id = inst_a;
+    vra.frame_id = id_a;
+    vra.frame_ms = mono_ms();
+    vra.ran_gray = true;
+    rctl.publish(vra, std::move(ga));
+
+    VisionResult latest_a;
+    rctl.latest(false, 0, 0, latest_a);
+    std::shared_ptr<const GrayFrame> stored_a;
+    CHECK(rctl.get_gray(inst_a, id_a, stored_a) == GrayRing::Lookup::Found && stored_a != nullptr);
+    CHECK(stored_a->stored_mono_ms >= latest_a.done_ms && stored_a->stored_mono_ms > 0);
+
+    // Capture baseline BEFORE rollover, then roll over and publish frame_id = 1 in new instance.
+    std::string base_inst;
+    uint32_t base_id = 0;
+    rctl.current_baseline(base_inst, base_id);
+    CHECK(base_inst == "rv-pre-roll" && base_id == std::numeric_limits<uint32_t>::max());
+
+    std::string inst_b;
+    const uint32_t id_b = rctl.next_frame_id(inst_b);
+    CHECK(inst_b != "rv-pre-roll" && id_b == 1);
+    const uint64_t req_ms = mono_ms();
+    VisionResult vrb;
+    vrb.instance_id = inst_b;
+    vrb.frame_id = id_b;
+    vrb.frame_ms = req_ms + 1;
+    vrb.ran_gray = true;
+    rctl.publish(vrb, make_gray(inst_b, id_b));
+
+    VisionResult after_roll;
+    CHECK(!rctl.wait_fresh(base_inst, base_id, req_ms, Pipelines{false, false, false, true}, 100, after_roll));
+    CHECK(after_roll.instance_id == inst_b && after_roll.frame_id == 1);
 }
 
 int main(int argc, char** argv) {

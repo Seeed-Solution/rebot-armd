@@ -757,7 +757,7 @@ int main(int argc, char** argv) {
 
         // Convert the validated RGB888 visible crop into owned gray storage BEFORE YOLO, ArUco,
         // or depth run so downstream preprocessors or scratch buffers cannot alias or mutate it.
-        std::shared_ptr<const rv::GrayFrame> gray_rec;
+        std::shared_ptr<rv::GrayFrame> gray_rec;
         if (p.gray && ctl.gray_available()) {
             const auto t_gray = std::chrono::steady_clock::now();
             const bool src_ok = (frame.format == af::PixelFormat::RGB888 &&
@@ -783,7 +783,6 @@ int main(int argc, char** argv) {
                                                crop.x, crop.y, crop.w, crop.h, meta);
                 if (rec) {
                     rec->convert_ms = ms_since(t_gray);
-                    rec->stored_mono_ms = rv::mono_ms();
                     vr.ran_gray = true;
                     vr.gray_ms = rec->convert_ms;
                     gray_rec = std::move(rec);

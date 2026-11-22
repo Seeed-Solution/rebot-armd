@@ -377,11 +377,14 @@ public:
     }
 
     /**
-     * Atomically publish a processed frame result and its optional immutable gray frame record.
-     * Any evicted gray frame is destroyed outside `mu_`. If `r.ran_gray` is true without a valid
-     * matching `gray` record, `ran_gray` is cleared and nothing is installed in the gray ring.
+     * Atomically publish a processed frame result and its optional gray frame record (frozen as
+     * immutable once retained in `gray_ring_`, with `stored_mono_ms` stamped after insertion under
+     * `mu_`). Any evicted gray frame is destroyed outside `mu_`. If `r.ran_gray` is true without a
+     * valid matching `gray` record, `ran_gray` is cleared and nothing is installed in the gray ring.
      */
-    void publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray = nullptr);
+    void publish(const VisionResult& r, std::shared_ptr<GrayFrame> gray = nullptr);
+    /** Atomically capture the current `(instance_id, frame_id)` baseline under `mu_`. */
+    void current_baseline(std::string& instance_out, uint32_t& frame_id_out) const;
     /** Look up a retained gray frame by `(instance_id, frame_id)` (immediate, no wait). */
     GrayRing::Lookup get_gray(const std::string& instance_id, uint32_t frame_id,
                               std::shared_ptr<const GrayFrame>& out) const;
@@ -392,10 +395,14 @@ public:
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
-     * Wait for a result newer than `after` from a frame newer than request_ms that ran at least
-     * `need` (a trigger's result). When `require_depth_map` is true, only results carrying a valid
-     * `depth_disp` grid satisfy the wait. Returns true on timeout.
+     * Wait for a result newer than `(after_instance, after)` from a frame newer than request_ms
+     * that ran at least `need` (a trigger's result). Passing the captured `(after_instance, after)`
+     * pair prevents a rollover race between baseline capture and wait entry. When
+     * `require_depth_map` is true, only results carrying a valid `depth_disp` grid satisfy the wait.
+     * Returns true on timeout.
      */
+    bool wait_fresh(const std::string& after_instance, uint32_t after, uint64_t request_ms, Pipelines need,
+                    int wait_ms, VisionResult& out, bool require_depth_map = false);
     bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
                     bool require_depth_map = false);
     void shutdown();
