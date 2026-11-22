@@ -629,7 +629,7 @@ fn mit_partial_send_reconnect_through_the_supervisor() {
     // (fresh readback, base modes restored), then a fresh handover
     let mut cleared = false;
     for _ in 0..20 {
-        if inner.clear_fault().is_ok() { cleared = true; break; }
+        if inner.clear_fault_confirmed(true).is_ok() { cleared = true; break; }
         clock.advance(std::time::Duration::from_millis(40));
         inner.tick(DT);
     }
@@ -1223,9 +1223,9 @@ fn mit_expiry_recovery_clears_to_idle_with_torque_off() {
     bus.clear_log();
     let mut ok = None;
     for _ in 0..6 {
-        match inner.clear_fault() { Ok(s) => { ok = Some(s); break; } Err(_) => { clock.advance(std::time::Duration::from_millis(120)); inner.tick(DT); } }
+        match inner.clear_fault_confirmed(true) { Ok(s) => { ok = Some(s); break; } Err(_) => { clock.advance(std::time::Duration::from_millis(120)); inner.tick(DT); } }
     }
-    assert!(ok.is_some(), "no recovery: {:?}", inner.clear_fault());
+    assert!(ok.is_some(), "no recovery: {:?}", inner.clear_fault_confirmed(true));
     assert!(matches!(inner.safety.state(), armd::SafetyState::Idle), "{:?}", inner.safety.state());
     assert!(!inner.is_torqued);
     assert!(bus.with(|s| s.motors.iter().all(|m| !m.enabled)), "every motor disabled");
@@ -1244,7 +1244,7 @@ fn mit_expiry_recovery_keeps_the_fault_when_a_motor_does_not_confirm() {
     bus.with(|s| s.motors[1].no_feedback = true); // J2 answers nothing any more
     let mut last = None;
     for _ in 0..4 {
-        let r = inner.clear_fault();
+        let r = inner.clear_fault_confirmed(true);
         assert!(r.is_err(), "cleared without J2's confirmation");
         last = r.err().map(|e| e.to_string());
         clock.advance(std::time::Duration::from_millis(120));
@@ -1254,4 +1254,46 @@ fn mit_expiry_recovery_keeps_the_fault_when_a_motor_does_not_confirm() {
     assert!(inner.safety.state().is_stopped());
     let disables = bus.tx_log().iter().filter(|f| f.data == damiao::CMD_DISABLE).count();
     assert!(disables < 60, "retry loop: {disables} disable frames");
+}
+
+fn recovery_commands(log: &[armd::transport::CanFrame]) -> usize {
+    log.iter().filter(|f| (1..=7).contains(&f.id) && [damiao::CMD_DISABLE, damiao::CMD_CLEAR_FAULTS].contains(&f.data)).count()
+}
+
+/// Round 6, #1b: without the explicit confirmation the expiry recovery is refused with a specific
+/// code and a message that every joint loses torque; nothing but read-only polls goes out.
+#[test]
+fn mit_expiry_recovery_needs_the_operator_confirmation() {
+    let (mut inner, bus, clock) = expired_after_loss();
+    inner.clear_fault_confirmed(false).ok(); // acknowledges the trip (polls may resume)
+    clock.advance(std::time::Duration::from_millis(300));
+    inner.tick(DT);
+    bus.clear_log();
+    let e = inner.clear_fault_confirmed(false).unwrap_err();
+    let (code, msg) = match &e { armd::ArmError::Rejected { code, message, .. } => (code.clone(), message.clone()), other => (String::new(), other.to_string()) };
+    assert_eq!(code, "MIT_RECOVERY_CONFIRM_REQUIRED", "{e}");
+    assert!(msg.contains("torque off on every joint") && msg.to_lowercase().contains("support"), "{msg}");
+    assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery commands without confirmation");
+    assert!(motion_frames(&bus.tx_log()).is_empty());
+    assert!(inner.safety.state().is_stopped());
+}
+
+/// Round 6, #1a: the trigger is evaluated from fresh feedback read for the request: stale feedback
+/// refuses with no recovery command; fresh feedback that no longer shows the expiry state (here
+/// every motor disabled, no error) takes the ordinary clear path instead of the recovery.
+#[test]
+fn mit_expiry_recovery_reads_fresh_feedback_first() {
+    // stale: no motor answers the fresh read
+    let (mut inner, bus, _clock) = expired_after_loss();
+    bus.with(|s| for m in s.motors.iter_mut() { m.silent = true; });
+    bus.clear_log();
+    assert!(inner.clear_fault_confirmed(true).is_err());
+    assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery command on stale feedback");
+    assert!(inner.safety.state().is_stopped());
+    // the cache says expiry, the motors now report: all disabled, no error
+    let (mut inner, bus, _clock) = expired_after_loss();
+    bus.with(|s| for m in s.motors.iter_mut() { m.enabled = false; m.state_override = None; });
+    bus.clear_log();
+    let _ = inner.clear_fault_confirmed(true);
+    assert_eq!(recovery_commands(&bus.tx_log()), 0, "recovery ran although fresh feedback shows no expiry");
 }

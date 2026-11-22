@@ -114,7 +114,16 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
             inner.set_torque(enabled).map_err(ArmError::from)?;
         }
-        "/api/v1/safety/clear_fault" => { inner.clear_fault().map_err(ArmError::from)?; }
+        "/api/v1/safety/clear_fault" => {
+            // {"mit_recovery": "torque_off_all"}: the operator accepts the MIT expiry recovery
+            // (torque off on every joint); any other value is refused
+            let mit_recovery = match body.get("mit_recovery") {
+                None | Some(Value::Null) => false,
+                Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => true,
+                Some(_) => return Err(invalid_command(&format!("mit_recovery must be \"{}\"", crate::mit::RECOVERY_CONFIRM_VALUE))),
+            };
+            inner.clear_fault_confirmed(mit_recovery)?;
+        }
         "/api/v1/motion/servo" => { inner.servo(positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
         "/api/v1/motion/jog" => {
             let (_, id, duration) = inner.jog_action(positions(body.get("target_positions"))?, body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "joint_move")?;

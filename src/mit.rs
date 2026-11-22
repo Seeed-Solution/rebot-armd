@@ -41,6 +41,14 @@ pub const QUALIFICATION_PATH: &str = "/api/v1/calibration/mit_qualification";
 /// Dynamic-output deadline while tracking owns an MIT joint: a feedback age or a gap between
 /// dynamic outputs of this length cancels the group and latches BUS_LOSS.
 pub const MIT_DEADLINE: Duration = Duration::from_millis(45);
+/// Code of a clear_fault that needs the operator's confirmation of the MIT expiry recovery.
+pub const RECOVERY_CONFIRM_CODE: &str = "MIT_RECOVERY_CONFIRM_REQUIRED";
+/// What the confirmation accepts: torque goes off on every joint.
+pub const RECOVERY_WARNING: &str = "A motor's command timeout expired after the MIT loss. Clearing recovers by turning torque off on every joint: \
+    the arm drops like a park torque-off. Support the arm or bring it to rest, then clear again with {\"mit_recovery\": \"torque_off_all\"}";
+/// Body value of clear_fault that confirms the MIT expiry recovery.
+pub const RECOVERY_CONFIRM_VALUE: &str = "torque_off_all";
+
 /// Ages and gaps from this value up to the deadline are logged and counted as near misses.
 pub const MIT_NEAR_MISS: Duration = Duration::from_millis(36);
 /// Margin of the activation criterion: control period + measured worst-case latency + this
@@ -502,6 +510,8 @@ pub struct MitRuntime {
     pub revoke_pending: bool,
     /// Feedback ages or output gaps at or above [`MIT_NEAR_MISS`] but under the deadline.
     pub near_misses: u64,
+    /// The current clear_fault carries the operator's recovery confirmation.
+    pub recovery_confirmed: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -945,14 +955,8 @@ pub fn invalidate_record(c: &mut crate::calibration::CalibrationFile, joints: &[
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
-    /// After an MIT loss: a motor reports an error state (its command timeout expired: 0xD) or the
-    /// motors are partly enabled, partly disabled.
-    pub(crate) fn mit_expiry_state(&self) -> bool {
-        let Some(st) = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.motor_status()) else { return false };
-        st.iter().any(|&c| c >= 8) || (st.contains(&0) && st.contains(&1))
-    }
-
-    /// clear_fault in [`Self::mit_expiry_state`] (operator, explicit): clear-error to the faulted
+    /// clear_fault after an MIT loss when fresh feedback shows a motor in an error state (its
+    /// command timeout expired: 0xD) or the motors partly enabled (operator, explicit and confirmed): clear-error to the faulted
     /// motors, a disable of every motor confirmed per motor, then Idle with torque off and the
     /// MIT group reset (fence disarmed, history cleared; the qualification record is untouched
     /// and the next arm reads the TIMEOUT again). A motor that does not confirm keeps the fault.
@@ -991,5 +995,22 @@ impl crate::supervisor::SupervisorInner {
         self.safety.clear_fault()?;
         let _ = self.safety.set_torque(false);
         Ok(self.safety.state().clone())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::supervisor::SupervisorInner {
+    /// `clear_fault` with the operator's explicit confirmation of the MIT expiry recovery
+    /// (`{"mit_recovery": "torque_off_all"}`). Without it, the recovery state is refused with
+    /// [`RECOVERY_CONFIRM_CODE`]; every other state clears as `clear_fault`.
+    pub fn clear_fault_confirmed(&mut self, mit_recovery: bool) -> Result<crate::safety::SafetyState, crate::supervisor::ArmError> {
+        self.mit.recovery_confirmed = mit_recovery;
+        let res = self.clear_fault();
+        self.mit.recovery_confirmed = false;
+        res.map_err(|e| match e {
+            crate::safety::SafetyError::ClearFaultRejected(m) if m.starts_with(RECOVERY_CONFIRM_CODE) =>
+                crate::supervisor::ArmError::Rejected { status: 409, code: RECOVERY_CONFIRM_CODE.into(), message: RECOVERY_WARNING.into() },
+            other => crate::supervisor::ArmError::from(other),
+        })
     }
 }

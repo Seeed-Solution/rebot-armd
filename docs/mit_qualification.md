@@ -22,8 +22,12 @@ commissioned again.
 ## Recovery after a motor command timeout
 
 When MIT tracking is lost and a motor's own TIMEOUT then expires, that motor disables itself and
-reports error 0xD (CAN communication loss) while the other motors stay enabled. In that state
-`/api/v1/safety/clear_fault` (operator session) recovers under control: it sends the Damiao
+reports error 0xD (CAN communication loss) while the other motors stay enabled.
+`/api/v1/safety/clear_fault` (operator session) first reads fresh feedback from every motor and
+decides from it (stale feedback: refused, nothing sent). In the expiry state it needs the
+explicit body `{"mit_recovery": "torque_off_all"}` (without it: `409
+MIT_RECOVERY_CONFIRM_REQUIRED`; the cockpit shows the warning and sends the confirmation only on
+a second tap within 8 s). With it armd recovers under control: it sends the Damiao
 clear-error command (`FF FF FF FF FF FF FF FB` on the motor's CAN ID) to every motor in an error
 state, disables every motor and requires fresh state-0 feedback from each, and only then clears to
 Idle. **Torque is then off on every joint**, like a park torque-off: the arm drops onto whatever

@@ -175,6 +175,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
     fn read_motor_identity(&mut self, joints: &[usize]) -> Result<Vec<crate::mit::MotorIdentity>, ArmDriverError> { self.inner.read_motor_identity(joints) }
     fn commission_motor_timeout(&mut self, joints: &[usize], counts: u32) -> Result<Vec<crate::mit::TimeoutCommissioning>, crate::mit::TimeoutBatchError> {

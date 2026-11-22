@@ -2338,8 +2338,20 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("MIT tracking: the control mode of a joint is uncertain after a failed switch; \
                 check the arm and power-cycle the motors".into()));
         }
-        if self.mit.owner == crate::mit::MitOwner::Lost && self.mit_expiry_state() {
-            return self.mit_expiry_recovery();
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            // decided from feedback read for this request, never from the cache
+            let fresh = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
+                Some(mut drv) => drv.mit_fresh_status(),
+                None => Err("no driver".into()),
+            };
+            let st = fresh.map_err(|e| SafetyError::ClearFaultRejected(format!(
+                "MIT tracking: fresh feedback is required before clearing ({e}); nothing was sent")))?;
+            if st.iter().any(|&c| c >= 8) || (st.contains(&0) && st.contains(&1)) {
+                if !std::mem::take(&mut self.mit.recovery_confirmed) {
+                    return Err(SafetyError::ClearFaultRejected(format!("{}: {}", crate::mit::RECOVERY_CONFIRM_CODE, crate::mit::RECOVERY_WARNING)));
+                }
+                return self.mit_expiry_recovery();
+            }
         }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         if let Some(ref d) = self.driver {

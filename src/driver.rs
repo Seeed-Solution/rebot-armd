@@ -273,6 +273,13 @@ pub trait ArmDriver: Send {
         Err("MIT expiry recovery is not supported by this driver".into())
     }
 
+    /// Fresh state of every motor for the MIT expiry recovery decision: a read-only status poll
+    /// to each motor after a receive boundary, and the state codes of feedback received after it.
+    /// Err names the motors without fresh feedback.
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+        Err("fresh status read is not supported by this driver".into())
+    }
+
     /// Current time of the driver's clock (the transport's deterministic clock in tests).
     fn clock_now(&self) -> Instant { Instant::now() }
 
@@ -2981,6 +2988,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn mit_fence_trip(&self) -> Option<String> { self.mit_fence_trip.as_ref().map(|(r, _)| r.clone()) }
 
     fn clock_now(&self) -> Instant { self.now() }
+
+    fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> {
+        let pre = self.rx_boundary().map_err(|e| e.to_string())?;
+        for &id in &self.motor_ids.clone() {
+            self.can.transmit(&damiao::build_refresh_frame(id)).map_err(|e| format!("status poll not sent: {e}"))?;
+        }
+        self.can.flush().map_err(|e| format!("flush: {e}"))?;
+        let start = self.now();
+        loop {
+            let _ = self.read_joint_states();
+            let stale: Vec<String> = (0..self.motor_ids.len()).filter(|&i| self.last_feedback_seq[i] <= pre).map(|i| format!("J{}", i + 1)).collect();
+            if stale.is_empty() { return Ok(self.motor_status.clone()); }
+            if self.since(start) >= REGISTER_REPLY_TIMEOUT {
+                return Err(format!("no fresh feedback from {}", stale.join(", ")));
+            }
+            self.pause(Duration::from_micros(500));
+        }
+    }
 
     fn mit_expiry_recover(&mut self) -> Result<(), String> {
         // 1. clear-error (FF..FB on the motor's ID) to every motor reporting an error state
