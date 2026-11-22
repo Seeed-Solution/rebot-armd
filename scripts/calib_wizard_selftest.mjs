@@ -323,5 +323,88 @@ const solveViews = views;
   const ids = bd.markers.map((x) => x.id).sort((a, b) => a - b);
   check('overlay board ids', n === bd.cols * bd.rows && ids.every((id, i) => id === i) && ids.length === n, `ARU_BOARD_IDS ${n}, board ${bd.cols} x ${bd.rows}, ids ${ids[0]}..${ids.at(-1)}`);
 }
+
+// ---- B8 / M4: physical_contact_end_m + thickness in hover/confirm, full check_points_end_m clearance, TCP boundary
+{
+  // 1. toolPoints includes extraEndPoints (extended corner fails clearance even when stock 3 points pass)
+  const Tend = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.25, 0.0, 0.12]);
+  const Xid = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.0, 0.0, 0.05]);
+  const stockPts = CW.toolPoints(Tend, Xid);
+  const fullPts = CW.toolPoints(Tend, Xid, [[0.032, 0.082, -0.05]]);
+  const stockMinZ = Math.min(...stockPts.map((p) => p[2]));
+  const fullMinZ = Math.min(...fullPts.map((p) => p[2]));
+  check('B8. full envelope toolPoints catches extra check_points_end_m dip',
+    stockMinZ >= 0.10 && fullMinZ < 0.08,
+    `stockMinZ ${stockMinZ.toFixed(3)} m, fullMinZ ${fullMinZ.toFixed(3)} m`);
+
+  // 2. Nonzero physical_contact_end_m [0.0288, 0, 0] + thickness 0.002 m in hover evaluation & confirmation plan
+  const contactEnd = [0.0288, 0, 0];
+  const thick = 0.002;
+  const Rdown = CW.rpyR(0, Math.PI / 2, 0);
+  // Tool pointing down (+X_end along -Z_base): contact at z = 0.014 (0.012 above paper at z = 0.002, table_z = 0.0)
+  // => end_link z must be 0.014 + 0.0288 = 0.0428 m
+  const Tvert = make(Rdown, [0.25, 0.0, 0.0428]);
+  const Ktest = { fx: 500, fy: 500, cx: 320, cy: 180, k1: 0, k2: 0 };
+  const bd = CW.makeBoard();
+  // Board at z = table_z + thickness = 0.002, flipped into table (+Z_board = -Z_base)
+  const TbbHover = make(CW.rpyR(Math.PI, 0, 0), [0.30, 0.0, 0.002]);
+  // Camera mounted 0.15 m above tips looking down along +X_end (optical axis +Z_cam = +X_end)
+  const Xhover = make(VIK.camMount(false, 0), [-0.15, 0.0, 0.0]);
+  const tipEnd = [0.0288 - 0.0023, 0.0, 0.0]; // sticker edge 2.3 mm above contact in end_link frame
+  const tipCam = CW.apply(inv(Xhover), tipEnd);
+  const Tcb = mul(inv(mul(Tvert, Xhover)), TbbHover);
+  const markers = bd.markers.map((m) => ({
+    id: m.id,
+    corners: [0, 1, 2, 3].map((k) => {
+      const pr = CW.project(Ktest, rotOf(Tcb), posOf(Tcb), m.corners[k]);
+      return [pr[0], pr[1]];
+    }),
+  }));
+  const hp = CW.hoverPoint({
+    observations: [{ markers }],
+    board: bd,
+    K: Ktest,
+    tipCam,
+    edgeToLow: 0.0023,
+    Tend: Tvert,
+    X: Xhover,
+    physicalContactEnd: contactEnd,
+  });
+  const ev = CW.evaluateHovers([hp, hp, hp, hp], { edgeToLow: 0.0023, thickness: thick });
+  check('B8. evaluateHovers uses physicalContactEnd and subtracts board thickness once',
+    hp.ok && Math.abs(hp.z_end_m - 0.0428) < 1e-6 && Math.abs(hp.z_contact_m - 0.014) < 1e-6
+      && Math.abs(hp.height_m - 0.012) < 1e-5 && Math.abs(ev.table_z_m - 0.0) < 1e-5,
+    `z_end ${hp.z_end_m?.toFixed(4)}, z_contact ${hp.z_contact_m?.toFixed(4)}, height ${hp.height_m?.toFixed(4)}, table_z ${ev.table_z_m?.toFixed(5)}`);
+
+  // Confirmation hover plan places physical contact at tableZ + thickness + clearanceM (0.014) => end_link at 0.0428
+  const ch = CW.kinChain(CALM.CHAIN), zero = new Array(42).fill(0);
+  const cp = CW.planHover({
+    Tbb: TbbHover,
+    X: Xhover,
+    tipCam,
+    edgeToLow: 0.0023,
+    ch,
+    kCand: zero,
+    kLive: zero,
+    q0,
+    K: Ktest,
+    board: bd,
+    lo,
+    hi,
+    tableZ: 0.0,
+    physicalContactEnd: contactEnd,
+    thickness: thick,
+    plan: { ...CW.HOVER_PLAN, count: 2, minCount: 1 },
+  });
+  check('B8. confirmation plan places rotated physical_contact at tableZ + thickness + clearance',
+    cp.ok && cp.points.length >= 1 && cp.points.every((pt) => Math.abs(pt.hover_m[2] - 0.0428) < 1e-4),
+    `confirm hover z_end ${(cp.points[0]?.hover_m[2] * 1000)?.toFixed(2)} mm (expected 42.80 mm)`);
+
+  // 3. Static contract checks on index.html: cwMove converts EndLink -> TCP once, renderCart uses obs.tcp and tcpOffset
+  check('B8/M4. index.html converts cwMove via CW.apply and uses obs.tcp / tcpOffset in renderCart',
+    html.includes('position: CW.apply(T, off)') && html.includes('cwFineSegment') && html.includes('S.wsCheckPoints')
+      && html.includes('(isSoArm || !C.sending) && hasObsTcp'),
+    'cwMove + cwFineSegment + renderCart verified');
+}
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);
