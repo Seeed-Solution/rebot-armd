@@ -41,6 +41,8 @@ jobs:
         run: node scripts/calib_wizard_selftest.mjs
       - name: RPC error contract
         run: node tests/test_rpc_error_contract.js
+      - name: MIT recovery confirmation (cockpit)
+        run: node tests/test_mit_recovery_confirm.js
 
   kits:
     # Shell syntax of the kit init scripts (the deb itself needs the SG2002 toolchain).
