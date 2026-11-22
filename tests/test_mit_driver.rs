@@ -391,3 +391,30 @@ fn mit_hand_back_respects_the_fence() {
     assert!(bus.tx_log().is_empty(), "sent after the deadline: {:?}", bus.tx_log());
     assert!(d.mit_fence_trip().is_some());
 }
+
+/// Review #7: the 5 ms RX budget running out before the queue is drained (slow host, fewer than
+/// 64 frames) is a backlog of unknown age: it trips, the dequeued samples do not count as fresh.
+#[test]
+fn mit_rx_time_budget_exhaustion_is_a_backlog() {
+    let (mut d, bus, _) = mit_rig(2000);
+    bus.with(|s| { for _ in 0..10 { s.push_feedback(0); } s.rx_step = Duration::from_millis(2); });
+    let _ = d.read_joint_states();
+    assert!(d.mit_fence_trip().is_some_and(|r| r.contains("backlog")), "{:?}", d.mit_fence_trip());
+}
+
+/// Review #7: a batch whose last transmit completes past the deadline (slow controller) trips the
+/// fence; its completion time never becomes the new reference of the deadline.
+#[test]
+fn mit_batch_completing_past_the_deadline_trips() {
+    let (mut d, bus, clock) = mit_rig(2000);
+    clock.advance(Duration::from_millis(10));
+    let t = targets(&mut d, 0.0);
+    d.write_joint_targets(&t).unwrap();
+    let _ = d.read_joint_states();
+    clock.advance(Duration::from_millis(38));
+    let _ = d.read_joint_states();
+    let t = targets(&mut d, 0.0); // fresh feedback; 38 ms after the last batch
+    bus.with(|s| s.tx_step = Duration::from_millis(1)); // 7 frames: completes 45 ms after the last batch
+    let res = d.write_joint_targets(&t);
+    assert!(res.is_err() && d.mit_fence_trip().is_some(), "completion past the deadline accepted: {res:?}");
+}

@@ -3274,6 +3274,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // MIT tracking owns joints: the fence is checked before every transmit; a failed
                 // or partial batch (or flush) trips it and discards every cached frame.
                 self.fence_check()?;
+                // The batch is dated by its start: flush (SocketCAN: queued in the kernel) does
+                // not bound when the frames reach the wire, so the earlier stamp is the safe one.
+                let batch_start = self.now();
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
                         if let Err(e) = self.transmit_fenced(&frame) {
@@ -3287,7 +3290,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.trip_fence(format!("flush failed: {e}"));
                     return Err(e.into());
                 }
-                self.mit_fence_last_tx = Some(self.now());
+                // a batch completing past the deadline trips and never resets it
+                self.fence_check()?;
+                self.mit_fence_last_tx = Some(batch_start);
                 return Ok(());
             }
             DamiaoControlMode::PosVel => {
@@ -3432,9 +3437,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.mit_fence.is_some() {
             if rx_drained {
                 let _ = self.fence_check();
-            } else if frames_processed >= 64 {
-                // the bounded read could not reach the newest sample: the queued latency is unknown
-                self.trip_fence(format!("RX backlog of more than {frames_processed} frames"));
+            } else {
+                // the bounded read (64 frames or 5 ms) could not reach the newest sample: the
+                // queued latency is unknown and nothing dequeued counts as fresh
+                self.trip_fence(format!("RX backlog: queue not drained after {frames_processed} frames"));
             }
         }
         if rx_drained && self.is_enabled && !self.is_enabling && self.recovery_tx_allowed()

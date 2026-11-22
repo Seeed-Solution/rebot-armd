@@ -153,6 +153,9 @@ pub struct FakeBusState {
     pub fail_tx_after: Option<usize>,
     /// Transmits to these command CAN IDs fail.
     pub fail_tx_ids: Vec<u32>,
+    /// Fake time each dequeued frame / each transmit takes (slow host, queued controller).
+    pub rx_step: Duration,
+    pub tx_step: Duration,
     /// The next `n` flushes fail.
     pub fail_flushes: usize,
     /// The 0xCC status poll refreshes the motor watchdog (unknown on the device).
@@ -283,7 +286,7 @@ impl FakeBus {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
         Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), tx_log: Vec::new(), tx_times: Vec::new(), clock,
             tx_lost: false, tx_error: false, tx_stall: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
-            fail_tx_ids: Vec::new(), fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
+            fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeBusState) -> R) -> R { f(&mut self.0.lock().unwrap()) }
     pub fn tx_log(&self) -> Vec<CanFrame> { self.with(|s| s.tx_log.clone()) }
@@ -296,6 +299,7 @@ impl CanTransport for FakeBus {
     }
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let mut s = self.0.lock().unwrap();
+        if let Some(c) = &s.clock { c.advance(s.tx_step); }
         let t = s.now();
         s.tx_log.push(*frame);
         s.tx_times.push(t);
@@ -328,7 +332,10 @@ impl CanTransport for FakeBus {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
         match s.rx.pop_front() {
-            Some(f) => Ok(f),
+            Some(f) => {
+                if let Some(c) = &s.clock { c.advance(s.rx_step); }
+                Ok(f)
+            }
             None => {
                 let p = std::mem::take(&mut s.pending);
                 s.rx.extend(p);
