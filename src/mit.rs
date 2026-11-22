@@ -498,6 +498,8 @@ pub struct MitRuntime {
     pub park_after_hand_back: bool,
     /// Action id of that deferred park (its outcome is reported on it).
     pub deferred_park_action: Option<u64>,
+    /// A rearm was refused while MIT moved the arm: brake, then hand back at rest.
+    pub revoke_pending: bool,
     /// Feedback ages or output gaps at or above [`MIT_NEAR_MISS`] but under the deadline.
     pub near_misses: u64,
 }
@@ -532,6 +534,7 @@ impl crate::supervisor::SupervisorInner {
     pub fn mit_motion_blocker(&self) -> Option<String> {
         if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
         if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
+        if self.mit.revoke_pending { return Some("MIT authorization revoked: braking to rest and handing back".into()); }
         match self.mit.owner {
             MitOwner::Active => None,
             MitOwner::Off => Some(format!("MIT tracking is not active: {}",

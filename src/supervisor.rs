@@ -1798,7 +1798,16 @@ impl SupervisorInner {
             // (no dynamic output during the reads, no silent mode restore).
             if self.mit_active() {
                 self.mit.armed_ok = false;
-                self.mit_hand_back("rearm").map_err(SafetyError::ClearFaultRejected)?;
+                if let Err(e) = self.mit_hand_back("rearm") {
+                    // not at rest: the authorization is gone, so the motion brakes to rest and MIT
+                    // hands back there (the tick); no motion starts meanwhile
+                    if self.mit_active() {
+                        self.active_trajectory = None;
+                        self.servo_target = None;
+                        self.mit.revoke_pending = true;
+                    }
+                    return Err(SafetyError::ClearFaultRejected(e));
+                }
             }
             if let Err(e) = self.mit_gate() {
                 // revoked before returning: no handover until a later arm passes the gate
@@ -5548,6 +5557,15 @@ impl SupervisorInner {
         // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.
         // No-ops while MIT is not requested.
         self.mit_supervise();
+        if self.mit.revoke_pending {
+            // a refused rearm revoked MIT: hand back once the brake reached rest
+            let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
+            if !self.mit_active() || self.safety.state().is_stopped() {
+                self.mit.revoke_pending = false;
+            } else if at_rest && self.mit_hand_back("authorization revoked").is_ok() {
+                self.mit.revoke_pending = false;
+            }
+        }
         if self.mit.park_after_hand_back {
             // a park waits for rest and the confirmed hand back, then starts
             let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);

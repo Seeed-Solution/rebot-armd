@@ -1099,3 +1099,27 @@ fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
     let a = inner.current_observation().action.unwrap();
     assert_eq!((a.id, a.state.as_str()), (id, "running"), "{a:?}");
 }
+
+/// Review round 3, #3: a rearm requested while MIT moves the arm is refused; the authorization is
+/// revoked, the motion brakes to rest (no new motion is accepted meanwhile) and MIT hands back at
+/// rest, so MIT output does not continue after the failed rearm.
+#[test]
+fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
+    goal[3] -= 0.3;
+    inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+    for _ in 0..15 { inner.tick(DT); }
+    assert!(inner.commanded_velocities[3].abs() > 0.01);
+    assert!(inner.set_torque(true).is_err(), "rearm accepted while MIT moves the arm");
+    assert!(inner.active_trajectory.is_none(), "the motion goes on after the refused rearm");
+    assert!(inner.plan_input().is_err(), "motion accepted after the refused rearm");
+    bus.clear_log();
+    for _ in 0..10 { inner.tick(DT); if !inner.mit_active() { break; } }
+    assert!(!inner.mit_active(), "MIT still owns J4");
+    assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data), "no hand back");
+    for _ in 0..5 { inner.tick(DT); }
+    assert!(!inner.mit_active(), "re-activated without a passed gate");
+}
