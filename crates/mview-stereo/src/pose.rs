@@ -108,6 +108,79 @@ pub struct ViewRefine {
     pub rms_after_px: Option<f64>,
 }
 
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchDir {
+    Fwd,
+    Rev,
+}
+
+/// Per-pass pose matching profile collected under `mview-profile`.
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PosePassProfile {
+    pub total_ms: f64,
+    pub integral_ms: f64,
+    pub coarse_score_ms: f64,
+    pub peak_select_ms: f64,
+    pub refine_ms: f64,
+    pub residual_ms: f64,
+    pub cells_cached: u64,
+    pub cells_flat: u64,
+    pub cells_dotted: u64,
+    pub run_len_hist: std::collections::BTreeMap<String, u64>,
+    pub run_count: u64,
+    pub max_run_len: u64,
+    pub half_grid_fwd: [u64; 4],
+    pub half_grid_rev: [u64; 4],
+    pub half_grid_fallback_fwd: u64,
+    pub half_grid_fallback_rev: u64,
+}
+
+#[cfg(feature = "mview-profile")]
+impl PosePassProfile {
+    fn new_seeded() -> Self {
+        let mut p = Self::default();
+        for len in 1..=16 {
+            p.run_len_hist.insert(len.to_string(), 0);
+        }
+        p.run_len_hist.insert("17..32".to_string(), 0);
+        p.run_len_hist.insert("33..64".to_string(), 0);
+        p.run_len_hist.insert("65+".to_string(), 0);
+        p
+    }
+
+    #[inline]
+    fn record_run(&mut self, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.run_count += 1;
+        self.max_run_len = self.max_run_len.max(len);
+        let key = match len {
+            1..=16 => len.to_string(),
+            17..=32 => "17..32".to_string(),
+            33..=64 => "33..64".to_string(),
+            _ => "65+".to_string(),
+        };
+        *self.run_len_hist.entry(key).or_insert(0) += 1;
+    }
+}
+
+/// Top-level pose refinement profile collected under `mview-profile`.
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PoseProfile {
+    pub prep_ms: f64,
+    pub pass1_match_ms: f64,
+    pub pass1_solve_ms: f64,
+    pub pass2_match_ms: f64,
+    pub pass2_solve_ms: f64,
+    pub total_ms: f64,
+    pub pass1: PosePassProfile,
+    pub pass2: PosePassProfile,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PoseRefinement {
     /// The cameras to reconstruct with (kinematic ones for views not refined).
@@ -116,6 +189,8 @@ pub struct PoseRefinement {
     pub n_corrs: usize,
     pub n_marker_corrs: usize,
     pub ms: f64,
+    #[cfg(feature = "mview-profile")]
+    pub profile: Option<PoseProfile>,
 }
 
 fn inside_any(x: f64, y: f64, rects: &[[f64; 4]]) -> bool { rects.iter().any(|r| in_rect(x, y, r)) }
@@ -273,7 +348,14 @@ fn coarse_dot<const N: usize>(img: &Gray, a: &[f32], gx: usize, gy: usize, tr: u
     dot
 }
 
-fn copy_cached_overlap(cxi: i32, cyi: i32, r: i32, cr: &CoarseRect, scratch: &mut MatchScratch) {
+fn copy_cached_overlap(
+    cxi: i32,
+    cyi: i32,
+    r: i32,
+    cr: &CoarseRect,
+    scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] prof: Option<&mut PosePassProfile>,
+) {
     if cr.r < 0 {
         return;
     }
@@ -284,6 +366,8 @@ fn copy_cached_overlap(cxi: i32, cyi: i32, r: i32, cr: &CoarseRect, scratch: &mu
     if ox0 > ox1 || oy0 > oy1 {
         return;
     }
+    #[cfg(feature = "mview-profile")]
+    let t_copy = Instant::now();
     let n = (2 * r + 1) as usize;
     let cn = (2 * cr.r + 1) as usize;
     let len = (ox1 - ox0 + 1) as usize;
@@ -294,6 +378,11 @@ fn copy_cached_overlap(cxi: i32, cyi: i32, r: i32, cr: &CoarseRect, scratch: &mu
         let sj = (gy - (cr.cy as i64 - cr.r as i64)) as usize;
         scratch.scores[dj * n + di0..dj * n + di0 + len]
             .copy_from_slice(&cr.scores[sj * cn + si0..sj * cn + si0 + len]);
+    }
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof {
+        p.cells_cached += (oy1 - oy0 + 1) as u64 * len as u64;
+        p.coarse_score_ms += ms(t_copy);
     }
 }
 
@@ -314,6 +403,7 @@ fn fill_coarse_scores<const N: usize>(
     s1: &[u32],
     s2: &[u64],
     scores: &mut [f32],
+    #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
 ) {
     let tr = t.r;
     let tn = if N > 0 { N } else { 2 * tr + 1 };
@@ -321,6 +411,9 @@ fn fill_coarse_scores<const N: usize>(
     let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
     let sw = f64::from(t.sw);
     let var_floor = 1e-3 * sw;
+    let mut dot_calls: u64 = 0;
+    #[cfg(feature = "mview-profile")]
+    let (mut cells_cached, mut cells_flat) = (0u64, 0u64);
 
     for gy in vy0..=vy1 {
         let j = (gy - (cyi - r)) as usize;
@@ -332,12 +425,24 @@ fn fill_coarse_scores<const N: usize>(
             let cj = gy as i64 - cr.cy as i64 + cr.r as i64;
             (0 <= cj && cj < cn as i64).then_some(cj as usize)
         });
+        #[cfg(feature = "mview-profile")]
+        let mut cur_run: u64 = 0;
         for gx in vx0..=vx1 {
             let i = (gx - (cxi - r)) as usize;
             if let (Some(cr), Some(cj)) = (cached, cj_opt) {
                 let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
                 if 0 <= ci && ci < cn as i64 {
                     scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
+                    #[cfg(feature = "mview-profile")]
+                    {
+                        if cur_run > 0 {
+                            if let Some(p) = prof.as_deref_mut() {
+                                p.record_run(cur_run);
+                            }
+                            cur_run = 0;
+                        }
+                        cells_cached += 1;
+                    }
                     continue;
                 }
             }
@@ -348,12 +453,45 @@ fn fill_coarse_scores<const N: usize>(
                 - (s2[bot_row + ox] - s2[top_row + ox])) as f64;
             let var = sum2 - sum1 * sum1 / sw;
             scores[row_off + i] = if var > var_floor {
+                dot_calls += 1;
+                #[cfg(feature = "mview-profile")]
+                {
+                    cur_run += 1;
+                }
                 let dot = coarse_dot::<N>(img, &t.a, gx as usize, gy as usize, tr);
                 dot / var.sqrt() as f32
             } else {
+                #[cfg(feature = "mview-profile")]
+                {
+                    if cur_run > 0 {
+                        if let Some(p) = prof.as_deref_mut() {
+                            p.record_run(cur_run);
+                        }
+                        cur_run = 0;
+                    }
+                    cells_flat += 1;
+                }
                 0.0
             };
         }
+        #[cfg(feature = "mview-profile")]
+        if cur_run > 0 {
+            if let Some(p) = prof.as_deref_mut() {
+                p.record_run(cur_run);
+            }
+        }
+    }
+
+    crate::ncc_backend::record_coarse_dots_batch(
+        crate::ncc_backend::NccBackendKind::Scalar,
+        dot_calls,
+        dot_calls,
+    );
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof {
+        p.cells_cached += cells_cached;
+        p.cells_flat += cells_flat;
+        p.cells_dotted += dot_calls;
     }
 }
 
@@ -365,6 +503,7 @@ fn fill_coarse_window_integral(
     r: i32,
     cached: Option<&CoarseRect>,
     scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
 ) {
     if let Some(cr) = cached {
         if cr.r >= 0
@@ -373,19 +512,37 @@ fn fill_coarse_window_integral(
             && (cr.cy as i64 - cr.r as i64) <= (cyi as i64 - r as i64)
             && (cyi as i64 + r as i64) <= (cr.cy as i64 + cr.r as i64)
         {
-            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
             return;
         }
     }
 
     let Some(t) = get_t.get_tmpl() else {
         if let Some(cr) = cached {
-            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
         }
         return;
     };
 
     if t.w.is_some() {
+        #[cfg(feature = "mview-profile")]
+        let t_w = Instant::now();
         let n = (2 * r + 1) as usize;
         let cn = cached.map_or(0, |cr| 2 * cr.r + 1);
         for j in 0..n {
@@ -401,6 +558,10 @@ fn fill_coarse_window_integral(
                     let ci = gx as i64 - cr.cx as i64 + cr.r as i64;
                     if 0 <= ci && ci < cn as i64 {
                         scratch.scores[row_off + i] = cr.scores[cj * cn as usize + ci as usize];
+                        #[cfg(feature = "mview-profile")]
+                        if let Some(p) = prof.as_deref_mut() {
+                            p.cells_cached += 1;
+                        }
                         continue;
                     }
                 }
@@ -409,13 +570,25 @@ fn fill_coarse_window_integral(
                 }
             }
         }
+        #[cfg(feature = "mview-profile")]
+        if let Some(p) = prof {
+            p.coarse_score_ms += ms(t_w);
+        }
         return;
     }
 
     let tr = t.r;
     if 2 * tr + 3 > img.w || 2 * tr + 3 > img.h {
         if let Some(cr) = cached {
-            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
         }
         return;
     }
@@ -426,7 +599,15 @@ fn fill_coarse_window_integral(
     let vy1 = (cyi + r).min(img.h as i32 - 2 - tr_i);
     if vx0 > vx1 || vy0 > vy1 {
         if let Some(cr) = cached {
-            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
         }
         return;
     }
@@ -438,11 +619,21 @@ fn fill_coarse_window_integral(
             && (cr.cy as i64 - cr.r as i64) <= vy0 as i64
             && vy1 as i64 <= (cr.cy as i64 + cr.r as i64)
         {
-            copy_cached_overlap(cxi, cyi, r, cr, scratch);
+            copy_cached_overlap(
+                cxi,
+                cyi,
+                r,
+                cr,
+                scratch,
+                #[cfg(feature = "mview-profile")]
+                prof,
+            );
             return;
         }
     }
 
+    #[cfg(feature = "mview-profile")]
+    let t_int = Instant::now();
     let ix0 = (vx0 - tr_i) as usize;
     let iy0 = (vy0 - tr_i) as usize;
     let ix1 = (vx1 + tr_i) as usize;
@@ -472,7 +663,13 @@ fn fill_coarse_window_integral(
             scratch.int_s2[cur + col + 1] = scratch.int_s2[prev + col + 1] + r2;
         }
     }
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof.as_deref_mut() {
+        p.integral_ms += ms(t_int);
+    }
 
+    #[cfg(feature = "mview-profile")]
+    let t_score = Instant::now();
     const COARSE_TN: usize = 2 * COARSE_R + 1;
     if tr == COARSE_R {
         fill_coarse_scores::<COARSE_TN>(
@@ -490,6 +687,8 @@ fn fill_coarse_window_integral(
             &scratch.int_s1,
             &scratch.int_s2,
             &mut scratch.scores,
+            #[cfg(feature = "mview-profile")]
+            prof.as_deref_mut(),
         );
     } else {
         fill_coarse_scores::<0>(
@@ -507,19 +706,47 @@ fn fill_coarse_window_integral(
             &scratch.int_s1,
             &scratch.int_s2,
             &mut scratch.scores,
+            #[cfg(feature = "mview-profile")]
+            prof.as_deref_mut(),
         );
+    }
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof {
+        p.coarse_score_ms += ms(t_score);
     }
 }
 
 /// Coarse candidates of `t` in `img` (half resolution): the local maxima of the NCC on the
 /// integer grid within `r` px of `c` with at least [`POSE_COARSE_MIN`], best first (at most 4).
+#[cfg(test)]
 fn window_peaks_cached(
+    img: &Gray,
+    get_t: impl GetTmpl,
+    c: [f64; 2],
+    r: i32,
+    cached: Option<&CoarseRect>,
+    scratch: &mut MatchScratch,
+) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
+    window_peaks_cached_profiled(
+        img,
+        get_t,
+        c,
+        r,
+        cached,
+        scratch,
+        #[cfg(feature = "mview-profile")]
+        None,
+    )
+}
+
+fn window_peaks_cached_profiled(
     img: &Gray,
     mut get_t: impl GetTmpl,
     c: [f64; 2],
     r: i32,
     cached: Option<&CoarseRect>,
     scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
 ) -> (([[f64; 2]; 4], usize), Option<(i32, i32)>) {
     if r < 0 {
         scratch.scores.clear();
@@ -532,8 +759,20 @@ fn window_peaks_cached(
 
     let center = (cx.abs() < 1e7 && cy.abs() < 1e7 && r < 1_000_000).then_some((cx as i32, cy as i32));
     if let Some((cxi, cyi)) = center {
-        fill_coarse_window_integral(img, get_t, cxi, cyi, r, cached, scratch);
+        fill_coarse_window_integral(
+            img,
+            get_t,
+            cxi,
+            cyi,
+            r,
+            cached,
+            scratch,
+            #[cfg(feature = "mview-profile")]
+            prof.as_deref_mut(),
+        );
     } else {
+        #[cfg(feature = "mview-profile")]
+        let t_fb = Instant::now();
         for j in 0..n {
             let y = cy + j as f64 - r as f64;
             let row_off = j * n;
@@ -545,8 +784,14 @@ fn window_peaks_cached(
                 }
             }
         }
+        #[cfg(feature = "mview-profile")]
+        if let Some(p) = prof.as_deref_mut() {
+            p.coarse_score_ms += ms(t_fb);
+        }
     }
 
+    #[cfg(feature = "mview-profile")]
+    let t_peak = Instant::now();
     scratch.peaks.clear();
     let ni = n as i32;
     for j in 0..ni {
@@ -567,6 +812,10 @@ fn window_peaks_cached(
     let len = scratch.peaks.len().min(4);
     for (dst, src) in top[..len].iter_mut().zip(&scratch.peaks[..len]) {
         *dst = src.1;
+    }
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof {
+        p.peak_select_ms += ms(t_peak);
     }
     ((top, len), center)
 }
@@ -591,7 +840,32 @@ fn pick_match(matches: &mut [([f64; 2], f64)]) -> Option<[f64; 2]> {
 /// `half` of another, in a window of `win` px around `q0` (full resolution): the coarse peaks
 /// refined at full resolution; the best needs [`POSE_NCC_MIN`] and must pass the ratio test
 /// against the best other match more than 2 px away.
+#[cfg(test)]
 fn match_2d_cached(
+    imgs: (&Gray, &Gray),
+    get_tc: impl GetTmpl,
+    get_tf: impl GetTmpl,
+    q0: [f64; 2],
+    win: f64,
+    pcache: PeakCache<'_>,
+    scratch: &mut MatchScratch,
+) -> Option<[f64; 2]> {
+    match_2d_cached_profiled(
+        imgs,
+        get_tc,
+        get_tf,
+        q0,
+        win,
+        pcache,
+        scratch,
+        #[cfg(feature = "mview-profile")]
+        MatchDir::Fwd,
+        #[cfg(feature = "mview-profile")]
+        None,
+    )
+}
+
+fn match_2d_cached_profiled(
     imgs: (&Gray, &Gray),
     get_tc: impl GetTmpl,
     mut get_tf: impl GetTmpl,
@@ -599,15 +873,28 @@ fn match_2d_cached(
     win: f64,
     mut pcache: PeakCache<'_>,
     scratch: &mut MatchScratch,
+    #[cfg(feature = "mview-profile")] dir: MatchDir,
+    #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
 ) -> Option<[f64; 2]> {
     let (full, half) = imgs;
     let r = (win / 2.0).ceil() as i32;
-    let ((top, top_len), center) = window_peaks_cached(half, get_tc, to_half(q0), r, pcache.coarse.as_ref(), scratch);
+    let ((top, top_len), center) = window_peaks_cached_profiled(
+        half,
+        get_tc,
+        to_half(q0),
+        r,
+        pcache.coarse.as_ref(),
+        scratch,
+        #[cfg(feature = "mview-profile")]
+        prof.as_deref_mut(),
+    );
     if let (CoarseCache::ReadWrite(slot), Some(budget), Some((cx, cy))) = (pcache.coarse, pcache.budget.as_deref_mut(), center) {
         if slot.is_none() && budget.try_reserve_cells(scratch.scores.len()) {
             *slot = Some(CoarseRect { cx, cy, r, scores: scratch.scores.clone() });
         }
     }
+    #[cfg(feature = "mview-profile")]
+    let t_ref = Instant::now();
     scratch.matches.clear();
     for h in &top[..top_len] {
         let key = (h[0].abs() < 1e7 && h[1].abs() < 1e7).then(|| (h[0] as i32, h[1] as i32));
@@ -617,7 +904,25 @@ fn match_2d_cached(
         let res = match cached_res {
             Some(v) => v,
             None => {
+                #[cfg(feature = "mview-profile")]
+                let hg0 = crate::half_grid_profile_counts();
                 let computed = get_tf.get_tmpl().and_then(|tf| refine_2d_pose(full, tf, [2.0 * h[0] + 0.5, 2.0 * h[1] + 0.5]));
+                #[cfg(feature = "mview-profile")]
+                if let Some(p) = prof.as_deref_mut() {
+                    let hg1 = crate::half_grid_profile_counts();
+                    let dst = match dir {
+                        MatchDir::Fwd => &mut p.half_grid_fwd,
+                        MatchDir::Rev => &mut p.half_grid_rev,
+                    };
+                    for idx in 0..4 {
+                        dst[idx] += hg1.0[idx] - hg0.0[idx];
+                    }
+                    let fb = hg1.1 - hg0.1;
+                    match dir {
+                        MatchDir::Fwd => p.half_grid_fallback_fwd += fb,
+                        MatchDir::Rev => p.half_grid_fallback_rev += fb,
+                    }
+                }
                 if let (Some(k), Some(rv), Some(budget)) = (key, pcache.refined.as_deref_mut(), pcache.budget.as_deref_mut()) {
                     if budget.try_reserve_refine() {
                         rv.push((k, computed));
@@ -632,7 +937,12 @@ fn match_2d_cached(
             }
         }
     }
-    pick_match(&mut scratch.matches)
+    let picked = pick_match(&mut scratch.matches);
+    #[cfg(feature = "mview-profile")]
+    if let Some(p) = prof {
+        p.refine_ms += ms(t_ref);
+    }
+    picked
 }
 
 struct PreparedFeat {
@@ -692,8 +1002,33 @@ impl TexturePrep {
         self.corrs_with_cache(views, cams, win, None)
     }
 
-    fn corrs_with_cache(&self, views: &[View], cams: &[Camera], win: &[f64], mut cache: Option<&mut MatchCache>) -> Vec<Corr> {
+    fn corrs_with_cache(&self, views: &[View], cams: &[Camera], win: &[f64], cache: Option<&mut MatchCache>) -> Vec<Corr> {
+        self.corrs_with_cache_profiled(
+            views,
+            cams,
+            win,
+            cache,
+            #[cfg(feature = "mview-profile")]
+            None,
+        )
+    }
+
+    fn corrs_with_cache_profiled(
+        &self,
+        views: &[View],
+        cams: &[Camera],
+        win: &[f64],
+        mut cache: Option<&mut MatchCache>,
+        #[cfg(feature = "mview-profile")] mut prof: Option<&mut PosePassProfile>,
+    ) -> Vec<Corr> {
+        #[cfg(feature = "mview-profile")]
+        let t_pass = Instant::now();
         if self.reference >= views.len() || views.len() < 2 || cams.len() != views.len() || win.len() != views.len() || self.halves.len() != views.len() {
+            #[cfg(feature = "mview-profile")]
+            if let Some(p) = prof {
+                p.total_ms = ms(t_pass);
+                p.residual_ms = (p.total_ms - (p.integral_ms + p.coarse_score_ms + p.peak_select_ms + p.refine_ms)).max(0.0);
+            }
             return Vec::new();
         }
         let rv = &views[self.reference];
@@ -710,12 +1045,38 @@ impl TexturePrep {
                 let Some(q0) = cams[j].project(&f.x0) else { continue; };
 
                 if !use_cache {
-                    let Some(q) = match_2d_cached((&v.img, &self.halves[j]), &f.tc, &f.tf, q0, win[j], PeakCache::none(), &mut scratch) else { continue; };
+                    let Some(q) = match_2d_cached_profiled(
+                        (&v.img, &self.halves[j]),
+                        &f.tc,
+                        &f.tf,
+                        q0,
+                        win[j],
+                        PeakCache::none(),
+                        &mut scratch,
+                        #[cfg(feature = "mview-profile")]
+                        MatchDir::Fwd,
+                        #[cfg(feature = "mview-profile")]
+                        prof.as_deref_mut(),
+                    ) else { continue; };
                     // left-right: this view's patch searched back in the reference around the feature
                     let hq = to_half(q);
                     let back = sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
                         .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)))
-                        .and_then(|(bc, bf)| match_2d_cached((&rv.img, &self.halves[self.reference]), &bc, &bf, px, win[j], PeakCache::none(), &mut scratch));
+                        .and_then(|(bc, bf)| {
+                            match_2d_cached_profiled(
+                                (&rv.img, &self.halves[self.reference]),
+                                &bc,
+                                &bf,
+                                px,
+                                win[j],
+                                PeakCache::none(),
+                                &mut scratch,
+                                #[cfg(feature = "mview-profile")]
+                                MatchDir::Rev,
+                                #[cfg(feature = "mview-profile")]
+                                prof.as_deref_mut(),
+                            )
+                        });
                     if back.is_some_and(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX) { obs.push((j, q)); }
                     continue;
                 }
@@ -729,7 +1090,7 @@ impl TexturePrep {
                     continue;
                 }
 
-                let fwd_q = match_2d_cached(
+                let fwd_q = match_2d_cached_profiled(
                     (&v.img, &self.halves[j]),
                     &f.tc,
                     &f.tf,
@@ -737,6 +1098,10 @@ impl TexturePrep {
                     win[j],
                     PeakCache { coarse: CoarseCache::ReadWrite(&mut pair.fwd_coarse), refined: Some(&mut pair.fwd_refined), budget: Some(budget) },
                     &mut scratch,
+                    #[cfg(feature = "mview-profile")]
+                    MatchDir::Fwd,
+                    #[cfg(feature = "mview-profile")]
+                    prof.as_deref_mut(),
                 );
 
                 let accepted = fwd_q.and_then(|q| {
@@ -753,7 +1118,7 @@ impl TexturePrep {
                             let lazy_bc = LazyTmpl::new(|| sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0)));
                             let lazy_bf = LazyTmpl::new(|| sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)));
                             let coarse = rev.coarse.as_ref().map_or(CoarseCache::None, CoarseCache::Read);
-                            match_2d_cached(
+                            match_2d_cached_profiled(
                                 (&rv.img, &self.halves[self.reference]),
                                 lazy_bc,
                                 lazy_bf,
@@ -761,6 +1126,10 @@ impl TexturePrep {
                                 win[j],
                                 PeakCache { coarse, refined: Some(&mut rev.refined), budget: Some(budget) },
                                 &mut scratch,
+                                #[cfg(feature = "mview-profile")]
+                                MatchDir::Rev,
+                                #[cfg(feature = "mview-profile")]
+                                prof.as_deref_mut(),
                             )
                         }
                     } else {
@@ -778,7 +1147,7 @@ impl TexturePrep {
                                 if pair.rev.is_none() {
                                     let mut rev_coarse = None;
                                     let mut rev_refined = Vec::new();
-                                    let b = match_2d_cached(
+                                    let b = match_2d_cached_profiled(
                                         (&rv.img, &self.halves[self.reference]),
                                         &bc,
                                         &bf,
@@ -786,11 +1155,27 @@ impl TexturePrep {
                                         win[j],
                                         PeakCache { coarse: CoarseCache::ReadWrite(&mut rev_coarse), refined: Some(&mut rev_refined), budget: Some(budget) },
                                         &mut scratch,
+                                        #[cfg(feature = "mview-profile")]
+                                        MatchDir::Rev,
+                                        #[cfg(feature = "mview-profile")]
+                                        prof.as_deref_mut(),
                                     );
                                     pair.rev = Some(RevCache { q_bits, px_bits, win_bits, tmpl_valid: true, outcome: b, coarse: rev_coarse, refined: rev_refined });
                                     b
                                 } else {
-                                    match_2d_cached((&rv.img, &self.halves[self.reference]), &bc, &bf, px, win[j], PeakCache::none(), &mut scratch)
+                                    match_2d_cached_profiled(
+                                        (&rv.img, &self.halves[self.reference]),
+                                        &bc,
+                                        &bf,
+                                        px,
+                                        win[j],
+                                        PeakCache::none(),
+                                        &mut scratch,
+                                        #[cfg(feature = "mview-profile")]
+                                        MatchDir::Rev,
+                                        #[cfg(feature = "mview-profile")]
+                                        prof.as_deref_mut(),
+                                    )
                                 }
                             }
                         }
@@ -805,6 +1190,11 @@ impl TexturePrep {
                 if let Some(q) = accepted { obs.push((j, q)); }
             }
             if obs.len() >= 2 { out.push(Corr { obs, on_table: true, marker: false }); }
+        }
+        #[cfg(feature = "mview-profile")]
+        if let Some(p) = prof {
+            p.total_ms = ms(t_pass);
+            p.residual_ms = (p.total_ms - (p.integral_ms + p.coarse_score_ms + p.peak_select_ms + p.refine_ms)).max(0.0);
         }
         out
     }
@@ -1101,25 +1491,83 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     let t0 = Instant::now();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
+    #[cfg(feature = "mview-profile")]
+    let t_prep = Instant::now();
     let prep = texture.then(|| match cams.get(reference) {
         Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
         None => TexturePrep { reference, halves: Vec::new(), feats: Vec::new() },
     });
+    #[cfg(feature = "mview-profile")]
+    let prep_ms = if texture { ms(t_prep) } else { 0.0 };
     let mut cache = prep.as_ref().map(|p| MatchCache::new(p.feats.len(), views.len()));
+    #[cfg(feature = "mview-profile")]
+    let mut pass1_prof = PosePassProfile::new_seeded();
+    #[cfg(feature = "mview-profile")]
+    let t_p1_match = Instant::now();
     let first = match (&prep, cache.as_mut()) {
-        (Some(p), c) => with(p.corrs_with_cache(views, &cams, &vec![pp.window_px; views.len()], c)),
+        (Some(p), c) => with(p.corrs_with_cache_profiled(
+            views,
+            &cams,
+            &vec![pp.window_px; views.len()],
+            c,
+            #[cfg(feature = "mview-profile")]
+            Some(&mut pass1_prof),
+        )),
         (None, _) => extra.to_vec(),
     };
+    #[cfg(feature = "mview-profile")]
+    let pass1_match_ms = ms(t_p1_match);
+    #[cfg(feature = "mview-profile")]
+    let t_p1_solve = Instant::now();
     let r1 = refine_poses(&cams, reference, &first, table_z, pp);
+    #[cfg(feature = "mview-profile")]
+    let pass1_solve_ms = ms(t_p1_solve);
+    #[cfg(feature = "mview-profile")]
+    let mut pass2_prof = PosePassProfile::new_seeded();
+    #[cfg(feature = "mview-profile")]
+    let (mut pass2_match_ms, mut pass2_solve_ms) = (0.0, 0.0);
     let mut out = match (&prep, cache.as_mut()) {
         (Some(p), c) => {
             let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
-            let second = with(p.corrs_with_cache(views, &r1.cams, &win, c));
-            refine_poses(&cams, reference, &second, table_z, pp)
+            #[cfg(feature = "mview-profile")]
+            let t_p2_match = Instant::now();
+            let second = with(p.corrs_with_cache_profiled(
+                views,
+                &r1.cams,
+                &win,
+                c,
+                #[cfg(feature = "mview-profile")]
+                Some(&mut pass2_prof),
+            ));
+            #[cfg(feature = "mview-profile")]
+            {
+                pass2_match_ms = ms(t_p2_match);
+            }
+            #[cfg(feature = "mview-profile")]
+            let t_p2_solve = Instant::now();
+            let r2 = refine_poses(&cams, reference, &second, table_z, pp);
+            #[cfg(feature = "mview-profile")]
+            {
+                pass2_solve_ms = ms(t_p2_solve);
+            }
+            r2
         }
         (None, _) => r1,
     };
     out.ms = ms(t0);
+    #[cfg(feature = "mview-profile")]
+    {
+        out.profile = Some(PoseProfile {
+            prep_ms,
+            pass1_match_ms,
+            pass1_solve_ms,
+            pass2_match_ms,
+            pass2_solve_ms,
+            total_ms: out.ms,
+            pass1: pass1_prof,
+            pass2: pass2_prof,
+        });
+    }
     out
 }
 
@@ -1193,7 +1641,15 @@ pub fn refine_poses(cams: &[Camera], reference: usize, corrs: &[Corr], table_z: 
             n_points: n, n_marker_corners: nm, rms_before_px: before[a], rms_after_px: after[a],
         }
     }).collect();
-    PoseRefinement { cams: st.cams, views, n_corrs: corrs.len(), n_marker_corrs: corrs.iter().filter(|c| c.marker).count(), ms: ms(t0) }
+    PoseRefinement {
+        cams: st.cams,
+        views,
+        n_corrs: corrs.len(),
+        n_marker_corrs: corrs.iter().filter(|c| c.marker).count(),
+        ms: ms(t0),
+        #[cfg(feature = "mview-profile")]
+        profile: None,
+    }
 }
 
 #[cfg(test)]
@@ -1809,5 +2265,76 @@ mod tests {
         let (wcx, wcy) = c_wbase.unwrap();
         let cr_weighted_partial = CoarseRect { cx: wcx, cy: wcy, r: 5, scores: scratch.scores.clone() };
         check_case("weighted_fallback_partial_cache", &img, &tc_weighted, [18.0, 20.0], 5, Some(&cr_weighted_partial), &mut scratch);
+    }
+
+    #[test]
+    fn refine_views_records_scalar_kernel_counts_and_resets() {
+        let look = [0.30, 0.0, 0.0];
+        let mut cam0 = cam_at([0.30, -0.02, 0.45], look);
+        let mut cam1 = cam_at([0.30, 0.02, 0.45], look);
+        for c in [&mut cam0, &mut cam1] {
+            c.cx = 160.0;
+            c.cy = 90.0;
+        }
+        let views = vec![
+            View { cam: cam0, img: render_table_view(&cam0) },
+            View { cam: cam1, img: render_table_view(&cam1) },
+        ];
+        let object_box = [140.0, 75.0, 180.0, 105.0];
+        let exclude = [[0.0, 0.0, 20.0, 20.0]];
+
+        reset_kernel_counts();
+        let res = refine_views(&views, 0, object_box, &exclude, 0.0, &[], true, &PoseParams::default());
+        assert!(res.n_corrs > 0);
+        let diag = backend_diagnostics();
+        assert_eq!(diag.backend, "scalar");
+        assert!(diag.counts.coarse_dots_scalar > 0);
+        assert_eq!(diag.counts.coarse_cells_scalar, diag.counts.coarse_dots_scalar);
+        assert!(diag.counts.half_moments_scalar > 0);
+        assert_eq!(diag.counts.coarse_dots_xthead071, 0);
+        assert_eq!(diag.counts.half_moments_xthead071, 0);
+
+        reset_kernel_counts();
+        assert_eq!(kernel_counts(), KernelCallCounts::default());
+    }
+
+    #[cfg(feature = "mview-profile")]
+    #[test]
+    fn refine_views_populates_pose_profile_with_stage_counts_and_histograms() {
+        let look = [0.30, 0.0, 0.0];
+        let mut cam0 = cam_at([0.30, -0.02, 0.45], look);
+        let mut cam1 = cam_at([0.30, 0.02, 0.45], look);
+        let mut cam2 = cam_at([0.28, 0.01, 0.45], look);
+        for c in [&mut cam0, &mut cam1, &mut cam2] {
+            c.cx = 160.0;
+            c.cy = 90.0;
+        }
+        let views = vec![
+            View { cam: cam0, img: render_table_view(&cam0) },
+            View { cam: cam1, img: render_table_view(&cam1) },
+            View { cam: cam2, img: render_table_view(&cam2) },
+        ];
+        let object_box = [140.0, 75.0, 180.0, 105.0];
+        let exclude = [[0.0, 0.0, 20.0, 20.0]];
+
+        let res = refine_views(&views, 0, object_box, &exclude, 0.0, &[], true, &PoseParams::default());
+        let prof = res.profile.expect("refine_views should populate pose profile");
+        assert!(prof.total_ms > 0.0 && prof.prep_ms > 0.0);
+        assert!(prof.pass1_match_ms > 0.0 && prof.pass2_match_ms >= 0.0);
+        assert!(prof.pass1.cells_dotted > 0);
+        assert!(prof.pass1.run_count > 0);
+        assert!(prof.pass1.max_run_len >= 1);
+        let hist_sum: u64 = prof.pass1.run_len_hist.values().sum();
+        assert_eq!(hist_sum, prof.pass1.run_count);
+        for k in ["1", "16", "17..32", "33..64", "65+"] {
+            assert!(prof.pass1.run_len_hist.contains_key(k), "missing key {k}");
+        }
+        assert!(prof.pass1.half_grid_fwd.iter().sum::<u64>() > 0);
+        assert!(prof.pass1.half_grid_rev.iter().sum::<u64>() > 0);
+        assert!(prof.pass2.cells_cached > 0, "pass 2 should observe cached coarse cells");
+
+        // Standalone refine_poses must leave profile = None.
+        let standalone = refine_poses(&[cam0, cam1, cam2], 0, &[], 0.0, &PoseParams::default());
+        assert!(standalone.profile.is_none());
     }
 }

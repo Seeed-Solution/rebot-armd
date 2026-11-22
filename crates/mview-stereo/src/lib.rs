@@ -51,10 +51,17 @@
 use std::time::Instant;
 
 pub mod kinematics;
+pub mod ncc_backend;
 pub mod pose;
 
 use kinematics::{Mat3, Vec3};
+pub use ncc_backend::{
+    backend_diagnostics, kernel_counts, reset_kernel_counts, BackendDiagnostics, KernelCallCounts,
+    NccBackendKind,
+};
 pub use pose::{marker_corrs, refine_poses, refine_views, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
+#[cfg(feature = "mview-profile")]
+pub use pose::{PosePassProfile, PoseProfile};
 
 /// Patch radius at full resolution (9x9 patches).
 pub const PATCH_R: usize = 4;
@@ -365,6 +372,14 @@ pub struct Stats {
     pub total_ms: f64,
 }
 
+/// NCC call counts collected during reconstruction when `mview-profile` is enabled.
+#[cfg(feature = "mview-profile")]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RecProfile {
+    pub ncc_calls: std::collections::BTreeMap<String, u64>,
+    pub total_ncc_calls: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Reconstruction {
     pub points: Vec<Point>,
@@ -372,7 +387,107 @@ pub struct Reconstruction {
     /// Every feature and how it ended (`point`, `no_peak`, `flat`, `ambiguous`, `edge_no_view`,
     /// `refine`, `left_right`, `reprojection`), for diagnostics.
     pub outcomes: Vec<(Feature, &'static str)>,
+    #[cfg(feature = "mview-profile")]
+    pub profile: Option<RecProfile>,
 }
+
+#[cfg(feature = "mview-profile")]
+mod profile_tls {
+    use super::RecProfile;
+    use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
+
+    thread_local! {
+        static HALF_GRID_COUNTS: Cell<([u64; 4], u64)> = const { Cell::new(([0; 4], 0)) };
+        static REC_NCC_ACTIVE: RefCell<Option<Vec<((bool, bool, usize), u64)>>> = const { RefCell::new(None) };
+    }
+
+    #[inline]
+    pub(crate) fn record_half_grid_phase(phase: usize) {
+        HALF_GRID_COUNTS.with(|c| {
+            let (mut phases, fb) = c.get();
+            phases[phase] += 1;
+            c.set((phases, fb));
+        });
+    }
+
+    #[inline]
+    pub(crate) fn record_half_grid_fallback() {
+        HALF_GRID_COUNTS.with(|c| {
+            let (phases, fb) = c.get();
+            c.set((phases, fb + 1));
+        });
+    }
+
+    #[inline]
+    pub(crate) fn half_grid_counts() -> ([u64; 4], u64) {
+        HALF_GRID_COUNTS.with(Cell::get)
+    }
+
+    #[inline]
+    pub(crate) fn record_rec_ncc(bilinear: bool, weighted: bool, patch_n: usize) {
+        REC_NCC_ACTIVE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(entries) = borrow.as_mut() else {
+                return;
+            };
+            let key = (bilinear, weighted, patch_n);
+            if let Some((_, count)) = entries.iter_mut().find(|(k, _)| *k == key) {
+                *count += 1;
+            } else {
+                entries.push((key, 1));
+            }
+        });
+    }
+
+    pub(crate) struct RecProfileGuard {
+        prev: Option<Vec<((bool, bool, usize), u64)>>,
+    }
+
+    impl RecProfileGuard {
+        pub(crate) fn enter() -> Self {
+            let prev = REC_NCC_ACTIVE.with(|cell| cell.borrow_mut().replace(Vec::new()));
+            Self { prev }
+        }
+
+        pub(crate) fn finish(mut self) -> RecProfile {
+            let entries = REC_NCC_ACTIVE.with(|cell| {
+                let cur = cell.borrow_mut().take();
+                *cell.borrow_mut() = self.prev.take();
+                cur.unwrap_or_default()
+            });
+            let mut ncc_calls = BTreeMap::new();
+            let mut total_ncc_calls = 0u64;
+            for ((bilinear, weighted, patch_n), count) in entries {
+                let interp = if bilinear { "bilinear" } else { "nearest" };
+                let wt = if weighted { "weighted" } else { "unweighted" };
+                ncc_calls.insert(format!("{interp}_{wt}_n{patch_n}"), count);
+                total_ncc_calls += count;
+            }
+            RecProfile {
+                ncc_calls,
+                total_ncc_calls,
+            }
+        }
+    }
+
+    impl Drop for RecProfileGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = self.prev.take() {
+                REC_NCC_ACTIVE.with(|cell| {
+                    *cell.borrow_mut() = Some(prev);
+                });
+            } else {
+                REC_NCC_ACTIVE.with(|cell| {
+                    let _ = cell.borrow_mut().take();
+                });
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mview-profile")]
+pub(crate) use profile_tls::half_grid_counts as half_grid_profile_counts;
 
 // ---- patches ----
 
@@ -458,6 +573,9 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
     let r = t.r;
     if !img.inside(x, y, r, if bilinear { 1.0 } else { 0.5 }) { return None; }
     let n = 2 * r + 1;
+    ncc_backend::record_patch_moments(ncc_backend::NccBackendKind::Scalar);
+    #[cfg(feature = "mview-profile")]
+    profile_tls::record_rec_ncc(bilinear, t.w.is_some(), n);
     // s1, s2 in f64: in f32 `s2 - s1*s1/sw` cancels (bright patches: s2 ~ 1e6 x n^2) and was off by up
     // to 0.4 NCC on real reCamera frames.
     let (mut s1, mut s2, mut dot) = (0.0f64, 0.0f64, 0.0f32);
@@ -531,6 +649,7 @@ fn half_grid_accum<const N: usize, const PHASE: u8>(img: &Gray, t: &Tmpl, base: 
 
 #[inline]
 fn half_grid_dispatch<const PHASE: u8>(img: &Gray, t: &Tmpl, base: usize, r: usize) -> (u32, u32, f32) {
+    ncc_backend::record_half_moments(ncc_backend::NccBackendKind::Scalar);
     const PATCH_N: usize = 2 * PATCH_R + 1;
     if r == PATCH_R {
         half_grid_accum::<PATCH_N, PHASE>(img, t, base)
@@ -545,6 +664,8 @@ fn half_grid_dispatch<const PHASE: u8>(img: &Gray, t: &Tmpl, base: usize, r: usi
 fn ncc_half_grid(img: &Gray, t: &Tmpl, x: f64, y: f64) -> Option<f32> {
     let r = t.r;
     if t.w.is_some() || r > HALF_GRID_MAX_R {
+        #[cfg(feature = "mview-profile")]
+        profile_tls::record_half_grid_fallback();
         return ncc(img, t, x, y, true);
     }
     if !img.inside(x, y, r, 1.0) {
@@ -554,11 +675,31 @@ fn ncc_half_grid(img: &Gray, t: &Tmpl, x: f64, y: f64) -> Option<f32> {
     let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
     let base = || (y0 as usize - r) * img.w + x0 as usize - r;
     let ((is1, is2, dot), s1_scale, s2_scale) = match (fx, fy) {
-        (0.0, 0.0) => (half_grid_dispatch::<0>(img, t, base(), r), 1.0f64, 1.0f64),
-        (0.5, 0.0) => (half_grid_dispatch::<1>(img, t, base(), r), 0.5f64, 0.25f64),
-        (0.0, 0.5) => (half_grid_dispatch::<2>(img, t, base(), r), 0.5f64, 0.25f64),
-        (0.5, 0.5) => (half_grid_dispatch::<3>(img, t, base(), r), 0.25f64, 0.0625f64),
-        _ => return ncc(img, t, x, y, true),
+        (0.0, 0.0) => {
+            #[cfg(feature = "mview-profile")]
+            profile_tls::record_half_grid_phase(0);
+            (half_grid_dispatch::<0>(img, t, base(), r), 1.0f64, 1.0f64)
+        }
+        (0.5, 0.0) => {
+            #[cfg(feature = "mview-profile")]
+            profile_tls::record_half_grid_phase(1);
+            (half_grid_dispatch::<1>(img, t, base(), r), 0.5f64, 0.25f64)
+        }
+        (0.0, 0.5) => {
+            #[cfg(feature = "mview-profile")]
+            profile_tls::record_half_grid_phase(2);
+            (half_grid_dispatch::<2>(img, t, base(), r), 0.5f64, 0.25f64)
+        }
+        (0.5, 0.5) => {
+            #[cfg(feature = "mview-profile")]
+            profile_tls::record_half_grid_phase(3);
+            (half_grid_dispatch::<3>(img, t, base(), r), 0.25f64, 0.0625f64)
+        }
+        _ => {
+            #[cfg(feature = "mview-profile")]
+            profile_tls::record_half_grid_fallback();
+            return ncc(img, t, x, y, true);
+        }
     };
     let s1 = f64::from(is1) * s1_scale;
     let s2 = f64::from(is2) * s2_scale;
@@ -1116,7 +1257,15 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     mut perturb: impl FnMut(usize, [f64; 2]) -> [f64; 2]) -> Reconstruction {
     let t_all = Instant::now();
     let mut rec = Reconstruction::default();
-    if reference >= views.len() || views.len() < 2 { return rec; }
+    if reference >= views.len() || views.len() < 2 {
+        #[cfg(feature = "mview-profile")]
+        {
+            rec.profile = Some(RecProfile::default());
+        }
+        return rec;
+    }
+    #[cfg(feature = "mview-profile")]
+    let rec_guard = profile_tls::RecProfileGuard::enter();
     let t0 = Instant::now();
     let pv: Vec<PView> = views.iter().map(|v| PView { cam: v.cam, full: &v.img, half: v.img.half() }).collect();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
@@ -1221,6 +1370,10 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     }
     rec.stats.points = rec.points.len();
     rec.stats.total_ms = ms(t_all);
+    #[cfg(feature = "mview-profile")]
+    {
+        rec.profile = Some(rec_guard.finish());
+    }
     rec
 }
 
@@ -2065,5 +2218,90 @@ mod tests {
         assert!(got_edge.iter().any(|f| f.normal.is_none()));
         assert!(got_edge.iter().any(|f| f.normal.is_some()));
         assert_features_bit_eq(&got_edge, &exp_edge);
+    }
+
+    #[test]
+    fn kernel_counts_track_half_grid_and_generic_ncc() {
+        let (w, h) = (32, 32);
+        let px: Vec<u8> = (0..w * h)
+            .map(|k| {
+                let (x, y) = ((k % w) as f64, (k / w) as f64);
+                (128.0 + 50.0 * (0.47 * x + 0.19 * y).sin() + 45.0 * (0.31 * x - 0.53 * y).cos())
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let img = Gray::new(w, h, px).unwrap();
+        let t = make_tmpl(sample_int(&img, 14, 14, PATCH_R), PATCH_R, None, 0.0).unwrap();
+
+        reset_kernel_counts();
+        assert!(ncc_half_grid(&img, &t, 14.5, 14.0).is_some());
+        assert!(ncc(&img, &t, 14.25, 14.75, true).is_some());
+        assert!(ncc(&img, &t, 1.0, 1.0, true).is_none());
+
+        let counts = kernel_counts();
+        assert_eq!(counts.half_moments_scalar, 1);
+        assert_eq!(counts.patch_moments_scalar, 1);
+        assert_eq!(counts.half_moments_xthead071, 0);
+        assert_eq!(counts.patch_moments_xthead071, 0);
+
+        reset_kernel_counts();
+        assert_eq!(kernel_counts(), KernelCallCounts::default());
+    }
+
+    #[cfg(feature = "mview-profile")]
+    #[test]
+    fn reconstruction_profile_counts_ncc_variants_without_pose_pollution() {
+        let look = [0.30, 0.0, 0.0];
+        let cams = [cam_at([0.1, -0.04, 0.3], look), cam_at([0.1, 0.0, 0.3], look), cam_at([0.1, 0.04, 0.3], look)];
+        let (w, h) = (120usize, 90usize);
+        let render = |cam: &Camera| -> Gray {
+            let mut c = *cam;
+            c.fx = 220.0;
+            c.fy = 220.0;
+            c.cx = 60.0;
+            c.cy = 45.0;
+            let mut px = vec![120u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let d = c.ray([x as f64, y as f64]);
+                    let t = -c.c[2] / d[2];
+                    let wx = c.c[0] + t * d[0];
+                    let wy = c.c[1] + t * d[1];
+                    let gx = (wx / 0.01).floor() as i64;
+                    let gy = (wy / 0.01).floor() as i64;
+                    let pat = ((gx.wrapping_mul(73856093) ^ gy.wrapping_mul(19349663)).wrapping_mul(83492791) >> 24) & 0xff;
+                    px[y * w + x] = (40 + (pat * 180) / 255) as u8;
+                }
+            }
+            Gray::new(w, h, px).unwrap()
+        };
+        let views: Vec<View> = cams
+            .iter()
+            .map(|cam| {
+                let mut c = *cam;
+                c.fx = 220.0;
+                c.fy = 220.0;
+                c.cx = 60.0;
+                c.cy = 45.0;
+                View { cam: c, img: render(cam) }
+            })
+            .collect();
+
+        // Run a pose-style generic NCC call beforehand; it must NOT pollute RecProfile.
+        let t_pre = make_tmpl(sample_int(&views[0].img, 40, 40, PATCH_R), PATCH_R, None, 0.0).unwrap();
+        assert!(ncc(&views[0].img, &t_pre, 40.3, 40.2, true).is_some());
+
+        let mut p = Params::new(0.0);
+        p.max_object_features = 15;
+        p.max_table_features = 10;
+        p.max_edge_features = 10;
+        let rec = reconstruct(&views, 1, [15.0, 15.0, 105.0, 75.0], [35.0, 25.0, 85.0, 65.0], &p);
+        let prof = rec.profile.expect("profile should be populated");
+        assert!(prof.total_ncc_calls > 0);
+        let sum: u64 = prof.ncc_calls.values().sum();
+        assert_eq!(sum, prof.total_ncc_calls);
+        assert!(prof.ncc_calls.contains_key("nearest_unweighted_n5"));
+        assert!(prof.ncc_calls.contains_key("bilinear_unweighted_n9"));
     }
 }
