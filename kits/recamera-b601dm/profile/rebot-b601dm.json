@@ -475,6 +475,83 @@
     "joint_limit_margin_rad": 0.05,
     "ramp_max_deviation_rad": 0.15
   },
+  "joint_tracking": {
+    "enabled": false,
+    "joints": [
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.68,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      },
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.65,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      },
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.71,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      },
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.17,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      },
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.0,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      },
+      {
+        "strategy": "position_lead",
+        "lag_s": 0.0,
+        "max_lead_rad": 0.03,
+        "kp": 0.0,
+        "kd": 0.0,
+        "gravity_scale": 0.0,
+        "coulomb_nm": 0.0,
+        "viscous_nm_s_rad": 0.0,
+        "inertia_kg_m2": 0.0,
+        "effort_limit_nm": 0.0
+      }
+    ]
+  },
   "damiao_ranges": [
     {
       "p_max": 12.5,
