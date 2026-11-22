@@ -7462,8 +7462,15 @@ impl ArmSupervisor {
             self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
             return (*obs).clone();
         }
-        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.read().await;
+        // A tick may have published while this call waited for the lock: serve that one
+        // instead of recomputing (and of a timestamp older than the published one).
+        if let Some(obs) = self.cached_observation() {
+            drop(inner);
+            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return (*obs).clone();
+        }
+        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
         inner.current_observation()
     }
 
@@ -8069,5 +8076,29 @@ mod observation_snapshot_tests {
         sup.tick(0.02).await;
         sup.get_observation().await;
         assert_eq!(sup.tick_stats().observation_cache.hits, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_waited_for_the_lock_serves_the_snapshot_published_meanwhile() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let writer = sup.inner().write().await;
+        let reader = {
+            let sup = sup.clone();
+            tokio::spawn(async move { sup.get_observation().await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // what a tick does under its guard
+        let mut published = writer.current_observation();
+        published.timestamp = 123.0;
+        sup.publish_observation(ObservationSnapshot {
+            generation: sup.inner().generation(),
+            at: Instant::now(),
+            max_age: Duration::from_secs(1),
+            obs: Arc::new(published),
+        });
+        drop(writer);
+        assert_eq!(reader.await.unwrap().timestamp, 123.0);
+        let c = sup.tick_stats().observation_cache;
+        assert_eq!((c.hits, c.misses), (1, 0));
     }
 }
