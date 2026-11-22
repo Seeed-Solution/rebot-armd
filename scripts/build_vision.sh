@@ -58,7 +58,7 @@ if [ -n "${RECAMERA_DOCKER:-}" ]; then
     CONTAINER_WORK="$(docker exec "$C" mktemp -d /tmp/rebot-vision-build.XXXXXX)"
     docker exec "$C" mkdir -p "${CONTAINER_WORK}/src" "${CONTAINER_WORK}/build"
     docker cp "${SRC_DIR}/." "$C:${CONTAINER_WORK}/src"
-    docker exec "$C" bash -s -- "${CONTAINER_WORK}" "${GCC_BIN}" "${SDK}" "${SSCMA}" "${UNPINNED}" <<'EOF'
+    docker exec -i "$C" bash -s -- "${CONTAINER_WORK}" "${GCC_BIN}" "${SDK}" "${SSCMA}" "${UNPINNED}" <<'EOF'
 set -euo pipefail
 W="$1"
 GCC_BIN="$2"
