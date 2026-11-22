@@ -839,7 +839,8 @@ pub fn feature_region(b: [f64; 4]) -> [f64; 4] {
 /// computed: armd's configuration has no jaw geometry. Measured on the real B601-DM with the v8
 /// camera holder (2026-11-21 debug bundles, 640x360): the dark jaws covered x 323..453, y 257..359
 /// in every view; this region adds about 20 px on each side. The jaws move with the camera, so
-/// their corners match at zero disparity; features in this region are not used.
+/// their corners match at zero disparity; features in this region are used neither for the pose
+/// refinement nor for the reconstruction.
 pub const GRIPPER_REGION_NORM: [f64; 4] = [0.47, 0.66, 0.74, 1.0];
 
 /// [`GRIPPER_REGION_NORM`] in pixels of an image of `size`.
@@ -864,7 +865,8 @@ pub fn shared_marker_corners(markers: &[Vec<mview_stereo::Marker>], reference: u
 pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64, mode: PoseRefine, markers: &[Vec<mview_stereo::Marker>]) -> Computed {
     let t0 = Instant::now();
     let region_px = feature_region(ref_box_px);
-    let p = Params::new(table_z);
+    let mut p = Params::new(table_z);
+    p.exclude_px = views.get(reference).map(|v| gripper_region_px([v.img.w as f64, v.img.h as f64]));
     let pose = (mode != PoseRefine::Off).then(|| {
         let mut pp = mview_stereo::PoseParams::default();
         let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();

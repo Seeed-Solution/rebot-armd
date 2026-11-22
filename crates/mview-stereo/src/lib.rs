@@ -15,7 +15,8 @@
 //!   `max_edge_features` edges with a uniform side (a plain face: the outline of a plain object)
 //!   and up to a third of it, less a fifth of the corners in the box, textured on both sides.
 //! - Depth range: a feature in the box is swept between `table_z - DEPTH_BELOW_TABLE_M` and
-//!   `table_z + max_height_m`, one outside it (table) up to `table_z + TABLE_SWEEP_ABOVE_M`.
+//!   `table_z + max_height_m` (0.12 m), one outside it (table) up to `table_z + TABLE_SWEEP_ABOVE_M`.
+//!   Features in `exclude_px` (the gripper jaws) are not used.
 //! - Views per feature: every other view for a corner; for an edge point only the views whose
 //!   epipolar line in the reference image crosses the edge at more than [`EDGE_MIN_ANGLE_DEG`]
 //!   (a line along the edge does not locate it). Of those, the [`SWEEP_VIEWS`] spread farthest
@@ -34,7 +35,7 @@
 //! - Triangulation: least-squares midpoint of the rays of all matched views; points with a
 //!   reprojection error above `reproj_max_px` in any view are dropped. An edge point is
 //!   `consistent` when at least two other views matched and the points triangulated from the
-//!   reference with each of them agree within [`EDGE_CONSISTENCY_M`] (or 3 px of disparity): a
+//!   reference with each of them agree within [`EDGE_CONSISTENCY_M`]: a
 //!   mismatch, or a silhouette of a curved surface that moves with the view, fails it.
 //! - Table plane ([`fit_table_plane`]): a plane fitted (RANSAC, then least squares) to the points
 //!   outside the box near the calibrated table height; heights are measured from it and the
@@ -71,10 +72,10 @@ pub const TOP_NEIGHBOURS: usize = 9;
 pub const TABLE_BAND_BELOW_M: f64 = 0.05;
 /// An edge point is matched only in views whose epipolar line crosses the edge at more than this.
 pub const EDGE_MIN_ANGLE_DEG: f64 = 30.0;
-/// Pairwise triangulations of an edge point must agree within max(this (m), the depth of
-/// EDGE_CONSISTENCY_PX of disparity at the shortest pair baseline) for the top height.
-pub const EDGE_CONSISTENCY_M: f64 = 0.004;
-pub const EDGE_CONSISTENCY_PX: f64 = 3.0;
+/// Pairwise triangulations of an edge point must agree within this (m) for the top height. (It
+/// was max(4 mm, the depth of 3 px of disparity at the shortest pair baseline): at 0.45 m and
+/// 4 cm that is 19 mm, so silhouette points of a curved surface passed.)
+pub const EDGE_CONSISTENCY_M: f64 = 0.005;
 /// Edge points are searched in the object box grown by this fraction of its size on each side.
 pub const EDGE_REGION_GROW: f64 = 0.25;
 /// Object points farther than max(3 x the median, ISOLATION_MIN_M) from their ISOLATION_K-th
@@ -174,6 +175,9 @@ pub struct Params {
     pub table_z_m: f64,
     /// Upper bound of the sweep above the table for features in the box (m).
     pub max_height_m: f64,
+    /// Image region without features (px [x0, y0, x1, y1]; the gripper jaws, which move with the
+    /// camera).
+    pub exclude_px: Option<[f64; 4]>,
     pub max_object_features: usize,
     pub max_table_features: usize,
     pub max_edge_features: usize,
@@ -207,7 +211,7 @@ pub struct Params {
 impl Params {
     pub fn new(table_z_m: f64) -> Self {
         Self {
-            table_z_m, max_height_m: 0.25, max_object_features: 200, max_table_features: 60, max_edge_features: 120,
+            table_z_m, max_height_m: 0.12, exclude_px: None, max_object_features: 200, max_table_features: 60, max_edge_features: 120,
             min_feature_dist_px: 5.0, min_edge_dist_px: 4.0, edge_min_grad: 6.0,
             sweep_min: 0.6, ncc_min: 0.8, ratio: 0.7, lr_tol_px: 2.0, reproj_max_px: 2.0, sweep_step_px: 0.75, object_min_h_m: 0.005,
             min_object_points: 8, plane: None, corner_rel_floor: 0.002, corner_cell_px: 16,
@@ -589,6 +593,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     for (l, x, y) in cand {
         let is_in = in_rect(x as f64, y as f64, &inner);
         if (is_in && n_in >= qi) || (!is_in && n_out >= qo) { continue; }
+        if p.exclude_px.is_some_and(|r| in_rect(x as f64, y as f64, &r)) { continue; }
         if corner_grid.near(x, y, d2) { continue; }
         corner_grid.add(x, y);
         out.push(Feature { x, y, normal: None, side: 0.0, strength: l });
@@ -671,6 +676,7 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
         let plain = score >= 1e4;
         if (plain && n_plain >= quota_plain) || (!plain && n_tex >= quota_tex) { continue; }
         if corner_grid.near(x, y, dc2) || edge_grid.near(x, y, de2) { continue; }
+        if p.exclude_px.is_some_and(|r| in_rect(x as f64, y as f64, &r)) { continue; }
         edge_grid.add(x, y);
         out.push(Feature { x, y, normal: Some(nrm), side, strength: if plain { score - 1e4 } else { score } });
         if plain { n_plain += 1 } else { n_tex += 1 }
@@ -1027,10 +1033,7 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         let tri = triangulate(&mcams, &pxs);
         let consistent = f.normal.is_none() || (mcams.len() >= 3 && {
             let pts: Vec<Vec3> = (1..mcams.len()).filter_map(|k| triangulate(&[mcams[0], mcams[k]], &[pxs[0], pxs[k]]).map(|t| t.0)).collect();
-            // tolerance: EDGE_CONSISTENCY_M, or EDGE_CONSISTENCY_PX of disparity at the shortest pair baseline
-            let z = kinematics::norm(&kinematics::sub(&x0, &rv.cam.c));
-            let b = (1..mcams.len()).map(|k| kinematics::norm(&kinematics::sub(&mcams[k].c, &mcams[0].c))).fold(f64::INFINITY, f64::min);
-            let tol = EDGE_CONSISTENCY_M.max(z * z * EDGE_CONSISTENCY_PX / (rv.cam.fx * b.max(1e-3)));
+            let tol = EDGE_CONSISTENCY_M;
             pts.len() == mcams.len() - 1 && pts.iter().enumerate().all(|(i, a)| pts[i + 1..].iter().all(|b| kinematics::norm(&kinematics::sub(a, b)) <= tol))
         });
         rec.stats.triangulate_ms += ms(t0);

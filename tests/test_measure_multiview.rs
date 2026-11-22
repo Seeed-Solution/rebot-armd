@@ -782,7 +782,8 @@ fn off_uses_the_kinematic_cameras() {
     let bx = render::box_px(&scene, &scene.boxes[0], &views[0].cam);
     let off = mm::compute(&views, 0, bx, 0.0, mm::PoseRefine::Off, &[]);
     assert!(off.pose.is_none());
-    let plain = armd::mview_stereo::reconstruct(&views, 0, off.region_px, bx, &armd::mview_stereo::Params::new(0.0));
+    let p = armd::mview_stereo::Params { exclude_px: Some(mm::gripper_region_px(cam.size)), ..armd::mview_stereo::Params::new(0.0) };
+    let plain = armd::mview_stereo::reconstruct(&views, 0, off.region_px, bx, &p);
     assert_eq!(off.rec.points, plain.points);
     let auto = mm::compute(&views, 0, bx, 0.0, mm::PoseRefine::Auto, &[]);
     let pr = auto.pose.unwrap();
