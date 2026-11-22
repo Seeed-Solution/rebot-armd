@@ -30,54 +30,113 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC_DIR="${REPO_ROOT}/kits/recamera-b601dm/vision"
 OUT_DIR="${REPO_ROOT}/target/vision-riscv"
 UNPINNED="-DREBOT_VISION_ALLOW_UNPINNED=$([ "${REBOT_VISION_ALLOW_UNPINNED:-0}" = 1 ] && echo ON || echo OFF)"
-mkdir -p "${OUT_DIR}"
 
-OUT_BIN="${OUT_DIR}/rebot-vision"
-OUT_MAP="${OUT_DIR}/rebot-vision.map"
-OUT_SHA="${OUT_DIR}/rebot-vision.sha256"
+# Output layout: every build fills its own generation directory, and one rename of the
+# `current` symlink publishes binary, map and checksum together:
+#   generations/<id>/{rebot-vision,rebot-vision.map,rebot-vision.sha256}   (never rewritten)
+#   current -> generations/<id>
+#   rebot-vision, rebot-vision.map, rebot-vision.sha256 -> current/...    (compatibility)
+# A reader that needs a matching set resolves `current` once (readlink -f) and reads from that
+# directory. A failed or interrupted build changes nothing visible except: a failure while
+# `current` still names the generation seen at start removes `current`, so no older binary
+# reads as this build's output. The newest KEEP_GENERATIONS generations are kept.
+GEN_ROOT="${OUT_DIR}/generations"
+CURRENT="${OUT_DIR}/current"
 LOCK_FILE="${OUT_DIR}/.publish.lock"
-STAGE_DIR="$(mktemp -d "${OUT_DIR}/.stage.XXXXXX")"
+KEEP_GENERATIONS=3
+mkdir -p "${GEN_ROOT}"
+
+GEN_ID="$(date -u +%Y%m%dT%H%M%SZ).$$"
+STAGE_DIR="$(mktemp -d "${GEN_ROOT}/.staging.$$.XXXXXX")"
 STAGE_BIN="${STAGE_DIR}/rebot-vision"
 STAGE_MAP="${STAGE_DIR}/rebot-vision.map"
 STAGE_SHA="${STAGE_DIR}/rebot-vision.sha256"
 HOST_BUILD=""
 CONTAINER_WORK=""
 PUBLISHED=0
+LOCK_DIR="${LOCK_FILE}.d"
+LOCK_HELD_DIR=0
 
-file_identity() {
-    if [ ! -e "$1" ]; then
+# Serialise publishers. flock(1) when present: the kernel drops the lock when the holder dies.
+# Otherwise a mkdir lock that records its owner's PID; a lock whose owner is gone is taken over,
+# and the EXIT trap releases a lock this shell holds.
+acquire_lock() {
+    if [ "${LOCK_HELD_DIR}" = 1 ]; then
         return 0
     fi
-    stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null || true
-}
-
-with_publish_lock() {
     if command -v flock >/dev/null 2>&1; then
-        (
-            flock -x 9
-            "$@"
-        ) 9>"${LOCK_FILE}"
-    else
-        local lockdir="${LOCK_FILE}.d"
-        while ! mkdir "${lockdir}" 2>/dev/null; do sleep 0.05; done
-        "$@"
-        local rc=$?
-        rmdir "${lockdir}" 2>/dev/null || true
-        return "${rc}"
+        exec 9>"${LOCK_FILE}"
+        flock -x 9
+        return 0
+    fi
+    while ! mkdir "${LOCK_DIR}" 2>/dev/null; do
+        local owner
+        owner="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+        if [ -n "${owner}" ] && ! kill -0 "${owner}" 2>/dev/null; then
+            rm -rf "${LOCK_DIR}"
+            continue
+        fi
+        sleep 0.1
+    done
+    echo $$ > "${LOCK_DIR}/pid"
+    LOCK_HELD_DIR=1
+}
+
+release_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>&-
+    elif [ "${LOCK_HELD_DIR}" = 1 ]; then
+        rm -rf "${LOCK_DIR}"
+        LOCK_HELD_DIR=0
     fi
 }
 
-PREV_INODE="$(file_identity "${OUT_BIN}")"
+# Atomically point `link` at `target` (rename(2) of a fresh symlink over the old entry).
+swap_link() {
+    local target="$1" link="$2" tmp
+    tmp="${link}.tmp.$$"
+    rm -f "${tmp}"
+    ln -s "${target}" "${tmp}"
+    mv -T "${tmp}" "${link}" 2>/dev/null || mv -fh "${tmp}" "${link}"
+}
 
-clear_stale_if_unchanged() {
-    if [ -n "${PREV_INODE}" ] && [ "$(file_identity "${OUT_BIN}")" = "${PREV_INODE}" ]; then
-        rm -f "${OUT_BIN}" "${OUT_MAP}" "${OUT_SHA}"
-    fi
+START_GEN="$(readlink "${CURRENT}" 2>/dev/null || true)"
+
+# Old generations beyond KEEP_GENERATIONS (never the current one) and staging directories of
+# builds that are no longer running. Called with the lock held.
+collect_garbage() {
+    local cur keep=0 d pid
+    cur="$(readlink "${CURRENT}" 2>/dev/null || true)"
+    for d in $(ls -1d "${GEN_ROOT}"/g.* 2>/dev/null | sort -r); do
+        if [ "generations/$(basename "${d}")" = "${cur}" ]; then
+            continue
+        fi
+        keep=$((keep + 1))
+        if [ "${keep}" -ge "${KEEP_GENERATIONS}" ]; then
+            rm -rf "${d}"
+        fi
+    done
+    for d in "${GEN_ROOT}"/.staging.*; do
+        [ -d "${d}" ] || continue
+        pid="$(basename "${d}" | cut -d. -f3)"
+        if [ "${d}" != "${STAGE_DIR}" ] && [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+            rm -rf "${d}"
+        fi
+    done
 }
 
 cleanup() {
     if [ "${PUBLISHED}" != 1 ]; then
-        with_publish_lock clear_stale_if_unchanged || true
+        acquire_lock || true
+        if [ -n "${START_GEN}" ] && [ "$(readlink "${CURRENT}" 2>/dev/null || true)" = "${START_GEN}" ]; then
+            rm -f "${CURRENT}"
+        elif [ -z "${START_GEN}" ] && [ ! -e "${CURRENT}" ]; then
+            # outputs of the layout before generations (regular files) are stale as well
+            for f in rebot-vision rebot-vision.map rebot-vision.sha256; do
+                if [ -f "${OUT_DIR}/${f}" ] && [ ! -L "${OUT_DIR}/${f}" ]; then rm -f "${OUT_DIR}/${f}"; fi
+            done
+        fi
+        release_lock || true
     fi
     rm -rf "${STAGE_DIR}"
     if [ -n "${HOST_BUILD}" ]; then
@@ -88,6 +147,8 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ -n "${RECAMERA_DOCKER:-}" ]; then
     C="${RECAMERA_DOCKER}"
@@ -154,22 +215,22 @@ else
     fi
 fi
 
-chmod 0755 "${STAGE_BIN}"
+chmod 0755 "${STAGE_BIN}" "${STAGE_DIR}"
 SHA256="$(sha256sum "${STAGE_BIN}" | awk '{print $1}')"
 SIZE="$(ls -lh "${STAGE_BIN}" | awk '{print $5}')"
 printf '%s  rebot-vision\n' "${SHA256}" > "${STAGE_SHA}"
 
-publish_artifacts() {
-    mv -f "${STAGE_BIN}" "${OUT_BIN}"
-    if [ -f "${STAGE_MAP}" ]; then
-        mv -f "${STAGE_MAP}" "${OUT_MAP}"
-    else
-        rm -f "${OUT_MAP}"
-    fi
-    mv -f "${STAGE_SHA}" "${OUT_SHA}"
-}
-
-with_publish_lock publish_artifacts
+GEN_DIR="${GEN_ROOT}/g.${GEN_ID}"
+acquire_lock
+mv -T "${STAGE_DIR}" "${GEN_DIR}" 2>/dev/null || mv "${STAGE_DIR}" "${GEN_DIR}"
+swap_link "generations/g.${GEN_ID}" "${CURRENT}"
 PUBLISHED=1
+for f in rebot-vision rebot-vision.map rebot-vision.sha256; do
+    if [ "$(readlink "${OUT_DIR}/${f}" 2>/dev/null || true)" != "current/${f}" ]; then
+        swap_link "current/${f}" "${OUT_DIR}/${f}"
+    fi
+done
+collect_garbage
+release_lock
 
-echo "rebot-vision: ${OUT_BIN} (${SIZE}, sha256=${SHA256})"
+echo "rebot-vision: ${GEN_DIR}/rebot-vision (${SIZE}, sha256=${SHA256})"

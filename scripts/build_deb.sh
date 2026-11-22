@@ -157,7 +157,8 @@ if [ -n "${REBOT_VISION_BIN:-}" ]; then
 else
     echo "[2/5] Building rebot-vision in container ${RECAMERA_DOCKER}..."
     "${SCRIPT_DIR}/build_vision.sh"
-    VISION_BIN="${REPO_ROOT}/target/vision-riscv/rebot-vision"
+    # resolve the published generation once (binary and checksum of one build)
+    VISION_BIN="$(readlink -f "${REPO_ROOT}/target/vision-riscv/current")/rebot-vision"
 fi
 if [ ! -f "${VISION_BIN}" ]; then
     echo "Error: rebot-vision binary not found at ${VISION_BIN}" >&2
