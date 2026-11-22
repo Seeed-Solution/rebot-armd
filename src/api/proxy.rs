@@ -172,9 +172,27 @@ impl DetectorUpstream {
             Some(i) => (&rest[..i], rest[i..].trim_end_matches('/')),
             None => (rest, ""),
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?),
-            None => (authority, 80),
+        let (host, port) = if let Some(rest_br) = authority.strip_prefix('[') {
+            let Some((h, after)) = rest_br.split_once(']') else {
+                return Err(format!("unclosed IPv6 literal in detector URL: {url}"));
+            };
+            let port = if after.is_empty() {
+                80
+            } else if let Some(p) = after.strip_prefix(':') {
+                p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?
+            } else {
+                return Err(format!("invalid authority in detector URL: {url}"));
+            };
+            (h, port)
+        } else {
+            let (h, p) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port in detector URL: {url}"))?),
+                None => (authority, 80),
+            };
+            if h.contains('[') || h.contains(']') {
+                return Err(format!("invalid host in detector URL: {url}"));
+            }
+            (h, p)
         };
         if host.is_empty() || host.contains(|c: char| c.is_whitespace() || c.is_control()) {
             return Err(format!("invalid host in detector URL: {url}"));
@@ -221,9 +239,14 @@ pub(crate) struct UpstreamResponse {
 /// Raw HTTP/1.1 request bytes. A request with a body always carries `Content-Type: application/json`
 /// (the detector rejects other content types on POST /api/trigger and /api/inference).
 fn build_request(up: &DetectorUpstream, method: &Method, path_and_query: &str, body: Option<&[u8]>) -> Vec<u8> {
+    let host_hdr = if up.host.contains(':') {
+        format!("[{}]:{}", up.host, up.port)
+    } else {
+        format!("{}:{}", up.host, up.port)
+    };
     let mut req = format!(
-        "{method} {}{path_and_query} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\nConnection: close\r\n",
-        up.base_path, up.host, up.port
+        "{method} {}{path_and_query} HTTP/1.1\r\nHost: {host_hdr}\r\nAccept: application/json\r\nConnection: close\r\n",
+        up.base_path
     );
     if let Some(b) = body {
         req.push_str(&format!("Content-Type: application/json\r\nContent-Length: {}\r\n", b.len()));

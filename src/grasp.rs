@@ -1113,6 +1113,8 @@ pub struct GrayFrame {
     pub grab_mono_ms: u64,
     pub stored_mono_ms: u64,
     pub convert_ms: f64,
+    /// HTTP transfer duration (ms), excluding RGF1 JSON parsing and pixel buffer copy.
+    pub fetch_ms: f64,
     pub parse_ms: f64,
 }
 
@@ -1385,6 +1387,7 @@ pub fn parse_gray_frame_with_format(
         grab_mono_ms,
         stored_mono_ms,
         convert_ms,
+        fetch_ms: 0.0,
         parse_ms,
     })
 }
@@ -1692,6 +1695,7 @@ impl DetectionSource for HttpDetectionSource {
                 return Err(GrayFrameError::Protocol("invalid gray frame instance_id".into()));
             }
             let path = format!("/api/frame/gray?instance_id={instance_id}&frame_id={frame_id}");
+            let t_fetch = Instant::now();
             let (status, content_type, body) = crate::api::proxy::request_status_bytes(
                 &self.upstream,
                 "GET",
@@ -1700,6 +1704,7 @@ impl DetectionSource for HttpDetectionSource {
             )
             .await
             .map_err(|e| GrayFrameError::Transport(format!("gray frame {frame_id}: {e}")))?;
+            let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
             if status != axum::http::StatusCode::OK {
                 let err_code = serde_json::from_slice::<Value>(&body)
                     .ok()
@@ -1720,7 +1725,9 @@ impl DetectionSource for HttpDetectionSource {
                     content_type.as_deref().unwrap_or("<missing>")
                 )));
             }
-            parse_gray_frame(&body, Some(&instance_id), Some(frame_id))
+            let mut frame = parse_gray_frame(&body, Some(&instance_id), Some(frame_id))?;
+            frame.fetch_ms = fetch_ms;
+            Ok(frame)
         })
     }
     fn trigger_with_focus(&self, pipelines: &'static [&'static str], wait_ms: u64, focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {

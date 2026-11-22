@@ -210,8 +210,10 @@ impl DetectionSource for FakeVision {
         let req_inst = instance_id.to_string();
         Box::pin(async move {
             self.gray_fetches.fetch_add(1, Ordering::SeqCst);
+            let t_fetch = Instant::now();
             let d = self.gray_fetch_delay_ms.load(Ordering::SeqCst);
             if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
+            let fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
             if let Some(err) = self.gray_fail_queue.lock().unwrap().pop_front() {
                 return Err(err);
             }
@@ -250,6 +252,7 @@ impl DetectionSource for FakeVision {
                 grab_mono_ms: 10002 + s.id,
                 stored_mono_ms: 10007 + s.id,
                 convert_ms: 4.5,
+                fetch_ms,
                 parse_ms: 0.2,
             })
         })

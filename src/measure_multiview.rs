@@ -695,7 +695,8 @@ async fn capture_gray(
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
     let bracket_limit = if plan.request.pose_refine == PoseRefine::Off { BRACKET_RAD } else { BRACKET_REFINED_RAD };
     let pipelines = if markers { YOLO_ARUCO_GRAY } else { YOLO_GRAY };
-    let (cw, ch) = (plan.cam.size[0].round() as usize, plan.cam.size[1].round() as usize);
+    let (cw, ch) = exact_camera_dims(plan.cam.size, "camera model (grasp setup image_size_px)")
+        .map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
     let mut tries: Vec<(f32, usize)> = Vec::new();
     let mut retry_reasons: Vec<String> = Vec::new();
     let mut last_acq_err: Option<String> = None;
@@ -728,7 +729,6 @@ async fn capture_gray(
             last_acq_err = Some(format!("gray frame {}: provider did not produce gray image", trig.frame.frame_id));
             continue;
         }
-        let t_fetch = Instant::now();
         let gray = match src.gray_frame(&instance_id, trig.frame.frame_id).await {
             Ok(g) => g,
             Err(e) if e.is_retryable() => {
@@ -738,7 +738,7 @@ async fn capture_gray(
             }
             Err(e) => return Err(fail("DETECTION_UNAVAILABLE", e.to_string())),
         };
-        let frame_fetch_ms = t_fetch.elapsed().as_secs_f64() * 1000.0;
+        let frame_fetch_ms = gray.fetch_ms;
         if gray.img.w != cw || gray.img.h != ch {
             return Err(fail("DETECTION_UNAVAILABLE", format!(
                 "gray frame is {}x{}; the camera model (grasp setup image_size_px) is {cw}x{ch}",
@@ -1278,12 +1278,35 @@ impl BundleImage {
     }
 }
 
+/// Validate exact integer pixel dimensions from a camera model `[w, h]` (no rounding of
+/// fractional sizes).
+fn exact_camera_dims(size: [f64; 2], label: &str) -> Result<(usize, usize), String> {
+    let [w, h] = size;
+    if !w.is_finite()
+        || !h.is_finite()
+        || w <= 0.0
+        || h <= 0.0
+        || w.fract() != 0.0
+        || h.fract() != 0.0
+        || w > usize::MAX as f64
+        || h > usize::MAX as f64
+    {
+        return Err(format!("{label} must be positive integer pixels, got {w}x{h}"));
+    }
+    Ok((w as usize, h as usize))
+}
+
+/// Stream a grayscale image directly as canonical binary PGM (`P5\n<w> <h>\n255\n` + exact `w * h`
+/// bytes) without allocating an extra copy of the pixel buffer.
+pub fn write_pgm<W: std::io::Write>(mut out: W, img: &Gray) -> std::io::Result<()> {
+    write!(out, "P5\n{} {}\n255\n", img.w, img.h)?;
+    out.write_all(&img.px)
+}
+
 /// Encode a grayscale image as canonical binary PGM (`P5\n<w> <h>\n255\n` + exact `w * h` bytes).
 pub fn encode_pgm(img: &Gray) -> Vec<u8> {
-    let header = format!("P5\n{} {}\n255\n", img.w, img.h);
-    let mut out = Vec::with_capacity(header.len() + img.px.len());
-    out.extend_from_slice(header.as_bytes());
-    out.extend_from_slice(&img.px);
+    let mut out = Vec::with_capacity(32 + img.px.len());
+    let _ = write_pgm(&mut out, img);
     out
 }
 
@@ -1343,7 +1366,7 @@ pub fn parse_pgm(data: &[u8], expected_size: [f64; 2]) -> Result<Gray, String> {
     }
     pos += 1;
 
-    let (cw, ch) = (expected_size[0].round() as usize, expected_size[1].round() as usize);
+    let (cw, ch) = exact_camera_dims(expected_size, "camera model (intrinsics size)")?;
     if w == 0 || h == 0 || w != cw || h != ch {
         return Err(format!("PGM is {w}x{h}; the camera model (intrinsics size) is {cw}x{ch}"));
     }
@@ -1367,7 +1390,7 @@ fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, images: &[(us
         let path = dir.join(format!("view_{k}.{}", img.ext()));
         match img {
             BundleImage::Jpeg(j) => std::fs::write(path, j)?,
-            BundleImage::Gray(g) => std::fs::write(path, encode_pgm(g))?,
+            BundleImage::Gray(g) => write_pgm(std::fs::File::create(path)?, g)?,
         }
     }
     let tmp = dir.join(".bundle.json.tmp");
@@ -1450,7 +1473,7 @@ pub fn write_replay_bundle_gray(dir: &std::path::Path, imgs: &[Gray], cams: &[Ca
     let c0 = cams.first().copied().ok_or_else(|| std::io::Error::other("no camera"))?;
     let mut views = Vec::with_capacity(imgs.len());
     for (k, (img, c)) in imgs.iter().zip(cams).enumerate() {
-        std::fs::write(dir.join(format!("view_{k}.pgm")), encode_pgm(img))?;
+        write_pgm(std::fs::File::create(dir.join(format!("view_{k}.pgm")))?, img)?;
         views.push(json!({
             "file": format!("view_{k}.pgm"), "encoding": "pgm", "frame_source": "gray",
             "camera": {"r_base_cam": mat_json(&c.r), "c_m": c.c}
@@ -1898,10 +1921,12 @@ mod tests {
         let g = parse_pgm(&with_comment, [4.0, 2.0]).unwrap();
         assert_eq!(g.px, vec![b'#', b' ', b'\n', 4, 5, 6, 7, 8]);
 
-        // Reject bad magic, bad maxval, geometry mismatch, truncated, extra trailing byte
+        // Reject bad magic, bad maxval, geometry mismatch (incl. fractional dims), truncated, extra byte
         assert!(parse_pgm(b"P2\n4 2\n255\n12345678", [4.0, 2.0]).is_err());
         assert!(parse_pgm(b"P5\n4 2\n65535\n12345678", [4.0, 2.0]).is_err());
         assert!(parse_pgm(b"P5\n4 2\n255\n12345678", [8.0, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n255\n12345678", [4.4, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n255\n12345678", [4.0, 2.2]).is_err());
         assert!(parse_pgm(b"P5\n4 2\n255\n1234567", [4.0, 2.0]).is_err());
         assert!(parse_pgm(b"P5\n4 2\n255\n123456789", [4.0, 2.0]).is_err());
     }

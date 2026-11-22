@@ -116,4 +116,30 @@ async fn http_detection_source_gray_negotiation_and_strict_fetch() {
     assert!(matches!(src.gray_frame("rv-golden-0001", 999).await, Err(GrayFrameError::Transport(m)) if m.contains("timed out")));
     // Older provider rejecting unknown pipeline
     assert!(src.trigger_gray(&["unknown_old"], 1000).await.unwrap_err().contains("400"));
+
+    // IPv6 loopback URL ([::1]:port) connects without brackets in the resolver and sends bracketed Host
+    let v6_listener = tokio::net::TcpListener::bind("[::1]:0").await.expect("bind IPv6 loopback");
+    let v6_port = v6_listener.local_addr().unwrap().port();
+    let v6_app = axum::Router::new()
+        .route("/api/mode", axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+            let expected_host = format!("[::1]:{v6_port}");
+            assert_eq!(headers.get(header::HOST).and_then(|v| v.to_str().ok()), Some(expected_host.as_str()));
+            axum::Json(json!({
+                "api_version": 2, "mode": "yolo", "enabled": false, "per_request_pipelines": true,
+                "available": {"yolo": true, "aruco": true, "depth": false, "gray": true},
+                "gray_frames": {"encoding": "RGF1", "format": "gray8", "width": 640, "height": 360, "stride": 640, "ring": 4, "exposure_qualified": false}
+            }))
+        }))
+        .route("/api/frame/gray", axum::routing::get(|| async {
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/octet-stream")], GOLDEN_RGF1)
+        }));
+    tokio::spawn(async move { axum::serve(v6_listener, v6_app).await.unwrap(); });
+    let up = DetectorUpstream::parse(&format!("http://[::1]:{v6_port}")).unwrap();
+    assert!(up.is_loopback());
+    let v6_src = HttpDetectionSource { upstream: up, image_size_px: [640.0, 360.0] };
+    let v6_mode = v6_src.mode_info().await.expect("IPv6 loopback /api/mode connect");
+    assert!(v6_mode.gray_available && v6_mode.upstream_loopback);
+    let v6_gray = v6_src.gray_frame("rv-golden-0001", 7).await.expect("IPv6 loopback gray fetch");
+    assert_eq!((v6_gray.img.w, v6_gray.img.h), (640, 360));
+    assert!(v6_gray.fetch_ms >= 0.0 && v6_gray.fetch_ms.is_finite());
 }

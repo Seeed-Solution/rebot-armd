@@ -102,7 +102,7 @@ impl DetectionSource for GrayOnlyVision {
                 frame_size: [640, 640], crop: [0, 140, 640, 360],
                 ts_ms: 1763791234000 + frame_id, frame_mono_ms: 10000 + frame_id,
                 wait_mono_ms: 9990 + frame_id, grab_mono_ms: 10002 + frame_id,
-                stored_mono_ms: 10007 + frame_id, convert_ms: 4.3, parse_ms: 0.2,
+                stored_mono_ms: 10007 + frame_id, convert_ms: 4.3, fetch_ms: 0.8, parse_ms: 0.2,
             })
         })
     }
