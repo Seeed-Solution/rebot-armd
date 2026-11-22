@@ -66,8 +66,9 @@ struct TrackingTestState {
     velocity_feedback: bool,
     /// Last `set_strict_mode_handover` value received.
     strict_mode_handover: Option<bool>,
-    /// Per-joint reported feedback ages; overrides `feedback_age` when set.
-    feedback_ages_per_joint: Option<Vec<Duration>>,
+    /// Reported per-joint feedback receive instants (`ArmDriver::feedback_instants`); when
+    /// None they are derived from the reported ages.
+    feedback_instants: Option<Vec<std::time::Instant>>,
 }
 
 impl TrackingTestState {
@@ -94,7 +95,7 @@ impl TrackingTestState {
             fail_mode_switch: false,
             velocity_feedback: true,
             strict_mode_handover: None,
-            feedback_ages_per_joint: None,
+            feedback_instants: None,
         }
     }
 }
@@ -133,10 +134,14 @@ impl ArmDriver for TrackingTestDriver {
     }
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         let s = self.0.lock().unwrap();
-        match &s.feedback_ages_per_joint {
-            Some(ages) => ages.iter().copied().map(Some).collect(),
-            None => vec![Some(s.feedback_age); s.dof],
+        vec![Some(s.feedback_age); s.dof]
+    }
+    fn feedback_instants(&self) -> Vec<Option<std::time::Instant>> {
+        if let Some(instants) = self.0.lock().unwrap().feedback_instants.clone() {
+            return instants.into_iter().map(Some).collect();
         }
+        let now = std::time::Instant::now();
+        self.feedback_ages().into_iter().map(|a| a.and_then(|a| now.checked_sub(a))).collect()
     }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
@@ -4063,8 +4068,8 @@ fn tracking_braking_fallback_keeps_rejected_motion_caps() {
 }
 
 /// Review 4 #3: without velocity feedback, two rest samples less than one control period
-/// apart (by their feedback timestamps) are no evidence of rest. Review 5 #4: spacing is set
-/// only through the reported feedback ages (no wall-clock assumption about tick duration).
+/// apart (by their feedback timestamps) are no evidence of rest. Review 5 #4 / 6 B: spacing is
+/// set only through injected feedback receive instants (no wall-clock dependence).
 #[test]
 fn tracking_rest_samples_must_be_one_control_period_apart() {
     use armd::tracking::TrackingHistoryState;
@@ -4077,11 +4082,12 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     };
     let period = Duration::from_secs_f64(1.0 / f64::from(cfg.control_frequency_hz));
     assert_eq!(period, Duration::from_millis(20), "the B601-DM profile runs at 50 Hz");
-    let base = Duration::from_millis(60);
+    // Injected feedback receive instants (ages stay 0, fresh).
+    let base = std::time::Instant::now();
     let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
     drv.with(|s| {
         s.velocity_feedback = false;
-        s.feedback_age = base;
+        s.feedback_instants = Some(vec![base; 7]);
     });
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
     inner.lease_enabled = false;
@@ -4090,10 +4096,10 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
     inner.target_positions = q0.to_vec();
     inner.tick(DT);
     inner.set_torque(true).unwrap();
-    // Controlled feedback timestamps (reported ages), 5 ms apart per tick: every pair of
-    // samples so far lies less than one control period (20 ms) apart.
+    // Receive instants 5 ms apart per tick: every pair of samples so far lies less than one
+    // control period (20 ms) apart.
     for k in 0..4u32 {
-        drv.with(|s| s.feedback_age = base - Duration::from_millis(5) * k);
+        drv.with(|s| s.feedback_instants = Some(vec![base + Duration::from_millis(5) * k; 7]));
         inner.tick(DT);
         assert_eq!(
             inner.tracking.history_state,
@@ -4102,7 +4108,7 @@ fn tracking_rest_samples_must_be_one_control_period_apart() {
         );
     }
     // The next sample is newer than every earlier one by more than a period: evidence.
-    drv.with(|s| s.feedback_age = base - Duration::from_millis(15) - period - Duration::from_millis(5));
+    drv.with(|s| s.feedback_instants = Some(vec![base + Duration::from_millis(15) + period + Duration::from_millis(5); 7]));
     inner.tick(DT);
     assert_ne!(inner.tracking.history_state, TrackingHistoryState::Unknown, "samples one period apart are evidence");
 }
@@ -4159,7 +4165,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
 /// Review 5 #2: a stationary arm without velocity feedback whose joints reply with a steady
 /// 2 ms spread (ticks 20 ms apart, so consecutive samples overlap to 18 ms) reaches rest
 /// evidence: the reference sample is kept across short intervals instead of being replaced
-/// every tick. Feedback timestamps are controlled through the reported ages.
+/// every tick. Feedback receive instants are injected (no wall-clock dependence).
 #[test]
 fn tracking_rest_reference_survives_staggered_joint_replies() {
     use armd::tracking::TrackingHistoryState;
@@ -4171,12 +4177,14 @@ fn tracking_rest_reference_survives_staggered_joint_replies() {
         ..ArmConfig::rebot_dm()
     };
     let ms = Duration::from_millis;
-    // Tick k: newest joint reply (80 - 20k) ms old, every odd joint 2 ms older.
-    let ages = |k: u64| -> Vec<Duration> { (0..7u64).map(|j| ms(80 - 20 * k) + ms(2 * (j % 2))).collect() };
+    // Injected receive instants (fresh ages 0): tick k replies at base + 20k ms, every odd
+    // joint 2 ms earlier.
+    let base = std::time::Instant::now();
+    let at = |k: u64| -> Vec<std::time::Instant> { (0..7u64).map(|j| base + ms(20 * k + 2) - ms(2 * (j % 2))).collect() };
     let drv = TrackingTestDriver::new(&q0, vec![0.0; 7]);
     drv.with(|s| {
         s.velocity_feedback = false;
-        s.feedback_ages_per_joint = Some(ages(0));
+        s.feedback_instants = Some(at(0));
     });
     let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv.clone()));
     inner.lease_enabled = false;
@@ -4188,7 +4196,7 @@ fn tracking_rest_reference_survives_staggered_joint_replies() {
     assert_eq!(inner.tracking.history_state, TrackingHistoryState::Unknown);
     let mut seeded_at = None;
     for k in 0..4u64 {
-        drv.with(|s| s.feedback_ages_per_joint = Some(ages(k)));
+        drv.with(|s| s.feedback_instants = Some(at(k)));
         let obs = inner.tick(DT);
         assert!(obs.safety_state.is_operational(), "tick {k}: {:?}", obs.fault);
         if inner.tracking.history_state != TrackingHistoryState::Unknown {

@@ -104,6 +104,13 @@ pub trait ArmDriver: Send {
     /// Age of the last received sample for each joint. Reading a cache does not refresh it.
     fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
 
+    /// Receive instant of each joint's latest feedback sample. Drivers that keep the
+    /// receive times report them directly; the default derives them from `feedback_ages`.
+    fn feedback_instants(&self) -> Vec<Option<Instant>> {
+        let now = Instant::now();
+        self.feedback_ages().into_iter().map(|a| a.and_then(|a| now.checked_sub(a))).collect()
+    }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -1140,6 +1147,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -1857,6 +1866,8 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
 
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -2426,6 +2437,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
+
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
 
 
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
@@ -3065,6 +3078,8 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
     }
+
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { self.last_feedback_instant.clone() }
 
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {

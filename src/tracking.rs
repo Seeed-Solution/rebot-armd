@@ -419,17 +419,15 @@ pub struct TrackingOutput {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
-    /// Receive times of the oldest and newest joint feedback sample, when every joint has one.
+    /// Receive times of the oldest and newest joint feedback sample, when every joint has one
+    /// (`ArmDriver::feedback_instants`: the driver's own receive instants, not now - age).
     fn feedback_instant_range(&self) -> Option<(std::time::Instant, std::time::Instant)> {
-        let now = std::time::Instant::now();
-        let ages = self.driver.as_ref()?.lock().ok()?.feedback_ages();
-        if ages.len() != self.config.dof {
+        let instants = self.driver.as_ref()?.lock().ok()?.feedback_instants();
+        if instants.len() != self.config.dof {
             return None;
         }
-        let ages: Vec<std::time::Duration> = ages.into_iter().collect::<Option<Vec<_>>>()?;
-        let oldest = now.checked_sub(*ages.iter().max()?)?;
-        let newest = now.checked_sub(*ages.iter().min()?)?;
-        Some((oldest, newest))
+        let instants: Vec<std::time::Instant> = instants.into_iter().collect::<Option<Vec<_>>>()?;
+        Some((*instants.iter().min()?, *instants.iter().max()?))
     }
 
     /// Positive evidence that the arm joints are at rest, from fresh feedback: measured
