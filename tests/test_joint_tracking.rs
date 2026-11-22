@@ -673,16 +673,16 @@ fn lead_limits_and_withdrawal() {
             cfg.limits[0].max_acceleration = 100.0;
             let q0 = INSPECT;
             let mut q_lead = q0;
-            q_lead[0] += 0.025;
+            q_lead[0] += 0.008; // 0.40 rad/s over DT <= 0.45 rad/s active cap so keep-out check governs
             let mut q_mid = q0;
-            q_mid[0] += 0.0125;
+            q_mid[0] += 0.004;
             let p_mid = cfg.arm_model.fk_f32(&q_mid).unwrap().p;
 
             let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
             // Simulate that previous tick successfully issued q_lead, and now q_d is back at q0
             // with a keep-out box sitting squarely on the midpoint of last_issued -> q_d!
             inner.tracking.record_issued(q_lead.to_vec(), vec![0.0; 7]);
-            let half_box = 0.002_f32;
+            let half_box = 0.0008_f32;
             inner.config.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
                 name: "return_block".into(),
                 min_m: [p_mid[0] as f32 - half_box, p_mid[1] as f32 - half_box, p_mid[2] as f32 - half_box],
@@ -1066,7 +1066,7 @@ fn tracking_escape_depths_persist_across_ticks() {
     let mut prev_depth = d0;
     for step_idx in 1..=3 {
         let mut q_step = q0;
-        q_step[1] += dir * 0.02 * step_idx as f32;
+        q_step[1] += dir * 0.008 * step_idx as f32; // 0.40 rad/s <= 0.45 rad/s planned cap
         inner.commanded_positions = q_step.to_vec();
         inner.measured_positions = q_step.to_vec();
         let out = inner.compute_position_lead_output(DT, &jt_ref).expect("escaping step must pass");
@@ -1198,4 +1198,101 @@ fn tracking_stream_braking_enforces_measured_lead_allowance() {
         inner.compute_position_lead_output(DT, &jt).is_err(),
         "multiplier 0 must be rejected when advancing past measured-lead boundary during braking"
     );
+}
+
+/// M4: Validation enforces the active motion's output speed cap (planned/speed_cap,
+/// servo_max_velocity) and the explicit measured-segment contract (swept keep-out on
+/// q_m -> q_cand and following-error envelope).
+#[test]
+fn tracking_active_limits_and_measured_segment_contract() {
+    // 1. Active planned speed_cap constrains output velocity: raw config limit is 2.0 rad/s,
+    //    planned_max_velocity is 0.45, and speed_cap.joint_velocity_scale = 0.2 -> cap 0.09 rad/s.
+    {
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            speed_cap: Some(armd::model::SpeedCap {
+                linear_mps: None,
+                angular_rps: None,
+                joint_velocity_scale: Some(0.2),
+            }),
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.limits[0].max_acceleration = 100.0;
+        let q0 = [0.0_f32; 7];
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        // At v_d = 0.015 rad/s, base_lead = 0.0102 rad.
+        // Full lead (m=1) over DT=0.02s gives v_cand = 0.0102/0.02 = 0.51 rad/s (> 0.09 cap, < 2.0 raw!).
+        // Only m=1/8 gives lead=0.001275 -> v_cand = 0.064 rad/s <= 0.09 cap!
+        inner.commanded_velocities[0] = 0.015;
+        let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
+        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale down to fit active speed cap");
+        assert!(out.multiplier < 1.0, "full lead must be rejected by active speed_cap, got m={}", out.multiplier);
+        let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
+        assert!(v_out <= 0.09 + 1e-4, "issued speed {v_out} exceeded active planned cap 0.09");
+    }
+
+    // 2. Measured-segment keep-out contract: prev_q -> q_cand is clear, but q_m -> q_cand cuts a keep-out box.
+    {
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.limits[0].max_acceleration = 100.0;
+        let mut q_m = INSPECT;
+        let mut q_d = INSPECT;
+        q_d[0] += 0.08;
+        let mut q_mid = INSPECT;
+        q_mid[0] += 0.04;
+        let p_mid = cfg.arm_model.fk_f32(&q_mid).unwrap().p;
+        // Put a small keep-out box at the midpoint between q_m and q_d (nowhere near q_d itself).
+        let hb = 0.003_f32;
+        cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
+            name: "meas_chord_box".into(),
+            min_m: [p_mid[0] as f32 - hb, p_mid[1] as f32 - hb, p_mid[2] as f32 - hb],
+            max_m: [p_mid[0] as f32 + hb, p_mid[1] as f32 + hb, p_mid[2] as f32 + hb],
+        });
+        let ws = cfg.workspace.as_ref().unwrap();
+        assert_eq!(cfg.arm_model.workspace_violation(&q_m, ws, &cfg.camera_mount).total, 0.0);
+        assert_eq!(cfg.arm_model.workspace_violation(&q_d, ws, &cfg.camera_mount).total, 0.0);
+
+        let (mut inner, _drv) = rig_at(cfg, &q_m, vec![0.0; 7]);
+        // prev_q is already at q_d (so prev_q -> q_d has zero travel and clears keepout),
+        // while q_m -> q_d sweeps across meas_chord_box!
+        inner.commanded_positions = q_d.to_vec();
+        inner.measured_positions = q_m.to_vec();
+        inner.tracking.record_issued(q_d.to_vec(), vec![0.0; 7]);
+        let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
+        assert!(
+            inner.compute_position_lead_output(DT, &jt).is_err(),
+            "measured segment q_m -> q_cand cutting a keep-out box must be rejected"
+        );
+        q_m[0] = q_d[0];
+        inner.measured_positions = q_m.to_vec();
+        assert!(inner.compute_position_lead_output(DT, &jt).is_ok());
+    }
+
+    // 3. Active servo speed cap constrains streaming output velocity.
+    {
+        let mut cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            servo_max_velocity: Some(vec![Some(0.10), Some(0.45), Some(0.45), Some(1.5), Some(1.5), Some(1.5), None]),
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        cfg.limits[0].max_acceleration = 100.0;
+        let q0 = [0.0_f32; 7];
+        let (mut inner, _drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        inner.servo_target = Some(vec![0.10, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        inner.servo_stream_active = true;
+        inner.commanded_velocities[0] = 0.02; // base_lead = 0.0136 -> full lead v = 0.68 > 0.10 servo cap
+        let jt = inner.config.joint_tracking.as_ref().unwrap().clone();
+        let out = inner.compute_position_lead_output(DT, &jt).expect("should scale lead to fit servo cap");
+        assert!(out.multiplier < 1.0, "full lead must be rejected by servo_max_velocity, got m={}", out.multiplier);
+        let v_out = ((out.positions[0] - q0[0]) as f64 / DT).abs();
+        assert!(v_out <= 0.10 + 1e-4, "streaming speed {v_out} exceeded servo_max_velocity 0.10");
+    }
 }

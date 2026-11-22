@@ -5237,7 +5237,8 @@ impl SupervisorInner {
 
                 if tracking_owned {
                     let jt = self.config.joint_tracking.as_ref().unwrap();
-                    match self.compute_position_lead_output(servo_dt, jt) {
+                    let active_limits = self.active_tracking_limits(servo_dt, time_scale);
+                    match self.compute_position_lead_output_with_limits(servo_dt, jt, &active_limits) {
                         Ok(out) => {
                             let targets: Vec<JointTarget> = out
                                 .positions

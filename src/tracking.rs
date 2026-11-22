@@ -224,14 +224,61 @@ pub struct TrackingOutput {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::supervisor::SupervisorInner {
-    /// Compute and validate the combined joint vector for Phase 1 position-lead tracking.
-    ///
-    /// Pure read-only evaluation (`&self`): never mutates live escape bookkeeping
-    /// (`servo_ws_min_depths`) or nominal supervisor state during candidate checks.
+    /// Applicable per-joint output limits for the active motion (planned speed cap,
+    /// servo/policy speed cap, and power-governor time scaling).
+    pub fn active_tracking_limits(&self, dt: f64, time_scale: f64) -> Vec<crate::model::JointLimit> {
+        let gripper_idx = self.config.gripper_index();
+        let mut limits = if self.servo_target.is_some() || self.servo_stream_active {
+            self.servo_limits()
+        } else {
+            self.planning_limits()
+        };
+        if time_scale.is_finite() && time_scale < 1.0 {
+            let scale = time_scale.clamp(0.0, 1.0) as f32;
+            let dt_f32 = dt.clamp(0.001, 0.1) as f32;
+            for (i, l) in limits.iter_mut().enumerate() {
+                if Some(i) == gripper_idx {
+                    continue;
+                }
+                let brake = self.commanded_velocities.get(i).map_or(0.0, |v| v.abs())
+                    - 0.9 * l.max_acceleration * dt_f32;
+                l.max_velocity = (l.max_velocity * scale).max(brake).max(1e-3);
+            }
+        }
+        limits
+    }
+
+    /// Compute and validate the combined joint vector for Phase 1 position-lead tracking
+    /// using the active motion's output limits.
     pub fn compute_position_lead_output(
         &self,
         dt: f64,
         jt: &JointTrackingConfig,
+    ) -> Result<TrackingOutput, TrackingReject> {
+        let limits = self.active_tracking_limits(dt, self.motion_time_scale());
+        self.compute_position_lead_output_with_limits(dt, jt, &limits)
+    }
+
+    /// Compute and validate the combined joint vector for Phase 1 position-lead tracking
+    /// against explicit `active_limits`.
+    ///
+    /// Pure read-only evaluation (`&self`): never mutates live escape bookkeeping
+    /// (`servo_ws_min_depths` or `tracking.ws_min_depths`) or nominal state during candidate checks.
+    ///
+    /// Segment contracts:
+    /// - Prev-issued segment (`prev_q -> q_cand`): joint position limits, active motion velocity
+    ///   and acceleration limits (planned/servo/policy/power-governor caps, no multiplicative
+    ///   inflation), and workspace/keep-out sweep using revision-tagged persistent escape depths.
+    /// - Measured segment (`q_m -> q_cand`, when feedback is fresh): swept workspace, keep-outs,
+    ///   link capsules and self-collision along the physical chord from `q_m` to `q_cand`, plus
+    ///   the streaming directional `servo_max_lead_rad` allowance (all multipliers including 0).
+    ///   Step velocity/acceleration limits are NOT applied to `(q_cand - q_m) / dt` because
+    ///   `q_cand - q_m` includes normal steady-state plant lag.
+    pub fn compute_position_lead_output_with_limits(
+        &self,
+        dt: f64,
+        jt: &JointTrackingConfig,
+        active_limits: &[crate::model::JointLimit],
     ) -> Result<TrackingOutput, TrackingReject> {
         use std::time::Duration;
         use crate::chain::WorkspaceEvaluator;
@@ -243,11 +290,12 @@ impl crate::supervisor::SupervisorInner {
 
         let dof = self.config.dof;
         if !dt.is_finite() || dt <= 0.0
+            || active_limits.len() != dof
             || self.commanded_positions.len() != dof
             || self.commanded_velocities.len() != dof
             || !self.commanded_positions.iter().all(|q| q.is_finite())
         {
-            return Err(TrackingReject::JointLimit("invalid nominal state or dt for tracking".into()));
+            return Err(TrackingReject::JointLimit("invalid nominal state, limits, or dt for tracking".into()));
         }
 
         let arm_indices = self.config.arm_joint_indices();
@@ -395,7 +443,7 @@ impl crate::supervisor::SupervisorInner {
 
             // Per-joint position, directional allowance, velocity, and acceleration checks.
             for &j in &arm_indices {
-                let lim = &self.config.limits[j];
+                let lim = &active_limits[j];
                 let q = q_cand[j];
                 if !q.is_finite() || q < lim.min_position - 1e-5 || q > lim.max_position + 1e-5 {
                     last_err = Some(TrackingReject::JointLimit(format!(
@@ -440,8 +488,8 @@ impl crate::supervisor::SupervisorInner {
                 let v_cand = (f64::from(q) - f64::from(prev_q[j])) / dt;
                 let v_prev_j = prev_v.map_or(0.0, |pv| f64::from(pv[j]));
                 let a_cand = (v_cand - v_prev_j) / dt;
-                let v_lim = f64::from(lim.max_velocity) * 1.001 + 1e-4;
-                let a_lim = f64::from(lim.max_acceleration) * 1.001 + 1e-3;
+                let v_lim = f64::from(lim.max_velocity) + 1e-4;
+                let a_lim = f64::from(lim.max_acceleration) + 1e-3;
                 if !v_cand.is_finite() || v_cand.abs() > v_lim {
                     last_err = Some(TrackingReject::JointLimit(format!(
                         "joint {} output velocity {v_cand:.3} rad/s exceeds limit {:.3}",
