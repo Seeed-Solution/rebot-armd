@@ -1,49 +1,101 @@
-//! The supervisor's `RwLock`, with two additions for the control tick:
+//! The supervisor's `RwLock`, with additions for the control tick:
 //!
 //! - a write generation, bumped each time a write guard is taken, so a reader can tell
 //!   whether the observation the tick published is still the current state;
-//! - the longest read and write hold by other tasks since the tick last looked, so a tick
-//!   that waited for the lock can name what held it. A hold includes any time the holding
-//!   task was preempted, which is what a real-time tick waiting on a normal-priority
-//!   reader sees. The hold is measured after the release, so it also covers a holder that
-//!   was preempted while releasing;
-//! - the longest time other tasks spent in `read().await` / `write().await`. tokio hands the
-//!   lock to a queued task when the previous holder releases it, before that task runs: a
-//!   task that is runnable but not scheduled (a starved tokio worker) holds the lock from
-//!   then on without a guard existing. Its hold looks short, its acquire time is long.
+//! - a hold log: every guard of another task records, before it releases the lock, how long
+//!   it held it, how long its `read()` / `write()` took, and the caller's source location
+//!   (`#[track_caller]`). The record is written before the release because the release
+//!   wakes the real-time tick, which on one core preempts the releasing task at once: a
+//!   record written after the release would reach the log only after that tick had read it.
+//!   A hold includes any time the holding task was preempted. A long acquire with a short
+//!   hold means tokio handed the lock to a queued task that was not scheduled (a starved
+//!   tokio worker): it blocked others from the hand-over on, without a guard existing.
 //!
-//! Guards deref to the tokio guards' target, so call sites stay `lock.read().await` /
-//! `lock.write().await`. Other `tokio::sync::RwLock` methods (`try_read`, ...) are reached
-//! through `Deref` and are neither timed nor counted; every way to take a write guard is
-//! implemented here so the generation cannot be bypassed.
+//! The tick reads the log with [`SupervisorLock::take_log`] while it holds the write guard;
+//! no other guard exists then, so the log's mutex is free. `last_release` is the guard the
+//! tick waited for (tokio grants the lock in queue order).
+//!
+//! There is no `Deref` to the inner `tokio::sync::RwLock`: every way to take a guard goes
+//! through this type, so none is untimed and no write bypasses the generation.
 
+use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::panic::Location;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
-#[derive(Default)]
-struct Holds {
-    generation: AtomicU64,
-    reader_max_us: AtomicU32,
-    writer_max_us: AtomicU32,
-    reader_acquire_max_us: AtomicU32,
-    writer_acquire_max_us: AtomicU32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldKind { Read, Write }
+
+impl HoldKind {
+    pub fn as_str(self) -> &'static str { match self { Self::Read => "read", Self::Write => "write" } }
 }
 
-/// Longest other holds and acquires since the previous [`SupervisorLock::take_maxima`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LockMaxima {
+/// One guard of another task.
+#[derive(Debug, Clone, Copy)]
+pub struct HoldRecord {
+    pub kind: HoldKind,
+    /// Where `read()` / `write()` was called.
+    pub location: &'static Location<'static>,
+    /// `read()` / `write()` called.
+    pub called: Instant,
+    /// Guard handed to the caller.
+    pub acquired: Instant,
+    /// Recorded just before the release.
+    pub released: Instant,
+}
+
+impl HoldRecord {
+    pub fn hold(&self) -> Duration { self.released - self.acquired }
+    pub fn acquire(&self) -> Duration { self.acquired - self.called }
+}
+
+/// Guards of other tasks released since the previous [`SupervisorLock::take_log`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HoldLog {
     pub reader_hold: Duration,
     pub writer_hold: Duration,
     pub reader_acquire: Duration,
     pub writer_acquire: Duration,
+    /// The last guard released (the one a waiting writer waited for).
+    pub last_release: Option<HoldRecord>,
+    /// The guard with the longest hold.
+    pub longest: Option<HoldRecord>,
+    /// The guard with the longest acquire.
+    pub slowest_acquire: Option<HoldRecord>,
 }
 
-fn us(d: Duration) -> u32 { d.as_micros().min(u128::from(u32::MAX)) as u32 }
+impl HoldLog {
+    fn add(&mut self, r: HoldRecord) {
+        let (hold, acquire) = (r.hold(), r.acquire());
+        let (h, a) = match r.kind {
+            HoldKind::Read => (&mut self.reader_hold, &mut self.reader_acquire),
+            HoldKind::Write => (&mut self.writer_hold, &mut self.writer_acquire),
+        };
+        *h = (*h).max(hold);
+        *a = (*a).max(acquire);
+        if self.longest.is_none_or(|l| hold > l.hold()) { self.longest = Some(r); }
+        if self.slowest_acquire.is_none_or(|l| acquire > l.acquire()) { self.slowest_acquire = Some(r); }
+        self.last_release = Some(r);
+    }
+}
+
+#[derive(Default)]
+struct Holds {
+    generation: AtomicU64,
+    log: std::sync::Mutex<HoldLog>,
+}
+
+impl Holds {
+    fn record(&self, kind: HoldKind, location: &'static Location<'static>, called: Instant, acquired: Instant) {
+        let r = HoldRecord { kind, location, called, acquired, released: Instant::now() };
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
+    }
+}
 
 pub struct SupervisorLock<T> {
     lock: Arc<RwLock<T>>,
@@ -60,44 +112,59 @@ impl<T> SupervisorLock<T> {
 
     fn bump(&self) -> u64 { self.holds.generation.fetch_add(1, Ordering::AcqRel) + 1 }
 
-    pub async fn read(&self) -> SupReadGuard<'_, T> {
-        let called = Instant::now();
-        let guard = self.lock.read().await;
-        self.holds.reader_acquire_max_us.fetch_max(us(called.elapsed()), Ordering::AcqRel);
-        SupReadGuard { guard: ManuallyDrop::new(guard), since: Instant::now(), holds: &self.holds }
+    #[track_caller]
+    pub fn read(&self) -> impl Future<Output = SupReadGuard<'_, T>> + '_ {
+        let (location, called) = (Location::caller(), Instant::now());
+        async move {
+            let guard = self.lock.read().await;
+            SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
+        }
     }
 
-    pub async fn write(&self) -> SupWriteGuard<'_, T> {
-        let called = Instant::now();
-        let guard = self.lock.write().await;
-        self.bump();
-        self.holds.writer_acquire_max_us.fetch_max(us(called.elapsed()), Ordering::AcqRel);
-        SupWriteGuard { guard: ManuallyDrop::new(guard), since: Instant::now(), holds: &self.holds }
+    #[track_caller]
+    pub fn try_read(&self) -> Result<SupReadGuard<'_, T>, TryLockError> {
+        let (location, called) = (Location::caller(), Instant::now());
+        let guard = self.lock.try_read()?;
+        Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
     }
 
+    #[track_caller]
+    pub fn write(&self) -> impl Future<Output = SupWriteGuard<'_, T>> + '_ {
+        let (location, called) = (Location::caller(), Instant::now());
+        async move {
+            let guard = self.lock.write().await;
+            self.bump();
+            SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
+        }
+    }
+
+    #[track_caller]
     pub fn try_write(&self) -> Result<SupWriteGuard<'_, T>, TryLockError> {
+        let (location, called) = (Location::caller(), Instant::now());
         let guard = self.lock.try_write()?;
         self.bump();
-        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), since: Instant::now(), holds: &self.holds })
+        Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
     }
 
+    #[track_caller]
     pub fn blocking_write(&self) -> SupWriteGuard<'_, T> {
-        let called = Instant::now();
+        let (location, called) = (Location::caller(), Instant::now());
         let guard = self.lock.blocking_write();
         self.bump();
-        self.holds.writer_acquire_max_us.fetch_max(us(called.elapsed()), Ordering::AcqRel);
-        SupWriteGuard { guard: ManuallyDrop::new(guard), since: Instant::now(), holds: &self.holds }
+        SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
     }
 
-    pub async fn write_owned(self: Arc<Self>) -> SupOwnedWriteGuard<T> {
-        let called = Instant::now();
-        let guard = self.lock.clone().write_owned().await;
-        self.bump();
-        self.holds.writer_acquire_max_us.fetch_max(us(called.elapsed()), Ordering::AcqRel);
-        SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), since: Instant::now(), holds: self.holds.clone() }
+    #[track_caller]
+    pub fn write_owned(self: Arc<Self>) -> impl Future<Output = SupOwnedWriteGuard<T>> {
+        let (location, called) = (Location::caller(), Instant::now());
+        async move {
+            let guard = self.lock.clone().write_owned().await;
+            self.bump();
+            SupOwnedWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: self.holds.clone() }
+        }
     }
 
-    /// The control tick's write guard: counted in the generation (returned) but not timed,
+    /// The control tick's write guard: counted in the generation (returned) but not logged,
     /// the tick times itself.
     pub async fn write_tick(&self) -> (RwLockWriteGuard<'_, T>, u64) {
         let guard = self.lock.write().await;
@@ -105,34 +172,35 @@ impl<T> SupervisorLock<T> {
         (guard, generation)
     }
 
-    /// Longest other holds (ended) and acquires (completed) since the previous call; resets them.
-    pub fn take_maxima(&self) -> LockMaxima {
-        let take = |a: &AtomicU32| Duration::from_micros(a.swap(0, Ordering::AcqRel).into());
-        LockMaxima {
-            reader_hold: take(&self.holds.reader_max_us),
-            writer_hold: take(&self.holds.writer_max_us),
-            reader_acquire: take(&self.holds.reader_acquire_max_us),
-            writer_acquire: take(&self.holds.writer_acquire_max_us),
+    /// The log since the previous call, reset. Never blocks: None when the log's mutex is
+    /// taken (not expected while the caller holds the write guard).
+    pub fn take_log(&self) -> Option<HoldLog> {
+        match self.holds.log.try_lock() {
+            Ok(mut log) => Some(std::mem::take(&mut *log)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(std::mem::take(&mut *p.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 }
 
-impl<T> Deref for SupervisorLock<T> {
-    type Target = RwLock<T>;
-    fn deref(&self) -> &RwLock<T> { &self.lock }
+#[derive(Clone, Copy)]
+struct Timing {
+    location: &'static Location<'static>,
+    called: Instant,
+    acquired: Instant,
 }
 
 pub struct SupReadGuard<'a, T> {
     guard: ManuallyDrop<RwLockReadGuard<'a, T>>,
-    since: Instant,
+    t: Timing,
     holds: &'a Holds,
 }
 
 impl<T> Drop for SupReadGuard<'_, T> {
     fn drop(&mut self) {
+        self.holds.record(HoldKind::Read, self.t.location, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.reader_max_us.fetch_max(us(self.since.elapsed()), Ordering::AcqRel);
     }
 }
 
@@ -143,15 +211,15 @@ impl<T> Deref for SupReadGuard<'_, T> {
 
 pub struct SupWriteGuard<'a, T> {
     guard: ManuallyDrop<RwLockWriteGuard<'a, T>>,
-    since: Instant,
+    t: Timing,
     holds: &'a Holds,
 }
 
 impl<T> Drop for SupWriteGuard<'_, T> {
     fn drop(&mut self) {
+        self.holds.record(HoldKind::Write, self.t.location, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.writer_max_us.fetch_max(us(self.since.elapsed()), Ordering::AcqRel);
     }
 }
 
@@ -166,15 +234,15 @@ impl<T> DerefMut for SupWriteGuard<'_, T> {
 
 pub struct SupOwnedWriteGuard<T> {
     guard: ManuallyDrop<OwnedRwLockWriteGuard<T>>,
-    since: Instant,
+    t: Timing,
     holds: Arc<Holds>,
 }
 
 impl<T> Drop for SupOwnedWriteGuard<T> {
     fn drop(&mut self) {
+        self.holds.record(HoldKind::Write, self.t.location, self.t.called, self.t.acquired);
         // SAFETY: dropped once, here; the field is not used afterwards.
         unsafe { ManuallyDrop::drop(&mut self.guard) };
-        self.holds.writer_max_us.fetch_max(us(self.since.elapsed()), Ordering::AcqRel);
     }
 }
 
@@ -192,36 +260,76 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn generation_counts_write_guards_and_holds_are_timed() {
+    async fn generation_counts_write_guards_and_holds_are_logged() {
         let lock = Arc::new(SupervisorLock::new(0u32));
         assert_eq!(lock.generation(), 0);
         { let _r = lock.read().await; }
+        { let _r = lock.try_read().unwrap(); }
         assert_eq!(lock.generation(), 0);
         { *lock.write().await += 1; }
         { *lock.try_write().unwrap() += 1; }
         { *lock.clone().write_owned().await += 1; }
-        let (_g, generation) = lock.write_tick().await;
+        let (g, generation) = lock.write_tick().await;
         assert_eq!(generation, 4);
-        drop(_g);
+        drop(g);
         assert_eq!(lock.generation(), 4);
         assert_eq!(*lock.read().await, 3);
-        lock.take_maxima();
-        {
-            let _r = lock.read().await;
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let m = lock.take_maxima();
-        assert!(m.reader_hold >= Duration::from_millis(5), "{m:?}");
-        assert!(m.reader_acquire < Duration::from_millis(5), "{m:?}");
-        assert_eq!(m.writer_hold, Duration::ZERO);
-        assert_eq!(lock.take_maxima(), LockMaxima::default());
-        // a writer queued behind a reader: its acquire time covers the reader's hold
+        lock.take_log();
+        let line = line!() + 1;
         let r = lock.read().await;
-        let w = tokio::spawn({ let lock = lock.clone(); async move { *lock.write().await += 1; } });
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::thread::sleep(Duration::from_millis(5));
+        drop(r);
+        let log = lock.take_log().unwrap();
+        assert!(log.reader_hold >= Duration::from_millis(5), "{log:?}");
+        assert!(log.reader_acquire < Duration::from_millis(5), "{log:?}");
+        assert_eq!(log.writer_hold, Duration::ZERO);
+        let longest = log.longest.unwrap();
+        assert_eq!((longest.kind, longest.location.file(), longest.location.line()), (HoldKind::Read, file!(), line));
+        assert!(lock.take_log().unwrap().last_release.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_that_waited_names_the_reader_it_waited_for() {
+        let lock = Arc::new(SupervisorLock::new(0u32));
+        let line = line!() + 1;
+        let r = lock.read().await;
+        let w = tokio::spawn({
+            let lock = lock.clone();
+            async move {
+                let (g, _) = lock.write_tick().await;
+                // what the tick does under its guard
+                let log = lock.take_log().unwrap();
+                drop(g);
+                log
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(r);
+        let log = w.await.unwrap();
+        let last = log.last_release.unwrap();
+        assert_eq!((last.kind, last.location.line()), (HoldKind::Read, line));
+        assert!(last.hold() >= Duration::from_millis(10), "{last:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_writer_records_its_acquire_time() {
+        let lock = Arc::new(SupervisorLock::new(0u32));
+        let r = lock.read().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let w = tokio::spawn({
+            let lock = lock.clone();
+            async move {
+                let write = lock.write();
+                tx.send(()).unwrap();
+                *write.await += 1;
+            }
+        });
+        rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
         drop(r);
         w.await.unwrap();
-        let m = lock.take_maxima();
-        assert!(m.writer_acquire >= Duration::from_millis(5), "{m:?}");
+        let log = lock.take_log().unwrap();
+        assert!(log.writer_acquire >= Duration::from_millis(5), "{log:?}");
+        assert_eq!(log.slowest_acquire.unwrap().kind, HoldKind::Write);
     }
 }

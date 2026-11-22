@@ -186,6 +186,7 @@ async fn tick_route_reports_timing_and_late_ticks() {
 async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     for _ in 0..3 { sup.tick(0.02).await; }
+    let reader_line = line!() + 1;
     let reader = sup.inner().read().await;
     let ticker = {
         let sup = sup.clone();
@@ -195,11 +196,46 @@ async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
     drop(reader);
     ticker.await.unwrap();
     let snap = sup.tick_stats();
-    let m = snap.max_tick.unwrap();
-    assert_eq!(m.ticks_ago, 0);
+    let b = snap.max_tick.unwrap();
+    assert_eq!(b.ticks_ago, 0);
+    let m = b.sample;
     assert!(m.wait_us >= 14_000, "{m:?}");
     assert!(m.reader_hold_us >= 14_000, "{m:?}");
     assert!(m.lock_us < m.wait_us, "{m:?}");
     assert!(m.tick_us >= m.wait_us + m.lock_us, "{m:?}");
     assert_eq!(m.period_us, 20_000);
+    // the guard waited for, with its source location
+    let w = m.waited_for.unwrap();
+    assert_eq!((w.kind, w.location.file(), w.location.line()), ("read", file!(), reader_line));
+    assert!(w.hold_us >= 14_000, "{w:?}");
+    assert!(w.acquired_before_wait_us > 0, "{w:?}");
+    assert!(w.released_before_lock_us >= 0, "{w:?}");
+    // the lock phases add up to at most the hold
+    let p = m.phases;
+    assert!(p.rx_us + p.control_us + p.tx_us + p.finish_us + p.obs_us <= m.lock_us, "{p:?}");
+    let json = serde_json::to_value(&snap).unwrap();
+    assert_eq!(json["max_tick"]["waited_for"]["kind"], "read");
+    for key in ["rx_us", "control_us", "tx_us", "finish_us", "obs_us"] {
+        assert!(json["lock_phases"][key]["max"].is_u64(), "{key}");
+        assert!(json["max_lock"][key].is_u64(), "{key}");
+    }
+}
+
+/// On a dedicated thread (as the control loop): a tick parked on the lock shows a voluntary
+/// switch and almost no CPU time for the wait.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tick_thread_usage_tells_a_parked_wait_from_a_busy_one() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let reader = sup.inner().read().await;
+    let handle = tokio::runtime::Handle::current();
+    let control = { let sup = sup.clone(); std::thread::spawn(move || { handle.block_on(sup.control_tick(0.02)); }) };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(reader);
+    tokio::task::spawn_blocking(move || control.join().unwrap()).await.unwrap();
+    let m = sup.tick_stats().max_tick.unwrap().sample;
+    assert!(m.wait_us >= 15_000, "{m:?}");
+    assert!(m.usage.wait_vcsw >= 1, "{m:?}");
+    assert!(m.usage.wait_cpu_us < m.wait_us / 2, "{m:?}");
+    assert!(m.usage.lock_cpu_us <= m.lock_us + 1_000, "{m:?}");
 }
