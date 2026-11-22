@@ -493,8 +493,14 @@ void VisionControl::trigger_end(uint64_t handle) {
     cv_.notify_all();
 }
 
+static bool has_valid_depth_map(const VisionResult& r) noexcept {
+    return r.depth_disp && r.depth_grid_w > 0 && r.depth_grid_h > 0 &&
+           r.depth_disp->size() == static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h);
+}
+
 void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFrame> gray) {
     std::shared_ptr<const GrayFrame> displaced;
+    VisionResult displaced_depth;
     {
         std::lock_guard<std::mutex> lk(mu_);
         VisionResult stored = r;
@@ -514,6 +520,10 @@ void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFra
         }
         stored.done_ms = mono_ms();
         latest_ = stored;
+        if (has_valid_depth_map(stored)) {
+            displaced_depth = std::move(latest_depth_map_);
+            latest_depth_map_ = stored;
+        }
         VisionResult hist = stored;
         hist.depth_disp.reset();
         if (recent_results_.size() >= kRecentResultsCap) recent_results_.pop_front();
@@ -521,8 +531,9 @@ void VisionControl::publish(const VisionResult& r, std::shared_ptr<const GrayFra
         result_meter_.add(stored.frame_ms);
     }
     cv_.notify_all();
-    // Displaced (or rejected) gray buffer is destroyed here, outside mu_.
+    // Displaced (or rejected) buffers are destroyed here, outside mu_.
     displaced.reset();
+    displaced_depth.depth_disp.reset();
     gray.reset();
 }
 
@@ -546,7 +557,8 @@ std::shared_ptr<void> VisionControl::try_acquire_gray_send() {
     return nullptr;
 }
 
-bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out) {
+bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
+                               bool require_depth_map) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
     std::unique_lock<std::mutex> lk(mu_);
@@ -554,13 +566,22 @@ bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines ne
     // A frame planned before this trigger was registered can be newer than request_ms but
     // lack its pipelines; the next one has them. Scanning recent_results_ newest-to-oldest
     // also preserves the qualifying result if a later non-matching frame updates latest_.
+    // Map waiters require the actual depth_disp payload, preserved in latest_depth_map_ across
+    // intervening non-depth publications.
     auto matches = [&](const VisionResult& r) {
         if (r.frame_id == 0) return false;
         const bool newer = (r.instance_id == start_instance) ? (r.frame_id > after) : true;
-        return newer && r.frame_ms >= request_ms &&
-               Pipelines{r.ran_yolo, r.ran_aruco, r.ran_depth, r.ran_gray}.covers(need);
+        if (!newer || r.frame_ms < request_ms) return false;
+        if (!Pipelines{r.ran_yolo, r.ran_aruco, r.ran_depth, r.ran_gray}.covers(need)) return false;
+        if (require_depth_map && !has_valid_depth_map(r)) return false;
+        return true;
     };
     auto find_match = [&]() -> const VisionResult* {
+        if (require_depth_map) {
+            if (matches(latest_)) return &latest_;
+            if (matches(latest_depth_map_)) return &latest_depth_map_;
+            return nullptr;
+        }
         for (auto it = recent_results_.rbegin(); it != recent_results_.rend(); ++it) {
             if (matches(*it)) {
                 if (it->frame_id == latest_.frame_id && it->instance_id == latest_.instance_id) return &latest_;
@@ -1218,7 +1239,7 @@ static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, u
     bool timeout = false;
     {
         auto scope = ctl.trigger_scope(request_ms, want, nullptr);
-        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r, /*require_depth_map=*/true);
     }
     ctl.depth_map_wait(false);
     const bool same_inst = (r.instance_id == baseline_instance);

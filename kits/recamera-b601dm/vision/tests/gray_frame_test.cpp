@@ -636,6 +636,84 @@ static void test_http_server_sockets() {
     cam.join();
 }
 
+static void test_depth_map_waiter_intervening_publication() {
+    VisionControl::Options opt;
+    opt.depth_available = true;
+    opt.depth_metric = true;
+    opt.depth_model_name = "depth_anything_v2_metric";
+    opt.instance_id = "rv-depth";
+    VisionControl ctl(opt, nullptr);
+
+    // 1. A depth-only result lacking depth_disp followed by a depth result WITH depth_disp,
+    //    immediately overwritten in latest_ by an intervening YOLO-only frame before the waiter
+    //    finishes reading: /api/depth must still return 200 with the valid depth map (not 503).
+    HttpReply reply;
+    std::thread waiter([&] {
+        reply = handle_control_request(ctl, "GET", "/api/depth?wait_ms=1000", "", 5000, nullptr, RequestPeer{true});
+    });
+
+    // Wait until /api/depth registers its trigger
+    for (int i = 0; i < 100 && !ctl.depth_map_wanted(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    CHECK(ctl.depth_map_wanted());
+    const uint64_t t_now = mono_ms() + 1;
+
+    // Intervening depth result without depth_disp (must be skipped by map waiter, not return 503)
+    {
+        VisionResult no_map;
+        no_map.frame_id = ctl.next_frame_id(no_map.instance_id);
+        no_map.frame_ms = t_now;
+        no_map.ran_depth = true;
+        no_map.width = 640;
+        no_map.height = 360;
+        ctl.publish(no_map);
+    }
+
+    // Valid depth map frame immediately followed by a non-depth publication overwriting latest_
+    uint32_t expected_depth_id = 0;
+    {
+        VisionResult with_map;
+        with_map.frame_id = ctl.next_frame_id(with_map.instance_id);
+        expected_depth_id = with_map.frame_id;
+        with_map.frame_ms = t_now + 1;
+        with_map.ran_depth = true;
+        with_map.depth_ms = 12.0f;
+        with_map.width = 640;
+        with_map.height = 360;
+        with_map.depth_grid_w = 4;
+        with_map.depth_grid_h = 4;
+        with_map.depth_disp = std::make_shared<std::vector<float>>(16, 0.5f);
+        ctl.publish(with_map);
+
+        VisionResult intervening;
+        intervening.frame_id = ctl.next_frame_id(intervening.instance_id);
+        intervening.frame_ms = t_now + 2;
+        intervening.ran_yolo = true;
+        intervening.width = 640;
+        intervening.height = 360;
+        ctl.publish(intervening);
+    }
+
+    waiter.join();
+    CHECK(reply.status == 200);
+    CHECK(reply.content_type == "application/octet-stream");
+    std::string djs;
+    std::vector<uint16_t> dmm;
+    CHECK(parse_depth_map_body(reply.body, djs, dmm));
+    CHECK(dmm.size() == 16);
+    CHECK(djs.find("\"frame_id\":" + std::to_string(expected_depth_id)) != std::string::npos);
+
+    // 2. Direct wait_fresh(require_depth_map=true) after an intervening non-depth publication
+    //    already overwrote latest_ still selects latest_depth_map_ with its intact payload.
+    VisionResult direct;
+    const bool timed_out = ctl.wait_fresh(0, t_now, Pipelines{false, false, true, false}, 100, direct,
+                                          /*require_depth_map=*/true);
+    CHECK(!timed_out);
+    CHECK(direct.frame_id == expected_depth_id);
+    CHECK(direct.depth_disp != nullptr && direct.depth_disp->size() == 16);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -654,6 +732,7 @@ int main(int argc, char** argv) {
     test_same_ms_trigger_handles_and_waiter_interleaving();
     test_http_contract_peer_errors_and_subscriptions();
     test_http_server_sockets();
+    test_depth_map_waiter_intervening_publication();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

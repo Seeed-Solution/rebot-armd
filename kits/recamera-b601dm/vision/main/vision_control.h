@@ -393,9 +393,11 @@ public:
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
      * Wait for a result newer than `after` from a frame newer than request_ms that ran at least
-     * `need` (a trigger's result). Returns true on timeout.
+     * `need` (a trigger's result). When `require_depth_map` is true, only results carrying a valid
+     * `depth_disp` grid satisfy the wait. Returns true on timeout.
      */
-    bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out);
+    bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out,
+                    bool require_depth_map = false);
     void shutdown();
 
 private:
@@ -450,6 +452,7 @@ private:
     uint32_t frame_seq_ = 0;
     GrayRing gray_ring_{kGrayRingCapacity};
     VisionResult latest_;
+    VisionResult latest_depth_map_;
     std::deque<VisionResult> recent_results_;
     bool stopping_ = false;
     ModelSet models_;
