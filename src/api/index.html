@@ -139,6 +139,22 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .btn-estop:hover { filter: brightness(1.05); box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), inset 0 -3px 0 rgba(127,17,17,0.35), 0 10px 22px -6px rgba(185,28,28,0.6), 0 0 0 4px rgba(220,38,38,0.12); }
 .btn-estop:active { transform: translateY(2px); box-shadow: inset 0 2px 5px rgba(0,0,0,0.25), 0 3px 8px -4px rgba(185,28,28,0.5); }
 
+.btn-stop {
+  min-height: 56px; padding: 0 14px; border-radius: var(--sc-radius-lg);
+  font-size: 14px; font-weight: 600; color: var(--sc-color-text);
+  border: 1px solid #d97706; background: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  cursor: pointer; user-select: none; -webkit-user-select: none; touch-action: none;
+  transition: transform .06s ease, filter .15s, box-shadow .15s, background .15s;
+}
+.btn-stop svg { width: 18px; height: 18px; color: #d97706; flex: none; }
+.btn-stop span { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.15; }
+.btn-stop small { font-size: 10px; font-weight: 500; color: var(--sc-color-text-secondary); letter-spacing: .04em; }
+.btn-stop:hover { background: #fffbe6; border-color: #b45309; }
+.btn-stop:active { transform: translateY(1px); background: #fef3c7; }
+.btn-stop:disabled { opacity: .45; cursor: not-allowed; }
+
 /* ---------- app shell ---------- */
 .app { height: 100vh; height: 100dvh; display: flex; flex-direction: column; }
 .topbar {
@@ -351,6 +367,9 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .btn.head-estop { flex: none; min-height: 40px; padding: 0 14px; font-size: 14px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
 .head-estop[hidden] { display: none; }
 .btn.head-estop:hover { color: #fff; background: var(--sc-estop); filter: brightness(1.06); }
+.btn.head-stop { flex: none; min-height: 40px; padding: 0 14px; font-size: 14px; font-weight: 600; color: #b45309; background: #fffbe6; border: 1px solid #ffd591; border-radius: var(--sc-radius-md); touch-action: none; }
+.head-stop[hidden] { display: none; }
+.btn.head-stop:hover { color: #d97706; background: #fef3c7; border-color: #faad14; }
 .calib-x { width: 48px; min-height: 48px; padding: 0; font-size: 22px; line-height: 1; }
 .calib-mode { display: flex; }
 .calib-mode button { flex: 1 1 0; white-space: normal; line-height: 1.3; padding-block: 5px; }
@@ -742,7 +761,7 @@ body.offline .banner { display: block; }
 .safety { padding: 14px; display: grid; gap: 12px; }
 /* desktop expert: the side column scrolls; the safety card (E-stop) stays at its top (phones: sticky under the header, below) */
 @media (min-width: 1024px) { .side > .safety { position: sticky; top: 0; z-index: 150; } }
-.safety-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.safety-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 8px; }
 .sw {
   display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 0 14px; text-align: left;
   border-radius: var(--sc-radius-lg); border: 1px solid #e3e8dc; background: linear-gradient(180deg, #ffffff, #f8faf5);
@@ -1011,7 +1030,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
     flex: 1; min-height: 0; padding: 20px; gap: 16px;
   }
   body.ui-simple .ready { display: flex; }
-  body.ui-simple .cockpit .btn-estop, body.ui-simple .cockpit .sw { min-height: 64px; }
+  body.ui-simple .cockpit .btn-estop, body.ui-simple .cockpit .btn-stop, body.ui-simple .cockpit .sw { min-height: 64px; }
   body.ui-simple .ck-mid {
     flex: 1; min-height: 0; justify-content: space-evenly; gap: 10px; padding: 16px 8px; border-radius: var(--sc-radius-lg);
     background: rgba(255,255,255,0.28); border: 1px solid rgba(255,255,255,0.65); border-radius: 20px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
@@ -1294,8 +1313,12 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .lang-btn { padding: 0 6px; }
   .head-stats { gap: 4px; margin-left: auto; }
   .safety { padding: 12px; }
-  .btn-estop { min-height: 64px; }
-  .sw { min-height: 64px; }
+  .safety-row { gap: 6px; }
+  .btn-estop, .btn-stop { min-height: 64px; }
+  .btn-estop { padding: 0 10px; gap: 6px; font-size: 15px; }
+  .btn-stop { padding: 0 8px; gap: 4px; font-size: 13px; }
+  .btn-stop small { display: none; }
+  .sw { min-height: 64px; padding: 0 8px; gap: 6px; }
   .jog-list { grid-template-columns: minmax(0, 1fr); }
   .stick-zone { grid-template-columns: 1fr 1fr; }
   .stick-center { grid-column: 1 / -1; grid-row: 2; justify-content: center; }
@@ -1374,6 +1397,16 @@ body::before {
 }
 .btn-estop:hover { filter: none; background: rgba(239, 68, 68, 0.95); box-shadow: 0 8px 28px rgba(239, 68, 68, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.5); }
 .btn-estop:active { transform: scale(.97); box-shadow: 0 4px 14px rgba(239, 68, 68, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.5); }
+.safety-row .sw { padding: 0 8px 0 7px; gap: 6px; }
+.safety-row .sw-track { width: 38px; height: 22px; border-radius: 11px; flex: none; }
+.safety-row .sw-track .thumb { width: 18px; height: 18px; }
+.safety-row .sw.on .sw-track .thumb { transform: translateX(16px); }
+.safety-row .sw.holding .sw-track .thumb { width: 22px; }
+.safety-row .sw-text b { font-size: 14px; white-space: nowrap; }
+.safety-row .sw-text small { font-size: 10px; line-height: 1.2; }
+.safety-row .btn-estop { padding: 0 10px; gap: 6px; font-size: 15px; }
+.safety-row .btn-estop svg { width: 18px; height: 18px; flex: none; }
+.safety-row .btn-estop small { font-size: 10px; }
 
 /* cockpit */
 .cockpit { background: rgba(255, 255, 255, 0.5); }
@@ -1451,7 +1484,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   .hd-btn { width: 28px; height: 28px; }
   .hd-btn svg { width: 16px; height: 16px; }
   /* touch controls: no scroll/zoom gestures, no text selection, no double-tap zoom */
-  .disc, .pose-btn, .grip-key, .preset, .sw, .btn-estop, .fs-btn, .pad, .cluster, .knob {
+  .disc, .pose-btn, .grip-key, .preset, .sw, .btn-estop, .btn-stop, .fs-btn, .pad, .cluster, .knob {
     touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
   }
   body.ui-expert .app { height: 100vh; height: 100dvh; }
@@ -1554,6 +1587,14 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .sw.clear { background: rgba(255,247,230,0.85); }
   body.ui-simple .btn-estop { min-height: 40px; padding: 0 14px; border-radius: 20px; font-size: 14px; background: rgba(220,38,38,0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: 0 4px 14px rgba(220,38,38,0.35); }
   body.ui-simple .btn-estop svg { width: 18px; height: 18px; }
+  body.ui-simple .btn-stop {
+    min-height: 40px; padding: 0 10px; border-radius: 20px; font-size: 13px; font-weight: 600;
+    color: #92400e; background: rgba(254,243,199,0.85); border: 1px solid rgba(245,158,11,0.5);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 4px 14px rgba(245,158,11,0.25);
+  }
+  body.ui-simple .btn-stop svg { width: 16px; height: 16px; }
+  body.ui-simple .btn-stop small { display: none; }
   body.ui-simple .safety { flex-direction: column; align-items: stretch; }
   body.ui-simple .gc-sw .sw-text small { display: none; }
   body.ui-simple .gc-sw.blocked .sw-text small { display: block; font-size: 10px; color: #1f2937; }
@@ -1990,6 +2031,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
             <span class="sw-text"><b id="enable-txt" data-i18n="en.enable">使能</b><small id="enable-sub" data-i18n="en.hold">按住 0.6 秒</small></span>
           </button>
+          <button class="btn-stop" id="btn-stop" data-i18n-aria="stop.aria" aria-label="停止运动并保持位置">
+            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+            <span><span data-i18n="stop">停止</span><small data-i18n="stop.sub">保持位置</small></span>
+          </button>
           <button class="btn-estop" id="btn-estop" data-i18n-aria="estop.aria" aria-label="紧急停止">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M8 2.5h8l5.5 5.5v8L16 21.5H8L2.5 16V8z"/><path d="M8 12h8" stroke-linecap="round" stroke-width="2.6"/></svg>
             <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
@@ -2200,6 +2245,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sub" data-i18n="kb.common">通用</span>
           <span><kbd>1</kbd>–<kbd>4</kbd></span><span data-i18n="kb.speed">速度 15 / 30 / 50 / 80 %（专家模式）</span>
           <span><kbd>H</kbd></span><span data-i18n="home">回零</span>
+          <span><kbd>Esc</kbd></span><span data-i18n="kb.stop">停止（保持位置）</span>
           <span><kbd>Space</kbd></span><span data-i18n="estop">急停</span>
         </div>
       </div>
@@ -2563,6 +2609,7 @@ const I18N = {
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
+    'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
     'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
@@ -2590,7 +2637,7 @@ const I18N = {
     'fm.estop': '⚠️ 急停已锁定，点击此处复位急停，再长按「使能」。', 'fm.fault': '⚠️ 故障：{d}。点击此处清除故障，再长按「使能」。',
     'kb.title': '键盘快捷键', 'kb.j1': 'J1 底座 逆 / 顺时针', 'kb.j2': 'J2 大臂 后仰 / 前倾', 'kb.j3': 'J3 小臂 下压 / 抬高', 'kb.j4': 'J4 手腕 下倾 / 上翘', 'kb.j5': 'J5 手腕 旋左 / 旋右',
     'kb.j6': 'J6 夹爪 张开 / 夹紧（G 切换）', 'kb.cartsub': '空间位姿 / 简化模式', 'kb.x': 'X 前 / 后', 'kb.y': 'Y 左 / 右', 'kb.z': 'Z 升 / 降', 'kb.p': '俯仰 上抬 / 下压', 'kb.r': '腕转 Roll',
-    'kb.common': '通用', 'kb.speed': '速度 15 / 30 / 50 / 80 %（专家模式）',
+    'kb.common': '通用', 'kb.stop': '停止（保持位置）', 'kb.speed': '速度 15 / 30 / 50 / 80 %（专家模式）',
     'ph.joint': '关节独立控制', 'ph.cart': '末端空间位姿 · 前端解析 IK · Yaw 随 J1',
     'jd.base.part': '底座', 'jd.base.motion': '水平旋转', 'jd.base.neg': '逆时针转', 'jd.base.pos': '顺时针转',
     'jd.shoulder.part': '肩部', 'jd.shoulder.motion': '大臂俯仰', 'jd.shoulder.neg': '后仰', 'jd.shoulder.pos': '前倾伸展',
@@ -2655,7 +2702,7 @@ const I18N = {
     'toast.lease_expired': '⚠️ 连接中断，控制权已释放；机械臂若处于上电状态会自动收回停靠',
     'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；下次操作时自动取回', 'toast.lease_busy': '{who}正在控制，本页面为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
-    'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
+    'toast.homing': '回零中', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
     'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
     'toast.stow_failed': '收起失败: ', 'toast.stow_unconfirmed': '设备未确认收纳，请检查机械臂状态', 'toast.parked_off': '已收纳并关闭力矩',
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
@@ -2776,6 +2823,7 @@ const I18N = {
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
     'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
+    'stop': 'Stop', 'stop.sub': 'HOLD', 'stop.aria': 'Stop motion and hold position',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
     'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
     'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
@@ -2803,7 +2851,7 @@ const I18N = {
     'fm.estop': '⚠️ E-Stop latched. Tap here to reset it, then hold "Enable".', 'fm.fault': '⚠️ Fault: {d}. Tap here to clear it, then hold "Enable".',
     'kb.title': 'Keyboard shortcuts', 'kb.j1': 'J1 Base CCW / CW', 'kb.j2': 'J2 Shoulder back / forward', 'kb.j3': 'J3 Elbow down / up', 'kb.j4': 'J4 Wrist tilt down / up', 'kb.j5': 'J5 Wrist rotate L / R',
     'kb.j6': 'J6 Gripper open / close (G toggles)', 'kb.cartsub': 'Cartesian / Simple mode', 'kb.x': 'X fwd / back', 'kb.y': 'Y left / right', 'kb.z': 'Z up / down', 'kb.p': 'Pitch up / down', 'kb.r': 'Wrist Roll',
-    'kb.common': 'General', 'kb.speed': 'Speed 15 / 30 / 50 / 80 % (Expert mode)',
+    'kb.common': 'General', 'kb.stop': 'Stop (hold position)', 'kb.speed': 'Speed 15 / 30 / 50 / 80 % (Expert mode)',
     'ph.joint': 'Independent joint control', 'ph.cart': 'End-effector pose · browser-side IK · Yaw follows J1',
     'jd.base.part': 'Base', 'jd.base.motion': 'Yaw rotation', 'jd.base.neg': 'CCW', 'jd.base.pos': 'CW',
     'jd.shoulder.part': 'Shoulder', 'jd.shoulder.motion': 'Upper-arm pitch', 'jd.shoulder.neg': 'Lean back', 'jd.shoulder.pos': 'Lean fwd',
@@ -2867,7 +2915,7 @@ const I18N = {
     'toast.lease_expired': '⚠️ Connection dropped, so control was released. If the arm was torqued, it parked itself',
     'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released; it is taken back on the next input', 'toast.lease_busy': '{who} is in control, this page is an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
-    'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
+    'toast.homing': 'Homing', 'toast.stop_unconfirmed': 'Stop not confirmed, use the E-stop', 'toast.stopped': 'Stopped, holding position', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
     'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
     'toast.stow_failed': 'Stow failed: ', 'toast.stow_unconfirmed': 'Device did not confirm park, check the arm', 'toast.parked_off': 'Parked and torque off',
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
@@ -4476,7 +4524,7 @@ function detApply(data) {
   renderDetToggle();
 }
 /* simple mode: recognition popover (#det-ctl) opened from the HUD chip; closes on the chip, an outside tap, a mode switch
-   (Escape stays the E-stop key) */
+   (Escape = Stop, Space = E-stop) */
 function visPopOpen(open) {
   const body = document.body, chip = $('btn-vis');
   if (open === body.classList.contains('vis-open')) return;
@@ -6339,7 +6387,7 @@ function cwFineToB() {
    trigger per candidate; at the first view with >= minMarkers board markers one re-aim at the ground point of the
    marker centroid, then stop. */
 const CW_SEARCH = { h: 0.31, radii: [0.20, 0.285, 0.37, 0.45], azDeg: [-70, -42, -14, 14, 42, 70], max: 25, rollsDeg: [0, 180, 30, -30, 60, -60, 90], clearance: 0.10, nearA: 0.08 };
-const CWJ_AVOID = '#btn-estop, #btn-enable, #pad-sxy, #pad-srot, #pad-sz, #pad-sgrip, #btn-pose, .cart-ctl, #stick-zone, #pad-left, #pad-right, #pad-wrist, .grip-state';
+const CWJ_AVOID = '#btn-estop, #btn-stop, #btn-enable, #pad-sxy, #pad-srot, #pad-sz, #pad-sgrip, #btn-pose, .cart-ctl, #stick-zone, #pad-left, #pad-right, #pad-wrist, .grip-state';
 const cwPlaceStep = (k = CWZ.step) => k === 'place' || k === 'move';
 const cwGcBusy = () => gcOn() || !!(S.obs && S.obs.gravity_comp && S.obs.gravity_comp.phase);
 const cwMoving = () => !!(S.obs && Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02));
@@ -7868,15 +7916,16 @@ function getCodeMap() {
 }
 window.addEventListener('keydown', (e) => {
   // The operator dialog owns Escape (cancel; it has its own E-stop button): an Escape meant to dismiss
-  // an automatically opened PIN prompt must not latch an E-stop that then needs the PIN to reset.
+  // an automatically opened PIN prompt must not trigger Stop while the dialog is open.
   if (e.key === 'Escape' && opIsOpen()) return;
   const isTyping = e.target && (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'password' || e.target.type === 'number')));
   if (isTyping) {
-    if (e.key === 'Escape') { e.preventDefault(); eStop(); }
+    if (e.key === 'Escape') { e.preventDefault(); stopMotion(); }
     return;
   }
-  // Space or Escape always triggers E-Stop regardless of slider focus
-  if (e.key === ' ' || e.code === 'Space' || e.key === 'Escape') { e.preventDefault(); eStop(); return; }
+  // Space triggers E-Stop; Escape triggers Stop regardless of slider focus
+  if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); eStop(); return; }
+  if (e.key === 'Escape') { e.preventDefault(); stopMotion(); return; }
   // Ignore any hotkey pressed with modifier keys (Ctrl, Meta/Cmd, Alt)
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
@@ -8823,6 +8872,28 @@ function home() {
   if (!canMove()) { toast(lockReason(), 'err'); flashLock(); return; }
   api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
+function stopMotion() {
+  buzz([20]);
+  releaseAll();
+  resetPoseMode();
+  if (S.leaseGeneration == null) {
+    toast(t('toast.stopped'), 'ok');
+    return;
+  }
+  const sendStop = (retries = 2) => {
+    api('/api/v1/motion/stop', {}, { quiet: true })
+      .then(() => toast(t('toast.stopped'), 'ok'))
+      .catch((e) => {
+        if (e && (e.code === 'LEASE_REQUIRED' || e.code === 'LEASE_LOST')) {
+          toast(t('toast.stopped'), 'ok');
+          return;
+        }
+        if (retries > 0) setTimeout(() => sendStop(retries - 1), 100);
+        else toast(t('toast.stop_unconfirmed'), 'err');
+      });
+  };
+  sendStop();
+}
 function eStop() {
   buzz([30, 40, 30]);
   releaseAll();
@@ -8850,11 +8921,12 @@ function eStop() {
     }
   }, 50);
 }
+$('btn-stop').addEventListener('pointerdown', (e) => { e.preventDefault(); stopMotion(); });
 $('btn-estop').addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
 $('btn-home').addEventListener('click', home);
-/* a compact E-stop in the head of every drawer / sheet, shown while an open drawer covers the cockpit E-stop or it is off
+/* a compact Stop and E-stop in the head of every drawer / sheet, shown while an open drawer covers the cockpit E-stop or it is off
    screen (phones: the bottom sheet; tablets and desktop: the side drawer over the right column). A touch screen has no
-   Space / Escape key, so the E-stop stays one tap away whatever is open. */
+   Space / Escape key, so Stop and E-stop stay one tap away whatever is open. */
 function estopReachable() {
   const real = $('btn-estop'), r = real.getBoundingClientRect();
   const x = r.left + r.width / 2, y = r.top + r.height / 2;
@@ -8863,7 +8935,7 @@ function estopReachable() {
   return !!el && real.contains(el);
 }
 function estopPinSync() {
-  const pins = document.querySelectorAll('.head-estop');
+  const pins = document.querySelectorAll('.head-estop, .head-stop');
   for (const b of pins) b.hidden = true; // measure the cockpit E-stop without the pins
   const reach = estopReachable();
   for (const b of pins) b.hidden = reach || !!b.parentElement.closest('[hidden]');
@@ -8874,8 +8946,12 @@ function estopPinSync() {
     b.type = 'button'; b.className = 'btn head-estop'; b.hidden = true;
     b.dataset.i18n = 'estop'; b.dataset.i18nAria = 'estop.aria'; b.textContent = t('estop'); b.setAttribute('aria-label', t('estop.aria'));
     b.addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+    const s = document.createElement('button');
+    s.type = 'button'; s.className = 'btn head-stop'; s.hidden = true;
+    s.dataset.i18n = 'stop'; s.dataset.i18nAria = 'stop.aria'; s.textContent = t('stop'); s.setAttribute('aria-label', t('stop.aria'));
+    s.addEventListener('pointerdown', (e) => { e.preventDefault(); stopMotion(); });
     const acts = h.querySelector('.cwiz-head-acts');
-    if (acts) acts.prepend(b); else h.insertBefore(b, h.lastElementChild);
+    if (acts) { acts.prepend(b); acts.prepend(s); } else { h.insertBefore(s, h.lastElementChild); h.insertBefore(b, h.lastElementChild); }
   }
   let timer = 0;
   const sync = () => { estopPinSync(); clearTimeout(timer); timer = setTimeout(estopPinSync, 260); }; // again after the sheet animation
@@ -12384,7 +12460,7 @@ function tkRenderBanner(k) {
     feed.appendChild(li);
   }
 }
-// HUD chip: compact summary of the external controller; opens #task (Enter / click; Space stays E-STOP).
+// HUD chip: compact summary of the external controller; opens #task (Enter / click; Space = E-stop, Escape = Stop).
 function renderActionChip(k) {
   const el = $('act-chip');
   if (!el) return;
@@ -12596,7 +12672,7 @@ async function tkCopy() {
 $('btn-task').addEventListener('click', () => taskOpen(true));
 $('ext-open-task').addEventListener('click', () => taskOpen(true));
 $('act-chip').addEventListener('click', () => taskOpen(true));
-// Enter only: Space and Escape are the page-wide E-STOP keys (window keydown handler)
+// Enter only: Space = E-stop and Escape = Stop in the window keydown handler
 $('act-chip').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); taskOpen(true); } });
 $('ext-dismiss').addEventListener('click', () => {
   if (!TK.lastExt) return;
@@ -13123,7 +13199,7 @@ function v3Tick(ts) {
   V3.dirty = false; V3.last = ts; V3.renders++;
   V3.r.render(V3.scene, V3.cam);
 }
-// view switch (radiogroup): click, arrow keys / Home / End move the selection; Escape stays the E-stop key
+// view switch (radiogroup): click, arrow keys / Home / End move the selection; Escape = Stop, Space = E-stop
 $('vs-video').addEventListener('click', () => { if (V3.open) v3Toggle(false); });
 $('vs-3d').addEventListener('click', () => { if (!V3.open) v3Toggle(true); });
 $('view-switch').addEventListener('keydown', (e) => {
@@ -13236,6 +13312,7 @@ function frame(ts) {
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
   setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;
+  $('btn-stop').disabled = !live;
   const holder = leaseOther();
   $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || holder == null;
   setText($('preempt-who'), holder == null ? '' : t('preempt.who', { who: leaseHolderText(holder) }));
@@ -14618,7 +14695,7 @@ $('op-estop')?.addEventListener('pointerdown', (e) => { e.preventDefault(); eSto
 $('op-inline')?.addEventListener('click', () => { opRequire('/api/v1/safety/clear_fault').then((ok) => { if (ok && isStopped()) clearFault(); }); });
 document.addEventListener('keydown', (e) => {
   if (!opIsOpen()) return;
-  // stopPropagation: the window handler below would take this Escape as an E-stop once the dialog is closed
+  // stopPropagation: the window handler below would take this Escape as Stop once the dialog is closed
   if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeOperatorModal(false); return; }
   if (e.key === 'Tab') { // keep focus inside the dialog
     const f = [...$('op-modal').querySelectorAll('button:not([hidden]):not([disabled]), input:not([hidden])')].filter((x) => x.offsetParent !== null);
