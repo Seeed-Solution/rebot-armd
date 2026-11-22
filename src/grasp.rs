@@ -2247,6 +2247,7 @@ pub struct PendingGrasp {
     /// Boxed: the setup makes the request large.
     pub request: Box<GraspRequest>,
     pub open_rad: f32,
+    pub physical_contact_end_m: Option<[f64; 3]>,
 }
 
 /// A grasp whose coarse approach was found reachable.
@@ -2281,7 +2282,12 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
     }
     let input = inner.plan_input()?;
-    Ok(PendingGrasp { input, request: Box::new(request), open_rad: policy.open_rad })
+    Ok(PendingGrasp {
+        input,
+        request: Box::new(request),
+        open_rad: policy.open_rad,
+        physical_contact_end_m: inner.config.effective_physical_contact_end_m(),
+    })
 }
 
 /// TCP height of the grasp plane (where box centres are assumed to lie).
@@ -2295,7 +2301,7 @@ fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
 /// Outside the lock: estimate the target from the box-centre ray and plan the approach
 /// with the gripper open (feasibility check, so an unreachable target is rejected up front).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
-    let PendingGrasp { input, request, open_rad } = pending;
+    let PendingGrasp { input, request, open_rad, physical_contact_end_m } = pending;
     let request = *request;
     let setup = &request.setup;
     let pose_end = input.arm.fk(&input.q0);
@@ -2305,7 +2311,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let target = cam.plane_point(&pose_end, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
-    let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
+    let pts = envelope_with_contact(input.ws.as_ref(), &input.cam, &cam.rec, physical_contact_end_m);
     let is_5dof = input.arm.arm_dof() == 5;
     let r_ref_p = if camera_down { &pose_end.p } else { &pose_tcp.p };
     let r_ref = if is_5dof {

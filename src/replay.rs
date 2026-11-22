@@ -103,6 +103,7 @@ pub struct ReplayPlan {
     pub power_scale: Option<f64>,
     pub has_gripper_motion: bool,
     pub tool_provenance_ok: bool,
+    pub planned_tool_digest: String,
     pub recorded_tool_id: Option<String>,
     pub recorded_tool_digest: Option<String>,
 }
@@ -389,6 +390,7 @@ fn plan_frames_with_provenance(
             Some(fit.scale)
         }
     };
+    let planned_tool_digest = input.active_tool.config_digest.clone();
     Ok(ReplayPlan {
         input,
         samples,
@@ -397,6 +399,7 @@ fn plan_frames_with_provenance(
         power_scale,
         has_gripper_motion,
         tool_provenance_ok,
+        planned_tool_digest,
         recorded_tool_id,
         recorded_tool_digest,
     })
@@ -629,6 +632,12 @@ impl SupervisorInner {
         if self.commanded_positions.iter().zip(&input.start).any(|(a, b)| (a - b).abs() >= 1e-4) {
             return Err(MotionError::PlanStale("commanded positions changed while loading the episode".into()).into());
         }
+        if plan.planned_tool_digest != self.config.active_tool.config_digest {
+            return Err(rejected(409, "TOOL_MISMATCH", format!(
+                "Replay for episode '{}' was planned for tool digest '{}' which does not match active tool '{}' ({})",
+                input.request.episode, plan.planned_tool_digest, self.config.active_tool.id, self.config.active_tool.config_digest
+            )));
+        }
         let gripper_idx = input.gripper_idx;
         let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| self.commanded_positions[g]);
         let mut first = plan.samples[0].clone();
@@ -830,6 +839,65 @@ mod tests {
         match err {
             ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
             other => panic!("expected 409 TOOL_MISMATCH on cross-tool install_replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r5_m2_arm_only_plan_cannot_install_under_different_active_tool_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+        let mut stock_cfg = crate::model::ArmConfig::rebot_dm();
+        stock_cfg.validate().unwrap();
+        let finray_pack: crate::tool::ToolPackConfig = serde_json::from_value(serde_json::json!({
+            "id": "soft_finray_gripper",
+            "kind": "gripper",
+            "robots": ["b601dm"],
+            "tcp_offset": [0.045, 0.0, 0.0]
+        })).unwrap();
+        let mut longer_cfg = crate::tool::apply_tool_overlay(&stock_cfg, &finray_pack).unwrap();
+        longer_cfg.active_tool.commissioning_required = false;
+
+        let q0 = vec![0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -1.0];
+        let mut q1 = q0.clone();
+        q1[0] = 0.2;
+        let mut recv = SupervisorInner::new(longer_cfg);
+        recv.lease_enabled = false;
+        recv.set_torque(true).unwrap();
+        recv.commanded_positions = q0.clone();
+        recv.measured_positions = q0.clone();
+        recv.target_positions = q0.clone();
+        let recv_epoch = recv.safety.epoch_id();
+
+        let frames = vec![frame(0.0, &q0), frame(0.5, &q0), frame(1.0, &q1)];
+        let stock_arm_only_plan = plan_frames(ReplayInput {
+            request: ReplayRequest { episode: "stock_arm_only".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
+            path: dir.path().join("unused.parquet"),
+            profile_id: stock_cfg.profile_id.clone(),
+            dof: stock_cfg.dof,
+            arm_dof: stock_cfg.arm_dof(),
+            gripper_idx: stock_cfg.gripper_index(),
+            joint_names: stock_cfg.limits.iter().map(|l| l.name.clone()).collect(),
+            limits: stock_cfg.limits.clone(),
+            speed_limits: stock_cfg.limits.clone(),
+            ws: None,
+            arm: stock_cfg.arm_model.clone(),
+            start: q0,
+            control_hz: 50,
+            epoch: recv_epoch,
+            workspace_revision: 0,
+            power: None,
+            store,
+            zero_offsets: vec![0.0; stock_cfg.dof],
+            tcp_offset: stock_cfg.tcp_offset,
+            active_tool: stock_cfg.active_tool.clone(),
+        }, &frames).unwrap();
+        assert!(!stock_arm_only_plan.has_gripper_motion);
+        assert_eq!(stock_arm_only_plan.planned_tool_digest, stock_cfg.active_tool.config_digest);
+
+        let err = recv.install_replay(stock_arm_only_plan).unwrap_err();
+        match err {
+            ArmError::Rejected { status: 409, code, .. } => assert_eq!(code, "TOOL_MISMATCH"),
+            other => panic!("expected 409 TOOL_MISMATCH for cross-tool arm-only replay plan, got {other:?}"),
         }
     }
 }

@@ -659,6 +659,8 @@ pub struct ApplyRequest {
 #[serde(deny_unknown_fields)]
 pub struct ToolInput {
     pub tool_id: String,
+    #[serde(default)]
+    pub tool_config_digest: Option<String>,
     pub tip_cam_m: [f64; 3],
     #[serde(default)]
     pub gripper_opening: Option<f64>,
@@ -736,7 +738,7 @@ pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
         None => None,
         Some(Value::Null) => Some(None),
         Some(v) => Some(Some(serde_json::from_value::<ToolInput>(v.clone())
-            .map_err(|e| CalibError::invalid(format!("tool must be {{tool_id, tip_cam_m, x_fingerprint, gripper_opening?, measured_at?, fit?}}: {e}")))?)),
+            .map_err(|e| CalibError::invalid(format!("tool must be {{tool_id, tool_config_digest?, tip_cam_m, x_fingerprint, gripper_opening?, measured_at?, fit?}}: {e}")))?)),
     };
     let acceptance = match o.get("acceptance") {
         None | Some(Value::Null) => None,
@@ -766,8 +768,21 @@ pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
 /// (tool axis end_link x vertical, TCP at `table_z_m + approach_height_m`). Independent of the
 /// yaw about the vertical. None when the point is behind the camera.
 pub fn grip_pixel_norm(cam: &CamModel, setup: &GraspSetup) -> Option<[f64; 2]> {
-    let pose = crate::kinematics::Pose::new(crate::grasp::look_down(&crate::kinematics::IDENTITY), [0.0, 0.0, setup.table_z_m + setup.approach_height_m]);
-    let px = cam.project(&pose, &[0.0, 0.0, setup.table_z_m + setup.grasp_height_m])?;
+    grip_pixel_norm_for_tcp(cam, setup, &[0.0; 3])
+}
+
+/// [`grip_pixel_norm`] accounting for the active tool's `tcp_offset` (in `end_link` frame).
+pub fn grip_pixel_norm_for_tcp(
+    cam: &CamModel,
+    setup: &GraspSetup,
+    tcp_offset: &[f64; 3],
+) -> Option<[f64; 2]> {
+    let tcp_pose = crate::kinematics::Pose::new(
+        crate::grasp::look_down(&crate::kinematics::IDENTITY),
+        [0.0, 0.0, setup.table_z_m + setup.approach_height_m],
+    );
+    let end_pose = crate::motion::tcp_to_end(&tcp_pose, tcp_offset);
+    let px = cam.project(&end_pose, &[0.0, 0.0, setup.table_z_m + setup.grasp_height_m])?;
     let n = cam.to_norm(px);
     Some([(n[0] * 1e4).round() / 1e4, (n[1] * 1e4).round() / 1e4])
 }
@@ -830,7 +845,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
     let cam = CamModel::assumed(&inner.config.arm_model, &setup, &mount);
     // outside the image (a mount tilted toward the jaws, e.g. v8 at approach height): the grip
     // pixel cannot be stored; camera-down acquisition does not use it, so it stays as it was
-    let grip_pixel_model = grip_pixel_norm(&cam, &setup);
+    let grip_pixel_model = grip_pixel_norm_for_tcp(&cam, &setup, &inner.config.tcp_offset);
     if let Some(p) = grip_pixel_model.filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v))) { setup.grip_pixel_norm = p; }
     setup.validate().map_err(|e| CalibError::invalid(format!("grasp setup after the calibration: {e}")))?;
     let now = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -853,6 +868,20 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         Some(Some(t)) => {
             if t.x_fingerprint != x_fp {
                 return Err(CalibError::new(409, "TOOL_STALE", "tool.x_fingerprint does not match this calibration (intrinsics or camera mount changed since the fingertip was measured); measure the fingertip again"));
+            }
+            let tool_matches = match t.tool_config_digest.as_deref() {
+                Some(dig) => inner.config.active_tool.matches_tool_calib(&t.tool_id, Some(dig)),
+                None => inner.config.active_tool.is_stock,
+            };
+            if !tool_matches {
+                return Err(CalibError::new(
+                    409,
+                    "TOOL_STALE",
+                    format!(
+                        "tool ({:?} / {:?}) does not match active tool '{}' ({}); measure the fingertip again",
+                        t.tool_id, t.tool_config_digest, inner.config.active_tool.id, inner.config.active_tool.config_digest
+                    ),
+                ));
             }
             let spec = inner.config.calibration_tool.as_ref().filter(|s| s.tool_id == t.tool_id);
             let tool = ToolCalibration {
@@ -1570,13 +1599,18 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     let vision_values = validate_intrinsics(&vision_target).map_err(|e| CalibError::invalid(format!("backup {name}: vision_intrinsics.json: {e}")))?;
     if let Some(c) = &target.calibration { c.validate().map_err(CalibError::invalid)?; }
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
-    let (before, active_tool) = {
+    let (before, active_tool, arm_model, tcp_offset) = {
         let inner = sup.inner().read().await;
         if let Some(k) = target.calibration.as_ref().and_then(|c| c.kinematics.as_ref()) {
             inner.config.arm_model.with_correction(Some(&k.joints)).map_err(|e| CalibError::new(400, "UNSUPPORTED", format!("backup {name}: {e}")))?;
         }
         if correction_of(target.calibration.as_ref()) != correction_of(inner.calibration.as_ref()) { kinematics_armed(&inner)?; }
-        (armd_state(&inner), inner.config.active_tool.clone())
+        (
+            armd_state(&inner),
+            inner.config.active_tool.clone(),
+            inner.config.arm_model.clone(),
+            inner.config.tcp_offset,
+        )
     };
     let (backup_tool_id, backup_tool_digest) = if target.tool_id.is_some() || target.tool_config_digest.is_some() {
         (target.tool_id.clone(), target.tool_config_digest.clone())
@@ -1591,13 +1625,48 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     } else {
         (None, None)
     };
+    // Tool-dependent fingertip / hover acceptance records from another tool do not carry over across tool swaps.
+    if let Some(c) = target.calibration.as_mut() {
+        strip_mismatched_tool_records(c, &active_tool);
+    }
     let tool_matches = active_tool.matches_record(backup_tool_id.as_deref(), backup_tool_digest.as_deref());
-    if !tool_matches && target.grasp_setup.is_some() {
-        tracing::warn!(
-            "Calibration restore {name}: stripping tool-scoped grasp_setup for {:?}/{:?} (active tool is '{}' / '{}')",
-            backup_tool_id, backup_tool_digest, active_tool.id, active_tool.config_digest
-        );
-        target.grasp_setup = None;
+    if !tool_matches {
+        if target.grasp_setup.is_some() {
+            tracing::warn!(
+                "Calibration restore {name}: stripping tool-scoped grasp_setup for {:?}/{:?} (active tool is '{}' / '{}')",
+                backup_tool_id, backup_tool_digest, active_tool.id, active_tool.config_digest
+            );
+            target.grasp_setup = None;
+        }
+        if let Some(mut live_b) = before.grasp_setup.clone() {
+            let vg = |k: &str| vision_values.get(k).and_then(Value::as_f64);
+            if let Some(fx) = vg("fx") { live_b.fx_px = fx; }
+            if let Some(fy) = vg("fy") { live_b.fy_px = fy; }
+            if let Some(cx) = vg("cx") { live_b.cx_px = Some(cx); }
+            if let Some(cy) = vg("cy") { live_b.cy_px = Some(cy); }
+            live_b.image_size_px = IMAGE_SIZE_PX;
+            live_b.camera_tilt_deg = f64::from(target.camera_mount.tilt_deg);
+            if let Some(cal_z) = target
+                .calibration
+                .as_ref()
+                .and_then(|c| c.table_z_m)
+                .filter(|z| z.is_finite())
+            {
+                live_b.table_z_m = cal_z;
+            }
+            let cam = CamModel::assumed(&arm_model, &live_b, &target.camera_mount);
+            if let Some(p) = grip_pixel_norm_for_tcp(&cam, &live_b, &tcp_offset)
+                .filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v)))
+            {
+                live_b.grip_pixel_norm = p;
+            }
+            live_b
+                .validate()
+                .map_err(|e| CalibError::invalid(format!("grasp setup after cross-tool restore: {e}")))?;
+            target.grasp_setup = Some(live_b);
+            target.tool_id = Some(active_tool.id.clone());
+            target.tool_config_digest = Some(active_tool.config_digest.clone());
+        }
     } else if let Some(g) = &target.grasp_setup {
         let inner = sup.inner().read().await;
         if let Some(gp) = inner.config.gripper_policy.as_ref() {
@@ -1611,10 +1680,6 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
             )
             .map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup incompatible with gripper_policy: {e}")))?;
         }
-    }
-    // Tool-dependent fingertip / hover acceptance records from another tool do not carry over across tool swaps.
-    if let Some(c) = target.calibration.as_mut() {
-        strip_mismatched_tool_records(c, &active_tool);
     }
     // the joint zero is not part of a camera restore: the live one stays (it has its own restore,
     // `/api/v1/calibration/joint_zero/restore`)

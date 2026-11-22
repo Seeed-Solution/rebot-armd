@@ -153,21 +153,35 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
     let input = inner.plan_input_tcp()?;
     let held_spill_safe = inner.held.as_ref().is_some_and(|h| h.spill_safe);
     let spill_max_tilt_deg = inner.grasp_setup().map_or(8.0, |s| s.spill_max_tilt_deg);
-    let table_clearance = inner.workspace_policy().map(|(w, _)| {
-        let rec = inner.grasp_setup()
-            .map(|s| crate::grasp::CamModel::assumed(&inner.config.arm_model, &s, &inner.config.camera_mount).rec)
-            .unwrap_or_else(|| crate::kinematics::rpy_to_r(0.0, 0.0, f64::from(inner.config.camera_mount.rot_deg).to_radians()));
-        let pts = crate::grasp::envelope_with_contact(
-            Some(w),
-            &inner.config.camera_mount,
-            &rec,
-            inner.config.effective_physical_contact_end_m(),
-        );
-        let bound = inner.grasp_setup()
-            .map(|s| s.table_z_m + crate::grasp::TABLE_CLEARANCE_M)
-            .unwrap_or_else(|| f64::from(w.floor_z_m));
-        (pts, bound)
-    });
+    let table_clearance = match (inner.workspace_policy(), inner.grasp_setup()) {
+        (Some((w, _)), gs) => {
+            let rec = gs
+                .as_ref()
+                .map(|s| crate::grasp::CamModel::assumed(&inner.config.arm_model, s, &inner.config.camera_mount).rec)
+                .unwrap_or_else(|| crate::kinematics::rpy_to_r(0.0, 0.0, f64::from(inner.config.camera_mount.rot_deg).to_radians()));
+            let pts = crate::grasp::envelope_with_contact(
+                Some(w),
+                &inner.config.camera_mount,
+                &rec,
+                inner.config.effective_physical_contact_end_m(),
+            );
+            let bound = gs
+                .map(|s| s.table_z_m + crate::grasp::TABLE_CLEARANCE_M)
+                .unwrap_or_else(|| f64::from(w.floor_z_m));
+            Some((pts, bound))
+        }
+        (None, Some(s)) => {
+            let rec = crate::grasp::CamModel::assumed(&inner.config.arm_model, &s, &inner.config.camera_mount).rec;
+            let pts = crate::grasp::envelope_with_contact(
+                None,
+                &inner.config.camera_mount,
+                &rec,
+                inner.config.effective_physical_contact_end_m(),
+            );
+            Some((pts, s.table_z_m + crate::grasp::TABLE_CLEARANCE_M))
+        }
+        (None, None) => None,
+    };
     Ok(PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg, table_clearance })
 }
 

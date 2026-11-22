@@ -1268,7 +1268,7 @@ pub enum ActivationTxState {
     },
     Aborted { tx_id: String },
     DegradedSplit {
-        tx_id: String,
+        tx_id: Option<String>,
         prev_tx_id: Option<String>,
         prev_scene: String,
         prev_tool: String,
@@ -3664,7 +3664,7 @@ fn verify_rollback_ack(
     Ok(restored_tx)
 }
 
-fn degraded_split_http_error(tx_id: &str, detail: &str) -> (StatusCode, Json<serde_json::Value>) {
+fn degraded_split_http_error(tx_id: Option<&str>, detail: &str) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
@@ -3700,7 +3700,7 @@ struct TxSnapshot {
 }
 
 impl TxSnapshot {
-    fn into_degraded(self, owner_tx_id: String, target_matches_tx: bool, detail: String) -> ActivationTxState {
+    fn into_degraded(self, owner_tx_id: Option<String>, target_matches_tx: bool, detail: String) -> ActivationTxState {
         ActivationTxState::DegradedSplit {
             tx_id: owner_tx_id,
             prev_tx_id: self.prev_tx_id,
@@ -3823,6 +3823,14 @@ async fn commit_local_active_state(
     (final_auto_start, final_seed, final_reset_seq, final_io_seq)
 }
 
+fn parse_optional_digest_field(val: &serde_json::Value, key: &str) -> Result<Option<String>, String> {
+    match val.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("{key} must be string or null, got {other}")),
+    }
+}
+
 fn remote_target_matches_local(
     sim_val: &serde_json::Value,
     target_scene: &str,
@@ -3832,13 +3840,19 @@ fn remote_target_matches_local(
 ) -> bool {
     let scene_ok = sim_val.get("scene").and_then(|v| v.as_str()) == Some(target_scene);
     let tool_ok = sim_val.get("tool").and_then(|v| v.as_str()) == Some(target_tool);
+    let Ok(actual_sd) = parse_optional_digest_field(sim_val, "scene_digest") else {
+        return false;
+    };
+    let Ok(actual_td) = parse_optional_digest_field(sim_val, "tool_digest") else {
+        return false;
+    };
     let sd_ok = match target_scene_digest.as_deref() {
-        Some(expected) => sim_val.get("scene_digest").and_then(|v| v.as_str()) == Some(expected),
-        None => sim_val.get("scene_digest").is_none_or(serde_json::Value::is_null),
+        Some(expected) => actual_sd.as_deref() == Some(expected),
+        None => actual_sd.is_none(),
     };
     let td_ok = match target_tool_digest.as_deref() {
-        Some(expected) => sim_val.get("tool_digest").and_then(|v| v.as_str()) == Some(expected),
-        None => sim_val.get("tool_digest").is_none_or(serde_json::Value::is_null),
+        Some(expected) => actual_td.as_deref() == Some(expected),
+        None => actual_td.is_none(),
     };
     scene_ok && tool_ok && sd_ok && td_ok
 }
@@ -3889,7 +3903,7 @@ fn resolve_remote_target_locally(
 
 fn foreign_degraded_from_sim_val(
     snap: &TxSnapshot,
-    owner_tx: String,
+    owner_tx: Option<String>,
     sim_val: &serde_json::Value,
     detail: String,
 ) -> ActivationTxState {
@@ -3903,14 +3917,8 @@ fn foreign_degraded_from_sim_val(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let r_sd = sim_val
-        .get("scene_digest")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let r_td = sim_val
-        .get("tool_digest")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let r_sd = parse_optional_digest_field(sim_val, "scene_digest").ok().flatten();
+    let r_td = parse_optional_digest_field(sim_val, "tool_digest").ok().flatten();
     ActivationTxState::DegradedSplit {
         tx_id: owner_tx,
         prev_tx_id: snap.prev_tx_id.clone(),
@@ -3943,42 +3951,103 @@ async fn converge_degraded_split(
     snap: TxSnapshot,
     detail: &str,
 ) -> Result<(bool, u64, u64, u64), (StatusCode, Json<serde_json::Value>)> {
-    if let Some(remote_tx) = extract_remote_tx_id(detail.as_bytes()) {
-        let sim_val = serde_json::from_str::<serde_json::Value>(detail)
-            .unwrap_or(serde_json::Value::Null);
-        if remote_tx != snap.tx_id {
-            let msg = format!(
-                "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{remote_tx}' (not '{}'); call /api/v1/sandbox/recover-split first",
-                snap.tx_id
-            );
-            {
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = foreign_degraded_from_sim_val(&snap, remote_tx.clone(), &sim_val, msg.clone());
-            }
-            return Err(degraded_split_http_error(&remote_tx, &msg));
+    let mut observed_val = serde_json::from_str::<serde_json::Value>(detail)
+        .unwrap_or(serde_json::Value::Null);
+    let mut observed_tx = extract_remote_tx_id(detail.as_bytes());
+    let need_state_check = match observed_tx.as_deref() {
+        Some(rt) if rt != snap.tx_id => false,
+        None => true,
+        Some(_) => {
+            observed_val.get("scene").is_none_or(serde_json::Value::is_null)
+                || observed_val.get("tool").is_none_or(serde_json::Value::is_null)
         }
-        if !remote_target_matches_local(
-            &sim_val,
-            &snap.target_scene,
-            &snap.target_tool,
-            &snap.target_scene_digest,
-            &snap.target_tool_digest,
-        ) {
-            let msg = format!(
-                "Sim DEGRADED_SPLIT '{}' reports a different scene/tool/digest than local transaction target '{}/{}'",
-                snap.tx_id, snap.target_scene, snap.target_tool
-            );
-            {
-                let mut tx_w = state.tx_state.write().await;
-                *tx_w = foreign_degraded_from_sim_val(&snap, remote_tx, &sim_val, msg.clone());
+    };
+    if need_state_check {
+        if let Ok(sresp) = sim_tx_call(
+            upstream,
+            Method::GET,
+            "/sim/state",
+            None,
+            state.sim_timeouts.reconcile,
+        )
+        .await
+        {
+            if sresp.status.is_success() {
+                if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
+                    let (sv_tx, sv_state) = extract_remote_tx_and_state(&sv);
+                    if sv_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                        let owner_compatible = match (observed_tx.as_deref(), sv_tx) {
+                            (None, Some(stx)) => {
+                                observed_tx = Some(stx.to_string());
+                                true
+                            }
+                            (Some(otx), Some(stx)) => otx == stx,
+                            _ => false,
+                        };
+                        if owner_compatible {
+                            if observed_val.is_null() {
+                                observed_val = sv;
+                            } else if let (Some(dst), Some(src)) =
+                                (observed_val.as_object_mut(), sv.as_object())
+                            {
+                                for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
+                                    if dst.get(k).is_none_or(serde_json::Value::is_null) {
+                                        if let Some(v) = src.get(k) {
+                                            dst.insert(k.to_string(), v.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            return Err(degraded_split_http_error(&snap.tx_id, &msg));
         }
+    }
+
+    let Some(remote_tx) = observed_tx else {
+        let msg = format!(
+            "Sim reported DEGRADED_SPLIT without explicit owner tx_id for '{}'; refusing auto-convergence via camera_only",
+            snap.tx_id
+        );
+        {
+            let mut tx_w = state.tx_state.write().await;
+            *tx_w = foreign_degraded_from_sim_val(&snap, None, &observed_val, msg.clone());
+        }
+        return Err(degraded_split_http_error(None, &msg));
+    };
+    if remote_tx != snap.tx_id {
+        let msg = format!(
+            "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{remote_tx}' (not '{}'); call /api/v1/sandbox/recover-split first",
+            snap.tx_id
+        );
+        {
+            let mut tx_w = state.tx_state.write().await;
+            *tx_w = foreign_degraded_from_sim_val(&snap, Some(remote_tx.clone()), &observed_val, msg.clone());
+        }
+        return Err(degraded_split_http_error(Some(&remote_tx), &msg));
+    }
+    if !remote_target_matches_local(
+        &observed_val,
+        &snap.target_scene,
+        &snap.target_tool,
+        &snap.target_scene_digest,
+        &snap.target_tool_digest,
+    ) {
+        let msg = format!(
+            "Sim DEGRADED_SPLIT '{}' reports missing or different scene/tool/digest than local transaction target '{}/{}'",
+            snap.tx_id, snap.target_scene, snap.target_tool
+        );
+        {
+            let mut tx_w = state.tx_state.write().await;
+            *tx_w = foreign_degraded_from_sim_val(&snap, Some(remote_tx.clone()), &observed_val, msg.clone());
+        }
+        return Err(degraded_split_http_error(Some(&remote_tx), &msg));
     }
     let split_tx_id = snap.tx_id.clone();
     {
         let mut tx_w = state.tx_state.write().await;
-        *tx_w = snap.clone().into_degraded(split_tx_id.clone(), true, detail.to_string());
+        *tx_w = snap.clone().into_degraded(Some(split_tx_id.clone()), true, detail.to_string());
     }
 
     let camera_body = serde_json::to_vec(&serde_json::json!({
@@ -4064,7 +4133,7 @@ async fn converge_degraded_split(
         }
     }
 
-    Err(degraded_split_http_error(&split_tx_id, detail))
+    Err(degraded_split_http_error(Some(&split_tx_id), detail))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4103,11 +4172,14 @@ fn activate_committed_response(
     }))
 }
 
-async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+async fn reconcile_unknown_tx(
+    state: &SandboxState,
+    running_robot: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let existing_tx = state.tx_state.read().await.clone();
     match existing_tx {
         ActivationTxState::DegradedSplit { ref tx_id, ref detail, .. } => {
-            Err(degraded_split_http_error(tx_id, detail))
+            Err(degraded_split_http_error(tx_id.as_deref(), detail))
         }
         ActivationTxState::Unknown {
             ref tx_id,
@@ -4155,6 +4227,13 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
             };
             let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
             if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+                check_required_upstream_robot_match(
+                    &sim_val,
+                    running_robot,
+                    "SIM_RECOVERY_INCOMPATIBLE",
+                    tx_id,
+                    "state reconciliation",
+                )?;
                 if !remote_target_matches_local(
                     &sim_val,
                     target_scene,
@@ -4218,24 +4297,27 @@ async fn reconcile_unknown_tx(state: &SandboxState) -> Result<(), (StatusCode, J
                     );
                     let mut tx_w = state.tx_state.write().await;
                     *tx_w = if matches {
-                        own_snap.into_degraded(tx_id.clone(), true, detail)
+                        own_snap.into_degraded(Some(tx_id.clone()), true, detail)
                     } else {
-                        foreign_degraded_from_sim_val(&own_snap, tx_id.clone(), &sim_val, detail)
+                        foreign_degraded_from_sim_val(&own_snap, Some(tx_id.clone()), &sim_val, detail)
                     };
                     return Err(degraded_split_http_error(
-                        tx_id,
+                        Some(tx_id),
                         "Previous sim activation is in DEGRADED_SPLIT; call /api/v1/sandbox/recover-split first",
                     ));
                 }
-                let owner_tx = remote_tx
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("foreign-split-{tx_id}"));
-                let foreign_msg = format!(
-                    "Remote sim is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
-                );
+                let owner_tx = remote_tx.map(str::to_string);
+                let foreign_msg = match owner_tx.as_deref() {
+                    Some(otx) => format!(
+                        "Remote sim is in DEGRADED_SPLIT owned by foreign transaction '{otx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
+                    ),
+                    None => format!(
+                        "Remote sim is in DEGRADED_SPLIT with unknown owner transaction (local '{tx_id}'); call /api/v1/sandbox/recover-split first"
+                    ),
+                };
                 let mut tx_w = state.tx_state.write().await;
                 *tx_w = foreign_degraded_from_sim_val(&own_snap, owner_tx.clone(), &sim_val, foreign_msg.clone());
-                return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
+                return Err(degraded_split_http_error(owner_tx.as_deref(), &foreign_msg));
             }
             if remote_state.eq_ignore_ascii_case("COMMITTING") {
                 return Err(tx_json_err(
@@ -4408,6 +4490,13 @@ async fn reconcile_lost_commit_ack(
     let sim_val = serde_json::from_slice::<serde_json::Value>(&sresp.body).unwrap_or(serde_json::Value::Null);
     let (remote_tx, remote_state) = extract_remote_tx_and_state(&sim_val);
     if remote_tx == Some(tx_id.as_str()) && remote_state.eq_ignore_ascii_case("COMMITTED") {
+        check_required_upstream_robot_match(
+            &sim_val,
+            running_robot,
+            "SIM_RECOVERY_INCOMPATIBLE",
+            &tx_id,
+            "state reconciliation",
+        )?;
         if !remote_target_matches_local(
             &sim_val,
             &snap.target_scene,
@@ -4430,19 +4519,22 @@ async fn reconcile_lost_commit_ack(
             let committed = converge_degraded_split(state, upstream, running_robot, snap, &detail).await?;
             return Ok(Some(committed));
         }
-        // B01: Foreign split owner -> adopt with target_matches_tx = false,
+        // B01: Foreign or unknown split owner -> adopt with target_matches_tx = false,
         // never graft foreign tx_id onto our target config.
-        let owner_tx = remote_tx
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("foreign-split-{tx_id}"));
-        let foreign_msg = format!(
-            "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{owner_tx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
-        );
+        let owner_tx = remote_tx.map(str::to_string);
+        let foreign_msg = match owner_tx.as_deref() {
+            Some(otx) => format!(
+                "Sim activation is in DEGRADED_SPLIT owned by foreign transaction '{otx}' (not '{tx_id}'); call /api/v1/sandbox/recover-split first"
+            ),
+            None => format!(
+                "Sim activation is in DEGRADED_SPLIT with unknown owner transaction (local '{tx_id}'); call /api/v1/sandbox/recover-split first"
+            ),
+        };
         {
             let mut tx_w = state.tx_state.write().await;
             *tx_w = foreign_degraded_from_sim_val(&snap, owner_tx.clone(), &sim_val, foreign_msg.clone());
         }
-        return Err(degraded_split_http_error(&owner_tx, &foreign_msg));
+        return Err(degraded_split_http_error(owner_tx.as_deref(), &foreign_msg));
     }
     if remote_state.eq_ignore_ascii_case("COMMITTING") {
         return Err(tx_json_err(
@@ -4493,10 +4585,10 @@ pub async fn activate(
     let _act_guard = state.activate_lock.lock().await;
 
     // 1. Refuse any new activation while SandboxState is DEGRADED_SPLIT (or reconcile Unknown first).
-    reconcile_unknown_tx(&state).await?;
+    let running_robot = running_robot_id(&supervisor).await;
+    reconcile_unknown_tx(&state, &running_robot).await?;
 
     // Validate requested robot/profile against running robot BEFORE resolving scene/tool/policy.
-    let running_robot = running_robot_id(&supervisor).await;
     let requested_robot = resolve_requested_robot(
         payload.robot.as_deref(),
         payload.profile.as_deref(),
@@ -4807,9 +4899,10 @@ pub async fn activate(
                 ));
             }
             Ok(resp) if resp.status == StatusCode::SERVICE_UNAVAILABLE && is_degraded_response(&resp.body) => {
-                // M3: store the explicit remote split owner tx_id (from response or GET /sim/state),
-                // never substituting the newly requested tx_id for an unknown owner, and require explicit
-                // target verification before setting target_matches_tx=true.
+                // M3 + M9 + M10: store explicit remote split owner tx_id (None when unknown, never
+                // fabricated), only enrich missing target metadata from GET /sim/state when it
+                // reports DEGRADED_SPLIT for the same owner tx_id (or supplies tx_id atomically when
+                // prepare omitted it).
                 let detail = String::from_utf8_lossy(&resp.body).to_string();
                 let mut sim_val = serde_json::from_slice::<serde_json::Value>(&resp.body)
                     .unwrap_or(serde_json::Value::Null);
@@ -4828,17 +4921,29 @@ pub async fn activate(
                     .await
                     {
                         if sresp.status.is_success() {
-                            if owner_tx.is_none() {
-                                owner_tx = extract_remote_tx_id(&sresp.body);
-                            }
                             if let Ok(sv) = serde_json::from_slice::<serde_json::Value>(&sresp.body) {
-                                if sim_val.is_null() {
-                                    sim_val = sv;
-                                } else if let (Some(dst), Some(src)) = (sim_val.as_object_mut(), sv.as_object()) {
-                                    for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
-                                        if dst.get(k).is_none_or(serde_json::Value::is_null) {
-                                            if let Some(v) = src.get(k) {
-                                                dst.insert(k.to_string(), v.clone());
+                                let (sv_tx, sv_state) = extract_remote_tx_and_state(&sv);
+                                if sv_state.eq_ignore_ascii_case("DEGRADED_SPLIT") {
+                                    let merge_ok = match (owner_tx.as_deref(), sv_tx) {
+                                        (None, Some(stx)) => {
+                                            owner_tx = Some(stx.to_string());
+                                            true
+                                        }
+                                        (Some(otx), Some(stx)) => otx == stx,
+                                        _ => false,
+                                    };
+                                    if merge_ok {
+                                        if sim_val.is_null() {
+                                            sim_val = sv;
+                                        } else if let (Some(dst), Some(src)) =
+                                            (sim_val.as_object_mut(), sv.as_object())
+                                        {
+                                            for k in ["tx_id", "scene", "tool", "scene_digest", "tool_digest"] {
+                                                if dst.get(k).is_none_or(serde_json::Value::is_null) {
+                                                    if let Some(v) = src.get(k) {
+                                                        dst.insert(k.to_string(), v.clone());
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -4856,10 +4961,10 @@ pub async fn activate(
                             &snap.target_scene_digest,
                             &snap.target_tool_digest,
                         );
-                        (remote_owner, matches)
+                        (Some(remote_owner), matches)
                     }
-                    Some(remote_owner) => (remote_owner, false),
-                    None => (format!("unknown-split-{tx_id}"), false),
+                    Some(remote_owner) => (Some(remote_owner), false),
+                    None => (None, false),
                 };
                 let mut tx_w = state.tx_state.write().await;
                 *tx_w = if target_matches_tx {
@@ -4867,7 +4972,7 @@ pub async fn activate(
                 } else {
                     foreign_degraded_from_sim_val(&snap, owner_tx_id.clone(), &sim_val, detail.clone())
                 };
-                return Err(degraded_split_http_error(&owner_tx_id, &detail));
+                return Err(degraded_split_http_error(owner_tx_id.as_deref(), &detail));
             }
             Ok(resp)
                 if resp.status == StatusCode::BAD_REQUEST
@@ -5011,7 +5116,7 @@ pub async fn recover_split(
         detail,
     ) = match cur_tx {
         ActivationTxState::DegradedSplit {
-            tx_id,
+            tx_id: Some(tx_id),
             prev_tx_id,
             prev_scene,
             prev_tool,
@@ -5046,8 +5151,11 @@ pub async fn recover_split(
             target_matches_tx,
             detail,
         ),
-        // M5: Restart recovery (or Unknown): query GET /sim/state and adopt remote DEGRADED_SPLIT tx_id
-        ActivationTxState::Idle | ActivationTxState::Unknown { .. } => {
+        // M5 + M10: Restart recovery, Unknown, or DegradedSplit without known owner tx_id:
+        // query GET /sim/state to discover the real remote DEGRADED_SPLIT tx_id and target.
+        ActivationTxState::Idle
+        | ActivationTxState::Unknown { .. }
+        | ActivationTxState::DegradedSplit { tx_id: None, .. } => {
             let sresp = sim_tx_call(
                 &upstream,
                 Method::GET,
@@ -5100,14 +5208,11 @@ pub async fn recover_split(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            let r_sd = sim_val
-                .get("scene_digest")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let r_td = sim_val
-                .get("tool_digest")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let sd_parsed = parse_optional_digest_field(&sim_val, "scene_digest");
+            let td_parsed = parse_optional_digest_field(&sim_val, "tool_digest");
+            let digests_well_typed = sd_parsed.is_ok() && td_parsed.is_ok();
+            let r_sd = sd_parsed.ok().flatten();
+            let r_td = td_parsed.ok().flatten();
 
             let (
                 resolved_target_matches,
@@ -5132,13 +5237,15 @@ pub async fn recover_split(
                     ref target_tool_digest,
                     ..
                 } if tx_id == adopted_tx => {
-                    if remote_target_matches_local(
-                        &sim_val,
-                        target_scene,
-                        target_tool,
-                        target_scene_digest,
-                        target_tool_digest,
-                    ) {
+                    if digests_well_typed
+                        && remote_target_matches_local(
+                            &sim_val,
+                            target_scene,
+                            target_tool,
+                            target_scene_digest,
+                            target_tool_digest,
+                        )
+                    {
                         (
                             true,
                             target_scene.clone(),
@@ -5164,8 +5271,8 @@ pub async fn recover_split(
                         )
                     }
                 }
-                _ => match (r_scene, r_tool) {
-                    (Some(rs), Some(rt)) => {
+                _ => match (digests_well_typed, r_scene, r_tool) {
+                    (true, Some(rs), Some(rt)) => {
                         let (ok, mjcf, sd, td) = resolve_remote_target_locally(
                             &state,
                             &running_robot,
@@ -5186,7 +5293,7 @@ pub async fn recover_split(
                             td,
                         )
                     }
-                    (rs_opt, rt_opt) => (
+                    (_, rs_opt, rt_opt) => (
                         false,
                         rs_opt.unwrap_or_default(),
                         rt_opt.unwrap_or_default(),
@@ -5202,6 +5309,14 @@ pub async fn recover_split(
 
             let (eff_prev_tx, eff_prev_scene, eff_prev_tool, eff_prev_sd, eff_prev_td) = match &cur_tx {
                 ActivationTxState::Unknown {
+                    prev_tx_id,
+                    prev_scene,
+                    prev_tool,
+                    prev_scene_digest,
+                    prev_tool_digest,
+                    ..
+                }
+                | ActivationTxState::DegradedSplit {
                     prev_tx_id,
                     prev_scene,
                     prev_tool,
@@ -5254,10 +5369,10 @@ pub async fn recover_split(
 
     if payload.action == "replay_camera" && !target_matches_tx {
         let mut tx_w = state.tx_state.write().await;
-        if !matches!(*tx_w, ActivationTxState::DegradedSplit { .. }) {
+        if !matches!(*tx_w, ActivationTxState::DegradedSplit { tx_id: Some(_), .. }) {
             let prev = state.active.read().await.clone();
             *tx_w = ActivationTxState::DegradedSplit {
-                tx_id: tx_id.clone(),
+                tx_id: Some(tx_id.clone()),
                 prev_tx_id: prev_tx_id.clone(),
                 prev_scene: prev_scene.clone(),
                 prev_tool: prev_tool.clone(),
@@ -5308,11 +5423,11 @@ pub async fn recover_split(
         state.sim_timeouts.commit,
     )
     .await
-    .map_err(|_| degraded_split_http_error(&tx_id, &detail))?;
+    .map_err(|_| degraded_split_http_error(Some(&tx_id), &detail))?;
 
     if !resp.status.is_success() {
         let msg = String::from_utf8_lossy(&resp.body).to_string();
-        return Err(degraded_split_http_error(&tx_id, &msg));
+        return Err(degraded_split_http_error(Some(&tx_id), &msg));
     }
 
     if payload.action == "replay_camera" {
@@ -5352,7 +5467,7 @@ pub async fn recover_split(
         })))
     } else {
         let restored_tx_id = verify_rollback_ack(&resp.body, &tx_id, prev_tx_id.as_deref())
-            .map_err(|msg| degraded_split_http_error(&tx_id, &msg))?;
+            .map_err(|msg| degraded_split_http_error(Some(&tx_id), &msg))?;
         restore_tx_state_after_rollback(
             &state,
             restored_tx_id.clone(),

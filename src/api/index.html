@@ -3265,7 +3265,7 @@ Object.assign(I18N.zh, {
   'task.empty': '还没有记录。外部程序发起动作或取得控制权时会显示在这里。', 'task.lease.acquire': '取得控制权', 'task.lease.release': '释放控制权',
   'task.env.hint': '只读。打开本面板时每 2 秒刷新一次。', 'task.open_poses': '打开点位管理',
   'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
-  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.tool_comm': '工具调试', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
+  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.daemon_tool': '臂端工具', 'task.env.tool_comm': '工具调试', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
   'tool.badge.comm': '{id} · 待调试', 'tool.comm.title': '工具「{id}」未完成调试', 'tool.comm.hint': '请先完成工具调试/标定后再执行常规运动。',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
@@ -3283,7 +3283,7 @@ Object.assign(I18N.en, {
   'task.empty': 'Nothing yet. Actions started by external clients and lease changes appear here.', 'task.lease.acquire': 'took control', 'task.lease.release': 'released control',
   'task.env.hint': 'Read-only. Refreshes every 2 s while this panel is open.', 'task.open_poses': 'Open Poses',
   'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
-  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.tool_comm': 'Tool commissioning', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
+  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.daemon_tool': 'Daemon tool', 'task.env.tool_comm': 'Tool commissioning', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
   'tool.badge.comm': '{id} · needs commissioning', 'tool.comm.title': 'Tool "{id}" needs commissioning', 'tool.comm.hint': 'Complete tool commissioning / calibration before running normal motions.',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
@@ -6854,8 +6854,18 @@ async function cwvTipMeasure() {
     const d1 = await commandRPC('/api/v1/calibration/apply', base, true, 15000);
     CWV.xfp = d1.after && d1.after.x_fingerprint;
     let toolId = 'unknown_tool';
-    try { const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(); if (st.calibration_tool && st.calibration_tool.tool_id) toolId = st.calibration_tool.tool_id; } catch (_) {}
-    const tool = { tool_id: toolId, tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
+    let toolDigest = (S.activeTool && S.activeTool.config_digest) || null;
+    try {
+      const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json();
+      if (st.active_tool && !st.active_tool.is_stock && st.active_tool.id) {
+        toolId = st.active_tool.id;
+        if (st.active_tool.config_digest) toolDigest = st.active_tool.config_digest;
+      } else {
+        if (st.calibration_tool && st.calibration_tool.tool_id) toolId = st.calibration_tool.tool_id;
+        if (!toolDigest && st.active_tool && st.active_tool.config_digest) toolDigest = st.active_tool.config_digest;
+      }
+    } catch (_) {}
+    const tool = { tool_id: toolId, ...(toolDigest ? { tool_config_digest: toolDigest } : {}), tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
       fit: { frames: res.frames, reproj_px: +res.reprojPx.toFixed(3), gap_px: +res.gapPx.toFixed(3), std_mm: +res.stdMm.toFixed(3) } };
     const d2 = await commandRPC('/api/v1/calibration/apply', { ...base, tool }, true, 15000);
     CWV.fp = d2.after && d2.after.fingerprint;
@@ -12539,17 +12549,19 @@ function tkEnvRows() {
   const val = (x) => (x == null || x === '' ? none : String(x));
   const rows = [['h', t('task.env.sec.sandbox')]];
   const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
-  const activeToolId = (S.activeTool && S.activeTool.id) || (sb && sb.active_tool);
+  const daemonToolId = S.activeTool && S.activeTool.id;
+  const sbToolId = sb && sb.active_tool;
   const toolCommReq = !!(S.activeTool && S.activeTool.commissioning_required === true);
   if (!E) rows.push(['r', t('task.env.mode'), t('task.env.loading')]);
   else if (!sb) {
     rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
-    if (activeToolId) rows.push(['r', t('task.env.tool'), val(activeToolId)]);
+    if (daemonToolId) rows.push(['r', t('task.env.daemon_tool'), val(daemonToolId)]);
     if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
   } else {
     rows.push(['r', t('task.env.mode'), sb.mode && sb.mode !== 'none' ? String(sb.mode) : none]);
     rows.push(['r', t('task.env.scene'), val(sb.active_scene)]);
-    rows.push(['r', t('task.env.tool'), val(activeToolId)]);
+    rows.push(['r', t('task.env.tool'), val(sbToolId)]);
+    if (daemonToolId && daemonToolId !== sbToolId) rows.push(['r', t('task.env.daemon_tool'), val(daemonToolId)]);
     if (toolCommReq) rows.push(['r', t('task.env.tool_comm'), t('tool.comm.hint'), 'warn']);
     rows.push(['r', t('task.env.policy'), val(sb.active_policy)]);
     const ps = sb.policy_status ?? (sb.telemetry && typeof sb.telemetry === 'object' ? sb.telemetry.policy_status : undefined);

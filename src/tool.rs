@@ -1257,12 +1257,15 @@ fn apply_tool_overlay_with_details(
         .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
         .collect();
 
-    // 4. Non-zero offset or extra points require kinematics and workspace on the profile.
-    if (tcp_offset != [0.0; 3] || !extra_points.is_empty())
+    let has_physical_contact = armd.is_some_and(|a| a.physical_contact_end_m.is_some())
+        || candidate.physical_contact_end_m.is_some();
+
+    // 4. Non-zero offset, extra check points, or physical contact point require kinematics and workspace on the profile.
+    if (tcp_offset != [0.0; 3] || !extra_points.is_empty() || has_physical_contact)
         && (candidate.kinematics.is_none() || candidate.workspace.is_none())
     {
         return Err(format!(
-            "tool '{}' has nonzero tcp_offset or extra_check_points_end_m, which requires kinematics and workspace on the profile",
+            "tool '{}' has nonzero tcp_offset, extra_check_points_end_m, or physical_contact_end_m, which requires kinematics and workspace on the profile",
             pack.id
         ));
     }

@@ -1374,13 +1374,6 @@ fn parse_mjcf_site_rotation(doc: &roxmltree::Document, node: roxmltree::Node) ->
 
 fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
     let req = requested.trim();
-    if !req.is_empty()
-        && base_doc
-            .descendants()
-            .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(req))
-    {
-        return Ok(req.to_string());
-    }
     if req.is_empty() || req == "end_link" {
         for site in base_doc.descendants() {
             if site.is_element() && site.tag_name().name() == "site" && site.attribute("name") == Some("tcp") {
@@ -1393,6 +1386,17 @@ fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> 
                 }
             }
         }
+        if base_doc
+            .descendants()
+            .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some("end_link"))
+        {
+            return Ok("end_link".to_string());
+        }
+    } else if base_doc
+        .descendants()
+        .any(|n| n.is_element() && n.tag_name().name() == "body" && n.attribute("name") == Some(req))
+    {
+        return Ok(req.to_string());
     }
     let label = if req.is_empty() { "end_link" } else { req };
     Err(format!("Could not find attach body <body name=\"{label}\"> in base XML"))
@@ -1629,9 +1633,63 @@ pub fn compose_mjcf(
             }
 
             // Insert tool worldbody children inside resolved attach_body (e.g. `end_link` or SO-101's `gripper`).
+            // If the attach body's `<site name="tcp">` has a non-zero zero-offset pos or non-identity orientation,
+            // wrap the tool worldbody XML in `<body name="__tool_mount_frame" pos="..." quat="...">` so tool
+            // geometries declared relative to tool mount origin keep their exact pose relative to `<site name="tcp">`.
             if !tool_worldbody_xml.is_empty() {
                 let attach_name = resolve_attach_body_name(&base_doc, &tm.attach_body)?;
                 resolved_attach_body = Some(attach_name.clone());
+                let mount_wrapped_xml = {
+                    let tcp_node = base_doc.descendants().find(|n| {
+                        n.is_element()
+                            && n.tag_name().name() == "site"
+                            && n.attribute("name") == Some("tcp")
+                            && !edits.iter().any(|e| {
+                                e.replacement.is_empty()
+                                    && n.range().start >= e.start
+                                    && n.range().end <= e.end
+                            })
+                    });
+                    if let Some(site_node) = tcp_node {
+                        let site_host = site_node
+                            .ancestors()
+                            .skip(1)
+                            .find(|a| a.is_element() && a.tag_name().name() == "body")
+                            .and_then(|b| b.attribute("name").map(str::trim));
+                        if site_host == Some(attach_name.as_str()) {
+                            let base_pos = match site_node.attribute("pos") {
+                                Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+                                None => [0.0; 3],
+                            };
+                            let r_site = parse_mjcf_site_rotation(&base_doc, site_node)?;
+                            let has_pos = base_pos.iter().any(|v| v.abs() > 1e-12);
+                            let has_rot = (0..3).any(|r| {
+                                (0..3).any(|c| (r_site[r][c] - crate::kinematics::IDENTITY[r][c]).abs() > 1e-9)
+                            });
+                            if has_pos || has_rot {
+                                let q = crate::kinematics::r_to_quat(&r_site);
+                                let fmt = |v: f64| if v == 0.0 { 0.0 } else { v };
+                                format!(
+                                    "<body name=\"__tool_mount_frame\" pos=\"{} {} {}\" quat=\"{} {} {} {}\">\n{}</body>",
+                                    fmt(base_pos[0]),
+                                    fmt(base_pos[1]),
+                                    fmt(base_pos[2]),
+                                    fmt(q[0]),
+                                    fmt(q[1]),
+                                    fmt(q[2]),
+                                    fmt(q[3]),
+                                    tool_worldbody_xml
+                                )
+                            } else {
+                                tool_worldbody_xml.clone()
+                            }
+                        } else {
+                            tool_worldbody_xml.clone()
+                        }
+                    } else {
+                        tool_worldbody_xml.clone()
+                    }
+                };
                 let mut attached = false;
                 for node in base_doc.descendants() {
                     if node.is_element() && node.tag_name().name() == "body" && node.attribute("name") == Some(attach_name.as_str()) {
@@ -1642,7 +1700,7 @@ pub fn compose_mjcf(
                             edits.push(XmlEdit {
                                 start: insert_pos,
                                 end: insert_pos,
-                                replacement: format!("\n{}\n", tool_worldbody_xml),
+                                replacement: format!("\n{}\n", mount_wrapped_xml),
                             });
                             attached = true;
                             break;
@@ -2300,8 +2358,10 @@ mod tests {
         assert!((offset_pos[1] - (-0.000218121 - 0.005)).abs() < 1e-5, "offset_pos={offset_pos:?}");
         assert!((offset_pos[2] - (-0.0981274 - 0.025)).abs() < 1e-5, "offset_pos={offset_pos:?}");
 
-        // 11. R4 M5 + m2: Shipped SO-101 (no `end_link`, tcp site inside `gripper`) resolves
-        // attach_body="end_link" (or empty) to `gripper` for both worldbody geom insertion and suction welds.
+        // 11. R4 M5 + m2 & R5 M6: Shipped SO-101 (no `end_link`, tcp site inside `gripper` with non-zero pos+quat)
+        // resolves attach_body="end_link" (or empty) to `gripper`, wraps tool worldbody children in
+        // `<body name="__tool_mount_frame">` matching base TCP site pos+quat so tool geom pose relative to
+        // updated `<site name="tcp">` matches declared `tcp_offset`, and sets suction weld body1="gripper".
         let so101_geom_tool = r#"<mujoco><worldbody><geom name="custom_pad" type="box" size="0.01 0.01 0.01" pos="0 0 0"/></worldbody></mujoco>"#;
         let so101_geom_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
             "id": "so101_custom_pad",
@@ -2317,10 +2377,34 @@ mod tests {
             .descendants()
             .find(|n| n.is_element() && n.tag_name().name() == "geom" && n.attribute("name") == Some("custom_pad"))
             .expect("custom_pad geom inserted");
+        let mount_frame = pad_geom.parent().expect("mount frame parent");
+        assert_eq!(mount_frame.attribute("name"), Some("__tool_mount_frame"));
         assert_eq!(
-            pad_geom.parent().and_then(|p| p.attribute("name")),
+            mount_frame.parent().and_then(|p| p.attribute("name")),
             Some("gripper"),
             "SO-101 attach_body='end_link' must attach under `gripper`"
+        );
+        let mf_pos = parse_mjcf_vec3(mount_frame.attribute("pos").unwrap(), "pos").unwrap();
+        for axis in 0..3 {
+            assert!((mf_pos[axis] - zero_pos[axis]).abs() < 1e-6);
+        }
+        let mf_r = parse_mjcf_site_rotation(&so101_geom_doc, mount_frame).unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!((mf_r[r][c] - r_site[r][c]).abs() < 1e-6);
+            }
+        }
+        let pad_tcp = so101_geom_doc
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "site" && n.attribute("name") == Some("tcp"))
+            .unwrap();
+        let pad_tcp_pos = parse_mjcf_vec3(pad_tcp.attribute("pos").unwrap(), "pos").unwrap();
+        // Relative vector (pad_tcp_pos - mf_pos) transformed into mount_frame local frame equals [0.01, 0, 0].
+        let rel_gripper = crate::kinematics::sub(&pad_tcp_pos, &mf_pos);
+        let rel_local = crate::kinematics::mat_vec(&crate::kinematics::transpose(&mf_r), &rel_gripper);
+        assert!(
+            (rel_local[0] - 0.01).abs() < 1e-6 && rel_local[1].abs() < 1e-6 && rel_local[2].abs() < 1e-6,
+            "rel_local={rel_local:?}"
         );
 
         let so101_suction_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
@@ -2339,7 +2423,8 @@ mod tests {
             .expect("suction weld inserted");
         assert_eq!(weld.attribute("body1"), Some("gripper"));
 
-        // 12. R4 m1: `euler` respects <compiler angle="degree|radian" eulerseq="..."/> and fails closed on unsupported eulerseq.
+        // 12. R4 m1 & R5 m5: `euler` respects <compiler angle="degree|radian" eulerseq="..."/>,
+        // verifies multi-axis intrinsic xyz vs extrinsic XYZ rotations, and fails closed on unsupported eulerseq.
         let deg_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0 0 90"/></body></worldbody></mujoco>"#;
         let deg_manifest: ToolManifest = serde_json::from_value(serde_json::json!({
             "id": "deg_tool", "kind": "suction", "robots": ["b601dm"], "tcp_offset": [0.02, 0.0, 0.0]
@@ -2353,7 +2438,58 @@ mod tests {
         // Default degree + xyz: 90 deg about z maps +x -> +y: [0, 0.02, 0]
         assert!(deg_pos[0].abs() < 1e-6 && (deg_pos[1] - 0.02).abs() < 1e-6 && deg_pos[2].abs() < 1e-6, "deg_pos={deg_pos:?}");
 
+        // Multi-axis intrinsic xyz with explicit angle="radian": R = Rx(pi/2) * Ry(pi/2) * Rz(0)
+        // [0.02, 0, 0] -> Ry(pi/2)*[0.02,0,0]=[0,0,-0.02] -> Rx(pi/2)*[0,0,-0.02]=[0,0.02,0]
+        let rad_xyz_base = r#"<mujoco><compiler angle="radian" eulerseq="xyz"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="1.5707963267948966 1.5707963267948966 0"/></body></worldbody></mujoco>"#;
+        let rad_xyz_out = compose_mjcf(rad_xyz_base, None, Some(&deg_manifest), None).unwrap();
+        let rad_xyz_doc = roxmltree::Document::parse(&rad_xyz_out).unwrap();
+        let rad_xyz_pos = parse_mjcf_vec3(
+            rad_xyz_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        assert!(
+            rad_xyz_pos[0].abs() < 1e-6 && (rad_xyz_pos[1] - 0.02).abs() < 1e-6 && rad_xyz_pos[2].abs() < 1e-6,
+            "rad_xyz_pos={rad_xyz_pos:?}"
+        );
+
+        // Multi-axis extrinsic XYZ with explicit angle="radian": R = Rz(0) * Ry(pi/2) * Rx(pi/2)
+        // Rx(pi/2)*[0.02,0,0]=[0.02,0,0] -> Ry(pi/2)*[0.02,0,0]=[0,0,-0.02]
+        let rad_ext_base = r#"<mujoco><compiler angle="radian" eulerseq="XYZ"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="1.5707963267948966 1.5707963267948966 0"/></body></worldbody></mujoco>"#;
+        let rad_ext_out = compose_mjcf(rad_ext_base, None, Some(&deg_manifest), None).unwrap();
+        let rad_ext_doc = roxmltree::Document::parse(&rad_ext_out).unwrap();
+        let rad_ext_pos = parse_mjcf_vec3(
+            rad_ext_doc.descendants().find(|n| n.attribute("name") == Some("tcp")).unwrap().attribute("pos").unwrap(),
+            "pos",
+        ).unwrap();
+        assert!(
+            rad_ext_pos[0].abs() < 1e-6 && rad_ext_pos[1].abs() < 1e-6 && (rad_ext_pos[2] + 0.02).abs() < 1e-6,
+            "rad_ext_pos={rad_ext_pos:?}"
+        );
+
         let bad_seq_base = r#"<mujoco><compiler angle="radian" eulerseq="xYz"/><worldbody><body name="end_link"><site name="tcp" pos="0 0 0" euler="0.1 0.2 0.3"/></body></worldbody></mujoco>"#;
         assert!(compose_mjcf(bad_seq_base, None, Some(&deg_manifest), None).unwrap_err().contains("eulerseq"));
+
+        // 13. R5 M7: When base MJCF has BOTH <body name="end_link"> and another TCP-hosting body <body name="gripper">,
+        // both attach_body="" and attach_body="end_link" unify on the TCP-hosting body (`gripper`).
+        let dual_body_base = r#"<mujoco><worldbody>
+          <body name="end_link">
+            <body name="gripper"><site name="tcp" pos="0 0 0"/></body>
+          </body>
+        </worldbody></mujoco>"#;
+        for attach_val in ["", "end_link"] {
+            let m: ToolManifest = serde_json::from_value(serde_json::json!({
+                "id": "dual_body_tool",
+                "kind": "suction",
+                "robots": ["b601dm"],
+                "attach_body": attach_val,
+                "tcp_offset": [0.01, 0.0, 0.0]
+            })).unwrap();
+            let composed = compose_mjcf(dual_body_base, Some(prop_scene), Some(&m), Some(so101_geom_tool)).unwrap();
+            let doc = roxmltree::Document::parse(&composed).unwrap();
+            let pad = doc.descendants().find(|n| n.attribute("name") == Some("custom_pad")).unwrap();
+            assert_eq!(pad.parent().and_then(|p| p.attribute("name")), Some("gripper"), "attach_body={attach_val:?}");
+            let w = doc.descendants().find(|n| n.attribute("name") == Some("suction_weld_0_chip")).unwrap();
+            assert_eq!(w.attribute("body1"), Some("gripper"), "attach_body={attach_val:?}");
+        }
     }
 }
