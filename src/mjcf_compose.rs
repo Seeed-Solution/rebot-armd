@@ -1386,6 +1386,62 @@ fn check_tcp_site_not_in_frame(node: roxmltree::Node) -> Result<(), String> {
     Ok(())
 }
 
+fn check_tcp_site_supported(doc: &roxmltree::Document, node: roxmltree::Node) -> Result<(), String> {
+    check_tcp_site_not_in_frame(node)?;
+    if node.attribute("fromto").is_some() {
+        return Err("base MJCF <site name=\"tcp\"> uses unsupported 'fromto' attribute".into());
+    }
+    let explicit_class = node
+        .attribute("class")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "main");
+    if let Some(cls) = explicit_class {
+        return Err(format!(
+            "base MJCF <site name=\"tcp\"> uses unsupported class '{cls}'"
+        ));
+    }
+    let ancestor_childclass = node.ancestors().skip(1).find_map(|a| {
+        a.is_element()
+            .then(|| {
+                a.attribute("childclass")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "main")
+            })
+            .flatten()
+    });
+    const TRANSFORM_ATTRS: [&str; 7] =
+        ["pos", "quat", "euler", "axisangle", "xyaxes", "zaxis", "fromto"];
+    for def in doc.descendants() {
+        if !def.is_element() || def.tag_name().name() != "default" {
+            continue;
+        }
+        let def_class = def
+            .attribute("class")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "main");
+        let applies = match (ancestor_childclass, def_class) {
+            (_, None) => true,
+            (Some(ac), Some(dc)) => ac == dc,
+            (None, Some(_)) => false,
+        };
+        if !applies {
+            continue;
+        }
+        for child in def.children() {
+            if child.is_element()
+                && child.tag_name().name() == "site"
+                && TRANSFORM_ATTRS.iter().any(|k| child.attribute(*k).is_some())
+            {
+                return Err(format!(
+                    "base MJCF <site name=\"tcp\"> inherits unsupported <default> <site> transform (class {:?})",
+                    def_class.unwrap_or("main")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_attach_body_name(base_doc: &roxmltree::Document, requested: &str) -> Result<String, String> {
     let req = requested.trim();
     if req.is_empty() || req == "end_link" {
@@ -1666,7 +1722,7 @@ pub fn compose_mjcf(
                             })
                     });
                     if let Some(site_node) = tcp_node {
-                        check_tcp_site_not_in_frame(site_node)?;
+                        check_tcp_site_supported(&base_doc, site_node)?;
                         let site_host = site_node
                             .ancestors()
                             .skip(1)
@@ -1747,7 +1803,7 @@ pub fn compose_mjcf(
                     if overlaps_delete {
                         continue;
                     }
-                    check_tcp_site_not_in_frame(node)?;
+                    check_tcp_site_supported(&base_doc, node)?;
                     let base_pos = match node.attribute("pos") {
                         Some(raw) => parse_mjcf_vec3(raw, "pos")?,
                         None => [0.0; 3],
@@ -2526,5 +2582,18 @@ mod tests {
             let err = compose_mjcf(framed_tcp_base, None, Some(&framed_manifest), tool_xml).unwrap_err();
             assert!(err.contains("frame"), "expected <frame> rejection, got: {err}");
         }
+
+        // 15. R7 M9: Base <site name="tcp"> with explicit class, fromto, or <default> transform fails closed.
+        let class_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" class="jaw" pos="0 0 0"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(class_base, None, Some(&framed_manifest), None).unwrap_err().contains("class"));
+
+        let fromto_base = r#"<mujoco><worldbody><body name="end_link"><site name="tcp" fromto="0 0 0 0.1 0 0"/></body></worldbody></mujoco>"#;
+        assert!(compose_mjcf(fromto_base, None, Some(&framed_manifest), None).unwrap_err().contains("fromto"));
+
+        let childclass_default_base = r#"<mujoco>
+          <default><default class="tool_cls"><site pos="0 0 0.05"/></default></default>
+          <worldbody><body name="end_link" childclass="tool_cls"><site name="tcp"/></body></worldbody>
+        </mujoco>"#;
+        assert!(compose_mjcf(childclass_default_base, None, Some(&framed_manifest), None).unwrap_err().contains("default"));
     }
 }

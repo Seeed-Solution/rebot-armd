@@ -6494,7 +6494,7 @@ async function cwSearch() {
     let found = null;
     const io = {
       abortReason: cwAbortReason,
-      check: (T) => { const q = cwModelQ(S.obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X, plane, clearance: CW_SEARCH.clearance, lo, hi }); },
+      check: (T) => { const q = cwModelQ(S.obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X, plane, clearance: CW_SEARCH.clearance, lo, hi, extraEndPoints: S.wsCheckPoints }); },
       move: (T, i) => { if (se.phase === 'scan') se.k = i + 1; cwRender(); return cwMove(T); },
       settle: cwSettle,
       capture: () => cwCapture(),
@@ -6824,18 +6824,23 @@ async function cwvTipMeasure() {
   CWV.tipBusy = true; CWV.tip = null; CWV.roi = null; CWV.frames = 0; cwSetStatus(t('cw.tip.busy'));
   const want = 16, frames = [];
   let last = null, lastDet = null, tries = 0;
-  let capToolId = 'unknown_tool', capToolDigest = (S.activeTool && S.activeTool.config_digest) || null;
+  let capToolId = null, capToolDigest = null;
   try {
-    const st0 = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json();
-    if (st0.active_tool) {
-      S.activeTool = st0.active_tool;
-      if (!st0.active_tool.is_stock && st0.active_tool.id) capToolId = st0.active_tool.id;
-      else if (st0.calibration_tool && st0.calibration_tool.tool_id) capToolId = st0.calibration_tool.tool_id;
-      if (st0.active_tool.config_digest) capToolDigest = st0.active_tool.config_digest;
-    } else if (st0.calibration_tool && st0.calibration_tool.tool_id) {
-      capToolId = st0.calibration_tool.tool_id;
-    }
-  } catch (_) {}
+    const r0 = await fetch('/api/v1/calibration', { cache: 'no-store' });
+    if (!r0.ok) throw new Error('HTTP ' + r0.status);
+    const st0 = await r0.json();
+    if (!st0 || !st0.active_tool || !st0.active_tool.id) throw new Error('active_tool unavailable');
+    S.activeTool = st0.active_tool;
+    capToolId = !st0.active_tool.is_stock
+      ? st0.active_tool.id
+      : ((st0.calibration_tool && st0.calibration_tool.tool_id) || st0.active_tool.id);
+    capToolDigest = st0.active_tool.config_digest || null;
+  } catch (e) {
+    CWV.tipBusy = false;
+    cwSetStatus(t('cw.err', { m: 'active tool check failed: ' + (e && e.message ? e.message : e) }), 'warn');
+    cwRender();
+    return;
+  }
   try {
     const pos0 = o.positions.slice();
     while (frames.length < want && tries++ < 60) {

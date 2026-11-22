@@ -3570,7 +3570,18 @@ impl SupervisorInner {
     pub fn refresh_effective_floor(&mut self) {
         let Some(profile) = self.profile_floor_z_m else { return; };
         let (_, fp) = crate::calibration::live_fingerprints(self);
-        let (floor, source, _) = crate::calibration::effective_floor_for(profile, self.calibration.as_ref(), &fp, &self.config.active_tool);
+        let legacy_fp = crate::calibration::legacy_file_fingerprint(
+            self.calibration.as_ref(),
+            &self.config.camera_mount,
+            &self.joint_zero_offsets,
+        );
+        let (floor, source, _) = crate::calibration::effective_floor_for_with_legacy(
+            profile,
+            self.calibration.as_ref(),
+            &fp,
+            Some(&legacy_fp),
+            &self.config.active_tool,
+        );
         self.floor_source = source;
         let Some(ws) = self.config.workspace.as_mut() else { return; };
         if ws.floor_z_m != floor {

@@ -2164,3 +2164,147 @@ fn r6_m5_calib_hover_enforces_commissioning_linear_and_angular_speed_caps() {
     assert!((plan_ok.job.params.approach_speed_mps - 0.05).abs() < 1e-9);
     assert!((plan_ok.angular_speed_rps - armd::motion::DEFAULT_ANGULAR_RPS).abs() < 1e-9);
 }
+
+#[test]
+fn r7_m5_calib_hover_backlash_quintic_segment_respects_commissioning_caps() {
+    let mut cfg = finray_cfg();
+    assert!(cfg.active_tool.commissioning_required);
+    cfg.backlash_approach = Some(armd::backlash::BacklashApproach {
+        enabled: true,
+        applies_to: vec!["move_to_precise".into()],
+        delta_deg: 2.5,
+        speed_rad_s: 0.5,
+        joints: None,
+    });
+    let (lo, hi): ([f64; 6], [f64; 6]) = (
+        std::array::from_fn(|i| cfg.limits[i].min_position as f64),
+        std::array::from_fn(|i| cfg.limits[i].max_position as f64),
+    );
+    let r_down = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    let p_approach = [0.28, 0.0, 0.14];
+    let p_hover = [0.28, 0.0, 0.10];
+    let q_seed: [f64; 6] = std::array::from_fn(|i| f64::from(INSPECT[i]));
+    let sol = cfg.arm_model.solve_dls(&Pose::new(r_down, p_approach), &q_seed, &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok);
+    let q_start: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { 0.0 });
+    let mut inner = common::sim_at(cfg.clone(), &q_start);
+
+    let input = inner.plan_input().unwrap();
+    let speed = Speed { linear: 0.015, angular: 0.2 };
+    let (goal, opts) = armd::motion::resolve_goal_opts(&input, &GoalSpec::Absolute { p: p_hover, r: Some(r_down) });
+    let direct = armd::motion::plan_cartesian_opts(&input, goal, speed, opts).unwrap();
+    let plan = inner.approach_plan("move_to_precise", backlash::Request::Profile).unwrap();
+    let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&DescentRules::tcp()), speed, opts);
+    let id = inner.begin_orchestrated_action("calib_hover", None, inner.safety.epoch_id()).unwrap();
+    let _dur = inner.install_macro_path_same_side_with_rules(id, &input, direct, pre, Some(&plan), Some(&DescentRules::tcp())).unwrap();
+
+    let active = inner.active_trajectory.as_ref().expect("active trajectory");
+    let seg = active.then.as_ref().expect("backlash quintic segment");
+    let dt = 0.005;
+    let n = ((seg.duration / dt).ceil() as usize).max(2);
+    let mut prev_tcp = cfg.arm_model.fk_f32(&seg.sample(0.0).positions).map(|e| cfg.end_to_tcp(&e).p);
+    for k in 1..=n {
+        let t = (k as f64 * dt).min(seg.duration);
+        let pt = seg.sample(t);
+        for j in 0..6 {
+            assert!(
+                pt.velocities[j].abs() <= 0.2 + 1e-4,
+                "R7 M5: backlash quintic joint {j} vel {} exceeded 0.2 rad/s at t={t:.3}",
+                pt.velocities[j]
+            );
+        }
+        let cur_tcp = cfg.arm_model.fk_f32(&pt.positions).map(|e| cfg.end_to_tcp(&e).p);
+        if let (Some(p0), Some(p1)) = (prev_tcp, cur_tcp) {
+            let tcp_mps = kinematics::norm(&kinematics::sub(&p1, &p0)) / dt;
+            assert!(
+                tcp_mps <= 0.03 + 1e-3,
+                "R7 M5: backlash quintic TCP speed {tcp_mps:.4} m/s exceeded 0.03 m/s at t={t:.3}"
+            );
+        }
+        prev_tcp = cur_tcp;
+    }
+}
+
+#[tokio::test]
+async fn r7_m6_and_m7_startup_sync_atomicity_and_stock_legacy_hover_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cal_path = dir.path().join("calibration.json");
+    let gs_path = dir.path().join("grasp_setup.json");
+
+    // M6: Invalid intrinsics (fx=0) during startup grasp_setup_needs_camera_sync must fail BEFORE
+    // installing camera_mount or clearing grasp_setup_needs_camera_sync.
+    let q_tilt15 = kinematics::r_to_quat(&armd::chain::ArmModel::REBOT_DEV_ARM.cam_mount(false, 0.0, -15.0));
+    let bad_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": [-0.0725, 0.0010, 0.0650],
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {"fx": 0.0, "fy": 830.0, "cx": 320.0, "cy": 180.0},
+        "table_z_m": 0.014
+    })).unwrap();
+    std::fs::write(&cal_path, serde_json::to_string_pretty(&bad_cal).unwrap()).unwrap();
+
+    let tool_b = other_tool_cfg();
+    let orig_mount = tool_b.camera_mount.clone();
+    let sup_bad = Arc::new(ArmSupervisor::new(tool_b));
+    grasp::load_into(&sup_bad, &gs_path).await; // Missing -> sets grasp_setup_needs_camera_sync=true
+    let err = calibration::load_into(&sup_bad, &cal_path, Some(&gs_path)).await.unwrap_err();
+    assert!(err.contains("fx_px") || err.contains("synced grasp setup invalid"), "{err}");
+    {
+        let inner = sup_bad.inner().read().await;
+        assert_eq!(inner.config.camera_mount, orig_mount, "M6: failed sync must not install partial camera_mount");
+        assert!(inner.grasp_setup_needs_camera_sync, "M6: failed sync must retain grasp_setup_needs_camera_sync");
+        assert!(inner.calibration.is_none());
+    }
+
+    // M7: Legacy unkeyed stock AcceptanceRecord (no tool_id/tool_config_digest, pre-tool-pack fingerprint)
+    // stays valid on stock active tool (preserving calibrated floor_z_m), while non-stock rejects it.
+    let mut stock_cfg = ArmConfig::rebot_dm();
+    stock_cfg.camera_mount.q_end_cam = Some(q_tilt15);
+    stock_cfg.validate().unwrap();
+    let x_fp = calibration::x_fingerprint(Some(&json!({"fx": 824.0})), &stock_cfg.camera_mount);
+    let legacy_fp = calibration::legacy_fingerprint(&x_fp, None, &vec![0.0; stock_cfg.dof], None, None);
+    let legacy_cal: CalibrationFile = serde_json::from_value(json!({
+        "camera_mount": {
+            "offset_m": stock_cfg.camera_mount.offset_m,
+            "q_end_cam": q_tilt15
+        },
+        "intrinsics": {"fx": 824.0},
+        "table_z_m": 0.025,
+        "table_z_source": "hover",
+        "acceptance": {
+            "fingerprint": legacy_fp,
+            "gate_version": 1,
+            "passed": true,
+            "measured_at": "2026-11-22T00:00:00Z",
+            "board": {},
+            "points": [],
+            "summary": {"table_z_m": 0.025}
+        }
+    })).unwrap();
+    let mut sup_stock = common::sim_at(stock_cfg.clone(), &INSPECT);
+    sup_stock.set_calibration(Some(legacy_cal.clone()));
+    assert_eq!(sup_stock.floor_source, "calibration_hover", "stock device must keep legacy hover floor");
+    assert!(
+        (sup_stock.config.workspace.as_ref().unwrap().floor_z_m - (0.025 - 0.003)).abs() < 1e-6,
+        "stock calibrated hover floor must be preserved"
+    );
+
+    // Non-stock tool must still reject legacy fingerprint even if acceptance record had no tool_id.
+    let mut fin = finray_cfg();
+    fin.camera_mount.q_end_cam = Some(q_tilt15);
+    let (_, fin_fp) = calibration::file_fingerprints(
+        Some(&legacy_cal),
+        &fin.camera_mount,
+        &vec![0.0; fin.dof],
+        Some(&fin.active_tool.config_digest),
+    );
+    let (fin_floor, fin_src, _) = calibration::effective_floor_for_with_legacy(
+        0.0,
+        Some(&legacy_cal),
+        &fin_fp,
+        Some(&legacy_fp),
+        &fin.active_tool,
+    );
+    assert_eq!((fin_floor, fin_src), (0.0, "profile"));
+}

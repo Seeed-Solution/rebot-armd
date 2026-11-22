@@ -461,7 +461,7 @@ mod runtime {
                 let gripper_idx = self.config.gripper_index();
                 for (i, (seg, base)) in seg_limits.iter_mut().zip(&planning).enumerate() {
                     if Some(i) != gripper_idx {
-                        seg.max_velocity = seg.max_velocity.min(base.max_velocity * 0.2);
+                        seg.max_velocity = seg.max_velocity.min(base.max_velocity * 0.2).min(0.2);
                     }
                 }
             }
@@ -470,6 +470,7 @@ mod runtime {
 
         /// The short segment `start -> target` with every check of a joint move: no torque /
         /// power hold in force, soft limits, power budget, workspace and keep-out sweep.
+        /// Under `commissioning_required`, also enforces TCP linear speed <= `0.2 * MAX_LINEAR_MPS`.
         /// Returns it (power-fitted) and its power scale; Err(reason).
         fn approach_segment(&self, start: &[f32], target: &[f32], seg_limits: &[JointLimit]) -> Result<(MultiJointQuinticTrajectory, Option<f64>), String> {
             if self.torque_guard.hold.is_some() || self.power.gov.hold.is_some() { return Err("segment: a torque or power hold is in force".into()); }
@@ -477,12 +478,49 @@ mod runtime {
             self.safety.validate_motion_command(epoch, start, &self.config.limits).map_err(|e| format!("pre_target: {}", code(e.into())))?;
             self.safety.validate_motion_command(epoch, target, &self.config.limits).map_err(|e| format!("segment: {}", code(e.into())))?;
             let zeros = vec![0.0; start.len()];
-            let traj = TrajectoryPlanner::plan(start, &zeros, target, &zeros, Some(MIN_SEGMENT_S), seg_limits)
+            let mut traj = TrajectoryPlanner::plan(start, &zeros, target, &zeros, Some(MIN_SEGMENT_S), seg_limits)
                 .map_err(|e| format!("segment: {e}"))?;
+            if self.config.active_tool.commissioning_required {
+                let cap_mps = 0.2 * crate::motion::MAX_LINEAR_MPS;
+                let max_tcp_mps = self.segment_peak_tcp_speed_mps(&traj);
+                if max_tcp_mps > cap_mps + 1e-6 {
+                    let min_dur = (traj.duration * (max_tcp_mps / cap_mps) * 1.02).max(MIN_SEGMENT_S);
+                    traj = TrajectoryPlanner::plan(start, &zeros, target, &zeros, Some(min_dur), seg_limits)
+                        .map_err(|e| format!("segment: {e}"))?;
+                }
+            }
             let (traj, scale) = self.power_fit_quintic(traj, start, &zeros, target, seg_limits, true).map_err(|e| format!("segment: {}", code(e)))?;
             let samples = self.workspace_samples(&traj).map_err(|e| format!("segment: {}", code(e.into())))?;
             self.check_workspace_path(start, samples.iter().map(Vec::as_slice)).map_err(|e| format!("segment: {}", code(e.into())))?;
             Ok((traj, scale))
+        }
+
+        fn segment_peak_tcp_speed_mps(&self, traj: &MultiJointQuinticTrajectory) -> f64 {
+            let n = ((traj.duration / 0.005).ceil() as usize).clamp(8, 512);
+            let dt = traj.duration / n as f64;
+            if dt <= 0.0 {
+                return 0.0;
+            }
+            let mut prev = self
+                .config
+                .arm_model
+                .fk_f32(&traj.sample(0.0).positions)
+                .map(|e| self.config.end_to_tcp(&e).p);
+            let mut max_mps = 0.0f64;
+            for k in 1..=n {
+                let t = (k as f64 * dt).min(traj.duration);
+                let cur = self
+                    .config
+                    .arm_model
+                    .fk_f32(&traj.sample(t).positions)
+                    .map(|e| self.config.end_to_tcp(&e).p);
+                if let (Some(p0), Some(p1)) = (prev, cur) {
+                    let d = crate::kinematics::norm(&crate::kinematics::sub(&p1, &p0));
+                    max_mps = max_mps.max(d / dt);
+                }
+                prev = cur;
+            }
+            max_mps
         }
 
         fn record_approach(&mut self, id: u64, outcome: &Outcome) {

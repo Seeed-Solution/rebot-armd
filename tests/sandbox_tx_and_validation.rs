@@ -787,6 +787,7 @@ async fn sandbox_commit_degraded_split_auto_converges_via_camera_only() {
                                 "error": "camera swap failed",
                                 "code": "SIM_ACTIVATION_DEGRADED",
                                 "state": "DEGRADED_SPLIT",
+                                "robot": "b601dm",
                                 "tx_id": b["tx_id"],
                                 "scene": prep["scene"],
                                 "tool": prep["tool"],
@@ -874,6 +875,7 @@ async fn sandbox_commit_degraded_split_falls_back_to_rollback_physics_cleanly() 
                             axum::Json(json!({
                                 "code": "SIM_ACTIVATION_DEGRADED",
                                 "state": "DEGRADED_SPLIT",
+                                "robot": "b601dm",
                                 "tx_id": b["tx_id"],
                                 "scene": prep["scene"],
                                 "tool": prep["tool"],
@@ -989,6 +991,7 @@ async fn sandbox_degraded_split_blocks_new_activate_exposes_state_and_recovers_v
                             axum::Json(json!({
                                 "code": "SIM_ACTIVATION_DEGRADED",
                                 "state": "DEGRADED_SPLIT",
+                                "robot": "b601dm",
                                 "tx_id": b["tx_id"],
                                 "scene": prep["scene"],
                                 "tool": prep["tool"],
@@ -1008,6 +1011,7 @@ async fn sandbox_degraded_split_blocks_new_activate_exposes_state_and_recovers_v
                     let prep = sp_s.lock().unwrap().clone().unwrap_or(Value::Null);
                     axum::Json(json!({
                         "activation_state": "DEGRADED_SPLIT",
+                        "robot": "b601dm",
                         "tx_id": prep["tx_id"],
                         "scene": prep["scene"],
                         "tool": prep["tool"],
@@ -4056,5 +4060,340 @@ async fn sandbox_r6_m2_degraded_split_recovery_requires_matching_robot_before_co
         std::env::remove_var("ARMD_SIM_URL");
         server.abort();
         assert_eq!(*rec_commits.lock().unwrap(), 0, "no commit POST allowed on robot mismatch");
+    }
+}
+
+#[tokio::test]
+async fn sandbox_r7_m1_m2_m3_m4_split_null_conflict_robot_normalization_and_state_transition() {
+    let _env_guard = SIM_ENV_LOCK.lock().await;
+
+    // 1. M1 + m2: explicit null scene_digest in 503 vs non-null in /sim/state rejects conflict;
+    // robot alias "rebot-dm" vs "b601dm" is compatible and converges.
+    for case in ["explicit_null_conflict", "robot_alias_match"] {
+        let phases: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let phases_c = phases.clone();
+        let last_prep: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let lp_p = last_prep.clone();
+        let lp_c = last_prep.clone();
+        let lp_s = last_prep.clone();
+        let case_c = case.to_string();
+        let case_s = case.to_string();
+
+        let mock_sim = axum::Router::new()
+            .route(
+                "/sim/scene/prepare",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let lp_p = lp_p.clone();
+                    async move {
+                        *lp_p.lock().unwrap() = Some(b.clone());
+                        axum::Json(json!({"ok": true, "state": "PREPARED", "tx_id": b["tx_id"], "robot": "b601dm"}))
+                    }
+                }),
+            )
+            .route(
+                "/sim/scene/commit",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let phases_c = phases_c.clone();
+                    let lp_c = lp_c.clone();
+                    let case_c = case_c.clone();
+                    async move {
+                        let phase = b["phase"].as_str().unwrap_or("").to_string();
+                        phases_c.lock().unwrap().push(phase.clone());
+                        let prep = lp_c.lock().unwrap().clone().unwrap_or(Value::Null);
+                        if phase == "all" {
+                            let body = if case_c == "explicit_null_conflict" {
+                                // Missing `tool` triggers /sim/state merge, and explicit `scene_digest: null`
+                                // must conflict with /sim/state's non-null digest!
+                                json!({
+                                    "code": "SIM_ACTIVATION_DEGRADED",
+                                    "state": "DEGRADED_SPLIT",
+                                    "tx_id": b["tx_id"],
+                                    "robot": "b601dm",
+                                    "scene": prep["scene"],
+                                    "scene_digest": Value::Null,
+                                    "tool_digest": prep["tool_digest"]
+                                })
+                            } else {
+                                // Alias robot "rebot-dm" + missing tool -> merges /sim/state "b601dm" + tool!
+                                json!({
+                                    "code": "SIM_ACTIVATION_DEGRADED",
+                                    "state": "DEGRADED_SPLIT",
+                                    "tx_id": b["tx_id"],
+                                    "robot": "rebot-dm",
+                                    "scene": prep["scene"]
+                                })
+                            };
+                            (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body))
+                        } else {
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "ok": true,
+                                    "state": "COMMITTED",
+                                    "tx_id": b["tx_id"],
+                                    "robot": "b601dm",
+                                    "scene_digest": prep["scene_digest"],
+                                    "tool_digest": prep["tool_digest"]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/sim/state",
+                get(move || {
+                    let lp_s = lp_s.clone();
+                    let case_s = case_s.clone();
+                    async move {
+                        let prep = lp_s.lock().unwrap().clone().unwrap_or(Value::Null);
+                        let scene_digest = if case_s == "explicit_null_conflict" {
+                            json!("sha256:conflicting_digest")
+                        } else {
+                            prep["scene_digest"].clone()
+                        };
+                        axum::Json(json!({
+                            "activation_state": "DEGRADED_SPLIT",
+                            "tx_id": prep["tx_id"],
+                            "robot": "b601dm",
+                            "scene": prep["scene"],
+                            "tool": prep["tool"],
+                            "scene_digest": scene_digest,
+                            "tool_digest": prep["tool_digest"]
+                        }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+        std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_builtins = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let app = app_for(ArmConfig::rebot_dm(), state.clone());
+        let (st, resp) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/activate",
+            Some(json!({"mode": "sim", "scene": "pcb_suction", "tool": "suction"})),
+        )
+        .await;
+        std::env::remove_var("ARMD_SIM_URL");
+        server.abort();
+
+        if case == "explicit_null_conflict" {
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{resp}");
+            assert_eq!(phases.lock().unwrap().as_slice(), &["all".to_string()]);
+            assert!(matches!(
+                *state.tx_state.read().await,
+                ActivationTxState::DegradedSplit { target_matches_tx: false, .. }
+            ));
+        } else {
+            assert_eq!(st, StatusCode::OK, "{resp}");
+            assert_eq!(phases.lock().unwrap().as_slice(), &["all".to_string(), "camera_only".to_string()]);
+        }
+    }
+
+    // 2. M2 + M4:
+    // (a) Direct commit 503 omitting `robot` queries /sim/state and rejects mismatched robot BEFORE camera_only,
+    //     transitioning local state out of Committing -> DegradedSplit { target_matches_tx: false }.
+    // (b) When camera_only ACK returns 200 OK with wrong robot, rejects directly WITHOUT falling back to rollback_physics.
+    for case in ["missing_robot_in_503_then_wrong_in_state", "camera_only_ack_wrong_robot"] {
+        let phases: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let phases_c = phases.clone();
+        let last_prep: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let lp_p = last_prep.clone();
+        let lp_c = last_prep.clone();
+        let lp_s = last_prep.clone();
+        let case_c = case.to_string();
+
+        let mock_sim = axum::Router::new()
+            .route(
+                "/sim/scene/prepare",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let lp_p = lp_p.clone();
+                    async move {
+                        *lp_p.lock().unwrap() = Some(b.clone());
+                        axum::Json(json!({"ok": true, "state": "PREPARED", "tx_id": b["tx_id"], "robot": "b601dm"}))
+                    }
+                }),
+            )
+            .route(
+                "/sim/scene/commit",
+                post(move |axum::Json(b): axum::Json<Value>| {
+                    let phases_c = phases_c.clone();
+                    let lp_c = lp_c.clone();
+                    let case_c = case_c.clone();
+                    async move {
+                        let phase = b["phase"].as_str().unwrap_or("").to_string();
+                        phases_c.lock().unwrap().push(phase.clone());
+                        let prep = lp_c.lock().unwrap().clone().unwrap_or(Value::Null);
+                        if phase == "all" {
+                            let mut body = json!({
+                                "code": "SIM_ACTIVATION_DEGRADED",
+                                "state": "DEGRADED_SPLIT",
+                                "tx_id": b["tx_id"],
+                                "scene": prep["scene"],
+                                "tool": prep["tool"],
+                                "scene_digest": prep["scene_digest"],
+                                "tool_digest": prep["tool_digest"]
+                            });
+                            if case_c == "camera_only_ack_wrong_robot" {
+                                body["robot"] = json!("b601dm");
+                            }
+                            (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body))
+                        } else {
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({
+                                    "ok": true,
+                                    "state": "COMMITTED",
+                                    "tx_id": b["tx_id"],
+                                    "robot": "so-arm101",
+                                    "scene_digest": prep["scene_digest"],
+                                    "tool_digest": prep["tool_digest"]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/sim/state",
+                get(move || {
+                    let lp_s = lp_s.clone();
+                    async move {
+                        let prep = lp_s.lock().unwrap().clone().unwrap_or(Value::Null);
+                        axum::Json(json!({
+                            "activation_state": "DEGRADED_SPLIT",
+                            "tx_id": prep["tx_id"],
+                            "robot": "so-arm101",
+                            "scene": prep["scene"],
+                            "tool": prep["tool"],
+                            "scene_digest": prep["scene_digest"],
+                            "tool_digest": prep["tool_digest"]
+                        }))
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+        std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_builtins = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let app = app_for(ArmConfig::rebot_dm(), state.clone());
+        let (st, err) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/activate",
+            Some(json!({"mode": "sim", "scene": "pcb_suction", "tool": "suction"})),
+        )
+        .await;
+        std::env::remove_var("ARMD_SIM_URL");
+        server.abort();
+
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{case}: {err}");
+        assert_eq!(err["code"], "ROBOT_INCOMPATIBLE", "{case}: {err}");
+        if case == "missing_robot_in_503_then_wrong_in_state" {
+            assert_eq!(phases.lock().unwrap().as_slice(), &["all".to_string()]);
+        } else {
+            assert_eq!(
+                phases.lock().unwrap().as_slice(),
+                &["all".to_string(), "camera_only".to_string()],
+                "wrong robot on camera_only ACK must NOT fall back to rollback_physics"
+            );
+        }
+        assert!(
+            matches!(
+                *state.tx_state.read().await,
+                ActivationTxState::DegradedSplit { target_matches_tx: false, .. }
+            ),
+            "{case}: local tx_state must transition out of Committing into DegradedSplit"
+        );
+    }
+
+    // 3. M3: prepare-503 with mismatched robot must NOT cache target_matches_tx=true, and manual recover_split
+    //    must block rollback_physics too before posting /sim/scene/commit.
+    {
+        let commit_called = Arc::new(Mutex::new(false));
+        let cc = commit_called.clone();
+        let mock_sim = axum::Router::new()
+            .route(
+                "/sim/scene/prepare",
+                post(|axum::Json(b): axum::Json<Value>| async move {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({
+                            "code": "SIM_ACTIVATION_DEGRADED",
+                            "state": "DEGRADED_SPLIT",
+                            "tx_id": b["tx_id"],
+                            "robot": "so-arm101",
+                            "scene": b["scene"],
+                            "tool": b["tool"],
+                            "scene_digest": b["scene_digest"],
+                            "tool_digest": b["tool_digest"]
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/sim/scene/commit",
+                post(move || {
+                    let cc = cc.clone();
+                    async move {
+                        *cc.lock().unwrap() = true;
+                        axum::Json(json!({"ok": true, "state": "COMMITTED"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, mock_sim).await.unwrap() });
+        std::env::set_var("ARMD_SIM_URL", format!("http://127.0.0.1:{port}"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_builtins = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let app = app_for(ArmConfig::rebot_dm(), state.clone());
+        let (st, _) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/activate",
+            Some(json!({"mode": "sim", "scene": "pcb_suction", "tool": "suction"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(matches!(
+            *state.tx_state.read().await,
+            ActivationTxState::DegradedSplit { target_matches_tx: false, .. }
+        ));
+        let (st_rec, rec_err) = send_json(
+            &app,
+            "POST",
+            "/api/v1/sandbox/recover-split",
+            Some(json!({"action": "rollback_physics"})),
+        )
+        .await;
+        std::env::remove_var("ARMD_SIM_URL");
+        server.abort();
+        assert_eq!(st_rec, StatusCode::BAD_REQUEST, "{rec_err}");
+        assert_eq!(rec_err["code"], "ROBOT_INCOMPATIBLE", "{rec_err}");
+        assert!(!*commit_called.lock().unwrap());
     }
 }

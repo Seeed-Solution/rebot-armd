@@ -310,6 +310,17 @@ const solveViews = views;
     `${r.res || r.err.why}, log ${f.log.join(',')}`);
   f = fake({ n: 2, checkFail: new Set([1]) }); r = await go(f);
   check('i. refused transition with no pose left -> abort', r.err && r.err.why === 'nopose' && f.moves() === 1 && f.log.at(-1) === 'stop', `${r.err ? r.err.why : r.res}, log ${f.log.join(',')}`);
+  // R7 M8: checkTransition passes extraEndPoints to toolPoints so board-search/re-aim catches tool extensions below clearance
+  {
+    const id4 = CW.make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.25, 0, 0.25]);
+    const T_b = CW.make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.25, 0.05, 0.25]);
+    const X_up = CW.make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0.05]);
+    const plane = { p: [0, 0, 0], n: [0, 0, 1] };
+    const ikOk = (_T, q) => ({ ok: true, q });
+    const stockTr = CW.checkTransition(id4, [0, 0, 0, 0, 0, 0], T_b, { ik: ikOk, X: X_up, plane, clearance: 0.12 });
+    const extTr = CW.checkTransition(id4, [0, 0, 0, 0, 0, 0], T_b, { ik: ikOk, X: X_up, plane, clearance: 0.12, extraEndPoints: [[0, 0, -0.15]] });
+    check('R7 M8. checkTransition catches extraEndPoints below clearance', stockTr.ok && !extTr.ok && extTr.reason === 'clearance', `stock=${stockTr.ok} ext=${extTr.ok}/${extTr.reason}`);
+  }
 }
 
 // ---- board SVG

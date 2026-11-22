@@ -185,6 +185,20 @@ pub fn fingerprint(
     fnv64(&format!("f1|{x_fp}|{}|{}|{}|{}|{}", json!(kin), json!(offsets), json!(z), json!(t), json!(active_tool_digest)))
 }
 
+/// Legacy pre-tool-pack fingerprint (omitting `tool_config_digest` and `active_tool_digest`),
+/// accepted only for legacy unkeyed stock `AcceptanceRecord` entries.
+pub fn legacy_fingerprint(
+    x_fp: &str,
+    kin: Option<&Correction>,
+    offsets: &[f32],
+    zero: Option<&crate::joint_zero::JointZero>,
+    tool: Option<&ToolCalibration>,
+) -> String {
+    let z = zero.map(|z| json!([z.method, z.set_at]));
+    let t = tool.map(|t| json!([t.tool_id, t.tip_cam_m, t.gripper_opening, t.edge_to_low_m]));
+    fnv64(&format!("f1|{x_fp}|{}|{}|{}|{}", json!(kin), json!(offsets), json!(z), json!(t)))
+}
+
 /// (x_fingerprint, fingerprint) of a calibration file with the camera mount `mount`, the live
 /// joint zero offsets, and the active tool digest.
 pub fn file_fingerprints(
@@ -196,6 +210,12 @@ pub fn file_fingerprints(
     let x = x_fingerprint(c.and_then(|c| c.intrinsics.as_ref()), mount);
     let f = fingerprint(&x, correction_of(c), offsets, c.and_then(|c| c.joint_zero.as_ref()), c.and_then(|c| c.tool.as_ref()), active_tool_digest);
     (x, f)
+}
+
+/// Legacy `(x_fingerprint, legacy_fingerprint)` for stock upgrade compatibility.
+pub fn legacy_file_fingerprint(c: Option<&CalibrationFile>, mount: &CameraMount, offsets: &[f32]) -> String {
+    let x = x_fingerprint(c.and_then(|c| c.intrinsics.as_ref()), mount);
+    legacy_fingerprint(&x, correction_of(c), offsets, c.and_then(|c| c.joint_zero.as_ref()), c.and_then(|c| c.tool.as_ref()))
 }
 
 /// (x_fingerprint, fingerprint) of the calibration in effect.
@@ -227,12 +247,28 @@ pub fn acceptance_valid(c: &CalibrationFile, fp: &str) -> bool {
 
 /// [`acceptance_valid`] plus active-tool `(tool_id, tool_config_digest)` match.
 pub fn acceptance_valid_for(c: &CalibrationFile, fp: &str, active_tool: &crate::tool::ActiveToolInfo) -> bool {
+    acceptance_valid_for_with_legacy(c, fp, None, active_tool)
+}
+
+/// [`acceptance_valid_for`] additionally accepting `legacy_fp` when `active_tool.is_stock`
+/// and the stored `AcceptanceRecord` has no tool metadata (`tool_id == None && tool_config_digest == None`).
+pub fn acceptance_valid_for_with_legacy(
+    c: &CalibrationFile,
+    fp: &str,
+    legacy_fp: Option<&str>,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> bool {
     c.has_camera()
         && c.stale.is_none()
         && c.acceptance.as_ref().is_some_and(|a| {
+            let fp_ok = a.fingerprint == fp
+                || (active_tool.is_stock
+                    && a.tool_id.is_none()
+                    && a.tool_config_digest.is_none()
+                    && legacy_fp.is_some_and(|lfp| a.fingerprint == lfp));
             a.passed
                 && a.invalidated.is_none()
-                && a.fingerprint == fp
+                && fp_ok
                 && active_tool.matches_record(a.tool_id.as_deref(), a.tool_config_digest.as_deref())
         })
 }
@@ -241,7 +277,7 @@ pub fn acceptance_valid_for(c: &CalibrationFile, fp: &str, active_tool: &crate::
 /// A table height is valid when the camera calibration is in effect and not stale, and, for
 /// `table_z_source: hover`, its acceptance is valid. Returns (floor, source, table_z used).
 pub fn effective_floor(profile_floor: f32, c: Option<&CalibrationFile>, fp: &str) -> (f32, &'static str, Option<f64>) {
-    effective_floor_inner(profile_floor, c, fp, None)
+    effective_floor_inner(profile_floor, c, fp, None, None)
 }
 
 /// [`effective_floor`] enforcing active-tool matching on hover acceptance.
@@ -251,13 +287,25 @@ pub fn effective_floor_for(
     fp: &str,
     active_tool: &crate::tool::ActiveToolInfo,
 ) -> (f32, &'static str, Option<f64>) {
-    effective_floor_inner(profile_floor, c, fp, Some(active_tool))
+    effective_floor_inner(profile_floor, c, fp, None, Some(active_tool))
+}
+
+/// [`effective_floor_for`] with optional legacy pre-tool-pack fingerprint for stock upgrade compatibility.
+pub fn effective_floor_for_with_legacy(
+    profile_floor: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    legacy_fp: Option<&str>,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> (f32, &'static str, Option<f64>) {
+    effective_floor_inner(profile_floor, c, fp, legacy_fp, Some(active_tool))
 }
 
 fn effective_floor_inner(
     profile_floor: f32,
     c: Option<&CalibrationFile>,
     fp: &str,
+    legacy_fp: Option<&str>,
     active_tool: Option<&crate::tool::ActiveToolInfo>,
 ) -> (f32, &'static str, Option<f64>) {
     let table = c.filter(|c| c.has_camera() && c.stale.is_none()).and_then(|c| {
@@ -265,7 +313,7 @@ fn effective_floor_inner(
         match c.table_z_source.as_deref() {
             Some("hover") => {
                 let ok = match active_tool {
-                    Some(t) => acceptance_valid_for(c, fp, t),
+                    Some(t) => acceptance_valid_for_with_legacy(c, fp, legacy_fp, t),
                     None => acceptance_valid(c, fp),
                 };
                 ok.then_some((z, "calibration_hover"))
@@ -467,39 +515,60 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             let q = crate::model::unit_quaternion(&file.camera_mount.q_end_cam.unwrap_or([1.0, 0.0, 0.0, 0.0])).unwrap_or([1.0, 0.0, 0.0, 0.0]);
             let mount = calibrated_mount(&inner, file.camera_mount.offset_m.unwrap_or([0.0; 3]), q);
             file.camera_mount = mount.clone();
-            tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
-                path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
-            inner.set_camera_mount(mount.clone());
-            if let Some(k) = &file.kinematics {
-                match inner.set_kinematics_correction(Some(&k.joints)) {
-                    Ok(()) => {
-                        let fit = k.fit.as_ref().map_or_else(|| "none".to_string(), |f| f.to_string());
-                        tracing::info!("Kinematic correction loaded from {} (fit {fit})", path.display());
-                    }
+
+            // Pre-validate candidate kinematics and synced grasp_setup BEFORE committing any live state.
+            let candidate_arm_model = if let Some(k) = &file.kinematics {
+                match inner.config.arm_model.with_correction(Some(&k.joints)) {
+                    Ok(m) => Some(m),
                     Err(e) => {
                         tracing::warn!("Ignoring the kinematic correction in {}: {e}; using the uncorrected model", path.display());
                         inner.calibration_load_error = Some(format!("calibration.json: kinematics: {e}; the uncorrected model is used"));
                         file.kinematics = None;
+                        None
                     }
                 }
-            }
-            if inner.grasp_setup_needs_camera_sync {
+            } else {
+                None
+            };
+            let candidate_grasp = if inner.grasp_setup_needs_camera_sync {
                 if let Some(mut setup) = inner.config.grasp.clone() {
-                    let arm_model = inner.config.arm_model.clone();
+                    let arm_ref = candidate_arm_model.as_ref().unwrap_or(&inner.config.arm_model);
                     let tcp_offset = inner.config.tcp_offset;
                     refresh_grasp_setup_camera_fields(
                         &mut setup,
                         file.intrinsics.as_ref(),
                         &mount,
                         file.table_z_m,
-                        &arm_model,
+                        arm_ref,
                         &tcp_offset,
                     );
                     if let Err(e) = setup.validate() {
-                        tracing::warn!("Skipping startup grasp setup camera sync from {}: {e}", path.display());
-                    } else {
-                        inner.set_grasp_setup(setup);
+                        let msg = format!("calibration.json: synced grasp setup invalid: {e}");
+                        inner.calibration_load_error = Some(msg.clone());
+                        return Err(msg);
                     }
+                    Some(setup)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
+                path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
+            inner.set_camera_mount(mount);
+            if file.kinematics.is_some() {
+                if let Some(ref k) = file.kinematics {
+                    if let Ok(()) = inner.set_kinematics_correction(Some(&k.joints)) {
+                        let fit = k.fit.as_ref().map_or_else(|| "none".to_string(), |f| f.to_string());
+                        tracing::info!("Kinematic correction loaded from {} (fit {fit})", path.display());
+                    }
+                }
+            }
+            if inner.grasp_setup_needs_camera_sync {
+                if let Some(setup) = candidate_grasp {
+                    inner.set_grasp_setup(setup);
                 }
                 inner.grasp_setup_needs_camera_sync = false;
             }
@@ -1754,13 +1823,28 @@ pub fn floor_view_for(
     fp: &str,
     active_tool: &crate::tool::ActiveToolInfo,
 ) -> Value {
-    let (eff, src, z) = effective_floor_for(profile, c, fp, active_tool);
+    floor_view_for_with_legacy(profile, c, fp, None, active_tool)
+}
+
+pub fn floor_view_for_with_legacy(
+    profile: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    legacy_fp: Option<&str>,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> Value {
+    let (eff, src, z) = effective_floor_for_with_legacy(profile, c, fp, legacy_fp, active_tool);
     json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
 }
 
 /// `{x_fingerprint, fingerprint, tool_valid, acceptance_valid, tip_end_m?}` of the calibration in effect.
 pub fn verification_view(inner: &SupervisorInner) -> Value {
     let (x_fp, fp) = live_fingerprints(inner);
+    let legacy_fp = legacy_file_fingerprint(
+        inner.calibration.as_ref(),
+        &inner.config.camera_mount,
+        &inner.joint_zero_offsets,
+    );
     let c = inner.calibration.as_ref();
     let tool_ok = c.is_some_and(|c| tool_valid_for(c, &x_fp, &inner.config.active_tool));
     // tip_end = X · tip_cam with the X in effect
@@ -1772,13 +1856,19 @@ pub fn verification_view(inner: &SupervisorInner) -> Value {
         Some([p[0] + f64::from(o[0]), p[1] + f64::from(o[1]), p[2] + f64::from(o[2])])
     });
     json!({"x_fingerprint": x_fp, "fingerprint": fp, "tool_valid": tool_ok, "tip_end_m": tip_end,
-        "acceptance_valid": c.is_some_and(|c| acceptance_valid_for(c, &fp, &inner.config.active_tool)),
+        "acceptance_valid": c.is_some_and(|c| acceptance_valid_for_with_legacy(c, &fp, Some(&legacy_fp), &inner.config.active_tool)),
         "table_z_source": c.and_then(|c| c.table_z_source.as_deref()).unwrap_or(if c.is_some_and(CalibrationFile::has_camera) { "camera" } else { "none" })})
 }
 
 /// `GET /api/v1/calibration`.
 pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     let inner = sup.inner().read().await;
+    let (_, fp) = live_fingerprints(&inner);
+    let legacy_fp = legacy_file_fingerprint(
+        inner.calibration.as_ref(),
+        &inner.config.camera_mount,
+        &inner.joint_zero_offsets,
+    );
     json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy, "load_error": inner.calibration_load_error,
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
@@ -1793,7 +1883,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "calibration_tool": inner.config.calibration_tool,
         "active_tool": inner.config.active_tool,
         "verification": verification_view(&inner),
-        "floor": inner.profile_floor_z_m.map(|p| floor_view_for(p, inner.calibration.as_ref(), &live_fingerprints(&inner).1, &inner.config.active_tool)),
+        "floor": inner.profile_floor_z_m.map(|p| floor_view_for_with_legacy(p, inner.calibration.as_ref(), &fp, Some(&legacy_fp), &inner.config.active_tool)),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
         "backups": list_backups(deps)})
 }

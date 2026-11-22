@@ -382,6 +382,16 @@ impl WasmEngine {
                         "tool envelope needs kinematics and a workspace".into(),
                     ));
                 }
+                if self.config.active_tool.is_stock
+                    && permanent_tool_check_points_end_m
+                        .as_ref()
+                        .is_some_and(|p| !p.is_empty())
+                    && tcp_offset.is_none()
+                {
+                    return Err(MotionError::InvalidCommand(
+                        "switching from stock to non-stock custom_envelope with permanent_tool_check_points_end_m requires explicit tcp_offset".into(),
+                    ));
+                }
                 let mut candidate = self.config.clone();
                 if let Some(off) = tcp_offset {
                     candidate.tcp_offset = off;
@@ -1562,5 +1572,25 @@ mod tests {
             "tool_xml": ""
         }));
         assert_code(no_tcp_err, "INVALID_COMMAND");
+
+        // R7 M10: switching from stock -> custom_envelope with permanent_tool_check_points_end_m requires explicit tcp_offset,
+        // while updating transient payload when already non-stock allows omitting tcp_offset.
+        init_config(crate::model::ArmConfig::rebot_dm());
+        let err_missing_tcp = call(json!({
+            "op": "set_tool_envelope",
+            "permanent_tool_check_points_end_m": [[0.03, 0.0, 0.0]]
+        }));
+        assert_code(err_missing_tcp, "INVALID_COMMAND");
+
+        let _ = ok(json!({
+            "op": "set_tool_envelope",
+            "tcp_offset": [0.0, 0.0, 0.0],
+            "permanent_tool_check_points_end_m": [[0.03, 0.0, 0.0]]
+        }));
+
+        let _ = ok(json!({
+            "op": "set_tool_envelope",
+            "transient_payload_check_points_end_m": [[0.04, 0.0, 0.0]]
+        }));
     }
 }
