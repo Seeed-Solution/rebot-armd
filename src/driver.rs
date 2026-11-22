@@ -2269,10 +2269,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Write CTRL_MODE for `joints` (each followed at once by `hold` in the new mode)
-    /// and wait for the write acknowledgements. Returns the joints that were not confirmed.
+    /// and wait for the write acknowledgements. A joint is confirmed only when the mode
+    /// write, every hold frame transmit, the bus flush, and the matching register reply
+    /// all succeed. Returns the joints that were not confirmed.
     fn write_modes(&mut self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], dual_hold: bool) -> Vec<usize> {
         self.register_replies.clear();
         let mut unsent = Vec::new();
+        let mut hold_failed = Vec::new();
         for &i in joints {
             let id = self.motor_ids[i];
             if self.transmit_with_retry(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
@@ -2288,20 +2291,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             } else {
                 vec![self.pos_vel_frame(i, hold[i].position)]
             };
+            let mut all_holds_ok = true;
             for frame in frames {
-                let _ = self.transmit_with_retry(&frame);
-                self.last_target_frames[i] = Some(frame);
+                if self.transmit_with_retry(&frame).is_ok() {
+                    self.last_target_frames[i] = Some(frame);
+                } else {
+                    all_holds_ok = false;
+                }
+            }
+            if !all_holds_ok {
+                hold_failed.push(i);
             }
         }
-        let _ = self.can.flush();
+        let flush_ok = self.can.flush().is_ok();
         let sent: Vec<usize> = joints.iter().copied().filter(|i| !unsent.contains(i)).collect();
         let expected: Vec<(usize, bool, u8)> = sent.iter().map(|&i| (i, true, damiao::RID_CTRL_MODE)).collect();
         let replies = self.await_register_replies(&expected);
         let mut failed = unsent;
         for (k, &i) in sent.iter().enumerate() {
-            if replies[k].is_some_and(|r| r.as_u32() == Self::mode_value(modes[i])) {
+            if flush_ok
+                && !hold_failed.contains(&i)
+                && replies[k].is_some_and(|r| r.as_u32() == Self::mode_value(modes[i]))
+            {
                 self.joint_modes[i] = Some(modes[i]);
             } else {
+                self.joint_modes[i] = None;
                 failed.push(i);
             }
         }

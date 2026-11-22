@@ -1694,3 +1694,126 @@ fn tracking_unknown_history_and_handover_ramp_out() {
         assert!(inner.safety.state().is_operational(), "torque trip ramp-out must stay operational");
     }
 }
+
+/// M5: Damiao `write_modes` rejects "mode acknowledged, hold lost" (transmit or flush failure)
+/// and gravity-comp handback requires fresh stationary feedback before transferring ownership.
+#[test]
+fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
+    use armd::driver::DamiaoArmDriver;
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::tracking::TrackingHistoryState;
+    use armd::transport::{CanFrame, CanTransport, MockCanTransport, TransportError};
+
+    // 1. "mode acknowledged, hold lost" (both hold transmit failure and flush failure).
+    struct FaultyHoldCan {
+        inner: MockCanTransport,
+        fail_mit_hold_tx: bool,
+        fail_flush_after_mode_write: bool,
+        mode_write_seen: bool,
+    }
+    impl CanTransport for FaultyHoldCan {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if frame.id == 0x7FF
+                && frame.data[2] == damiao::REG_WRITE
+                && frame.data[3] == damiao::RID_CTRL_MODE
+            {
+                self.mode_write_seen = true;
+            }
+            if self.fail_mit_hold_tx && frame.id == 1 && frame.data != [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC] {
+                return Err(TransportError::Io(std::io::Error::other("simulated hold transmit loss")));
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            if self.fail_flush_after_mode_write && self.mode_write_seen {
+                return Err(TransportError::Io(std::io::Error::other("simulated bus flush failure")));
+            }
+            self.inner.flush()
+        }
+    }
+
+    let make_can = |fail_mit_hold_tx: bool, fail_flush_after_mode_write: bool| -> FaultyHoldCan {
+        let mut mock = MockCanTransport::new();
+        let limits = DamiaoLimits::default();
+        let p = damiao::float_to_uint(0.2, limits.p_min, limits.p_max, 16);
+        let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+        mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
+        let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
+            CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
+        };
+        for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
+            mock.respond_to_transmit(damiao::build_read_register_frame(1, rid), mk_reply(damiao::REG_READ, rid, val.to_le_bytes()));
+        }
+        for mode in [damiao::CTRL_MODE_MIT, damiao::CTRL_MODE_POS_VEL] {
+            mock.respond_to_transmit(
+                damiao::build_set_control_mode_frame(1, mode),
+                mk_reply(damiao::REG_WRITE, damiao::RID_CTRL_MODE, mode.to_le_bytes()),
+            );
+        }
+        FaultyHoldCan {
+            inner: mock,
+            fail_mit_hold_tx,
+            fail_flush_after_mode_write,
+            mode_write_seen: false,
+        }
+    };
+
+    // Subcase A: mode write acks, but MIT hold transmit fails -> must reject switch!
+    {
+        let mut drv = DamiaoArmDriver::new(make_can(true, false), vec![1]);
+        drv.set_torque(true).unwrap();
+        let res = drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.2, 0.0, 30.0, 1.0, 0.0)]);
+        assert!(drv.can_mut().mode_write_seen, "CTRL_MODE write must have been sent");
+        assert!(res.is_err(), "mode acknowledged with lost hold frame must fail set_joint_modes");
+        assert!(drv.joint_modes_uncertain(), "rollback also lost MIT dual-hold -> joint mode stays uncertain");
+    }
+
+    // Subcase B: mode write and hold transmit succeed, but flush fails -> must reject switch!
+    {
+        let mut drv = DamiaoArmDriver::new(make_can(false, true), vec![1]);
+        drv.set_torque(true).unwrap();
+        let res = drv.set_joint_modes(&[JointMode::Mit], &[JointTarget::mit(0.2, 0.0, 30.0, 1.0, 0.0)]);
+        assert!(drv.can_mut().mode_write_seen, "CTRL_MODE write must have been sent before flush failure");
+        assert!(res.is_err(), "mode acknowledged with failed flush must fail set_joint_modes");
+        assert!(drv.joint_modes_uncertain(), "failed flush must leave joint mode uncertain");
+    }
+
+    // 2. Gravity-comp handback requires fresh stationary feedback before ownership transfer.
+    {
+        let cfg = ArmConfig {
+            lease_timeout_ms: 600_000,
+            workspace: None,
+            joint_tracking: Some(lead_config(true, 0.68)),
+            ..ArmConfig::rebot_dm()
+        };
+        let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+        let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
+        inner.enter_gravity_comp(Default::default()).unwrap();
+        assert!(inner.gravity_comp.is_some());
+        inner.tick(DT);
+        inner.exit_gravity_comp("REQUESTED", "test");
+
+        // Keep measured velocity above entry_max_velocity (0.05 rad/s) past exit_hold_ms (100 ms):
+        // ownership must NOT transfer back to Position/Tracking while arm is moving!
+        for _ in 0..8 {
+            drv.with(|s| s.v[0] = 0.20);
+            inner.tick(DT);
+        }
+        assert!(inner.gravity_comp.is_some(), "must stay in Exiting while arm is still moving");
+
+        // Once stationary and fresh, handback succeeds, seeds a confirmed baseline, and the same
+        // tick's tracking output validates and issues the stationary hold frame.
+        drv.with(|s| s.v[0] = 0.0);
+        inner.tick(DT);
+        assert!(inner.gravity_comp.is_none(), "stationary fresh feedback should complete handback");
+        assert!(inner.safety.state().is_operational(), "clean handback must stay operational");
+        assert_eq!(inner.tracking.history_state, TrackingHistoryState::Issued);
+        let issued = inner.tracking.last_issued_positions.as_ref().expect("confirmed baseline issued");
+        for i in 0..6 {
+            assert!((issued[i] - q0[i]).abs() < 1e-4, "joint {i} handback target drifted: {} vs {}", issued[i], q0[i]);
+        }
+    }
+}
