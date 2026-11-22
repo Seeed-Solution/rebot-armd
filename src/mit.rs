@@ -41,6 +41,15 @@ pub const QUALIFICATION_PATH: &str = "/api/v1/calibration/mit_qualification";
 /// Dynamic-output deadline while tracking owns an MIT joint: a feedback age or a gap between
 /// dynamic outputs of this length cancels the group and latches BUS_LOSS.
 pub const MIT_DEADLINE: Duration = Duration::from_millis(45);
+/// Ages and gaps from this value up to the deadline are logged and counted as near misses.
+pub const MIT_NEAR_MISS: Duration = Duration::from_millis(36);
+/// Margin of the activation criterion: control period + measured worst-case latency + this
+/// must stay under [`MIT_DEADLINE`].
+pub const MIT_LATENCY_MARGIN_MS: f32 = 5.0;
+
+/// The single deadline comparison used everywhere: `elapsed` reached the MIT deadline.
+pub fn past_deadline(elapsed: Duration) -> bool { elapsed >= MIT_DEADLINE }
+
 /// Default TIMEOUT count: 100 ms at the documented (unverified) 50 µs per count.
 pub const DEFAULT_TIMEOUT_COUNTS: u32 = 2000;
 /// Largest TIMEOUT count accepted by the commissioning (1 s at the documented unit).
@@ -144,6 +153,9 @@ pub struct MitJointQualification {
     pub tested_response: String,
     /// Measured time from the last command to the response (ms).
     pub measured_expiry_ms: f32,
+    /// Measured worst-case scheduling + RX queue + TX latency of the control loop (ms): with the
+    /// control period and a margin it must fit under the 45 ms deadline ([`check_gate`]).
+    pub worst_latency_ms: f32,
     /// Load envelope the joint was qualified with (free text: payload, posture range).
     pub load_envelope: String,
     /// Qualified gain ceilings and effort ceiling (N·m).
@@ -176,7 +188,7 @@ impl MitQualificationFile {
                 if s.is_empty() || s.len() > 256 { return Err(e(&format!("{name}: 1..256 bytes"))); }
             }
             for (name, v) in [("pmax", j.pmax), ("vmax", j.vmax), ("tmax", j.tmax), ("max_kp", j.max_kp), ("max_kd", j.max_kd),
-                ("effort_ceiling_nm", j.effort_ceiling_nm), ("measured_expiry_ms", j.measured_expiry_ms)] {
+                ("effort_ceiling_nm", j.effort_ceiling_nm), ("measured_expiry_ms", j.measured_expiry_ms), ("worst_latency_ms", j.worst_latency_ms)] {
                 if !v.is_finite() || v <= 0.0 { return Err(e(&format!("{name} must be finite and > 0"))); }
             }
             if j.timeout_raw == 0 || j.timeout_raw > MAX_TIMEOUT_COUNTS {
@@ -257,6 +269,14 @@ pub fn check_gate(cfg: &ArmConfig, record: Option<&MitQualificationFile>, zero_o
         if Some(q.profile_id.as_str()) != cfg.profile_id.as_deref() { fail(format!("record profile {} != {:?}", q.profile_id, cfg.profile_id)); }
         if cfg.joint_names.get(i) != Some(&q.joint_name) { fail(format!("record joint name {} != {:?}", q.joint_name, cfg.joint_names.get(i))); }
         let fp = zero_fingerprint(zero_offsets.get(i).copied().unwrap_or(0.0));
+        // activation criterion: the deadline is a hard ceiling, so the configured period plus the
+        // measured worst-case latency (and a margin) must fit under it
+        let period_ms = 1000.0 / cfg.control_frequency_hz.max(1) as f32;
+        let budget = period_ms + q.worst_latency_ms + MIT_LATENCY_MARGIN_MS;
+        if budget.is_nan() || budget >= MIT_DEADLINE.as_secs_f32() * 1000.0 {
+            fail(format!("control period {period_ms:.1} ms + measured worst-case latency {} ms + margin {MIT_LATENCY_MARGIN_MS} ms does not fit under the {} ms deadline",
+                q.worst_latency_ms, MIT_DEADLINE.as_millis()));
+        }
         if !q.timeout_unit_verified { fail("the TIMEOUT unit and expiry are not verified on the device (timeout_unit_verified false)".into()); }
         if q.zero_fingerprint != fp { fail(format!("joint zero changed since the qualification ({} != {fp})", q.zero_fingerprint)); }
         match readback.get(n) {
@@ -476,6 +496,8 @@ pub struct MitRuntime {
     pub lost_reason: Option<String>,
     /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
     pub park_after_hand_back: bool,
+    /// Feedback ages or output gaps at or above [`MIT_NEAR_MISS`] but under the deadline.
+    pub near_misses: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -533,9 +555,11 @@ impl crate::supervisor::SupervisorInner {
         Ok(g)
     }
 
-    /// Fresh feedback of every joint younger than the MIT deadline.
+    /// Fresh feedback of every joint: no age past the deadline ([`past_deadline`]).
     fn mit_feedback_fresh(&self) -> bool {
-        self.feedback_numeric_valid && self.hardware_feedback_fresh(MIT_DEADLINE.saturating_sub(Duration::from_millis(1)))
+        if !self.feedback_numeric_valid { return false; }
+        let ages = match self.driver.as_ref().and_then(|d| d.lock().ok()) { Some(drv) => drv.feedback_ages(), None => return true };
+        ages.len() == self.config.dof && ages.iter().all(|a| a.is_some_and(|a| !past_deadline(a)))
     }
 
     /// A stationary MIT hold: the reference is at rest (fixed nominal, zero velocity and
@@ -673,13 +697,20 @@ impl crate::supervisor::SupervisorInner {
             Some(drv) => (drv.mit_fence_trip(), drv.feedback_ages()),
             None => (None, Vec::new()),
         };
+        let gap = self.mit.last_output.map(|t| t.elapsed());
         let reason = if let Some(t) = trip { Some(format!("driver deadline fence: {t}")) }
-            else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(|a| a >= MIT_DEADLINE)) {
+            else if let Some((i, a)) = ages.iter().enumerate().find(|(_, a)| a.is_none_or(past_deadline)) {
                 Some(format!("joint {} feedback age {a:?} reached {MIT_DEADLINE:?}", i + 1))
             } else if ages.len() != self.config.dof { Some("feedback ages unavailable".into()) }
-            else { self.mit.last_output.map(|t| t.elapsed()).filter(|g| *g >= MIT_DEADLINE)
-                .map(|g| format!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}")) };
-        if let Some(r) = reason { self.mit_lose(r, crate::safety::FaultCode::BusLoss); }
+            else { gap.filter(|g| past_deadline(*g)).map(|g| format!("gap between dynamic outputs {g:?} reached {MIT_DEADLINE:?}")) };
+        if let Some(r) = reason { self.mit_lose(r, crate::safety::FaultCode::BusLoss); return; }
+        let worst = ages.iter().flatten().copied().chain(gap).max().unwrap_or_default();
+        if worst >= MIT_NEAR_MISS {
+            self.mit.near_misses += 1;
+            if self.mit.near_misses.is_power_of_two() {
+                tracing::warn!("MIT deadline near miss #{}: {worst:?} of {MIT_DEADLINE:?} (feedback age or output gap)", self.mit.near_misses);
+            }
+        }
     }
 
     /// Positions of a handover hold: owned joints at the measured position, the others (and the

@@ -56,7 +56,7 @@ fn record_j4(timeout_raw: u32) -> MitQualificationFile {
             profile_id: "rebot_b601dm".into(), joint: 4, joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
             zero_fingerprint: mit::zero_fingerprint(0.0), motor_id: 4, reply_id: 0x14, esc_id: 4, mst_id: 0x14, sw_ver: SW_VER,
             pmax: l.p_max, vmax: l.v_max, tmax: l.t_max, timeout_raw, timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
-            timeout_unit_verified: true, tested_response: "disabled".into(), measured_expiry_ms: 101.0,
+            timeout_unit_verified: true, tested_response: "disabled".into(), measured_expiry_ms: 101.0, worst_latency_ms: 8.0,
             load_envelope: "unloaded, supported".into(), max_kp: 15.0, max_kd: 0.5, effort_ceiling_nm: 4.0,
             date: "2026-11-22T00:00:00Z".into(), trace_id: "test".into(),
         }],
@@ -188,6 +188,10 @@ fn mit_gate_refuses_to_arm_unqualified_hardware() {
         ("kp above the qualified ceiling", 2000, Some({ let mut r = record_j4(2000); r.joints[0].max_kp = 8.0; r }), Box::new(|_, _| {})),
         ("effort limit above the qualified ceiling", 2000, Some({ let mut r = record_j4(2000); r.joints[0].effort_ceiling_nm = 2.0; r }), Box::new(|_, _| {})),
         ("timeout unit not verified on the device", 2000, Some({ let mut r = record_j4(2000); r.joints[0].timeout_unit_verified = false; r }), Box::new(|_, _| {})),
+        ("measured latency does not fit the 45 ms deadline at 50 Hz (20 + 21 + 5 ms margin)", 2000,
+            Some({ let mut r = record_j4(2000); r.joints[0].worst_latency_ms = 21.0; r }), Box::new(|_, _| {})),
+        ("control period too long for the deadline (25 Hz: 40 + 8 + 5 ms)", 2000, Some(record_j4(2000)),
+            Box::new(|inner, _| inner.config.control_frequency_hz = 25)),
         ("other profile", 2000, Some({ let mut r = record_j4(2000); r.joints[0].profile_id = "so_arm101".into(); r }), Box::new(|_, _| {})),
     ];
     for (label, timeout, rec, mutate) in cases {
@@ -969,4 +973,23 @@ fn mit_timeout_batch_failure_reports_applied_and_uncertain_joints() {
     let e = inner.mit_timeout_command(&json!({"joints": [4, 5]})).unwrap_err();
     let f = e.reply_fields();
     assert_eq!((f["applied"].clone(), f["uncertain"].clone(), f["not_attempted"].clone()), (json!([]), json!([]), json!([5])), "{f:?}");
+}
+
+/// Review #14: a feedback age or output gap close to (but under) the 45 ms deadline is counted
+/// and logged as a near miss; the group stays active.
+#[test]
+fn mit_near_misses_are_counted_without_cancelling() {
+    for attempt in 0..3 {
+        let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+        for _ in 0..3 { inner.tick(DT); }
+        bus.with(|s| s.motors[3].silent = true);
+        std::thread::sleep(std::time::Duration::from_millis(38));
+        bus.with(|s| s.motors[3].silent = false);
+        inner.tick(DT);
+        if inner.mit.owner == mit::MitOwner::Lost { eprintln!("attempt {attempt}: scheduler crossed 45 ms, retry"); continue; }
+        assert!(inner.mit_active());
+        assert!(inner.mit.near_misses >= 1, "near miss not counted");
+        return;
+    }
+    panic!("could not stay under 45 ms in three attempts");
 }

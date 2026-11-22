@@ -307,7 +307,7 @@ fn mit_record_j2() -> Value {
         "profile_id": "rebot_b601dm", "joint": 2, "joint_name": "joint2", "zero_fingerprint": armd::mit::zero_fingerprint(0.0),
         "motor_id": 2, "reply_id": 18, "esc_id": 2, "mst_id": 18, "sw_ver": 942747703, "pmax": 12.5, "vmax": 10.0, "tmax": 28.0,
         "timeout_raw": 2000, "timeout_unit_us": 50, "timeout_unit_verified": true, "tested_response": "disabled",
-        "measured_expiry_ms": 101.0, "load_envelope": "supported", "max_kp": 30.0, "max_kd": 1.0, "effort_ceiling_nm": 4.0,
+        "measured_expiry_ms": 101.0, "worst_latency_ms": 8.0, "load_envelope": "supported", "max_kp": 30.0, "max_kd": 1.0, "effort_ceiling_nm": 4.0,
         "date": "2026-11-22T00:00:00Z", "trace_id": "t"}]})
 }
 

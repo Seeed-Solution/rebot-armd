@@ -10,11 +10,11 @@ on the arm yet; every value marked "needs device verification" is an open item.
 | Check | Where | Result when it fails |
 |---|---|---|
 | A joint uses `"strategy": "mit"` with `hold_kp` / `hold_kd`, positive `kp`, `kd`, `effort_limit_nm`; gains at or below the profile's `gravity_comp.hold_kp` / `hold_kd`; `coulomb_nm`, `viscous_nm_s_rad · max_velocity`, `inertia_kg_m2 · max_acceleration` each within `effort_limit_nm` | profile load | enabled block rejected; a disabled block is ignored as in Phase 1 |
-| `calibration.json` `mit_qualification` holds the joint, bound to profile, joint name, joint zero, motor ID, reply ID, ESC_ID, MST_ID, sw_ver, PMAX / VMAX / TMAX, TIMEOUT; not invalidated by a zero; `measured_expiry_ms` > 0 and `tested_response` given | every arm and rearm, against a fresh register readback | the arm does not arm (`MIT_UNQUALIFIED`), no enable frame is sent |
+| `calibration.json` `mit_qualification` holds the joint, bound to profile, joint name, joint zero, motor ID, reply ID, ESC_ID, MST_ID, sw_ver, PMAX / VMAX / TMAX, TIMEOUT; not invalidated by a zero; `timeout_unit_verified` true; `measured_expiry_ms` > 0 and `tested_response` given; control period + `worst_latency_ms` + 5 ms < 45 ms | every arm and rearm, against a fresh register readback | the arm does not arm (`MIT_UNQUALIFIED`), no enable frame is sent |
 | TIMEOUT readback nonzero and equal to the record | same | same |
 | Profile gains and effort limit at or below the record's `max_kp`, `max_kd`, `effort_ceiling_nm` (and TMAX) | same | same |
 | Handover only from fresh (< 45 ms), stationary, confirmed position control; mode ACK, hold transmit, flush and feedback newer than the ACK | first tick at rest after arming | MIT stays inactive, motions are refused; an unconfirmed rollback latches a fault and blocks clearance |
-| Feedback age or gap between dynamic batches ≥ 45 ms, RX backlog, partial or failed batch | every tick (supervisor) and before every transmit (driver) | group cancelled, BUS_LOSS (or DRIVER_WRITE_FAILED) latched, no further frame; read-only status polls only after 2 × `measured_expiry_ms` (at least 250 ms); reconnect needs fault clearance and a rearm (fresh readback, base modes restored) |
+| Feedback age or gap between dynamic batches ≥ 45 ms, RX backlog, partial or failed batch | every tick (supervisor) and before every transmit (driver) | group cancelled, BUS_LOSS latched wherever the loss is detected (also over another fault), no further frame; read-only status polls only after the operator's fault clearance and 2 × `measured_expiry_ms` (at least 250 ms); reconnect needs a rearm (fresh readback, base modes restored); ages or gaps from 36 ms on are counted and logged as near misses |
 
 TIMEOUT is RAM only. A power cycle resets it to 0 and the next arm refuses until it is
 commissioned again.
@@ -45,7 +45,9 @@ later joint individually. All register writes are RAM only.
    unsupported drop; production needs a safe timeout response across the whole envelope.
 3. **Comparison runs.** Identical bidirectional excursions with POS_VEL, `position_lead` and MIT at
    0.03, 0.06 and 0.10 rad/s, then a hold. Record nominal and wire output, measured state and
-   feedback ages, clipping, current and temperature.
+   feedback ages, clipping, current and temperature, and the worst-case loop latency
+   (`worst_latency_ms`: scheduling, RX queue and TX to the wire; SocketCAN `flush` does not bound
+   wire time, so measure it on the bus).
 4. **Gates** (design section 4, the same metrics as `tests/test_mit_plant.rs`):
    - hold: within 2.0-4.5 s after each move, the maximum |Δq| over sample pairs at most 1 s apart
      ≤ 1.0 mrad for every creep3 pose and both repetitions; incomplete telemetry is a failure;
@@ -62,7 +64,11 @@ the motors again and stores the record only when it matches them; the file is wr
 then published. Fields per joint: `profile_id`, `joint`, `joint_name`, `zero_fingerprint`
 (`zero:<hex bits of the joint zero offset>`), `motor_id`, `reply_id`, `esc_id`, `mst_id`, `sw_ver`,
 `pmax`, `vmax`, `tmax`, `timeout_raw`, `timeout_unit_us`, `timeout_unit_verified`, `tested_response`,
-`measured_expiry_ms`, `load_envelope`, `max_kp`, `max_kd`, `effort_ceiling_nm`, `date`, `trace_id`.
+`measured_expiry_ms`, `worst_latency_ms` (measured worst-case scheduling + RX queue + TX latency of
+the control loop under load; step 3 records it), `load_envelope`, `max_kp`, `max_kd`,
+`effort_ceiling_nm`, `date`, `trace_id`. A malformed or invalid record is ignored and flagged at load
+(the rest of `calibration.json` is used) and refuses MIT. A zero of a qualified joint writes the
+invalidation to disk before the zero; if that write fails, the zero is refused.
 A motor or software zero of the joint marks the record invalidated; requalify after it.
 
 ## What the plant model says (not a measurement)

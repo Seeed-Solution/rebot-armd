@@ -2519,10 +2519,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let Some(deadline) = self.mit_fence else { return Ok(()) };
         let now = self.now();
-        if let Some(i) = (0..self.motor_ids.len()).find(|&i| self.last_feedback_instant[i].is_none_or(|t| now.saturating_duration_since(t) >= deadline)) {
+        // one comparison for every check: elapsed >= deadline trips
+        let past = |d: Duration| d >= deadline;
+        if let Some(i) = (0..self.motor_ids.len()).find(|&i| self.last_feedback_instant[i].is_none_or(|t| past(now.saturating_duration_since(t)))) {
             let age = self.last_feedback_instant[i].map(|t| now.saturating_duration_since(t));
             self.trip_fence(format!("joint {} feedback age {age:?} reached {deadline:?}", i + 1));
-        } else if let Some(gap) = self.mit_fence_last_tx.map(|t| now.saturating_duration_since(t)).filter(|g| *g >= deadline) {
+        } else if let Some(gap) = self.mit_fence_last_tx.map(|t| now.saturating_duration_since(t)).filter(|g| past(*g)) {
             self.trip_fence(format!("gap between dynamic outputs {gap:?} reached {deadline:?}"));
         }
         match &self.mit_fence_trip {
