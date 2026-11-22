@@ -854,11 +854,42 @@ pub struct GrayFormatDescriptor {
     pub stride: usize,
     pub ring: usize,
     pub exposure_qualified: bool,
+    pub frame_size: Option<[usize; 2]>,
+    pub crop: Option<[usize; 4]>,
+    pub luma: Option<String>,
+    pub luma_range: Option<String>,
 }
 
 impl GrayFormatDescriptor {
     fn parse(v: &Value) -> Option<Self> {
         let g = v.get("gray_frames")?.as_object()?;
+        let parse_u_array = |k: &str, len: usize| -> Option<Vec<usize>> {
+            let a = g.get(k)?.as_array()?;
+            if a.len() != len { return None; }
+            a.iter().map(|x| usize::try_from(x.as_u64()?).ok()).collect()
+        };
+        let frame_size = match g.get("frame_size") {
+            None => None,
+            Some(_) => {
+                let fs = parse_u_array("frame_size", 2)?;
+                Some([fs[0], fs[1]])
+            }
+        };
+        let crop = match g.get("crop") {
+            None => None,
+            Some(_) => {
+                let c = parse_u_array("crop", 4)?;
+                Some([c[0], c[1], c[2], c[3]])
+            }
+        };
+        let luma = match g.get("luma") {
+            None => None,
+            Some(v) => Some(v.as_str()?.to_string()),
+        };
+        let luma_range = match g.get("luma_range") {
+            None => None,
+            Some(v) => Some(v.as_str()?.to_string()),
+        };
         Some(Self {
             encoding: g.get("encoding")?.as_str()?.to_string(),
             format: g.get("format")?.as_str()?.to_string(),
@@ -867,7 +898,50 @@ impl GrayFormatDescriptor {
             stride: usize::try_from(g.get("stride")?.as_u64()?).ok()?,
             ring: usize::try_from(g.get("ring")?.as_u64()?).ok()?,
             exposure_qualified: g.get("exposure_qualified").and_then(Value::as_bool).unwrap_or(false),
+            frame_size,
+            crop,
+            luma,
+            luma_range,
         })
+    }
+
+    /// True when the advertised descriptor matches the fixed v1 RGF1 contract.
+    pub fn is_supported_v1(&self) -> bool {
+        if self.encoding != "RGF1"
+            || self.format != "gray8"
+            || self.width != GRAY_V1_WIDTH
+            || self.height != GRAY_V1_HEIGHT
+            || self.stride != GRAY_V1_STRIDE
+            || self.ring == 0
+        {
+            return false;
+        }
+        if let Some([fw, fh]) = self.frame_size {
+            if fw == 0 || fh == 0 {
+                return false;
+            }
+        }
+        if let Some([cx, cy, cw, ch]) = self.crop {
+            if cw != self.width || ch != self.height {
+                return false;
+            }
+            if let Some([fw, fh]) = self.frame_size {
+                if cx.checked_add(cw).is_none_or(|x| x > fw) || cy.checked_add(ch).is_none_or(|y| y > fh) {
+                    return false;
+                }
+            }
+        }
+        if let Some(ref l) = self.luma {
+            if l != GRAY_V1_LUMA {
+                return false;
+            }
+        }
+        if let Some(ref r) = self.luma_range {
+            if r != GRAY_V1_LUMA_RANGE {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1022,6 +1096,8 @@ pub const GRAY_MAX_HEADER_BYTES: usize = 16384;
 pub const GRAY_V1_WIDTH: usize = 640;
 pub const GRAY_V1_HEIGHT: usize = 360;
 pub const GRAY_V1_STRIDE: usize = 640;
+pub const GRAY_V1_LUMA: &str = "(77*R+150*G+29*B)>>8";
+pub const GRAY_V1_LUMA_RANGE: &str = "full_0_255";
 
 /// One decoded raw gray frame from rebot-vision `GET /api/frame/gray`.
 #[derive(Debug, Clone, PartialEq)]
@@ -1029,6 +1105,8 @@ pub struct GrayFrame {
     pub instance_id: String,
     pub frame_id: u64,
     pub img: crate::mview_stereo::Gray,
+    pub frame_size: [usize; 2],
+    pub crop: [usize; 4],
     pub ts_ms: u64,
     pub frame_mono_ms: u64,
     pub wait_mono_ms: u64,
@@ -1103,12 +1181,24 @@ fn valid_instance_token(s: &str) -> bool {
 
 /// Strictly parse an `RGF1` gray frame body (`"RGF1"` + u32 LE `N` + `N` space-padded UTF-8 JSON
 /// bytes aligned to 8 + exact `height * stride` pixel bytes). Validates bounds, alignment,
-/// checked arithmetic, fixed v1 geometry (`640x360`, `stride=640`), exact payload length, and
-/// expected identity before allocating the pixel buffer.
+/// checked arithmetic, required v1 metadata (encoding, source dims, crop bounds, luma, timing),
+/// fixed v1 geometry (`640x360`, `stride=640`), exact payload length, and expected identity
+/// before allocating the pixel buffer.
 pub fn parse_gray_frame(
     body: &[u8],
     expected_instance_id: Option<&str>,
     expected_frame_id: Option<u64>,
+) -> Result<GrayFrame, GrayFrameError> {
+    parse_gray_frame_with_format(body, expected_instance_id, expected_frame_id, None)
+}
+
+/// Strict [`parse_gray_frame`] that additionally checks the frame metadata against a negotiated
+/// [`GrayFormatDescriptor`] from `GET /api/mode`.
+pub fn parse_gray_frame_with_format(
+    body: &[u8],
+    expected_instance_id: Option<&str>,
+    expected_frame_id: Option<u64>,
+    expected_format: Option<&GrayFormatDescriptor>,
 ) -> Result<GrayFrame, GrayFrameError> {
     let t0 = Instant::now();
     let proto = |m: String| GrayFrameError::Protocol(m);
@@ -1145,13 +1235,20 @@ pub fn parse_gray_frame(
     if v.get("api_version").and_then(Value::as_u64) != Some(2) {
         return Err(proto("RGF1 unsupported api_version (expected 2)".into()));
     }
-    if let Some(enc) = v.get("encoding") {
-        if enc.as_str() != Some("RGF1") {
-            return Err(proto("RGF1 unexpected encoding field".into()));
-        }
+    if v.get("encoding").and_then(Value::as_str) != Some("RGF1") {
+        return Err(proto("RGF1 missing or unsupported encoding (expected RGF1)".into()));
     }
     if v.get("format").and_then(Value::as_str) != Some("gray8") {
         return Err(proto("RGF1 unsupported format (expected gray8)".into()));
+    }
+    if v.get("frame_format").and_then(Value::as_str) != Some("RGB888") {
+        return Err(proto("RGF1 missing or unsupported frame_format (expected RGB888)".into()));
+    }
+    if v.get("luma").and_then(Value::as_str) != Some(GRAY_V1_LUMA) {
+        return Err(proto("RGF1 missing or unsupported luma equation".into()));
+    }
+    if v.get("luma_range").and_then(Value::as_str) != Some(GRAY_V1_LUMA_RANGE) {
+        return Err(proto("RGF1 missing or unsupported luma_range (expected full_0_255)".into()));
     }
     let instance_id = v
         .get("instance_id")
@@ -1173,9 +1270,24 @@ pub fn parse_gray_frame(
             return Err(proto(format!("RGF1 frame_id mismatch: expected {exp}, got {frame_id}")));
         }
     }
+    let req_u64 = |k: &str| -> Result<u64, GrayFrameError> {
+        v.get(k).and_then(Value::as_u64).ok_or_else(|| proto(format!("RGF1 missing or invalid {k}")))
+    };
     let req_usize = |k: &str| -> Result<usize, GrayFrameError> {
-        let n = v.get(k).and_then(Value::as_u64).ok_or_else(|| proto(format!("RGF1 missing {k}")))?;
+        let n = req_u64(k)?;
         usize::try_from(n).map_err(|_| proto(format!("RGF1 {k} overflow")))
+    };
+    let req_usize_array = |k: &str, len: usize| -> Result<Vec<usize>, GrayFrameError> {
+        let arr = v.get(k).and_then(Value::as_array).ok_or_else(|| proto(format!("RGF1 missing {k}")))?;
+        if arr.len() != len {
+            return Err(proto(format!("RGF1 {k} must have {len} elements")));
+        }
+        arr.iter()
+            .map(|el| {
+                let n = el.as_u64().ok_or_else(|| proto(format!("RGF1 {k} element must be non-negative integer")))?;
+                usize::try_from(n).map_err(|_| proto(format!("RGF1 {k} element overflow")))
+            })
+            .collect()
     };
     let width = req_usize("width")?;
     let height = req_usize("height")?;
@@ -1185,6 +1297,67 @@ pub fn parse_gray_frame(
             "RGF1 unsupported geometry {width}x{height} stride {stride} (expected {GRAY_V1_WIDTH}x{GRAY_V1_HEIGHT} stride {GRAY_V1_STRIDE})"
         )));
     }
+    let fs_vec = req_usize_array("frame_size", 2)?;
+    let frame_size = [fs_vec[0], fs_vec[1]];
+    if frame_size[0] == 0 || frame_size[1] == 0 {
+        return Err(proto(format!("RGF1 invalid frame_size {}x{}", frame_size[0], frame_size[1])));
+    }
+    let crop_vec = req_usize_array("crop", 4)?;
+    let crop = [crop_vec[0], crop_vec[1], crop_vec[2], crop_vec[3]];
+    if crop[2] != width || crop[3] != height {
+        return Err(proto(format!(
+            "RGF1 crop size {}x{} does not match output {}x{}",
+            crop[2], crop[3], width, height
+        )));
+    }
+    if crop[0].checked_add(crop[2]).is_none_or(|x| x > frame_size[0])
+        || crop[1].checked_add(crop[3]).is_none_or(|y| y > frame_size[1])
+    {
+        return Err(proto(format!(
+            "RGF1 crop {:?} exceeds frame_size {:?}",
+            crop, frame_size
+        )));
+    }
+    if let Some(fmt) = expected_format {
+        if fmt.encoding != "RGF1" || fmt.format != "gray8" {
+            return Err(proto("RGF1 negotiated descriptor encoding/format incompatible".into()));
+        }
+        if width != fmt.width || height != fmt.height || stride != fmt.stride {
+            return Err(proto(format!(
+                "RGF1 geometry {width}x{height} stride {stride} does not match negotiated {}x{} stride {}",
+                fmt.width, fmt.height, fmt.stride
+            )));
+        }
+        if let Some(exp_fs) = fmt.frame_size {
+            if frame_size != exp_fs {
+                return Err(proto(format!(
+                    "RGF1 frame_size {:?} does not match negotiated {:?}",
+                    frame_size, exp_fs
+                )));
+            }
+        }
+        if let Some(exp_crop) = fmt.crop {
+            if crop != exp_crop {
+                return Err(proto(format!(
+                    "RGF1 crop {:?} does not match negotiated {:?}",
+                    crop, exp_crop
+                )));
+            }
+        }
+    }
+    let _channel = req_u64("channel")?;
+    let _model_generation = req_u64("model_generation")?;
+    let ts_ms = req_u64("ts_ms")?;
+    let frame_mono_ms = req_u64("frame_mono_ms")?;
+    let wait_mono_ms = req_u64("wait_mono_ms")?;
+    let grab_mono_ms = req_u64("grab_mono_ms")?;
+    let stored_mono_ms = req_u64("stored_mono_ms")?;
+    let convert_ms = v
+        .get("convert_ms")
+        .and_then(Value::as_f64)
+        .filter(|x| x.is_finite() && *x >= 0.0)
+        .ok_or_else(|| proto("RGF1 missing or invalid convert_ms".into()))?;
+
     let payload_len = height
         .checked_mul(stride)
         .ok_or_else(|| proto("RGF1 payload size overflow".into()))?;
@@ -1197,12 +1370,6 @@ pub fn parse_gray_frame(
             body.len()
         )));
     }
-    let u64_opt = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let convert_ms = v
-        .get("convert_ms")
-        .and_then(Value::as_f64)
-        .filter(|x| x.is_finite() && *x >= 0.0)
-        .unwrap_or(0.0);
     let img = crate::mview_stereo::Gray::new(width, height, body[off..total].to_vec())
         .ok_or_else(|| proto("RGF1 pixel buffer allocation mismatch".into()))?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1210,11 +1377,13 @@ pub fn parse_gray_frame(
         instance_id,
         frame_id,
         img,
-        ts_ms: u64_opt("ts_ms"),
-        frame_mono_ms: u64_opt("frame_mono_ms"),
-        wait_mono_ms: u64_opt("wait_mono_ms"),
-        grab_mono_ms: u64_opt("grab_mono_ms"),
-        stored_mono_ms: u64_opt("stored_mono_ms"),
+        frame_size,
+        crop,
+        ts_ms,
+        frame_mono_ms,
+        wait_mono_ms,
+        grab_mono_ms,
+        stored_mono_ms,
         convert_ms,
         parse_ms,
     })
@@ -5724,6 +5893,12 @@ mod tests {
             "api_version": 2, "encoding": "RGF1", "format": "gray8",
             "instance_id": "rv-test1", "frame_id": 1,
             "width": 640, "height": 360, "stride": 640,
+            "frame_size": [640, 640], "frame_format": "RGB888",
+            "crop": [0, 140, 640, 360], "channel": 0,
+            "luma": GRAY_V1_LUMA, "luma_range": GRAY_V1_LUMA_RANGE,
+            "ts_ms": 1763791234567u64, "frame_mono_ms": 100u64,
+            "wait_mono_ms": 95u64, "grab_mono_ms": 101u64, "stored_mono_ms": 105u64,
+            "convert_ms": 4.2, "model_generation": 0u64,
         });
         assert!(parse_gray_frame(&build_rgf1(&base_hdr(), &px), Some("rv-test1"), Some(1)).is_ok());
 
@@ -5733,8 +5908,32 @@ mod tests {
         bad_pad[8 + hlen - 1] = b'\t';
         assert!(matches!(parse_gray_frame(&bad_pad, None, None), Err(GrayFrameError::Protocol(_))));
 
-        // Incorrect stride / wrong dimensions / arithmetic overflow / wrong api_version / wrong format
+        // Missing required v1 metadata fields must all be rejected
+        for missing_key in [
+            "encoding", "format", "frame_format", "frame_size", "crop", "channel",
+            "luma", "luma_range", "ts_ms", "frame_mono_ms", "wait_mono_ms",
+            "grab_mono_ms", "stored_mono_ms", "convert_ms", "model_generation",
+        ] {
+            let mut h = base_hdr();
+            h.as_object_mut().unwrap().remove(missing_key);
+            assert!(
+                matches!(parse_gray_frame(&build_rgf1(&h, &px), None, None), Err(GrayFrameError::Protocol(_))),
+                "missing {missing_key} must fail"
+            );
+        }
+
+        // Incompatible metadata, crop out-of-bounds/mismatch, negative timing, bad stride/dims
         for mut h in [
+            { let mut h = base_hdr(); h["encoding"] = serde_json::json!("RGF2"); h },
+            { let mut h = base_hdr(); h["frame_format"] = serde_json::json!("BGR888"); h },
+            { let mut h = base_hdr(); h["luma"] = serde_json::json!("limited"); h },
+            { let mut h = base_hdr(); h["luma_range"] = serde_json::json!("limited_16_235"); h },
+            { let mut h = base_hdr(); h["frame_size"] = serde_json::json!([0, 640]); h },
+            { let mut h = base_hdr(); h["crop"] = serde_json::json!([0, 300, 640, 360]); h }, // 300+360 > 640
+            { let mut h = base_hdr(); h["crop"] = serde_json::json!([0, 140, 640, 350]); h }, // ch != height
+            { let mut h = base_hdr(); h["crop"] = serde_json::json!([0, 140, 640]); h },      // wrong arity
+            { let mut h = base_hdr(); h["convert_ms"] = serde_json::json!(-1.0); h },
+            { let mut h = base_hdr(); h["stored_mono_ms"] = serde_json::json!(-5); h },
             { let mut h = base_hdr(); h["stride"] = serde_json::json!(648); h },
             { let mut h = base_hdr(); h["width"] = serde_json::json!(320); h["stride"] = serde_json::json!(320); h },
             { let mut h = base_hdr(); h["height"] = serde_json::json!(u64::MAX); h },
@@ -5746,6 +5945,28 @@ mod tests {
             h["width"] = serde_json::json!(0);
             assert!(matches!(parse_gray_frame(&build_rgf1(&h, &[]), None, None), Err(GrayFrameError::Protocol(_))));
         }
+
+        // Negotiated format mismatch (frame_size / crop differs from negotiated /api/mode descriptor)
+        let negotiated = GrayFormatDescriptor {
+            encoding: "RGF1".into(), format: "gray8".into(),
+            width: 640, height: 360, stride: 640, ring: 4, exposure_qualified: false,
+            frame_size: Some([640, 640]), crop: Some([0, 140, 640, 360]),
+            luma: Some(GRAY_V1_LUMA.into()), luma_range: Some(GRAY_V1_LUMA_RANGE.into()),
+        };
+        assert!(negotiated.is_supported_v1());
+        assert!(parse_gray_frame_with_format(&build_rgf1(&base_hdr(), &px), Some("rv-test1"), Some(1), Some(&negotiated)).is_ok());
+        let mut diff_crop = base_hdr();
+        diff_crop["crop"] = serde_json::json!([0, 100, 640, 360]);
+        assert!(matches!(
+            parse_gray_frame_with_format(&build_rgf1(&diff_crop, &px), None, None, Some(&negotiated)),
+            Err(GrayFrameError::Protocol(m)) if m.contains("crop")
+        ));
+        let mut diff_fs = base_hdr();
+        diff_fs["frame_size"] = serde_json::json!([1280, 720]);
+        assert!(matches!(
+            parse_gray_frame_with_format(&build_rgf1(&diff_fs, &px), None, None, Some(&negotiated)),
+            Err(GrayFrameError::Protocol(m)) if m.contains("frame_size")
+        ));
     }
 
     #[test]
@@ -5753,12 +5974,20 @@ mod tests {
         let m = ModeInfo::parse(Some(&serde_json::json!({
             "mode": "yolo", "enabled": false, "per_request_pipelines": true,
             "available": {"yolo": true, "aruco": true, "depth": false, "gray": true},
-            "gray_frames": {"encoding": "RGF1", "format": "gray8", "width": 640, "height": 360, "stride": 640, "ring": 4, "exposure_qualified": false}
+            "gray_frames": {
+                "encoding": "RGF1", "format": "gray8", "width": 640, "height": 360, "stride": 640,
+                "frame_size": [640, 640], "crop": [0, 140, 640, 360],
+                "luma": GRAY_V1_LUMA, "luma_range": GRAY_V1_LUMA_RANGE,
+                "ring": 4, "exposure_qualified": false
+            }
         })));
         assert!(m.per_request_pipelines && m.aruco_available && m.gray_available);
         assert_eq!(m.gray_format, Some(GrayFormatDescriptor {
             encoding: "RGF1".into(), format: "gray8".into(), width: 640, height: 360, stride: 640, ring: 4, exposure_qualified: false,
+            frame_size: Some([640, 640]), crop: Some([0, 140, 640, 360]),
+            luma: Some(GRAY_V1_LUMA.into()), luma_range: Some(GRAY_V1_LUMA_RANGE.into()),
         }));
+        assert!(m.gray_format.as_ref().unwrap().is_supported_v1());
         let old = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "per_request_pipelines": true, "available": {"yolo": true, "aruco": true}})));
         assert!(old.aruco_available && !old.gray_available && old.gray_format.is_none());
 

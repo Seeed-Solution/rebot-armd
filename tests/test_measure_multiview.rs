@@ -242,6 +242,8 @@ impl DetectionSource for FakeVision {
                 instance_id: cur_inst,
                 frame_id: s.id,
                 img: s.img,
+                frame_size: [640, 640],
+                crop: [0, 140, 640, 360],
                 ts_ms: 1763791234000 + s.id,
                 frame_mono_ms: 10000 + s.id,
                 wait_mono_ms: 9990 + s.id,

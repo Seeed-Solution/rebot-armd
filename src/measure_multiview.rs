@@ -661,13 +661,14 @@ async fn capture(
     plan: &Plan,
     src: &dyn DetectionSource,
     frame_source: FrameSource,
+    negotiated_gray: Option<&grasp::GrayFormatDescriptor>,
     offset: [f64; 2],
     shift_px: [f64; 2],
     margin_px: f64,
     markers: bool,
 ) -> Result<Capture, Stop> {
     match frame_source {
-        FrameSource::Gray => capture_gray(ctx, plan, src, offset, shift_px, margin_px, markers).await,
+        FrameSource::Gray => capture_gray(ctx, plan, src, negotiated_gray, offset, shift_px, margin_px, markers).await,
         FrameSource::Snapshot => capture_snapshot(ctx, plan, src, offset, shift_px, margin_px, markers).await,
     }
 }
@@ -684,6 +685,7 @@ async fn capture_gray(
     ctx: &MacroCtx,
     plan: &Plan,
     src: &dyn DetectionSource,
+    negotiated_gray: Option<&grasp::GrayFormatDescriptor>,
     offset: [f64; 2],
     shift_px: [f64; 2],
     margin_px: f64,
@@ -742,6 +744,30 @@ async fn capture_gray(
                 "gray frame is {}x{}; the camera model (grasp setup image_size_px) is {cw}x{ch}",
                 gray.img.w, gray.img.h
             )));
+        }
+        if let Some(fmt) = negotiated_gray {
+            if gray.img.w != fmt.width || gray.img.h != fmt.height {
+                return Err(fail("DETECTION_UNAVAILABLE", format!(
+                    "gray frame {}x{} does not match negotiated {}x{}",
+                    gray.img.w, gray.img.h, fmt.width, fmt.height
+                )));
+            }
+            if let Some(exp_fs) = fmt.frame_size {
+                if gray.frame_size != exp_fs {
+                    return Err(fail("DETECTION_UNAVAILABLE", format!(
+                        "gray frame source size {:?} does not match negotiated {:?}",
+                        gray.frame_size, exp_fs
+                    )));
+                }
+            }
+            if let Some(exp_crop) = fmt.crop {
+                if gray.crop != exp_crop {
+                    return Err(fail("DETECTION_UNAVAILABLE", format!(
+                        "gray frame crop {:?} does not match negotiated {:?}",
+                        gray.crop, exp_crop
+                    )));
+                }
+            }
         }
         let t_fetch_done = Instant::now();
         let (_, _, fence_seqs) = sample_with_timing(ctx).await;
@@ -1021,7 +1047,8 @@ fn look_at(plan: &Plan, pose: &Pose, target: &Detection) -> Vec3 {
 }
 
 /// Everything after the start capture, until the views are captured.
-async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame_source: FrameSource, caps: &mut Vec<Capture>, target: &Detection,
+async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame_source: FrameSource,
+    negotiated_gray: Option<&grasp::GrayFormatDescriptor>, caps: &mut Vec<Capture>, target: &Detection,
     fallbacks: &mut Vec<Value>, pivot: &Vec3, markers: bool) -> Result<(), (Stop, bool)> {
     let pose0 = caps[0].pose;
     let cam0 = camera_at(&plan.cam, &pose0);
@@ -1060,7 +1087,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let cap = capture(ctx, plan, src, frame_source, c, shift, margin, markers).await.map_err(|s| (s, true))?;
+                    let cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers).await.map_err(|s| (s, true))?;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
                     if pick_view(target, plan.request.min_score, &cap.detections, plan.cam.to_norm(seen)).is_none() {
@@ -1556,13 +1583,17 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
             }
         }
     };
-    let frame_source = if mode.gray_available && mode.upstream_loopback {
+    let frame_source = if mode.gray_available
+        && mode.upstream_loopback
+        && mode.gray_format.as_ref().is_none_or(grasp::GrayFormatDescriptor::is_supported_v1)
+    {
         FrameSource::Gray
     } else {
         FrameSource::Snapshot
     };
+    let negotiated_gray_format = if frame_source == FrameSource::Gray { mode.gray_format.clone() } else { None };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
-    let first = capture(ctx, plan, src, frame_source, [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
+    let first = capture(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
@@ -1577,7 +1608,7 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     }
     let mut caps = vec![first];
     let mut fallbacks = Vec::new();
-    let views_res = run_views(ctx, plan, src, frame_source, &mut caps, &target, &mut fallbacks, &pivot, markers).await;
+    let views_res = run_views(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), &mut caps, &target, &mut fallbacks, &pivot, markers).await;
     if let Err((stop, moved)) = views_res {
         // a measurement failure goes back to the start first; a stop, fault, collision, torque
         // limit, lease loss or anything else ends the action where the arm is

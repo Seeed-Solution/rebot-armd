@@ -99,6 +99,7 @@ impl DetectionSource for GrayOnlyVision {
                 .ok_or_else(|| GrayFrameError::NotStored("404 FRAME_NOT_STORED".into()))?;
             Ok(GrayFrame {
                 instance_id: req_inst, frame_id, img: shot.img,
+                frame_size: [640, 640], crop: [0, 140, 640, 360],
                 ts_ms: 1763791234000 + frame_id, frame_mono_ms: 10000 + frame_id,
                 wait_mono_ms: 9990 + frame_id, grab_mono_ms: 10002 + frame_id,
                 stored_mono_ms: 10007 + frame_id, convert_ms: 4.3, parse_ms: 0.2,
