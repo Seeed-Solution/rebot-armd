@@ -209,7 +209,7 @@ impl crate::supervisor::SupervisorInner {
     ///
     /// Pure read-only evaluation (`&self`): never mutates live escape bookkeeping
     /// (`servo_ws_min_depths`) or nominal supervisor state during candidate checks.
-    pub(crate) fn compute_position_lead_output(
+    pub fn compute_position_lead_output(
         &self,
         dt: f64,
         jt: &JointTrackingConfig,

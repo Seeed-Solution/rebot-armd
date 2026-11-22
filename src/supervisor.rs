@@ -5234,10 +5234,11 @@ impl SupervisorInner {
                                     kd: None,
                                 })
                                 .collect();
-                            let write_res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
-                                Some(mut driver) => Some(driver.write_joint_targets(&targets)),
-                                None => None,
-                            };
+                            let write_res = self
+                                .driver
+                                .as_ref()
+                                .and_then(|d| d.lock().ok())
+                                .map(|mut driver| driver.write_joint_targets(&targets));
                             match write_res {
                                 Some(Ok(())) => self.tracking.record_issued(out.positions, out.velocities),
                                 Some(Err(e)) => {
