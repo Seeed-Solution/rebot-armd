@@ -500,7 +500,12 @@ available under **Advanced**.
    0.18–0.35 m from the board (candidates at 0.18, 0.20, 0.23, 0.26, 0.30, 0.35 m; with the v8 mount
    the clearance rule removes the 0.18 m ones, the self-test uses 0.20–0.35 m), view tilt 0–30° in several azimuths, roll ±15°, at least 6
    predicted visible markers, tool points at least 0.10 m above the board plane, each transition
-   checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits).
+   checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits). After a
+   re-solve moves the board plane, the pose the arm is at can read below the clearance; a move out
+   of it is then allowed when the target is above the clearance and no tool point on the way goes
+   lower than the start's lowest point (before this rule the re-plan returned 0 poses and the run
+   stopped with `nopose: clearance`; simulated end-to-end runs: 1 of 15 failed before, 10 of 10
+   passed after).
 3. **Capture**: each pose is a `move_to` at 0.03 m/s and 0.3 rad/s, then still for 0.3 s, then one
    `["aruco"]` trigger. Every move needs a tap unless **Run all** is ticked. **Stop** stays in the
    footer; a hidden page, stale telemetry, lease loss, E-stop or fault aborts the run, which does
