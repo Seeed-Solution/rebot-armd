@@ -1055,7 +1055,8 @@ pub struct GripperMotion {
     moved: bool,
     phase: GripPhase,
     /// Grasp: measured J7 where contact was detected; the command then stops at
-    /// `contact + squeeze_rad` (never past it) and closes at GRIPPER_CONTACT_SPEED.
+    /// `contact + squeeze_rad` (never past it) and closes at GRIPPER_CONTACT_SPEED. Cleared
+    /// again when the contact gave way (`contact_yielded`).
     pub contact_rad: Option<f32>,
     contact_ticks: u32,
 }
@@ -1095,6 +1096,19 @@ impl GripperMotion {
 
     fn close_dir(&self) -> f32 { if self.policy.closed_rad >= self.policy.open_rad { 1.0 } else { -1.0 } }
 
+    /// Grasp: the jaw (measured `m_g`) went on past the contact by at least half of squeeze_rad
+    /// and the torque is below contact_torque_nm (holding_torque_nm when unset): the object gave
+    /// way. False without a contact or when the stop is already closed_rad.
+    fn contact_yielded(&self, m_g: f32, tau_g: f32, torque_feedback: bool) -> bool {
+        let (Some(contact), Some(stop)) = (self.contact_rad, self.contact_stop()) else { return false };
+        let dir = self.close_dir();
+        let low_torque = !torque_feedback
+            || tau_g.abs() < self.policy.contact_torque_nm.unwrap_or(self.policy.holding_torque_nm);
+        (self.policy.closed_rad - stop) * dir > 1e-4
+            && (m_g - contact) * dir >= 0.5 * self.policy.squeeze_rad
+            && low_torque
+    }
+
     pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
         self.elapsed += ctx.dt;
         let mut positions: Vec<f32> = ctx.commanded.to_vec();
@@ -1118,6 +1132,9 @@ impl GripperMotion {
         let force_cap = self.policy.max_close_torque_nm.filter(|_| ctx.torque_feedback && ctx.feedback_fresh);
         let squeeze_rad = self.policy.squeeze_rad;
         let ramp_rate = 2.0 * f64::from(squeeze_rad) / (self.policy.settle_ms as f64 / 1000.0);
+        let contact_stop = self.contact_stop();
+        let yielded = self.contact_yielded(m_g, tau_g, ctx.torque_feedback);
+        let mut rearm = false;
         if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
@@ -1134,6 +1151,23 @@ impl GripperMotion {
                 }
             }
             if idx < positions.len() { positions[idx] = *hold; }
+            let window_done = *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6;
+            // The contact gave way: the squeeze, limited to the contact stop, ends with the jaw
+            // past the contact and little torque, so the object turned or slid in the jaws (a box
+            // closed on across its corners squares up) and the hold would grip with about 0 N·m.
+            rearm = window_done && yielded && contact_stop.is_some_and(|stop| (*hold - stop).abs() < 1e-4);
+        }
+        if rearm {
+            // forget the contact and close on at GRIPPER_CONTACT_SPEED from the measured jaw until
+            // the next torque rise or following error sets a new contact stop
+            self.phase = GripPhase::Moving;
+            self.contact_rad = None;
+            self.contact_ticks = 0;
+            self.still_for = 0.0;
+            if idx < positions.len() { positions[idx] = m_g; }
+            return StepOut { positions, velocities, status: StepStatus::Running, progress: progress_of(m_g), clear_gripper_stall: true };
+        }
+        if let GripPhase::Squeeze { elapsed, taus, loads, .. } = &mut self.phase {
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
                 let mut sorted = taus.clone();
                 sorted.sort_by(|a, b| a.total_cmp(b));
