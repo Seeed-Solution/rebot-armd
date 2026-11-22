@@ -584,6 +584,59 @@ pub struct Feature {
 #[inline]
 fn in_rect(x: f64, y: f64, r: &[f64; 4]) -> bool { x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] }
 
+#[inline(always)]
+fn stream_corner_row<const SUB_OLD: bool, const EMIT_LAM: bool>(
+    gx_slice: &[f32],
+    gy_slice: &[f32],
+    ring_row: &mut [[f32; 3]],
+    vacc: &mut [[f32; 3]],
+    lam_row: &mut [f32],
+    max_l: &mut f32,
+) {
+    let rw = vacc.len();
+    assert!(gx_slice.len() >= rw + 4 && gy_slice.len() >= rw + 4 && ring_row.len() == rw);
+    if EMIT_LAM {
+        assert!(lam_row.len() == rw);
+    }
+    let mut hacc = [0.0f32; 3];
+    for i in 0..4 {
+        let (a, b) = (gx_slice[i], gy_slice[i]);
+        hacc[0] += a * a;
+        hacc[1] += b * b;
+        hacc[2] += a * b;
+    }
+    for col in 0..rw {
+        let (a, b) = (gx_slice[col + 4], gy_slice[col + 4]);
+        hacc[0] += a * a;
+        hacc[1] += b * b;
+        hacc[2] += a * b;
+        if col >= 1 {
+            let (a, b) = (gx_slice[col - 1], gy_slice[col - 1]);
+            hacc[0] -= a * a;
+            hacc[1] -= b * b;
+            hacc[2] -= a * b;
+        }
+        let va = &mut vacc[col];
+        for c in 0..3 {
+            va[c] += hacc[c];
+        }
+        if SUB_OLD {
+            let old = ring_row[col];
+            for c in 0..3 {
+                va[c] -= old[c];
+            }
+        }
+        ring_row[col] = hacc;
+        if EMIT_LAM {
+            let [a, c, b] = *va;
+            let half = 0.5 * (a + c);
+            let l = half - (0.25 * (a - c) * (a - c) + b * b).max(0.0).sqrt();
+            lam_row[col] = l;
+            *max_l = (*max_l).max(l);
+        }
+    }
+}
+
 /// Corners in `region` (quotas inside / outside `inner`) and edge points in `edge_region` (see the
 /// module doc).
 pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params) -> Vec<Feature> {
@@ -596,44 +649,47 @@ pub fn features(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64
     // gradients over the region plus a 2 px border (structure tensor window 5x5)
     let (gx0, gy0) = (x0 - 2, y0 - 2);
     let (gw, gh) = (x1 - x0 + 5, y1 - y0 + 5);
-    let mut gxv = vec![0.0f32; gw * gh];
-    let mut gyv = vec![0.0f32; gw * gh];
-    for j in 0..gh {
-        let y = gy0 + j;
-        for i in 0..gw {
-            let x = gx0 + i;
-            gxv[j * gw + i] = 0.5 * (img.at(x + 1, y) - img.at(x - 1, y));
-            gyv[j * gw + i] = 0.5 * (img.at(x, y + 1) - img.at(x, y - 1));
-        }
-    }
-    // separable 5x5 box sums of gx^2, gy^2, gx gy: horizontal, then vertical
     let (rw, rh) = (x1 - x0 + 1, y1 - y0 + 1);
-    let mut hs = vec![[0.0f32; 3]; rw * gh];
-    for j in 0..gh {
-        let row = j * gw;
-        let mut acc = [0.0f32; 3];
-        for i in 0..gw {
-            let (a, b) = (gxv[row + i], gyv[row + i]);
-            acc[0] += a * a; acc[1] += b * b; acc[2] += a * b;
-            if i >= 5 { let (a, b) = (gxv[row + i - 5], gyv[row + i - 5]); acc[0] -= a * a; acc[1] -= b * b; acc[2] -= a * b; }
-            if i >= 4 { hs[j * rw + i - 4] = acc; }
-        }
-    }
+    let need_edges = p.max_edge_features > 0;
+    let (mut gxv, mut gyv) = if need_edges {
+        (vec![0.0f32; gw * gh], vec![0.0f32; gw * gh])
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (mut gx_row, mut gy_row) = if need_edges {
+        (Vec::new(), Vec::new())
+    } else {
+        (vec![0.0f32; gw], vec![0.0f32; gw])
+    };
+    // separable 5x5 box sums of gx^2, gy^2, gx gy streamed by row
+    let mut hs_ring = vec![[0.0f32; 3]; 5 * rw];
+    let mut vacc = vec![[0.0f32; 3]; rw];
     let mut lam = vec![0.0f32; rw * rh];
     let mut max_l = 0.0f32;
-    for i in 0..rw {
-        let mut acc = [0.0f32; 3];
-        for j in 0..gh {
-            let h = hs[j * rw + i];
-            for c in 0..3 { acc[c] += h[c]; }
-            if j >= 5 { let h = hs[(j - 5) * rw + i]; for c in 0..3 { acc[c] -= h[c]; } }
-            if j >= 4 {
-                let [a, c, b] = acc;
-                let half = 0.5 * (a + c);
-                let l = half - (0.25 * (a - c) * (a - c) + b * b).max(0.0).sqrt();
-                lam[(j - 4) * rw + i] = l;
-                max_l = max_l.max(l);
-            }
+    for j in 0..gh {
+        let (gx_slice, gy_slice) = if need_edges {
+            (&mut gxv[j * gw..(j + 1) * gw], &mut gyv[j * gw..(j + 1) * gw])
+        } else {
+            (&mut gx_row[..], &mut gy_row[..])
+        };
+        let y = gy0 + j;
+        let row_c = &img.px[y * img.w + gx0 - 1..][..gw + 2];
+        let row_u = &img.px[(y - 1) * img.w + gx0..][..gw];
+        let row_d = &img.px[(y + 1) * img.w + gx0..][..gw];
+        for i in 0..gw {
+            gx_slice[i] = 0.5 * (f32::from(row_c[i + 2]) - f32::from(row_c[i]));
+            gy_slice[i] = 0.5 * (f32::from(row_d[i]) - f32::from(row_u[i]));
+        }
+        let ring_row = &mut hs_ring[(j % 5) * rw..(j % 5 + 1) * rw];
+        if j < 4 {
+            stream_corner_row::<false, false>(gx_slice, gy_slice, ring_row, &mut vacc, &mut [], &mut max_l);
+        } else if j == 4 {
+            let lam_row = &mut lam[0..rw];
+            stream_corner_row::<false, true>(gx_slice, gy_slice, ring_row, &mut vacc, lam_row, &mut max_l);
+        } else {
+            let out_row = j - 4;
+            let lam_row = &mut lam[out_row * rw..(out_row + 1) * rw];
+            stream_corner_row::<true, true>(gx_slice, gy_slice, ring_row, &mut vacc, lam_row, &mut max_l);
         }
     }
     // corners: relative and absolute floors (a 5x5 window of 2-grey-level gradients is no corner)
@@ -1772,5 +1828,242 @@ mod tests {
         for (x, y) in [(10.25, 11.75), (10.5, 11.3), (11.1, 10.0), (10.0, 11.9)] {
             assert_ncc_eq(ncc_half_grid(&img, &t, x, y), ncc(&img, &t, x, y, true));
         }
+    }
+
+    fn features_column_major_ref(img: &Gray, region: [f64; 4], inner: [f64; 4], edge_region: [f64; 4], p: &Params) -> Vec<Feature> {
+        let m = PATCH_R + 4;
+        let x0 = (region[0].floor().max(0.0) as usize).max(m);
+        let y0 = (region[1].floor().max(0.0) as usize).max(m);
+        let x1 = (region[2].ceil().max(0.0) as usize).min(img.w.saturating_sub(m + 1));
+        let y1 = (region[3].ceil().max(0.0) as usize).min(img.h.saturating_sub(m + 1));
+        if x1 <= x0 + 2 || y1 <= y0 + 2 { return Vec::new(); }
+        let (gx0, gy0) = (x0 - 2, y0 - 2);
+        let (gw, gh) = (x1 - x0 + 5, y1 - y0 + 5);
+        let mut gxv = vec![0.0f32; gw * gh];
+        let mut gyv = vec![0.0f32; gw * gh];
+        for j in 0..gh {
+            let y = gy0 + j;
+            for i in 0..gw {
+                let x = gx0 + i;
+                gxv[j * gw + i] = 0.5 * (img.at(x + 1, y) - img.at(x - 1, y));
+                gyv[j * gw + i] = 0.5 * (img.at(x, y + 1) - img.at(x, y - 1));
+            }
+        }
+        let (rw, rh) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut hs = vec![[0.0f32; 3]; rw * gh];
+        for j in 0..gh {
+            let row = j * gw;
+            let mut acc = [0.0f32; 3];
+            for i in 0..gw {
+                let (a, b) = (gxv[row + i], gyv[row + i]);
+                acc[0] += a * a; acc[1] += b * b; acc[2] += a * b;
+                if i >= 5 { let (a, b) = (gxv[row + i - 5], gyv[row + i - 5]); acc[0] -= a * a; acc[1] -= b * b; acc[2] -= a * b; }
+                if i >= 4 { hs[j * rw + i - 4] = acc; }
+            }
+        }
+        let mut lam = vec![0.0f32; rw * rh];
+        let mut max_l = 0.0f32;
+        for i in 0..rw {
+            let mut acc = [0.0f32; 3];
+            for j in 0..gh {
+                let h = hs[j * rw + i];
+                for c in 0..3 { acc[c] += h[c]; }
+                if j >= 5 { let h = hs[(j - 5) * rw + i]; for c in 0..3 { acc[c] -= h[c]; } }
+                if j >= 4 {
+                    let [a, c, b] = acc;
+                    let half = 0.5 * (a + c);
+                    let l = half - (0.25 * (a - c) * (a - c) + b * b).max(0.0).sqrt();
+                    lam[(j - 4) * rw + i] = l;
+                    max_l = max_l.max(l);
+                }
+            }
+        }
+        let floor = (p.corner_rel_floor * max_l).max(100.0);
+        let mut cand: Vec<(f32, usize, usize)> = Vec::new();
+        for j in 1..rh.saturating_sub(1) {
+            for i in 1..rw.saturating_sub(1) {
+                let l = lam[j * rw + i];
+                if l < floor { continue; }
+                let local_max = (0..3).all(|dj| (0..3).all(|di| (di == 1 && dj == 1) || lam[(j + dj - 1) * rw + i + di - 1] <= l));
+                if local_max { cand.push((l, x0 + i, y0 + j)); }
+            }
+        }
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if p.corner_cell_px > 0 {
+            let c = p.corner_cell_px;
+            let mut rank: std::collections::HashMap<(usize, usize), usize> = Default::default();
+            let mut keyed: Vec<(usize, usize, (f32, usize, usize))> = cand.iter().enumerate().map(|(i, &e)| {
+                let r = rank.entry((e.1 / c, e.2 / c)).or_insert(0);
+                *r += 1;
+                (*r, i, e)
+            }).collect();
+            keyed.sort_by_key(|k| (k.0, k.1));
+            cand = keyed.into_iter().map(|k| k.2).collect();
+        }
+        let mut out: Vec<Feature> = Vec::new();
+        let (mut n_in, mut n_out) = (0, 0);
+        let (qi, qo) = (p.max_object_features, p.max_table_features);
+        let d2 = p.min_feature_dist_px * p.min_feature_dist_px;
+        let mut corner_grid = Spacing::new(x0, y0, rw, rh);
+        for (l, x, y) in cand {
+            let is_in = in_rect(x as f64, y as f64, &inner);
+            if (is_in && n_in >= qi) || (!is_in && n_out >= qo) { continue; }
+            if p.exclude_px.is_some_and(|r| in_rect(x as f64, y as f64, &r)) { continue; }
+            if corner_grid.near(x, y, d2) { continue; }
+            corner_grid.add(x, y);
+            out.push(Feature { x, y, normal: None, side: 0.0, strength: l });
+            if is_in { n_in += 1 } else { n_out += 1 }
+            if n_in >= qi && n_out >= qo { break; }
+        }
+        let quota_plain = p.max_edge_features;
+        let quota_tex = (p.max_edge_features / 3).saturating_sub(n_in / 5);
+        if quota_plain == 0 { return out; }
+        let g = |i: usize, j: usize| -> (f32, f32) { let k = (j + 2) * gw + i + 2; (gxv[k], gyv[k]) };
+        let mag2: Vec<f32> = (0..rw * rh).map(|k| { let (a, b) = g(k % rw, k / rw); a * a + b * b }).collect();
+        let max_m2 = mag2.iter().copied().fold(0.0f32, f32::max);
+        let thr = p.edge_min_grad.max(0.1 * max_m2.sqrt());
+        let thr2 = thr * thr;
+        let (ex0, ey0) = ((edge_region[0].max(0.0) as usize).max(x0 + 1), (edge_region[1].max(0.0) as usize).max(y0 + 1));
+        let (ex1, ey1) = ((edge_region[2].max(0.0) as usize).min(x1.saturating_sub(1)), (edge_region[3].max(0.0) as usize).min(y1.saturating_sub(1)));
+        let mut ecand: Vec<(f32, usize, usize, [f64; 2])> = Vec::new();
+        for y in ey0..=ey1 {
+            let j = y - y0;
+            for x in ex0..=ex1 {
+                let i = x - x0;
+                let m2 = mag2[j * rw + i];
+                if m2 < thr2 { continue; }
+                let (a, b) = g(i, j);
+                let (ax, ay) = (a.abs(), b.abs());
+                let (di, dj): (isize, isize) = if ax > 2.414 * ay { (1, 0) } else if ay > 2.414 * ax { (0, 1) } else if (a > 0.0) == (b > 0.0) { (1, 1) } else { (1, -1) };
+                let at = |ii: isize, jj: isize| mag2[(jj as usize) * rw + ii as usize];
+                if m2 < at(i as isize + di, j as isize + dj) || m2 < at(i as isize - di, j as isize - dj) { continue; }
+                let mg = m2.sqrt();
+                ecand.push((mg, x, y, [f64::from(a / mg), f64::from(b / mg)]));
+            }
+        }
+        ecand.sort_by(|a, b| (a.2 / 2, a.1 / 2).cmp(&(b.2 / 2, b.1 / 2)).then(b.0.total_cmp(&a.0)));
+        ecand.dedup_by(|a, b| (a.1 / 2, a.2 / 2) == (b.1 / 2, b.2 / 2));
+        let (ix0, iy0) = (x0.saturating_sub(8), y0.saturating_sub(8));
+        let (ix1, iy1) = ((x1 + 8).min(img.w - 1), (y1 + 8).min(img.h - 1));
+        let iw = ix1 - ix0 + 2;
+        let mut s1 = vec![0u64; iw * (iy1 - iy0 + 2)];
+        let mut s2 = vec![0u64; s1.len()];
+        for y in iy0..=iy1 {
+            let (mut r1, mut r2) = (0u64, 0u64);
+            for x in ix0..=ix1 {
+                let v = u64::from(img.px[y * img.w + x]);
+                r1 += v; r2 += v * v;
+                let k = (y - iy0 + 1) * iw + x - ix0 + 1;
+                s1[k] = s1[k - iw] + r1;
+                s2[k] = s2[k - iw] + r2;
+            }
+        }
+        let side_std = |x: usize, y: usize, nrm: [f64; 2], sgn: f64| -> f32 {
+            let (cx, cy) = ((x as f64 + sgn * 5.0 * nrm[0]).round(), (y as f64 + sgn * 5.0 * nrm[1]).round());
+            if cx < (ix0 + 3) as f64 || cy < (iy0 + 3) as f64 || cx > (ix1 - 3) as f64 || cy > (iy1 - 3) as f64 { return f32::INFINITY; }
+            let (cx, cy) = (cx as usize - ix0, cy as usize - iy0);
+            let rect = |t: &[u64]| t[(cy + 4) * iw + cx + 4] + t[(cy - 3) * iw + cx - 3] - t[(cy - 3) * iw + cx + 4] - t[(cy + 4) * iw + cx - 3];
+            let (a, b) = (rect(&s1) as f64, rect(&s2) as f64);
+            ((b / 49.0 - (a / 49.0) * (a / 49.0)).max(0.0)).sqrt() as f32
+        };
+        let mut ranked: Vec<(f32, usize, usize, [f64; 2], f32)> = ecand.into_iter().map(|(mg, x, y, nrm)| {
+            let (sp, sn) = (side_std(x, y, nrm, 1.0), side_std(x, y, nrm, -1.0));
+            let uniform = sp.min(sn);
+            let side = if uniform < UNIFORM_STD && sp.max(sn) > 2.0 * uniform + 2.0 { if sp < sn { 1.0 } else { -1.0 } } else { 0.0 };
+            let plain = uniform < UNIFORM_STD;
+            (if plain { mg + 1e4 } else { mg }, x, y, nrm, side)
+        }).collect();
+        ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut edge_grid = Spacing::new(x0, y0, rw, rh);
+        let (de2, dc2) = (p.min_edge_dist_px * p.min_edge_dist_px, 9.0);
+        let (mut n_plain, mut n_tex) = (0, 0);
+        for (score, x, y, nrm, side) in ranked {
+            let plain = score >= 1e4;
+            if (plain && n_plain >= quota_plain) || (!plain && n_tex >= quota_tex) { continue; }
+            if corner_grid.near(x, y, dc2) || edge_grid.near(x, y, de2) { continue; }
+            if p.exclude_px.is_some_and(|r| in_rect(x as f64, y as f64, &r)) { continue; }
+            edge_grid.add(x, y);
+            out.push(Feature { x, y, normal: Some(nrm), side, strength: if plain { score - 1e4 } else { score } });
+            if plain { n_plain += 1 } else { n_tex += 1 }
+            if n_plain >= quota_plain && n_tex >= quota_tex { break; }
+        }
+        out
+    }
+
+    fn assert_features_bit_eq(got: &[Feature], exp: &[Feature]) {
+        assert_eq!(got.len(), exp.len(), "feature count mismatch");
+        for (idx, (g, e)) in got.iter().zip(exp).enumerate() {
+            assert_eq!(g.x, e.x, "x mismatch at {idx}");
+            assert_eq!(g.y, e.y, "y mismatch at {idx}");
+            match (g.normal, e.normal) {
+                (None, None) => {}
+                (Some(gn), Some(en)) => {
+                    assert_eq!(gn[0].to_bits(), en[0].to_bits(), "normal[0] mismatch at {idx}");
+                    assert_eq!(gn[1].to_bits(), en[1].to_bits(), "normal[1] mismatch at {idx}");
+                }
+                _ => panic!("normal presence mismatch at {idx}: {g:?} vs {e:?}"),
+            }
+            assert_eq!(g.side.to_bits(), e.side.to_bits(), "side mismatch at {idx}");
+            assert_eq!(g.strength.to_bits(), e.strength.to_bits(), "strength mismatch at {idx}");
+        }
+    }
+
+    #[test]
+    fn row_streamed_features_match_column_major_reference() {
+        let (w, h) = (180usize, 140usize);
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let mut px = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let noise = ((seed & 0x1F) as i32) - 16;
+                let val = if (40..130).contains(&x) && (35..105).contains(&y) {
+                    if ((x / 10) + (y / 10)).is_multiple_of(2) { 215 } else { 45 }
+                } else if (x / 12 + y / 12).is_multiple_of(3) {
+                    180
+                } else {
+                    80
+                };
+                if (135..165).contains(&x) && (30..110).contains(&y) {
+                    px[y * w + x] = 220;
+                } else if (128..172).contains(&x) && (22..118).contains(&y) {
+                    px[y * w + x] = 60;
+                } else {
+                    px[y * w + x] = (val + noise).clamp(0, 255) as u8;
+                }
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let region = [4.0, 5.0, 174.0, 134.0];
+        let inner = [38.0, 32.0, 132.0, 108.0];
+        let edge_region = [30.0, 25.0, 168.0, 120.0];
+
+        let mut p_pose = Params::new(0.0);
+        p_pose.max_edge_features = 0;
+        p_pose.corner_cell_px = 0;
+        p_pose.corner_rel_floor = 0.01;
+        p_pose.max_object_features = 0;
+        p_pose.max_table_features = 100;
+        p_pose.min_feature_dist_px = 8.0;
+        let got_pose = features(&img, region, inner, edge_region, &p_pose);
+        let exp_pose = features_column_major_ref(&img, region, inner, edge_region, &p_pose);
+        assert!(!got_pose.is_empty());
+        assert_features_bit_eq(&got_pose, &exp_pose);
+
+        let p_grid = Params { corner_cell_px: 16, ..p_pose };
+        let got_grid = features(&img, region, inner, edge_region, &p_grid);
+        let exp_grid = features_column_major_ref(&img, region, inner, edge_region, &p_grid);
+        assert!(!got_grid.is_empty());
+        assert_features_bit_eq(&got_grid, &exp_grid);
+
+        let mut p_edge = Params::new(0.0);
+        p_edge.max_edge_features = 40;
+        let got_edge = features(&img, region, inner, edge_region, &p_edge);
+        let exp_edge = features_column_major_ref(&img, region, inner, edge_region, &p_edge);
+        assert!(got_edge.iter().any(|f| f.normal.is_none()));
+        assert!(got_edge.iter().any(|f| f.normal.is_some()));
+        assert_features_bit_eq(&got_edge, &exp_edge);
     }
 }
