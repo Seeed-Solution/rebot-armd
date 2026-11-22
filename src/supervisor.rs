@@ -2067,10 +2067,16 @@ impl SupervisorInner {
                     return;
                 }
 
-                // MIT tracking hands back to position control before the park when the arm is
-                // at rest; otherwise at the first tick at rest during the park.
-                if self.mit_active() {
-                    if let Err(e) = self.mit_hand_back("park") { tracing::warn!("{e}"); }
+                // MIT tracking hands back to confirmed stationary position control before the
+                // park. Moving: brake to rest first (the reference stops; the tick ramps the
+                // velocity down), hand back at rest, then this park is requested again.
+                if self.mit_active() && self.mit_hand_back("park").is_err() {
+                    if self.mit_active() && !self.safety.state().is_stopped() {
+                        tracing::warn!("Park requested while MIT tracking moves the arm: braking to rest and handing back first");
+                        self.active_trajectory = None;
+                        self.mit.park_after_hand_back = true;
+                    }
+                    return;
                 }
                 // Return to home position cleanly, then disable torque.
                 // Allow unload from Operational or Idle.
@@ -5529,6 +5535,16 @@ impl SupervisorInner {
         // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.
         // No-ops while MIT is not requested.
         self.mit_supervise();
+        if self.mit.park_after_hand_back {
+            // a park waits for rest and the confirmed hand back, then starts
+            let at_rest = self.commanded_velocities.iter().all(|v| *v == 0.0);
+            if !self.mit_active() || self.safety.state().is_stopped() {
+                self.mit.park_after_hand_back = false;
+            } else if at_rest && self.mit_hand_back("park").is_ok() {
+                self.mit.park_after_hand_back = false;
+                self.apply_stop_policy(StopPolicy::NormalUnload);
+            }
+        }
         if self.pending_normal_unload && self.mit_active() {
             let _ = self.mit_hand_back("park");
         }

@@ -895,3 +895,48 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     let epoch = inner.safety.epoch_id();
     inner.jog_action(target, None, Some(epoch), "joint_move").expect("jog once MIT owns J4");
 }
+
+/// Review #12: a park requested while MIT moves the arm brakes to rest first, hands back through
+/// the confirmed stationary switch, and only then installs the park trajectory (also for the
+/// lease-expiry park, which takes the same NormalUnload path).
+#[test]
+fn mit_moving_park_brakes_hands_back_then_parks() {
+    let (mut inner, bus) = active_rig(mit_config_j4(), 0.0);
+    let inp = inner.plan_input().unwrap();
+    let mut goal = [0.0_f64; 6];
+    for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
+    goal[3] -= 0.3;
+    inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+    for _ in 0..15 { inner.tick(DT); }
+    assert!(inner.commanded_velocities[3].abs() > 0.01, "moving");
+    bus.clear_log();
+    inner.apply_stop_policy(armd::StopPolicy::NormalUnload);
+    assert!(inner.active_trajectory.is_none() && !inner.pending_normal_unload, "park installed while moving");
+    let mut handed_back_tick = None;
+    let mut park_tick = None;
+    let mut prev_v = inner.commanded_velocities[3].abs();
+    for k in 0..200 {
+        let before = bus.tx_log().len();
+        inner.tick(DT);
+        let log = bus.tx_log();
+        let new = &log[before..];
+        if handed_back_tick.is_none() {
+            let back = new.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data);
+            let before_back = &new[..back.unwrap_or(new.len())];
+            assert!(posvel_frames(before_back, 4).is_empty(), "POS_VEL on J4 before the hand back (tick {k})");
+            if back.is_some() {
+                handed_back_tick = Some(k);
+                assert!(prev_v < 0.05, "hand back while still moving ({prev_v} rad/s commanded the tick before)");
+            } else {
+                assert!(inner.commanded_velocities[3].abs() <= prev_v + 1e-6, "not braking at tick {k}");
+                assert!(!inner.pending_normal_unload, "park started before the hand back (tick {k})");
+                prev_v = inner.commanded_velocities[3].abs();
+            }
+        }
+        if park_tick.is_none() && inner.pending_normal_unload { park_tick = Some(k); }
+        if park_tick.is_some() && handed_back_tick.is_some() { break; }
+    }
+    let (h, p) = (handed_back_tick.expect("hand back"), park_tick.expect("park installed"));
+    assert!(h <= p, "park ({p}) before the hand back ({h})");
+    assert!(!inner.mit_active());
+}

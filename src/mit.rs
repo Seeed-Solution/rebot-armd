@@ -444,6 +444,8 @@ pub struct MitRuntime {
     pub handover_error: Option<String>,
     /// Why the group was cancelled.
     pub lost_reason: Option<String>,
+    /// A park was requested while MIT moved the arm: it starts after rest and the hand back.
+    pub park_after_hand_back: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -475,6 +477,7 @@ impl crate::supervisor::SupervisorInner {
     /// Why a motion may not start: MIT is requested on an armed arm but does not own its joints.
     pub fn mit_motion_blocker(&self) -> Option<String> {
         if !self.is_torqued || mit_joints(&self.config).is_empty() { return None; }
+        if self.mit.park_after_hand_back { return Some("a park waits for the MIT hand back at rest".into()); }
         match self.mit.owner {
             MitOwner::Active => None,
             MitOwner::Off => Some(format!("MIT tracking is not active: {}",
