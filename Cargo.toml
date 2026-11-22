@@ -1,6 +1,6 @@
 [package]
 name = "armd"
-version = "0.1.0"
+version = "1.5.0"
 edition = "2021"
 description = "Arm control daemon (armd) for the reBot B601-DM arm on a Seeed reCamera: lease-based WebSocket control, safety supervisor, web cockpit and Parquet episode recording"
 license = "MIT"
