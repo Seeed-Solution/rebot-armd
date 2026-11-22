@@ -99,13 +99,11 @@ fn main() {
         eprintln!("usage: mview_replay <bundle dir> [--points] [--json <file>] [--pose-refine auto|aruco|off]");
         std::process::exit(2);
     };
-    armd::mview_stereo::reset_kernel_counts();
     let (b, c) = match armd::measure_multiview::replay_bundle_with(std::path::Path::new(&dir), mode) {
         Ok(r) => r,
         Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     };
-    let backend_diag = armd::mview_stereo::backend_diagnostics();
-    println!("ncc backend {}", serde_json::to_string(&backend_diag).unwrap());
+    println!("ncc backend {}", serde_json::to_string(&c.ncc_backend).unwrap());
     println!("views {}, reference {}, box {:?}, region {:?}, table_z {:.4} m", b.views.len(), b.reference, b.ref_box_px, c.region_px, b.table_z_m);
     println!("replay stats {}", serde_json::to_string(&c.rec.stats).unwrap());
     println!("device stats {}", b.doc["stats"]);
@@ -128,7 +126,7 @@ fn main() {
     }
     #[cfg(feature = "mview-profile")]
     let profile_doc = {
-        let doc = build_profile_doc(&dir, &backend_diag, &c);
+        let doc = build_profile_doc(&dir, &c.ncc_backend, &c);
         println!("profile {}", serde_json::to_string(&doc).unwrap());
         doc
     };
@@ -151,7 +149,7 @@ fn main() {
             "cams": cams,
             "points": pts,
             "stats": c.rec.stats,
-            "backend": backend_diag,
+            "backend": &c.ncc_backend,
         });
         #[cfg(feature = "mview-profile")]
         {
