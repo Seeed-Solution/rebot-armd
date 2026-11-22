@@ -67,12 +67,17 @@ pid_alive() {
     kill -0 "$1" 2>/dev/null || ps -p "$1" >/dev/null 2>&1
 }
 
-# Serialise publishers. flock(1) when present: the kernel drops the lock when the holder dies.
-# Otherwise LOCK_LINK, a symlink whose target is the owner's PID: ln -s creates lock and PID in
-# one atomic step, so no lock exists without an owner. A lock whose owner is gone is renamed
-# aside and removed only when the aside still names that owner; a successor's lock moved by
-# mistake is put back. The EXIT trap releases a lock this shell holds, and release removes the
-# link only while it names this shell. (REBOT_VISION_NO_FLOCK=1 forces the fallback; tests.)
+# Serialise publishers. flock(1) when present (util-linux on every Linux build host): exact
+# exclusion, and the kernel drops the lock when the holder dies.
+# Otherwise (macOS) LOCK_LINK, a symlink whose target is the owner's PID: ln -s creates lock and
+# PID in one atomic step, so no lock exists without an owner. Taking over a dead owner's lock is
+# two steps (rename aside, check the aside still names that owner, else link it back), which a
+# shell cannot make atomic: this fallback serialises best-effort. That is safe for publication
+# itself (every generation is complete and `current` changes by one rename); garbage collection,
+# the one destructive step, runs only when the lock reads back as this shell's right before it.
+# The EXIT trap releases a lock this shell holds, and release removes the link only while it
+# names this shell. REBOT_VISION_NO_FLOCK=1 forces the fallback; REBOT_VISION_TEST_RECLAIM_DELAY
+# and REBOT_VISION_TEST_HOLD_LOCK (seconds) widen the race windows for scripts/tests.
 acquire_lock() {
     if [ "${LOCK_HELD}" = 1 ]; then
         return 0
@@ -88,6 +93,7 @@ acquire_lock() {
     while ! ln -s "$$" "${LOCK_LINK}" 2>/dev/null; do
         owner="$(readlink "${LOCK_LINK}" 2>/dev/null || true)"
         if [ -n "${owner}" ] && ! pid_alive "${owner}"; then
+            if [ -n "${REBOT_VISION_TEST_RECLAIM_DELAY:-}" ]; then sleep "${REBOT_VISION_TEST_RECLAIM_DELAY}"; fi
             if mv "${LOCK_LINK}" "${aside}" 2>/dev/null; then
                 moved="$(readlink "${aside}" 2>/dev/null || true)"
                 if [ "${moved}" != "${owner}" ] && [ -n "${moved}" ]; then
@@ -101,6 +107,17 @@ acquire_lock() {
         sleep 0.1
     done
     LOCK_HELD=1
+}
+
+# True while this shell holds the publish lock (fallback: the link names this shell).
+lock_is_ours() {
+    if [ "${LOCK_HELD}" != 1 ]; then
+        return 1
+    fi
+    if [ "${REBOT_VISION_NO_FLOCK:-0}" != 1 ] && command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+    [ "$(readlink "${LOCK_LINK}" 2>/dev/null || true)" = "$$" ]
 }
 
 release_lock() {
@@ -275,6 +292,7 @@ printf '%s  rebot-vision\n' "${SHA256}" > "${STAGE_SHA}"
 
 GEN_DIR="${GEN_ROOT}/g.${GEN_ID}"
 acquire_lock
+if [ -n "${REBOT_VISION_TEST_HOLD_LOCK:-}" ]; then sleep "${REBOT_VISION_TEST_HOLD_LOCK}"; fi
 mv -T "${STAGE_DIR}" "${GEN_DIR}" 2>/dev/null || mv "${STAGE_DIR}" "${GEN_DIR}"
 swap_link "generations/g.${GEN_ID}" "${CURRENT}"
 PUBLISHED=1
@@ -292,7 +310,11 @@ if [ -n "${REBOT_VISION_COPY_TO:-}" ]; then
         rm -f "${REBOT_VISION_COPY_TO}/rebot-vision.map"  # not this build's
     fi
 fi
-collect_garbage
+if lock_is_ours; then
+    collect_garbage
+else
+    echo "build_vision.sh: publish lock not held by this build; old generations are kept" >&2
+fi
 release_lock
 
 echo "rebot-vision: ${GEN_DIR}/rebot-vision (${SIZE}, sha256=${SHA256})"

@@ -59,6 +59,23 @@ cur="$(cat "${OUT}/rebot-vision")"
 check 'case "${cur}" in par-*) true ;; *) false ;; esac'
 check '[ "$(cut -d" " -f1 "${OUT}/current/rebot-vision.sha256")" = "$(printf %s "${cur}" | sha256sum | cut -d" " -f1)" ]'
 
+#    d. Delayed reclaimer: A reads the dead owner, stalls, and meanwhile B takes the lock over and
+#       holds it. A's late rename moves B's lock aside, finds it no longer names the dead owner
+#       and links it back: B keeps the lock until it releases, both publish, no lock remains.
+ln -s "${dead}" "${LOCK}.owner"
+( publish late-a REBOT_VISION_NO_FLOCK=1 REBOT_VISION_TEST_RECLAIM_DELAY=2 ) & a=$!
+sleep 0.5
+( publish held-b REBOT_VISION_NO_FLOCK=1 REBOT_VISION_TEST_HOLD_LOCK=4 ) & b=$!
+sleep 1
+owner_b="$(readlink "${LOCK}.owner" 2>/dev/null || true)"
+check '[ -n "${owner_b}" ] && [ "${owner_b}" != "${dead}" ] && kill -0 "${owner_b}"'
+sleep 2.5
+check '[ "$(readlink "${LOCK}.owner" 2>/dev/null || true)" = "${owner_b}" ]'
+check "wait ${a}"
+check "wait ${b}"
+check '[ ! -L "${LOCK}.owner" ]'
+check 'cur="$(cat "${OUT}/rebot-vision")"; [ "${cur}" = late-a ] || [ "${cur}" = held-b ]'
+
 # 3. REBOT_VISION_COPY_TO hands each caller its own generation, even while other publishers
 #    switch `current` and collect old generations.
 ( for i in 1 2 3 4 5 6; do publish "noise-${i}"; done ) & noise=$!
