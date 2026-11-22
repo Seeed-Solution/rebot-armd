@@ -2924,6 +2924,8 @@ impl SupervisorInner {
     ) -> Result<(u64, u64, f64), ArmError> {
         let mut target_positions = target_positions;
         self.gravity_comp_motion_busy()?;
+        // jog, home, move_to_pose, backlash approach: MIT must own its joints when requested
+        if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         #[cfg(feature = "policy-runtime")]
         if self.policy_loading {
             return Err(MotionError::MotionBusy("a policy is loading".into()).into());
@@ -6043,6 +6045,9 @@ impl SupervisorInner {
             _ => {}
         }
         if mode == PolicyMode::Live {
+            if let Some(reason) = self.mit_motion_blocker() {
+                return Err(MotionError::MotionBusy(reason).into());
+            }
             if !self.policy_live_allowed() && !i_am_at_the_arm {
                 return Err(ArmError::Rejected {
                     status: 403,

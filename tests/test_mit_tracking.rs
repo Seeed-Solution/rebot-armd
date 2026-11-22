@@ -855,3 +855,43 @@ fn mit_torque_guard_hold_never_pushes_into_the_held_direction() {
     }
     assert!(held, "no torque-guard hold on J4");
 }
+
+/// Review #11: jog, home, move_to_pose-style quintics and a live policy start are refused while
+/// MIT is requested but does not own its joints (handover pending or failed).
+#[test]
+fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
+    let bus = FakeBus::new(&b601_limits());
+    bus.with(|s| for (i, m) in s.motors.iter_mut().enumerate() { m.q = Q0[i]; });
+    let mut d = disabled_driver(&bus);
+    d.check_mapping_ranges();
+    let mut inner = SupervisorInner::new(mit_config_j4()).with_driver(Box::new(d));
+    inner.lease_enabled = false;
+    inner.tick(DT);
+    inner.mit_timeout_command(&json!({"joints": [4]})).unwrap();
+    with_record(&mut inner, record_j4(2000));
+    inner.set_torque(true).unwrap();
+    assert!(!inner.mit_active(), "no tick yet: handover pending");
+    let epoch = inner.safety.epoch_id();
+    let mut target = inner.commanded_positions.clone();
+    target[3] += 0.05;
+    let e = inner.jog_action(target, None, Some(epoch), "joint_move").unwrap_err();
+    assert!(e.to_string().contains("MIT tracking is not active"), "jog: {e}");
+    let home = inner.config.home_positions.clone();
+    let e = inner.jog_action(home, None, Some(epoch), "home").unwrap_err();
+    assert!(e.to_string().contains("MIT tracking is not active"), "home: {e}");
+    #[cfg(feature = "policy-runtime")]
+    {
+        let e = inner.check_policy_start_preconditions_with(armd::policy_runtime::PolicyMode::Live, false, true, epoch).unwrap_err();
+        assert!(e.to_string().contains("MIT tracking is not active"), "live policy: {e}");
+        // shadow mode moves nothing
+        let shadow = inner.check_policy_start_preconditions_with(armd::policy_runtime::PolicyMode::Shadow, false, true, epoch);
+        assert!(shadow.as_ref().err().is_none_or(|e| !e.to_string().contains("MIT")), "{shadow:?}");
+    }
+    inner.tick(DT);
+    inner.tick(DT);
+    assert!(inner.mit_active());
+    let mut target = inner.commanded_positions.clone();
+    target[3] += 0.05;
+    let epoch = inner.safety.epoch_id();
+    inner.jog_action(target, None, Some(epoch), "joint_move").expect("jog once MIT owns J4");
+}
