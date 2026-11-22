@@ -1206,17 +1206,115 @@ pub fn debug_dir() -> std::path::PathBuf {
 }
 
 pub const MAX_DEBUG_BUNDLES: usize = 5;
-pub const BUNDLE_VERSION: u32 = 1;
+pub const BUNDLE_VERSION: u32 = 2;
+
+/// One view image stored in a debug bundle.
+enum BundleImage {
+    Jpeg(Vec<u8>),
+    Gray(Gray),
+}
+
+impl BundleImage {
+    fn ext(&self) -> &'static str {
+        match self {
+            Self::Jpeg(_) => "jpg",
+            Self::Gray(_) => "pgm",
+        }
+    }
+}
+
+/// Encode a grayscale image as canonical binary PGM (`P5\n<w> <h>\n255\n` + exact `w * h` bytes).
+pub fn encode_pgm(img: &Gray) -> Vec<u8> {
+    let header = format!("P5\n{} {}\n255\n", img.w, img.h);
+    let mut out = Vec::with_capacity(header.len() + img.px.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(&img.px);
+    out
+}
+
+/// Parse a binary PGM (`P5`, maxval 255) into a [`Gray`] matching `expected_size` exactly (no
+/// letterbox crop). Consumes **exactly one** ASCII whitespace byte after the maxval token so a
+/// first pixel equal to whitespace (`0x20`, `0x0A`, `0x09`, `0x0D`) or `#` (`0x23`) survives.
+pub fn parse_pgm(data: &[u8], expected_size: [f64; 2]) -> Result<Gray, String> {
+    let mut pos = 0usize;
+    let skip_ws_and_comments = |pos: &mut usize| -> Result<(), String> {
+        loop {
+            while *pos < data.len() && matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n') {
+                *pos += 1;
+            }
+            if *pos < data.len() && data[*pos] == b'#' {
+                while *pos < data.len() && data[*pos] != b'\n' {
+                    *pos += 1;
+                }
+                if *pos < data.len() {
+                    *pos += 1;
+                } else {
+                    return Err("PGM header truncated inside comment".into());
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    };
+    let next_token = |pos: &mut usize| -> Result<&[u8], String> {
+        skip_ws_and_comments(pos)?;
+        let start = *pos;
+        while *pos < data.len() && !matches!(data[*pos], b' ' | b'\t' | b'\r' | b'\n' | b'#') {
+            *pos += 1;
+        }
+        if *pos == start {
+            return Err("PGM header missing token".into());
+        }
+        Ok(&data[start..*pos])
+    };
+
+    let magic = next_token(&mut pos)?;
+    if magic != b"P5" {
+        return Err("PGM magic must be P5".into());
+    }
+    let parse_dim = |tok: &[u8], what: &str| -> Result<usize, String> {
+        let s = std::str::from_utf8(tok).map_err(|_| format!("PGM {what} is not ASCII"))?;
+        s.parse::<usize>().map_err(|_| format!("PGM invalid {what}: {s}"))
+    };
+    let w = parse_dim(next_token(&mut pos)?, "width")?;
+    let h = parse_dim(next_token(&mut pos)?, "height")?;
+    let maxval = parse_dim(next_token(&mut pos)?, "maxval")?;
+    if maxval != 255 {
+        return Err(format!("PGM maxval must be 255, got {maxval}"));
+    }
+    // Consume EXACTLY one whitespace delimiter byte; do not skip subsequent bytes or '#'.
+    if pos >= data.len() || !matches!(data[pos], b' ' | b'\t' | b'\r' | b'\n') {
+        return Err("PGM missing single whitespace delimiter after maxval".into());
+    }
+    pos += 1;
+
+    let (cw, ch) = (expected_size[0].round() as usize, expected_size[1].round() as usize);
+    if w == 0 || h == 0 || w != cw || h != ch {
+        return Err(format!("PGM is {w}x{h}; the camera model (intrinsics size) is {cw}x{ch}"));
+    }
+    let expected_bytes = w.checked_mul(h).ok_or_else(|| "PGM dimensions overflow".to_string())?;
+    let payload = &data[pos..];
+    if payload.len() != expected_bytes {
+        return Err(format!("PGM payload length mismatch: expected {expected_bytes} bytes, got {}", payload.len()));
+    }
+    Gray::new(w, h, payload.to_vec()).ok_or_else(|| "PGM buffer creation failed".to_string())
+}
 
 fn mat_json(m: &kinematics::Mat3) -> Value { json!(m) }
 
-/// Write the bundle of one run (blocking): `view_<k>.jpg` and `bundle.json`.
-fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, jpegs: &[(usize, Vec<u8>)]) -> std::io::Result<std::path::PathBuf> {
+/// Write the bundle of one run (blocking): `view_<k>.{jpg,pgm}` and `bundle.json`.
+fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, images: &[(usize, BundleImage)]) -> std::io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(root)?;
     let dir = root.join(id.to_string());
     if dir.exists() { std::fs::remove_dir_all(&dir)?; }
     std::fs::create_dir_all(&dir)?;
-    for (k, j) in jpegs { std::fs::write(dir.join(format!("view_{k}.jpg")), j)?; }
+    for (k, img) in images {
+        let path = dir.join(format!("view_{k}.{}", img.ext()));
+        match img {
+            BundleImage::Jpeg(j) => std::fs::write(path, j)?,
+            BundleImage::Gray(g) => std::fs::write(path, encode_pgm(g))?,
+        }
+    }
     let tmp = dir.join(".bundle.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(json_doc).unwrap_or_default())?;
     std::fs::rename(tmp, dir.join("bundle.json"))?;
@@ -1230,13 +1328,27 @@ fn write_bundle(root: &std::path::Path, id: u64, json_doc: &Value, jpegs: &[(usi
 }
 
 /// The bundle document (see docs/agent_action_api.md, "Debug bundle").
-fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_px: [f64; 4], c: &Computed, measurement: &Value) -> Value {
+fn bundle_doc(id: u64, plan: &Plan, frame_source: FrameSource, caps: &[Capture], reference: usize, ref_box_px: [f64; 4], c: &Computed, measurement: &Value) -> Value {
     let views: Vec<Value> = caps.iter().enumerate().map(|(k, v)| {
         let cam = camera_at(&plan.cam, &v.pose);
+        let (ext, encoding) = match v.frame_source {
+            FrameSource::Gray => ("pgm", "pgm"),
+            FrameSource::Snapshot => ("jpg", "jpeg"),
+        };
         json!({
-            "file": format!("view_{k}.jpg"), "offset_m": v.offset, "frame_id": v.frame_id,
-            "joints_rad": v.joints, "bracket_rad": v.bracket, "snapshot_tries_mrad": v.snapshot_tries.iter().map(|t| t * 1000.0).collect::<Vec<f32>>(),
-            "settle_s": v.settle_s, "trigger_ms": v.trigger_ms, "snapshot_wait_ms": v.snapshot_wait_ms, "snapshot_polls": v.snapshot_polls,
+            "file": format!("view_{k}.{ext}"), "encoding": encoding,
+            "frame_source": v.frame_source.name(), "instance_id": v.instance_id,
+            "offset_m": v.offset, "frame_id": v.frame_id,
+            "joints_rad": v.joints, "bracket_rad": v.bracket,
+            "snapshot_tries_mrad": v.snapshot_tries.iter().map(|t| t * 1000.0).collect::<Vec<f32>>(),
+            "retry_reasons": v.retry_reasons,
+            "bracket_duration_ms": v.bracket_duration_ms,
+            "feedback_wait_b_ms": v.feedback_wait_b_ms,
+            "feedback_age_a_ms": v.feedback_age_a_ms,
+            "feedback_age_b_ms": v.feedback_age_b_ms,
+            "settle_s": v.settle_s, "trigger_ms": v.trigger_ms,
+            "frame_fetch_ms": v.frame_fetch_ms, "gray_convert_ms": v.gray_convert_ms, "parse_ms": v.parse_ms,
+            "snapshot_wait_ms": v.snapshot_wait_ms, "snapshot_polls": v.snapshot_polls,
             "tcp": {"xyz_m": v.pose.p, "r": mat_json(&v.pose.r)},
             "camera": {"r_base_cam": mat_json(&cam.r), "c_m": cam.c},
             "detections": v.detections.iter().map(|d| json!({"label": d.label, "score": d.score, "box_norm": d.box_norm})).collect::<Vec<_>>(),
@@ -1251,6 +1363,7 @@ fn bundle_doc(id: u64, plan: &Plan, caps: &[Capture], reference: usize, ref_box_
     let outcomes: Vec<Value> = c.rec.outcomes.iter().map(|(f, o)| json!({"x": f.x, "y": f.y, "edge": f.normal.is_some(), "outcome": o})).collect();
     json!({
         "version": BUNDLE_VERSION, "action_id": id, "armd_version": env!("CARGO_PKG_VERSION"),
+        "frame_source": frame_source.name(),
         "created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "request": {"motion": plan.request.motion.name(), "axes": plan.request.axes.name(), "views": plan.request.views,
             "baseline_m": plan.request.baseline_m, "speed_scale": plan.request.speed_scale, "label": plan.request.label, "min_score": plan.request.min_score,
@@ -1269,9 +1382,26 @@ pub fn write_replay_bundle(dir: &std::path::Path, jpegs: &[Vec<u8>], cams: &[Cam
     let c0 = cams.first().copied().ok_or_else(|| std::io::Error::other("no camera"))?;
     let views: Vec<Value> = jpegs.iter().zip(cams).enumerate().map(|(k, (j, c))| {
         let _ = std::fs::write(dir.join(format!("view_{k}.jpg")), j);
-        json!({"file": format!("view_{k}.jpg"), "camera": {"r_base_cam": mat_json(&c.r), "c_m": c.c}})
+        json!({"file": format!("view_{k}.jpg"), "encoding": "jpeg", "frame_source": "snapshot", "camera": {"r_base_cam": mat_json(&c.r), "c_m": c.c}})
     }).collect();
-    let doc = json!({"version": BUNDLE_VERSION, "intrinsics": {"fx": c0.fx, "fy": c0.fy, "cx": c0.cx, "cy": c0.cy, "size": size},
+    let doc = json!({"version": BUNDLE_VERSION, "frame_source": "snapshot", "intrinsics": {"fx": c0.fx, "fy": c0.fy, "cx": c0.cx, "cy": c0.cy, "size": size},
+        "table_z_m": table_z_m, "reference": reference, "ref_box_px": ref_box_px, "views": views});
+    std::fs::write(dir.join("bundle.json"), serde_json::to_vec_pretty(&doc).unwrap_or_default())
+}
+
+/// Write a v2 replay bundle with raw binary PGM (`P5`) grayscale views.
+pub fn write_replay_bundle_gray(dir: &std::path::Path, imgs: &[Gray], cams: &[Camera], size: [f64; 2], reference: usize, ref_box_px: [f64; 4], table_z_m: f64) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let c0 = cams.first().copied().ok_or_else(|| std::io::Error::other("no camera"))?;
+    let mut views = Vec::with_capacity(imgs.len());
+    for (k, (img, c)) in imgs.iter().zip(cams).enumerate() {
+        std::fs::write(dir.join(format!("view_{k}.pgm")), encode_pgm(img))?;
+        views.push(json!({
+            "file": format!("view_{k}.pgm"), "encoding": "pgm", "frame_source": "gray",
+            "camera": {"r_base_cam": mat_json(&c.r), "c_m": c.c}
+        }));
+    }
+    let doc = json!({"version": BUNDLE_VERSION, "frame_source": "gray", "intrinsics": {"fx": c0.fx, "fy": c0.fy, "cx": c0.cx, "cy": c0.cy, "size": size},
         "table_z_m": table_z_m, "reference": reference, "ref_box_px": ref_box_px, "views": views});
     std::fs::write(dir.join("bundle.json"), serde_json::to_vec_pretty(&doc).unwrap_or_default())
 }
@@ -1289,11 +1419,17 @@ pub struct Bundle {
     pub doc: Value,
 }
 
-/// Read a bundle directory: decode each view's JPEG to the camera frame and rebuild its camera
-/// from the stored pose.
+/// Read a bundle directory (v1 legacy JPEG bundles and v2 bundles with per-view `"encoding"`
+/// `"jpeg"` or `"pgm"`): decode each view to the camera frame and rebuild its camera from the
+/// stored pose. Rejects unsupported versions, unknown/missing v2 encodings, malformed lengths,
+/// and geometry mismatches.
 pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
     let doc: Value = serde_json::from_slice(&std::fs::read(dir.join("bundle.json")).map_err(|e| format!("bundle.json: {e}"))?)
         .map_err(|e| format!("bundle.json: {e}"))?;
+    let version = doc.get("version").and_then(Value::as_u64).ok_or("bundle: version missing")?;
+    if version != 1 && version != 2 {
+        return Err(format!("bundle: unsupported version {version} (expected 1 or 2)"));
+    }
     let f = |v: &Value, what: &str| v.as_f64().ok_or_else(|| format!("bundle: {what} missing"));
     let mat = |v: &Value, what: &str| -> Result<kinematics::Mat3, String> { serde_json::from_value(v.clone()).map_err(|e| format!("bundle: {what}: {e}")) };
     let vec3 = |v: &Value, what: &str| -> Result<Vec3, String> { serde_json::from_value(v.clone()).map_err(|e| format!("bundle: {what}: {e}")) };
@@ -1305,8 +1441,20 @@ pub fn read_bundle(dir: &std::path::Path) -> Result<Bundle, String> {
     for (k, v) in doc["views"].as_array().ok_or("bundle: views missing")?.iter().enumerate() {
         markers.push(grasp::parse_markers(&v["markers"]));
         let file = v["file"].as_str().ok_or("bundle: view file missing")?;
-        let jpeg = std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
-        let img = decode_frame(&jpeg, size)?;
+        let encoding = match (version, v.get("encoding").and_then(Value::as_str)) {
+            (1, None) | (1, Some("jpeg")) => "jpeg",
+            (1, Some(other)) => return Err(format!("bundle: views[{k}] unsupported v1 encoding \"{other}\"")),
+            (2, Some(enc @ ("jpeg" | "pgm"))) => enc,
+            (2, Some(other)) => return Err(format!("bundle: views[{k}] unknown encoding \"{other}\"")),
+            (2, None) => return Err(format!("bundle: views[{k}] missing encoding")),
+            _ => unreachable!(),
+        };
+        let bytes = std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
+        let img = match encoding {
+            "jpeg" => decode_frame(&bytes, size)?,
+            "pgm" => parse_pgm(&bytes, size)?,
+            _ => unreachable!(),
+        };
         let cam = Camera { r: mat(&v["camera"]["r_base_cam"], &format!("views[{k}].camera"))?, c: vec3(&v["camera"]["c_m"], &format!("views[{k}].camera"))?, fx, fy, cx, cy };
         views.push(View { cam, img });
     }
@@ -1434,10 +1582,15 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     }
     let views: Vec<View> = caps.iter_mut().map(|c| View { cam: camera_at(&plan.cam, &c.pose), img: std::mem::replace(&mut c.img, Gray { w: 0, h: 0, px: Vec::new() }) }).collect();
     let table_z = plan.setup.table_z_m;
+    let keep_views_for_debug = plan.request.debug && frame_source == FrameSource::Gray;
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "compute", 0.9, None, None);
-    let task = tokio::task::spawn_blocking(move || compute(&views, reference, ref_box_px, table_z, mode, &marks));
+    let task = tokio::task::spawn_blocking(move || {
+        let c = compute(&views, reference, ref_box_px, table_z, mode, &marks);
+        let returned_views = if keep_views_for_debug { views } else { Vec::new() };
+        (c, returned_views)
+    });
     let back = back_to_start(ctx, plan).await;
-    let c = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
+    let (c, mut computed_views) = task.await.map_err(|e| fail("INTERNAL", format!("compute task failed: {e}")))?;
     let stats = c.rec.stats;
     tracing::info!("measure_multiview {}: {} views, {stats:?}, {:.0} ms, {:?}", ctx.id, caps.len(), c.ms, c.measure.as_ref().map(|m| m.height_m));
     let in_box = box_heights(&c.rec.points, table_z);
@@ -1450,10 +1603,13 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     value["pose_refine"] = pose;
     if let Some(vs) = value["views"].as_array_mut() { for (v, p) in vs.iter_mut().zip(per_view) { v["pose_refine"] = p; } }
     if plan.request.debug {
-        let doc = bundle_doc(ctx.id, plan, &caps, reference, ref_box_px, &c, &value);
-        let jpegs: Vec<(usize, Vec<u8>)> = caps.iter_mut().enumerate().filter_map(|(k, v)| v.jpeg.take().map(|j| (k, j))).collect();
+        let doc = bundle_doc(ctx.id, plan, frame_source, &caps, reference, ref_box_px, &c, &value);
+        let images: Vec<(usize, BundleImage)> = match frame_source {
+            FrameSource::Snapshot => caps.iter_mut().enumerate().filter_map(|(k, v)| v.jpeg.take().map(|j| (k, BundleImage::Jpeg(j)))).collect(),
+            FrameSource::Gray => computed_views.drain(..).enumerate().map(|(k, v)| (k, BundleImage::Gray(v.img))).collect(),
+        };
         let (root, id) = (debug_dir(), ctx.id);
-        let written = tokio::task::spawn_blocking(move || write_bundle(&root, id, &doc, &jpegs)).await;
+        let written = tokio::task::spawn_blocking(move || write_bundle(&root, id, &doc, &images)).await;
         value["debug"] = match written {
             Ok(Ok(dir)) => json!({"dir": dir.to_string_lossy(), "written": true}),
             Ok(Err(e)) => { tracing::warn!("measure_multiview {}: debug bundle not written: {e}", ctx.id); json!({"dir": debug_dir().to_string_lossy(), "written": false, "error": e.to_string()}) }
@@ -1660,5 +1816,85 @@ mod tests {
 
     fn jpeg(img: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
         jpeg_encoder::Encoder::new(out, 90).encode(img, w as u16, h as u16, jpeg_encoder::ColorType::Luma).unwrap();
+    }
+
+    #[test]
+    fn pgm_roundtrip_and_delimiter_first_pixel_edge_cases() {
+        // Every whitespace byte and '#' as pixel 0 must survive untouched after the single delimiter.
+        for first in [b' ', b'\n', b'\t', b'\r', b'#', 0x00, 0xFF] {
+            let mut px = vec![128u8; 64 * 36];
+            px[0] = first;
+            px[1] = b'#';
+            px[64 * 36 - 1] = 255 - first;
+            let img = Gray::new(64, 36, px.clone()).unwrap();
+            let encoded = encode_pgm(&img);
+            assert!(encoded.starts_with(b"P5\n64 36\n255\n"));
+            assert_eq!(encoded.len(), "P5\n64 36\n255\n".len() + 64 * 36);
+            let decoded = parse_pgm(&encoded, [64.0, 36.0]).unwrap();
+            assert_eq!(decoded, img, "first pixel 0x{first:02X}");
+        }
+        // Comments between tokens before maxval are allowed
+        let mut with_comment = b"P5\n# comment\n4 # w\n2\n# max\n255\n".to_vec();
+        with_comment.extend_from_slice(&[b'#', b' ', b'\n', 4, 5, 6, 7, 8]);
+        let g = parse_pgm(&with_comment, [4.0, 2.0]).unwrap();
+        assert_eq!(g.px, vec![b'#', b' ', b'\n', 4, 5, 6, 7, 8]);
+
+        // Reject bad magic, bad maxval, geometry mismatch, truncated, extra trailing byte
+        assert!(parse_pgm(b"P2\n4 2\n255\n12345678", [4.0, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n65535\n12345678", [4.0, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n255\n12345678", [8.0, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n255\n1234567", [4.0, 2.0]).is_err());
+        assert!(parse_pgm(b"P5\n4 2\n255\n123456789", [4.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn read_bundle_supports_v1_jpeg_v2_pgm_and_rejects_bad_versions_and_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cam = Camera { r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], c: [0.0; 3], fx: 60.0, fy: 60.0, cx: 32.0, cy: 18.0 };
+        let mut raw_px = vec![0u8; 64 * 36];
+        for (i, p) in raw_px.iter_mut().enumerate() { *p = ((i * 7 + 13) & 0xFF) as u8; }
+        raw_px[0] = b'#';
+        let gray = Gray::new(64, 36, raw_px.clone()).unwrap();
+        let mut sq = vec![0u8; 64 * 64];
+        sq[14 * 64..50 * 64].copy_from_slice(&raw_px);
+        let mut jpg_bytes = Vec::new();
+        jpeg(&sq, 64, 64, &mut jpg_bytes);
+
+        // 1. Legacy v1 JPEG bundle (no per-view encoding field)
+        let v1_dir = dir.path().join("v1");
+        std::fs::create_dir_all(&v1_dir).unwrap();
+        std::fs::write(v1_dir.join("view_0.jpg"), &jpg_bytes).unwrap();
+        let v1_doc = json!({
+            "version": 1, "intrinsics": {"fx": 60.0, "fy": 60.0, "cx": 32.0, "cy": 18.0, "size": [64.0, 36.0]},
+            "table_z_m": 0.0, "reference": 0, "ref_box_px": [10.0, 10.0, 30.0, 30.0],
+            "views": [{"file": "view_0.jpg", "camera": {"r_base_cam": cam.r, "c_m": cam.c}}]
+        });
+        std::fs::write(v1_dir.join("bundle.json"), serde_json::to_vec(&v1_doc).unwrap()).unwrap();
+        let b1 = read_bundle(&v1_dir).unwrap();
+        assert_eq!((b1.views.len(), b1.views[0].img.w, b1.views[0].img.h), (1, 64, 36));
+
+        // 2. v2 PGM bundle via write_replay_bundle_gray (exact pixel roundtrip!)
+        let v2_dir = dir.path().join("v2_pgm");
+        write_replay_bundle_gray(&v2_dir, &[gray.clone()], &[cam], [64.0, 36.0], 0, [10.0, 10.0, 30.0, 30.0], 0.0).unwrap();
+        let b2 = read_bundle(&v2_dir).unwrap();
+        assert_eq!(b2.views.len(), 1);
+        assert_eq!(b2.views[0].img, gray);
+
+        // 3. Reject unknown version, missing encoding in v2, unknown encoding, and geometry mismatch
+        let bad_dir = dir.path().join("bad");
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("view_0.pgm"), encode_pgm(&gray)).unwrap();
+        for mut doc in [
+            json!({"version": 3, "intrinsics": {"fx": 60.0, "fy": 60.0, "cx": 32.0, "cy": 18.0, "size": [64.0, 36.0]}, "table_z_m": 0.0, "reference": 0, "ref_box_px": [10.0, 10.0, 30.0, 30.0], "views": []}),
+            json!({"version": 2, "intrinsics": {"fx": 60.0, "fy": 60.0, "cx": 32.0, "cy": 18.0, "size": [64.0, 36.0]}, "table_z_m": 0.0, "reference": 0, "ref_box_px": [10.0, 10.0, 30.0, 30.0], "views": [{"file": "view_0.pgm", "camera": {"r_base_cam": cam.r, "c_m": cam.c}}]}),
+            json!({"version": 2, "intrinsics": {"fx": 60.0, "fy": 60.0, "cx": 32.0, "cy": 18.0, "size": [64.0, 36.0]}, "table_z_m": 0.0, "reference": 0, "ref_box_px": [10.0, 10.0, 30.0, 30.0], "views": [{"file": "view_0.pgm", "encoding": "png", "camera": {"r_base_cam": cam.r, "c_m": cam.c}}]}),
+            json!({"version": 2, "intrinsics": {"fx": 60.0, "fy": 60.0, "cx": 32.0, "cy": 18.0, "size": [128.0, 72.0]}, "table_z_m": 0.0, "reference": 0, "ref_box_px": [10.0, 10.0, 30.0, 30.0], "views": [{"file": "view_0.pgm", "encoding": "pgm", "camera": {"r_base_cam": cam.r, "c_m": cam.c}}]}),
+        ] {
+            std::fs::write(bad_dir.join("bundle.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert!(read_bundle(&bad_dir).is_err(), "{doc}");
+            doc["version"] = Value::Null;
+            std::fs::write(bad_dir.join("bundle.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert!(read_bundle(&bad_dir).is_err());
+        }
     }
 }
