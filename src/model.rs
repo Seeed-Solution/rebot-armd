@@ -982,6 +982,8 @@ impl SpeedCap {
     }
 }
 
+pub use crate::tracking::{JointTrackingConfig, JointTrackingJoint, TrackingStrategy};
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -1044,6 +1046,9 @@ pub struct ArmConfig {
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
     pub gravity_comp: Option<GravityCompPolicy>,
+    /// Joint tracking compensation (`src/tracking.rs`); None = legacy output path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_tracking: Option<JointTrackingConfig>,
     /// Damiao mapping range per joint (one per DOF). None keeps the single default
     /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
     #[serde(default)]
@@ -1169,6 +1174,7 @@ impl Default for ArmConfig {
             gripper_policy: None,
             #[cfg(not(target_arch = "wasm32"))] grasp: None,
             gravity_comp: None,
+            joint_tracking: None,
             damiao_ranges: None,
             speed_cap: None,
             backlash_approach: None,
@@ -1456,6 +1462,9 @@ impl ArmConfig {
                 ));
             }
         }
+        if let Some(jt) = &self.joint_tracking {
+            jt.validate(self.arm_dof(), self.dof, self.gripper_index())?;
+        }
         if let Some(ws) = &self.workspace {
             ws.validate()?;
             for (i, c) in ws.link_capsules.iter().enumerate() {
@@ -1702,6 +1711,7 @@ impl ArmConfig {
             gripper_policy: Some(GripperPolicy::rebot_dm()),
             #[cfg(not(target_arch = "wasm32"))] grasp: Some(crate::grasp::GraspSetup::default()),
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
+            joint_tracking: Some(JointTrackingConfig::rebot_dm()),
             damiao_ranges: Some(vec![
                 DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3,
                 DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7,
