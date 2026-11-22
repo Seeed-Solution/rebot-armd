@@ -158,6 +158,28 @@ impl JointTrackingConfig {
     }
 }
 
+/// `ArmConfig.joint_tracking` from a profile. A block whose `enabled` is not `true` is never
+/// evaluated, so it never rejects the profile (as before joint tracking existed, when the
+/// field was ignored): it is kept when it parses, otherwise logged and dropped (None).
+/// An enabled block parses strictly (`deny_unknown_fields`, known strategies).
+pub fn deserialize_profile_block<'de, D>(deserializer: D) -> Result<Option<JointTrackingConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let enabled = raw.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+    match serde_json::from_value::<JointTrackingConfig>(raw) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(e) if enabled => Err(serde::de::Error::custom(format!("joint_tracking: {e}"))),
+        Err(e) => {
+            tracing::warn!("joint_tracking is not enabled and does not parse (ignored): {e}");
+            Ok(None)
+        }
+    }
+}
+
 /// Runtime output history for joint tracking compensation.
 ///
 /// Seeded from fresh measurements on torque enable; invalidated on partial
@@ -1421,9 +1443,32 @@ mod tests {
 
     #[test]
     fn serde_rejects_unknown_fields_and_unknown_strategy() {
+        // The strict parser (used for an enabled block) rejects unknown fields and strategies.
         assert!(serde_json::from_str::<JointTrackingConfig>(r#"{"enabled":false,"joints":[],"extra":1}"#).is_err());
         assert!(serde_json::from_str::<JointTrackingJoint>(r#"{"strategy":"position","extra":1}"#).is_err());
         assert!(serde_json::from_str::<JointTrackingJoint>(r#"{"strategy":"pd_plus"}"#).is_err());
+
+        // Review 6 A: in a profile, a block that is not enabled never rejects the profile
+        // (e4f72b6 ignored the field); it stays inert. An enabled block parses strictly.
+        let parse = |block: &str| {
+            let mut v = serde_json::to_value(crate::model::ArmConfig::rebot_dm()).unwrap();
+            v["joint_tracking"] = serde_json::from_str(block).unwrap();
+            serde_json::from_value::<crate::model::ArmConfig>(v)
+        };
+        for block in [
+            r#"{"enabled":false,"joints":[],"extra":1}"#,
+            r#"{"joints":[{"strategy":"pd_plus"}]}"#,
+            r#"{"enabled":"yes","joints":[]}"#,
+            r#"[1, 2]"#,
+        ] {
+            let cfg = parse(block).unwrap_or_else(|e| panic!("disabled block {block} must not reject the profile: {e}"));
+            assert!(cfg.joint_tracking.is_none(), "invalid disabled block {block} stays inert");
+        }
+        let ok = parse(r#"{"enabled":false,"joints":[]}"#).unwrap();
+        assert_eq!(ok.joint_tracking, Some(JointTrackingConfig { enabled: false, joints: vec![] }));
+        assert!(parse(r#"{"enabled":true,"joints":[],"extra":1}"#).is_err(), "enabled block parses strictly");
+        assert!(parse(r#"{"enabled":true,"joints":[{"strategy":"pd_plus"}]}"#).is_err());
+        assert!(parse("null").unwrap().joint_tracking.is_none());
     }
 
     #[test]

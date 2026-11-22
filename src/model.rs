@@ -1047,7 +1047,8 @@ pub struct ArmConfig {
     #[serde(default)]
     pub gravity_comp: Option<GravityCompPolicy>,
     /// Joint tracking compensation (`src/tracking.rs`); None = legacy output path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A block that is not enabled never rejects the profile (`deserialize_profile_block`).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "crate::tracking::deserialize_profile_block")]
     pub joint_tracking: Option<JointTrackingConfig>,
     /// Damiao mapping range per joint (one per DOF). None keeps the single default
     /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
