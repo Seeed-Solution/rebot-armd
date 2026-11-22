@@ -701,19 +701,23 @@ async fn capture_gray(
 
     for k in 0..SNAPSHOT_TRIES {
         if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
-        recheck(ctx, plan).await?;
-        let t_a = Instant::now();
-        let (a, inst_a) = sample_with_instants(ctx).await;
-        let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
-        let t_trigger = Instant::now();
+        // Take sample A immediately before EACH trigger attempt so a timed-out trigger never
+        // leaves an outdated sample A paired with a later attempt's frame and sample B.
         let mut trig = None;
         for _ in 0..TRIGGERS {
-            ctx.check().await?;
+            recheck(ctx, plan).await?;
+            let t_a = Instant::now();
+            let (a, inst_a) = sample_with_instants(ctx).await;
+            let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
+            let t_trigger = Instant::now();
             let res = src.trigger_gray(pipelines, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))?;
-            if let Some(r) = res { trig = Some(r); break; }
+            if let Some(r) = res {
+                trig = Some((r, t_a, a, age_a_ms, t_trigger.elapsed().as_secs_f64() * 1000.0));
+                break;
+            }
         }
-        let trig = trig.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
-        let trigger_ms = t_trigger.elapsed().as_secs_f64() * 1000.0;
+        let (trig, t_a, a, age_a_ms, trigger_ms) =
+            trig.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
         let Some(instance_id) = trig.instance_id.clone().filter(|s| !s.is_empty()) else {
             return Err(fail("DETECTION_UNAVAILABLE", "gray trigger reply missing instance_id"));
         };
@@ -799,20 +803,22 @@ async fn capture_snapshot(
     let mut got = None;
     for k in 0..SNAPSHOT_TRIES {
         if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
-        recheck(ctx, plan).await?;
-        let t_a = Instant::now();
-        let (a, inst_a) = sample_with_instants(ctx).await;
-        let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
-        let t_trigger = Instant::now();
         let mut frame = None;
         for _ in 0..TRIGGERS {
-            ctx.check().await?;
+            recheck(ctx, plan).await?;
+            let t_a = Instant::now();
+            let (a, inst_a) = sample_with_instants(ctx).await;
+            let age_a_ms = max_feedback_age_ms(t_a, &inst_a);
+            let t_trigger = Instant::now();
             let got = if markers { src.trigger_markers(YOLO_ARUCO, TRIGGER_WAIT_MS).await } else { src.trigger(YOLO, TRIGGER_WAIT_MS).await.map(|f| f.map(|f| (f, Vec::new()))) };
-            if let Some(f) = got.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
+            if let Some(f) = got.map_err(|e| source_fail(format!("trigger: {e}")))? {
+                let t_reply = Instant::now();
+                frame = Some((f, t_a, a, age_a_ms, t_reply, (t_reply - t_trigger).as_secs_f64() * 1000.0));
+                break;
+            }
         }
-        let frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
-        let t_reply = Instant::now();
-        let trigger_ms = (t_reply - t_trigger).as_secs_f64() * 1000.0;
+        let (frame, t_a, a, age_a_ms, t_reply, trigger_ms) =
+            frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
         let mut polls = 0;
         let jpeg = loop {
             let j = snap().await?;

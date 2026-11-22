@@ -73,6 +73,8 @@ struct FakeVision {
     gray_fail_queue: Mutex<VecDeque<GrayFrameError>>,
     gray_fail_after_start: Mutex<Option<GrayFrameError>>,
     on_gray_fetch: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    gray_trigger_timeouts: AtomicU64,
+    on_gray_trigger_timeout: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// `r` turned by `angle` about its own axis `axis` (0 x, 1 y, 2 z).
@@ -191,6 +193,13 @@ impl DetectionSource for FakeVision {
     }
     fn trigger_gray(&self, p: &'static [&'static str], _w: u64) -> BoxFuture<'_, Result<Option<GrayTriggerResult>, String>> {
         Box::pin(async move {
+            if self.gray_trigger_timeouts.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                if let Some(cb) = self.on_gray_trigger_timeout.lock().unwrap().as_ref() {
+                    cb();
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                return Ok(None);
+            }
             let ((frame, m), gray_ran) = self.frame_with_pipelines(p).await;
             let markers = if p.contains(&"aruco") { m } else { Vec::new() };
             let instance_id = Some(self.instance_id.lock().unwrap().clone());
@@ -306,7 +315,8 @@ async fn rig_scene(config: ArmConfig, plain: bool, plain_table: bool, driver: Op
         rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false),
         gray: AtomicBool::new(false), instance_id: Mutex::new("rv-fake-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
-        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None) });
+        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1091,7 +1101,8 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
         rot_err: Mutex::new(0.0), markers: Mutex::new(Vec::new()), aruco: AtomicBool::new(false),
         gray: AtomicBool::new(true), instance_id: Mutex::new("rv-fb-1".into()), gray_ring: Mutex::new(VecDeque::new()),
         gray_fetches: AtomicU64::new(0), gray_fetch_delay_ms: AtomicU64::new(0), gray_fail_queue: Mutex::new(VecDeque::new()),
-        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None) });
+        gray_fail_after_start: Mutex::new(None), on_gray_fetch: Mutex::new(None),
+        gray_trigger_timeouts: AtomicU64::new(0), on_gray_trigger_timeout: Mutex::new(None) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1204,4 +1215,36 @@ async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_st
         let a = r.wait(id, 60.0).await;
         assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("STALE_TELEMETRY")), "{a}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gray_trigger_timeout_resamples_sample_a() {
+    let inner_arm = common::TestArm::new();
+    inner_arm.0.lock().unwrap().q = START;
+    let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+    let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
+    let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+
+    // First gray trigger times out while J4 shifts +6 mrad (above the 2 mrad pose_refine=off
+    // bracket limit); second trigger succeeds at the shifted pose. Keeping sample A from the
+    // first attempt would fail MOVED or record the pre-timeout pose in bracket_rad[0].
+    let shift = 0.006f32;
+    r.vision.gray_trigger_timeouts.store(1, Ordering::SeqCst);
+    let ctrl_cb = ctrl.clone();
+    *r.vision.on_gray_trigger_timeout.lock().unwrap() = Some(Box::new(move || {
+        ctrl_cb.lock().unwrap().applied_step[3] = shift;
+    }));
+
+    let ack = r.start(json!({"label": "box", "pose_refine": "off", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 120.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    let v0 = &a["measurement"]["views"][0];
+    let a_j4 = v0["bracket_rad"][0][3].as_f64().unwrap();
+    let b_j4 = v0["bracket_rad"][1][3].as_f64().unwrap();
+    let expected = f64::from(START[3] + shift);
+    assert!((a_j4 - expected).abs() < 1e-4, "expected second sample A ({expected}), got {a_j4}");
+    assert!((b_j4 - expected).abs() < 1e-4, "expected sample B ({expected}), got {b_j4}");
+    let spread_mrad = v0["snapshot_tries_mrad"][0].as_f64().unwrap();
+    assert!(spread_mrad < 0.2, "expected near-zero spread on retaken bracket, got {spread_mrad}");
 }
