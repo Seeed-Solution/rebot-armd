@@ -163,58 +163,92 @@ fn match_2d(full: &Gray, half: &Gray, tc: &Tmpl, tf: &Tmpl, q0: [f64; 2], win: f
     Some(q)
 }
 
+struct PreparedFeat {
+    px: [f64; 2],
+    x0: Vec3,
+    tc: Tmpl,
+    tf: Tmpl,
+}
+
+struct TexturePrep {
+    reference: usize,
+    halves: Vec<Gray>,
+    feats: Vec<PreparedFeat>,
+}
+
+impl TexturePrep {
+    fn new(views: &[View], ref_cam: &Camera, reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64) -> Self {
+        if reference >= views.len() || views.len() < 2 {
+            return Self { reference, halves: Vec::new(), feats: Vec::new() };
+        }
+        let rv = &views[reference];
+        let m = POSE_BOX_MARGIN_PX;
+        let grown = [object_box[0] - m, object_box[1] - m, object_box[2] + m, object_box[3] + m];
+        let mut skip = vec![grown];
+        skip.extend_from_slice(exclude);
+        let mut p = Params::new(table_z);
+        (p.max_object_features, p.max_table_features, p.max_edge_features, p.min_feature_dist_px) = (0, POSE_MAX_FEATURES, 0, 8.0);
+        // strongest first over the whole image: on the real bundles (2026-11-21/22) the strongest
+        // corners (sheet codes, cable edges) matched more often than a grid of weaker ones
+        (p.corner_rel_floor, p.corner_cell_px) = (0.01, 0);
+        let full = [0.0, 0.0, rv.img.w as f64 - 1.0, rv.img.h as f64 - 1.0];
+        // the box quota is 0: corners in it are left out; corners in an excluded region are dropped
+        // afterwards, so the quota is taken twice
+        p.max_table_features *= 2;
+        let raw_feats: Vec<Feature> = features(&rv.img, full, grown, [0.0; 4], &p).into_iter()
+            .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
+        let halves: Vec<Gray> = views.iter().map(|v| v.img.half()).collect();
+        let mut feats = Vec::new();
+        for f in raw_feats {
+            let px = [f.x as f64, f.y as f64];
+            let d = ref_cam.ray(px);
+            if d[2] > -1e-3 { continue; }
+            let t = (table_z - ref_cam.c[2]) / d[2];
+            if t.is_nan() || t <= 0.05 { continue; }
+            let x0 = [ref_cam.c[0] + t * d[0], ref_cam.c[1] + t * d[1], ref_cam.c[2] + t * d[2]];
+            let hq = to_half(px);
+            let (Some(tc), Some(tf)) = (
+                sample_bilinear(&halves[reference], hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, None, 0.0)),
+                make_tmpl(sample_int(&rv.img, f.x, f.y, PATCH_R), PATCH_R, None, 0.0),
+            ) else { continue; };
+            feats.push(PreparedFeat { px, x0, tc, tf });
+        }
+        Self { reference, halves, feats }
+    }
+
+    fn corrs(&self, views: &[View], cams: &[Camera], win: &[f64]) -> Vec<Corr> {
+        if self.reference >= views.len() || views.len() < 2 || cams.len() != views.len() || win.len() != views.len() || self.halves.len() != views.len() {
+            return Vec::new();
+        }
+        let rv = &views[self.reference];
+        let mut out = Vec::new();
+        for f in &self.feats {
+            let px = f.px;
+            let mut obs = vec![(self.reference, px)];
+            for (j, v) in views.iter().enumerate() {
+                if j == self.reference { continue; }
+                let Some(q0) = cams[j].project(&f.x0) else { continue; };
+                let Some(q) = match_2d(&v.img, &self.halves[j], &f.tc, &f.tf, q0, win[j]) else { continue; };
+                // left-right: this view's patch searched back in the reference around the feature
+                let hq = to_half(q);
+                let back = sample_bilinear(&self.halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
+                    .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)))
+                    .and_then(|(bc, bf)| match_2d(&rv.img, &self.halves[self.reference], &bc, &bf, px, win[j]));
+                if back.is_some_and(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX) { obs.push((j, q)); }
+            }
+            if obs.len() >= 2 { out.push(Corr { obs, on_table: true, marker: false }); }
+        }
+        out
+    }
+}
+
 /// Table-texture correspondences (see the module doc): corners of `views[reference]` outside
 /// `object_box` (grown by [`POSE_BOX_MARGIN_PX`]) and `exclude`, matched in 2D in every other
 /// view within `win[view]` px of the point where the reference ray meets the plane z =
 /// `table_z`, projected with `cams`.
 pub fn texture_corrs(views: &[View], cams: &[Camera], reference: usize, object_box: [f64; 4], exclude: &[[f64; 4]], table_z: f64, win: &[f64]) -> Vec<Corr> {
     if reference >= views.len() || views.len() < 2 || cams.len() != views.len() || win.len() != views.len() { return Vec::new(); }
-    let rv = &views[reference];
-    let m = POSE_BOX_MARGIN_PX;
-    let grown = [object_box[0] - m, object_box[1] - m, object_box[2] + m, object_box[3] + m];
-    let mut skip = vec![grown];
-    skip.extend_from_slice(exclude);
-    let mut p = Params::new(table_z);
-    (p.max_object_features, p.max_table_features, p.max_edge_features, p.min_feature_dist_px) = (0, POSE_MAX_FEATURES, 0, 8.0);
-    // strongest first over the whole image: on the real bundles (2026-11-21/22) the strongest
-    // corners (sheet codes, cable edges) matched more often than a grid of weaker ones
-    (p.corner_rel_floor, p.corner_cell_px) = (0.01, 0);
-    let full = [0.0, 0.0, rv.img.w as f64 - 1.0, rv.img.h as f64 - 1.0];
-    // the box quota is 0: corners in it are left out; corners in an excluded region are dropped
-    // afterwards, so the quota is taken twice
-    p.max_table_features *= 2;
-    let feats: Vec<Feature> = features(&rv.img, full, grown, [0.0; 4], &p).into_iter()
-        .filter(|f| !inside_any(f.x as f64, f.y as f64, &skip)).take(POSE_MAX_FEATURES).collect();
-    let halves: Vec<Gray> = views.iter().map(|v| v.img.half()).collect();
-    let mut out = Vec::new();
-    for f in feats {
-        let px = [f.x as f64, f.y as f64];
-        let rc = &cams[reference];
-        let d = rc.ray(px);
-        if d[2] > -1e-3 { continue; }
-        let t = (table_z - rc.c[2]) / d[2];
-        if t.is_nan() || t <= 0.05 { continue; }
-        let x0 = [rc.c[0] + t * d[0], rc.c[1] + t * d[1], rc.c[2] + t * d[2]];
-        let hq = to_half(px);
-        let (Some(tc), Some(tf)) = (
-            sample_bilinear(&halves[reference], hq[0], hq[1], COARSE_R).and_then(|v| make_tmpl(v, COARSE_R, None, 0.0)),
-            make_tmpl(sample_int(&rv.img, f.x, f.y, PATCH_R), PATCH_R, None, 0.0),
-        ) else { continue; };
-        let mut obs = vec![(reference, px)];
-        for (j, v) in views.iter().enumerate() {
-            if j == reference { continue; }
-            let Some(q0) = cams[j].project(&x0) else { continue; };
-            let Some(q) = match_2d(&v.img, &halves[j], &tc, &tf, q0, win[j]) else { continue; };
-            // left-right: this view's patch searched back in the reference around the feature
-            let hq = to_half(q);
-            let back = sample_bilinear(&halves[j], hq[0], hq[1], COARSE_R).and_then(|tv| make_tmpl(tv, COARSE_R, None, 0.0))
-                .zip(sample_bilinear(&v.img, q[0], q[1], PATCH_R).and_then(|tv| make_tmpl(tv, PATCH_R, None, 0.0)))
-                .and_then(|(bc, bf)| match_2d(&rv.img, &halves[reference], &bc, &bf, px, win[j]));
-            if back.is_some_and(|b| (b[0] - px[0]).hypot(b[1] - px[1]) <= POSE_LR_TOL_PX) { obs.push((j, q)); }
-        }
-        if obs.len() >= 2 { out.push(Corr { obs, on_table: true, marker: false }); }
-    }
-    out
+    TexturePrep::new(views, &cams[reference], reference, object_box, exclude, table_z).corrs(views, cams, win)
 }
 
 /// Marker-corner correspondences: each (id, corner index) seen in at least two views (an id
@@ -499,13 +533,23 @@ pub fn refine_views(views: &[View], reference: usize, object_box: [f64; 4], excl
     let t0 = Instant::now();
     let cams: Vec<Camera> = views.iter().map(|v| v.cam).collect();
     let with = |mut c: Vec<Corr>| { c.extend_from_slice(extra); c };
-    let first = if texture { with(texture_corrs(views, &cams, reference, object_box, exclude, table_z, &vec![pp.window_px; views.len()])) } else { extra.to_vec() };
+    let prep = texture.then(|| match cams.get(reference) {
+        Some(rc) => TexturePrep::new(views, rc, reference, object_box, exclude, table_z),
+        None => TexturePrep { reference, halves: Vec::new(), feats: Vec::new() },
+    });
+    let first = match &prep {
+        Some(p) => with(p.corrs(views, &cams, &vec![pp.window_px; views.len()])),
+        None => extra.to_vec(),
+    };
     let r1 = refine_poses(&cams, reference, &first, table_z, pp);
-    let mut out = if texture {
-        let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
-        let second = with(texture_corrs(views, &r1.cams, reference, object_box, exclude, table_z, &win));
-        refine_poses(&cams, reference, &second, table_z, pp)
-    } else { r1 };
+    let mut out = match &prep {
+        Some(p) => {
+            let win: Vec<f64> = r1.views.iter().map(|v| if v.status == "refined" { pp.guided_window_px } else { pp.window_px }).collect();
+            let second = with(p.corrs(views, &r1.cams, &win));
+            refine_poses(&cams, reference, &second, table_z, pp)
+        }
+        None => r1,
+    };
     out.ms = ms(t0);
     out
 }
@@ -653,5 +697,81 @@ mod tests {
         assert_eq!(c[1].obs[2], (2, [130.0, 10.0]));
         let views = vec![vec![m(2, 300.0)], vec![m(2, 310.0)]];
         assert!(marker_corrs(&views, 0, [290.0, 0.0, 330.0, 40.0]).iter().all(|k| !k.on_table), "corners in the box");
+    }
+
+    #[test]
+    fn texture_prep_matches_one_shot_texture_corrs_and_handles_invalid_inputs() {
+        let look = [0.30, 0.0, 0.0];
+        let c0 = cam_at([0.30, -0.02, 0.45], look);
+        let c1 = cam_at([0.30, 0.02, 0.45], look);
+        let render = |cam: &Camera| -> Gray {
+            let (w, h) = (320usize, 180usize);
+            let mut cam_s = *cam;
+            cam_s.cx = 160.0;
+            cam_s.cy = 90.0;
+            let mut px = vec![128u8; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let d = cam_s.ray([x as f64, y as f64]);
+                    let t = -cam_s.c[2] / d[2];
+                    let wx = cam_s.c[0] + t * d[0];
+                    let wy = cam_s.c[1] + t * d[1];
+                    let gx = (wx / 0.0045).floor() as i64;
+                    let gy = (wy / 0.0045).floor() as i64;
+                    let h1 = ((gx.wrapping_mul(73856093) ^ gy.wrapping_mul(19349663)).wrapping_mul(83492791) >> 24) & 0xff;
+                    let gx2 = (wx / 0.0073).floor() as i64;
+                    let gy2 = (wy / 0.0073).floor() as i64;
+                    let h2 = ((gx2.wrapping_mul(19349663) ^ gy2.wrapping_mul(83492791)).wrapping_mul(73856093) >> 24) & 0xff;
+                    px[y * w + x] = ((h1 + h2) / 2) as u8;
+                }
+            }
+            Gray::new(w, h, px).unwrap()
+        };
+        let mut cam0 = c0;
+        cam0.cx = 160.0;
+        cam0.cy = 90.0;
+        let mut cam1 = c1;
+        cam1.cx = 160.0;
+        cam1.cy = 90.0;
+        let views = vec![
+            View { cam: cam0, img: render(&c0) },
+            View { cam: cam1, img: render(&c1) },
+        ];
+        let object_box = [140.0, 75.0, 180.0, 105.0];
+        let exclude = [[0.0, 0.0, 20.0, 20.0]];
+
+        // Invalid inputs: empty without panic
+        assert!(TexturePrep::new(&views, &cam0, 2, object_box, &exclude, 0.0).corrs(&views, &[cam0, cam1], &[15.0, 15.0]).is_empty());
+        assert!(texture_corrs(&views, &[cam0, cam1], 2, object_box, &exclude, 0.0, &[15.0, 15.0]).is_empty());
+        assert!(TexturePrep::new(&views[..1], &cam0, 0, object_box, &exclude, 0.0).corrs(&views[..1], &[cam0], &[15.0]).is_empty());
+        assert!(texture_corrs(&views[..1], &[cam0], 0, object_box, &exclude, 0.0, &[15.0]).is_empty());
+        assert!(TexturePrep::new(&[], &cam0, 0, object_box, &exclude, 0.0).corrs(&[], &[], &[]).is_empty());
+        assert!(texture_corrs(&[], &[], 0, object_box, &exclude, 0.0, &[]).is_empty());
+
+        let prep = TexturePrep::new(&views, &cam0, 0, object_box, &exclude, 0.0);
+        assert!(prep.corrs(&views, &[cam0], &[15.0, 15.0]).is_empty());
+        assert!(prep.corrs(&views, &[cam0, cam1], &[15.0]).is_empty());
+        assert!(texture_corrs(&views, &[cam0], 0, object_box, &exclude, 0.0, &[15.0, 15.0]).is_empty());
+        assert!(texture_corrs(&views, &[cam0, cam1], 0, object_box, &exclude, 0.0, &[15.0]).is_empty());
+
+        let r_oob = refine_views(&views, 5, object_box, &exclude, 0.0, &[], true, &PoseParams::default());
+        assert_eq!(r_oob.n_corrs, 0);
+
+        // Two passes on synthetic 2-view textured table scene: bit-identical to one-shot texture_corrs
+        let cams1 = [cam0, cam1];
+        let win1 = [15.0, 15.0];
+        let got1 = prep.corrs(&views, &cams1, &win1);
+        let exp1 = texture_corrs(&views, &cams1, 0, object_box, &exclude, 0.0, &win1);
+        assert!(!got1.is_empty(), "synthetic textured scene should yield correspondences");
+        assert_eq!(got1, exp1);
+
+        let mut cam1_p = cam1;
+        cam1_p.r = mat_mul(&rodrigues(&[0.0008, -0.0005, 0.0004]), &cam1.r);
+        let cams2 = [cam0, cam1_p];
+        let win2 = [15.0, 4.0];
+        let got2 = prep.corrs(&views, &cams2, &win2);
+        let exp2 = texture_corrs(&views, &cams2, 0, object_box, &exclude, 0.0, &win2);
+        assert!(!got2.is_empty(), "guided pass should yield correspondences");
+        assert_eq!(got2, exp2);
     }
 }
