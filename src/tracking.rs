@@ -201,6 +201,7 @@ pub struct TrackingOutput {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
     pub multiplier: f32,
+    pub sweep_evals_used: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -309,6 +310,7 @@ impl crate::supervisor::SupervisorInner {
                     positions: self.commanded_positions.clone(),
                     velocities: vec![0.0; dof],
                     multiplier: 0.0,
+                    sweep_evals_used: 0,
                 });
             }
             None => {
@@ -347,9 +349,11 @@ impl crate::supervisor::SupervisorInner {
             None
         };
 
-        // 4. Try multipliers 1, 1/2, 1/4, 1/8, 0 in order on the combined joint vector.
+        // 4. Try multipliers 1, 1/2, 1/4, 1/8, 0 in order on the combined joint vector,
+        // sharing one per-tick workspace subdivision budget across all attempts and both segments.
         let multipliers = if has_desired_lead { LEAD_MULTIPLIERS } else { ZERO_ONLY };
         let mut last_err: Option<TrackingReject> = None;
+        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
 
         'cand: for &m in multipliers {
             let mut q_cand = self.commanded_positions.clone();
@@ -430,7 +434,6 @@ impl crate::supervisor::SupervisorInner {
             // Combined-vector workspace and swept keep-out checks on both segments.
             if let Some((ref eval, ref c_prev, ref min_d_prev, ref meas_ctx)) = ws_ctx {
                 let mut local_min_d = min_d_prev.clone();
-                let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
                 if let Err((_, f)) = eval.sweep_linear_step(
                     prev_q,
                     &q_cand,
@@ -446,7 +449,6 @@ impl crate::supervisor::SupervisorInner {
                 }
                 if let Some((ref c_meas, ref min_d_meas)) = meas_ctx {
                     let mut local_min_d = min_d_meas.clone();
-                    let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
                     if let Err((_, f)) = eval.sweep_linear_step(
                         &self.measured_positions,
                         &q_cand,
@@ -470,6 +472,7 @@ impl crate::supervisor::SupervisorInner {
                 positions: q_cand,
                 velocities: v_out,
                 multiplier: m,
+                sweep_evals_used: MAX_KEEPOUT_EVALS_PER_TICK - budget,
             });
         }
 
