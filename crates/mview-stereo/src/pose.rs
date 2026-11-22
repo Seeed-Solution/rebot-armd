@@ -153,7 +153,7 @@ fn window_peaks(img: &Gray, t: &Tmpl, c: [f64; 2], r: i32) -> Vec<[f64; 2]> {
 /// against the best other match more than 2 px away.
 fn match_2d(full: &Gray, half: &Gray, tc: &Tmpl, tf: &Tmpl, q0: [f64; 2], win: f64) -> Option<[f64; 2]> {
     let mut m: Vec<([f64; 2], f64)> = window_peaks(half, tc, to_half(q0), (win / 2.0).ceil() as i32).into_iter()
-        .filter_map(|h| refine_2d(full, tf, [2.0 * h[0] + 0.5, 2.0 * h[1] + 0.5]))
+        .filter_map(|h| refine_2d_pose(full, tf, [2.0 * h[0] + 0.5, 2.0 * h[1] + 0.5]))
         .filter(|(q, _)| (q[0] - q0[0]).abs() <= win + 2.0 && (q[1] - q0[1]).abs() <= win + 2.0).collect();
     m.sort_by(|a, b| b.1.total_cmp(&a.1));
     let (q, best) = *m.first()?;

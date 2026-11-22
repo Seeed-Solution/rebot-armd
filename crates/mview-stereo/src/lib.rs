@@ -846,6 +846,47 @@ fn refine_2d(img: &Gray, t: &Tmpl, mut q: [f64; 2]) -> Option<([f64; 2], f64)> {
     None
 }
 
+fn refine_2d_cached(mut q: [f64; 2], mut eval: impl FnMut([f64; 2]) -> Option<f32>) -> Option<([f64; 2], f64)> {
+    const H: f64 = 0.5;
+    let mut prev: Option<([[f32; 3]; 3], isize, isize)> = None;
+    for _ in 0..6 {
+        let mut g = [[f32::NEG_INFINITY; 3]; 3];
+        let mut best = (1usize, 1usize, f32::NEG_INFINITY);
+        for (j, row) in g.iter_mut().enumerate() {
+            for (i, cell) in row.iter_mut().enumerate() {
+                let v = match prev {
+                    Some((pg, di, dj)) => {
+                        let (pi, pj) = (i as isize + di, j as isize + dj);
+                        if (0..3).contains(&pi) && (0..3).contains(&pj) {
+                            pg[pj as usize][pi as usize]
+                        } else {
+                            eval([q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H])?
+                        }
+                    }
+                    None => eval([q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H])?,
+                };
+                *cell = v;
+                if v > best.2 { best = (i, j, v); }
+            }
+        }
+        let (i, j, s) = best;
+        if (i, j) != (1, 1) {
+            let (di, dj) = (i as isize - 1, j as isize - 1);
+            q = [q[0] + (i as f64 - 1.0) * H, q[1] + (j as f64 - 1.0) * H];
+            prev = Some((g, di, dj));
+            continue;
+        }
+        let dx = parabola(g[1][0], g[1][1], g[1][2]);
+        let dy = parabola(g[0][1], g[1][1], g[2][1]);
+        return Some(([q[0] + dx * H, q[1] + dy * H], f64::from(s)));
+    }
+    None
+}
+
+pub(crate) fn refine_2d_pose(img: &Gray, t: &Tmpl, q: [f64; 2]) -> Option<([f64; 2], f64)> {
+    refine_2d_cached(q, |p| ncc(img, t, p[0], p[1], true))
+}
+
 /// Match of `t` near `q` along the unit image direction `e` only (an edge point): NCC at
 /// -0.5, 0, 0.5 px (moved while the best is at an end), parabola.
 fn refine_1d(img: &Gray, t: &Tmpl, mut q: [f64; 2], e: [f64; 2]) -> Option<([f64; 2], f64)> {
@@ -1358,5 +1399,151 @@ mod tests {
         let h = img.half();
         assert_eq!((h.w, h.h, h.px.clone()), (2, 1, vec![2, 12]));
         assert_eq!(to_half([0.5, 0.5]), [0.0, 0.0]);
+    }
+
+    fn assert_refine_eq(a: Option<([f64; 2], f64)>, b: Option<([f64; 2], f64)>) {
+        match (a, b) {
+            (None, None) => {}
+            (Some((pa, sa)), Some((pb, sb))) => {
+                assert_eq!(pa[0].to_bits(), pb[0].to_bits(), "x mismatch: {pa:?} vs {pb:?}");
+                assert_eq!(pa[1].to_bits(), pb[1].to_bits(), "y mismatch: {pa:?} vs {pb:?}");
+                assert_eq!(sa.to_bits(), sb.to_bits(), "score mismatch: {sa} vs {sb}");
+            }
+            _ => panic!("option mismatch: {a:?} vs {b:?}"),
+        }
+    }
+
+    #[test]
+    fn refine_2d_pose_matches_refine_2d_across_all_eight_shift_directions() {
+        let (w, h) = (32, 32);
+        let px: Vec<u8> = (0..w * h).map(|k| {
+            let (x, y) = ((k % w) as f64, (k / w) as f64);
+            (128.0 + 50.0 * (0.47 * x + 0.19 * y).sin() + 45.0 * (0.31 * x - 0.53 * y).cos() + 20.0 * (0.11 * x * y).sin())
+                .round().clamp(0.0, 255.0) as u8
+        }).collect();
+        let img = Gray::new(w, h, px).unwrap();
+        let q0 = [16.5, 16.5];
+
+        for dj in -1..=1isize {
+            for di in -1..=1isize {
+                if di == 0 && dj == 0 { continue; }
+                for steps in [1.0f64, 2.0f64] {
+                    let target = [q0[0] + 0.5 * steps * di as f64, q0[1] + 0.5 * steps * dj as f64];
+                    let v = sample_bilinear(&img, target[0], target[1], 4).unwrap();
+                    let t = make_tmpl(v, 4, None, 0.0).unwrap();
+                    let got = refine_2d_pose(&img, &t, q0);
+                    let exp = refine_2d(&img, &t, q0);
+                    assert!(got.is_some(), "expected convergence for ({di}, {dj}) steps={steps}");
+                    assert_refine_eq(got, exp);
+                }
+
+                let tx = q0[0] + 0.5 * di as f64;
+                let ty = q0[1] + 0.5 * dj as f64;
+                let mut seen: Vec<[f64; 2]> = Vec::new();
+                let res = refine_2d_cached(q0, |p| {
+                    assert!(!seen.iter().any(|q| q[0] == p[0] && q[1] == p[1]), "re-evaluated {p:?} on ({di}, {dj})");
+                    seen.push(p);
+                    let (dx, dy) = (p[0] - tx, p[1] - ty);
+                    Some(-((dx * dx + dy * dy) as f32))
+                }).unwrap();
+                let expected_evals = if di == 0 || dj == 0 { 12 } else { 14 };
+                assert_eq!(seen.len(), expected_evals, "direction ({di}, {dj})");
+                assert!((res.0[0] - tx).abs() < 1e-12 && (res.0[1] - ty).abs() < 1e-12, "{res:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn refine_2d_cached_preserves_tie_breaking_and_iteration_limit() {
+        // Vertical-invariant image: all 3 rows at the matching x column produce identical NCC.
+        let (w, h) = (32, 32);
+        let px: Vec<u8> = (0..w * h).map(|k| {
+            let x = (k % w) as f64;
+            (128.0 + 70.0 * (0.63 * x).sin() + 30.0 * (0.29 * x).cos()).round().clamp(0.0, 255.0) as u8
+        }).collect();
+        let img = Gray::new(w, h, px).unwrap();
+        let t = make_tmpl(sample_int(&img, 16, 16, 4), 4, None, 0.0).unwrap();
+        // Horizontal-only shift to x=16.0: row j=0 beats j=1,2 on strict `>` and keeps shifting y by -0.5.
+        assert_refine_eq(refine_2d_pose(&img, &t, [16.5, 16.5]), refine_2d(&img, &t, [16.5, 16.5]));
+        // Centered on x=16.0: j=0..=2 at i=1 all tie; best stays at (1, 1) due to strict `>`.
+        assert_refine_eq(refine_2d_pose(&img, &t, [16.0, 16.5]), refine_2d(&img, &t, [16.0, 16.5]));
+
+        // Flat surface: row-major strict `>` picks (0, 0) over initial -inf every step -> None after 6 iters.
+        let mut flat_evals = 0usize;
+        let flat = refine_2d_cached([10.0, 10.0], |_| { flat_evals += 1; Some(0.5) });
+        assert_eq!(flat_evals, 9 + 5 * 5);
+        assert_eq!(flat, None);
+
+        // Tie between center (1, 1) and later cells (2, 1), (2, 2): strict `>` keeps (1, 1).
+        let mut center_tie_evals = 0usize;
+        let center_tie = refine_2d_cached([10.0, 10.0], |p| {
+            center_tie_evals += 1;
+            if p[0] >= 10.0 && p[1] >= 10.0 && (p[0] == 10.0 && p[1] == 10.0 || p[0] == 10.5 && p[1] == 10.0 || p[0] == 10.5 && p[1] == 10.5) {
+                Some(0.9)
+            } else {
+                Some(0.1)
+            }
+        });
+        assert_eq!(center_tie_evals, 9);
+        assert_eq!(center_tie, Some(([10.25, 10.0], f64::from(0.9f32))));
+
+        // Symmetric tie between (0, 0) and (2, 2): row-major strict `>` picks (0, 0) = [9.5, 9.5].
+        let sym = refine_2d_cached([10.0, 10.0], |p| {
+            if (p[0] == 9.5 && p[1] == 9.5) || (p[0] == 10.5 && p[1] == 10.5) { Some(0.9) } else { Some(0.1) }
+        });
+        assert_eq!(sym, Some(([9.5, 9.5], f64::from(0.9f32))));
+
+        // Monotonic ramp: hits the 6-iteration limit and returns None.
+        let mut ramp_evals = 0usize;
+        let ramp = refine_2d_cached([10.0, 10.0], |p| {
+            ramp_evals += 1;
+            Some((p[0] + p[1]) as f32)
+        });
+        assert_eq!(ramp, None);
+        assert_eq!(ramp_evals, 9 + 5 * 5);
+    }
+
+    #[test]
+    fn refine_2d_pose_matches_refine_2d_at_image_boundaries() {
+        let (w, h) = (20, 20);
+        let mut px: Vec<u8> = (0..w * h).map(|k| {
+            let (x, y) = (k % w, k / w);
+            ((x * 37 + y * 53) % 100 + 20) as u8
+        }).collect();
+        // Stamp a distinct 9x9 pattern at (5, 10) and also near the bottom-right at (14, 14).
+        let stamp: Vec<u8> = (0..81).map(|k| {
+            let (x, y) = (k % 9, k / 9);
+            if (x + y) % 2 == 0 { 230 } else { 30 }
+        }).collect();
+        for sy in 0..9 {
+            for sx in 0..9 {
+                let v = stamp[sy * 9 + sx];
+                px[(10 - 4 + sy) * w + (5 - 4 + sx)] = v;
+                px[(14 - 4 + sy) * w + (14 - 4 + sx)] = v;
+            }
+        }
+        let img = Gray::new(w, h, px).unwrap();
+        let t = make_tmpl(sample_int(&img, 5, 10, 4), 4, None, 0.0).unwrap();
+
+        // Iter 0 out of bounds (x = 4.5 < 5.0).
+        assert_refine_eq(refine_2d_pose(&img, &t, [5.0, 10.0]), refine_2d(&img, &t, [5.0, 10.0]));
+        assert!(refine_2d_pose(&img, &t, [5.0, 10.0]).is_none());
+
+        // Iter 0 in bounds at [5.5, 10.0], shifts left to [5.0, 10.0], iter 1 hits x = 4.5 -> None.
+        assert_refine_eq(refine_2d_pose(&img, &t, [5.5, 10.0]), refine_2d(&img, &t, [5.5, 10.0]));
+        assert!(refine_2d_pose(&img, &t, [5.5, 10.0]).is_none());
+
+        // Iter 0 in bounds at [13.5, 13.5], shifts diagonally to [14.0, 14.0], iter 1 hits x = 14.5 -> None.
+        assert_refine_eq(refine_2d_pose(&img, &t, [13.5, 13.5]), refine_2d(&img, &t, [13.5, 13.5]));
+        assert!(refine_2d_pose(&img, &t, [13.5, 13.5]).is_none());
+
+        // Direct None propagation check on iter 1 after a cardinal shift.
+        let mut calls = 0usize;
+        let out = refine_2d_cached([10.0, 10.0], |p| {
+            calls += 1;
+            if p[0] < 9.5 { None } else if p[0] == 9.5 && p[1] == 10.0 { Some(1.0) } else { Some(0.2) }
+        });
+        assert_eq!(out, None);
+        assert_eq!(calls, 10);
     }
 }
