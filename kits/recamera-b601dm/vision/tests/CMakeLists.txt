@@ -131,7 +131,8 @@ add_executable(gray_frame_test ${CMAKE_CURRENT_LIST_DIR}/gray_frame_test.cpp ${M
                                ${MAIN}/vision_control.cpp ${MAIN}/intrinsics.cpp ${MAIN}/model_catalogue.cpp
                                ${MAIN}/result_json.cpp ${MAIN}/depth_geom.cpp ${MAIN}/depth_map.cpp ${MAIN}/http_control.cpp)
 target_include_directories(gray_frame_test PRIVATE ${MAIN})
-target_compile_definitions(gray_frame_test PRIVATE
+# _GLIBCXX_ASSERTIONS: bounds-checked operator[] so stale ring indices abort the test.
+target_compile_definitions(gray_frame_test PRIVATE _GLIBCXX_ASSERTIONS
     GOLDEN_RGF1_PATH="${CMAKE_CURRENT_LIST_DIR}/../../../../tests/fixtures/gray_frame_golden.rgf1")
 target_compile_options(gray_frame_test PRIVATE -Wall -Wextra)
 target_link_libraries(gray_frame_test PRIVATE rv_json Threads::Threads)

@@ -438,6 +438,7 @@ std::string VisionControl::instance_id() const {
 
 uint32_t VisionControl::next_frame_id(std::string& instance_out) {
     std::vector<std::shared_ptr<const GrayFrame>> displaced;
+    VisionResult displaced_depth;
     uint32_t id = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -447,7 +448,14 @@ uint32_t VisionControl::next_frame_id(std::string& instance_out) {
             instance_id_ = std::move(next_inst);
             frame_seq_ = 0;
             gray_ring_.clear(displaced);
-            recent_results_.clear();
+            // Keep the pre-sized history slots (publish() indexes them); empty them and restart
+            // the ring so no index refers to a previous-generation entry.
+            for (VisionResult& slot : recent_results_) slot = VisionResult{};
+            recent_head_ = 0;
+            recent_count_ = 0;
+            // The retained depth map belongs to the previous generation.
+            displaced_depth = std::move(latest_depth_map_);
+            latest_depth_map_ = VisionResult{};
             latest_.frame_id = 0;
             latest_.instance_id = instance_id_;
         }
@@ -455,6 +463,7 @@ uint32_t VisionControl::next_frame_id(std::string& instance_out) {
         instance_out = instance_id_;
     }
     displaced.clear();
+    displaced_depth.depth_disp.reset();
     return id;
 }
 
@@ -603,6 +612,9 @@ bool VisionControl::wait_fresh(const std::string& after_instance, uint32_t after
     // intervening non-depth publications.
     auto matches = [&](const VisionResult& r) {
         if (r.frame_id == 0) return false;
+        // Only the baseline's generation and the current one exist for this waiter; anything
+        // else (a retained entry of an older generation) is not newer than the baseline.
+        if (r.instance_id != start_instance && r.instance_id != instance_id_) return false;
         const bool newer = (r.instance_id == start_instance) ? (r.frame_id > after) : true;
         if (!newer || r.frame_ms < request_ms) return false;
         if (!Pipelines{r.ran_yolo, r.ran_aruco, r.ran_depth, r.ran_gray}.covers(need)) return false;

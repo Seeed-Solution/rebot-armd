@@ -861,6 +861,79 @@ static void test_gray_allocation_failure_after_conversion_and_noexcept_ring() {
     CHECK(after_roll.instance_id == inst_b && after_roll.frame_id == 1);
 }
 
+
+// Rollover keeps the pre-sized history slots (publishing after a rollover must not index
+// destroyed elements; the target builds with _GLIBCXX_ASSERTIONS so a bad index aborts) and
+// invalidates the retained depth map so it cannot match a waiter of the next generation.
+static void test_rollover_preserves_history_slots_and_drops_depth_map() {
+    VisionControl::Options o;
+    o.instance_id = "rv-gen0";
+    o.initial_frame_id = std::numeric_limits<uint32_t>::max() - 3u;
+    VisionControl ctl(o, nullptr);
+    const uint64_t t0 = mono_ms();
+
+    VisionResult with_map;
+    with_map.frame_id = ctl.next_frame_id(with_map.instance_id);
+    with_map.frame_ms = t0 + 5;
+    with_map.ran_depth = true;
+    with_map.width = 640;
+    with_map.height = 360;
+    with_map.depth_grid_w = 4;
+    with_map.depth_grid_h = 4;
+    with_map.depth_disp = std::make_shared<std::vector<float>>(16, 0.5f);
+    ctl.publish(with_map);
+    for (int i = 0; i < 2; ++i) {
+        VisionResult r;
+        r.frame_id = ctl.next_frame_id(r.instance_id);
+        r.frame_ms = t0 + 6 + static_cast<uint64_t>(i);
+        r.ran_yolo = true;
+        ctl.publish(r);
+    }
+
+    // Roll over and publish more results than the history holds in the new generation.
+    std::string inst1;
+    uint32_t last_id = 0;
+    for (int i = 0; i < 10; ++i) {
+        VisionResult r;
+        r.frame_id = ctl.next_frame_id(r.instance_id);
+        r.frame_ms = t0 + 20 + static_cast<uint64_t>(i);
+        r.ran_yolo = true;
+        r.ran_gray = false;
+        if (i == 0) {
+            inst1 = r.instance_id;
+            CHECK(r.frame_id == 1 && inst1 != "rv-gen0");
+        }
+        last_id = r.frame_id;
+        ctl.publish(r);
+    }
+    CHECK(last_id == 10);
+
+    // Yolo waiter of the new generation sees its newest result.
+    VisionResult got;
+    CHECK(!ctl.wait_fresh(inst1, 0, t0, Pipelines{true, false, false, false}, 50, got));
+    CHECK(got.instance_id == inst1 && got.frame_id == 10);
+
+    // The generation-0 depth map (frame_ms after the request) must not satisfy a map waiter of
+    // generation 1, nor one whose baseline is in generation 0.
+    VisionResult map_new;
+    CHECK(ctl.wait_fresh(inst1, 0, t0, Pipelines{false, false, true, false}, 30, map_new, /*require_depth_map=*/true));
+    VisionResult map_old;
+    CHECK(ctl.wait_fresh("rv-gen0", 0, t0, Pipelines{false, false, true, false}, 30, map_old, /*require_depth_map=*/true));
+
+    // A new-generation depth map is found again.
+    VisionResult m;
+    m.frame_id = ctl.next_frame_id(m.instance_id);
+    m.frame_ms = t0 + 40;
+    m.ran_depth = true;
+    m.depth_grid_w = 2;
+    m.depth_grid_h = 2;
+    m.depth_disp = std::make_shared<std::vector<float>>(4, 0.25f);
+    ctl.publish(m);
+    VisionResult map_hit;
+    CHECK(!ctl.wait_fresh(inst1, 0, t0, Pipelines{false, false, true, false}, 30, map_hit, /*require_depth_map=*/true));
+    CHECK(map_hit.instance_id == inst1 && map_hit.frame_id == 11 && map_hit.depth_disp && map_hit.depth_disp->size() == 4);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -881,6 +954,7 @@ int main(int argc, char** argv) {
     test_http_server_sockets();
     test_depth_map_waiter_intervening_publication();
     test_gray_allocation_failure_after_conversion_and_noexcept_ring();
+    test_rollover_preserves_history_slots_and_drops_depth_map();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;
