@@ -974,6 +974,32 @@ async fn gray_capture_succeeds_with_zero_snapshots_and_reports_metrics() {
     assert!(m["stats"]["frame_fetch_ms"].is_number() && m["stats"]["parse_ms"].is_number(), "{}", m["stats"]);
     check_timing(m, 40.0, 30.0);
     println!("timing {}", m["timing"]);
+    // the start view skips the minimum settle wait (still windows only); the view poses wait 2 s
+    let settle: Vec<f64> = m["views"].as_array().unwrap().iter().map(|v| v["timing"]["settle_ms"].as_f64().unwrap()).collect();
+    assert!(settle[0] < 1000.0 && settle[0] >= (mm::STILL_WINDOW as f64 - 1.0) * 20.0, "{settle:?}");
+    assert!(settle[1..].iter().all(|s| *s >= mm::MIN_SETTLE_S * 1000.0), "{settle:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_arm_moving_at_the_start_fails_not_settled_before_any_trigger() {
+    // J4 drifts 50 mrad/s from the start (above the 0.03 rad/s still velocity): without the
+    // minimum wait the start view still needs a still window, so it ends NOT_SETTLED after the
+    // window time (MAX_SETTLE_S - MIN_SETTLE_S) without triggering the camera or moving
+    let creep = Arc::new(Mutex::new(Creep { shake: true, shake_rate: 0.05, ..Default::default() }));
+    let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
+    let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
+    r.vision.gray.store(true, Ordering::SeqCst);
+    let t0 = Instant::now();
+    let ack = r.start(json!({"label": "box"})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 30.0).await;
+    let took = t0.elapsed().as_secs_f64();
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("NOT_SETTLED")), "{a}");
+    let window = mm::MAX_SETTLE_S - mm::MIN_SETTLE_S;
+    assert!(a["message"].as_str().unwrap().contains(&format!("within {window} s")), "{a}");
+    assert!(took >= window && took < window + 3.0, "{took}");
+    assert_eq!(r.vision.frame.load(Ordering::SeqCst), 0, "no trigger before the arm is still");
+    assert!(r.at_start().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

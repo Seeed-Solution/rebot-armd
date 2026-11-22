@@ -32,7 +32,9 @@
 //!   (all views); every view its own `decode_ms`. `measurement.timing` and `views[].timing`: the
 //!   wall-clock phases ([`RunTiming`], [`ViewTiming`]).
 //! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
-//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`). Then one snapshot `s0`: with
+//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`). The start view (the arm was not
+//!   moved by the action) skips the minimum wait: the settle rule only, for up to
+//!   [`MAX_SETTLE_S`] - [`MIN_SETTLE_S`]. Then one snapshot `s0`: with
 //!   inference idle the camera runs at 1 fps, so `/snapshot.jpg` can still hold a frame taken while
 //!   the arm moved (real B601-DM, 2026-11-22: the same frame for 0.7-2.2 s). A joint sample, a YOLO
 //!   trigger (a frame newer than the request; it also refreshes the snapshot), then snapshots every
@@ -576,11 +578,14 @@ async fn sample_fresh_after(
     }
 }
 
-/// Wait until the arm is still (see [`STILL_WINDOW`]): `MIN_SETTLE_S`, then sliding windows until
-/// `MAX_SETTLE_S`. Returns the seconds it took.
-async fn settle(ctx: &MacroCtx, plan: &Plan) -> Result<f64, Stop> {
+/// Wait until the arm is still (see [`STILL_WINDOW`]): `min_s`, then sliding windows until
+/// `min_s` + ([`MAX_SETTLE_S`] - [`MIN_SETTLE_S`]). Returns the seconds it took. The start view
+/// passes 0 (the arm stood at the start pose before the action; the still windows and the
+/// bracket check still apply), the view poses [`MIN_SETTLE_S`].
+async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     let t0 = Instant::now();
-    let until = t0 + Duration::from_secs_f64(MIN_SETTLE_S);
+    let until = t0 + Duration::from_secs_f64(min_s);
+    let max_s = min_s + (MAX_SETTLE_S - MIN_SETTLE_S);
     while Instant::now() < until {
         ctx.check().await?;
         tokio::time::sleep(POLL).await;
@@ -593,8 +598,8 @@ async fn settle(ctx: &MacroCtx, plan: &Plan) -> Result<f64, Stop> {
         win.push_back(sample(ctx).await);
         if win.len() > STILL_WINDOW { win.pop_front(); }
         if win.len() == STILL_WINDOW && is_still(&win, &arm) { return Ok(t0.elapsed().as_secs_f64()); }
-        if t0.elapsed().as_secs_f64() > MAX_SETTLE_S {
-            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {MAX_SETTLE_S} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples)")));
+        if t0.elapsed().as_secs_f64() > max_s {
+            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {max_s} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples)")));
         }
         tokio::time::sleep(STILL_SAMPLE).await;
     }
@@ -744,10 +749,11 @@ async fn capture(
     shift_px: [f64; 2],
     margin_px: f64,
     markers: bool,
+    min_settle_s: f64,
 ) -> Result<Capture, Stop> {
     match frame_source {
-        FrameSource::Gray => capture_gray(ctx, plan, src, negotiated_gray, offset, shift_px, margin_px, markers).await,
-        FrameSource::Snapshot => capture_snapshot(ctx, plan, src, offset, shift_px, margin_px, markers).await,
+        FrameSource::Gray => capture_gray(ctx, plan, src, negotiated_gray, offset, shift_px, margin_px, markers, min_settle_s).await,
+        FrameSource::Snapshot => capture_snapshot(ctx, plan, src, offset, shift_px, margin_px, markers, min_settle_s).await,
     }
 }
 
@@ -768,8 +774,9 @@ async fn capture_gray(
     shift_px: [f64; 2],
     margin_px: f64,
     markers: bool,
+    min_settle_s: f64,
 ) -> Result<Capture, Stop> {
-    let settle_s = settle(ctx, plan).await?;
+    let settle_s = settle(ctx, plan, min_settle_s).await?;
     let t_cap = Instant::now();
     let (mut trig_total_ms, mut fetch_total_ms) = (0.0, 0.0);
     let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
@@ -904,8 +911,9 @@ async fn capture_snapshot(
     shift_px: [f64; 2],
     margin_px: f64,
     markers: bool,
+    min_settle_s: f64,
 ) -> Result<Capture, Stop> {
-    let settle_s = settle(ctx, plan).await?;
+    let settle_s = settle(ctx, plan, min_settle_s).await?;
     let t_cap = Instant::now();
     let snap = || async { src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}"))) };
     // possibly a frame from before the motion settled (the idle camera runs at 1 fps)
@@ -1186,7 +1194,7 @@ async fn run_views(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, frame
                         used.push(c);
                     }
                     ctx.sup.inner().write().await.set_action_phase(ctx.id, &format!("capture:{k}"), k as f32 / (total + 1.0), None, None);
-                    let mut cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers).await.map_err(|s| (s, true))?;
+                    let mut cap = capture(ctx, plan, src, frame_source, negotiated_gray, c, shift, margin, markers, MIN_SETTLE_S).await.map_err(|s| (s, true))?;
                     cap.timing.motion_ms = motion_ms;
                     // where the look-at point is in the captured view (measured joints)
                     let seen = camera_at(&plan.cam, &cap.pose).project(pivot).map_or(shift, |q| [q[0] - start_px[0], q[1] - start_px[1]]);
@@ -1734,7 +1742,8 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     };
     ctx.sup.inner().write().await.set_action_phase(ctx.id, "capture:start", 0.0, None, None);
     let t_detect = Instant::now();
-    let first = capture(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), [0.0, 0.0], [0.0, 0.0], f64::NAN, markers).await?;
+    // the start view: no minimum wait (the arm was not moved by this action), still windows only
+    let first = capture(ctx, plan, src, frame_source, negotiated_gray_format.as_ref(), [0.0, 0.0], [0.0, 0.0], f64::NAN, markers, 0.0).await?;
     let Some(target) = pick_start(&plan.request, &first.detections) else {
         let what = plan.request.label.as_deref().map_or("an object".to_string(), |l| format!("a {l}"));
         return Err(fail("TARGET_LOST", format!("{what} (score >= {}) is not detected at the start pose{}", plan.request.min_score,
