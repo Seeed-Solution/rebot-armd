@@ -442,11 +442,20 @@ uint32_t VisionControl::next_frame_id(std::string& instance_out) {
     uint32_t id = 0;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (frame_seq_ == UINT32_MAX) {
-            std::string next_inst = generate_instance_id();
+        const bool rollover = frame_seq_ == UINT32_MAX;
+        // 1. Everything that can allocate, before any member changes: a failure leaves identity,
+        //    sequence and retained records as they were, and the next call rolls over again.
+        std::string next_inst;
+        std::string latest_inst;
+        if (rollover) {
+            next_inst = generate_instance_id();
             if (next_inst == instance_id_) next_inst = generate_instance_id();
-            instance_id_ = std::move(next_inst);
-            frame_seq_ = 0;
+            latest_inst = next_inst;
+            displaced.reserve(gray_ring_.capacity());  // GrayRing::clear() then does not allocate
+        }
+        std::string out = rollover ? next_inst : instance_id_;
+        // 2. Commit with non-throwing operations.
+        if (rollover) {
             gray_ring_.clear(displaced);
             // Keep the pre-sized history slots (publish() indexes them); empty them and restart
             // the ring so no index refers to a previous-generation entry.
@@ -457,10 +466,12 @@ uint32_t VisionControl::next_frame_id(std::string& instance_out) {
             displaced_depth = std::move(latest_depth_map_);
             latest_depth_map_ = VisionResult{};
             latest_.frame_id = 0;
-            latest_.instance_id = instance_id_;
+            latest_.instance_id = std::move(latest_inst);
+            instance_id_ = std::move(next_inst);
+            frame_seq_ = 0;
         }
         id = ++frame_seq_;
-        instance_out = instance_id_;
+        instance_out = std::move(out);
     }
     displaced.clear();
     displaced_depth.depth_disp.reset();

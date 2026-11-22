@@ -1017,6 +1017,50 @@ static void test_frame_boundary_contains_allocation_failures() {
     CHECK(ctl.get_gray(long_inst, second.frame_id, gf) == GrayRing::Lookup::Found && gf->pixels->at(0) == 22);
 }
 
+
+// Rollover under allocation failure: each allocation inside next_frame_id() fails in turn.
+// A failed call changes nothing (identity, sequence, retained gray records), so the next call
+// rolls over again; the successful one expires the old generation and returns frame 1.
+static void test_rollover_allocation_failure_is_all_or_nothing() {
+    VisionControl::Options o;
+    o.instance_id = std::string(40, 'o');  // long: copies of it allocate
+    o.initial_frame_id = std::numeric_limits<uint32_t>::max() - 1u;
+    VisionControl ctl(o, nullptr);
+    VisionResult last;
+    last.frame_id = ctl.next_frame_id(last.instance_id);
+    CHECK(last.frame_id == std::numeric_limits<uint32_t>::max());
+    last.frame_ms = mono_ms();
+    last.ran_gray = true;
+    ctl.publish(last, make_gray(last.instance_id, last.frame_id, 640, 360, 33));
+
+    int failures = 0;
+    bool rolled = false;
+    uint32_t id = 0;
+    std::string inst;
+    for (long k = 1; k <= 64 && !rolled; ++k) {
+        rolled = contain_frame([&] {
+            t_alloc_countdown = k;
+            id = ctl.next_frame_id(inst);
+            t_alloc_countdown = 0;
+        }, [&](const char*) { ++failures; });
+        t_alloc_countdown = 0;
+        if (rolled) break;
+        CHECK(ctl.instance_id() == o.instance_id);
+        std::shared_ptr<const GrayFrame> gf;
+        CHECK(ctl.get_gray(o.instance_id, last.frame_id, gf) == GrayRing::Lookup::Found && gf && gf->pixels->at(0) == 33);
+        std::string base_inst;
+        uint32_t base_id = 0;
+        ctl.current_baseline(base_inst, base_id);
+        CHECK(base_inst == o.instance_id && base_id == last.frame_id);
+    }
+    CHECK(rolled && failures >= 1);
+    CHECK(id == 1 && inst == ctl.instance_id() && inst != o.instance_id);
+    std::shared_ptr<const GrayFrame> gf;
+    CHECK(ctl.get_gray(o.instance_id, last.frame_id, gf) == GrayRing::Lookup::Expired);
+    std::string inst2;
+    CHECK(ctl.next_frame_id(inst2) == 2 && inst2 == inst);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--write-golden") == 0) {
         const std::string body = gray_frame_body(make_golden_frame());
@@ -1039,6 +1083,7 @@ int main(int argc, char** argv) {
     test_gray_allocation_failure_after_conversion_and_noexcept_ring();
     test_rollover_preserves_history_slots_and_drops_depth_map();
     test_frame_boundary_contains_allocation_failures();
+    test_rollover_allocation_failure_is_all_or_nothing();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

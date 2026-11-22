@@ -127,7 +127,10 @@ public:
     Lookup find(const std::string& instance_id, uint32_t frame_id, const std::string& current_instance_id,
                 std::shared_ptr<const GrayFrame>& out) const;
 
-    /** Remove all retained records into `displaced` (caller frees outside lock) and reset eviction state. */
+    /**
+     * Remove all retained records into `displaced` (caller frees outside lock) and reset eviction
+     * state. Does not allocate (or throw) when `displaced` has room for `size()` more entries.
+     */
     void clear(std::vector<std::shared_ptr<const GrayFrame>>& displaced);
 
     size_t size() const noexcept { return count_; }
