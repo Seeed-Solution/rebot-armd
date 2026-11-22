@@ -391,6 +391,8 @@ pub struct SupervisorInner {
     pub last_can_feedback_instant: Option<Instant>,
     /// Monotonic hardware receive instant for each joint (same length as `measured_positions`).
     pub joint_feedback_instants: Vec<Option<Instant>>,
+    /// Monotonic per-joint hardware feedback sequence counter (same length as `measured_positions`).
+    pub joint_feedback_seqs: Vec<u64>,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
@@ -643,6 +645,7 @@ impl SupervisorInner {
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
             joint_feedback_instants: vec![None; dof],
+            joint_feedback_seqs: vec![0; dof],
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             requested_estop_count: Arc::new(AtomicU64::new(0)),
@@ -1402,16 +1405,48 @@ impl SupervisorInner {
         }))
     }
 
-    /// Snapshot of `(measured_positions, arm_velocities, arm_feedback_instants)` read coherently
-    /// under the supervisor lock.
-    pub fn arm_feedback_snapshot(&self) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>) {
+    /// Update per-joint feedback instants and monotonic sequence counters from a hardware driver.
+    fn record_driver_feedback_timing(
+        joint_feedback_instants: &mut Vec<Option<Instant>>,
+        joint_feedback_seqs: &mut Vec<u64>,
+        dof: usize,
+        driver: &dyn ArmDriver,
+    ) {
+        let instants = driver.feedback_instants();
+        let seqs = driver.feedback_seqs();
+        if joint_feedback_seqs.len() != dof {
+            joint_feedback_seqs.resize(dof, 0);
+        }
+        if seqs.len() == dof {
+            *joint_feedback_seqs = seqs;
+        } else {
+            for i in 0..dof {
+                let prev = joint_feedback_instants.get(i).copied().flatten();
+                let cur = instants.get(i).copied().flatten();
+                if let Some(t) = cur {
+                    if prev.is_none_or(|p| t > p) {
+                        joint_feedback_seqs[i] = joint_feedback_seqs[i].wrapping_add(1);
+                    }
+                }
+            }
+        }
+        *joint_feedback_instants = instants;
+    }
+
+    /// Snapshot of `(measured_positions, arm_velocities, arm_feedback_instants, arm_feedback_seqs)`
+    /// read coherently under the supervisor lock.
+    pub fn arm_feedback_snapshot(&self) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
         let arm = self.config.arm_joint_indices();
         let vels = arm.iter().map(|&i| self.measured_velocities.get(i).copied().unwrap_or(0.0)).collect();
         let instants = arm
             .iter()
             .map(|&i| self.joint_feedback_instants.get(i).copied().flatten())
             .collect();
-        (self.measured_positions.clone(), vels, instants)
+        let seqs = arm
+            .iter()
+            .map(|&i| self.joint_feedback_seqs.get(i).copied().unwrap_or(0))
+            .collect();
+        (self.measured_positions.clone(), vels, instants, seqs)
     }
 
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
@@ -1841,7 +1876,12 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = driver.feedback_ages().into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                self.joint_feedback_instants = driver.feedback_instants();
+                Self::record_driver_feedback_timing(
+                    &mut self.joint_feedback_instants,
+                    &mut self.joint_feedback_seqs,
+                    self.config.dof,
+                    driver.as_ref(),
+                );
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -2232,7 +2272,12 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                self.joint_feedback_instants = drv.feedback_instants();
+                Self::record_driver_feedback_timing(
+                    &mut self.joint_feedback_instants,
+                    &mut self.joint_feedback_seqs,
+                    self.config.dof,
+                    drv.as_ref(),
+                );
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -2282,7 +2327,12 @@ impl SupervisorInner {
             self.feedback_numeric_valid = true;
             self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                 .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-            self.joint_feedback_instants = drv.feedback_instants();
+            Self::record_driver_feedback_timing(
+                &mut self.joint_feedback_instants,
+                &mut self.joint_feedback_seqs,
+                self.config.dof,
+                drv.as_ref(),
+            );
             Self::apply_feedback(
                 &mut self.measured_positions,
                 &mut self.measured_velocities,
@@ -4344,7 +4394,12 @@ impl SupervisorInner {
                             .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
                     } else { self.last_can_feedback_instant = None; }
                     if self.feedback_numeric_valid {
-                        self.joint_feedback_instants = driver.feedback_instants();
+                        Self::record_driver_feedback_timing(
+                    &mut self.joint_feedback_instants,
+                    &mut self.joint_feedback_seqs,
+                    self.config.dof,
+                    driver.as_ref(),
+                );
                         Self::apply_feedback(
                             &mut self.measured_positions,
                             &mut self.measured_velocities,
@@ -4373,6 +4428,10 @@ impl SupervisorInner {
             let now = Instant::now();
             self.joint_feedback_instants.resize(self.config.dof, Some(now));
             self.joint_feedback_instants.fill(Some(now));
+            self.joint_feedback_seqs.resize(self.config.dof, 0);
+            for seq in &mut self.joint_feedback_seqs {
+                *seq = seq.wrapping_add(1);
+            }
         }
         if let Some(errors) = motor_errors {
             self.update_motor_errors(errors);

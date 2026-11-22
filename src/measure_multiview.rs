@@ -501,10 +501,17 @@ async fn sample(ctx: &MacroCtx) -> (Vec<f32>, Vec<f32>) {
     (inner.measured_positions.clone(), arm.iter().map(|&i| inner.measured_velocities.get(i).copied().unwrap_or(0.0)).collect())
 }
 
+/// Measured joints (all), per-arm-joint feedback instants, and per-arm-joint monotonic feedback
+/// sequence counters, read coherently under one lock.
+async fn sample_with_timing(ctx: &MacroCtx) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
+    let inner = ctx.sup.inner().read().await;
+    let (pos, _, instants, seqs) = inner.arm_feedback_snapshot();
+    (pos, instants, seqs)
+}
+
 /// Measured joints (all) and per-arm-joint feedback instants, read coherently under one lock.
 async fn sample_with_instants(ctx: &MacroCtx) -> (Vec<f32>, Vec<Option<Instant>>) {
-    let inner = ctx.sup.inner().read().await;
-    let (pos, _, instants) = inner.arm_feedback_snapshot();
+    let (pos, instants, _) = sample_with_timing(ctx).await;
     (pos, instants)
 }
 
@@ -520,15 +527,29 @@ fn max_feedback_age_ms(now: Instant, instants: &[Option<Instant>]) -> Option<f64
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
-/// Wait until every arm joint has a hardware feedback sample acquired at or after `after`,
+/// Wait until every arm joint has a hardware feedback sample acquired at or after `after` whose
+/// sequence counter has advanced by at least 2 beyond `fence_seqs` (the first update after the
+/// fence may have been queued in the SocketCAN RX buffer before the fence; the second cannot),
 /// bounded by [`FEEDBACK_WAIT_MAX`] and the action deadline / `recheck` invariants.
 /// Returns `(positions, arm_feedback_instants, wait_ms)`.
-async fn sample_fresh_after(ctx: &MacroCtx, plan: &Plan, after: Instant) -> Result<(Vec<f32>, Vec<Option<Instant>>, f64), Stop> {
+async fn sample_fresh_after(
+    ctx: &MacroCtx,
+    plan: &Plan,
+    after: Instant,
+    fence_seqs: &[u64],
+) -> Result<(Vec<f32>, Vec<Option<Instant>>, f64), Stop> {
     let wait_start = Instant::now();
     loop {
         recheck(ctx, plan).await?;
-        let (pos, instants) = sample_with_instants(ctx).await;
-        if !instants.is_empty() && instants.iter().all(|t| t.is_some_and(|ts| ts >= after)) {
+        let (pos, instants, seqs) = sample_with_timing(ctx).await;
+        let ready = !instants.is_empty()
+            && instants.len() == fence_seqs.len()
+            && seqs.len() == fence_seqs.len()
+            && instants
+                .iter()
+                .zip(seqs.iter().zip(fence_seqs.iter()))
+                .all(|(t, (&seq, &base))| t.is_some_and(|ts| ts >= after) && seq.wrapping_sub(base) >= 2);
+        if ready {
             return Ok((pos, instants, wait_start.elapsed().as_secs_f64() * 1000.0));
         }
         if wait_start.elapsed() >= FEEDBACK_WAIT_MAX {
@@ -719,7 +740,8 @@ async fn capture_gray(
             )));
         }
         let t_fetch_done = Instant::now();
-        let (b, inst_b, feedback_wait_b_ms) = sample_fresh_after(ctx, plan, t_fetch_done).await?;
+        let (_, _, fence_seqs) = sample_with_timing(ctx).await;
+        let (b, inst_b, feedback_wait_b_ms) = sample_fresh_after(ctx, plan, t_fetch_done, &fence_seqs).await?;
         let t_b = Instant::now();
         let bracket_duration_ms = (t_b - t_a).as_secs_f64() * 1000.0;
         let age_b_ms = max_feedback_age_ms(t_b, &inst_b);

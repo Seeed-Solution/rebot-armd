@@ -975,19 +975,46 @@ async fn gray_motion_during_bracket_and_fetch_fails_moved() {
     assert!(msg.contains("J4") && msg.contains("limit 2.0"), "{msg}");
 }
 
-struct FeedbackControl {
-    /// Optional per-joint freeze: `(joint_idx, frozen_instant, release_at, step_rad_on_release)`.
-    freeze: Option<(usize, Instant, Option<Instant>, f32)>,
-    applied_step: [f32; 7],
-    instants: [Instant; 7],
+struct ScheduledRxFrame {
+    deliver_at: Instant,
+    joint: usize,
+    step_rad: f32,
 }
 
-struct FeedbackTimingArm {
+/// Queue-backed feedback fake modelling SocketCAN + Damiao decode-time stamping:
+/// frames arrive in `rx_queue`, `read_joint_states()` drains available frames, stamps
+/// `Instant::now()` at decode time, and increments `seqs[joint]` once per decoded frame.
+struct FeedbackControl {
+    /// Joint held off auto-enqueue (until `unhold_at`, or indefinitely if `None`).
+    held_joint: Option<(usize, Option<Instant>)>,
+    /// Frames queued to become readable at `deliver_at` (emulating queued CAN RX frames).
+    pending_rx: VecDeque<ScheduledRxFrame>,
+    /// RX buffer drained by `read_joint_states()`.
+    rx_queue: VecDeque<(usize, f32)>,
+    applied_step: [f32; 7],
+    instants: [Instant; 7],
+    seqs: [u64; 7],
+}
+
+impl FeedbackControl {
+    fn new(now: Instant) -> Self {
+        Self {
+            held_joint: None,
+            pending_rx: VecDeque::new(),
+            rx_queue: VecDeque::new(),
+            applied_step: [0.0; 7],
+            instants: [now; 7],
+            seqs: [1; 7],
+        }
+    }
+}
+
+struct QueuedFeedbackArm {
     inner: common::TestArm,
     ctrl: Arc<Mutex<FeedbackControl>>,
 }
 
-impl ArmDriver for FeedbackTimingArm {
+impl ArmDriver for QueuedFeedbackArm {
     fn capabilities(&self) -> DriverCapabilities { self.inner.capabilities() }
     fn enable_state(&self) -> EnableState { self.inner.enable_state() }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
@@ -1001,29 +1028,46 @@ impl ArmDriver for FeedbackTimingArm {
         let c = self.ctrl.lock().unwrap();
         c.instants.iter().copied().map(Some).collect()
     }
+    fn feedback_seqs(&self) -> Vec<u64> {
+        let c = self.ctrl.lock().unwrap();
+        c.seqs.to_vec()
+    }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let now = Instant::now();
-        let mut c = self.ctrl.lock().unwrap();
-        let mut frozen_j = None;
-        if let Some((j, frozen_at, release_at, step_rad)) = c.freeze {
-            if release_at.is_some_and(|rel| now >= rel) {
-                c.applied_step[j] += step_rad;
-                c.freeze = None;
-            } else {
-                frozen_j = Some((j, frozen_at));
-            }
-        }
-        for i in 0..7 {
-            if let Some((fj, ft)) = frozen_j {
-                if i == fj {
-                    c.instants[i] = ft;
-                    continue;
+        let step = {
+            let mut c = self.ctrl.lock().unwrap();
+            // Release held joint if its unhold deadline arrived.
+            if let Some((_, Some(unhold_at))) = c.held_joint {
+                if now >= unhold_at {
+                    c.held_joint = None;
                 }
             }
-            c.instants[i] = now;
-        }
-        let step = c.applied_step;
-        drop(c);
+            let held = c.held_joint.map(|(j, _)| j);
+            // Enqueue normal 50 Hz bus replies for unheld joints.
+            for j in 0..7 {
+                if held != Some(j) {
+                    let s = c.applied_step[j];
+                    c.rx_queue.push_back((j, s));
+                }
+            }
+            // Move any scheduled queued CAN frames whose delivery time has arrived into rx_queue.
+            let mut remaining = VecDeque::new();
+            while let Some(ev) = c.pending_rx.pop_front() {
+                if now >= ev.deliver_at {
+                    c.rx_queue.push_back((ev.joint, ev.step_rad));
+                } else {
+                    remaining.push_back(ev);
+                }
+            }
+            c.pending_rx = remaining;
+            // Drain rx_queue and stamp at decode time (just like DamiaoArmDriver::read_joint_states).
+            while let Some((j, step_rad)) = c.rx_queue.pop_front() {
+                c.applied_step[j] = step_rad;
+                c.instants[j] = Instant::now();
+                c.seqs[j] = c.seqs[j].wrapping_add(1);
+            }
+            c.applied_step
+        };
         let mut s = self.inner.read_joint_states()?;
         for (i, js) in s.iter_mut().enumerate().take(7) {
             js.position += step[i];
@@ -1068,21 +1112,24 @@ async fn rig_with_driver(config: ArmConfig, driver: Box<dyn ArmDriver>) -> Rig {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_stale() {
-    // 1. Staggered update with a real +8 mrad step on J5 delivered 80 ms AFTER fetch completed:
-    //    if armd accepted cached sample B it would see 0 mrad spread and succeed; waiting for J5's
-    //    fresh post-fetch feedback catches the 8 mrad move -> MOVED naming J5.
+    // 1. Pre-fence queued CAN frame (old 0-step pose) delivered 25 ms AFTER the fence (advancing
+    //    seq by +1 with a post-fence decode timestamp), followed by the genuine post-fence frame
+    //    (+8 mrad step on J5) at 90 ms (seq +2). A timestamp-only fence would accept the queued
+    //    pre-fence frame and miss the move; requiring seq +2 catches J5 -> MOVED.
     {
         let inner_arm = common::TestArm::new();
         inner_arm.0.lock().unwrap().q = START;
-        let now = Instant::now();
-        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
-        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+        let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
         let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
         let ctrl_cb = ctrl.clone();
         *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
             let t = Instant::now();
-            // J5 stays at t - 40 ms until t + 80 ms, then updates with +8 mrad step
-            ctrl_cb.lock().unwrap().freeze = Some((4, t - Duration::from_millis(40), Some(t + Duration::from_millis(80)), 0.008));
+            let mut c = ctrl_cb.lock().unwrap();
+            let prev_step = c.applied_step[4];
+            c.held_joint = Some((4, Some(t + Duration::from_millis(120))));
+            c.pending_rx.push_back(ScheduledRxFrame { deliver_at: t + Duration::from_millis(25), joint: 4, step_rad: prev_step });
+            c.pending_rx.push_back(ScheduledRxFrame { deliver_at: t + Duration::from_millis(90), joint: 4, step_rad: prev_step + 0.008 });
         }));
         let ack = r.start(json!({"pose_refine": "off"})).await;
         let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
@@ -1091,13 +1138,35 @@ async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_st
         assert!(a["message"].as_str().unwrap().contains("J5"), "{a}");
     }
 
-    // 2. Staggered J5 update with 0 step after 70 ms: waits and succeeds, recording feedback_wait_b_ms >= 40 ms.
+    // 2. Only ONE pre-fence queued frame arrives after the fence (seq +1, fresh decode timestamp),
+    //    and no second post-fence update arrives within 500 ms -> fails STALE_TELEMETRY.
     {
         let inner_arm = common::TestArm::new();
         inner_arm.0.lock().unwrap().q = START;
-        let now = Instant::now();
-        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
-        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+        let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
+        let ctrl_cb = ctrl.clone();
+        *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
+            let t = Instant::now();
+            let mut c = ctrl_cb.lock().unwrap();
+            let prev_step = c.applied_step[4];
+            c.held_joint = Some((4, None));
+            c.pending_rx.push_back(ScheduledRxFrame { deliver_at: t + Duration::from_millis(25), joint: 4, step_rad: prev_step });
+        }));
+        let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+        let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+        let a = r.wait(id, 60.0).await;
+        assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("STALE_TELEMETRY")), "{a}");
+    }
+
+    // 3. Staggered 2nd post-fence update for J5 arrives at 80 ms with 0 step -> waits and succeeds,
+    //    recording feedback_wait_b_ms >= 50 ms.
+    {
+        let inner_arm = common::TestArm::new();
+        inner_arm.0.lock().unwrap().q = START;
+        let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+        let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
         let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
         let fired = Arc::new(AtomicBool::new(false));
         let ctrl_cb = ctrl.clone();
@@ -1105,7 +1174,10 @@ async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_st
         *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
             if !fired_cb.swap(true, Ordering::SeqCst) {
                 let t = Instant::now();
-                ctrl_cb.lock().unwrap().freeze = Some((4, t - Duration::from_millis(30), Some(t + Duration::from_millis(70)), 0.0));
+                let mut c = ctrl_cb.lock().unwrap();
+                c.held_joint = Some((4, Some(t + Duration::from_millis(120))));
+                c.pending_rx.push_back(ScheduledRxFrame { deliver_at: t + Duration::from_millis(25), joint: 4, step_rad: 0.0 });
+                c.pending_rx.push_back(ScheduledRxFrame { deliver_at: t + Duration::from_millis(80), joint: 4, step_rad: 0.0 });
             }
         }));
         let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
@@ -1113,21 +1185,19 @@ async fn gray_sample_b_waits_for_staggered_joint_update_and_rejects_cached_or_st
         let a = r.wait(id, 150.0).await;
         assert_eq!(a["state"], "done", "{a}");
         let wait_b = a["measurement"]["views"][0]["feedback_wait_b_ms"].as_f64().unwrap();
-        assert!(wait_b >= 40.0, "expected staggered wait >= 40 ms, got {wait_b}");
+        assert!(wait_b >= 50.0, "expected staggered wait >= 50 ms, got {wait_b}");
     }
 
-    // 3. Frozen J3 feedback never updates after fetch -> fails STALE_TELEMETRY.
+    // 4. Frozen J3 feedback delivers 0 updates after fetch -> fails STALE_TELEMETRY.
     {
         let inner_arm = common::TestArm::new();
         inner_arm.0.lock().unwrap().q = START;
-        let now = Instant::now();
-        let ctrl = Arc::new(Mutex::new(FeedbackControl { freeze: None, applied_step: [0.0; 7], instants: [now; 7] }));
-        let drv = FeedbackTimingArm { inner: inner_arm, ctrl: ctrl.clone() };
+        let ctrl = Arc::new(Mutex::new(FeedbackControl::new(Instant::now())));
+        let drv = QueuedFeedbackArm { inner: inner_arm, ctrl: ctrl.clone() };
         let mut r = rig_with_driver(ArmConfig::rebot_dm(), Box::new(drv)).await;
         let ctrl_cb = ctrl.clone();
         *r.vision.on_gray_fetch.lock().unwrap() = Some(Box::new(move || {
-            let t = Instant::now();
-            ctrl_cb.lock().unwrap().freeze = Some((2, t - Duration::from_millis(30), None, 0.0));
+            ctrl_cb.lock().unwrap().held_joint = Some((2, None));
         }));
         let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
         let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));

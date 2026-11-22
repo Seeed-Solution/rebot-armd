@@ -111,6 +111,11 @@ pub trait ArmDriver: Send {
         self.feedback_ages().into_iter().map(|a| a.and_then(|age| now.checked_sub(age))).collect()
     }
 
+    /// Monotonic per-joint hardware feedback sequence counter, incremented once per decoded
+    /// hardware reply for that joint. Reading a cache does not advance it. Empty means the
+    /// driver does not report explicit counters (supervisor falls back to instant advances).
+    fn feedback_seqs(&self) -> Vec<u64> { Vec::new() }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -258,6 +263,7 @@ pub struct FeetechArmDriver<T: Transport> {
     cached_loads: Vec<f32>,
     pub motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     confirmed_enable_state: EnableState,
     tx_echo: Option<bool>,
     tx_echo_auto: bool,
@@ -304,6 +310,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             cached_loads: vec![0.0; dof],
             motor_status: vec![0; dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             confirmed_enable_state: EnableState::Unknown,
             tx_echo: None,
             tx_echo_auto: false,
@@ -387,6 +394,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.cached_loads = vec![0.0; dof];
             self.motor_status = vec![0; dof];
             self.last_feedback_instant = vec![None; dof];
+            self.feedback_seq.resize(dof, 0);
             self.cached_raw_steps = vec![0; dof];
             self.last_enable_confirmed = vec![None; dof];
             self.missed_enable_polls = vec![0; dof];
@@ -1061,6 +1069,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                                 self.cached_loads[joint_idx] = load;
                                 self.motor_status[joint_idx] = pkt.error;
                                 self.last_feedback_instant[joint_idx] = Some(read_time);
+                                self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
 
                                 replied_ids.insert(pkt.id);
                             }
@@ -1140,6 +1149,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -1812,6 +1825,7 @@ pub struct FashionStarArmDriver<T: Transport> {
     zero_offsets: Vec<u16>,
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
 }
@@ -1825,6 +1839,7 @@ impl<T: Transport> FashionStarArmDriver<T> {
             zero_offsets: vec![fashionstar::DEFAULT_ZERO_OFFSET; dof],
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
         }
@@ -1861,6 +1876,10 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -1964,6 +1983,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
                             let tenth_deg = i16::from_le_bytes([content[0], content[1]]);
                             self.cached_states[joint_idx].position = fashionstar::tenth_deg_to_rad(tenth_deg);
                             self.last_feedback_instant[joint_idx] = Some(Instant::now());
+                            self.feedback_seq[joint_idx] = self.feedback_seq[joint_idx].wrapping_add(1);
                             break;
                         }
                     }
@@ -2026,6 +2046,7 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     cached_states: Vec<JointState>,
     last_target_frames: Vec<Option<CanFrame>>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     motor_status: Vec<u8>,
     is_enabled: bool,
     pending_rearm: bool,
@@ -2066,6 +2087,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             cached_states: vec![JointState::default(); dof],
             last_target_frames: vec![None; dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             motor_status: vec![0; dof],
             is_enabled: false,
             pending_rearm: true,
@@ -2409,6 +2431,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
     }
 
 
@@ -2885,6 +2911,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 temperature: feedback.t_mos.max(feedback.t_rotor),
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
@@ -2994,6 +3021,7 @@ pub struct RobStrideArmDriver<C: CanTransport> {
     default_kd: f32,
     cached_states: Vec<JointState>,
     last_feedback_instant: Vec<Option<Instant>>,
+    feedback_seq: Vec<u64>,
     fault_flags: Vec<u8>,
 }
 
@@ -3009,6 +3037,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
             default_kd: 1.0,
             cached_states: vec![JointState::default(); dof],
             last_feedback_instant: vec![None; dof],
+            feedback_seq: vec![0; dof],
             fault_flags: vec![0; dof],
         }
     }
@@ -3040,6 +3069,10 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_seqs(&self) -> Vec<u64> {
+        self.feedback_seq.clone()
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -3158,6 +3191,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                                 temperature: feedback.mos_temperature,
                             };
                             self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
                             self.fault_flags[idx] = feedback.fault_flags;
                         }
                     }
