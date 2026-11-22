@@ -17,6 +17,9 @@
 //   g. pose generator: >= 20 poses, camera 0.18..0.35 m from the board, tool points >= 0.10 m above the
 //      plane, transitions without IK failure / branch flip, two or more tilt azimuths; bootstrap from
 //      nominal values; re-solve after 8 views
+//   j. re-plan from a pose 15 mm under the clearance (plane estimate moved up after the re-solve): the tour
+//      completes with every move re-checked, no tool point lower than the start; a move to a target below
+//      the clearance stays refused
 // CALM / VIK come from src/api/index.html (blocks CALIB-MATH and VIEW-IK), as in the browser.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -320,6 +323,34 @@ const solveViews = views;
     const stockTr = CW.checkTransition(id4, [0, 0, 0, 0, 0, 0], T_b, { ik: ikOk, X: X_up, plane, clearance: 0.12 });
     const extTr = CW.checkTransition(id4, [0, 0, 0, 0, 0, 0], T_b, { ik: ikOk, X: X_up, plane, clearance: 0.12, extraEndPoints: [[0, 0, -0.15]] });
     check('R7 M8. checkTransition catches extraEndPoints below clearance', stockTr.ok && !extTr.ok && extTr.reason === 'clearance', `stock=${stockTr.ok} ext=${extTr.ok}/${extTr.reason}`);
+  }
+  // j. re-plan from a pose that reads below the clearance: the re-solve moved the plane estimate up (sim e2e:
+  // bootstrap board z -16 mm, refined ~0), so the view the arm is at is 15 mm under the 0.10 m clearance.
+  // Every move out of it used to fail 'clearance' at the first sample: the tour stopped with 0 poses and the
+  // run aborted with 'nopose: clearance'. The tour must now complete, every consecutive move must pass
+  // checkTransition, and none may take a tool point lower than the start.
+  {
+    const clearance = 0.10, h = (q, B) => Math.min(...CW.toolPoints(fk(q), Xtrue).map((p) => p[2] - posOf(B)[2]));
+    const start = poses.find((p) => h(p.q, Tbb) < 0.12);
+    const Tup = make(rotOf(Tbb), add(posOf(Tbb), [0, 0, h(start.q, Tbb) - (clearance - 0.015)]));
+    const h0 = h(start.q, Tup);
+    const g = CW.generatePoses({ Tbb: Tup, board, K: Ktrue, X: Xtrue, q0: start.q, fk, ik, lo, hi, n: 10, exclude: [start.T] });
+    const plane = CW.boardPlane(Tup);
+    const above = (T) => Math.min(...CW.toolPoints(T, Xtrue).map((pt) => pt[2] - plane.p[2])); // plane normal +z
+    // the old rule (every sample >= clearance) refuses the first move at its first 1 cm sample
+    const A0 = fk(start.q), B0 = g.poses.length ? g.poses[0].T : A0, d0 = Math.hypot(...posOf(B0).map((v, k) => v - posOf(A0)[k]));
+    const strictRefuses = above(CW.interpPose(A0, B0, Math.min(1, 0.01 / Math.max(d0, 1e-9)))) < clearance;
+    let prevT = fk(start.q), prevQ = start.q, bad = 0, lowest = Infinity;
+    for (const p of g.poses) {
+      const tr = CW.checkTransition(prevT, prevQ, p.T, { ik, X: Xtrue, plane, clearance, lo, hi });
+      if (!tr.ok) bad++;
+      for (let k = 1; k <= 50; k++) lowest = Math.min(lowest, above(CW.interpPose(prevT, p.T, k / 50)));
+      prevT = p.T; prevQ = tr.ok ? tr.q : p.q;
+    }
+    check('j. tour from a start below the clearance completes', h0 < clearance - 0.01 && strictRefuses && g.poses.length === 10 && bad === 0 && lowest >= h0 - 1e-6 && g.stats.transition === 0,
+      `start height ${h0.toFixed(3)} m (clearance ${clearance}), old rule refuses the first move ${strictRefuses}, tour ${g.poses.length}/10, re-check failures ${bad}, lowest tool point on the way ${lowest.toFixed(3)} m, stats ${JSON.stringify(g.stats)}`);
+    const flat = CW.checkTransition(fk(start.q), start.q, CW.make(rotOf(fk(start.q)), add(posOf(fk(start.q)), [0.03, 0, 0])), { ik, X: Xtrue, plane, clearance, lo, hi });
+    check('j. a start below the clearance may not move to a target below it', !flat.ok && flat.reason === 'clearance', `${flat.ok ? 'ok' : flat.reason}`);
   }
 }
 
