@@ -11,10 +11,10 @@ set -euo pipefail
 # components/libwebsockets/prebuilt built once by its fetch_and_build.sh.
 #
 # RECAMERA_DOCKER=<container>  docker exec into a running sophgo/tpuc_dev container
-#                              (e.g. tpuc_recamera). The sources are copied in with
-#                              docker cp, built under /tmp/rebot-vision-build in the
-#                              container, and the binary is copied out. Paths below
-#                              are inside the container:
+#                              (e.g. tpuc_recamera). The sources are copied into an
+#                              isolated temporary directory in the container, built
+#                              there, verified, and the stripped binary is copied out.
+#                              Paths below are inside the container:
 #   RECAMERA_ROOT     default /recamera
 #   RECAMERA_GCC      default $RECAMERA_ROOT/host-tools/gcc/riscv64-linux-musl-x86_64/bin
 #   SG200X_SDK_PATH   default $RECAMERA_ROOT/sg2002_recamera_emmc
@@ -32,34 +32,94 @@ OUT_DIR="${REPO_ROOT}/target/vision-riscv"
 UNPINNED="-DREBOT_VISION_ALLOW_UNPINNED=$([ "${REBOT_VISION_ALLOW_UNPINNED:-0}" = 1 ] && echo ON || echo OFF)"
 mkdir -p "${OUT_DIR}"
 
+OUT_BIN="${OUT_DIR}/rebot-vision"
+OUT_MAP="${OUT_DIR}/rebot-vision.map"
+STAGE_BIN="${OUT_DIR}/.rebot-vision.tmp.$$"
+STAGE_MAP="${OUT_DIR}/.rebot-vision.map.tmp.$$"
+CONTAINER_WORK=""
+
+cleanup() {
+    rm -f "${STAGE_BIN}" "${STAGE_MAP}"
+    if [ -n "${CONTAINER_WORK}" ] && [ -n "${RECAMERA_DOCKER:-}" ]; then
+        docker exec "${RECAMERA_DOCKER}" rm -rf "${CONTAINER_WORK}" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+# Never leave a previous artifact behind if this build fails.
+rm -f "${OUT_BIN}" "${OUT_MAP}"
+
 if [ -n "${RECAMERA_DOCKER:-}" ]; then
     C="${RECAMERA_DOCKER}"
     R="${RECAMERA_ROOT:-/recamera}"
     GCC_BIN="${RECAMERA_GCC:-$R/host-tools/gcc/riscv64-linux-musl-x86_64/bin}"
     SDK="${SG200X_SDK_PATH:-$R/sg2002_recamera_emmc}"
     SSCMA="${SSCMA_ROOT:-$R/sscma-example-sg200x}"
-    W=/tmp/rebot-vision-build
-    docker exec "$C" sh -c "rm -rf $W/src && mkdir -p $W/src $W/build"
-    docker cp "${SRC_DIR}/." "$C:$W/src"
-    docker exec "$C" bash -c "set -e
-        export PATH=${GCC_BIN}:\$PATH SG200X_SDK_PATH=${SDK} SSCMA_ROOT=${SSCMA}
-        test -d \$SSCMA_ROOT/components/libwebsockets/prebuilt || { echo 'run components/libwebsockets/fetch_and_build.sh in SSCMA_ROOT first' >&2; exit 1; }
-        cmake -S $W/src -B $W/build -DCMAKE_BUILD_TYPE=Release ${UNPINNED} >$W/configure.log || { cat $W/configure.log; exit 1; }
-        tail -n 3 $W/configure.log
-        cmake --build $W/build -j\$(nproc) -- --no-print-directory 2>&1 | grep -E 'error|warning: unused|Linking|Built target rebot-vision' || true
-        test -x $W/build/rebot-vision
-        riscv64-unknown-linux-musl-strip -o $W/build/rebot-vision.stripped $W/build/rebot-vision"
-    docker cp "$C:$W/build/rebot-vision.stripped" "${OUT_DIR}/rebot-vision"
-    docker cp "$C:$W/build/rebot-vision.map" "${OUT_DIR}/rebot-vision.map" 2>/dev/null || true
+    CONTAINER_WORK="$(docker exec "$C" mktemp -d /tmp/rebot-vision-build.XXXXXX)"
+    docker exec "$C" mkdir -p "${CONTAINER_WORK}/src" "${CONTAINER_WORK}/build"
+    docker cp "${SRC_DIR}/." "$C:${CONTAINER_WORK}/src"
+    docker exec "$C" bash -s -- "${CONTAINER_WORK}" "${GCC_BIN}" "${SDK}" "${SSCMA}" "${UNPINNED}" <<'EOF'
+set -euo pipefail
+W="$1"
+GCC_BIN="$2"
+SDK="$3"
+SSCMA="$4"
+UNPINNED="$5"
+
+export PATH="${GCC_BIN}:${PATH}"
+export SG200X_SDK_PATH="${SDK}"
+export SSCMA_ROOT="${SSCMA}"
+
+test -d "${SSCMA_ROOT}/components/libwebsockets/prebuilt" || {
+    echo "run components/libwebsockets/fetch_and_build.sh in SSCMA_ROOT first" >&2
+    exit 1
+}
+
+if ! cmake -S "${W}/src" -B "${W}/build" -DCMAKE_BUILD_TYPE=Release "${UNPINNED}" >"${W}/configure.log" 2>&1; then
+    cat "${W}/configure.log" >&2
+    exit 1
+fi
+tail -n 3 "${W}/configure.log"
+
+if ! cmake --build "${W}/build" -j"$(nproc)" -- --no-print-directory >"${W}/build.log" 2>&1; then
+    cat "${W}/build.log" >&2
+    exit 1
+fi
+grep -E 'warning: unused|Linking|Built target rebot-vision' "${W}/build.log" || true
+
+test -x "${W}/build/rebot-vision"
+riscv64-unknown-linux-musl-strip -o "${W}/build/rebot-vision.stripped" "${W}/build/rebot-vision"
+riscv64-unknown-linux-musl-readelf -h "${W}/build/rebot-vision.stripped" | grep -q 'RISC-V' || {
+    echo "rebot-vision artifact is not a RISC-V ELF binary" >&2
+    exit 1
+}
+EOF
+    docker cp "$C:${CONTAINER_WORK}/build/rebot-vision.stripped" "${STAGE_BIN}"
+    docker cp "$C:${CONTAINER_WORK}/build/rebot-vision.map" "${STAGE_MAP}" 2>/dev/null || true
 else
     : "${SG200X_SDK_PATH:?set SG200X_SDK_PATH or RECAMERA_DOCKER}"
     : "${SSCMA_ROOT:?set SSCMA_ROOT or RECAMERA_DOCKER}"
     command -v riscv64-unknown-linux-musl-g++ >/dev/null || { echo "riscv64-unknown-linux-musl-g++ not in PATH" >&2; exit 1; }
-    B="${REPO_ROOT}/target/vision-riscv/build"
+    B="$(mktemp -d "${OUT_DIR}/build.XXXXXX")"
+    trap 'rm -rf "$B"; cleanup' EXIT
     cmake -S "${SRC_DIR}" -B "$B" -DCMAKE_BUILD_TYPE=Release "${UNPINNED}"
     cmake --build "$B" -j"$(nproc)"
-    riscv64-unknown-linux-musl-strip -o "${OUT_DIR}/rebot-vision" "$B/rebot-vision"
+    test -x "$B/rebot-vision"
+    riscv64-unknown-linux-musl-strip -o "${STAGE_BIN}" "$B/rebot-vision"
+    riscv64-unknown-linux-musl-readelf -h "${STAGE_BIN}" | grep -q 'RISC-V' || {
+        echo "rebot-vision artifact is not a RISC-V ELF binary" >&2
+        exit 1
+    }
+    if [ -f "$B/rebot-vision.map" ]; then
+        cp "$B/rebot-vision.map" "${STAGE_MAP}"
+    fi
 fi
 
-chmod 0755 "${OUT_DIR}/rebot-vision"
-echo "rebot-vision: ${OUT_DIR}/rebot-vision ($(ls -lh "${OUT_DIR}/rebot-vision" | awk '{print $5}'))"
+chmod 0755 "${STAGE_BIN}"
+mv -f "${STAGE_BIN}" "${OUT_BIN}"
+if [ -f "${STAGE_MAP}" ]; then
+    mv -f "${STAGE_MAP}" "${OUT_MAP}"
+fi
+
+SHA256="$(sha256sum "${OUT_BIN}" | awk '{print $1}')"
+echo "rebot-vision: ${OUT_BIN} ($(ls -lh "${OUT_BIN}" | awk '{print $5}'), sha256=${SHA256})"
