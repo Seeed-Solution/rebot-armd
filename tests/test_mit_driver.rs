@@ -480,3 +480,25 @@ fn mit_unconfirmed_disable_fails_and_keeps_the_fence() {
     d.set_torque(false).expect("confirmed disable");
     assert!(d.mit_fence_trip().is_none());
 }
+
+/// Review round 4, #1: the re-enable after a fence trip restores the base mode with POS_VEL frames
+/// only (no MIT double hold) until the mode is confirmed; no MIT frame before a new handover.
+#[test]
+fn mit_reenable_after_a_trip_sends_no_mit_frame() {
+    let (mut d, bus, clock) = mit_rig(2000);
+    bus.with(|s| s.motors[J4].silent = true);
+    clock.advance(Duration::from_millis(50));
+    let _ = d.read_joint_states();
+    assert!(d.mit_fence_trip().is_some());
+    d.acknowledge_mit_fence_trip();
+    bus.with(|s| { s.motors[J4].silent = false; s.push_all_feedback(); });
+    clock.advance(HOLDOFF);
+    let _ = d.read_joint_states();
+    let _ = d.read_joint_states();
+    bus.clear_log();
+    d.set_torque(true).expect("rearm");
+    assert_eq!(d.joint_control_modes()[J4], Some(DamiaoControlMode::PosVel));
+    let mit: Vec<_> = bus.tx_log().into_iter().filter(|f| f.id == 4 && ![damiao::CMD_ENABLE, damiao::CMD_DISABLE, damiao::CMD_CLEAR_FAULTS].contains(&f.data)).collect();
+    assert!(mit.is_empty(), "MIT frames on the re-enable after a trip: {mit:?}");
+    assert!(bus.tx_log().iter().any(|f| f.id == 0x104), "POS_VEL hold with the base-mode restore");
+}

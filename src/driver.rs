@@ -2169,6 +2169,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_fence_holdoff: Duration,
     /// The operator cleared the trip (`acknowledge_mit_fence_trip`): polls may resume.
     mit_fence_acked: bool,
+    /// MIT tracking armed a fence since the last confirmed enable: base-mode restores use POS_VEL
+    /// frames only.
+    mit_tracking_used: bool,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
@@ -2219,6 +2222,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
+            mit_tracking_used: false,
         }
     }
 
@@ -2957,6 +2961,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) {
+        if deadline.is_some() { self.mit_tracking_used = true; }
         self.mit_fence = deadline;
         self.mit_fence_holdoff = holdoff;
         self.mit_fence_last_tx = deadline.map(|_| self.now());
@@ -3226,7 +3231,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if !stray.is_empty() {
                 let base = vec![self.control_mode; self.motor_ids.len()];
                 let hold: Vec<JointTarget> = self.cached_states.iter().map(|s| JointTarget::position(s.position)).collect();
-                let failed = self.write_modes(&stray, &base, &hold, true);
+                // after MIT tracking (fence armed, tripped or used since the last confirmed enable)
+                // the base mode is restored with POS_VEL frames only: no MIT frame from cached
+                // positions before the mode is confirmed (a new handover is the only way back)
+                let dual = !self.mit_tracking_used;
+                let failed = self.write_modes(&stray, &base, &hold, dual);
                 if !failed.is_empty() {
                     self.is_enabling = false;
                     self.is_enabled = false;
@@ -3325,6 +3334,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.mit_fence = None;
             self.mit_fence_trip = None;
             self.mit_fence_acked = false;
+            self.mit_tracking_used = false;
             self.mit_fence_last_tx = None;
             Ok(())
         }
