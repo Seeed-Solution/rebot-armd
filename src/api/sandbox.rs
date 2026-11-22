@@ -4990,6 +4990,10 @@ pub async fn activate(
                 }
                 {
                     let mut tx_w = state.tx_state.write().await;
+                    *tx_w = ActivationTxState::Prepared { tx_id: tx_id.clone() };
+                }
+                {
+                    let mut tx_w = state.tx_state.write().await;
                     *tx_w = ActivationTxState::Committing { tx_id: tx_id.clone() };
                 }
 

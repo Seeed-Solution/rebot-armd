@@ -1789,20 +1789,29 @@ pub fn compose_mjcf(
         // Update base TCP site pos relative to the base site's zero-offset pose
         // (p_tcp = p_base_site + R_base_site * tcp_offset), preserving base pose for [0, 0, 0].
         if tm.tcp_offset.is_some() || skip_range.is_some() {
-            let (site_node, base_pos, r_site) = if let Some((node, _, pos, rot)) = cached_tcp_site {
-                (node, pos, rot)
+            let (site_node, composed_pos) = if let Some((node, _, base_pos, r_site)) = cached_tcp_site {
+                let pos = if resolved_tcp == [0.0; 3] {
+                    base_pos
+                } else {
+                    crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+                };
+                (node, pos)
             } else {
                 let node = find_active_tcp_site(&base_doc, &edits).ok_or_else(|| {
                     "Base MJCF is missing an active <site name=\"tcp\"> element to update tcp_offset".to_string()
                 })?;
                 check_tcp_site_supported(&base_doc, node)?;
-                let (pos, rot) = parse_site_pos_and_rot(&base_doc, node)?;
-                (node, pos, rot)
-            };
-            let composed_pos = if resolved_tcp == [0.0; 3] {
-                base_pos
-            } else {
-                crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+                let base_pos = match node.attribute("pos") {
+                    Some(raw) => parse_mjcf_vec3(raw, "pos")?,
+                    None => [0.0; 3],
+                };
+                let pos = if resolved_tcp == [0.0; 3] {
+                    base_pos
+                } else {
+                    let r_site = parse_mjcf_site_rotation(&base_doc, node)?;
+                    crate::kinematics::add(&base_pos, &crate::kinematics::mat_vec(&r_site, &resolved_tcp))
+                };
+                (node, pos)
             };
             let pos_val = format!(
                 "{} {} {}",

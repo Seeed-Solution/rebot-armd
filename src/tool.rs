@@ -287,11 +287,19 @@ pub fn prepare_commissioning_confirm(
 fn check_commissioning_fresh(
     inner: &crate::supervisor::SupervisorInner,
     prepared: &PreparedToolCommissioning,
+    reject_busy: bool,
 ) -> Result<(), crate::supervisor::ArmError> {
     if inner.tool_commissioning_revision != prepared.base_revision {
         return Err(crate::supervisor::ArmError::PolicyRevisionMismatch {
             expected: prepared.base_revision,
             current: inner.tool_commissioning_revision,
+        });
+    }
+    if reject_busy && inner.calibration_busy {
+        return Err(crate::supervisor::ArmError::Rejected {
+            status: 409,
+            code: "CONFIG_BUSY".into(),
+            message: "a camera calibration apply or restore is running".into(),
         });
     }
     if inner.config.active_tool.id != prepared.tool_id
@@ -309,15 +317,7 @@ pub fn precheck_commissioning_confirm(
     inner: &crate::supervisor::SupervisorInner,
     prepared: &PreparedToolCommissioning,
 ) -> Result<(), crate::supervisor::ArmError> {
-    check_commissioning_fresh(inner, prepared)?;
-    if inner.calibration_busy {
-        return Err(crate::supervisor::ArmError::Rejected {
-            status: 409,
-            code: "CONFIG_BUSY".into(),
-            message: "a camera calibration apply or restore is running".into(),
-        });
-    }
-    Ok(())
+    check_commissioning_fresh(inner, prepared, true)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -325,7 +325,7 @@ pub fn commit_commissioning_confirm(
     inner: &mut crate::supervisor::SupervisorInner,
     prepared: PreparedToolCommissioning,
 ) -> Result<(ActiveToolInfo, u64), crate::supervisor::ArmError> {
-    check_commissioning_fresh(inner, &prepared)?;
+    check_commissioning_fresh(inner, &prepared, false)?;
     inner.config.active_tool.commissioning_required = false;
     inner.tool_commissioning_confirmed_at = Some(prepared.confirmed_at);
     inner.tool_commissioning_revision += 1;
@@ -822,6 +822,39 @@ pub fn canonical_tool_payload_json(
         grasp_height_m,
         edge_to_low_m,
     )
+}
+
+/// Compute `v1:<sha256>` digest for a resolved `f64` tool configuration.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_tool_config_digest_f64(
+    robot_id: &str,
+    tool_id: &str,
+    kind: &str,
+    tcp_offset_m: [f64; 3],
+    permanent_tool_check_points_end_m: &[[f64; 3]],
+    physical_contact_end_m: Option<[f64; 3]>,
+    contact_opening_m: Option<f64>,
+    dynamics: Option<&ToolDynamics>,
+    gripper_policy: Option<&CanonicalGripperInput>,
+    max_grasp_width_m: Option<f64>,
+    grasp_height_m: Option<f64>,
+    edge_to_low_m: Option<f64>,
+) -> String {
+    let json = canonical_tool_payload_json_f64(
+        robot_id,
+        tool_id,
+        kind,
+        tcp_offset_m,
+        permanent_tool_check_points_end_m,
+        physical_contact_end_m,
+        contact_opening_m,
+        dynamics,
+        gripper_policy,
+        max_grasp_width_m,
+        grasp_height_m,
+        edge_to_low_m,
+    );
+    format!("v1:{}", crate::gravity::compute_sha256(json.as_bytes()))
 }
 
 /// Compute `v1:<sha256>` digest for a resolved tool configuration.

@@ -1847,6 +1847,15 @@ pub fn floor_view(profile: f32, c: Option<&CalibrationFile>, fp: &str) -> Value 
     floor_json(profile, effective_floor(profile, c, fp))
 }
 
+pub fn floor_view_for(
+    profile: f32,
+    c: Option<&CalibrationFile>,
+    fp: &str,
+    active_tool: &crate::tool::ActiveToolInfo,
+) -> Value {
+    floor_view_for_with_legacy(profile, c, fp, None, active_tool)
+}
+
 pub fn floor_view_for_with_legacy(
     profile: f32,
     c: Option<&CalibrationFile>,
