@@ -791,9 +791,15 @@ export const toolPoints = (Tend, X, extraEndPoints = null) => {
 };
 /* Straight-line transition A -> B checked at interpolated points (<= stepM / stepRad apart) with the IK
    (ik(T, qSeed) -> { ok, q }); refuses an IK failure, a joint jump > maxJointStep between samples (branch
-   flip), joint limits, a tool point below the clearance plane. Returns { ok, q, reason, at }. */
+   flip), joint limits, a tool point below the clearance plane. Returns { ok, q, reason, at }.
+   A start below the clearance (the plane estimate moved up after a re-solve, so the pose the arm is at now
+   reads lower than when it was planned) would refuse every move out of it. Such a start may only move to a
+   target B above the clearance, and no tool point on the way may go lower than the start's lowest one. */
 export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, extraEndPoints = null, stepM = 0.01, stepRad = 0.05, maxJointStep = 0.25 }) {
   const d = norm3(sub3(posOf(B), posOf(A))), a = norm3(logRot(mm(tr(rotOf(A)), rotOf(B))));
+  const height = (T) => Math.min(...toolPoints(T, X, extraEndPoints).map((p) => dot3(sub3(p, plane.p), plane.n)));
+  const floor = plane ? Math.min(clearance, height(A)) : 0;
+  if (plane && floor < clearance && height(B) < clearance) return { ok: false, reason: 'clearance', at: 1 };
   const n = Math.max(1, Math.ceil(Math.max(d / stepM, a / stepRad)));
   let q = qA.slice();
   for (let k = 1; k <= n; k++) {
@@ -801,7 +807,7 @@ export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, ext
     if (!s || !s.ok) return { ok: false, reason: 'ik', at: k / n };
     if (s.q.some((v, i) => Math.abs(v - q[i]) > maxJointStep)) return { ok: false, reason: 'flip', at: k / n };
     if (lo && s.q.some((v, i) => v < lo[i] - 1e-6 || v > hi[i] + 1e-6)) return { ok: false, reason: 'limits', at: k / n };
-    if (plane && toolPoints(T, X, extraEndPoints).some((p) => dot3(sub3(p, plane.p), plane.n) < clearance)) return { ok: false, reason: 'clearance', at: k / n };
+    if (plane && height(T) < floor) return { ok: false, reason: 'clearance', at: k / n };
     q = s.q;
   }
   return { ok: true, q };
