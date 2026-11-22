@@ -2758,3 +2758,174 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
     let _ = drv.read_joint_states();
     assert_eq!(drv.take_recovery_writes(), vec![0], "successful recovery transmit must be recorded");
 }
+
+/// Review 2 B1: One joint's Damiao recovery must NOT wipe issued history for unaffected
+/// moving/lagging joints or reseed the whole arm to measured position with zero velocity.
+#[test]
+fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
+    use armd::driver::DamiaoArmDriver;
+    use armd::protocol::damiao::{self, DamiaoLimits};
+    use armd::transport::{CanFrame, CanTransport, TransportError};
+    use std::collections::VecDeque;
+
+    struct MovingRecoveryBus {
+        rx: VecDeque<CanFrame>,
+        tx_log: Vec<CanFrame>,
+        q_meas: [f32; 7],
+        drop_rx: [bool; 7],
+        limits: DamiaoLimits,
+    }
+    impl MovingRecoveryBus {
+        fn new(q0: [f32; 7]) -> Self {
+            Self {
+                rx: VecDeque::new(),
+                tx_log: Vec::new(),
+                q_meas: q0,
+                drop_rx: [false; 7],
+                limits: DamiaoLimits::default(),
+            }
+        }
+        fn push_feedback(&mut self, i: usize) {
+            let id = (i + 1) as u8;
+            let p_u = damiao::float_to_uint(self.q_meas[i], self.limits.p_min, self.limits.p_max, 16);
+            let frame = CanFrame::new_standard(
+                0x10 + u16::from(id),
+                &[0x10 | id, (p_u >> 8) as u8, p_u as u8, 0, 0, 0, 30, 30],
+            )
+            .unwrap();
+            self.rx.push_back(frame);
+        }
+    }
+    #[derive(Clone)]
+    struct SharedBus(Arc<Mutex<MovingRecoveryBus>>);
+    impl CanTransport for SharedBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let mut s = self.0.lock().unwrap();
+            s.tx_log.push(*frame);
+            if frame.data == [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC] && (1..=7).contains(&frame.id) {
+                s.push_feedback((frame.id - 1) as usize);
+            } else if (0x101..=0x107).contains(&frame.id) {
+                let idx = (frame.id - 0x101) as usize;
+                if !s.drop_rx[idx] {
+                    s.push_feedback(idx);
+                }
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.0.lock().unwrap().rx.pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
+    let bus_state = Arc::new(Mutex::new(MovingRecoveryBus::new(q0)));
+    let damiao_drv = DamiaoArmDriver::new(SharedBus(bus_state.clone()), vec![1, 2, 3, 4, 5, 6, 7]);
+
+    // Enable tracking on both J1 and J2.
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    jt.joints[0].strategy = TrackingStrategy::PositionLead;
+    jt.joints[0].lag_s = 0.68;
+    jt.joints[1].strategy = TrackingStrategy::PositionLead;
+    jt.joints[1].lag_s = 0.68;
+    let cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(jt),
+        ..ArmConfig::rebot_dm()
+    };
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(damiao_drv));
+    inner.lease_enabled = false;
+    inner.commanded_positions = q0.to_vec();
+    inner.measured_positions = q0.to_vec();
+    inner.target_positions = q0.to_vec();
+    inner.set_torque(true).unwrap();
+    inner.tick(DT);
+    assert!(inner.safety.state().is_operational());
+
+    // Drive J2 along a smooth trajectory while J2 physically lags behind its issued command
+    // (simulating real motor lag on unaffected joint 2).
+    let mut goal = q0.to_vec();
+    goal[1] += 0.20;
+    let traj = TrajectoryPlanner::plan(&q0, &[0.0; 7], &goal, &[0.0; 7], Some(4.0), &inner.config.limits).unwrap();
+    let _ = inner.safety.mark_motion_started();
+    inner.active_trajectory = Some(armd::motion::ActiveTrajectory::quintic(traj, None));
+    for _ in 0..55 {
+        inner.tick(DT);
+        // J2 trails its nominal position by ~0.04 rad while moving cleanly.
+        let mut s = bus_state.lock().unwrap();
+        s.q_meas[1] = inner.commanded_positions[1] - 0.04;
+        for i in 0..7 {
+            s.push_feedback(i);
+        }
+    }
+    let j2_issued_before = inner.tracking.last_issued_positions.as_ref().unwrap()[1];
+    let j2_nom_before = inner.commanded_positions[1];
+    let j2_meas_before = bus_state.lock().unwrap().q_meas[1];
+    assert!(
+        j2_issued_before - j2_nom_before >= 0.015,
+        "J2 must have active lead before J1 recovery (issued={j2_issued_before:.4}, nom={j2_nom_before:.4})"
+    );
+    assert!(
+        j2_issued_before - j2_meas_before >= 0.050,
+        "J2 must be lagging significantly behind its issued target"
+    );
+
+    // Delay ONLY J1's RX past 45 ms so Damiao emits an autonomous recovery write for J1 only.
+    {
+        let mut s = bus_state.lock().unwrap();
+        s.rx.clear();
+        s.drop_rx[0] = true;
+        s.tx_log.clear();
+    }
+    std::thread::sleep(Duration::from_millis(55));
+    {
+        let mut s = bus_state.lock().unwrap();
+        for i in 1..7 {
+            s.push_feedback(i);
+        }
+    }
+    inner.tick(DT);
+    assert!(inner.tracking.recovery_suspended, "J1 recovery must suspend compensated writes");
+    // B1 invariant: unaffected J2's last issued position MUST be preserved (not cleared!).
+    assert_eq!(
+        inner.tracking.last_issued_positions.as_ref().map(|v| v[1]),
+        Some(j2_issued_before),
+        "unaffected J2's issued history must be preserved during J1 recovery"
+    );
+
+    // Restore J1 RX and push fresh post-recovery feedback for all joints.
+    {
+        let mut s = bus_state.lock().unwrap();
+        s.drop_rx[0] = false;
+        s.tx_log.clear();
+        for i in 0..7 {
+            s.push_feedback(i);
+        }
+    }
+    inner.tick(DT);
+    assert!(!inner.tracking.recovery_suspended, "fresh post-recovery feedback must clear suspension");
+    assert!(inner.safety.state().is_operational(), "recovery resume must stay operational: {:?}", inner.safety.state());
+
+    // Inspect the first resumed CAN frame sent to unaffected motor 2 (0x102):
+    // It must ramp smoothly from `j2_issued_before` within velocity limits, NOT jump by >0.05 rad to `j2_meas_before`!
+    let resumed_tx = bus_state.lock().unwrap().tx_log.clone();
+    let j2_resumed = resumed_tx
+        .iter()
+        .find(|f| f.id == 0x102)
+        .map(|f| f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]))
+        .expect("expected resumed POS_VEL frame on 0x102 for unaffected J2");
+    let step_v_j2 = ((j2_resumed - j2_issued_before) as f64 / DT).abs();
+    let max_v_j2 = inner.config.limits[1].max_velocity as f64;
+    assert!(
+        step_v_j2 <= max_v_j2 + 1e-2,
+        "unaffected J2 took an unchecked step on J1 recovery resume: prev={j2_issued_before:.4} -> resumed={j2_resumed:.4} (meas={j2_meas_before:.4}, v={step_v_j2:.3} > {max_v_j2:.3})"
+    );
+    assert!(
+        (j2_resumed - j2_meas_before).abs() > 0.020,
+        "unaffected J2 must NOT have been reseeded straight to lagging measured pose"
+    );
+}

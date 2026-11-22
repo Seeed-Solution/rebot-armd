@@ -4446,16 +4446,25 @@ impl SupervisorInner {
                     && self.measured_positions.iter().all(|q| q.is_finite());
                 if all_fresh_post_recovery {
                     let gripper_idx = self.config.gripper_index();
-                    for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
-                        if Some(i) != gripper_idx {
-                            let l = &self.config.limits[i];
-                            *c = m.clamp(l.min_position, l.max_position);
+                    let recovered: Vec<usize> = self
+                        .tracking
+                        .recovery_joints
+                        .iter()
+                        .map(|&(j, _)| j)
+                        .collect();
+                    let mut recovered_updates = Vec::with_capacity(recovered.len());
+                    for &j in &recovered {
+                        if j < self.config.dof && Some(j) != gripper_idx {
+                            let l = &self.config.limits[j];
+                            let clamped = self.measured_positions[j].clamp(l.min_position, l.max_position);
+                            self.commanded_positions[j] = clamped;
+                            self.target_positions[j] = clamped;
+                            recovered_updates.push((j, clamped));
                         }
                     }
-                    self.target_positions = self.commanded_positions.clone();
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.tracking.seed(&self.commanded_positions);
+                    self.tracking.resume_from_recovery(&recovered_updates);
                 }
             }
         }
@@ -5219,6 +5228,7 @@ impl SupervisorInner {
             && self.active_trajectory.is_none()
             && !self.pending_normal_unload
             && self.gravity_comp.is_none()
+            && !self.tracking.recovery_suspended
             && !self.safety.state().is_stopped()
         {
             // A stale/dropped target requests zero velocity. The same feasible

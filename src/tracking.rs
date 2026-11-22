@@ -214,11 +214,10 @@ impl TrackingRuntime {
     }
 
     /// Suspend compensated writes after autonomous driver recovery writes until
-    /// confirmed fresh post-recovery feedback establishes a clean baseline.
+    /// confirmed fresh post-recovery feedback establishes a clean baseline for
+    /// the recovered joint(s). Preserves unaffected joints' issued history so they
+    /// never suffer an unchecked step on resume.
     pub fn suspend_for_recovery(&mut self, joints: &[usize], at: std::time::Instant) {
-        self.history_state = TrackingHistoryState::Unknown;
-        self.last_issued_positions = None;
-        self.last_issued_velocities = None;
         self.ws_min_depths = None;
         self.recovery_suspended = true;
         for &j in joints {
@@ -227,6 +226,30 @@ impl TrackingRuntime {
             } else {
                 self.recovery_joints.push((j, at));
             }
+        }
+    }
+
+    /// Resume after post-recovery feedback confirms the recovered joint(s).
+    /// Updates issued history ONLY for `recovered_positions`, preserving unaffected
+    /// joints' last issued targets (or keeping `Unknown` if no prior history existed).
+    pub fn resume_from_recovery(&mut self, recovered_positions: &[(usize, f32)]) {
+        self.recovery_suspended = false;
+        self.recovery_joints.clear();
+        self.ws_min_depths = None;
+        if let Some(prev_q) = self.last_issued_positions.as_mut() {
+            let dof = prev_q.len();
+            let prev_v = self
+                .last_issued_velocities
+                .get_or_insert_with(|| vec![0.0; dof]);
+            prev_v.fill(0.0);
+            for &(j, q) in recovered_positions {
+                if j < dof && q.is_finite() {
+                    prev_q[j] = q;
+                }
+            }
+        } else {
+            self.history_state = TrackingHistoryState::Unknown;
+            self.last_issued_velocities = None;
         }
     }
 
