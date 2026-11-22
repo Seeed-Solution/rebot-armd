@@ -447,8 +447,24 @@ void dp_mark(const Contour& c, size_t i, size_t j, double eps, std::vector<char>
     }
 }
 
-Contour simplify_closed(const Contour& poly, double eps, int max_vertices) {
-    if (poly.size() <= 3 || max_vertices < 3) return poly;
+// every k-th vertex so that at most n remain (the first kept)
+Contour subsample(const Contour& poly, size_t n) {
+    if (poly.size() <= n || n == 0) return poly;
+    Contour out;
+    out.reserve(n);
+    for (size_t k = 0; k < n; ++k) out.push_back(poly[k * poly.size() / n]);
+    return out;
+}
+
+// Bounded work: a contour longer than kMaxSimplifyInput is first subsampled to it (Douglas-Peucker
+// is O(n^2) on a jagged boundary), then one Douglas-Peucker pass at `eps`; a result still over
+// `max_vertices` is subsampled to it. Never fewer than min(3, input) vertices.
+constexpr size_t kMaxSimplifyInput = 2048;
+
+Contour simplify_closed(const Contour& in, double eps, int max_vertices) {
+    const size_t cap = static_cast<size_t>(std::max(3, max_vertices));
+    const Contour poly = subsample(in, kMaxSimplifyInput);
+    if (poly.size() <= 3) return poly;
     size_t far = 1;
     double fd = -1;
     for (size_t k = 1; k < poly.size(); ++k) {
@@ -461,20 +477,18 @@ Contour simplify_closed(const Contour& poly, double eps, int max_vertices) {
     // the chain far .. n-1, 0 as its own array
     Contour wrap(poly.begin() + static_cast<long>(far), poly.end());
     wrap.push_back(poly[0]);
-    double e = std::max(eps, 1e-6);
-    for (;;) {
-        std::vector<char> keep(poly.size(), 0), keep2(wrap.size(), 0);
-        keep[0] = keep[far] = 1;
-        dp_mark(poly, 0, far, e, keep);
-        dp_mark(wrap, 0, wrap.size() - 1, e, keep2);
-        for (size_t k = 0; k + 1 < wrap.size(); ++k)
-            if (keep2[k]) keep[far + k] = 1;
-        Contour out;
-        for (size_t k = 0; k < poly.size(); ++k)
-            if (keep[k]) out.push_back(poly[k]);
-        if (static_cast<int>(out.size()) <= max_vertices) return out;
-        e *= 2;
-    }
+    std::vector<char> keep(poly.size(), 0), keep2(wrap.size(), 0);
+    keep[0] = keep[far] = 1;
+    dp_mark(poly, 0, far, std::max(eps, 1e-6), keep);
+    dp_mark(wrap, 0, wrap.size() - 1, std::max(eps, 1e-6), keep2);
+    for (size_t k = 0; k + 1 < wrap.size(); ++k)
+        if (keep2[k]) keep[far + k] = 1;
+    Contour out;
+    for (size_t k = 0; k < poly.size(); ++k)
+        if (keep[k]) out.push_back(poly[k]);
+    // a pass that dropped below 3 (a degenerate chain) keeps the input instead
+    if (out.size() < 3) out = poly;
+    return subsample(out, cap);
 }
 
 }  // namespace

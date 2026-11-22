@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -389,6 +391,50 @@ static void test_contour_bounded() {
     CHECK(c16.size() <= 16 && c16.size() >= 4);
 }
 
+static void bbox(const Contour& c, float& x0, float& y0, float& x1, float& y1) {
+    x0 = y0 = 1e9f;
+    x1 = y1 = -1e9f;
+    for (const auto& p : c) {
+        x0 = std::min(x0, p[0]);
+        y0 = std::min(y0, p[1]);
+        x1 = std::max(x1, p[0]);
+        y1 = std::max(y1, p[1]);
+    }
+}
+
+static void test_contour_comb_and_worst_case() {
+    // a 160 x 15 comb: a 3-row spine, 1-cell teeth every 2 columns; the outline has 4 corners per
+    // tooth (> 128): reduced to the cap, never collapsed
+    const int w = 160, h = 15;
+    std::vector<uint8_t> m(w * h, 0);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) m[y * w + x] = (y < 3 || x % 2 == 0);
+    Contour c = mask_exterior_contour(m.data(), w, h, w);
+    CHECK(c.size() >= 3 && c.size() <= static_cast<size_t>(kMaxContourVertices));
+    float x0, y0, x1, y1;
+    bbox(c, x0, y0, x1, y1);
+    CHECK(x0 == 0 && y0 == 0 && x1 >= 158 && y1 >= 14);
+    CHECK(contour_area(c) > 0.3 * w * 3);
+    // worst case on a 160 x 160 crop: a comb with 1-cell teeth on both sides of every other row
+    // (tens of thousands of boundary corners); bounded time
+    const int n = 160;
+    std::vector<uint8_t> g(n * n, 0);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) g[y * n + x] = (x == 0 || (y % 2 == 0 && x % 2 == 0) || (y % 4 == 0));
+    const auto t0 = std::chrono::steady_clock::now();
+    Contour d;
+    for (int r = 0; r < 10; ++r) d = mask_exterior_contour(g.data(), n, n, n);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10;
+    std::printf("worst-case contour: %zu vertices, %.2f ms per call (host)\n", d.size(), ms);
+    CHECK(d.size() >= 3 && d.size() <= static_cast<size_t>(kMaxContourVertices));
+    CHECK(ms < 20.0);
+    // degenerate shapes keep at least 3 vertices: one cell, a 1-cell line
+    std::vector<uint8_t> one(1, 1);
+    CHECK(mask_exterior_contour(one.data(), 1, 1, 1).size() == 4);
+    std::vector<uint8_t> line(200, 1);
+    CHECK(mask_exterior_contour(line.data(), 200, 1, 200).size() == 4);
+}
+
 static void test_contour_mapping() {
     // 640-square model: crop at cell (10, 40), 4 input px per cell, frame = input
     Contour c = {{0, 0}, {2, 0}, {2, 3}};
@@ -425,6 +471,7 @@ int main() {
     std::printf("Running mask_geom tests...\n");
     test_contour_trace();
     test_contour_bounded();
+    test_contour_comb_and_worst_case();
     test_contour_mapping();
     auto cases = load_vectors();
     CHECK_MSG(!cases.empty(), "No test vector cases loaded");
