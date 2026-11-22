@@ -3,6 +3,8 @@
 //! points triangulated from grayscale images taken at known camera poses. Pure computation, no
 //! I/O; the action runs it in `spawn_blocking`.
 //!
+//! - Camera rotations ([`pose`]): before the reconstruction the caller may refine the rotation of
+//!   every view but the reference from points on the table ([`refine_views`]).
 //! - Features (reference view): Shi-Tomasi corners (minimum eigenvalue of the 5x5 structure
 //!   tensor) in the feature region, at most `max_object_features` in the object box and
 //!   `max_table_features` outside it, strongest first and `min_feature_dist_px` apart; plus edge
@@ -41,8 +43,10 @@
 use std::time::Instant;
 
 pub mod kinematics;
+pub mod pose;
 
 use kinematics::{Mat3, Vec3};
+pub use pose::{marker_corrs, refine_poses, refine_views, texture_corrs, Corr, Marker, PoseParams, PoseRefinement, ViewRefine};
 
 /// Patch radius at full resolution (9x9 patches).
 pub const PATCH_R: usize = 4;
@@ -929,6 +933,8 @@ pub struct ObjectMeasure {
     pub n_edge_points: usize,
     pub n_top_points: usize,
     pub reproj_rms_px: f64,
+    /// Indices (into the measured points) of the object points.
+    pub points: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -962,12 +968,12 @@ pub fn table_check(points: &[Point], p: &Params) -> TableCheck {
 /// Object measurement from the points in the box above the table; `Err("too_few_points")`
 /// below `min_object_points` object points or [`MIN_TOP_POINTS`] points usable for the top.
 pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static str> {
-    let obj: Vec<&Point> = points.iter().filter(|q| q.in_box && q.x[2] - p.table_z_m > p.object_min_h_m).collect();
-    if obj.len() < p.min_object_points { return Err("too_few_points"); }
+    let idx: Vec<usize> = (0..points.len()).filter(|&i| { let q = &points[i]; q.in_box && q.x[2] - p.table_z_m > p.object_min_h_m }).collect();
+    if idx.len() < p.min_object_points { return Err("too_few_points"); }
     // isolated points (false matches): distance to the ISOLATION_K-th nearest object point above
     // max(3 x its median, ISOLATION_MIN_M)
-    let kth: Vec<f64> = obj.iter().map(|q| {
-        let mut d: Vec<f64> = obj.iter().map(|o| kinematics::norm(&kinematics::sub(&o.x, &q.x))).collect();
+    let kth: Vec<f64> = idx.iter().map(|&i| {
+        let mut d: Vec<f64> = idx.iter().map(|&o| kinematics::norm(&kinematics::sub(&points[o].x, &points[i].x))).collect();
         let k = ISOLATION_K.min(d.len() - 1);
         d.select_nth_unstable_by(k, f64::total_cmp);
         d[k]
@@ -975,7 +981,8 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
     let mut sorted = kth.clone();
     sorted.sort_by(f64::total_cmp);
     let lim = (3.0 * quantile(&sorted, 0.5)).max(ISOLATION_MIN_M);
-    let obj: Vec<&Point> = obj.into_iter().zip(&kth).filter(|(_, d)| **d <= lim).map(|(q, _)| q).collect();
+    let idx: Vec<usize> = idx.into_iter().zip(&kth).filter(|(_, d)| **d <= lim).map(|(i, _)| i).collect();
+    let obj: Vec<&Point> = idx.iter().map(|&i| &points[i]).collect();
     if obj.len() < p.min_object_points { return Err("too_few_points"); }
     let top_pts: Vec<&&Point> = obj.iter().filter(|q| q.consistent).collect();
     if top_pts.len() < MIN_TOP_POINTS { return Err("too_few_points"); }
@@ -1020,6 +1027,7 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
         n_edge_points: obj.iter().filter(|q| q.edge).count(),
         n_top_points: top_pts.len(),
         reproj_rms_px: rms,
+        points: idx,
     })
 }
 

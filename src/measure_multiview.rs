@@ -43,6 +43,13 @@
 //! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
 //!   (the supervisor ends it; [`recheck`] between steps). A measurement failure after motion
 //!   ([`RETURN_AFTER`], `TOO_FEW_POINTS`) returns to the start joints first when `return_to_start`.
+//! - Pose refinement ([`mview_stereo::pose`]): before the reconstruction, the rotation of every
+//!   view but the reference is refined from table-texture corners outside the target box and the
+//!   gripper region ([`GRIPPER_REGION_NORM`]) matched in 2D (real B601-DM, 2026-11-22: 1-2 mrad
+//!   per view, otherwise a flat sheet triangulated several mm above the table). Each view reports
+//!   its correction, point count and reprojection rms before and after (`views[].pose_refine`,
+//!   `pose_refine`); a view with too few points or a correction above the cap keeps its
+//!   kinematic pose.
 //! - The image computation runs in `spawn_blocking`, while the arm returns to the start pose.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -772,6 +779,8 @@ pub struct Computed {
     pub table: mview_stereo::TableCheck,
     pub rec: mview_stereo::Reconstruction,
     pub region_px: [f64; 4],
+    /// The per-view rotation refinement ([`mview_stereo::pose`]); its cameras were used.
+    pub pose: Option<mview_stereo::PoseRefinement>,
     pub ms: f64,
 }
 
@@ -781,15 +790,49 @@ pub fn feature_region(b: [f64; 4]) -> [f64; 4] {
     [b[0] - REGION_GROW * w - REGION_PAD_PX, b[1] - REGION_GROW * h - REGION_PAD_PX, b[2] + REGION_GROW * w + REGION_PAD_PX, b[3] + REGION_GROW * h + REGION_PAD_PX]
 }
 
-/// The reconstruction of the captures (blocking; spawn_blocking).
+/// Image region of the gripper jaws as fractions of the image [x0, y0, x1, y1]. A constant, not
+/// computed: armd's configuration has no jaw geometry. Measured on the real B601-DM with the v8
+/// camera holder (2026-11-21 debug bundles, 640x360): the dark jaws covered x 323..453, y 257..359
+/// in every view; this region adds about 20 px on each side. The jaws move with the camera, so
+/// their corners match at zero disparity; features in this region are not used.
+pub const GRIPPER_REGION_NORM: [f64; 4] = [0.47, 0.66, 0.74, 1.0];
+
+/// [`GRIPPER_REGION_NORM`] in pixels of an image of `size`.
+pub fn gripper_region_px(size: [f64; 2]) -> [f64; 4] {
+    let g = GRIPPER_REGION_NORM;
+    [g[0] * size[0], g[1] * size[1], g[2] * size[0], g[3] * size[1]]
+}
+
+/// The reconstruction of the captures (blocking; spawn_blocking): the per-view rotation
+/// refinement, then the reconstruction with the refined cameras.
 pub fn compute(views: &[View], reference: usize, ref_box_px: [f64; 4], table_z: f64) -> Computed {
     let t0 = Instant::now();
     let region_px = feature_region(ref_box_px);
     let p = Params::new(table_z);
-    let rec = mview_stereo::reconstruct(views, reference, region_px, ref_box_px, &p);
+    let pp = mview_stereo::PoseParams::default();
+    let exclude = views.get(reference).map(|v| vec![gripper_region_px([v.img.w as f64, v.img.h as f64])]).unwrap_or_default();
+    let pose = mview_stereo::refine_views(views, reference, ref_box_px, &exclude, table_z, &[], true, &pp);
+    let refined: Vec<View> = views.iter().zip(&pose.cams).map(|(v, c)| View { cam: *c, img: v.img.clone() }).collect();
+    let rec = mview_stereo::reconstruct(&refined, reference, region_px, ref_box_px, &p);
     let measure = mview_stereo::measure(&rec.points, &p);
     let table = mview_stereo::table_check(&rec.points, &p);
-    Computed { measure, table, rec, region_px, ms: t0.elapsed().as_secs_f64() * 1000.0 }
+    Computed { measure, table, rec, region_px, pose: Some(pose), ms: t0.elapsed().as_secs_f64() * 1000.0 }
+}
+
+/// The `pose_refine` value of the measurement (and of each view, `views`).
+pub fn pose_value(pose: &Option<mview_stereo::PoseRefinement>) -> (Value, Vec<Value>) {
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    let Some(p) = pose else { return (json!({"applied": false}), Vec::new()); };
+    let views: Vec<Value> = p.views.iter().map(|v| json!({
+        "status": v.status, "correction_mrad": r2(v.correction_mrad), "rot_mrad": v.rot_mrad.map(r2),
+        "n_points": v.n_points, "n_marker_corners": v.n_marker_corners,
+        "rms_before_px": v.rms_before_px.map(r2), "rms_after_px": v.rms_after_px.map(r2),
+    })).collect();
+    (json!({
+        "applied": p.views.iter().any(|v| v.status == "refined"),
+        "n_points": p.n_corrs, "n_marker_points": p.n_marker_corrs, "ms": p.ms.round(),
+        "views": views,
+    }), views)
 }
 
 /// Triangulated points in the target box: count and height above the table (mm: min, median,
@@ -1023,6 +1066,9 @@ async fn measure_run(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource) -> 
     let mut value = measurement_value(plan, &caps, &ref_det, &c.measure, &c.table, &stats, &fallbacks, c.ms);
     value["in_box"] = in_box.clone();
     value["outcomes"] = outcome_counts(&c.rec, ref_box_px);
+    let (pose, per_view) = pose_value(&c.pose);
+    value["pose_refine"] = pose;
+    if let Some(vs) = value["views"].as_array_mut() { for (v, p) in vs.iter_mut().zip(per_view) { v["pose_refine"] = p; } }
     if plan.request.debug {
         let doc = bundle_doc(ctx.id, plan, &caps, reference, ref_box_px, &c, &value);
         let jpegs: Vec<(usize, Vec<u8>)> = caps.iter_mut().enumerate().filter_map(|(k, v)| v.jpeg.take().map(|j| (k, j))).collect();
