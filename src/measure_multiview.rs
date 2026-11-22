@@ -694,7 +694,7 @@ fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: 
             "label": target.label, "score": target.score,
             "centroid_m": m.centroid_m.map(r4), "top_z_m": r4(m.top_z_m), "height_m": r4(m.height_m),
             "width_m": r4(m.width_m), "length_m": r4(m.length_m), "yaw_deg": r1(m.yaw_deg),
-            "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points,
+            "n_points": m.n_points, "n_edge_points": m.n_edge_points, "n_top_points": m.n_top_points, "top_method": m.top_method,
             "reproj_rms_px": (m.reproj_rms_px * 100.0).round() / 100.0, "views_used": caps.len(),
         })], Value::Null),
         Err(w) => (Vec::new(), json!(w)),

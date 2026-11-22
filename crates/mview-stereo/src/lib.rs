@@ -40,8 +40,9 @@
 //!   a usable fit the plane z = `table_z_m` stays.
 //! - Measurement ([`measure`]): points more than `object_min_h_m` above the table plane whose
 //!   reference pixel lies in the object box are object points, less isolated ones (false matches,
-//!   [`ISOLATION_K`]). The top is the p90 of the locally
-//!   median-filtered heights of the corners and the consistent edge points only; the footprint is
+//!   [`ISOLATION_K`]). The top is the median height of the highest cluster of corners and
+//!   consistent edge points ([`TOP_CLUSTER_MIN`] within [`TOP_CLUSTER_DZ_M`] and
+//!   [`TOP_CLUSTER_XY_M`]), else the p90 of their locally median-filtered heights; the footprint is
 //!   the oriented extent (PCA of x, y, 2nd to 98th percentile) of all object points. Points within
 //!   [-0.05, `object_min_h_m`] m of the plane are table points (`table_check`).
 use std::time::Instant;
@@ -82,6 +83,12 @@ pub const ISOLATION_MIN_M: f64 = 0.004;
 pub const UNIFORM_STD: f32 = 5.0;
 /// Points the top height needs (corners and consistent edge points).
 pub const MIN_TOP_POINTS: usize = 4;
+/// Top cluster: the highest top point with at least [`TOP_CLUSTER_MIN`] top points (itself
+/// included) within [`TOP_CLUSTER_DZ_M`] in height and [`TOP_CLUSTER_XY_M`] in x, y; the top is
+/// their median height, with the height window re-centred on the median until it settles.
+pub const TOP_CLUSTER_MIN: usize = 3;
+pub const TOP_CLUSTER_DZ_M: f64 = 0.003;
+pub const TOP_CLUSTER_XY_M: f64 = 0.015;
 
 /// 8-bit grayscale image, row-major.
 #[derive(Debug, Clone, PartialEq)]
@@ -1041,6 +1048,9 @@ pub struct ObjectMeasure {
     pub reproj_rms_px: f64,
     /// Indices (into the measured points) of the object points.
     pub points: Vec<usize>,
+    /// How the top was found: `cluster` (the highest top cluster) or `p90` (no cluster: the p90
+    /// of the locally median-filtered heights).
+    pub top_method: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1092,8 +1102,31 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
     if obj.len() < p.min_object_points { return Err("too_few_points"); }
     let top_pts: Vec<&&Point> = obj.iter().filter(|q| q.consistent).collect();
     if top_pts.len() < MIN_TOP_POINTS { return Err("too_few_points"); }
-    // top: p90 of the heights after a local median (each point's height = median of its
-    // TOP_NEIGHBOURS nearest top points in x, y), so the per-point noise does not lift the p90
+    // top: the highest cluster of top points (see TOP_CLUSTER_MIN), else the p90 of the heights
+    // after a local median (each point's height = median of its TOP_NEIGHBOURS nearest top points
+    // in x, y), so the per-point noise does not lift the p90
+    let th: Vec<f64> = top_pts.iter().map(|q| p.height(&q.x)).collect();
+    let mut order: Vec<usize> = (0..top_pts.len()).collect();
+    order.sort_by(|&a, &b| th[b].total_cmp(&th[a]));
+    // the top points within TOP_CLUSTER_XY_M of point i and TOP_CLUSTER_DZ_M of height c: median, count
+    let around = |i: usize, c: f64| -> (f64, usize) {
+        let mut nb: Vec<f64> = (0..top_pts.len()).filter(|&j| (th[j] - c).abs() <= TOP_CLUSTER_DZ_M
+            && (top_pts[j].x[0] - top_pts[i].x[0]).hypot(top_pts[j].x[1] - top_pts[i].x[1]) <= TOP_CLUSTER_XY_M).map(|j| th[j]).collect();
+        nb.sort_by(f64::total_cmp);
+        (quantile(&nb, 0.5), nb.len())
+    };
+    // the seed is the highest point of its window, so its median sits high: re-centre the
+    // height window on the median a few times (the local mode)
+    let cluster = order.iter().find_map(|&i| {
+        let (mut c, n) = around(i, th[i]);
+        if n < TOP_CLUSTER_MIN { return None; }
+        for _ in 0..5 {
+            let (m, k) = around(i, c);
+            if k == 0 || (m - c).abs() < 1e-5 { break; }
+            c = m;
+        }
+        Some(c)
+    });
     let mut z: Vec<f64> = top_pts.iter().map(|q| {
         let mut nb: Vec<(f64, f64)> = top_pts.iter().map(|o| ((o.x[0] - q.x[0]).hypot(o.x[1] - q.x[1]), p.height(&o.x))).collect();
         let k = TOP_NEIGHBOURS.min(nb.len());
@@ -1103,7 +1136,7 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
         quantile(&zs, 0.5)
     }).collect();
     z.sort_by(f64::total_cmp);
-    let top_h = quantile(&z, 0.9);
+    let top_h = cluster.unwrap_or_else(|| quantile(&z, 0.9));
     let n = obj.len() as f64;
     let (mx, my) = (obj.iter().map(|q| q.x[0]).sum::<f64>() / n, obj.iter().map(|q| q.x[1]).sum::<f64>() / n);
     let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
@@ -1135,6 +1168,7 @@ pub fn measure(points: &[Point], p: &Params) -> Result<ObjectMeasure, &'static s
         n_top_points: top_pts.len(),
         reproj_rms_px: rms,
         points: idx,
+        top_method: if cluster.is_some() { "cluster" } else { "p90" },
     })
 }
 
@@ -1224,6 +1258,23 @@ mod tests {
         // too few points, or a plane far from the calibrated table: no fit
         assert!(fit_table_plane(&pts[..9], &Params::new(0.01), [0.3, 0.0]).is_none());
         assert!(fit_table_plane(&pts, &Params::new(-0.002), [0.3, 0.0]).is_none());
+    }
+
+    #[test]
+    fn the_top_is_the_highest_cluster_not_a_few_stray_points() {
+        let p = Params::new(0.0);
+        // a 30 mm top of 20 points over 40 mm, a lower step at 15 mm, and two stray points at 50 mm
+        // 30 mm apart (no cluster): the top is 30 mm
+        let mut pts: Vec<Point> = (0..20).map(|i| pt(0.3 + 0.002 * f64::from(i), 0.0, 0.030 + 0.0005 * f64::from(i % 3), true)).collect();
+        pts.extend((0..20).map(|i| pt(0.3 + 0.002 * f64::from(i), 0.02, 0.015, true)));
+        pts.extend([pt(0.31, 0.005, 0.05, true), pt(0.34, 0.005, 0.05, true)]);
+        let m = measure(&pts, &p).unwrap();
+        assert_eq!(m.top_method, "cluster");
+        assert!((m.height_m - 0.0305).abs() < 1e-9, "{m:?}");
+        // scattered points, no 3 within 3 mm and 15 mm: the p90 fallback
+        let pts: Vec<Point> = (0..10).map(|i| pt(0.3 + 0.02 * f64::from(i), 0.0, 0.01 + 0.004 * f64::from(i), true)).collect();
+        let m = measure(&pts, &Params { object_min_h_m: 0.001, ..p }).unwrap();
+        assert_eq!(m.top_method, "p90");
     }
 
     #[test]

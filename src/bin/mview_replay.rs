@@ -27,8 +27,8 @@ fn main() {
     println!("in box {}", armd::measure_multiview::box_heights(&c.rec.points, b.table_z_m));
     println!("outcomes {}", armd::measure_multiview::outcome_counts(&c.rec, b.ref_box_px));
     match &c.measure {
-        Ok(m) => println!("measurement height {:.1} mm, top {:.4} m, {} points ({} edge, {} top), width {:.1} mm, length {:.1} mm, yaw {:.1} deg, rms {:.2} px",
-            m.height_m * 1000.0, m.top_z_m, m.n_points, m.n_edge_points, m.n_top_points, m.width_m * 1000.0, m.length_m * 1000.0, m.yaw_deg, m.reproj_rms_px),
+        Ok(m) => println!("measurement height {:.1} mm ({}), top {:.4} m, {} points ({} edge, {} top), width {:.1} mm, length {:.1} mm, yaw {:.1} deg, rms {:.2} px",
+            m.height_m * 1000.0, m.top_method, m.top_z_m, m.n_points, m.n_edge_points, m.n_top_points, m.width_m * 1000.0, m.length_m * 1000.0, m.yaw_deg, m.reproj_rms_px),
         Err(w) => println!("measurement: {w}"),
     }
     println!("table check n {} median {:?} mm |median| {:?} mm; table plane {}", c.table.n_points, c.table.median_mm, c.table.median_abs_mm, armd::measure_multiview::plane_value(&c.plane));
@@ -44,7 +44,7 @@ fn main() {
             "consistent": q.consistent, "rms": q.reproj_rms_px, "object": obj.contains(&i),
         })).collect();
         let m = c.measure.as_ref().map_or_else(|w| json!(w), |m| json!({"h_mm": m.height_m * 1000.0, "w_mm": m.width_m * 1000.0, "l_mm": m.length_m * 1000.0,
-            "n": m.n_points, "n_top": m.n_top_points, "rms": m.reproj_rms_px}));
+            "n": m.n_points, "n_top": m.n_top_points, "rms": m.reproj_rms_px, "top_method": m.top_method}));
         let cams: Vec<serde_json::Value> = c.pose.as_ref().map(|p| p.cams.clone()).unwrap_or_else(|| b.views.iter().map(|v| v.cam).collect())
             .iter().map(|k| json!({"r": k.r, "c": k.c})).collect();
         let doc = json!({"table_z": b.table_z_m, "box": b.ref_box_px, "measure": m, "pose_refine": pose, "cams": cams, "points": pts});
