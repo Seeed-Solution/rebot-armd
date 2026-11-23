@@ -323,10 +323,29 @@ impl SupervisorInner {
             n.push("thermal trip and a completed watchdog park turn torque off; every other stop holds position with torque on".into());
             n
         });
+        // gripper motor current cap: what the driver applies, else what the profile configures
+        let driver_cap = self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.motor_current_cap()));
+        let gripper_current_cap = match (driver_cap, &c.damiao_gripper) {
+            (Some(cap), _) => serde_json::to_value(cap).unwrap_or(Value::Null),
+            (None, Some(g)) => json!({
+                "joint": c.gripper_index(),
+                "mode": g.mode,
+                "current_raw": (g.mode == crate::model::DamiaoGripperMode::PosForce).then_some(g.current_ceiling_raw),
+                "active": false,
+                "calibrated": g.calibrated,
+                "ceiling_torque_nm": g.ceiling_torque_nm,
+                "torque_reference": g.torque_reference,
+                "close_speed_rad_s": g.close_speed_rad_s,
+                "note": if g.mode == crate::model::DamiaoGripperMode::PosVel { "no motor current cap (legacy POS_VEL gripper)" }
+                    else { "configured; not applied by the attached driver" },
+            }),
+            (None, None) => Value::Null,
+        };
         let hardware = json!({
             "physical_estop": hw.physical_estop,
             "torque_off_on_fault": false,
             "operator_auth_enforced": self.operator_auth_enforced,
+            "gripper_current_cap": gripper_current_cap,
             "notes": notes,
         });
 
