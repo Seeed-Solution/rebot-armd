@@ -706,7 +706,7 @@ impl crate::supervisor::SupervisorInner {
         let base = if let Some(active) = &self.active_trajectory {
             if let crate::motion::Reference::Gripper(gm) = &active.reference {
                 if gm.gripper_index == g {
-                    return Some(gm.limit.max_velocity);
+                    return Some(gm.wire_velocity_ceiling());
                 }
             }
             active.motion_limits.as_ref().and_then(|ls| ls.get(g).map(|l| l.max_velocity))
@@ -781,12 +781,10 @@ impl crate::supervisor::SupervisorInner {
                                 if t.velocity.is_none_or(|v| v == 0.0) {
                                     t.velocity = Some(ceiling_wire);
                                 } else if let Some(v) = t.velocity {
-                                    let v_raw = crate::model::DamiaoGripperDrive::quantize_vel_raw(v);
-                                    if v_raw == 0 {
-                                        t.velocity = Some(crate::model::DamiaoGripperDrive::wire_speed_f32(1).copysign(v));
-                                    } else if v_raw > ceiling_raw {
-                                        t.velocity = Some(ceiling_wire.copysign(v));
-                                    }
+                                    let wire_raw = (f64::from(v.abs()) * 100.0)
+                                        .ceil()
+                                        .clamp(1.0, f64::from(ceiling_raw)) as u16;
+                                    t.velocity = Some(crate::model::DamiaoGripperDrive::wire_speed_f32(wire_raw).copysign(v));
                                 }
                             } else if t.velocity.is_none_or(|v| v == 0.0) {
                                 if let Some(c) = active_pf_ceiling.filter(|c| c.is_finite() && *c > 0.0) {

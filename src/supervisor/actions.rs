@@ -543,7 +543,7 @@ impl SupervisorInner {
             }
         }
         self.releasing = matches!(motion.request.command, GripperCommand::Open);
-        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -647,7 +647,7 @@ impl SupervisorInner {
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         )?;
         self.releasing = matches!(motion.request.command, GripperCommand::Open);
-        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
         self.servo_target = None;
@@ -719,7 +719,7 @@ impl SupervisorInner {
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         )?;
         let duration = motion.expected_duration();
-        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;

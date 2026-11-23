@@ -1247,6 +1247,15 @@ impl DamiaoGripperDrive {
         if Self::quantize_vel_raw(v) < raw { v.next_up() } else { v }
     }
 
+    /// Largest `f32` not exceeding `raw * 0.01` rad/s: used for trajectory stepping so
+    /// `bounded_servo_step` never advances the target faster than the wire speed `raw * 0.01`.
+    pub fn step_speed_f32(raw: u16) -> f32 {
+        if raw == 0 { return 0.0; }
+        let exact = f64::from(raw) / 100.0;
+        let v = exact as f32;
+        if f64::from(v) > exact { v.next_down() } else { v }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=10_000).contains(&self.current_ceiling_raw) {
             return Err("damiao_gripper.current_ceiling_raw must be 1..=10000".into());

@@ -2718,7 +2718,123 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         ).unwrap();
         assert_eq!(gm.planned_speed, f64::from(want_raw) / 100.0);
         assert!(gm.planned_speed <= req_speed, "planned_speed {} exceeded request {}", gm.planned_speed, req_speed);
-        assert_eq!(damiao::pos_force_vel_raw(gm.limit.max_velocity), want_raw);
+        assert!(f64::from(gm.limit.max_velocity) <= f64::from(want_raw) / 100.0);
+        assert_eq!(damiao::pos_force_vel_raw(gm.wire_velocity_ceiling()), want_raw);
+    }
+
+    // 10. step_speed_f32 vs wire_speed_f32 across representative raw values, and per-frame
+    //     full close (-5.7 -> 0.0) at close_speed_rad_s = 0.299 (wire raw 29 = 0.29 rad/s).
+    for raw in [1u16, 2, 3, 28, 29, 30, 100, 200] {
+        let step = DamiaoGripperDrive::step_speed_f32(raw);
+        let wire = DamiaoGripperDrive::wire_speed_f32(raw);
+        assert!(f64::from(step) <= f64::from(raw) / 100.0, "raw={raw} step={step}");
+        assert_eq!(DamiaoGripperDrive::quantize_vel_raw(wire), raw, "raw={raw} wire={wire}");
+        assert!(f64::from(wire) >= f64::from(raw) / 100.0, "raw={raw} wire={wire}");
+    }
+    {
+        let (mut sup_c, inner_c, clock_c) = make_sup(Some(0.299), -5.7);
+        assert_eq!(damiao::pos_force_vel_raw(0.299), 29);
+        inner_c.clear_log();
+        let ep_c = sup_c.safety.epoch_id();
+        let (id_c, _) = sup_c.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            ep_c,
+        ).unwrap();
+        let mut saw_cruise_29 = false;
+        let mut frames_checked = 0usize;
+        let mut done_action = None;
+        for _ in 0..(25.0 / DT) as usize {
+            let q_prev = sup_c.commanded_positions[J7];
+            inner_c.clear_log();
+            clock_c.advance(Duration::from_millis(20));
+            sup_c.tick(DT);
+            let q_curr = sup_c.commanded_positions[J7];
+            for f in j7_commands(&inner_c.tx_log()) {
+                assert_eq!(f.id, 0x307);
+                let vel_raw = u16::from_le_bytes([f.data[4], f.data[5]]);
+                assert!((1..=29).contains(&vel_raw), "vel_raw={vel_raw} out of 1..=29");
+                assert_eq!(DamiaoGripperDrive::quantize_vel_raw(DamiaoGripperDrive::wire_speed_f32(vel_raw)), vel_raw);
+                let wire_limit = f64::from(vel_raw) / 100.0;
+                assert!(
+                    f64::from(sup_c.commanded_velocities[J7].abs()) <= wire_limit,
+                    "planner velocity {} exceeded wire_limit {} (vel_raw={vel_raw})",
+                    sup_c.commanded_velocities[J7].abs(),
+                    wire_limit
+                );
+                let step_rate = (f64::from(q_curr) - f64::from(q_prev)).abs() / DT;
+                assert!(
+                    step_rate <= wire_limit,
+                    "stepped displacement rate {step_rate} exceeded wire_limit {wire_limit} (vel_raw={vel_raw})"
+                );
+                if vel_raw == 29 {
+                    saw_cruise_29 = true;
+                }
+                frames_checked += 1;
+            }
+            let a = sup_c.last_action.clone().unwrap();
+            assert_eq!(a.id, id_c);
+            if !a.is_running() {
+                done_action = Some(a);
+                break;
+            }
+        }
+        let a = done_action.expect("full close at 0.299 did not finish within 25s");
+        assert_eq!(a.state, "done", "{a:?}");
+        assert!(sup_c.measured_positions[J7].abs() < 0.05, "J7 ended at {}", sup_c.measured_positions[J7]);
+        assert!(frames_checked > 0 && saw_cruise_29, "frames_checked={frames_checked} saw_cruise_29={saw_cruise_29}");
+    }
+    {
+        // Grasp close (grasp: true) through contact and squeeze against a stop at -2.0 rad:
+        // every 0x307 frame (accel, cruise, contact, squeeze entry, and squeeze hold) respects
+        // the wire-encoded speed limit without jumping past raw * 0.01 * DT on squeeze.
+        let (mut sup_g, inner_g, clock_g) = make_sup(Some(0.299), -5.7);
+        inner_g.with(|s| s.motors[J7].stop_at = Some(-2.0));
+        inner_g.clear_log();
+        let ep_g = sup_g.safety.epoch_id();
+        let (id_g, _) = sup_g.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
+            ep_g,
+        ).unwrap();
+        let mut frames_checked = 0usize;
+        let mut saw_squeeze = false;
+        let mut done_action = None;
+        for _ in 0..(25.0 / DT) as usize {
+            let q_prev = sup_g.commanded_positions[J7];
+            inner_g.clear_log();
+            clock_g.advance(Duration::from_millis(20));
+            sup_g.tick(DT);
+            let q_curr = sup_g.commanded_positions[J7];
+            if q_curr > -2.0 && sup_g.measured_positions[J7] <= -1.99 {
+                saw_squeeze = true;
+            }
+            for f in j7_commands(&inner_g.tx_log()) {
+                assert_eq!(f.id, 0x307);
+                let vel_raw = u16::from_le_bytes([f.data[4], f.data[5]]);
+                assert!((1..=29).contains(&vel_raw), "grasp vel_raw={vel_raw} out of 1..=29");
+                let wire_limit = f64::from(vel_raw) / 100.0;
+                assert!(
+                    f64::from(sup_g.commanded_velocities[J7].abs()) <= wire_limit,
+                    "grasp planner velocity {} exceeded wire_limit {} (vel_raw={vel_raw})",
+                    sup_g.commanded_velocities[J7].abs(),
+                    wire_limit
+                );
+                let step_rate = (f64::from(q_curr) - f64::from(q_prev)).abs() / DT;
+                assert!(
+                    step_rate <= wire_limit,
+                    "grasp stepped displacement rate {step_rate} exceeded wire_limit {wire_limit} (vel_raw={vel_raw})"
+                );
+                frames_checked += 1;
+            }
+            let a = sup_g.last_action.clone().unwrap();
+            assert_eq!(a.id, id_g);
+            if !a.is_running() {
+                done_action = Some(a);
+                break;
+            }
+        }
+        let a = done_action.expect("grasp close at 0.299 did not finish within 25s");
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        assert!(frames_checked > 0 && saw_squeeze, "frames_checked={frames_checked} saw_squeeze={saw_squeeze}");
     }
 }
 

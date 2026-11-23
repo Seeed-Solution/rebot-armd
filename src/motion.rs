@@ -1205,6 +1205,8 @@ pub struct GripperMotion {
     /// Effective travel speed (rad/s) used for trajectory stepping, `expected_duration()` and
     /// default timeout: capped at `close_speed_rad_s` when closing in position-force mode.
     pub planned_speed: f64,
+    /// Wire-quantized velocity ceiling (`raw * 0.01` rad/s) when planned against a pos-force driver.
+    pub planned_vel_raw: Option<u16>,
     pub elapsed: f64,
     /// Deadline (s): the request's timeout_s, else the default rule.
     pub timeout_s: f64,
@@ -1245,7 +1247,7 @@ impl GripperMotion {
             GripperCommand::Seek => policy.closed_rad + dir * 0.6,
         }.clamp(limit.min_position, limit.max_position);
         let closing = (target - start) * dir > 1e-6;
-        let (planned_speed, max_velocity) = match close_speed_limit {
+        let (planned_speed, max_velocity, planned_vel_raw) = match close_speed_limit {
             Some(cap) => {
                 if !(cap.is_finite() && cap > 0.0) {
                     return Err(MotionError::InvalidCommand(
@@ -1271,19 +1273,45 @@ impl GripperMotion {
                         "Gripper speed {effective:.4} rad/s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
                     )));
                 }
-                (f64::from(raw) / 100.0, crate::model::DamiaoGripperDrive::wire_speed_f32(raw))
+                (
+                    f64::from(raw) / 100.0,
+                    crate::model::DamiaoGripperDrive::step_speed_f32(raw),
+                    Some(raw),
+                )
             }
-            None => (request.speed, request.speed as f32),
+            None => (request.speed, request.speed as f32, None),
         };
         let limit = JointLimit { max_velocity, ..limit };
         let mut m = Self {
-            request, policy, limit, target, start, gripper_index, planned_speed,
+            request, policy, limit, target, start, gripper_index, planned_speed, planned_vel_raw,
             elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving,
             contact_rad: None, contact_ticks: 0,
         };
         m.timeout_s = m.request.timeout_s
             .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
         Ok(m)
+    }
+
+    /// Wire-safe velocity ceiling for CAN encoding (prevents double-flooring `step_speed_f32`).
+    pub fn wire_velocity_ceiling(&self) -> f32 {
+        self.planned_vel_raw
+            .map_or(self.limit.max_velocity, crate::model::DamiaoGripperDrive::wire_speed_f32)
+    }
+
+    fn step_pos_force_advance(q_g: f32, target: f32, dir: f32, raw: u16, dt: f64) -> f32 {
+        if (target - q_g) * dir <= 0.0 {
+            return target; // safety hold or retreat: immediate
+        }
+        let max_dq = (f64::from(raw) / 100.0) * dt;
+        let diff = f64::from(target) - f64::from(q_g);
+        if diff.abs() <= max_dq {
+            return target;
+        }
+        let mut q = (f64::from(q_g) + diff.signum() * max_dq) as f32;
+        if (f64::from(q) - f64::from(q_g)).abs() > max_dq {
+            q = if q > q_g { q.next_down() } else { q.next_up() };
+        }
+        q
     }
 
     /// Expected duration (s) for the travel at the planned speed, plus settle.
@@ -1358,7 +1386,10 @@ impl GripperMotion {
         }
         let force_cap = self.policy.max_close_torque_nm.filter(|_| ctx.torque_feedback && ctx.feedback_fresh);
         let squeeze_rad = self.policy.squeeze_rad;
-        let ramp_rate = 2.0 * f64::from(squeeze_rad) / (self.policy.settle_ms as f64 / 1000.0);
+        let ramp_rate = {
+            let r = 2.0 * f64::from(squeeze_rad) / (self.policy.settle_ms as f64 / 1000.0);
+            self.planned_vel_raw.map_or(r, |raw| r.min(f64::from(raw) / 100.0))
+        };
         let contact_stop = self.contact_stop();
         let yielded = self.contact_yielded(m_g, tau_g, ctx.torque_feedback);
         let mut rearm = false;
@@ -1377,7 +1408,12 @@ impl GripperMotion {
                     *hold += dir * ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
                 }
             }
-            if idx < positions.len() { positions[idx] = *hold; }
+            if idx < positions.len() {
+                positions[idx] = match self.planned_vel_raw {
+                    Some(raw) => Self::step_pos_force_advance(q_g, *hold, dir, raw, ctx.dt),
+                    None => *hold,
+                };
+            }
             let window_done = *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6;
             // The contact gave way: the squeeze, limited to the contact stop, ends with the jaw
             // past the contact and little torque, so the object turned or slid in the jaws (a box
@@ -1442,7 +1478,14 @@ impl GripperMotion {
             self.contact_ticks = if torque_hit || lag_hit { self.contact_ticks + 1 } else { 0 };
             if self.contact_ticks >= GRIPPER_CONTACT_TICKS {
                 self.contact_rad = Some(m_g);
-                self.limit.max_velocity = self.limit.max_velocity.min(GRIPPER_CONTACT_SPEED);
+                if let Some(raw) = self.planned_vel_raw {
+                    let contact_raw = crate::model::DamiaoGripperDrive::quantize_vel_raw(GRIPPER_CONTACT_SPEED).max(1);
+                    let next_raw = raw.min(contact_raw);
+                    self.planned_vel_raw = Some(next_raw);
+                    self.limit.max_velocity = crate::model::DamiaoGripperDrive::step_speed_f32(next_raw);
+                } else {
+                    self.limit.max_velocity = self.limit.max_velocity.min(GRIPPER_CONTACT_SPEED);
+                }
             }
         }
         let stop = self.contact_stop();
@@ -1454,7 +1497,14 @@ impl GripperMotion {
             if idx < velocities.len() { velocities[idx] = 0.0; }
         } else if !stalled {
             match crate::supervisor::SupervisorInner::bounded_servo_step(q_g, target, v_gc, ctx.dt, &self.limit) {
-                Some((q, v, _)) => {
+                Some((mut q, v, _)) => {
+                    if let Some(max_raw) = self.planned_vel_raw {
+                        let tick_raw = (f64::from(v.abs()) * 100.0).ceil().clamp(1.0, f64::from(max_raw)) as u16;
+                        let max_dq = (f64::from(tick_raw) / 100.0) * ctx.dt;
+                        if (f64::from(q) - f64::from(q_g)).abs() > max_dq {
+                            q = if q > q_g { q.next_down() } else { q.next_up() };
+                        }
+                    }
                     if idx < positions.len() { positions[idx] = q; }
                     if idx < velocities.len() { velocities[idx] = v; }
                 }
@@ -1479,7 +1529,12 @@ impl GripperMotion {
                 let squeezed = self.contact_stop().map_or(squeezed, |stop| if (squeezed - stop) * dir > 0.0 { stop } else { squeezed });
                 let hold = if dir > 0.0 { squeezed.min(self.policy.closed_rad) } else { squeezed.max(self.policy.closed_rad) }
                     .clamp(self.limit.min_position, self.limit.max_position);
-                if idx < positions.len() { positions[idx] = hold; }
+                if idx < positions.len() {
+                    positions[idx] = match self.planned_vel_raw {
+                        Some(raw) => Self::step_pos_force_advance(q_g, hold, dir, raw, ctx.dt),
+                        None => hold,
+                    };
+                }
                 if idx < velocities.len() { velocities[idx] = 0.0; }
                 let ramp = capped && self.policy.max_close_torque_nm.is_some();
                 self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp };

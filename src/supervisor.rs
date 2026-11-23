@@ -1661,7 +1661,7 @@ impl SupervisorInner {
         tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
-        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.target_positions[gripper_idx] = motion.target;
         self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
@@ -2514,7 +2514,7 @@ impl SupervisorInner {
             // contact speed reduction) so completion and subsequent hold ticks preserve it.
             if let Reference::Gripper(gm) = &active.reference {
                 if gripper_idx_for_ceiling == Some(gm.gripper_index) {
-                    self.gripper_hold_vel_ceiling = Some(gm.limit.max_velocity);
+                    self.gripper_hold_vel_ceiling = Some(gm.wire_velocity_ceiling());
                 }
             }
             // same-side approach: progress over both legs; the first leg's end starts the short
