@@ -455,19 +455,6 @@ pub trait ArmDriver: Send {
     /// output).
     fn set_estop_gate(&mut self, _gate: crate::rt_core::urgent::EstopGate) {}
 
-    /// Supply monotonic E-stop (`requested`) and authorized-stop ([`crate::rt_core::urgent::StopRequests`])
-    /// generation counters so deferred motion frames stamped at admission are invalidated even after
-    /// a stop has already been applied (`requested == applied`).
-    fn set_stop_generations(
-        &mut self,
-        _estop_requested: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
-        _stops: Option<crate::rt_core::urgent::StopRequests>,
-    ) {}
-
-    /// Explicitly invalidate any carried-over pending motion frames (e.g. when applying a stop
-    /// through `dyn ArmDriver`). Returns the number of dropped frames.
-    fn invalidate_pending_tx(&mut self) -> usize { 0 }
-
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
 
@@ -2613,10 +2600,6 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pending_tx: PendingTxQueue,
     /// Shared TX pass state across `receive_feedback()` and `write_joint_targets*()` in one tick.
     tick_tx: Option<TickTxPass>,
-    /// Monotonic E-stop requested generation counter (for stamping queued motion frames).
-    estop_requested: Option<std::sync::Arc<AtomicU64>>,
-    /// Monotonic authorized-stop generation counter (for stamping queued motion frames).
-    stop_requests: Option<crate::rt_core::urgent::StopRequests>,
     /// Round-robin start index for budget-constrained 0xCC refresh sweeps.
     refresh_cursor: usize,
     /// Bitmask of stale joints not yet polled in the current 0xCC refresh sweep.
@@ -2868,8 +2851,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             tx_budget: TxBudget::default(),
             pending_tx: PendingTxQueue::new(),
             tick_tx: None,
-            estop_requested: None,
-            stop_requests: None,
             refresh_cursor: 0,
             refresh_unfinished: 0,
         }
@@ -2897,30 +2878,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.tick_tx = None;
     }
 
-    /// Configure E-stop and optional authorized-stop gating together with their monotonic
-    /// generation counters so deferred motion frames stamped at admission cannot survive an
-    /// applied stop (`requested == applied`).
-    pub fn set_stop_gate(
-        &mut self,
-        estop_requested: std::sync::Arc<AtomicU64>,
-        estop_applied: std::sync::Arc<AtomicU64>,
-        stops: Option<crate::rt_core::urgent::StopRequests>,
-    ) {
-        let mut gate = crate::rt_core::urgent::EstopGate::new(estop_requested.clone(), estop_applied);
-        if let Some(ref s) = stops {
-            gate = gate.with_stops(s.clone());
-        }
-        self.estop_gate = Some(gate);
-        self.estop_requested = Some(estop_requested);
-        self.stop_requests = stops;
-    }
-
     #[inline]
     fn current_stop_stamp(&self) -> StopStamp {
-        StopStamp {
-            estop_gen: self.estop_requested.as_ref().map_or(0, |a| a.load(Ordering::SeqCst)),
-            stop_gen: self.stop_requests.as_ref().map_or(0, |s| s.current()),
-        }
+        let (estop_gen, stop_gen) = self
+            .estop_gate
+            .as_ref()
+            .map_or((0, 0), crate::rt_core::urgent::EstopGate::generations);
+        StopStamp { estop_gen, stop_gen }
     }
 
     /// Number of unsent target frames currently queued for the next tick.
@@ -4837,15 +4801,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
-    fn set_stop_generations(
-        &mut self,
-        estop_requested: Option<std::sync::Arc<AtomicU64>>,
-        stops: Option<crate::rt_core::urgent::StopRequests>,
-    ) {
-        self.estop_requested = estop_requested;
-        self.stop_requests = stops;
-    }
-    fn invalidate_pending_tx(&mut self) -> usize { self.discard_pending_tx() }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {

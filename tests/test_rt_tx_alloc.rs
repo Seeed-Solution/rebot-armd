@@ -445,12 +445,11 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace))), "{res:?}");
     assert_eq!((a, f), (0, 0), "unfenced flush ENOBUFS touched allocator");
 
-    // 8b. Drain after an applied stop (requested == applied) invalidates stamped frames — 0 allocs, 0 frees.
+    // 8b. Drain after an applied stop (requested == applied) invalidates stamped frames via set_estop_gate — 0 allocs, 0 frees.
     d.can_mut().flush_err = None;
-    d.set_stop_gate(
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Some(stops.clone()),
+    d.set_estop_gate(
+        EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_stops(stops.clone()),
     );
     d.set_tx_budget(TxBudget {
         max_frames: 4,
