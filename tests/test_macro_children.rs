@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use armd::macro_action::{ChildTicket, ContactGuard, SubState};
 use armd::model::ArmConfig;
-use armd::rt_core::ops::CoreOps;
+use armd::rt_core::broker::BootId;
+use armd::rt_core::ids::ArmId;
+use armd::rt_core::ops::{CommitCtx, CoreOps};
 use armd::SupervisorInner;
 use common::{TestArm, INSPECT};
 
@@ -65,7 +67,9 @@ fn stop_between_preparation_and_install_installs_nothing() {
     let mut inner = inner();
     let id = begin(&mut inner);
     // preparation: the worker plans from a snapshot
-    let snap = inner.planning_snapshot(0);
+    let ctx = CommitCtx { arm: ArmId::LOCAL, boot: BootId(1), now: Instant::now(), stop_generation: 0 };
+    let snap = inner.planning_snapshot(&ctx);
+    assert_eq!(snap.authority.parent_generation, id, "the running macro is the parent its children commit under");
     let mut target = snap.commanded.clone();
     target[0] += 0.1;
     let before = inner.commanded_positions.clone();
