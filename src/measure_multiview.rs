@@ -1688,7 +1688,7 @@ pub fn plane_value(plane: &Option<mview_stereo::TablePlane>) -> Value {
     let r2 = |x: f64| (x * 100.0).round() / 100.0;
     plane.as_ref().map_or(Value::Null, |t| json!({
         "n_points": t.n_points, "n_inliers": t.n_inliers, "offset_mm": r2(t.offset_mm), "tilt_deg": r2(t.tilt_deg),
-        "mad_mm": r2(t.mad_mm), "threshold_mm": r2(t.threshold_mm),
+        "mad_mm": r2(t.mad_mm), "threshold_mm": r2(t.threshold_mm), "mode": t.mode, "max_gap_deg": r2(t.max_gap_deg),
     }))
 }
 
