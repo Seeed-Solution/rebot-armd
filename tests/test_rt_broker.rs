@@ -813,3 +813,54 @@ fn child_primitives_of_a_running_macro_commit_through_the_release() {
     assert!(got.iter().any(|r| matches!(r, Reply::Terminal { action, children: 2, outcome: Outcome::Completed, .. } if *action == parent)), "{got:?}");
     assert_eq!((b.reserved(), b.outstanding()), (0, 0));
 }
+
+#[test]
+fn default_eight_plan_slots_exhaust_and_recover_and_stale_boot_is_refused() {
+    use armd::rt_core::broker::PLAN_SLOTS;
+
+    let (mut fx, mut b, mut tw, _stop) = ReleaseFixture::new_fresh(supervisor(), Capacities::default());
+    assert_eq!(b.plan_capacity(), PLAN_SLOTS);
+    assert_eq!(b.boot(), fx.boot());
+    assert!(!fx.boot().is_zero());
+
+    let a = auth(&fx);
+    let p = quintic(&fx, 0.05, 0.5);
+    for seq in 1..=(PLAN_SLOTS as u64) {
+        submit_install(&mut b, seq, a, later(), p).expect("slot free");
+    }
+    assert_eq!(submit_install(&mut b, 9, a, later(), p), Err(AdmitError::PlansFull));
+    assert_eq!(b.stats().refused_admission, 1);
+
+    // Committing install #1 then superseding it with #2 retires slot #1 so #9 can be admitted.
+    assert!(fx.step().command.unwrap().1.is_ok());
+    // Install #2 was prepared from the same start as #1; after #1 advanced slightly it may
+    // be refused PLAN_STALE, which also retires its slot immediately.
+    let _ = fx.step();
+    replies(&mut b);
+    assert!(b.stats().retired >= 1);
+    assert!(submit_install(&mut b, 9, auth(&fx), later(), quintic(&fx, -0.02, 0.2)).is_ok());
+
+    // Target frames carrying a stale boot id or zero boot id are refused with WRONG_TARGET.
+    fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), ..TargetAuthority::default() });
+    let q = fx.core.commanded_positions.clone();
+    let mut arr = [0.0; MAX_DOF];
+    arr[..q.len()].copy_from_slice(&q);
+    for (seq, bad_boot) in [(1u64, BootId::fresh()), (2u64, BootId(0))] {
+        tw.submit(TargetFrame {
+            arm: ArmId::LOCAL,
+            boot: bad_boot,
+            stream: StreamId(1),
+            seq,
+            authority: auth(&fx),
+            policy_generation: 0,
+            input_at: fx.now(),
+            vision_at: None,
+            vision_frame_id: None,
+            deadline: later(),
+            dof: q.len() as u8,
+            q: arr,
+            replaceable: true,
+        });
+        assert_eq!(fx.step().target, Some((seq, Err("WRONG_TARGET"))));
+    }
+}
