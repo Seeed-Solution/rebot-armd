@@ -443,7 +443,7 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-field input { min-height: 40px; padding: 0 10px; font: inherit; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-base); background: var(--sc-color-bg); color: var(--sc-color-text); }
 .cwiz-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .cwiz-acts .btn { min-height: 48px; font-size: 14px; touch-action: manipulation; }
-.cwiz-acts .wide { grid-column: 1 / -1; }
+.cwiz-acts .wide, .cwiz-acts > .btn:only-child { grid-column: 1 / -1; }
 .cwiz-stop { color: #fff !important; background: var(--sc-estop) !important; border-color: var(--sc-estop) !important; }
 .cwiz-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .cwiz-toggle input { width: 20px; height: 20px; }
