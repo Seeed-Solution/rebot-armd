@@ -1440,6 +1440,16 @@ impl GripperMotion {
         let contact_stop = self.contact_stop();
         let yielded = self.contact_yielded(m_g, tau_g, ctx.torque_feedback);
         let mut rearm = false;
+        // the deadline covers the squeeze too (with its rearms): past it the action fails; a
+        // squeeze keeps its hold (the grip on an object stays), a move holds the measured jaw
+        if self.elapsed > self.timeout_s {
+            if let GripPhase::Squeeze { hold, .. } = &self.phase {
+                if idx < positions.len() { positions[idx] = *hold; }
+                return StepOut { positions, velocities, progress: 1.0, clear_gripper_stall: false,
+                    status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
+                        "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+            }
+        }
         if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp, cap_ramp } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
@@ -1520,7 +1530,10 @@ impl GripperMotion {
         }
         if self.extendable && self.elapsed - self.progress_ref.0 >= GRIPPER_PROGRESS_WINDOW_S - 1e-9 && m_g.is_finite() {
             let toward = (self.target - self.start).signum();
-            if self.window_unloaded && (m_g - self.progress_ref.1) * toward >= GRIPPER_PROGRESS_RAD {
+            // progressing: at least half the current speed limit over the window (a creep that
+            // only just moves earns nothing), with |τ| within the free-motion threshold
+            let min_progress = GRIPPER_PROGRESS_RAD.max(0.5 * self.limit.max_velocity * GRIPPER_PROGRESS_WINDOW_S as f32);
+            if self.window_unloaded && (m_g - self.progress_ref.1) * toward >= min_progress {
                 let remaining = f64::from((active_target - m_g).abs());
                 let need = self.elapsed + remaining / f64::from(self.limit.max_velocity.max(0.05))
                     + 0.5 + self.policy.settle_ms as f64 / 1000.0 + GRIPPER_TIMEOUT_MARGIN_S;
