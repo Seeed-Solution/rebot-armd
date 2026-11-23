@@ -392,8 +392,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        // identity, deadline, stop, epoch, a lease valid now, configuration revision
         self.check_commit(d, ctx)?;
-        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        // the configuration authority's active revision, reservations, feedback (track C)
+        if let Some(code) = self.motion_commit_blocker(&d.stamp.authority) { return Err(code); }
         // a child names the parent its stamp was admitted under
         if let Some(c) = primitive.child() {
             if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }

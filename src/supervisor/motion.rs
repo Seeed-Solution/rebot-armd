@@ -979,10 +979,44 @@ impl SupervisorInner {
         }
         let arm_dof = input.arm.arm_dof();
         let gripper_idx = self.config.gripper_index().unwrap_or(arm_dof);
-        let moved = (0..arm_dof).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
-            || (self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0) - input.j7).abs() >= 1e-4;
-        if moved { return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into()); }
+        if crate::motion::plan_start_moved(&self.commanded_positions, &input.q0[..arm_dof.min(6)], gripper_idx, input.j7) {
+            return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into());
+        }
         Ok(())
+    }
+
+    // -- RT commit (armd 1.6 RT core, track C) ------------------------------------------
+
+    /// Feedback a commit may plan from: numerically valid, and fresh per the driver (no driver: simulated).
+    pub fn commit_feedback_valid(&self) -> bool {
+        self.feedback_numeric_valid && self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+    }
+
+    /// The refusal code when a primitive admitted under `admitted` may not be installed,
+    /// beyond the stamp and authority checks of the commit (identity, deadline, stop, epoch,
+    /// a lease valid at the commit instant, configuration revision, parent, prepared start):
+    /// the configuration authority's active workspace revision (`PLAN_STALE`), no
+    /// configuration reservation inhibiting motion (`CONFIG_BUSY`) and valid feedback
+    /// (`FEEDBACK_STALE`). None: the install's own checks decide. Changes nothing.
+    pub fn motion_commit_blocker(&self, admitted: &crate::rt_core::broker::Authority) -> Option<&'static str> {
+        use crate::rt_core::config_iface::{ConfigAuthority, ConfigDomain};
+        if ConfigAuthority::revision(self, ConfigDomain::Workspace) != admitted.config_revision { return Some("PLAN_STALE"); }
+        if self.core.motion_inhibited_by_config() { return Some("CONFIG_BUSY"); }
+        if !self.commit_feedback_valid() { return Some("FEEDBACK_STALE"); }
+        None
+    }
+
+    /// An authorized stop (the RT's urgent-stop generation advanced): ends client motion
+    /// like [`Self::stop_motion`], except a running watchdog park. The park belongs to the
+    /// lease watchdog, not to the client that stopped: only a new lease ([`Self::acquire_lease`],
+    /// [`Self::preempt_lease`]) takes it over. Returns false when the park was kept.
+    pub fn authorized_stop(&mut self) -> bool {
+        if self.watchdog_park.is_some() && self.pending_normal_unload {
+            tracing::info!("Stop during a watchdog park: the park continues (only a new lease takes it over)");
+            return false;
+        }
+        self.stop_motion();
+        true
     }
 
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {

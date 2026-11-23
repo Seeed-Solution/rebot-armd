@@ -155,6 +155,32 @@ pub const IK_LIMIT_MARGIN: f64 = 0.02;
 /// Auto-level threshold (cockpit `CFG.view.levelCos`).
 pub fn level_cos() -> f64 { (15.0f64).to_radians().cos() }
 
+/// A prepared plan is stale when a commanded joint (arm joints and the gripper) moved by at
+/// least this much since the plan's start was taken (rad).
+pub const PLAN_START_TOL_RAD: f64 = 1e-4;
+
+/// Whether `commanded` left the start of a plan: an arm joint differs from `arm_q0` or the
+/// gripper (index `gripper_idx`, a missing joint reads 0) from `gripper_q0` by [`PLAN_START_TOL_RAD`] or more.
+pub fn plan_start_moved(commanded: &[f32], arm_q0: &[f64], gripper_idx: usize, gripper_q0: f32) -> bool {
+    let arm = arm_q0.iter().enumerate()
+        .any(|(i, q0)| commanded.get(i).is_none_or(|q| (f64::from(*q) - q0).abs() >= PLAN_START_TOL_RAD));
+    arm || (commanded.get(gripper_idx).copied().unwrap_or(0.0) - gripper_q0).abs() >= PLAN_START_TOL_RAD as f32
+}
+
+/// Worker-side preparation of a joint move for the RT broker (armd 1.6 RT core, track C):
+/// the joint quintic from the snapshot's commanded joints to `q` in `duration_s`, to submit
+/// under `snap.authority`. Refused before admission (nothing is queued) when a configuration
+/// hold inhibits motion (`CONFIG_BUSY`) or `q` does not fit (`INVALID_COMMAND`); the commit
+/// rechecks everything (stamp, lease, start, configuration, feedback).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_joint_move(snap: &crate::rt_core::ops::PlanningSnapshot, q: &[f32], duration_s: f64) -> Result<crate::rt_core::ops::Primitive, &'static str> {
+    if snap.config_inhibited { return Err("CONFIG_BUSY"); }
+    if q.len() != snap.commanded.len() || !q.iter().all(|v| v.is_finite()) || !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("INVALID_COMMAND");
+    }
+    crate::rt_core::ops::Primitive::joint_quintic(&snap.commanded, q, duration_s)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed {
     pub linear: f64,
