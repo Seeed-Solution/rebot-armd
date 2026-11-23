@@ -82,6 +82,11 @@ pub const ESTOP_INHIBITED: &str = "E-stop requested during the target batch; rem
 /// Universal robotic arm hardware driver trait
 /// Name of a Damiao feedback state code that reports a fault (8 and above); None for
 /// the normal states (0 disabled, 1 enabled).
+/// The error is the E-stop gate's refusal ([`ESTOP_INHIBITED`]).
+pub fn is_estop_inhibited(e: &ArmDriverError) -> bool {
+    matches!(e, ArmDriverError::Protocol(m) if m == ESTOP_INHIBITED)
+}
+
 pub fn damiao_fault_name(code: u8) -> Option<&'static str> {
     Some(match code {
         0..=7 => return None,
@@ -2788,6 +2793,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Target-frame transmit: up to 3 WouldBlock retries 100 µs apart, and before every attempt
+    /// the MIT fence (`fenced`, deadline inclusive) and the E-stop gate: a stop or an expiry
+    /// between two attempts of one frame sends nothing more.
+    fn transmit_target(&mut self, frame: &CanFrame, fenced: bool) -> Result<(), ArmDriverError> {
+        let mut retries = 0;
+        loop {
+            if fenced { self.fence_check()?; }
+            self.estop_check()?;
+            match self.can.transmit(frame) {
+                Ok(()) => return Ok(()),
+                Err(TransportError::WouldBlock) if retries < 3 => {
+                    retries += 1;
+                    self.pause(Duration::from_micros(100));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
     /// replies matched by motor ID, read opcode and RID, newer than the request. Returns
     /// (value, reply CAN ID) per RID.
@@ -3729,8 +3753,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             return Err(e);
                         }
                         if started[i].is_none() { started[i] = Some(self.now()); }
-                        if let Err(e) = self.transmit_fenced(&frame) {
-                            self.trip_fence(format!("transmit to joint {} failed after {} of {} joints: {e}", i + 1, i, targets.len()));
+                        if let Err(e) = self.transmit_target(&frame, true) {
+                            if is_estop_inhibited(&e) {
+                                self.trip_fence(format!("E-stop between transmit attempts to joint {} after {i} of {} joints", i + 1, targets.len()));
+                            } else {
+                                self.trip_fence(format!("transmit to joint {} failed after {} of {} joints: {e}", i + 1, i, targets.len()));
+                            }
                             return Err(e);
                         }
                         self.last_target_frames[i] = Some(frame);
@@ -3750,7 +3778,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
                         self.estop_check()?;
-                        self.transmit_with_retry(&frame)?;
+                        self.transmit_target(&frame, false)?;
                         self.last_target_frames[i] = Some(frame);
                     }
                 }
@@ -3775,7 +3803,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         &self.limits[i],
                     );
                     self.estop_check()?;
-                    self.transmit_with_retry(&frame)?;
+                    self.transmit_target(&frame, false)?;
                     self.last_target_frames[i] = Some(frame);
                 }
             }
