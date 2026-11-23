@@ -95,8 +95,10 @@ pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
 pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// Gripper torque cap: consecutive ticks with |τ| above `gripper_policy.max_close_torque_nm`
-/// (fresh feedback, jaw driven closed) that latch the stall regardless of the jaw speed.
-pub const GRIPPER_FORCE_CAP_TICKS: u32 = 2;
+/// (fresh feedback, jaw driven closed; or the torque pushing open above it while driven open)
+/// that latch the stall regardless of the jaw speed. One: the first sample over the cap latches
+/// (at two, one impact sample of a stiff contact passed before the latch).
+pub const GRIPPER_FORCE_CAP_TICKS: u32 = 1;
 /// A torque-cap latch under a servo stream or live policy releases only when the stream's
 /// gripper target is at least this much more open than the latch hold (rad). Low torque does
 /// not release it there: on a rigid object the hold at the measured jaw reads ~0 N·m, and a
@@ -5588,8 +5590,14 @@ impl SupervisorInner {
             if !self.gripper_stalled { self.gripper_force_capped = false; }
             let v_cmd = self.commanded_velocities.get(g_idx).copied().unwrap_or(0.0);
             let closing = (p_cmd - p_meas) * close_dir > 1e-3 || (desired_g - p_meas) * close_dir > 1e-3 || v_cmd * close_dir > 1e-3;
+            let opening = !closing
+                && ((p_cmd - p_meas) * close_dir < -1e-3 || (desired_g - p_meas) * close_dir < -1e-3 || v_cmd * close_dir < -1e-3);
             let force_cap = self.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm);
-            let over_cap = is_bus_fresh && has_torque_feedback && closing && force_cap.is_some_and(|cap| tau_g.abs() > cap);
+            // closing: |τ| over the cap; opening: the torque pushing open over the cap (signed, so
+            // releasing a squeezed object, whose torque still pushes closed, does not trip it)
+            let over_cap = is_bus_fresh && has_torque_feedback && force_cap.is_some_and(|cap|
+                (closing && tau_g.abs() > cap) || (opening && -tau_g * close_dir > cap));
+            let cap_dir = if opening { -close_dir } else { close_dir };
             self.gripper_force_ticks = if over_cap { self.gripper_force_ticks.saturating_add(1) } else { 0 };
 
             if force_cap.is_some() && closing && self.is_torqued && (!is_bus_fresh || !has_torque_feedback) {
@@ -5635,7 +5643,7 @@ impl SupervisorInner {
                 self.gripper_stalled = true;
                 self.gripper_force_capped = true;
                 self.gripper_force_ticks = 0;
-                self.gripper_stall_sign = close_dir;
+                self.gripper_stall_sign = cap_dir;
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
                 if p_meas.is_finite() {
@@ -5645,7 +5653,7 @@ impl SupervisorInner {
                     if let Some(ref mut st) = self.servo_target {
                         if st.len() > g_idx { st[g_idx] = p_meas; }
                     }
-                    if let Some(h) = self.gripper_motion_hold.as_mut() { *h = (p_meas, close_dir); }
+                    if let Some(h) = self.gripper_motion_hold.as_mut() { *h = (p_meas, cap_dir); }
                 }
                 self.note_motion_limit(MotionLimitReason::GripperForce, Some(g_idx));
             } else if !self.gripper_stalled && gripper_hw_overload && should_latch_hw_overload {

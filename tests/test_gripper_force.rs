@@ -150,9 +150,9 @@ fn without_regulator() -> ArmConfig {
     config
 }
 
-/// Margin above the cap: the latch needs GRIPPER_FORCE_CAP_TICKS ticks and the rig's torque
-/// rises 0.07 N·m per tick at 1.05 rad/s, plus one tick of feedback delay.
-const CAP_MARGIN_NM: f32 = 0.25;
+/// Margin above the cap: the first sample over the cap latches (GRIPPER_FORCE_CAP_TICKS 1), so
+/// at most one tick of the incident's rise passes: 3.32 N·m/rad x 1.05 rad/s x 20 ms = 0.07 N·m.
+const CAP_MARGIN_NM: f32 = RISE_NM_PER_RAD * 1.05 * DT as f32 + 1e-3;
 
 /// Without the cap and the contact detection (rc10 behaviour), the incident profile breaks the
 /// finger: the rig reproduces the incident.
@@ -597,7 +597,8 @@ fn stream_latch_does_not_release_while_closing() {
 
 /// Item 2 + 3: rigid block at 3 / 10 / 30 N·m/rad under a 30 fps closing stream at 1 rad/s
 /// (incident leader ramp) and 0.3 rad/s. After the impact sample the torque stays at or
-/// below 1.2 x cap and settles near contact_torque_nm; no re-squeeze cycles over the 5 s hold.
+/// below 1.2 x cap and settles near contact_torque_nm (or, when the impact sample is over the
+/// cap, the cap latch holds the jaw at the block); no re-squeeze cycles over the 5 s hold.
 /// The impact sample itself is stiffness x the POS_VEL lag at contact (no feedback precedes it);
 /// it stays under stiffness x max_lead_rad.
 #[test]
@@ -613,7 +614,15 @@ fn rigid_stream_contact_is_regulated() {
             assert!(run.impact_nm <= stiffness * max_lead() + 1e-3, "{run:?}");
             assert!(run.after_impact_nm <= 1.2 * cap(), "k {stiffness} {speed} rad/s: {run:?}");
             assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
-            assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            if stiffness * max_lead().min(speed / 4.5) > cap() {
+                // the impact sample is over the cap: the first over-cap sample latches
+                // (GRIPPER_FORCE_CAP_TICKS 1) and the latch holds the measured jaw, so a rigid
+                // block is held at about 0 N·m until the stream opens and closes again
+                assert_eq!(run.trips, 1, "k {stiffness} {speed} rad/s: {run:?}");
+                assert!(run.held_nm <= contact + 0.2, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            } else {
+                assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            }
             let r = rig.lock().unwrap();
             assert!((r.q[6] + 2.0).abs() < 1e-3, "jaw at the block: {}", r.q[6]);
         }

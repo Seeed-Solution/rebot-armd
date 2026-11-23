@@ -1080,8 +1080,6 @@ pub const GRIPPER_CONTACT_LAG_RAD: f32 = 0.30;
 pub const GRIPPER_CONTACT_SLOW_FRACTION: f32 = 0.3;
 /// J7 speed (rad/s) from contact to the contact stop.
 pub const GRIPPER_CONTACT_SPEED: f32 = 0.3;
-/// A grasp squeeze above the gripper torque cap is reduced to aim at this fraction of the cap.
-pub const SQUEEZE_CAP_FRACTION: f32 = 0.8;
 /// Squeeze after a torque cap trip: press in from the measured position, reaching squeeze_rad
 /// in half the squeeze window (settle_ms), until |τ| reaches this fraction of the cap (or squeeze_rad past the measured position).
 pub const SQUEEZE_RAMP_FRACTION: f32 = 0.6;
@@ -1401,13 +1399,15 @@ impl GripperMotion {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
             loads.push(ctx.loads.get(idx).copied().unwrap_or(0.0).abs());
-            // torque cap: back the squeeze off toward the measured position so the grip
-            // torque settles near SQUEEZE_CAP_FRACTION of the cap (position-proportional grip)
+            // torque cap: over it the squeeze holds the measured jaw and ramps in again
             if let Some(cap) = force_cap {
                 let press = (*hold - m_g) * dir;
                 if tau_g.abs() > cap {
-                    if press > 0.0 { *hold = m_g + dir * press * (SQUEEZE_CAP_FRACTION * cap / tau_g.abs()); }
-                    *ramp = false;
+                    // over the cap: hold the measured jaw (no press), like the supervisor's latch,
+                    // then press in again on the ramp up to SQUEEZE_RAMP_FRACTION of the cap (a
+                    // proportional back-off kept pressing and overshot the cap on stiff objects)
+                    if press > 0.0 { *hold = m_g; }
+                    *ramp = true;
                 } else if *ramp && tau_g.abs() < SQUEEZE_RAMP_FRACTION * cap && press < squeeze_rad {
                     *hold += dir * ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
                 }
