@@ -626,6 +626,10 @@ pub struct PersistTestHooks {
     pub payload_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
     /// Positive control: performs one deliberate heap allocation+drop inside the next sub-release wake body.
     pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
+    /// Positive control: performs one deliberate `Box::new` allocation inside the next release
+    /// body when the `AtomicBool` is true, storing the raw pointer in the `AtomicPtr` for
+    /// off-thread reclamation so the release measures `lock_alloc_calls == 1`.
+    pub inject_release_alloc_once: Option<Arc<(AtomicBool, std::sync::atomic::AtomicPtr<u64>)>>,
     /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
     pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Overrides `PANIC_DISABLE_TIMEOUT` for deterministic deadline-observer tests.
@@ -2447,6 +2451,12 @@ fn control_thread_main(
             state.flush_pending_maint_reply(&core);
             state.emit_estop_ack_if_advanced(&mut core);
             state.drain_retired_states(&mut core);
+            if let Some((armed, slot)) = state.hooks.inject_release_alloc_once.as_deref() {
+                if armed.swap(false, Ordering::AcqRel) {
+                    let ptr = Box::into_raw(Box::new(0xB3_u64));
+                    slot.store(ptr, Ordering::Release);
+                }
+            }
             let control_hz = core.config.control_frequency_hz;
             let done = Instant::now();
             let allocs = crate::diagnostics::alloc::take();

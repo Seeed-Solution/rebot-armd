@@ -7,7 +7,7 @@ mod mit_support;
 static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
 use std::io::{self, Write};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use armd::diagnostics::logwriter::{NonBlocking, INLINE_LINE_BYTES};
 use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
 use armd::model::JointState;
 use armd::protocol::damiao::DamiaoLimits;
-use armd::rt_core::executor::ExecutorConfig;
+use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
 use armd::rt_core::ops::{CoreOps, ServiceBudget};
 use armd::safety::{
     BoundedFaultReason, BoundedSafetyState, BoundedText, ClearFaultDriverError, ClearFaultError,
@@ -308,19 +308,122 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
     let ov_text = take_global_logs(log);
     assert!(ov_text.contains("Safety log:") && ov_text.contains("events dropped"), "{ov_text}");
 
-    // Production RtExecutor: E-stop + clear log lines appear off-thread via `armd-dispatch`.
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    sup.set_lease_enabled(false).await;
+    // Direct positive control: injecting exactly 1 allocation without in-window drop measures count == 1.
+    let (single_alloc, boxed) = std::thread::spawn(|| {
+        alloc::time_this_thread();
+        let _ = alloc::take();
+        let b = Box::new(0xB3_u64);
+        std::hint::black_box(&*b);
+        (alloc::take(), b)
+    }).join().unwrap();
+    drop(boxed);
+    assert_eq!(single_alloc.calls, 1, "positive control: one allocation must measure count == 1: {single_alloc:?}");
+
+    // Production RtExecutor: real ThermalTrip fault + refused clear + cooldown clear + E-stop + clear
+    // all run with 0 heap ops across a non-empty sample window, logs appear off-thread via `armd-dispatch`,
+    // and injecting one release allocation produces exact lock_alloc_calls == 1.
+    let mut rt_arm_cfg = ArmConfig::rebot_dm();
+    rt_arm_cfg.max_temperature = 75.0;
+    rt_arm_cfg.joint_tracking = None;
+    let temp_ctl = Arc::new(Mutex::new(30.0f32));
+    let rt_drv = RestingSupportDriver {
+        dof: rt_arm_cfg.dof,
+        enable: EnableState::Enabled,
+        feedback_valid: true,
+        age: Some(Duration::from_millis(10)),
+        disables_arm: false,
+        hw_fault: false,
+        timeout_on_reset: false,
+        positions: rt_arm_cfg.resting_positions().to_vec(),
+        temperature: Arc::clone(&temp_ctl),
+        clock: MockClock::new(),
+    };
+    let sup = Arc::new(ArmSupervisor::new(rt_arm_cfg.clone()).with_driver(Box::new(rt_drv)));
+    {
+        let mut g = sup.inner().write().await;
+        g.lease_enabled = false;
+        g.is_torqued = true;
+        g.feedback_numeric_valid = true;
+        g.measured_positions = rt_arm_cfg.resting_positions().to_vec();
+        g.commanded_positions = rt_arm_cfg.resting_positions().to_vec();
+        g.target_positions = rt_arm_cfg.resting_positions().to_vec();
+        g.measured_velocities = vec![0.0; g.config.dof];
+        g.temperatures = vec![30.0; g.config.dof];
+        let _ = g.safety.set_torque(true).unwrap();
+    }
+    let inject_once = Arc::new((AtomicBool::new(false), AtomicPtr::new(std::ptr::null_mut())));
     let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(4));
     cfg.alloc_timing = true;
-    let handle = sup.start_executor(cfg).await.unwrap();
-    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 4).await;
+    let hooks = PersistTestHooks {
+        inject_release_alloc_once: Some(Arc::clone(&inject_once)),
+        ..Default::default()
+    };
+    let handle = sup.start_executor_with_hooks(cfg, hooks).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= 8).await;
     let _ = take_global_logs(log);
-    assert_eq!(sup.trigger_e_stop_checked().await.unwrap().0, SafetyState::EStop);
+
+    // Measure over a non-empty window covering a real ThermalTrip fault, hot refusal, cooldown clear,
+    // E-stop latch, and E-stop clear.
+    let before_safety = sup.tick_samples().len();
+    *temp_ctl.lock().unwrap() = 85.0;
+    wait_until_async(Duration::from_secs(2), || {
+        sup.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })))
+    }).await;
+    let hot_err = ApiError::from(sup.clear_fault().await.unwrap_err());
+    assert_eq!((hot_err.status, hot_err.code.as_deref()), (StatusCode::CONFLICT, Some("CLEAR_FAULT_REJECTED")));
+
+    *temp_ctl.lock().unwrap() = 50.0;
+    let cool_step = handle.stats().steps.load(Ordering::Relaxed);
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= cool_step + 4).await;
     assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
+
+    assert_eq!(sup.trigger_e_stop_checked().await.unwrap().0, SafetyState::EStop);
+    let estop_step = handle.stats().steps.load(Ordering::Relaxed);
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= estop_step + 4).await;
+    assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
+    let done_step = handle.stats().steps.load(Ordering::Relaxed);
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= done_step + 4).await;
+
+    let safety_samples = sup.tick_samples();
+    let safety_window = &safety_samples[before_safety..];
+    assert!(!safety_window.is_empty(), "executor safety sample window must be non-empty");
+    assert_eq!(
+        safety_window.iter().map(|s| s.usage.lock_alloc_calls).max(),
+        Some(0),
+        "live executor real ThermalTrip + E-stop + clear must do 0 heap ops; max={:?}",
+        safety_window.iter().map(|s| s.usage.lock_alloc_calls).collect::<Vec<_>>()
+    );
+    assert_eq!(handle.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
+
+    // Positive control in live RtExecutor: inject exactly 1 allocation and verify count == 1.
+    let before_pos = sup.tick_samples().len();
+    inject_once.0.store(true, Ordering::Release);
+    wait_until_async(Duration::from_secs(2), || !inject_once.0.load(Ordering::Acquire)).await;
+    let pos_step = handle.stats().steps.load(Ordering::Relaxed);
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= pos_step + 3).await;
+    let pos_samples = sup.tick_samples();
+    let pos_window = &pos_samples[before_pos..];
+    assert!(!pos_window.is_empty(), "positive control sample window must be non-empty");
+    assert_eq!(
+        pos_window.iter().map(|s| s.usage.lock_alloc_calls).max(),
+        Some(1),
+        "positive control: 1 injected release alloc must measure lock_alloc_calls == 1; got {:?}",
+        pos_window.iter().map(|s| s.usage.lock_alloc_calls).collect::<Vec<_>>()
+    );
+    assert_eq!(pos_window.iter().filter(|s| s.usage.lock_alloc_calls == 1).count(), 1);
+    let leaked_ptr = inject_once.1.swap(std::ptr::null_mut(), Ordering::AcqRel);
+    assert!(!leaked_ptr.is_null(), "injected allocation pointer must be stored for reclamation");
+    // SAFETY: pointer was produced once by `Box::into_raw(Box::new(0xB3_u64))` and reclaimed once here.
+    unsafe { drop(Box::from_raw(leaked_ptr)); }
+
     handle.stop_and_join();
     let rt_text = take_global_logs(log);
-    assert!(rt_text.contains("Safety: Idle -> EStop") && rt_text.contains("Safety: cleared -> Idle"), "{rt_text}");
+    assert!(
+        rt_text.contains("ThermalTrip")
+            && rt_text.contains("Safety: Idle -> EStop")
+            && rt_text.contains("Safety: cleared -> Idle"),
+        "expected ThermalTrip, E-stop, and clear log lines off-thread:\n{rt_text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -488,7 +591,11 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     assert_eq!((api.status, api.code.as_deref()), (StatusCode::CONFLICT, Some("CLEAR_FAULT_REJECTED")));
     assert!(api.message.starts_with("Cannot disable faulted supporting arm joint away from resting pose ("), "{}", api.message);
     assert!(api.message.ends_with("); support the arm at rest first"), "{}", api.message);
-    assert_eq!(sup.tick_samples()[before..].iter().map(|s| s.usage.lock_alloc_calls).max().unwrap_or(0), 0);
+    let samples = sup.tick_samples();
+    let window = &samples[before..];
+    assert!(!window.is_empty(), "clear-refusal executor sample window must be non-empty");
+    assert_eq!(window.iter().map(|s| s.usage.lock_alloc_calls).max(), Some(0));
+    assert_eq!(handle.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
     handle.stop_and_join();
 }
 
