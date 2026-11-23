@@ -290,6 +290,93 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
 #[global_allocator]
 static GLOBAL: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
 
+/// Finalizes daemon shutdown after `supervisor.request_shutdown()` confirmed readiness.
+///
+/// The API server stays live until the owner's final shutdown commit succeeds. If the final
+/// commit is refused (for example because the arm was rearmed concurrently) or fails, the API is
+/// stopped, a bounded torque-off disable is issued through the current owner to preserve the
+/// torque-off guarantee, the reason is logged, and `Err` is returned so `armd` exits non-zero.
+async fn finalize_shutdown(
+    supervisor: &Arc<ArmSupervisor>,
+    server_handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    executor_handle: Option<armd::rt_core::executor::RtExecutorHandle>,
+    legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), String> {
+    if let Some(handle) = executor_handle {
+        let h_commit = handle.clone();
+        let commit_res = tokio::task::spawn_blocking(move || h_commit.shutdown_and_join()).await;
+        match commit_res {
+            Ok(Ok(())) => {
+                // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
+                server_handle.abort();
+                info!("armd stopped after shutdown readiness confirmation");
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                error!("Final shutdown commit refused by RT owner: {e}");
+                server_handle.abort();
+                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                let h_disable = handle.clone();
+                let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
+                    .await
+                    .unwrap_or_else(|je| armd::supervisor::PanicDisableOutcome::Failed(je.to_string()));
+                outcome.log("Refused final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
+                return Err(format!(
+                    "Final shutdown commit refused by RT owner: {e} (torque-off: {outcome:?})"
+                ));
+            }
+            Err(je) => {
+                error!("Final shutdown commit task failed: {je}");
+                server_handle.abort();
+                supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                let h_disable = handle.clone();
+                let outcome = tokio::task::spawn_blocking(move || h_disable.emergency_disable_and_join())
+                    .await
+                    .unwrap_or_else(|e| armd::supervisor::PanicDisableOutcome::Failed(e.to_string()));
+                outcome.log("Failed final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
+                return Err(format!(
+                    "Final shutdown commit task failed: {je} (torque-off: {outcome:?})"
+                ));
+            }
+        }
+    }
+
+    if let Some(control_stop) = legacy_control_stop {
+        let confirmed = {
+            let inner = supervisor.inner().write().await;
+            let ok = inner.driver.is_none() || inner.shutdown_ready();
+            if ok {
+                inner.e_stop_latched.store(true, Ordering::SeqCst);
+            }
+            ok
+        };
+        if !confirmed {
+            error!("Final legacy shutdown recheck refused: hardware disable is not confirmed");
+            server_handle.abort();
+            let sup = Arc::clone(supervisor);
+            let outcome = tokio::task::spawn_blocking(move || {
+                sup.attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT)
+            })
+            .await
+            .unwrap_or_else(|je| armd::supervisor::PanicDisableOutcome::Failed(je.to_string()));
+            outcome.log("Refused legacy final shutdown torque-off", armd::supervisor::PANIC_DISABLE_TIMEOUT);
+            control_stop.store(true, Ordering::SeqCst);
+            return Err(format!(
+                "Final legacy shutdown recheck refused: hardware disable is not confirmed (torque-off: {outcome:?})"
+            ));
+        }
+        // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
+        server_handle.abort();
+        control_stop.store(true, Ordering::SeqCst);
+        info!("armd stopped after shutdown readiness confirmation");
+        return Ok(());
+    }
+
+    server_handle.abort();
+    info!("armd stopped after shutdown readiness confirmation");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -591,17 +678,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
-    server_handle.abort();
-    if let Some(handle) = executor_handle {
-        if let Err(e) = handle.shutdown_and_join() {
-            warn!("RT executor shutdown join returned error: {e}");
-        }
-    }
-    if let Some(control_stop) = legacy_control_stop {
-        control_stop.store(true, Ordering::SeqCst);
-    }
-    info!("armd stopped after shutdown readiness confirmation");
+    finalize_shutdown(
+        &supervisor,
+        &mut server_handle,
+        executor_handle,
+        legacy_control_stop,
+    )
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     Ok(())
 }
 
@@ -703,6 +787,138 @@ mod shutdown_tests {
         assert!(inner.set_torque(true).is_err());
         let mut unknown = physical(EnableState::Unknown);
         assert!(!request_shutdown(&mut unknown));
+    }
+
+    struct ToggleableRtDriver {
+        state: Arc<std::sync::Mutex<EnableState>>,
+        disable_sent: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ArmDriver for ToggleableRtDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            *self.state.lock().unwrap()
+        }
+        fn is_enabled(&self) -> bool {
+            *self.state.lock().unwrap() == EnableState::Enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::ZERO); 7]
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); 7])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            if !enable {
+                self.disable_sent.fetch_add(1, Ordering::SeqCst);
+            }
+            *self.state.lock().unwrap() = if enable {
+                EnableState::Enabled
+            } else {
+                EnableState::Disabled
+            };
+            Ok(())
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalize_shutdown_propagates_refusal_non_zero_and_keeps_torque_off_guarantee() {
+        // (a) Executor final commit refused (never confirmed / torqued): must return Err (non-zero
+        // exit), log refusal, keep API alive until commit runs, AND issue bounded disable through
+        // the RT owner before exiting!
+        let state = Arc::new(std::sync::Mutex::new(EnableState::Enabled));
+        let disable_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drv = ToggleableRtDriver {
+            state: state.clone(),
+            disable_sent: disable_sent.clone(),
+        };
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+        sup.set_lease_enabled(false).await;
+        sup.set_torque(true).await.unwrap();
+        let handle = sup
+            .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        let mut server_handle = tokio::spawn(async {
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        assert!(!server_handle.is_finished(), "API must remain alive before finalize_shutdown");
+
+        let err = finalize_shutdown(&sup, &mut server_handle, Some(handle.clone()), None)
+            .await
+            .expect_err("refused final shutdown commit must return Err for non-zero exit");
+        assert!(
+            err.contains("shutdown has not been confirmed") || err.contains("refused"),
+            "error must report refusal reason: {err}"
+        );
+        assert!(handle.is_exited(), "executor must have completed bounded teardown");
+        assert!(
+            disable_sent.load(Ordering::SeqCst) >= 1,
+            "refused final shutdown must still issue torque-off through RT owner"
+        );
+        assert_eq!(*state.lock().unwrap(), EnableState::Disabled);
+
+        // (b) Confirmed disabled executor: finalize_shutdown commits cleanly and returns Ok(()).
+        let state_ok = Arc::new(std::sync::Mutex::new(EnableState::Disabled));
+        let drv_ok = ToggleableRtDriver {
+            state: state_ok,
+            disable_sent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let sup_ok = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_ok)));
+        sup_ok.set_lease_enabled(false).await;
+        let handle_ok = sup_ok
+            .start_executor(armd::rt_core::executor::ExecutorConfig::for_tests(Duration::from_millis(5)))
+            .await
+            .unwrap();
+        assert!(sup_ok.request_shutdown().await.unwrap());
+        let mut server_ok = tokio::spawn(async {
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        finalize_shutdown(&sup_ok, &mut server_ok, Some(handle_ok.clone()), None)
+            .await
+            .expect("confirmed shutdown must exit cleanly");
+        assert!(handle_ok.is_exited());
+
+        // (c) Legacy final shutdown recheck refused (hardware still enabled): returns Err,
+        // stops legacy control loop, AND runs bounded legacy disable to keep torque-off guarantee!
+        let state_leg = Arc::new(std::sync::Mutex::new(EnableState::Enabled));
+        let disable_leg = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drv_leg = ToggleableRtDriver {
+            state: state_leg.clone(),
+            disable_sent: disable_leg.clone(),
+        };
+        let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
+        sup_leg.set_lease_enabled(false).await;
+        sup_leg.set_torque(true).await.unwrap();
+        let legacy_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut server_leg = tokio::spawn(async {
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        let err_leg = finalize_shutdown(&sup_leg, &mut server_leg, None, Some(legacy_stop.clone()))
+            .await
+            .expect_err("refused legacy final shutdown must return Err");
+        assert!(err_leg.contains("refused"), "{err_leg}");
+        assert!(legacy_stop.load(Ordering::SeqCst));
+        assert!(disable_leg.load(Ordering::SeqCst) >= 1);
+        assert_eq!(*state_leg.lock().unwrap(), EnableState::Disabled);
     }
 
     #[test]

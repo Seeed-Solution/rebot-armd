@@ -282,7 +282,7 @@ struct MaintClientInner {
 }
 
 impl MaintClientInner {
-    fn drain_replies(&mut self) {
+    fn pop_all_replies(&mut self) {
         while let Ok(reply) = self.rep_rx.pop() {
             self.in_flight = self.in_flight.saturating_sub(1);
             // Explicitly drop returned payloads here on the off-RT caller/dispatcher thread.
@@ -296,9 +296,22 @@ impl MaintClientInner {
                 waiter.deliver(res);
             }
         }
+    }
+
+    fn drain_replies_with_hook(&mut self, mut between_pop_and_exit_check: impl FnMut()) {
+        self.pop_all_replies();
+        between_pop_and_exit_check();
         if self.exited.load(Ordering::Acquire) {
+            // Drain once more after observing `exited` (Release -> Acquire): any reply pushed
+            // immediately before thread exit (e.g. `CommitShutdown(true)`) is guaranteed visible
+            // now and must not be lost to `fail_remaining`.
+            self.pop_all_replies();
             self.fail_remaining(OwnerError::Stopped);
         }
+    }
+
+    fn drain_replies(&mut self) {
+        self.drain_replies_with_hook(|| {});
     }
 
     fn fail_remaining(&mut self, err: OwnerError) {
@@ -493,7 +506,7 @@ impl EstopRegistry {
         self.drain();
     }
 
-    pub(crate) fn drain(&mut self) {
+    fn pop_acks_and_overflow(&mut self) {
         let mut drained = Vec::new();
         if let Some(rx) = self.ack_rx.as_mut() {
             while let Ok(ack) = rx.pop() {
@@ -507,7 +520,15 @@ impl EstopRegistry {
             let max_dropped = ov.load(Ordering::Acquire);
             self.record_overflow(max_dropped);
         }
+    }
+
+    fn drain_with_hook(&mut self, mut between_pop_and_exit_check: impl FnMut()) {
+        self.pop_acks_and_overflow();
+        between_pop_and_exit_check();
         if self.exited.as_ref().is_some_and(|e| e.load(Ordering::Acquire)) {
+            // Drain once more after observing `exited` so final acks / overflow recorded before
+            // thread exit are never lost to `EXECUTOR_STOPPED`.
+            self.pop_acks_and_overflow();
             let remaining = std::mem::take(&mut self.waiters);
             for (_, senders) in remaining {
                 for tx in senders {
@@ -519,6 +540,10 @@ impl EstopRegistry {
                 }
             }
         }
+    }
+
+    pub(crate) fn drain(&mut self) {
+        self.drain_with_hook(|| {});
     }
 }
 
@@ -662,6 +687,12 @@ impl OffThreadSinks {
     }
 }
 
+#[derive(Default)]
+struct TeardownDisable {
+    requested: AtomicBool,
+    outcome: Mutex<Option<crate::supervisor::PanicDisableOutcome>>,
+}
+
 struct RtExecutorShared {
     broker: Arc<Mutex<Broker<PlanSlot>>>,
     target_writer: Arc<Mutex<TargetWriter>>,
@@ -677,6 +708,7 @@ struct RtExecutorShared {
     exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
     shutdown_confirmed: Arc<AtomicBool>,
+    teardown_disable: Arc<TeardownDisable>,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
@@ -849,6 +881,21 @@ impl RtExecutorHandle {
     pub fn stop_and_join(&self) {
         self.shared.teardown_and_join();
     }
+
+    /// Requests the RT owner thread (`armd-control`) to perform one bounded hardware torque
+    /// disable during teardown before exiting, then joins all worker threads. Preserves the
+    /// single-bus-writer invariant when final shutdown commit was refused or failed.
+    pub fn emergency_disable_and_join(&self) -> crate::supervisor::PanicDisableOutcome {
+        self.shared.teardown_disable.requested.store(true, Ordering::Release);
+        self.shared.teardown_and_join();
+        self.shared
+            .teardown_disable
+            .outcome
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or(crate::supervisor::PanicDisableOutcome::Unconfirmed)
+    }
 }
 
 /// Spawns the synchronous RT executor (`armd-control`) and dedicated persistence worker (`armd-persist`).
@@ -882,6 +929,7 @@ pub(crate) fn spawn_executor(
     let persist_stop = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
+    let teardown_disable = Arc::new(TeardownDisable::default());
     let stats = Arc::new(ExecutorStats::default());
 
     let persist_rep_rx = Arc::new(Mutex::new(persist_rep_rx));
@@ -917,6 +965,7 @@ pub(crate) fn spawn_executor(
         let cfg_clone = cfg.clone();
         let control_stop = control_stop.clone();
         let exited = exited.clone();
+        let teardown_disable = teardown_disable.clone();
         let stats = stats.clone();
         let estop_overflow_gen = estop_overflow_gen.clone();
         let hub_clone = hub.clone();
@@ -931,6 +980,7 @@ pub(crate) fn spawn_executor(
                 ready_tx,
                 control_stop,
                 exited,
+                teardown_disable,
                 stats,
                 control_sched,
                 control_period_us,
@@ -1000,6 +1050,7 @@ pub(crate) fn spawn_executor(
         exited,
         persist_worker_exited,
         shutdown_confirmed: Arc::new(AtomicBool::new(false)),
+        teardown_disable,
         persist_thread: Mutex::new(Some(persist_thread)),
         control_thread: Mutex::new(Some(control_thread)),
         monitor_thread: Mutex::new(monitor_thread),
@@ -1837,6 +1888,7 @@ fn spawn_persist_worker(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control_thread_main(
     mut core: SupervisorInner,
     engine: ReleaseEngine,
@@ -1845,6 +1897,7 @@ fn control_thread_main(
     ready_tx: mpsc::SyncSender<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>,
     control_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    teardown_disable: Arc<TeardownDisable>,
     stats: Arc<ExecutorStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
@@ -1938,6 +1991,7 @@ fn control_thread_main(
     let mut releases = Releases::start(cfg.period);
     let mut last_release_start = Instant::now();
     let mut publish_gen = initial_generation;
+    let mut panicked = false;
 
     while !control_stop.load(Ordering::Acquire) {
         sleep_until_ns(releases.next_ns());
@@ -2146,6 +2200,7 @@ fn control_thread_main(
         }));
 
         if let Err(err) = step_res {
+            panicked = true;
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2155,6 +2210,7 @@ fn control_thread_main(
                 crate::supervisor::PanicDisableOutcome::Failed("secondary panic during RT executor panic-disable".into())
             });
             outcome.log("RT executor panic", crate::supervisor::PANIC_DISABLE_TIMEOUT);
+            *teardown_disable.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
             match cfg.panic_policy {
                 PanicPolicy::AbortProcess => {
                     crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -2165,6 +2221,17 @@ fn control_thread_main(
                 }
             }
         }
+    }
+
+    if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
+        }))
+        .unwrap_or_else(|_| {
+            crate::supervisor::PanicDisableOutcome::Failed("panic during emergency teardown disable".into())
+        });
+        outcome.log("RT executor emergency shutdown", crate::supervisor::PANIC_DISABLE_TIMEOUT);
+        *teardown_disable.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
     }
 
     // Clean exit drain: return queued maintenance payloads off-thread, reconcile any abandoned
@@ -2309,5 +2376,68 @@ mod tests {
         assert!(validate_startup_owner(RtOwner::Executor, "mock").is_ok());
         assert!(validate_startup_owner(RtOwner::Executor, "sim").is_err());
         assert!(validate_startup_owner(RtOwner::Executor, "rebot-dm").is_err());
+    }
+
+    #[test]
+    fn maint_client_drains_final_commit_reply_after_observing_exited() {
+        let (req_tx, _req_rx) = RingBuffer::<MaintRequest>::new(4);
+        let (mut rep_tx, rep_rx) = RingBuffer::<MaintReply>::new(4);
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut inner = MaintClientInner {
+            req_tx,
+            rep_rx,
+            in_flight: 1,
+            next_id: 2,
+            closed: false,
+            waiters: HashMap::new(),
+            exited: exited.clone(),
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        inner.waiters.insert(1, MaintWaiter::Sync(tx));
+
+        // Simulate the exact race: consumer observes an empty reply queue, then producer pushes
+        // `ShutdownCommitted(true)` and stores `exited = true` before consumer checks `exited`.
+        inner.drain_replies_with_hook(|| {
+            rep_tx
+                .push(MaintReply {
+                    id: 1,
+                    result: MaintenanceResult::ShutdownCommitted(true),
+                    returned_offsets: None,
+                    returned_probe: None,
+                })
+                .unwrap();
+            exited.store(true, Ordering::Release);
+        });
+
+        let delivered = rx.try_recv().expect("commit reply must be delivered, not lost to exited");
+        assert!(matches!(delivered, Ok(MaintenanceResult::ShutdownCommitted(true))));
+        assert!(inner.waiters.is_empty());
+        assert_eq!(inner.in_flight, 0);
+    }
+
+    #[test]
+    fn estop_registry_drains_final_ack_after_observing_exited() {
+        let (mut ack_tx, ack_rx) = RingBuffer::<EstopAck>::new(4);
+        let overflow = Arc::new(AtomicU64::new(0));
+        let exited = Arc::new(AtomicBool::new(false));
+        let mut reg = EstopRegistry::default();
+        reg.attach_executor(ack_rx, overflow, exited.clone());
+        let mut rx = reg.register(7);
+
+        reg.drain_with_hook(|| {
+            ack_tx
+                .push(EstopAck {
+                    first_gen: 7,
+                    last_gen: 7,
+                    state: Arc::new(SafetyState::EStop),
+                    epoch: 42,
+                })
+                .unwrap();
+            exited.store(true, Ordering::Release);
+        });
+
+        let delivered = rx.try_recv().expect("final estop ack must be delivered, not lost to exited");
+        assert_eq!(delivered.unwrap(), (SafetyState::EStop, 42));
+        assert!(reg.waiters.is_empty());
     }
 }
