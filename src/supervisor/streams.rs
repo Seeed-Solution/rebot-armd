@@ -1034,8 +1034,8 @@ impl SupervisorInner {
             .filter(|r| r.action_id == action_id)
             .and_then(|r| r.verified_release_gate.as_ref())
         {
-            let active_calib = self.active_calibration_digest();
-            if !gate.calibration_digest().eq_ignore_ascii_case(&active_calib) {
+            if !gate.calibration_digest().eq_ignore_ascii_case(self.active_calibration_digest_str()) {
+                let active_calib = self.active_calibration_digest();
                 let msg = format!(
                     "calibration_digest mismatch: gate declares {}, active deployment is {active_calib}",
                     gate.calibration_digest()

@@ -176,6 +176,8 @@ impl SupervisorInner {
     /// and recompute the effective floor.
     pub fn set_calibration(&mut self, c: Option<crate::calibration::CalibrationFile>) {
         self.calibration = c;
+        #[cfg(feature = "policy-runtime")]
+        { self.calibration_digest = Self::calibration_digest_of(self.calibration.as_ref()); }
         self.refresh_effective_floor();
     }
 
@@ -419,8 +421,15 @@ impl SupervisorInner {
     /// Deterministic SHA-256 digest of the active camera calibration state, or
     /// `EMPTY_CALIBRATION_DIGEST` when uncalibrated.
     #[cfg(feature = "policy-runtime")]
-    pub fn active_calibration_digest(&self) -> String {
-        match &self.calibration {
+    pub fn active_calibration_digest(&self) -> String { self.calibration_digest.clone() }
+
+    /// [`Self::active_calibration_digest`] without a copy (live policy steps).
+    #[cfg(feature = "policy-runtime")]
+    pub fn active_calibration_digest_str(&self) -> &str { &self.calibration_digest }
+
+    #[cfg(feature = "policy-runtime")]
+    fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
+        match c {
             None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             Some(cal) => {
                 let bytes = serde_json::to_vec(cal).unwrap_or_default();

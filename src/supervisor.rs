@@ -383,6 +383,10 @@ pub struct SupervisorInner {
     /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
     /// profile's camera mount.
     pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// SHA-256 of `calibration` (`active_calibration_digest`), recomputed by `set_calibration`
+    /// so a live policy step compares it without serializing and hashing.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) calibration_digest: String,
     /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
     /// MIT not requested.
     pub mit_gate_error: Option<String>,
@@ -702,6 +706,8 @@ impl SupervisorInner {
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest: crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             mit_gate_error: None,
             mit: Default::default(),
             profile_floor_z_m,

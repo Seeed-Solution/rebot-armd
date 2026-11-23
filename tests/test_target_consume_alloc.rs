@@ -163,3 +163,22 @@ fn a_stop_and_the_next_servo_target_do_not_touch_the_allocator() {
     assert_eq!((allocs, frees), (0, 0), "stop + next target touched the allocator");
     assert!((inner.servo_target.as_ref().unwrap()[0] - (base[0] + 0.002)).abs() < 1e-6);
 }
+
+/// The calibration digest a live step compares with the release gate is computed when the
+/// calibration is installed: reading it does not serialize, hash or allocate.
+#[cfg(feature = "policy-runtime")]
+#[test]
+fn the_calibration_digest_is_cached_at_install() {
+    use armd::calibration::CalibrationFile;
+    use armd::policy_runtime::EMPTY_CALIBRATION_DIGEST;
+    let (mut inner, _) = supervisor();
+    assert_eq!(inner.active_calibration_digest(), EMPTY_CALIBRATION_DIGEST);
+    let cal = CalibrationFile { mit_qualification: Some(serde_json::json!({"k": 1})), ..Default::default() };
+    let expected = armd::gravity::compute_sha256(&serde_json::to_vec(&cal).unwrap());
+    inner.set_calibration(Some(cal));
+    let (same, allocs, frees) = counted(|| inner.active_calibration_digest_str().eq_ignore_ascii_case(&expected));
+    assert!(same);
+    assert_eq!((allocs, frees), (0, 0));
+    inner.set_calibration(None);
+    assert_eq!(inner.active_calibration_digest(), EMPTY_CALIBRATION_DIGEST);
+}
