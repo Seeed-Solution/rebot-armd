@@ -3878,6 +3878,14 @@ enum OwnerSlot {
     Failed,
 }
 
+/// Ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after latching
+/// `e_stop_latched` and registering the per-request waiter.
+pub(crate) struct CheckedEstopTicket {
+    req: u64,
+    rx: tokio::sync::oneshot::Receiver<Result<(SafetyState, u64), ArmError>>,
+    mode: u8,
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
@@ -4848,13 +4856,14 @@ impl ArmSupervisor {
         }
     }
 
-    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
-    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
-    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
-        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
+    /// Synchronously latches the physical E-stop flag, increments the requested generation,
+    /// and registers a per-request waiter without awaiting any async lock. Call
+    /// [`Self::finish_e_stop_checked`] to obtain the applied `(SafetyState, epoch_id)`.
+    pub(crate) fn begin_e_stop_checked(&self) -> CheckedEstopTicket {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::begin_e_stop_checked");
         // Set the physical E-stop latch FIRST before touching any lock.
         self.e_stop_latched.store(true, Ordering::SeqCst);
-        let (req, mut rx, mode) = {
+        let (req, rx, mode) = {
             let mut reg = self.estop_reg.lock().unwrap_or_else(|e| e.into_inner());
             let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
             let rx = reg.register(req);
@@ -4864,6 +4873,14 @@ impl ArmSupervisor {
             }
             (req, rx, mode)
         };
+        CheckedEstopTicket { req, rx, mode }
+    }
+
+    pub(crate) async fn finish_e_stop_checked(
+        &self,
+        ticket: CheckedEstopTicket,
+    ) -> Result<(SafetyState, u64), ArmError> {
+        let CheckedEstopTicket { req, mut rx, mode } = ticket;
         match mode {
             OWNER_EXECUTOR => self.await_estop_waiter(rx).await,
             OWNER_LEGACY | OWNER_TRANSFERRING => {
@@ -4918,6 +4935,14 @@ impl ArmSupervisor {
                 Err(executor_unavailable())
             }
         }
+    }
+
+    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
+    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
+    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
+        let ticket = self.begin_e_stop_checked();
+        self.finish_e_stop_checked(ticket).await
     }
 
     pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
