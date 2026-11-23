@@ -71,7 +71,7 @@ fn an_install_is_acked_then_completes_and_retires_its_slot() {
     assert_eq!(ended, Some((action, Outcome::Completed)));
     assert_eq!(replies(&mut b), vec![
         Reply::Ack { request: r, commit_seq: 1, action: Some(action) },
-        Reply::Terminal { request: r, action, outcome: Outcome::Completed },
+        Reply::Terminal { request: r, action, outcome: Outcome::Completed, children: 0 },
     ]);
     let s = b.stats();
     assert_eq!((s.admitted, s.acked, s.terminals, s.retired, b.reserved()), (1, 1, 1, 1, 0));
@@ -125,7 +125,7 @@ fn an_authorized_stop_invalidates_queued_and_active_work_regardless_of_capacity(
     got.extend(replies(&mut b));
     assert_eq!(got[0], Reply::Ack { request: r1, commit_seq: 1, action: Some(action) });
     assert!(got.contains(&Reply::Refused { request: r2, code: "STOPPED" }));
-    assert!(got.contains(&Reply::Terminal { request: r1, action, outcome: Outcome::Stopped }));
+    assert!(got.contains(&Reply::Terminal { request: r1, action, outcome: Outcome::Stopped, children: 0 }));
     assert_eq!((b.reserved(), b.outstanding(), b.stats().retired), (0, 0, 2));
 }
 
@@ -484,6 +484,35 @@ fn a_torque_transition_is_acked_then_its_terminal_follows_from_the_poll() {
     assert_eq!(rep.transition_ended, Some((t, Outcome::Completed)));
     assert!(fx.transition().is_none());
     let got = replies(&mut b);
-    assert_eq!(got[1], Reply::Terminal { request: r, action: t, outcome: Outcome::Completed });
+    assert_eq!(got[1], Reply::Terminal { request: r, action: t, outcome: Outcome::Completed, children: 0 });
     assert_eq!((b.reserved(), b.outstanding()), (0, 0));
+}
+
+#[test]
+fn macro_children_name_their_parent_and_a_macro_terminal_carries_its_child_count() {
+    use armd::rt_core::ops::{ChildSpec, ChildTicket};
+    use armd::rt_core::MacroTerminal;
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.1, 2.0)).unwrap();
+    fx.step();
+    let parent = fx.active().unwrap();
+    let a = auth(&fx);
+    let start = { let mut s = [0.0; MAX_DOF]; let c = &fx.core.commanded_positions; s[..c.len()].copy_from_slice(c); s };
+    let child = |p: u64| ChildSpec { ticket: ChildTicket { parent: armd::rt_core::broker::ActionId(p), child_seq: 1 }, timeout_s: 2.0, timeout_code: "GRIPPER_TIMEOUT", contact: None };
+    let grip = |p: u64| Primitive::Gripper { child: Some(child(p)), dof: 7, start, fraction: 0.0, speed: 1.0, grasp: true };
+    // a ticket for another parent than the stamp's
+    submit_install(&mut b, 2, a, later(), grip(parent.0 + 1)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
+    // well-formed, not wired in the foundation adapter
+    submit_install(&mut b, 3, a, later(), grip(parent.0)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("UNSUPPORTED"));
+    assert_eq!(fx.active(), Some(parent));
+    // the macro's terminal record (outcome and children) outlives its action record
+    fx.core.core.record_macro_terminal(MacroTerminal { action: parent, children: 3, outcome: Outcome::Failed("NOT_HOLDING") });
+    let rep = fx.step();
+    assert_eq!(rep.ended, Some((parent, Outcome::Failed("NOT_HOLDING"))));
+    let got = replies(&mut b);
+    assert!(got.iter().any(|r| matches!(r, Reply::Terminal { action, children: 3, outcome: Outcome::Failed("NOT_HOLDING"), .. } if *action == parent)), "{got:?}");
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
+    assert!(snap.feedback_queue_bounds.is_empty(), "mock follower: no queue bounds");
 }

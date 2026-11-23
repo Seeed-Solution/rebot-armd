@@ -209,8 +209,9 @@ pub enum Reply {
     Ack { request: RequestId, commit_seq: u64, action: Option<ActionId> },
     /// Not committed (nothing changed on the RT side; a plan slot was retired).
     Refused { request: RequestId, code: &'static str },
-    /// The physical completion of an acknowledged action.
-    Terminal { request: RequestId, action: ActionId, outcome: Outcome },
+    /// The physical completion of an acknowledged action; `children`: the child primitives
+    /// a macro action ran (0 for a plain primitive or a transition).
+    Terminal { request: RequestId, action: ActionId, outcome: Outcome, children: u32 },
 }
 
 impl Reply {
@@ -672,10 +673,13 @@ impl<P> RtIntake<P> {
 
     /// The physical end of an acknowledged install (consumes its token: one terminal per
     /// install); retires its plan slot.
-    pub fn terminal(&mut self, i: Installed, outcome: Outcome) {
+    pub fn terminal(&mut self, i: Installed, outcome: Outcome) { self.terminal_with_children(i, outcome, 0); }
+
+    /// [`Self::terminal`] of a macro action that ran `children` child primitives.
+    pub fn terminal_with_children(&mut self, i: Installed, outcome: Outcome, children: u32) {
         if let Some(plan) = i.plan { self.plans.retire(plan); }
         self.installed -= 1;
-        self.reply(Reply::Terminal { request: i.request, action: i.action, outcome });
+        self.reply(Reply::Terminal { request: i.request, action: i.action, outcome, children });
     }
 
     /// The broker is gone (dropped): the RT keeps running and drops replies.
@@ -848,7 +852,7 @@ mod tests {
             rt.terminal(acked.installed.unwrap(), Outcome::Completed);
             let mut got = Vec::new();
             assert_eq!(b.poll(|_, r| { got.push(r); true }), 2);
-            assert_eq!(got, vec![Reply::Ack { request: r, commit_seq: k + 1, action: Some(ActionId(k)) }, Reply::Terminal { request: r, action: ActionId(k), outcome: Outcome::Completed }]);
+            assert_eq!(got, vec![Reply::Ack { request: r, commit_seq: k + 1, action: Some(ActionId(k)) }, Reply::Terminal { request: r, action: ActionId(k), outcome: Outcome::Completed, children: 0 }]);
         }
         assert_eq!(gens, (1..=100).collect::<Vec<u64>>(), "one slot, a new generation per reuse");
         let s = b.stats();
@@ -979,7 +983,7 @@ mod tests {
         assert_eq!(got, vec![
             Reply::Refused { request: r1, code: "INTERNAL" },
             Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(9)) },
-            Reply::Terminal { request: r2, action: ActionId(9), outcome: Outcome::Completed },
+            Reply::Terminal { request: r2, action: ActionId(9), outcome: Outcome::Completed, children: 0 },
         ]);
         assert_eq!((b.reserved(), b.outstanding(), b.stats().unexpected, rt.reply_overflow()), (0, 0, 0, 0));
         assert_eq!(b.stats().retired, 2);

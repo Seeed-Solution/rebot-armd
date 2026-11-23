@@ -78,6 +78,66 @@ pub enum Primitive {
     /// prepared from, every joint including the gripper: the commit refuses it (`PLAN_STALE`)
     /// when any commanded joint differs from it by `>= START_TOLERANCE`.
     JointQuintic { dof: u8, start: [f32; MAX_DOF], q: [f32; MAX_DOF], duration_s: f64 },
+    /// Macro children (track E; the foundation adapter refuses them with `UNSUPPORTED`
+    /// until C/E wire them). Each names its parent ([`ChildSpec`]); its deadline is the
+    /// descriptor's.
+    ///
+    /// Straight-line Cartesian path through `waypoints[..n]` (base frame `[x, y, z, roll,
+    /// pitch, yaw]`, m / rad) at `speed_mps`.
+    CartesianPath { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], n: u8, waypoints: [[f32; 6]; MAX_WAYPOINTS], speed_mps: f32 },
+    /// Gripper to `fraction` (0 closed .. 1 open) at `speed`; `grasp`: stop on contact.
+    Gripper { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], fraction: f32, speed: f32, grasp: bool },
+    /// Joint quintic with per-joint velocity limits and a settle time after it.
+    JointQuinticLimited { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], q: [f32; MAX_DOF], duration_s: f64, max_velocity: [f32; MAX_DOF], settle_s: f64 },
+    /// Replay of a recorded episode.
+    Replay { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], episode: EpisodeRef, speed: f32, gripper: bool },
+}
+
+/// Waypoints a [`Primitive::CartesianPath`] carries at most.
+pub const MAX_WAYPOINTS: usize = 16;
+
+/// A macro child's identity: its parent action and its sequence within that parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildTicket {
+    pub parent: ActionId,
+    pub child_seq: u32,
+}
+
+/// A child primitive's ticket and the guards it runs under.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChildSpec {
+    pub ticket: ChildTicket,
+    /// The child fails with `timeout_code` after `timeout_s` (e.g. `GRIPPER_TIMEOUT`).
+    pub timeout_s: f64,
+    pub timeout_code: &'static str,
+    pub contact: Option<ContactGuard>,
+}
+
+/// Stop the child when a joint's residual torque exceeds its bound (N·m; 0: unguarded).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContactGuard {
+    pub max_residual_nm: [f32; MAX_DOF],
+    /// The child's terminal code on contact (e.g. `COLLISION`, or `Completed` for a descent
+    /// that is meant to touch: `None`).
+    pub stop_code: Option<&'static str>,
+}
+
+/// An episode id, inline (ULID: 26 bytes; up to 32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpisodeRef {
+    len: u8,
+    id: [u8; 32],
+}
+
+impl EpisodeRef {
+    /// None when `id` is longer than 32 bytes.
+    pub fn new(id: &str) -> Option<Self> {
+        if id.len() > 32 { return None; }
+        let mut b = [0u8; 32];
+        b[..id.len()].copy_from_slice(id.as_bytes());
+        Some(Self { len: id.len() as u8, id: b })
+    }
+    pub fn as_str(&self) -> &str { std::str::from_utf8(&self.id[..usize::from(self.len)]).unwrap_or_default() }
 }
 
 /// A prepared start differs from the commanded position when a joint (gripper included)
@@ -85,6 +145,14 @@ pub enum Primitive {
 pub const START_TOLERANCE: f32 = 1e-4;
 
 impl Primitive {
+    /// The child ticket of a macro child (None: a plain primitive).
+    pub fn child(&self) -> Option<&ChildSpec> {
+        match self {
+            Self::None | Self::JointQuintic { .. } => None,
+            Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. } => child.as_ref(),
+        }
+    }
+
     /// A joint quintic prepared from `start` (the planning snapshot's commanded positions).
     /// `INVALID_COMMAND` when `q` is empty or longer than [`MAX_DOF`], or `start` has
     /// another length: nothing is truncated.
@@ -152,6 +220,11 @@ pub struct PlanningSnapshot {
     pub commanded: Vec<f32>,
     pub feedback_instants: Vec<Option<Instant>>,
     pub feedback_seqs: Vec<u64>,
+    /// Per-joint receive-queue bounds of the latest feedback (multiview receive progress);
+    /// empty when the driver reports none.
+    pub feedback_queue_bounds: Vec<Option<Instant>>,
+    /// Estimated residual joint torques (N·m, contact), None without an estimate.
+    pub residual_torques: Option<[f32; 6]>,
     pub motion_active: bool,
     /// A configuration hold inhibits motion (`ArmCore::motion_inhibited_by_config`): refuse
     /// motion at admission; the commit refuses it with `CONFIG_BUSY`.
@@ -246,6 +319,9 @@ pub trait CoreOps {
     fn apply_stop(&mut self);
     /// How `action` ended, None while it runs.
     fn action_outcome(&self, action: ActionId) -> Option<Outcome>;
+    /// Child primitives the ended macro `action` ran (its terminal record,
+    /// `ArmCore::last_macro`); 0 for a plain primitive.
+    fn action_children(&self, _action: ActionId) -> u32 { 0 }
     /// The bus owner's progress and confirmations within `budget` (exclusive: the bus
     /// owner's state machine advances here).
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll;
@@ -301,6 +377,8 @@ impl CoreOps for SupervisorInner {
             commanded: self.commanded_positions.clone(),
             feedback_instants: self.core.feedback().instants().to_vec(),
             feedback_seqs: self.core.feedback().seqs().to_vec(),
+            feedback_queue_bounds: self.joint_feedback_queue_bounds.clone(),
+            residual_torques: self.residual_torques,
             motion_active: self.active_trajectory.is_some(),
             config_inhibited: self.core.motion_inhibited_by_config(),
             taken_at: ctx.now,
@@ -310,8 +388,13 @@ impl CoreOps for SupervisorInner {
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.check_commit(d, ctx)?;
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        // a child names the parent its stamp was admitted under
+        if let Some(c) = primitive.child() {
+            if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }
+        }
         match primitive {
             Primitive::None => Err("INVALID_COMMAND"),
+            Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => Err("UNSUPPORTED"),
             Primitive::JointQuintic { dof, start, q, duration_s } => {
                 // the fields are public: a hand-built primitive may name more joints than it holds
                 let n = usize::from(*dof);
@@ -366,9 +449,13 @@ impl CoreOps for SupervisorInner {
     fn apply_stop(&mut self) { self.stop_motion(); }
 
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
+        // a macro's terminal record outlives its action record (finish_action, a newer action)
+        if let Some(m) = self.core.last_macro().filter(|m| m.action == action) { return Some(m.outcome); }
         let Some(a) = self.last_action.as_ref().filter(|a| a.id == action.0) else { return Some(Outcome::Superseded); };
         outcome_of(&a.state, a.code.as_deref())
     }
+
+    fn action_children(&self, action: ActionId) -> u32 { self.core.last_macro().filter(|m| m.action == action).map_or(0, |m| m.children) }
 
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         // no bus servicing is delegated yet (the tick reads feedback): only the budget is reported
@@ -449,7 +536,7 @@ impl CoreOps for StubCore {
     fn authority(&self, ctx: &CommitCtx) -> Authority { Authority { stop_generation: ctx.stop_generation, ..Authority::default() } }
     fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot {
         PlanningSnapshot { arm: ArmId::LOCAL, published_seq: 0, authority: self.authority(ctx), measured: Vec::new(), commanded: Vec::new(),
-            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), motion_active: false, config_inhibited: false, taken_at: ctx.now }
+            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), feedback_queue_bounds: Vec::new(), residual_torques: None, motion_active: false, config_inhibited: false, taken_at: ctx.now }
     }
     fn commit_primitive(&mut self, _: &Descriptor, _: &Primitive, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_immediate(&mut self, _: &Descriptor, _: ImmediateOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
@@ -643,7 +730,8 @@ impl<O: CoreOps> ReleaseFixture<O> {
         if let Some(action) = self.active() {
             if let Some(outcome) = self.core.action_outcome(action) {
                 let installed = self.active.take().expect("active above");
-                self.intake.terminal(installed, outcome);
+                let children = self.core.action_children(action);
+                self.intake.terminal_with_children(installed, outcome, children);
                 report.ended = Some((action, outcome));
             }
         }

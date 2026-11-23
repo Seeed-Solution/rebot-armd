@@ -72,6 +72,17 @@ pub struct ArmCore {
     targets: TargetAuthority,
     /// The driver transition in flight and its latest progress (`ops::CoreOps::commit_transition`).
     transition: Option<Result<TorqueProgress, &'static str>>,
+    /// The terminal record of the last macro action that ended.
+    last_macro: Option<MacroTerminal>,
+}
+
+/// How a macro action ended, kept after its action record is finished or replaced, so the
+/// RT can send its terminal (outcome with cause, child count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacroTerminal {
+    pub action: super::broker::ActionId,
+    pub children: u32,
+    pub outcome: super::broker::Outcome,
 }
 
 impl ArmCore {
@@ -88,6 +99,7 @@ impl ArmCore {
             config: ConfigHold::default(),
             targets: TargetAuthority::default(),
             transition: None,
+            last_macro: None,
         }
     }
 
@@ -255,4 +267,12 @@ impl ArmCore {
         if !matches!(p, Ok(TorqueProgress::Pending { .. })) { self.transition = None; }
         Some(p)
     }
+
+    // -- macro terminals ------------------------------------------------------------------
+
+    /// Records how a macro action ended (call where the macro finishes, track E).
+    pub fn record_macro_terminal(&mut self, t: MacroTerminal) { self.last_macro = Some(t); }
+
+    /// The last macro terminal record.
+    pub fn last_macro(&self) -> Option<MacroTerminal> { self.last_macro }
 }

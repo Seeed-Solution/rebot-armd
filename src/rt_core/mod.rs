@@ -48,7 +48,7 @@ pub mod config_iface;
 pub mod ops;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use core::{ArmCore, FeedbackState, ObservationBuffer};
+pub use core::{ArmCore, FeedbackState, MacroTerminal, ObservationBuffer};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod core;
