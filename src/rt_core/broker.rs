@@ -330,7 +330,7 @@ impl<P> std::ops::Deref for PlanSlotRef<P> {
 impl<P> Clone for PlanSlotRef<P> {
     fn clone(&self) -> Self {
         let prev = self.slots.pins[self.handle.index()].fetch_add(1, Ordering::Relaxed);
-        assert!(prev < u32::MAX, "plan slot pin count overflow");
+        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
         Self { slots: self.slots.clone(), handle: self.handle }
     }
 }
@@ -480,7 +480,7 @@ impl<P> PlanReader<P> {
         let w = self.slots.words.get(idx)?;
         if w.load(Ordering::Acquire) != pack(h.generation, READY) { return None; }
         let prev = self.slots.pins[idx].fetch_add(1, Ordering::Acquire);
-        assert!(prev < u32::MAX, "plan slot pin count overflow");
+        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
         if w.load(Ordering::Acquire) != pack(h.generation, READY) {
             self.slots.pins[idx].fetch_sub(1, Ordering::Release);
             return None;

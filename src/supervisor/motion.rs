@@ -664,6 +664,24 @@ impl SupervisorInner {
         Some((out, dof))
     }
 
+    /// Zero-allocation static refusal checks for RT jog commits (`commit_primitive` /
+    /// `Primitive::JointQuintic`), preserving the exact refusal precedence of `jog_action_slice`.
+    pub(crate) fn jog_precheck_static(&self) -> Result<(), &'static str> {
+        if self.config.active_tool.commissioning_required { return Err("COMMISSIONING_REQUIRED"); }
+        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        if self.gravity_comp.is_some() { return Err("MOTION_BUSY"); }
+        // When MIT tracking is configured on a torqued arm, defer remaining checks to
+        // `jog_action_slice` so `mit_motion_blocker()` keeps its exact precedence.
+        if self.is_torqued && self.config.joint_tracking.is_some() { return Ok(()); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading || self.policy_run.is_some() { return Err("MOTION_BUSY"); }
+        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
+        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
+        if self.pending_rearm || self.pending_normal_unload { return Err("NOT_ARMED"); }
+        Ok(())
+    }
+
     /// Jog from a fixed slice (RT commit path: no `to_vec()`, no `planning_limits()`
     /// allocation, no `target_positions` replacement free).
     pub(crate) fn jog_action_slice(

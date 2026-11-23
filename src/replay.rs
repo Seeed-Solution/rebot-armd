@@ -443,9 +443,20 @@ fn workspace_reject(e: SafetyError) -> ArmError {
     }
 }
 
+// `ReplayMotion` is already boxed in `Reference::Replay`; keeping approach polynomials inline
+// avoids deallocating a `Vec<QuinticPolynomial>` on the RT thread when transitioning to `Follow`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum Phase {
     Approach(MultiJointQuinticTrajectory),
+    /// Fixed-storage approach polynomials for RT prepared replays: transitioning to `Follow`
+    /// never frees a `Vec<QuinticPolynomial>` on the RT thread.
+    ApproachInline {
+        polys: [crate::trajectory::QuinticPolynomial; crate::rt_core::mailbox::MAX_DOF],
+        dof: usize,
+        duration: f64,
+        elapsed: f64,
+    },
     Follow { t: f64, stalled_for: f64 },
     Settle(Settle),
 }
@@ -523,11 +534,11 @@ impl ReplayMotion {
 
     /// Recording time reached (s): 0 during the approach.
     pub fn t_s(&self) -> f64 {
-        match &self.phase { Phase::Approach(_) => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
+        match &self.phase { Phase::Approach(_) | Phase::ApproachInline { .. } => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
     }
 
     pub fn phase_name(&self) -> &'static str {
-        match self.phase { Phase::Approach(_) => "approach", Phase::Follow { .. } => "replay", Phase::Settle(_) => "settle" }
+        match self.phase { Phase::Approach(_) | Phase::ApproachInline { .. } => "approach", Phase::Follow { .. } => "replay", Phase::Settle(_) => "settle" }
     }
 
     /// Approach + playback at `speed` + settle allowance (s).
@@ -574,6 +585,22 @@ impl ReplayMotion {
                 traj.step_pv_into(ctx.dt * ctx.time_scale, &mut q, &mut v);
                 let finished = traj.is_finished();
                 for x in v.iter_mut() { *x *= ctx.time_scale as f32; }
+                let clear = self.apply_gripper(&mut q, ctx);
+                if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
+                if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
+                StepOut { positions: q, velocities: v, status: StepStatus::Running, progress: 0.0, clear_gripper_stall: clear }
+            }
+            Phase::ApproachInline { polys, dof, duration, elapsed } => {
+                let (mut q, mut v) = (positions, velocities);
+                *elapsed += ctx.dt * ctx.time_scale;
+                let t = *elapsed;
+                let finished = t >= *duration;
+                q.clear();
+                v.clear();
+                for poly in &polys[..*dof] {
+                    q.push(poly.position(t) as f32);
+                    v.push((poly.velocity(t) * ctx.time_scale) as f32);
+                }
                 let clear = self.apply_gripper(&mut q, ctx);
                 if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
                 if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
@@ -761,6 +788,26 @@ impl SupervisorInner {
         Ok((traj, approach_scale))
     }
 
+    /// Zero-allocation validation of a prepared replay preserving the exact refusal precedence
+    /// of [`Self::check_prepared_replay`] (`INVALID_COMMAND`, `PLAN_STALE`, preconditions, `TOOL_MISMATCH`).
+    pub(crate) fn validate_prepared_replay(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
+        duration: f64, epoch: u64) -> Result<(crate::rt_core::ops::EpisodeRef, f32, bool, f64), &'static str> {
+        let crate::rt_core::ops::PathKind::Replay { episode, speed, gripper, sample_dt, tool_digest } = kind else {
+            return Err("INVALID_COMMAND");
+        };
+        if path.is_empty() || dof != self.config.dof || dof > crate::rt_core::mailbox::MAX_DOF || !(sample_dt.is_finite() && sample_dt > 0.0) || !(duration.is_finite() && duration >= 0.0) {
+            return Err("INVALID_COMMAND");
+        }
+        if self.safety.epoch_id() != epoch {
+            return Err("PLAN_STALE");
+        }
+        self.replay_preconditions().map_err(crate::rt_core::ops::static_code)?;
+        if crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest) != tool_digest {
+            return Err("TOOL_MISMATCH");
+        }
+        Ok((episode, speed, gripper, sample_dt))
+    }
+
     /// Shared checks for a prepared replay (from `&PreparedPath` or pinned `PlanSlotRef`).
     fn check_prepared_replay(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
         duration: f64, epoch: u64) -> Result<(crate::rt_core::ops::EpisodeRef, f32, bool, f64), ArmError> {
@@ -786,13 +833,33 @@ impl SupervisorInner {
     pub(crate) fn prepared_replay_from_slot(&mut self, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
         kind: crate::rt_core::ops::PathKind, duration: f64, power_scale: Option<f64>, epoch: u64)
         -> Result<(ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2]), ArmError> {
-        let (episode, speed, gripper, sample_dt) = self.check_prepared_replay(dof, &slot.path, kind, duration, epoch)?;
+        let checked = self.check_prepared_replay(dof, &slot.path, kind, duration, epoch)?;
+        self.prepared_replay_from_slot_checked(dof, slot, checked, duration, power_scale, epoch)
+    }
+
+    /// [`Self::prepared_replay_from_slot`] after zero-allocation [`Self::validate_prepared_replay`].
+    pub(crate) fn prepared_replay_from_slot_checked(&mut self, dof: usize, slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        checked: (crate::rt_core::ops::EpisodeRef, f32, bool, f64), duration: f64, power_scale: Option<f64>, epoch: u64)
+        -> Result<(ReplayMotion, [f32; crate::rt_core::mailbox::MAX_DOF], usize, [Option<f64>; 2]), ArmError> {
+        let (episode, speed, gripper, sample_dt) = checked;
         let gripper_idx = self.config.gripper_index();
         let hold_gripper = gripper_idx.filter(|_| !gripper).map(|g| self.commanded_positions[g]);
         let mut first = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         first[..dof].copy_from_slice(&slot.path.samples()[0][..dof]);
         if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
         let (traj, approach_scale) = self.replay_approach(&first[..dof], epoch)?;
+        let approach_duration = traj.duration;
+        let phase = if traj.polynomials.len() <= crate::rt_core::mailbox::MAX_DOF {
+            let zero_poly = crate::trajectory::QuinticPolynomial {
+                a0: 0.0, a1: 0.0, a2: 0.0, a3: 0.0, a4: 0.0, a5: 0.0,
+                duration: approach_duration, p0: 0.0, p1: 0.0, v0: 0.0, v1: 0.0, a_start: 0.0, a_end: 0.0,
+            };
+            let mut polys = [zero_poly; crate::rt_core::mailbox::MAX_DOF];
+            polys[..traj.polynomials.len()].copy_from_slice(&traj.polynomials);
+            Phase::ApproachInline { polys, dof: traj.polynomials.len(), duration: approach_duration, elapsed: 0.0 }
+        } else {
+            Phase::Approach(traj)
+        };
         let motion = ReplayMotion {
             episode: ReplayEpisode::Inline(episode),
             speed: f64::from(speed) * power_scale.unwrap_or(1.0),
@@ -803,8 +870,8 @@ impl SupervisorInner {
             duration,
             hold_gripper,
             tag: None,
-            approach_duration: traj.duration,
-            phase: Phase::Approach(traj),
+            approach_duration,
+            phase,
         };
         Ok((motion, first, dof, [power_scale, approach_scale]))
     }

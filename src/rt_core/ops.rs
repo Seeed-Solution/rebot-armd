@@ -580,7 +580,7 @@ pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
 
 /// The protocol code of a delegated error, as a static string without allocating
 /// (unknown codes: `REJECTED`).
-fn static_code(e: ArmError) -> &'static str {
+pub(crate) fn static_code(e: ArmError) -> &'static str {
     use crate::safety::SafetyError as S;
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
@@ -686,6 +686,7 @@ impl CoreOps for SupervisorInner {
                 let n = usize::from(*dof);
                 if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                self.jog_precheck_static()?;
                 self.jog_action_slice(&q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
@@ -750,7 +751,8 @@ impl CoreOps for SupervisorInner {
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
                 match child {
                     None => {
-                        let prepared = self.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch).map_err(static_code)?;
+                        let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
                         committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
@@ -1255,5 +1257,33 @@ mod tests {
         assert_eq!(total_bytes, 655_360);
         assert!(w.stage(|_| {}).is_none());
         for h in handles { assert!(r.retire(h)); }
+    }
+
+    #[test]
+    fn stop_diag_slot_records_coalesces_and_drains() {
+        let slot = StopDiagSlot::new();
+        let mut seen = 0;
+        assert_eq!(slot.poll(&mut seen), None);
+
+        slot.record_park_ignored(ArmId(3), 1.25, 12.5);
+        slot.record_park_ignored(ArmId(3), 2.5, 12.5);
+        assert_eq!(slot.count(), 2);
+
+        let rec = slot.drain_and_log(&mut seen).expect("coalesced record");
+        assert_eq!(
+            rec,
+            StopDiagRecord {
+                count: 2,
+                arm: ArmId(3),
+                park_elapsed_us: 2_500_000,
+                park_budget_us: 12_500_000,
+            }
+        );
+        assert_eq!(seen, 2);
+        assert_eq!(slot.poll(&mut seen), None);
+
+        slot.record_park_ignored(ArmId::LOCAL, f64::NAN, -1.0);
+        let san = slot.poll(&mut seen).expect("sanitized record");
+        assert_eq!((san.count, san.park_elapsed_us, san.park_budget_us), (1, 0, 0));
     }
 }
