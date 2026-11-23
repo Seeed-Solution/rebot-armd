@@ -443,7 +443,7 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-field input { min-height: 40px; padding: 0 10px; font: inherit; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-base); background: var(--sc-color-bg); color: var(--sc-color-text); }
 .cwiz-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .cwiz-acts .btn { min-height: 48px; font-size: 14px; touch-action: manipulation; }
-.cwiz-acts .wide { grid-column: 1 / -1; }
+.cwiz-acts .wide, .cwiz-acts > .btn:only-child { grid-column: 1 / -1; }
 .cwiz-stop { color: #fff !important; background: var(--sc-estop) !important; border-color: var(--sc-estop) !important; }
 .cwiz-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .cwiz-toggle input { width: 20px; height: 20px; }
@@ -1289,6 +1289,10 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 .toast .toast-act { min-height: 36px; padding: 0 14px; font-size: 13px; font-weight: 600; flex: none; }
 /* operator-only controls while the session is locked (OP_GATES): a lock after the label; a tap starts the unlock */
 body.op-locked :is([data-op], [data-op-mark])::after { content: "\00a0🔒"; font-size: 0.85em; }
+body.op-locked label.tgl[data-op] { margin-left: 22px; }
+body.op-locked label.tgl[data-op]::after { position: absolute; right: calc(100% + 6px); top: 50%; transform: translateY(-50%); content: "🔒"; font-size: 13px; line-height: 1; }
+body.op-locked .tool-item[data-op]::after { content: none; }
+body.op-locked .tool-item[data-op] > b::after { content: "\00a0🔒"; font-size: 0.85em; }
 
 /* ---------- lease preemption ---------- */
 .btn.btn-park-off { width: 100%; flex-direction: column; gap: 2px; justify-content: center; margin-top: 8px; min-height: 48px; font-weight: 600; }
@@ -1804,6 +1808,11 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
 .act-row.one { grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); }
 .act-row.one > .act-full { grid-column: auto; }
 .act-row > .act-back:not(.armed):not(:disabled), .act-row > .tch-del:not(.armed) { background: transparent; box-shadow: none; color: var(--sc-color-text-secondary); }
+/* keep toasts clear of open drawer headers and top controls (phone bottom-sheet & tablet side-drawer) */
+body:has(.calib-mask:not([hidden])) .toasts { top: auto; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; max-width: calc(100vw - 32px); flex-direction: column-reverse; }
+@media (min-width: 820px) {
+  body:has(.calib-mask:not([hidden])) .toasts { left: calc((100vw - 440px) / 2); max-width: calc(100vw - 440px - 32px); }
+}
 </style>
 </head>
 <body class="ui-simple offline locked">
@@ -2687,7 +2696,7 @@ const I18N = {
     'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
     'stop': '停止', 'stop.sub': '保持位置', 'stop.aria': '停止运动并保持位置',
-    'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
+    'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who} 正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
     'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
@@ -2777,7 +2786,7 @@ const I18N = {
     'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_preempted': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式',
     'toast.lease_expired': '⚠️ 连接中断，控制权已释放；机械臂若处于上电状态会自动收回停靠',
-    'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；下次操作时自动取回', 'toast.lease_busy': '{who}正在控制，本页面为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
+    'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；下次操作时自动取回', 'toast.lease_busy': '{who} 正在控制，本页面为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.stop_unconfirmed': '停止未确认，请使用急停', 'toast.stopped': '已停止，位置保持', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
     'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
@@ -3757,10 +3766,23 @@ function toast(msg, kind = '', code = '', opts = null) {
   const op = code === 'OPERATOR_REQUIRED';
   // the operator dialog is open and already says why
   if (op && typeof opIsOpen === 'function' && opIsOpen()) return null;
+  const box = $('toasts');
+  const msgText = String(msg);
+  const codeText = String(code || '');
+  const ms = opts && opts.ms ? opts.ms : op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600;
+  const dup = [...box.children].find((x) => x._toastMsg === msgText);
+  if (dup) {
+    const keep = (!codeText || dup._toastCode === codeText) && !(opts && (opts.act || opts.retry));
+    clearTimeout(dup._toastTimer);
+    if (keep) { dup._toastTimer = setTimeout(() => dup.remove(), ms); return dup; }
+    dup.remove();
+  }
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
+  el._toastMsg = msgText;
+  el._toastCode = codeText;
   const why = errWhy(code);
-  if (why && !String(msg).includes(why)) {
+  if (why && !msgText.includes(why)) {
     const tx = document.createElement('span'); tx.className = 'toast-txt';
     const a = document.createElement('span'); a.textContent = msg;
     const b = document.createElement('span'); b.className = 'toast-why'; b.textContent = why;
@@ -3782,9 +3804,9 @@ function toast(msg, kind = '', code = '', opts = null) {
     });
     el.classList.add('has-act'); el.appendChild(btn);
   }
-  $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), opts && opts.ms ? opts.ms : op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
-  while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
+  box.appendChild(el);
+  el._toastTimer = setTimeout(() => el.remove(), ms);
+  while (box.children.length > 3) { clearTimeout(box.firstChild._toastTimer); box.firstChild.remove(); }
   return el;
 }
 function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
@@ -11506,7 +11528,7 @@ function toolsRelease() {
 function toolsWizard(mode) {
   ssetOpen(false);
   if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; }
-  if (!CWZ.views.length) CWZ.mode = mode;
+  if (!CWZ.views.length) { CWZ.mode = mode; CWZ.modeChosen = true; }
   cwOpen(true);
 }
 $('tools-release').addEventListener('click', toolsRelease);
