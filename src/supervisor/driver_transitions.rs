@@ -1539,8 +1539,15 @@ impl SupervisorInner {
     }
 
     fn clear_fault_finish(&mut self) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_finish_bounded().map_err(SafetyError::from)
+    }
+
+    fn clear_fault_finish_bounded(
+        &mut self,
+    ) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        use crate::safety::{ClearFaultError, ClearFaultRefusal};
         if self.shutdown_committed {
-            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+            return Err(ClearFaultError::Rejected(ClearFaultRefusal::ShutdownCommitted));
         }
         self.pending_rearm = true;
         if self.mit.owner == crate::mit::MitOwner::Lost {
@@ -1562,9 +1569,11 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
-        Self::check_concurrent_estop(self)?;
+        if self.consume_pending_estop() {
+            return Err(ClearFaultError::EStopActive);
+        }
         let was_estop = *self.safety.state() == SafetyState::EStop;
-        let state = self.safety.clear_fault()?;
+        let state = self.safety.clear_fault_bounded().map_err(ClearFaultError::Rejected)?;
         self.handover_settling_since = None;
         if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
             self.apply_stop_policy(StopPolicy::EStopLatch);
@@ -1574,88 +1583,173 @@ impl SupervisorInner {
         }
         self.e_stop_latched.store(false, Ordering::SeqCst);
         self.shutdown_refused_unknown = false;
-        Self::check_concurrent_estop(self)?;
+        if self.consume_pending_estop() {
+            return Err(ClearFaultError::EStopActive);
+        }
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)
     }
 
-    /// Bounded fault clearing for the RT executor: uses Step 2's already-polled feedback
-    /// (zero extra `read_joint_states()` calls), refuses `MitOwner::Lost`, and sends hardware
-    /// resets only via [`ArmDriver::clear_fault_budgeted`] while preserving the reset latch
-    /// rule (a reset write never clears the fault on the same call).
-    pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
-        if self.shutdown_committed {
-            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+    fn measured_workspace_violation_bounded(&self) -> Option<crate::safety::WorkspaceSupportViolation> {
+        use crate::safety::{BoundedText, WorkspaceSupportViolation};
+        let (ws, cam) = self.workspace_policy()?;
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(&self.config.arm_model, ws, cam, self.config.tcp_offset);
+        if self.config.arm_model.frames_f32(&self.measured_positions).is_none() {
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason: BoundedText::new("non-finite or incomplete joint positions"),
+            });
         }
-        Self::check_concurrent_estop(self)?;
-        if self.driver_config_error.is_some() {
-            self.reapply_driver_limits();
+        if ws.self_collision_enabled && !ws.link_capsules.is_empty() && !ws.self_collision_pairs.is_empty()
+            && (!ws.self_collision_min_clearance_m.is_finite() || ws.self_collision_min_clearance_m < 0.0)
+        {
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason: BoundedText::new("invalid self_collision_min_clearance_m"),
+            });
         }
+        let mut buf = eval.alloc_buf();
+        match eval.eval_into(&self.measured_positions, &mut buf, "clear_fault") {
+            Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new(&f.limit),
+                reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
+            }),
+            Ok(()) => {
+                let (slot, &clr) = buf.as_slice().iter().enumerate()
+                    .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)?;
+                Some(describe_workspace_slot_bounded(&eval, ws, cam, self.config.tcp_offset, slot, clr))
+            }
+        }
+    }
+
+    /// Allocation-free bounded equivalent of [`Self::resting_pose_support_violation_with_driver`].
+    pub(crate) fn resting_pose_support_violation_bounded(
+        &self,
+        drv: Option<&dyn ArmDriver>,
+        ages: &[Option<Duration>],
+    ) -> Option<crate::safety::RestingSupportViolation> {
+        use crate::safety::{RestingSupportJointItem as Item, RestingSupportViolation as V, MAX_RESTING_SUPPORT_ITEMS};
+        let dof = self.config.dof;
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+            return Some(V::FeedbackLengthMismatch);
+        }
+        let Some(policy) = self.config.resting_pose.as_ref() else { return Some(V::NoRestingPoseConfigured); };
+        if self.driver.is_some() {
+            let Some(driver) = drv else { return Some(V::DriverFeedbackUnavailable); };
+            let caps = driver.capabilities();
+            if !caps.velocity_feedback { return Some(V::DriverLacksVelocityFeedback); }
+            if !policy.support_torque_limits.is_empty() && !caps.torque_feedback { return Some(V::DriverLacksTorqueFeedback); }
+            if !policy.support_load_limits.is_empty() && !caps.load_feedback { return Some(V::DriverLacksLoadFeedback); }
+            let max_age = Duration::from_millis(policy.feedback_max_age_ms);
+            if !self.feedback_numeric_valid || ages.len() != dof || !ages.iter().all(|a| a.is_some_and(|age| age <= max_age)) {
+                return Some(V::FeedbackTooOld { max_age_ms: policy.feedback_max_age_ms });
+            }
+        }
+        let mut items = [None; MAX_RESTING_SUPPORT_ITEMS];
+        let mut len = 0usize;
+        for (i, &v) in self.measured_velocities.iter().enumerate().take(dof) {
+            let limit = policy.max_velocity_of(i);
+            if (!v.is_finite() || v.abs() > limit) && len < MAX_RESTING_SUPPORT_ITEMS {
+                items[len] = Some(Item::JointMoving { joint: i as u16, velocity: v, limit });
+                len += 1;
+            }
+        }
+        let mut total = 0.0;
+        let rest = self.config.resting_positions();
+        for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
+            let dev = (self.measured_positions[i] - rest[i]).abs();
+            if (!dev.is_finite() || dev > tol) && len < MAX_RESTING_SUPPORT_ITEMS {
+                items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
+                len += 1;
+            }
+            total += dev;
+        }
+        if len == 0 && total > policy.max_total_deviation {
+            items[0] = Some(Item::TotalDeviation { total, limit: policy.max_total_deviation });
+            len = 1;
+        }
+        if self.driver.is_some() {
+            for &(i, max_tau) in &policy.support_torque_limits {
+                if i >= dof { return Some(V::SupportTorqueIndexOutOfRange { index: i }); }
+                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                if (!tau.is_finite() || tau.abs() > max_tau) && len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
+                    len += 1;
+                }
+            }
+            for &(i, max_load) in &policy.support_load_limits {
+                if i >= dof { return Some(V::SupportLoadIndexOutOfRange { index: i }); }
+                let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
+                if (!load.is_finite() || load.abs() > max_load) && len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
+                    len += 1;
+                }
+            }
+        }
+        let workspace = self.measured_workspace_violation_bounded();
+        (len > 0 || workspace.is_some()).then_some(V::Failures { items, len: len as u8, workspace })
+    }
+
+    /// Bounded, allocation-free fault clearing for the RT executor; refusal text is rendered off-thread.
+    pub fn clear_fault_executor_bounded(&mut self, deadline: Instant) -> Result<SafetyState, crate::safety::ClearFaultError> {
+        use crate::safety::{BoundedText, ClearFaultError as E, ClearFaultRefusal as R};
+        if self.shutdown_committed { return Err(E::Rejected(R::ShutdownCommitted)); }
+        if self.consume_pending_estop() { return Err(E::EStopActive); }
+        if self.driver_config_error.is_some() { self.reapply_driver_limits(); }
         if let Some(ref err) = self.driver_config_error {
-            return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
+            return Err(E::Rejected(R::DriverConfigError(BoundedText::new(err))));
         }
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
-        if self.gravity_comp_blocks_clear() {
-            return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
-        }
-        if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
-        if self.mit.owner == crate::mit::MitOwner::Lost {
-            return Err(SafetyError::ClearFaultRejected("UNSUPPORTED: MIT lost recovery requires legacy path".into()));
-        }
+        if self.gravity_comp_blocks_clear() { return Err(E::Rejected(R::GravityCompUnconfirmed)); }
+        if self.disable_pending { return Err(E::Rejected(R::DisablePending)); }
+        if self.mit.owner == crate::mit::MitOwner::Lost { return Err(E::Rejected(R::MitLostUnsupported)); }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut drv = match d.lock() {
                 Ok(g) => g,
-                Err(_) => {
-                    self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::FeedbackUnavailable);
-                }
+                Err(_) => { self.scratch.ages = scratch_ages; return Err(E::FeedbackUnavailable); }
             };
-            let disabling = drv.clear_fault_disables_joints();
             if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
-                && disabling.iter().any(|&j| j < self.config.arm_dof())
+                && drv.clear_fault_disables_arm_joint(self.config.arm_dof())
             {
                 drv.feedback_ages_into(&mut scratch_ages);
-                let max_age = self.resting_policy().map(|p| Duration::from_millis(p.feedback_max_age_ms)).unwrap_or(Duration::from_millis(250));
-                if !self.feedback_numeric_valid
-                    || !drv.is_feedback_valid()
-                    || scratch_ages.len() != self.config.dof
+                let max_age = self.config.resting_pose.as_ref()
+                    .map(|p| Duration::from_millis(p.feedback_max_age_ms))
+                    .unwrap_or(Duration::from_millis(250));
+                if !self.feedback_numeric_valid || !drv.is_feedback_valid() || scratch_ages.len() != self.config.dof
                     || !scratch_ages.iter().all(|a| a.is_some_and(|t| t <= max_age))
                 {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before checking resting pose support".into()));
+                    return Err(E::Rejected(R::FreshFeedbackRequiredForRestingSupport));
                 }
-                if let Some(reason) = self.resting_pose_support_violation_with_driver(Some(drv.as_ref())) {
+                if let Some(v) = self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &scratch_ages) {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected(format!(
-                        "Cannot disable faulted supporting arm joint away from resting pose ({reason}); support the arm at rest first"
-                    )));
+                    return Err(E::Rejected(R::RestingPoseSupport(v)));
                 }
             }
-            // Clearing a latched motor error requires a later fresh feedback observation.
-            if drv.check_hardware_status().is_err() {
+            if drv.has_hardware_fault() {
                 let now = Instant::now();
                 if now >= deadline {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
-                    return Err(SafetyError::ClearFaultRejected("Clear fault budget expired".into()));
+                    return Err(E::Rejected(R::BudgetExpired));
                 }
                 let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                 let r = drv.clear_fault_budgeted(drv_deadline);
                 drop(drv);
                 self.scratch.ages = scratch_ages;
-                r.map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-                return Err(SafetyError::ClearFaultRejected("Hardware reset sent; wait for fresh fault-free feedback before retrying".into()));
+                if let Err(e) = r { return Err(E::Rejected(R::DriverError(clear_fault_driver_error(&e)))); }
+                return Err(E::Rejected(R::HardwareResetSent));
             }
             drv.feedback_ages_into(&mut scratch_ages);
             let ages_valid = scratch_ages.len() == self.config.dof
                 && !scratch_ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)));
             let fb_valid = drv.is_feedback_valid();
-            let hw_status = drv.check_hardware_status();
+            let hw_status = if drv.has_hardware_fault() { drv.check_hardware_status() } else { Ok(()) };
             let temp_fb = drv.capabilities().temperature_feedback;
             let state = drv.enable_state();
             let partial = drv.has_known_partial_enable();
@@ -1663,22 +1757,23 @@ impl SupervisorInner {
             drop(drv);
             self.scratch.ages = scratch_ages;
             if !self.feedback_numeric_valid || !fb_valid || !ages_valid {
-                return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before resetting a fault".into()));
+                return Err(E::Rejected(R::FreshFeedbackRequired));
             }
-            hw_status.map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
-            if thermal && (!temp_fb || self.temperatures.iter().any(|t|
-                !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C))
-            {
-                return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
+            if let Err(e) = hw_status { return Err(E::Rejected(R::DriverError(clear_fault_driver_error(&e)))); }
+            if thermal && (!temp_fb || self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C)) {
+                return Err(E::Rejected(R::TemperatureConfirmationRequired));
             }
-            if state == EnableState::Unknown && !partial {
-                return Err(SafetyError::ClearFaultRejected("Hardware enable state is unknown; reset remains latched".into()));
-            }
+            if state == EnableState::Unknown && !partial { return Err(E::Rejected(R::EnableStateUnknown)); }
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
         } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
-            return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+            return Err(E::Rejected(R::TemperatureAboveThreshold));
         }
-        self.clear_fault_finish()
+        self.clear_fault_finish_bounded()
+    }
+
+    /// Bounded fault clearing for the RT executor rendered into [`SafetyError`] for direct callers.
+    pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_executor_bounded(deadline).map_err(SafetyError::from)
     }
 
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
@@ -1724,4 +1819,97 @@ impl SupervisorInner {
             Some(d) => d.lock().is_ok_and(|drv| drv.is_feedback_valid()),
         }
     }
+}
+
+fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety::ClearFaultDriverError {
+    use crate::driver::ArmDriverError as E;
+    use crate::safety::{BoundedText, ClearFaultDriverError as C};
+    use crate::transport::TransportError as T;
+    match e {
+        E::Transport(T::Timeout) => C::TransportTimeout,
+        E::Transport(T::WouldBlock) => C::TransportWouldBlock,
+        E::Transport(T::NotOpen) => C::TransportNotOpen,
+        E::Transport(T::ChecksumMismatch { expected, actual }) => C::TransportChecksumMismatch { expected: *expected, actual: *actual },
+        E::Transport(T::FrameTooShort { expected, actual }) => C::TransportFrameTooShort { expected: *expected, actual: *actual },
+        E::Transport(other) => {
+            let mut buf = BoundedText::empty();
+            let _ = core::fmt::write(&mut buf, format_args!("{other}"));
+            C::TransportFormatted(buf)
+        }
+        E::Protocol(s) => C::Protocol(BoundedText::new(s)),
+        E::JointCountMismatch { expected, actual } => C::JointCountMismatch { expected: *expected, actual: *actual },
+        E::HardwareFault(s) => C::HardwareFault(BoundedText::new(s)),
+        E::Timeout(id) => C::JointTimeout(*id),
+        E::EstopInhibited => C::EstopInhibited,
+    }
+}
+
+fn describe_workspace_slot_bounded(
+    eval: &crate::chain::WorkspaceEvaluator<'_>,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    tcp_offset: [f64; 3],
+    slot: usize,
+    clr: f64,
+) -> crate::safety::WorkspaceSupportViolation {
+    use crate::kinematics as k;
+    use crate::safety::{BoundedText, WorkspaceSupportViolation as W};
+    use core::fmt::Write as _;
+
+    let depth = -clr;
+    if slot >= eval.self_collision_slot_start {
+        let pi = slot - eval.self_collision_slot_start;
+        let (id_a, id_b) = ws.self_collision_pairs.get(pi).map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
+        let (mut cid, mut gid, mut limit) = (BoundedText::empty(), BoundedText::empty(), BoundedText::empty());
+        let _ = write!(&mut cid, "self_collision:{id_a}:{id_b}");
+        let _ = write!(&mut gid, "capsule:{id_a}");
+        let _ = write!(&mut limit, "self_collision '{id_a}' vs '{id_b}'");
+        let ia = ws.link_capsules.iter().position(|c| c.id == id_a);
+        let ib = ws.link_capsules.iter().position(|c| c.id == id_b);
+        let point = match (ia, ib) { (Some(a), Some(b)) if a != b => eval.num_end_pts + a, _ => 0 };
+        let bound = f64::from(ws.self_collision_min_clearance_m);
+        return W::Constraint { limit, point, cid, gid, depth, value: bound + clr, bound };
+    }
+    if eval.has_reach && slot >= eval.num_geoms * eval.slots_per_geom {
+        let reach_idx = slot - eval.num_geoms * eval.slots_per_geom;
+        let bound = f64::from(ws.max_reach_m.unwrap_or(0.0));
+        let (point, gid) = if reach_idx == 0 {
+            (0, BoundedText::new("end_origin"))
+        } else {
+            let tcp_f32 = tcp_offset.map(|v| v as f32);
+            let pt = ws.check_points_end_m.iter()
+                .position(|c| (c[0] - tcp_f32[0]).abs() <= 1e-6 && (c[1] - tcp_f32[1]).abs() <= 1e-6 && (c[2] - tcp_f32[2]).abs() <= 1e-6)
+                .map_or(0, |i| i + 1);
+            (pt, BoundedText::new("tcp_origin"))
+        };
+        return W::Constraint { limit: BoundedText::new("reach"), point, cid: BoundedText::new("max_reach"), gid, depth, value: bound - clr, bound };
+    }
+    let (gi, ci) = (slot / eval.slots_per_geom, slot % eval.slots_per_geom);
+    let mut gid = BoundedText::empty();
+    if gi == 0 {
+        gid.push_str("end_origin");
+    } else if gi < eval.num_end_pts {
+        if cam.offset_m.is_some() && gi + 1 == eval.num_end_pts { gid.push_str("camera_mount"); }
+        else { let _ = write!(&mut gid, "end_point:{gi}"); }
+    } else {
+        let _ = write!(&mut gid, "capsule:{}", ws.link_capsules[gi - eval.num_end_pts].id);
+    }
+    let (mut limit, mut cid) = (BoundedText::empty(), BoundedText::empty());
+    let (value, bound) = if ci == 0 {
+        limit.push_str("floor"); cid.push_str("floor_z");
+        let b = f64::from(ws.floor_z_m); (b + clr, b)
+    } else if ci <= 3 {
+        let ax = ci - 1;
+        limit.push_str(k::BOX_LIMITS[ax][0]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][0]);
+        let b = f64::from(ws.box_min_m[ax]); (b + clr, b)
+    } else if ci <= 6 {
+        let ax = ci - 4;
+        limit.push_str(k::BOX_LIMITS[ax][1]); cid.push_str(k::BOX_CONSTRAINT_IDS[ax][1]);
+        let b = f64::from(ws.box_max_m[ax]); (b - clr, b)
+    } else {
+        let name = ws.keepout_boxes.get(ci - 7).map_or("?", |b| b.name.as_str());
+        let _ = write!(&mut limit, "keepout '{name}'"); let _ = write!(&mut cid, "keepout:{name}");
+        (depth, 0.0)
+    };
+    W::Constraint { limit, point: gi, cid, gid, depth, value, bound }
 }

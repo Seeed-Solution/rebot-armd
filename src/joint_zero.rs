@@ -184,6 +184,8 @@ impl ArmDriver for ZeroOffsetDriver {
     fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.inner.joint_loads_into(out) }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.inner.motor_status_into(out) }
+    fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool { self.inner.clear_fault_disables_arm_joint(arm_dof) }
+    fn has_hardware_fault(&self) -> bool { self.inner.has_hardware_fault() }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
     fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
     fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {

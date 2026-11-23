@@ -466,6 +466,241 @@ impl SafetyLogEvent {
     }
 }
 
+/// Maximum per-joint resting-pose support violations captured inline without heap allocation.
+pub const MAX_RESTING_SUPPORT_ITEMS: usize = 32;
+
+/// One per-joint or total-deviation resting-pose support violation captured on the control thread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RestingSupportJointItem {
+    JointMoving { joint: u16, velocity: f32, limit: f32 },
+    JointOffHome { joint: u16, deviation: f32, limit: f32 },
+    TotalDeviation { total: f32, limit: f32 },
+    JointTorque { joint: u16, torque: f32, limit: f32 },
+    JointLoad { joint: u16, load: f32, limit: f32 },
+}
+
+impl std::fmt::Display for RestingSupportJointItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::JointMoving { joint, velocity, limit } =>
+                write!(f, "joint {} moving at {velocity:.4} rad/s (limit {limit})", usize::from(joint) + 1),
+            Self::JointOffHome { joint, deviation, limit } =>
+                write!(f, "joint {} off home by {deviation:.4} rad (limit {limit})", usize::from(joint) + 1),
+            Self::TotalDeviation { total, limit } =>
+                write!(f, "total deviation {total:.4} rad (limit {limit})"),
+            Self::JointTorque { joint, torque, limit } =>
+                write!(f, "joint {} torque {torque:.2} Nm (limit {limit})", usize::from(joint) + 1),
+            Self::JointLoad { joint, load, limit } =>
+                write!(f, "joint {} load {load:.2} (limit {limit})", usize::from(joint) + 1),
+        }
+    }
+}
+
+/// Bounded workspace violation captured during resting-pose support verification.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum WorkspaceSupportViolation {
+    EvalFailed { limit: BoundedText<32>, reason: BoundedText<128> },
+    Constraint {
+        limit: BoundedText<160>,
+        point: usize,
+        cid: BoundedText<160>,
+        gid: BoundedText<80>,
+        depth: f64,
+        value: f64,
+        bound: f64,
+    },
+}
+
+impl std::fmt::Display for WorkspaceSupportViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EvalFailed { limit, reason } =>
+                write!(f, "measured pose workspace evaluation failed ({limit}): {reason}"),
+            Self::Constraint { limit, point, cid, gid, depth, value, bound } => {
+                write!(f, "measured pose violates workspace constraint '{limit}' (point {point} [{gid}]: ")?;
+                if !depth.is_finite() {
+                    write!(f, "invalid workspace check for {cid} ({gid})")?;
+                } else {
+                    write!(f, "new intrusion into {cid} by {depth:.3}m (geometry {gid})")?;
+                }
+                write!(f, ", value {value:.4} m vs bound {bound:.4} m)")
+            }
+        }
+    }
+}
+
+/// Typed, bounded resting-pose support violation rendered off-thread to identical API text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum RestingSupportViolation {
+    FeedbackLengthMismatch,
+    NoRestingPoseConfigured,
+    DriverFeedbackUnavailable,
+    DriverLacksVelocityFeedback,
+    DriverLacksTorqueFeedback,
+    DriverLacksLoadFeedback,
+    FeedbackTooOld { max_age_ms: u64 },
+    SupportTorqueIndexOutOfRange { index: usize },
+    SupportLoadIndexOutOfRange { index: usize },
+    Failures {
+        items: [Option<RestingSupportJointItem>; MAX_RESTING_SUPPORT_ITEMS],
+        len: u8,
+        workspace: Option<WorkspaceSupportViolation>,
+    },
+}
+
+impl std::fmt::Display for RestingSupportViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FeedbackLengthMismatch => f.write_str("feedback length does not match dof"),
+            Self::NoRestingPoseConfigured => f.write_str("no resting pose configured"),
+            Self::DriverFeedbackUnavailable => f.write_str("driver feedback unavailable"),
+            Self::DriverLacksVelocityFeedback => f.write_str("driver lacks velocity feedback"),
+            Self::DriverLacksTorqueFeedback => f.write_str("driver lacks torque feedback for support torque limits"),
+            Self::DriverLacksLoadFeedback => f.write_str("driver lacks load feedback for support load limits"),
+            Self::FeedbackTooOld { max_age_ms } => write!(f, "feedback older than {max_age_ms} ms"),
+            Self::SupportTorqueIndexOutOfRange { index } => write!(f, "support torque index {index} out of range"),
+            Self::SupportLoadIndexOutOfRange { index } => write!(f, "support load index {index} out of range"),
+            Self::Failures { items, len, workspace } => {
+                let mut first = true;
+                for item in items.iter().take(usize::from(*len)).flatten() {
+                    if !first { f.write_str("; ")?; }
+                    first = false;
+                    write!(f, "{item}")?;
+                }
+                if let Some(ws) = workspace {
+                    if !first { f.write_str("; ")?; }
+                    write!(f, "{ws}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Typed, bounded driver error captured during RT `clear_fault`, rendered off-thread to exact
+/// `ArmDriverError::to_string()` text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum ClearFaultDriverError {
+    TransportTimeout,
+    TransportWouldBlock,
+    TransportNotOpen,
+    TransportChecksumMismatch { expected: u8, actual: u8 },
+    TransportFrameTooShort { expected: usize, actual: usize },
+    JointCountMismatch { expected: usize, actual: usize },
+    JointTimeout(u8),
+    EstopInhibited,
+    Protocol(BoundedText<256>),
+    HardwareFault(BoundedText<256>),
+    TransportFormatted(BoundedText<256>),
+}
+
+impl std::fmt::Display for ClearFaultDriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TransportTimeout => f.write_str("Transport error: Timeout error"),
+            Self::TransportWouldBlock => f.write_str("Transport error: Operation would block"),
+            Self::TransportNotOpen => f.write_str("Transport error: Device not open"),
+            Self::TransportChecksumMismatch { expected, actual } =>
+                write!(f, "Transport error: Checksum mismatch: expected 0x{expected:02X}, calculated 0x{actual:02X}"),
+            Self::TransportFrameTooShort { expected, actual } =>
+                write!(f, "Transport error: Frame too short: expected at least {expected} bytes, got {actual}"),
+            Self::JointCountMismatch { expected, actual } =>
+                write!(f, "Joint count mismatch: expected {expected}, got {actual}"),
+            Self::JointTimeout(id) => write!(f, "Timeout waiting for response from joint {id}"),
+            Self::EstopInhibited => f.write_str("E-stop requested during the target batch; remaining frames not sent"),
+            Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
+            Self::HardwareFault(msg) => write!(f, "Hardware fault: {msg}"),
+            Self::TransportFormatted(msg) => write!(f, "Transport error: {msg}"),
+        }
+    }
+}
+
+/// Typed, bounded RT `clear_fault` refusal carrying zero heap allocations on the control thread;
+/// rendered off-thread to the exact existing `SafetyError::ClearFaultRejected(String)` text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum ClearFaultRefusal {
+    ShutdownCommitted,
+    DriverConfigError(BoundedText<256>),
+    GravityCompUnconfirmed,
+    DisablePending,
+    MitLostUnsupported,
+    FreshFeedbackRequiredForRestingSupport,
+    RestingPoseSupport(RestingSupportViolation),
+    BudgetExpired,
+    HardwareResetSent,
+    FreshFeedbackRequired,
+    TemperatureConfirmationRequired,
+    EnableStateUnknown,
+    TemperatureAboveThreshold,
+    ReclaimQueueFull,
+    DriverError(ClearFaultDriverError),
+}
+
+impl ClearFaultRefusal {
+    /// Renders the exact API error text off the RT control thread.
+    pub fn render_message(&self) -> String { self.to_string() }
+}
+
+impl std::fmt::Display for ClearFaultRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShutdownCommitted => f.write_str("Daemon shutdown is committed"),
+            Self::DriverConfigError(err) => write!(f, "Driver limit configuration error: {err}"),
+            Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
+            Self::DisablePending => f.write_str("Torque disable is still unconfirmed"),
+            Self::MitLostUnsupported => f.write_str("UNSUPPORTED: MIT lost recovery requires legacy path"),
+            Self::FreshFeedbackRequiredForRestingSupport => f.write_str("Fresh feedback is required before checking resting pose support"),
+            Self::RestingPoseSupport(violation) =>
+                write!(f, "Cannot disable faulted supporting arm joint away from resting pose ({violation}); support the arm at rest first"),
+            Self::BudgetExpired => f.write_str("Clear fault budget expired"),
+            Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
+            Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
+            Self::TemperatureConfirmationRequired => f.write_str("Temperature must be confirmed below the reset threshold"),
+            Self::EnableStateUnknown => f.write_str("Hardware enable state is unknown; reset remains latched"),
+            Self::TemperatureAboveThreshold => f.write_str("Temperature is above the reset threshold"),
+            Self::ReclaimQueueFull => f.write_str("Fault state reclamation queue is full; retry after off-thread drain"),
+            Self::DriverError(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Bounded RT error returned by `clear_fault_executor_bounded`; converted off-thread into [`SafetyError`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum ClearFaultError {
+    EStopActive,
+    FeedbackUnavailable,
+    Rejected(ClearFaultRefusal),
+}
+
+impl std::fmt::Display for ClearFaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EStopActive => f.write_str("E-Stop is latched, motion rejected"),
+            Self::FeedbackUnavailable => f.write_str("Actuator feedback unavailable: physical angles not received from hardware"),
+            Self::Rejected(r) => write!(f, "Cannot clear fault while hardware fault condition persists: {r}"),
+        }
+    }
+}
+
+impl std::error::Error for ClearFaultError {}
+impl From<ClearFaultRefusal> for ClearFaultError {
+    fn from(r: ClearFaultRefusal) -> Self { Self::Rejected(r) }
+}
+impl From<ClearFaultError> for SafetyError {
+    fn from(e: ClearFaultError) -> Self {
+        match e {
+            ClearFaultError::EStopActive => SafetyError::EStopActive,
+            ClearFaultError::FeedbackUnavailable => SafetyError::FeedbackUnavailable,
+            ClearFaultError::Rejected(r) => SafetyError::ClearFaultRejected(r.render_message()),
+        }
+    }
+}
+
 /// Emits a warning off-thread when bounded deferred safety log events were dropped.
 pub fn emit_safety_log_dropped(dropped: u64) {
     if dropped > 0 {
@@ -864,15 +1099,13 @@ impl SafetyManager {
         }
     }
 
-    /// Attempt to clear E-Stop or Fault back to Idle.
+    /// Attempt to clear E-Stop or Fault back to Idle without heap allocation.
     /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
-    pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
+    pub fn clear_fault_bounded(&mut self) -> Result<SafetyState, ClearFaultRefusal> {
         match &*self.state_arc {
             SafetyState::EStop | SafetyState::Fault(_) => {
                 if !self.try_replace_state_arc(Arc::clone(&self.idle_arc)) {
-                    return Err(SafetyError::ClearFaultRejected(
-                        "Fault state reclamation queue is full; retry after off-thread drain".into(),
-                    ));
+                    return Err(ClearFaultRefusal::ReclaimQueueFull);
                 }
                 if self.deferred_logging {
                     self.queue_log_event(SafetyLogEvent::Cleared);
@@ -885,6 +1118,13 @@ impl SafetyManager {
             }
             other => Ok(other.clone()),
         }
+    }
+
+    /// Attempt to clear E-Stop or Fault back to Idle.
+    /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
+    pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
+        self.clear_fault_bounded()
+            .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))
     }
 
     /// Set torque enabled/disabled

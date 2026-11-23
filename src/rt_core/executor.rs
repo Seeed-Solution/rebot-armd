@@ -30,7 +30,10 @@ use super::urgent::StopRequests;
 use crate::diagnostics::tick::{LockPhases, ThreadUsage, TickSample, UsageMark};
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::persist::{PublishOutcome, StagedWrite};
-use crate::safety::{SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY};
+use crate::safety::{
+    ClearFaultError, SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY,
+    SAFETY_LOG_CAPACITY,
+};
 use crate::supervisor::{ArmError, PendingZeroCheckPersist, SupervisorInner};
 
 /// Elapsed time above which a tick counts as late in the log (as in 1.5).
@@ -272,13 +275,14 @@ pub enum MaintenanceOp {
 }
 
 /// Reply payload of one [`MaintenanceOp`].
+#[allow(clippy::large_enum_variant)] // bounded stack refusal keeps RT ClearFault zero-alloc
 pub enum MaintenanceResult {
     ShutdownRequested(bool),
     ShutdownCommitted(bool),
     ShutdownReady(bool),
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
-    FaultCleared(Result<SafetyState, SafetyError>),
+    FaultCleared(Result<SafetyState, ClearFaultError>),
     JointZeroOffsetsSet(Result<(), String>),
     MotorZeroSet(Result<(), String>),
     ProbeReturned,
@@ -1002,14 +1006,14 @@ impl RtExecutorHandle {
 
     pub fn clear_fault(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
         match self.call_maintenance(MaintenanceOp::ClearFault)? {
-            MaintenanceResult::FaultCleared(r) => Ok(r),
+            MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn clear_fault_async(&self) -> Result<Result<SafetyState, SafetyError>, OwnerError> {
         match self.call_maintenance_async(MaintenanceOp::ClearFault).await? {
-            MaintenanceResult::FaultCleared(r) => Ok(r),
+            MaintenanceResult::FaultCleared(r) => Ok(r.map_err(SafetyError::from)),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -1374,7 +1378,7 @@ impl ControlState {
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault => {
                 self.shutdown_committed = false;
-                let res = core.clear_fault_executor(release_deadline);
+                let res = core.clear_fault_executor_bounded(release_deadline);
                 MaintenanceResult::FaultCleared(res)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
