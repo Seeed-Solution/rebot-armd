@@ -398,7 +398,7 @@ impl SupervisorInner {
         if let Some(id) = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id) {
             self.finish_action(id, "failed", Some("COLLISION"), Some(message.clone()), None, None, None);
         }
-        self.macro_run = None;
+        self.drop_macro_run("failed", Some("COLLISION"));
         // Hold commanded = measured; the gripper keeps its command so a held object stays held.
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);

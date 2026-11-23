@@ -3061,7 +3061,7 @@ impl SupervisorInner {
                                 crate::tracking::TrackingReject::Workspace(ws_err) => {
                                     tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
                                     self.hold_measured_pose();
-                                    self.macro_run = None;
+                                    self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
                                     self.safety.trigger_fault_coded(
                                         FaultCode::Other,
                                         FaultReason::Other(format!("Joint tracking output rejected: {ws_err}")),
@@ -3070,7 +3070,7 @@ impl SupervisorInner {
                                 crate::tracking::TrackingReject::JointLimit(msg) => {
                                     tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
                                     self.hold_measured_pose();
-                                    self.macro_run = None;
+                                    self.drop_macro_run("failed", Some("JOINT_LIMIT"));
                                     self.safety.trigger_fault_coded(
                                         FaultCode::JointLimit,
                                         FaultReason::Other(format!("Joint tracking output rejected: {msg}")),

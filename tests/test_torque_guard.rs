@@ -702,3 +702,24 @@ fn lease_loss_with_the_rest_pose_behind_the_load_holds_and_latches() {
     assert!(obs.is_torqued);
     assert!((obs.commanded_positions[J2] - hold_q).abs() < 1e-5, "kept the backed-off hold: {}", obs.commanded_positions[J2]);
 }
+
+/// A macro whose child pushes into a stop: the guard ends it and its terminal record names
+/// TORQUE_LIMIT with the child count.
+#[test]
+fn a_macro_child_into_a_stop_records_the_macro_terminal() {
+    use armd::rt_core::broker::{ActionId, Outcome};
+    use armd::rt_core::ops::CoreOps;
+    let (mut inner, arm) = rig();
+    arm.with(|s| s.stop_hi[J4] = Some(INSPECT[J4] + 0.1));
+    let epoch = inner.safety.epoch_id();
+    let id = inner.begin_orchestrated_action("sequence", None, epoch).unwrap();
+    let mut t = INSPECT.to_vec();
+    t[J4] += 0.5;
+    let limits = inner.planning_limits();
+    inner.install_macro_quintic(id, t, &limits).unwrap();
+    for _ in 0..200 { inner.tick(DT); if inner.macro_run.is_none() { break; } }
+    assert!(inner.macro_run.is_none(), "the guard ended the macro");
+    let rec = inner.core.last_macro().expect("terminal record");
+    assert_eq!((rec.action, rec.children, rec.outcome), (ActionId(id), 1, Outcome::Failed("TORQUE_LIMIT")));
+    assert_eq!(CoreOps::action_outcome(&inner, ActionId(id)), Some(Outcome::Failed("TORQUE_LIMIT")));
+}

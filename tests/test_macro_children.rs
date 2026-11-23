@@ -274,3 +274,20 @@ fn a_contact_guard_with_a_stop_code_fails_the_child() {
     assert!(inner.active_trajectory.is_none());
     assert_eq!(inner.macro_child_watch(t).unwrap().contact_joint, Some(1));
 }
+
+#[test]
+fn a_newer_action_records_the_superseded_macros_terminal() {
+    let mut inner = inner();
+    let id = begin(&mut inner);
+    install(&mut inner, id, 0.05).unwrap();
+    // a jog starts a new action while the macro's child runs
+    let mut q = inner.commanded_positions.clone();
+    q[0] -= 0.05;
+    inner.stop_motion();
+    let (_, jog, _) = inner.jog_action(q, Some(0.5), None, "joint_move").unwrap();
+    assert!(inner.macro_run.is_none() && jog != id);
+    let rec = inner.core.last_macro().unwrap();
+    assert_eq!((rec.action, rec.children, rec.outcome), (ActionId(id), 1, Outcome::Superseded));
+    assert_eq!(CoreOps::action_outcome(&inner, ActionId(id)), Some(Outcome::Superseded));
+    assert_eq!(CoreOps::action_children(&inner, ActionId(id)), 1);
+}

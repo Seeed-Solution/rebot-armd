@@ -87,7 +87,7 @@ impl SupervisorInner {
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
         let now = self.now_s();
         // any new action ends a running macro (its orchestrator sees the record cancelled)
-        self.macro_run = None;
+        self.drop_macro_run("cancelled", Some("SUPERSEDED"));
         #[cfg(feature = "policy-runtime")]
         if let Some(mut run) = self.policy_run.take() {
             run.stop_reason = Some("SUPERSEDED".to_string());
@@ -625,6 +625,15 @@ impl SupervisorInner {
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
         self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
         Ok(crate::rt_core::broker::ActionId(id))
+    }
+
+    /// Ends the running macro without its orchestrator (a guard, a fault, a newer action):
+    /// records its terminal (`state`, `code`, child count) unless `finish_action` already did,
+    /// so `CoreOps::action_outcome` / `action_children` answer for it.
+    pub(crate) fn drop_macro_run(&mut self, state: &str, code: Option<&str>) {
+        let Some(id) = self.macro_run.as_ref().map(|m| m.id) else { return; };
+        if self.core.last_macro().is_none_or(|m| m.action.0 != id) { self.record_macro_terminal(id, state, code); }
+        self.macro_run = None;
     }
 
     /// Keeps the terminal record of macro `id` (outcome with its code, child count) in the

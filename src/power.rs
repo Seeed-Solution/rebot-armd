@@ -660,7 +660,7 @@ impl SupervisorInner {
         if let Some(id) = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id) {
             self.finish_action(id, "failed", Some("POWER_LIMIT"), Some(message), None, None, None);
         }
-        self.macro_run = None;
+        self.drop_macro_run("failed", Some("POWER_LIMIT"));
         self.hold_measured_pose();
         self.note_motion_limit(MotionLimitReason::Power, Some(joint));
         // The supervisor clamps measured positions and preserves the gripper command.
