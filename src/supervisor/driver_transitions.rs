@@ -1663,20 +1663,29 @@ impl SupervisorInner {
         }
         let mut items = [None; MAX_RESTING_SUPPORT_ITEMS];
         let mut len = 0usize;
+        let mut overflowed = 0u16;
         for (i, &v) in self.measured_velocities.iter().enumerate().take(dof) {
             let limit = policy.max_velocity_of(i);
-            if (!v.is_finite() || v.abs() > limit) && len < MAX_RESTING_SUPPORT_ITEMS {
-                items[len] = Some(Item::JointMoving { joint: i as u16, velocity: v, limit });
-                len += 1;
+            if !v.is_finite() || v.abs() > limit {
+                if len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointMoving { joint: i as u16, velocity: v, limit });
+                    len += 1;
+                } else {
+                    overflowed = overflowed.saturating_add(1);
+                }
             }
         }
         let mut total = 0.0;
         let rest = self.config.resting_positions();
         for (i, &tol) in policy.position_tolerances.iter().enumerate().take(dof) {
             let dev = (self.measured_positions[i] - rest[i]).abs();
-            if (!dev.is_finite() || dev > tol) && len < MAX_RESTING_SUPPORT_ITEMS {
-                items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
-                len += 1;
+            if !dev.is_finite() || dev > tol {
+                if len < MAX_RESTING_SUPPORT_ITEMS {
+                    items[len] = Some(Item::JointOffHome { joint: i as u16, deviation: dev, limit: tol });
+                    len += 1;
+                } else {
+                    overflowed = overflowed.saturating_add(1);
+                }
             }
             total += dev;
         }
@@ -1688,22 +1697,34 @@ impl SupervisorInner {
             for &(i, max_tau) in &policy.support_torque_limits {
                 if i >= dof { return Some(V::SupportTorqueIndexOutOfRange { index: i }); }
                 let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
-                if (!tau.is_finite() || tau.abs() > max_tau) && len < MAX_RESTING_SUPPORT_ITEMS {
-                    items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
-                    len += 1;
+                if !tau.is_finite() || tau.abs() > max_tau {
+                    if len < MAX_RESTING_SUPPORT_ITEMS {
+                        items[len] = Some(Item::JointTorque { joint: i as u16, torque: tau, limit: max_tau });
+                        len += 1;
+                    } else {
+                        overflowed = overflowed.saturating_add(1);
+                    }
                 }
             }
             for &(i, max_load) in &policy.support_load_limits {
                 if i >= dof { return Some(V::SupportLoadIndexOutOfRange { index: i }); }
                 let load = self.loads.get(i).copied().unwrap_or(f32::NAN);
-                if (!load.is_finite() || load.abs() > max_load) && len < MAX_RESTING_SUPPORT_ITEMS {
-                    items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
-                    len += 1;
+                if !load.is_finite() || load.abs() > max_load {
+                    if len < MAX_RESTING_SUPPORT_ITEMS {
+                        items[len] = Some(Item::JointLoad { joint: i as u16, load, limit: max_load });
+                        len += 1;
+                    } else {
+                        overflowed = overflowed.saturating_add(1);
+                    }
                 }
             }
         }
-        let workspace = self.measured_workspace_violation_bounded(bufs);
-        (len > 0 || workspace.is_some()).then_some(V::Failures { items, len: len as u8, workspace })
+        let mut workspace = self.measured_workspace_violation_bounded(bufs);
+        if workspace.is_some() && len >= MAX_RESTING_SUPPORT_ITEMS {
+            workspace = None;
+            overflowed = overflowed.saturating_add(1);
+        }
+        (len > 0 || workspace.is_some()).then_some(V::Failures { items, len: len as u8, overflowed, workspace })
     }
 
     /// Bounded, allocation-free fault clearing for the RT executor; refusal text is rendered off-thread.

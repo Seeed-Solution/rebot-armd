@@ -23,9 +23,9 @@ use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::ExecutorConfig;
 use armd::rt_core::ops::{CoreOps, ServiceBudget};
 use armd::safety::{
-    BoundedFaultReason, BoundedSafetyState, ClearFaultDriverError, ClearFaultError, ClearFaultRefusal,
-    FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StaticFault,
-    DETAIL_UNAVAILABLE, SAFETY_LOG_CAPACITY,
+    BoundedFaultReason, BoundedSafetyState, BoundedText, ClearFaultDriverError, ClearFaultError,
+    ClearFaultRefusal, FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState,
+    StaticFault, DETAIL_UNAVAILABLE, MAX_RESTING_SUPPORT_ITEMS, SAFETY_LOG_CAPACITY,
 };
 use armd::transport::{MockClock, TransportError};
 use armd::{ArmConfig, ArmError, ArmSupervisor, StopPolicy, SupervisorInner};
@@ -910,4 +910,92 @@ async fn safety_and_logwriter_drop_counters_are_monotonic_published_and_reported
         shutdown_logs.contains(&format!("Safety log shutdown: {expected_drops} total events dropped")),
         "missing shutdown summary in:\n{shutdown_logs}"
     );
+}
+
+#[test]
+fn api_clear_fault_messages_mark_resting_overflow_and_utf8_driver_truncation() {
+    // 1. More than 32 resting-policy failures (plus workspace violation as an extra entry):
+    //    lists the first 32 entries then ` (+N more)`, keeps CLEAR_FAULT_REJECTED, 0 heap ops on RT,
+    //    and matches legacy output verbatim.
+    let mut cfg = ArmConfig::rebot_dm();
+    let mut rp = armd::model::RestingPosePolicy::rebot_dm();
+    rp.support_torque_limits.clear();
+    for _ in 0..37 {
+        rp.support_torque_limits.push((0, 0.1));
+    }
+    cfg.resting_pose = Some(rp);
+    if let Some(ws) = cfg.workspace.as_mut() {
+        ws.floor_z_m = 2.0; // 38th failing entry
+    }
+    let drv = RestingSupportDriver {
+        dof: cfg.dof,
+        enable: EnableState::Enabled,
+        feedback_valid: true,
+        age: Some(Duration::from_millis(10)),
+        disables_arm: true,
+        hw_fault: false,
+        timeout_on_reset: false,
+        positions: cfg.resting_positions().to_vec(),
+        temperature: Arc::new(Mutex::new(30.0)),
+        clock: MockClock::new(),
+    };
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+    inner.feedback_numeric_valid = true;
+    inner.safety.set_off_thread_reclaim(true);
+    inner.safety.trigger_fault(FaultReason::BusLoss);
+    inner.measured_positions = inner.config.resting_positions().to_vec();
+    inner.measured_velocities = vec![0.0; inner.config.dof];
+    inner.torques = vec![5.0; inner.config.dof]; // fails all 37 torque limits
+
+    let legacy_reason = inner
+        .resting_pose_support_violation_with_driver(Some(inner.driver.as_ref().unwrap().lock().unwrap().as_ref()))
+        .unwrap();
+    assert!(legacy_reason.ends_with(" (+6 more)"), "37 torque + 1 workspace = 38 -> +6 more: {legacy_reason}");
+    assert_eq!(legacy_reason.matches("; ").count(), MAX_RESTING_SUPPORT_ITEMS - 1, "{legacy_reason}");
+
+    alloc::time_this_thread();
+    let _ = alloc::take();
+    let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert_eq!(alloc::take().calls, 0, ">32 resting-policy refusal must do 0 heap ops");
+    assert_api_clear_fault_text(
+        err,
+        &format!("Cannot disable faulted supporting arm joint away from resting pose ({legacy_reason}); support the arm at rest first"),
+    );
+
+    // 2. Driver error strings > 256 bytes: cut at 256 bytes on a UTF-8 char boundary with `…` (U+2026),
+    //    while strings <= 256 bytes are NOT suffixed.
+    let exact_256 = "a".repeat(256);
+    let exact_bt = BoundedText::<256>::new(&exact_256);
+    assert!(!exact_bt.is_truncated());
+    assert_eq!(exact_bt.to_string(), exact_256);
+
+    // 255 ASCII bytes + 2-byte 'é' (257 bytes total) -> must cut at byte 255 + '…' (valid UTF-8!).
+    let mut utf8_boundary = "x".repeat(255);
+    utf8_boundary.push('é');
+    utf8_boundary.push_str("tail");
+    let trunc_bt = BoundedText::<256>::new(&utf8_boundary);
+    assert!(trunc_bt.is_truncated());
+    assert_eq!(trunc_bt.as_str().len(), 255);
+    assert_eq!(trunc_bt.to_string(), format!("{}…", "x".repeat(255)));
+
+    // 254 ASCII bytes + 3-byte '中' (257 bytes) -> must cut at byte 254 + '…', keeps CLEAR_FAULT_REJECTED.
+    let mut cjk_long = "z".repeat(254);
+    cjk_long.push('中');
+    cjk_long.push('余');
+    let drv_err = ClearFaultError::Rejected(ClearFaultRefusal::DriverError(
+        ClearFaultDriverError::HardwareFault(BoundedText::<256>::new(&cjk_long)),
+    ));
+    assert_api_clear_fault_text(drv_err, &format!("Hardware fault: {}…", "z".repeat(254)));
+
+    // DriverConfigError > 256 bytes also truncates cleanly with `…` and keeps CLEAR_FAULT_REJECTED.
+    let mut cfg_err_inner = SupervisorInner::new(cfg);
+    cfg_err_inner.safety.set_off_thread_reclaim(true);
+    cfg_err_inner.safety.trigger_fault(FaultReason::BusLoss);
+    cfg_err_inner.driver_config_error = Some(cjk_long);
+    let _ = alloc::take();
+    let cfg_err = cfg_err_inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    assert_eq!(alloc::take().calls, 0);
+    assert_api_clear_fault_text(cfg_err, &format!("Driver limit configuration error: {}…", "z".repeat(254)));
 }

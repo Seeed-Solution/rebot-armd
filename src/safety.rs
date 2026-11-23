@@ -369,14 +369,17 @@ pub struct LatchedFaultDetail {
 }
 
 /// Fixed-capacity UTF-8 text buffer stored inline without heap allocation.
+/// When input exceeds `N` bytes, it is cut on a UTF-8 character boundary within `N` bytes and
+/// [`Display`] appends `…` (U+2026).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BoundedText<const N: usize> {
     len: u16,
+    truncated: bool,
     buf: [u8; N],
 }
 
 impl<const N: usize> BoundedText<N> {
-    pub const fn empty() -> Self { Self { len: 0, buf: [0u8; N] } }
+    pub const fn empty() -> Self { Self { len: 0, truncated: false, buf: [0u8; N] } }
 
     pub fn new(s: &str) -> Self {
         let mut out = Self::empty();
@@ -385,11 +388,18 @@ impl<const N: usize> BoundedText<N> {
     }
 
     pub fn push_str(&mut self, s: &str) {
+        if s.is_empty() { return; }
         let used = usize::from(self.len);
         let avail = N.saturating_sub(used);
-        if avail == 0 { return; }
+        if avail == 0 {
+            self.truncated = true;
+            return;
+        }
         let mut take = s.len().min(avail);
         while take > 0 && !s.is_char_boundary(take) { take -= 1; }
+        if take < s.len() {
+            self.truncated = true;
+        }
         self.buf[used..used + take].copy_from_slice(&s.as_bytes()[..take]);
         self.len = (used + take) as u16;
     }
@@ -399,6 +409,8 @@ impl<const N: usize> BoundedText<N> {
     }
 
     pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    pub fn is_truncated(&self) -> bool { self.truncated }
 }
 
 impl<const N: usize> Default for BoundedText<N> { fn default() -> Self { Self::empty() } }
@@ -426,7 +438,11 @@ impl<const N: usize> PartialEq<String> for BoundedText<N> {
 }
 impl<const N: usize> Serialize for BoundedText<N> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+        if self.truncated {
+            serializer.collect_str(self)
+        } else {
+            serializer.serialize_str(self.as_str())
+        }
     }
 }
 impl<'de, const N: usize> Deserialize<'de> for BoundedText<N> {
@@ -439,7 +455,13 @@ impl<const N: usize> std::fmt::Debug for BoundedText<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
 }
 impl<const N: usize> std::fmt::Display for BoundedText<N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())?;
+        if self.truncated {
+            f.write_str("…")?;
+        }
+        Ok(())
+    }
 }
 impl<const N: usize> core::fmt::Write for BoundedText<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push_str(s); Ok(()) }
@@ -613,6 +635,7 @@ pub enum RestingSupportViolation {
     Failures {
         items: [Option<RestingSupportJointItem>; MAX_RESTING_SUPPORT_ITEMS],
         len: u8,
+        overflowed: u16,
         workspace: Option<WorkspaceSupportViolation>,
     },
 }
@@ -629,7 +652,7 @@ impl std::fmt::Display for RestingSupportViolation {
             Self::FeedbackTooOld { max_age_ms } => write!(f, "feedback older than {max_age_ms} ms"),
             Self::SupportTorqueIndexOutOfRange { index } => write!(f, "support torque index {index} out of range"),
             Self::SupportLoadIndexOutOfRange { index } => write!(f, "support load index {index} out of range"),
-            Self::Failures { items, len, workspace } => {
+            Self::Failures { items, len, overflowed, workspace } => {
                 let mut first = true;
                 for item in items.iter().take(usize::from(*len)).flatten() {
                     if !first { f.write_str("; ")?; }
@@ -639,6 +662,9 @@ impl std::fmt::Display for RestingSupportViolation {
                 if let Some(ws) = workspace {
                     if !first { f.write_str("; ")?; }
                     write!(f, "{ws}")?;
+                }
+                if *overflowed > 0 {
+                    write!(f, " (+{overflowed} more)")?;
                 }
                 Ok(())
             }

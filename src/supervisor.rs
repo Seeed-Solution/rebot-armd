@@ -1555,7 +1555,16 @@ impl SupervisorInner {
         if let Some(msg) = self.measured_workspace_violation("clear_fault") {
             failures.push(msg);
         }
-        (!failures.is_empty()).then(|| failures.join("; "))
+        if failures.is_empty() {
+            None
+        } else if failures.len() > crate::safety::MAX_RESTING_SUPPORT_ITEMS {
+            let overflowed = failures.len() - crate::safety::MAX_RESTING_SUPPORT_ITEMS;
+            let mut joined = failures[..crate::safety::MAX_RESTING_SUPPORT_ITEMS].join("; ");
+            let _ = core::fmt::write(&mut joined, format_args!(" (+{overflowed} more)"));
+            Some(joined)
+        } else {
+            Some(failures.join("; "))
+        }
     }
 
     /// Stationary check over the settle hold window: per joint, the position span, the
