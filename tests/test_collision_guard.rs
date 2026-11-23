@@ -194,7 +194,7 @@ fn escalates_to_fault_collision_after_max_auto_resumes() {
     assert_eq!(fault.code, FaultCode::Collision);
     assert!(!fault.recoverable);
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)) && obs.is_torqued);
-    assert_eq!(serde_json::to_value(&fault).unwrap()["code"], "COLLISION");
+    assert_eq!(serde_json::to_value(fault).unwrap()["code"], "COLLISION");
     let c = obs.collision.unwrap();
     assert!(!c.active && c.trips_in_window == 3, "{c:?}");
     // stays latched: no auto-resume from a Fault

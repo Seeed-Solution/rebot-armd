@@ -24,8 +24,8 @@ use armd::rt_core::executor::ExecutorConfig;
 use armd::rt_core::ops::{CoreOps, ServiceBudget};
 use armd::safety::{
     BoundedFaultReason, BoundedSafetyState, ClearFaultDriverError, ClearFaultError, ClearFaultRefusal,
-    FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, DETAIL_UNAVAILABLE,
-    SAFETY_LOG_CAPACITY,
+    FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StaticFault,
+    DETAIL_UNAVAILABLE, SAFETY_LOG_CAPACITY,
 };
 use armd::transport::{MockClock, TransportError};
 use armd::{ArmConfig, ArmError, ArmSupervisor, StopPolicy, SupervisorInner};
@@ -675,4 +675,131 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
         assert!(sm.latched_fault_detail(kind).is_none());
     }
     drop((ret_jl, ret_th, ret_other, held_pool, held_lazy));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remaining_safety_paths_zero_alloc_fault_producers_gravity_comp_estop_and_large_workspace() {
+    let log = global_log();
+    let _serial = log.guard.lock().await;
+    let _ = take_global_logs(log);
+
+    // 1. Static + dynamically formatted fault producers & FaultInfo construction -> 0 heap ops.
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    inner.lease_enabled = false;
+    inner.is_torqued = true;
+    inner.safety.set_off_thread_reclaim(true);
+    let _ = inner.safety.set_torque(true).unwrap();
+
+    // Warm one control tick (populates lazy scratch), then trigger ControlDeadline -> 0 heap ops.
+    inner.tick_control(0.02);
+    alloc::time_this_thread();
+    let _ = alloc::take();
+    // Control loop deadline exceeded (src/supervisor.rs:2278) -> StaticFault::ControlDeadline.
+    inner.tick_control(0.5);
+    let deadline_allocs = alloc::take();
+    assert_eq!(deadline_allocs.calls, 0, "ControlDeadline tick fault path allocated: {deadline_allocs:?}");
+    let fi = inner.safety.fault().unwrap();
+    assert_eq!(fi.code, FaultCode::ControlDeadline);
+    assert_eq!(fi.message, "Control loop deadline exceeded");
+
+    // StaticFault::InvalidTelemetry + trigger_fault_formatted + FaultInfo build -> 0 heap ops.
+    let _ = alloc::take();
+    inner.safety.trigger_static_fault(StaticFault::InvalidTelemetry);
+    let fi_inv = inner.safety.fault().unwrap();
+    inner.safety.trigger_fault_formatted(FaultCode::FollowingError, FaultKind::Other, |b| {
+        let _ = core::fmt::write(b, format_args!("Persistent joint tracking error: joint 2 cmd 0.500 meas 0.100 rad"));
+    });
+    let fi_fe = inner.safety.fault().unwrap();
+    let prod_allocs = alloc::take();
+    assert_eq!(prod_allocs.calls, 0, "static + formatted fault producers allocated: {prod_allocs:?}");
+    assert_eq!((fi_inv.code, fi_inv.message.as_str()), (FaultCode::InvalidTelemetry, "Invalid hardware telemetry"));
+    assert_eq!(fi_fe.code, FaultCode::FollowingError);
+    assert_eq!(fi_fe.message, "Persistent joint tracking error: joint 2 cmd 0.500 meas 0.100 rad");
+    inner.safety.drain_retired_state_arcs_off_thread();
+    inner.safety.drain_log_events_off_thread();
+
+    // 2. E-stop during floating gravity compensation (src/supervisor/motion.rs:161) -> 0 heap ops.
+    let mut gc_cfg = ArmConfig::rebot_dm();
+    gc_cfg.joint_tracking = None;
+    let mut gc = SupervisorInner::new(gc_cfg);
+    gc.lease_enabled = false;
+    gc.set_torque(true).unwrap();
+    gc.tick(0.02);
+    gc.enter_gravity_comp(armd::gravity_comp::GravityCompRequest::default()).unwrap();
+    gc.tick(0.02);
+    assert!(gc.gravity_comp.is_some());
+    gc.safety.set_off_thread_reclaim(true);
+    let _ = take_global_logs(log);
+
+    let _ = alloc::take();
+    gc.apply_stop_policy(StopPolicy::EStopLatch);
+    let gc_estop_allocs = alloc::take();
+    assert_eq!(gc_estop_allocs.calls, 0, "E-stop during gravity comp allocated: {gc_estop_allocs:?}");
+    assert_eq!(*gc.safety.state(), SafetyState::EStop);
+    let last_exit = gc.gravity_comp_last_exit.expect("gravity_comp_last_exit must be recorded");
+    assert_eq!((last_exit.code.as_str(), last_exit.message.as_str()), ("ESTOP", "E-stop"));
+    assert_eq!(take_global_logs(log), "", "gravity comp E-stop must not format logs on control thread");
+    gc.safety.drain_log_events_off_thread();
+    let gc_logs = take_global_logs(log);
+    assert!(gc_logs.contains("Gravity compensation exit: ESTOP E-stop"), "{gc_logs}");
+
+    // 3. clear_fault with workspace exceeding 256 slots (src/supervisor/driver_transitions.rs:1613) -> 0 heap ops.
+    let mut ws_cfg = ArmConfig::rebot_dm();
+    ws_cfg.resting_pose = Some(armd::model::RestingPosePolicy::rebot_dm());
+    {
+        let ws = ws_cfg.workspace.as_mut().expect("rebot-dm workspace");
+        ws.keepout_boxes.clear();
+        for i in 0..16 {
+            ws.keepout_boxes.push(armd::model::KeepoutBox {
+                name: format!("kb_{i}"),
+                min_m: [0.5 + i as f32 * 0.02, 0.5, 0.5],
+                max_m: [0.51 + i as f32 * 0.02, 0.55, 0.55],
+            });
+        }
+        // Add extra end check points so total_slots > MAX_STACK_WORKSPACE_SLOTS (256).
+        for i in 0..10 {
+            ws.check_points_end_m.push([0.0, 0.0, 0.01 * (i as f32 + 1.0)]);
+        }
+        ws.floor_z_m = 2.0; // force a workspace violation at resting pose
+        let eval = armd::chain::WorkspaceEvaluator::new_with_tcp(
+            &ws_cfg.arm_model, ws, &ws_cfg.camera_mount, ws_cfg.tcp_offset,
+        );
+        assert!(
+            eval.total_slots > armd::kinematics::MAX_STACK_WORKSPACE_SLOTS,
+            "test must exceed 256 workspace slots, got {}", eval.total_slots
+        );
+    }
+    let ws_drv = RestingSupportDriver {
+        dof: ws_cfg.dof,
+        enable: EnableState::Enabled,
+        feedback_valid: true,
+        age: Some(Duration::from_millis(10)),
+        disables_arm: true,
+        hw_fault: false,
+        timeout_on_reset: false,
+        positions: ws_cfg.resting_positions().to_vec(),
+        temperature: Arc::new(Mutex::new(30.0)),
+        clock: MockClock::new(),
+    };
+    let mut ws_inner = SupervisorInner::new(ws_cfg).with_driver(Box::new(ws_drv));
+    ws_inner.lease_enabled = false;
+    ws_inner.is_torqued = true;
+    ws_inner.feedback_numeric_valid = true;
+    ws_inner.safety.set_off_thread_reclaim(true);
+    ws_inner.safety.trigger_fault(FaultReason::BusLoss);
+    ws_inner.measured_positions = ws_inner.config.resting_positions().to_vec();
+    ws_inner.measured_velocities = vec![0.0; ws_inner.config.dof];
+    ws_inner.torques = vec![0.0; ws_inner.config.dof];
+    let legacy_ws_msg = ws_inner
+        .resting_pose_support_violation_with_driver(Some(ws_inner.driver.as_ref().unwrap().lock().unwrap().as_ref()))
+        .unwrap();
+
+    let _ = alloc::take();
+    let err_ws = ws_inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+    let ws_allocs = alloc::take();
+    assert_eq!(ws_allocs.calls, 0, ">256-slot workspace clear_fault allocated: {ws_allocs:?}");
+    assert_api_clear_fault_text(
+        err_ws,
+        &format!("Cannot disable faulted supporting arm joint away from resting pose ({legacy_ws_msg}); support the arm at rest first"),
+    );
 }

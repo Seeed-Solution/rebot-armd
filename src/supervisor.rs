@@ -687,7 +687,7 @@ impl SupervisorInner {
         let profile_grasp = config.grasp.clone();
         let mock_gripper_stall_offset = std::env::var("ARMD_MOCK_GRIPPER_STALL_OFFSET").ok().and_then(|s| s.parse::<f32>().ok());
 
-        Self {
+        let mut inner = Self {
             config,
             safety: SafetyManager::new(),
             held: None,
@@ -864,7 +864,19 @@ impl SupervisorInner {
             ),
             estop_ack_overflow_gen: 0,
             before_publish_hook: None,
+        };
+        inner.prepare_workspace_eval_bufs();
+        inner
+    }
+
+    /// Pre-sizes `ws_eval_bufs` (including overflow slot and capsule buffers for workspaces
+    /// exceeding 256 slots) off the RT thread so RT checks allocate zero heap memory.
+    pub fn prepare_workspace_eval_bufs(&mut self) {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        if let Some((ws, cam)) = self.workspace_policy() {
+            bufs.prepare_for(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         }
+        self.ws_eval_bufs = bufs;
     }
 
     /// Minimal empty shell left inside `ArmSupervisor::inner` once ownership transfers to
@@ -2245,21 +2257,17 @@ impl SupervisorInner {
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
-            self.safety.trigger_fault_coded_lazy(FaultCode::InvalidTelemetry, || {
-                FaultReason::Other("Invalid hardware telemetry".into())
-            });
+            self.safety.trigger_static_fault(crate::safety::StaticFault::InvalidTelemetry);
         } else if driver_torque_lost && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
-                self.commanded_positions = self.measured_positions.clone();
-                self.target_positions = self.measured_positions.clone();
+                copy_into(&mut self.commanded_positions, &self.measured_positions);
+                copy_into(&mut self.target_positions, &self.measured_positions);
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault_coded_lazy(FaultCode::HardwareFault, || {
-                FaultReason::Other("Unexpected motor torque loss detected while operational".into())
-            });
+            self.safety.trigger_static_fault(crate::safety::StaticFault::UnexpectedTorqueLoss);
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors
@@ -2270,14 +2278,12 @@ impl SupervisorInner {
             self.stop_motion();
             self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
-                self.commanded_positions = self.measured_positions.clone();
-                self.target_positions = self.measured_positions.clone();
+                copy_into(&mut self.commanded_positions, &self.measured_positions);
+                copy_into(&mut self.target_positions, &self.measured_positions);
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault_coded_lazy(FaultCode::ControlDeadline, || {
-                FaultReason::Other("Control loop deadline exceeded".into())
-            });
+            self.safety.trigger_static_fault(crate::safety::StaticFault::ControlDeadline);
         }
         self.step_zero_convention();
         let dt_raw = dt;
@@ -2715,13 +2721,11 @@ impl SupervisorInner {
                 if let Ok(driver) = d.lock() {
                     if let Err(e) = driver.check_hardware_status() {
                         tracing::error!("Hardware fault detected on driver: {}", e);
-                        let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+                        if self.measured_positions.iter().all(|p| p.is_finite())
                             && self.measured_positions.len() == self.config.dof
                         {
-                            self.measured_positions.clone()
-                        } else {
-                            self.commanded_positions.clone()
-                        };
+                            copy_into(&mut self.commanded_positions, &self.measured_positions);
+                        }
                         self.pending_normal_unload = false;
                         self.unload_settle = None;
                         self.active_trajectory = None;
@@ -2732,12 +2736,13 @@ impl SupervisorInner {
                         self.servo_settled_ticks.fill(0);
                         self.servo_ws_min_depths = None;
                         self.tracking.invalidate();
-                        self.target_positions = hold_pos.clone();
-                        self.commanded_positions = hold_pos;
-                        self.commanded_velocities = vec![0.0; self.config.dof];
-                        self.safety.trigger_fault_coded_lazy(FaultCode::HardwareFault, || {
-                            FaultReason::Other(e.to_string())
-                        });
+                        copy_into(&mut self.target_positions, &self.commanded_positions);
+                        self.commanded_velocities.fill(0.0);
+                        self.safety.trigger_fault_formatted(
+                            FaultCode::HardwareFault,
+                            crate::safety::FaultKind::Other,
+                            |buf| { let _ = core::fmt::write(buf, format_args!("{e}")); },
+                        );
                     }
                 }
             }
@@ -2815,16 +2820,23 @@ impl SupervisorInner {
                 } else if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
                     self.stop_motion();
                     self.tracking.invalidate();
-                    self.commanded_positions = self.measured_positions.clone();
-                    self.target_positions = self.measured_positions.clone();
+                    copy_into(&mut self.commanded_positions, &self.measured_positions);
+                    copy_into(&mut self.target_positions, &self.measured_positions);
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault_coded_lazy(FaultCode::FollowingError, || {
-                        FaultReason::Other(format!(
-                            "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad",
-                            joint + 1
-                        ))
-                    });
+                    self.safety.trigger_fault_formatted(
+                        FaultCode::FollowingError,
+                        crate::safety::FaultKind::Other,
+                        |buf| {
+                            let _ = core::fmt::write(
+                                buf,
+                                format_args!(
+                                    "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad",
+                                    joint + 1
+                                ),
+                            );
+                        },
+                    );
                 }
             } else { self.following_error_since = None; }
         } else { self.following_error_since = None; }
@@ -3489,18 +3501,20 @@ impl SupervisorInner {
                                     tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
-                                    self.safety.trigger_fault_coded(
+                                    self.safety.trigger_fault_formatted(
                                         FaultCode::Other,
-                                        FaultReason::Other(format!("Joint tracking output rejected: {ws_err}")),
+                                        crate::safety::FaultKind::Other,
+                                        |buf| { let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}")); },
                                     );
                                 }
                                 crate::tracking::TrackingReject::JointLimit(msg) => {
                                     tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("JOINT_LIMIT"));
-                                    self.safety.trigger_fault_coded(
+                                    self.safety.trigger_fault_formatted(
                                         FaultCode::JointLimit,
-                                        FaultReason::Other(format!("Joint tracking output rejected: {msg}")),
+                                        crate::safety::FaultKind::JointLimitExceeded,
+                                        |buf| { let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {msg}")); },
                                     );
                                 }
                             }
@@ -3585,11 +3599,15 @@ impl SupervisorInner {
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             if self.measured_positions.iter().all(|q| q.is_finite()) {
-                self.commanded_positions = self.measured_positions.clone();
-                self.target_positions = self.measured_positions.clone();
+                copy_into(&mut self.commanded_positions, &self.measured_positions);
+                copy_into(&mut self.target_positions, &self.measured_positions);
             }
             if !self.safety.state().is_stopped() {
-                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
+                self.safety.trigger_fault_formatted(
+                    FaultCode::DriverWriteFailed,
+                    crate::safety::FaultKind::Other,
+                    |buf| { let _ = core::fmt::write(buf, format_args!("Control output failed: {error}")); },
+                );
             }
             tracing::error!("Control output failed: {error}");
         }
@@ -3696,8 +3714,8 @@ impl SupervisorInner {
                 self.handover_settling_since = None;
             } else if settling_since.elapsed() > Duration::from_millis(1500) {
                 self.stop_motion();
-                self.commanded_velocities = vec![0.0; self.config.dof];
-                self.safety.trigger_fault_coded(FaultCode::HandoverUnsettled, FaultReason::Other("Handover settling timeout".into()));
+                self.commanded_velocities.fill(0.0);
+                self.safety.trigger_static_fault(crate::safety::StaticFault::HandoverSettlingTimeout);
                 self.handover_settling_since = None;
             }
         }
@@ -4124,6 +4142,7 @@ impl ArmSupervisor {
         // and drop any legacy retired fault Arcs off-thread before transferring ownership.
         Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
         guard.safety.drain_retired_state_arcs_off_thread();
+        guard.prepare_workspace_eval_bufs();
 
         let initial_gen = self.inner.generation();
         let shell = SupervisorInner::detached_shell(

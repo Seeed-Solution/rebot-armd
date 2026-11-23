@@ -158,10 +158,10 @@ impl SupervisorInner {
                 for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
                 self.tracking.invalidate();
                 let at = self.start_time.elapsed().as_secs_f64();
-                tracing::warn!("Gravity compensation exit: ESTOP E-stop");
+                self.safety.log_gravity_comp_estop_exit();
                 self.gravity_comp_last_exit = Some(crate::model::GravityCompExit {
-                    code: "ESTOP".into(),
-                    message: "E-stop".into(),
+                    code: crate::model::HolderLabel::new("ESTOP"),
+                    message: crate::model::HolderLabel::new("E-stop"),
                     at,
                 });
                 exited_gravity_comp = true;
@@ -174,10 +174,12 @@ impl SupervisorInner {
         }
         // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
         if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
-            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), driver) {
+            if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), driver) {
                 if let Ok(mut drv) = d.try_lock() {
                     if let Err(e) = drv.write_joint_targets(&targets) {
-                        tracing::error!("Gravity comp hold write failed: {e}");
+                        let mut msg = crate::safety::BoundedText::<160>::empty();
+                        let _ = core::fmt::write(&mut msg, format_args!("{e}"));
+                        self.safety.log_gravity_comp_hold_write_failed(msg);
                     }
                 }
             }
@@ -405,18 +407,15 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.active_trajectory = None;
                 self.servo_target = None;
-                let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+                if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
                 {
-                    self.measured_positions.clone()
-                } else {
-                    self.commanded_positions.clone()
-                };
-                self.target_positions = hold_pos.clone();
-                self.commanded_positions = hold_pos;
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+                }
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                self.commanded_velocities.fill(0.0);
                 if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    self.measured_velocities.fill(0.0);
                 }
                 self.bus_loss_instant = Some(Instant::now());
                 self.safety.trigger_fault(FaultReason::BusLoss);

@@ -32,7 +32,7 @@ use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::persist::{PublishOutcome, StagedWrite};
 use crate::safety::{
     ClearFaultError, SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY,
-    SAFETY_LOG_CAPACITY,
+    FORMATTED_FAULT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY,
 };
 use crate::supervisor::{ArmError, PendingZeroCheckPersist, SupervisorInner};
 
@@ -733,7 +733,7 @@ impl OffThreadSinks {
             while let Ok(mut arc) = rx.pop() {
                 if !ret_tx.is_abandoned() && !ret_tx.is_full() {
                     if let Some(slot) = Arc::get_mut(&mut arc) {
-                        *slot = SafetyState::Idle;
+                        crate::safety::SafetyManager::reset_recycled_fault_arc(slot);
                         let _ = ret_tx.push(arc);
                         continue;
                     }
@@ -1105,7 +1105,8 @@ pub(crate) fn spawn_executor(
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
-    let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(FAULT_ARC_POOL_CAPACITY);
+    let (reclaim_return_tx, reclaim_return_rx) =
+        RingBuffer::<Arc<SafetyState>>::new(FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY);
     let (safety_log_tx, safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(SAFETY_LOG_CAPACITY);
     let safety_log_dropped = Arc::new(AtomicU64::new(0));
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
@@ -1314,7 +1315,9 @@ impl ControlState {
     /// `armd-control` into the bounded SPSC rings, and replenishes clean recycled fault slots
     /// without allocating or dropping on `armd-control`.
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
-        while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY {
+        while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY
+            || core.safety.formatted_fault_arc_pool_len() < FORMATTED_FAULT_ARC_POOL_CAPACITY
+        {
             let Ok(arc) = self.reclaim_return_rx.pop() else {
                 break;
             };

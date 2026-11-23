@@ -23,7 +23,7 @@ use crate::motion::MotionError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::persist::{self, Loaded, PendingWrite};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::safety::{FaultCode, FaultReason, SafetyError};
+use crate::safety::{FaultCode, SafetyError};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
@@ -420,8 +420,16 @@ impl SupervisorInner {
         self.safety.mark_motion_finished();
         if escalated {
             tracing::error!("Collision guard: {trips} trips within {:.0} s; latching Fault COLLISION", p.escalate_window_s);
-            self.safety.trigger_fault_coded(FaultCode::Collision, FaultReason::Other(format!(
-                "COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s)));
+            self.safety.trigger_fault_formatted(
+                FaultCode::Collision,
+                crate::safety::FaultKind::Other,
+                |buf| {
+                    let _ = core::fmt::write(
+                        buf,
+                        format_args!("COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s),
+                    );
+                },
+            );
         }
         // Pure step has already installed the hold state.
     }

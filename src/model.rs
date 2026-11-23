@@ -2711,15 +2711,13 @@ pub struct ModeReason {
 crate::fieldwise_clone!(ModeReason { code, message });
 
 /// Why the last gravity-compensation session ended.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct GravityCompExit {
-    pub code: String,
-    pub message: String,
+    pub code: HolderLabel,
+    pub message: HolderLabel,
     /// Observation timestamp of the exit (s).
     pub at: f64,
 }
-
-crate::fieldwise_clone!(GravityCompExit { code, message, at });
 
 /// Gravity-compensation state published with every observation.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]

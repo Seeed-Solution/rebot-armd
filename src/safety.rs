@@ -93,16 +93,36 @@ impl FaultCode {
 }
 
 /// `observation.fault`: present whenever the safety state is Fault or EStop.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FaultInfo {
     pub code: FaultCode,
-    pub message: String,
+    pub message: BoundedText<SAFETY_LOG_TEXT_CAPACITY>,
     pub recoverable: bool,
 }
 
-crate::fieldwise_clone!(FaultInfo { code, message, recoverable });
-
 impl FaultReason {
+    /// Writes the human-readable fault message directly into a [`core::fmt::Write`] sink
+    /// without heap allocation.
+    pub fn write_message_into(&self, w: &mut impl core::fmt::Write) {
+        match self {
+            FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } => {
+                let _ = write!(w, "Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]");
+            }
+            FaultReason::ThermalTrip { joint_idx, temperature, limit } => {
+                let _ = write!(w, "Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1);
+            }
+            FaultReason::BusLoss => {
+                let _ = w.write_str("No fresh feedback from every joint (bus loss)");
+            }
+            FaultReason::WatchdogTimeout => {
+                let _ = w.write_str("Control lease expired while torqued");
+            }
+            FaultReason::Other(m) => {
+                let _ = w.write_str(m);
+            }
+        }
+    }
+
     pub fn message(&self) -> String {
         match self {
             FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } =>
@@ -239,6 +259,8 @@ impl SafetyError {
 pub const RETIRED_STATE_CAPACITY: usize = 16;
 /// Capacity of [`SafetyManager`]'s preallocated `Arc<SafetyState>` fault slot pool.
 pub const FAULT_ARC_POOL_CAPACITY: usize = 32;
+/// Capacity of [`SafetyManager`]'s preallocated formatted-message `Arc<SafetyState>` fault slot pool.
+pub const FORMATTED_FAULT_ARC_POOL_CAPACITY: usize = 16;
 /// Capacity of [`SafetyManager`]'s bounded deferred safety log event ring.
 pub const SAFETY_LOG_CAPACITY: usize = 64;
 /// Maximum inline text bytes stored in a deferred safety log event's `FaultReason::Other`.
@@ -247,6 +269,48 @@ pub const SAFETY_LOG_TEXT_CAPACITY: usize = 320;
 pub const SAFETY_JOINT_NAME_CAPACITY: usize = 64;
 /// Fallback message recorded when a latched fault's detail storage is unavailable.
 pub const DETAIL_UNAVAILABLE: &str = "detail unavailable";
+
+/// Preallocated static fault variants latched without heap allocation or pool consumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StaticFault {
+    InvalidTelemetry = 0,
+    UnexpectedTorqueLoss = 1,
+    ControlDeadline = 2,
+    HandoverSettlingTimeout = 3,
+    DisableUnconfirmed = 4,
+}
+
+impl StaticFault {
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::InvalidTelemetry,
+        Self::UnexpectedTorqueLoss,
+        Self::ControlDeadline,
+        Self::HandoverSettlingTimeout,
+        Self::DisableUnconfirmed,
+    ];
+
+    pub const fn code(self) -> FaultCode {
+        match self {
+            Self::InvalidTelemetry => FaultCode::InvalidTelemetry,
+            Self::UnexpectedTorqueLoss => FaultCode::HardwareFault,
+            Self::ControlDeadline => FaultCode::ControlDeadline,
+            Self::HandoverSettlingTimeout => FaultCode::HandoverUnsettled,
+            Self::DisableUnconfirmed => FaultCode::DriverWriteFailed,
+        }
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidTelemetry => "Invalid hardware telemetry",
+            Self::UnexpectedTorqueLoss => "Unexpected motor torque loss detected while operational",
+            Self::ControlDeadline => "Control loop deadline exceeded",
+            Self::HandoverSettlingTimeout => "Handover settling timeout",
+            Self::DisableUnconfirmed => "Torque disable has not been confirmed by fresh hardware feedback",
+        }
+    }
+}
 
 /// Discriminant of [`FaultReason`] tracked in [`SafetyManager`]'s fixed-size latched-kind bitmask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +402,39 @@ impl<const N: usize> BoundedText<N> {
 }
 
 impl<const N: usize> Default for BoundedText<N> { fn default() -> Self { Self::empty() } }
+impl<const N: usize> std::ops::Deref for BoundedText<N> {
+    type Target = str;
+    fn deref(&self) -> &str { self.as_str() }
+}
+impl<const N: usize> AsRef<str> for BoundedText<N> {
+    fn as_ref(&self) -> &str { self.as_str() }
+}
+impl<const N: usize> From<&str> for BoundedText<N> {
+    fn from(s: &str) -> Self { Self::new(s) }
+}
+impl<const N: usize> From<String> for BoundedText<N> {
+    fn from(s: String) -> Self { Self::new(&s) }
+}
+impl<const N: usize> PartialEq<str> for BoundedText<N> {
+    fn eq(&self, other: &str) -> bool { self.as_str() == other }
+}
+impl<const N: usize> PartialEq<&str> for BoundedText<N> {
+    fn eq(&self, other: &&str) -> bool { self.as_str() == *other }
+}
+impl<const N: usize> PartialEq<String> for BoundedText<N> {
+    fn eq(&self, other: &String) -> bool { self.as_str() == other.as_str() }
+}
+impl<const N: usize> Serialize for BoundedText<N> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl<'de, const N: usize> Deserialize<'de> for BoundedText<N> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::new(&s))
+    }
+}
 impl<const N: usize> std::fmt::Debug for BoundedText<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
 }
@@ -418,6 +515,8 @@ pub enum SafetyLogEvent {
     EStop { from: BoundedSafetyState },
     Fault { from: BoundedSafetyState, reason: BoundedFaultReason, code: FaultCode },
     Cleared,
+    GravityCompEstopExit,
+    GravityCompHoldWriteFailed(BoundedText<160>),
 }
 
 impl SafetyLogEvent {
@@ -428,6 +527,8 @@ impl SafetyLogEvent {
             Self::Fault { from, reason, code } =>
                 tracing::warn!(target: "armd::safety", "Safety: {:?} -> Fault({:?}) [{code:?}]", from, reason),
             Self::Cleared => tracing::info!(target: "armd::safety", "Safety: cleared -> Idle"),
+            Self::GravityCompEstopExit => tracing::warn!(target: "armd::supervisor::motion", "Gravity compensation exit: ESTOP E-stop"),
+            Self::GravityCompHoldWriteFailed(err) => tracing::error!(target: "armd::supervisor::motion", "Gravity comp hold write failed: {err}"),
         }
     }
 }
@@ -688,8 +789,11 @@ pub struct SafetyManager {
     bus_loss_arc: Arc<SafetyState>,
     watchdog_timeout_arc: Arc<SafetyState>,
     detail_unavailable_arc: Arc<SafetyState>,
+    static_fault_arcs: [Arc<SafetyState>; StaticFault::COUNT],
     fault_arc_pool: [Option<Arc<SafetyState>>; FAULT_ARC_POOL_CAPACITY],
     fault_arc_pool_len: usize,
+    formatted_fault_arc_pool: [Option<Arc<SafetyState>>; FORMATTED_FAULT_ARC_POOL_CAPACITY],
+    formatted_fault_arc_pool_len: usize,
     retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
     retired_head: usize,
     retired_len: usize,
@@ -719,9 +823,16 @@ impl Clone for SafetyManager {
             bus_loss_arc: Arc::clone(&self.bus_loss_arc),
             watchdog_timeout_arc: Arc::clone(&self.watchdog_timeout_arc),
             detail_unavailable_arc: Arc::clone(&self.detail_unavailable_arc),
+            static_fault_arcs: std::array::from_fn(|i| Arc::clone(&self.static_fault_arcs[i])),
             // Fresh unique pool slots so `Arc::get_mut` always succeeds on both instances.
             fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
             fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
+            formatted_fault_arc_pool: std::array::from_fn(|_| {
+                Some(Arc::new(SafetyState::Fault(FaultReason::Other(
+                    String::with_capacity(SAFETY_LOG_TEXT_CAPACITY),
+                ))))
+            }),
+            formatted_fault_arc_pool_len: FORMATTED_FAULT_ARC_POOL_CAPACITY,
             retired_state_arcs: self.retired_state_arcs.clone(),
             retired_head: self.retired_head,
             retired_len: self.retired_len,
@@ -753,8 +864,19 @@ impl Default for SafetyManager {
             detail_unavailable_arc: Arc::new(SafetyState::Fault(FaultReason::Other(
                 DETAIL_UNAVAILABLE.into(),
             ))),
+            static_fault_arcs: std::array::from_fn(|i| {
+                Arc::new(SafetyState::Fault(FaultReason::Other(
+                    StaticFault::ALL[i].message().into(),
+                )))
+            }),
             fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
             fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
+            formatted_fault_arc_pool: std::array::from_fn(|_| {
+                Some(Arc::new(SafetyState::Fault(FaultReason::Other(
+                    String::with_capacity(SAFETY_LOG_TEXT_CAPACITY),
+                ))))
+            }),
+            formatted_fault_arc_pool_len: FORMATTED_FAULT_ARC_POOL_CAPACITY,
             retired_state_arcs: std::array::from_fn(|_| None),
             retired_head: 0,
             retired_len: 0,
@@ -848,6 +970,44 @@ impl SafetyManager {
         self.fault_arc_pool_len
     }
 
+    /// Number of preallocated formatted-message `Arc<SafetyState>` fault slots currently available.
+    pub fn formatted_fault_arc_pool_len(&self) -> usize {
+        self.formatted_fault_arc_pool_len
+    }
+
+    /// Resets a uniquely-owned retired `SafetyState` off-thread for recycling into either the
+    /// formatted-message pool (`Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY))`) or the
+    /// general pool (`Idle`).
+    pub fn reset_recycled_fault_arc(slot: &mut SafetyState) {
+        if let SafetyState::Fault(FaultReason::Other(s)) = slot {
+            if s.capacity() >= SAFETY_LOG_TEXT_CAPACITY && s.capacity() <= SAFETY_LOG_TEXT_CAPACITY * 2 {
+                s.clear();
+                return;
+            }
+            *slot = SafetyState::Fault(FaultReason::Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY)));
+        } else {
+            *slot = SafetyState::Idle;
+        }
+    }
+
+    /// Emits or defers the gravity-compensation E-stop exit warning without RT heap allocation.
+    pub fn log_gravity_comp_estop_exit(&mut self) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::GravityCompEstopExit);
+        } else {
+            tracing::warn!(target: "armd::supervisor::motion", "Gravity compensation exit: ESTOP E-stop");
+        }
+    }
+
+    /// Emits or defers a gravity-compensation hold-write failure without RT heap allocation.
+    pub fn log_gravity_comp_hold_write_failed(&mut self, msg: BoundedText<160>) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::GravityCompHoldWriteFailed(msg));
+        } else {
+            tracing::error!(target: "armd::supervisor::motion", "Gravity comp hold write failed: {msg}");
+        }
+    }
+
     /// True when `kind` has been latched since the last successful clear to `Idle`.
     #[inline]
     pub fn has_latched_fault_kind(&self, kind: FaultKind) -> bool {
@@ -906,19 +1066,29 @@ impl SafetyManager {
         }
     }
 
-    /// Returns a clean, uniquely owned `SafetyState::Idle` `Arc` recycled off-thread back into
-    /// the bounded fault slot pool; returns `Err(arc)` without dropping if rejected.
+    /// Returns a clean, uniquely owned `SafetyState::Idle` or pre-sized empty `Other(String)`
+    /// `Arc` recycled off-thread back into the matching bounded fault slot pool; returns
+    /// `Err(arc)` without dropping if rejected.
     pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) -> Result<(), Arc<SafetyState>> {
-        if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY
-            && Arc::strong_count(&arc) == 1
-            && Arc::weak_count(&arc) == 0
-            && *arc == SafetyState::Idle
-        {
-            self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
-            self.fault_arc_pool_len += 1;
-            Ok(())
-        } else {
-            Err(arc)
+        if Arc::strong_count(&arc) != 1 || Arc::weak_count(&arc) != 0 {
+            return Err(arc);
+        }
+        match &*arc {
+            SafetyState::Idle if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY => {
+                self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
+                self.fault_arc_pool_len += 1;
+                Ok(())
+            }
+            SafetyState::Fault(FaultReason::Other(s))
+                if s.is_empty()
+                    && s.capacity() >= SAFETY_LOG_TEXT_CAPACITY
+                    && self.formatted_fault_arc_pool_len < FORMATTED_FAULT_ARC_POOL_CAPACITY =>
+            {
+                self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len] = Some(arc);
+                self.formatted_fault_arc_pool_len += 1;
+                Ok(())
+            }
+            _ => Err(arc),
         }
     }
 
@@ -944,16 +1114,15 @@ impl SafetyManager {
     }
 
     /// Drops all queued retired fault states on a non-RT thread (legacy/pre-handoff cleanup),
-    /// recycling uniquely owned slots (no outstanding strong or weak handles) back to the pool.
+    /// recycling uniquely owned slots (no outstanding strong or weak handles) back to the pools.
     pub fn drain_retired_state_arcs_off_thread(&mut self) {
         while let Some(mut arc) = self.pop_retired_state_arc() {
-            if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY {
-                if let Some(slot) = Arc::get_mut(&mut arc) {
-                    *slot = SafetyState::Idle;
-                    self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
-                    self.fault_arc_pool_len += 1;
-                    continue;
+            if let Some(slot) = Arc::get_mut(&mut arc) {
+                Self::reset_recycled_fault_arc(slot);
+                if let Err(rejected) = self.return_fault_arc(arc) {
+                    drop(rejected);
                 }
+                continue;
             }
             drop(arc);
         }
@@ -963,6 +1132,7 @@ impl SafetyManager {
         Arc::ptr_eq(arc, &self.bus_loss_arc)
             || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
             || Arc::ptr_eq(arc, &self.detail_unavailable_arc)
+            || self.static_fault_arcs.iter().any(|a| Arc::ptr_eq(arc, a))
     }
 
     fn allocate_fault_arc(&mut self, reason: FaultReason) -> Result<Arc<SafetyState>, FaultReason> {
@@ -1002,11 +1172,10 @@ impl SafetyManager {
             return true;
         }
         let mut prev = std::mem::replace(&mut self.state_arc, next);
-        if !self.off_thread_reclaim && needs_reclaim && self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY {
+        if !self.off_thread_reclaim && needs_reclaim {
             if let Some(slot) = Arc::get_mut(&mut prev) {
-                *slot = SafetyState::Idle;
-                self.fault_arc_pool[self.fault_arc_pool_len] = Some(prev);
-                self.fault_arc_pool_len += 1;
+                Self::reset_recycled_fault_arc(slot);
+                let _ = self.return_fault_arc(prev);
             }
         }
         true
@@ -1048,9 +1217,16 @@ impl SafetyManager {
     }
 
     pub fn fault(&self) -> Option<FaultInfo> {
-        let (code, message) = match &*self.state_arc {
-            SafetyState::EStop => (FaultCode::Estop, "E-stop latched".to_string()),
-            SafetyState::Fault(reason) => (self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason)), reason.message()),
+        let mut message = BoundedText::empty();
+        let code = match &*self.state_arc {
+            SafetyState::EStop => {
+                message.push_str("E-stop latched");
+                FaultCode::Estop
+            }
+            SafetyState::Fault(reason) => {
+                reason.write_message_into(&mut message);
+                self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))
+            }
             _ => return None,
         };
         Some(FaultInfo {
@@ -1058,6 +1234,64 @@ impl SafetyManager {
             message,
             recoverable: code.recoverable() && !self.any_latched_non_recoverable(),
         })
+    }
+
+    /// Advance epoch and latch a preallocated static fault with zero heap allocations and zero
+    /// pool consumption.
+    pub fn trigger_static_fault(&mut self, fault: StaticFault) -> u64 {
+        let code = fault.code();
+        let bounded = BoundedFaultReason::Other(BoundedText::new(fault.message()));
+        self.record_latched_fault(FaultKind::Other, LatchedFaultDetail { code, reason: bounded });
+        self.emit_or_queue_fault_log(&bounded, code);
+        if self.can_accept_fault_transition() {
+            self.fault_code = Some(code);
+            let replaced = self.try_replace_state_arc(Arc::clone(&self.static_fault_arcs[fault as usize]));
+            debug_assert!(replaced);
+        }
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        self.epoch_id
+    }
+
+    /// Advance epoch and latch a dynamically formatted fault message completely inline on the RT
+    /// thread (0 heap alloc, 0 heap free) using the pre-sized formatted-message slot pool.
+    pub fn trigger_fault_formatted(
+        &mut self,
+        code: FaultCode,
+        kind: FaultKind,
+        fmt_msg: impl FnOnce(&mut BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
+    ) -> u64 {
+        let mut msg = BoundedText::<SAFETY_LOG_TEXT_CAPACITY>::empty();
+        fmt_msg(&mut msg);
+        let bounded = BoundedFaultReason::Other(msg);
+        self.record_latched_fault(kind, LatchedFaultDetail { code, reason: bounded });
+        self.emit_or_queue_fault_log(&bounded, code);
+        if self.can_accept_fault_transition() {
+            let mut next_arc = None;
+            while self.formatted_fault_arc_pool_len > 0 {
+                self.formatted_fault_arc_pool_len -= 1;
+                if let Some(mut arc) = self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len].take() {
+                    if let Some(SafetyState::Fault(FaultReason::Other(s))) = Arc::get_mut(&mut arc) {
+                        if s.capacity() >= msg.as_str().len() {
+                            s.clear();
+                            s.push_str(msg.as_str());
+                            next_arc = Some(arc);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(arc) = next_arc {
+                self.fault_code = Some(code);
+                let replaced = self.try_replace_state_arc(arc);
+                debug_assert!(replaced);
+            } else if !matches!(*self.state_arc, SafetyState::Fault(_)) {
+                self.fault_code = Some(code);
+                let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
+                debug_assert!(replaced);
+            }
+        }
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        self.epoch_id
     }
 
     /// Advance epoch and latch Fault immediately; the code follows from the reason.

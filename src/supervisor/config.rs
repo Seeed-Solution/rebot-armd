@@ -221,6 +221,7 @@ impl SupervisorInner {
         let tilt = f64::from(self.config.camera_mount.tilt_deg);
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
         self.refresh_effective_floor();
+        self.prepare_workspace_eval_bufs();
     }
 
     /// Install the kinematic correction of the built-in model (calibration apply / restore /

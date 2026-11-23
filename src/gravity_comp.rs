@@ -320,14 +320,14 @@ impl SupervisorInner {
         } else {
             tracing::warn!("Gravity compensation exit: {code} {message}");
         }
-        self.gravity_comp_last_exit = Some(GravityCompExit { code: code.into(), message, at });
+        self.gravity_comp_last_exit = Some(GravityCompExit { code: code.into(), message: message.into(), at });
         self.gravity_comp_write_now();
     }
 
     /// Send this tick's gravity-comp targets immediately (exit paths outside the tick).
     fn gravity_comp_write_now(&mut self) {
         if !self.is_torqued || self.disable_pending { return; }
-        let Some(targets) = self.gravity_comp_targets() else { return; };
+        let Some(targets) = self.gravity_comp_targets_array() else { return; };
         if let Some(d) = &self.driver {
             if let Ok(mut drv) = d.lock() {
                 if let Err(e) = drv.write_joint_targets(&targets) { tracing::error!("Gravity comp hold write failed: {e}"); }
@@ -335,17 +335,25 @@ impl SupervisorInner {
         }
     }
 
+    /// Stack-allocated gravity-comp targets (`ARM` MIT joints + 1 position gripper), 0 heap allocs.
+    pub(crate) fn gravity_comp_targets_array(&self) -> Option<[JointTarget; ARM + 1]> {
+        let run = self.gravity_comp.as_ref()?;
+        Some(std::array::from_fn(|i| {
+            if i < ARM {
+                JointTarget::mit(run.position[i], 0.0, run.kp[i], run.kd[i], run.tau_ff[i])
+            } else {
+                JointTarget {
+                    position: self.commanded_positions[ARM],
+                    velocity: Some(self.commanded_velocities[ARM]),
+                    torque: Some(0.0), kp: None, kd: None,
+                }
+            }
+        }))
+    }
+
     /// Joint targets while the mode is on: MIT for J1-J6, position for the gripper.
     pub fn gravity_comp_targets(&self) -> Option<Vec<JointTarget>> {
-        let run = self.gravity_comp.as_ref()?;
-        let mut targets: Vec<JointTarget> = (0..ARM)
-            .map(|i| JointTarget::mit(run.position[i], 0.0, run.kp[i], run.kd[i], run.tau_ff[i])).collect();
-        targets.push(JointTarget {
-            position: self.commanded_positions[ARM],
-            velocity: Some(self.commanded_velocities[ARM]),
-            torque: Some(0.0), kp: None, kd: None,
-        });
-        Some(targets)
+        self.gravity_comp_targets_array().map(|a| a.to_vec())
     }
 
     fn gravity_comp_exit_cause(&mut self, dt: f64) -> Option<(&'static str, String)> {

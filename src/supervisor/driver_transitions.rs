@@ -1362,8 +1362,7 @@ impl SupervisorInner {
                         self.torque_off_finish().map(|_| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
-                        self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(
-                            "Torque disable has not been confirmed by fresh hardware feedback".into()));
+                        self.safety.trigger_static_fault(crate::safety::StaticFault::DisableUnconfirmed);
                         Err("FEEDBACK_UNCONFIRMED")
                     }
                 };
@@ -1592,10 +1591,12 @@ impl SupervisorInner {
         Ok(state)
     }
 
-    fn measured_workspace_violation_bounded(&self) -> Option<crate::safety::WorkspaceSupportViolation> {
+    fn measured_workspace_violation_bounded(
+        &self,
+        bufs: &mut crate::chain::EvalBufs,
+    ) -> Option<crate::safety::WorkspaceSupportViolation> {
         use crate::safety::{BoundedText, WorkspaceSupportViolation};
         let (ws, cam) = self.workspace_policy()?;
-        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(&self.config.arm_model, ws, cam, self.config.tcp_offset);
         if self.config.arm_model.frames_f32(&self.measured_positions).is_none() {
             return Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new("invalid"),
@@ -1610,18 +1611,30 @@ impl SupervisorInner {
                 reason: BoundedText::new("invalid self_collision_min_clearance_m"),
             });
         }
-        let mut buf = eval.alloc_buf();
-        match eval.eval_into(&self.measured_positions, &mut buf, "clear_fault") {
+        if let Some(cap) = ws.link_capsules.iter().find(|c| self.config.arm_model.resolve_frame(&c.frame).is_none()) {
+            let mut reason = BoundedText::<128>::empty();
+            let _ = core::fmt::write(&mut reason, format_args!("unknown frame '{}' for capsule '{}'", cap.frame, cap.id));
+            return Some(WorkspaceSupportViolation::EvalFailed {
+                limit: BoundedText::new("invalid"),
+                reason,
+            });
+        }
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+            &self.config.arm_model, ws, cam, self.config.tcp_offset, bufs,
+        );
+        let mut buf = eval.alloc_buf_in(bufs);
+        let violation = match eval.eval_into_in(&self.measured_positions, &mut buf, &mut bufs.world_caps, "clear_fault") {
             Err(f) => Some(WorkspaceSupportViolation::EvalFailed {
                 limit: BoundedText::new(&f.limit),
                 reason: BoundedText::new(f.detail.reason.as_deref().unwrap_or("invalid joint positions")),
             }),
-            Ok(()) => {
-                let (slot, &clr) = buf.as_slice().iter().enumerate()
-                    .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)?;
-                Some(describe_workspace_slot_bounded(&eval, ws, cam, self.config.tcp_offset, slot, clr))
-            }
-        }
+            Ok(()) => buf.as_slice().iter().enumerate()
+                .find(|(_, clr)| !clr.is_finite() || **clr < -crate::kinematics::WORKSPACE_EPS)
+                .map(|(slot, &clr)| describe_workspace_slot_bounded(&eval, ws, cam, self.config.tcp_offset, slot, clr)),
+        };
+        crate::chain::WorkspaceEvaluator::recycle_buf(buf, bufs);
+        eval.recycle(bufs);
+        violation
     }
 
     /// Allocation-free bounded equivalent of [`Self::resting_pose_support_violation_with_driver`].
@@ -1629,6 +1642,7 @@ impl SupervisorInner {
         &self,
         drv: Option<&dyn ArmDriver>,
         ages: &[Option<Duration>],
+        bufs: &mut crate::chain::EvalBufs,
     ) -> Option<crate::safety::RestingSupportViolation> {
         use crate::safety::{RestingSupportJointItem as Item, RestingSupportViolation as V, MAX_RESTING_SUPPORT_ITEMS};
         let dof = self.config.dof;
@@ -1688,7 +1702,7 @@ impl SupervisorInner {
                 }
             }
         }
-        let workspace = self.measured_workspace_violation_bounded();
+        let workspace = self.measured_workspace_violation_bounded(bufs);
         (len > 0 || workspace.is_some()).then_some(V::Failures { items, len: len as u8, workspace })
     }
 
@@ -1709,9 +1723,14 @@ impl SupervisorInner {
         let thermal = self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
+            let mut ws_bufs = std::mem::take(&mut self.ws_eval_bufs);
             let mut drv = match d.lock() {
                 Ok(g) => g,
-                Err(_) => { self.scratch.ages = scratch_ages; return Err(E::FeedbackUnavailable); }
+                Err(_) => {
+                    self.scratch.ages = scratch_ages;
+                    self.ws_eval_bufs = ws_bufs;
+                    return Err(E::FeedbackUnavailable);
+                }
             };
             if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
                 && drv.clear_fault_disables_arm_joint(self.config.arm_dof())
@@ -1725,11 +1744,13 @@ impl SupervisorInner {
                 {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
+                    self.ws_eval_bufs = ws_bufs;
                     return Err(E::Rejected(R::FreshFeedbackRequiredForRestingSupport));
                 }
-                if let Some(v) = self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &scratch_ages) {
+                if let Some(v) = self.resting_pose_support_violation_bounded(Some(drv.as_ref()), &scratch_ages, &mut ws_bufs) {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
+                    self.ws_eval_bufs = ws_bufs;
                     return Err(E::Rejected(R::RestingPoseSupport(v)));
                 }
             }
@@ -1738,12 +1759,14 @@ impl SupervisorInner {
                 if now >= deadline {
                     drop(drv);
                     self.scratch.ages = scratch_ages;
+                    self.ws_eval_bufs = ws_bufs;
                     return Err(E::Rejected(R::BudgetExpired));
                 }
                 let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
                 let r = drv.clear_fault_budgeted(drv_deadline);
                 drop(drv);
                 self.scratch.ages = scratch_ages;
+                self.ws_eval_bufs = ws_bufs;
                 if let Err(e) = r { return Err(E::Rejected(R::DriverError(clear_fault_driver_error(&e)))); }
                 return Err(E::Rejected(R::HardwareResetSent));
             }
@@ -1758,6 +1781,7 @@ impl SupervisorInner {
             let any_enabled = drv.has_any_joint_enabled();
             drop(drv);
             self.scratch.ages = scratch_ages;
+            self.ws_eval_bufs = ws_bufs;
             if !self.feedback_numeric_valid || !fb_valid || !ages_valid {
                 return Err(E::Rejected(R::FreshFeedbackRequired));
             }
