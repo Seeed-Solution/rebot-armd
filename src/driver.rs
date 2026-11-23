@@ -254,13 +254,10 @@ pub trait ArmDriver: Send {
 
     /// Bounded target write: distinguishes complete submission ([`TxBatchOutcome::Complete`])
     /// from transient deferral ([`TxBatchOutcome::Deferred`]) without faulting or authorizing
-    /// motion completion on deferral. Default forwards to [`Self::write_joint_targets`].
+    /// motion completion on deferral. Drivers and wrappers that support pending-queue carry-over
+    /// override this method; the default forwards to fail-closed [`Self::write_joint_targets`].
     fn write_joint_targets_bounded(&mut self, targets: &[JointTarget]) -> Result<TxBatchOutcome, ArmDriverError> {
-        match self.write_joint_targets(targets) {
-            Ok(()) => Ok(TxBatchOutcome::Complete),
-            Err(ArmDriverError::TxDeferred { pending }) => Ok(TxBatchOutcome::Deferred { pending }),
-            Err(e) => Err(e),
-        }
+        self.write_joint_targets(targets).map(|()| TxBatchOutcome::Complete)
     }
 
     /// Enable or disable torque / power across all joints
@@ -2510,6 +2507,9 @@ impl PendingTxQueue {
     fn len(&self) -> usize { self.len }
 
     #[inline]
+    fn is_empty(&self) -> bool { self.len == 0 }
+
+    #[inline]
     fn front(&self) -> Option<PendingTxFrame> {
         if self.len > 0 { self.buf[0] } else { None }
     }
@@ -2941,23 +2941,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
-    /// The frames of joint `i`'s target in its confirmed mode (one, or both kinds while its mode
-    /// is unconfirmed), on the stack: the control tick's write does not allocate. A position-force
-    /// joint with an unconfirmed mode gets none (`target_frames_refused` refuses the batch first).
+    /// The frames of joint `i`'s target in its active/confirmed mode (one, or both kinds while its
+    /// mode is unconfirmed), on the stack: the control tick's write does not allocate. Respects
+    /// global `DamiaoControlMode::Mit` directly; a position-force joint with an unconfirmed mode
+    /// gets none (`target_frames_refused` refuses the batch first).
     fn target_frames(&self, i: usize, target: &JointTarget) -> impl Iterator<Item = CanFrame> {
-        let (a, b) = match self.joint_modes[i] {
-            Some(DamiaoControlMode::PosVel) => (Some(self.pos_vel_frame(i, target.position)), None),
-            Some(DamiaoControlMode::Mit) => (Some(self.mit_frame(i, target)), None),
-            Some(DamiaoControlMode::PosForce) => (self.pos_force_frame(i, target), None),
-            None if self.base_mode(i) == DamiaoControlMode::PosForce => (None, None),
-            None => (Some(self.pos_vel_frame(i, target.position)), Some(self.mit_frame(i, target))),
-        };
-        a.into_iter().chain(b)
-    }
-
-    /// Target frames for `write_joint_targets*`: respects global `DamiaoControlMode::Mit` directly
-    /// and otherwise uses per-joint `target_frames`. Stack-only (zero allocation).
-    fn target_frames_for_write(&self, i: usize, target: &JointTarget) -> impl Iterator<Item = CanFrame> {
         let (a, b) = match self.control_mode {
             DamiaoControlMode::Mit => (Some(self.mit_frame(i, target)), None),
             DamiaoControlMode::PosVel | DamiaoControlMode::PosForce => match self.joint_modes[i] {
@@ -3266,6 +3254,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 // replay already-submitted frames.
                 self.discard_pending_tx_stopped();
                 return Err(e.into());
+            }
+        }
+        if !self.pending_tx.is_empty() {
+            if let Err(e) = self.estop_check() {
+                self.discard_pending_tx_stopped();
+                return Err(e);
             }
         }
         if fail_on_stale_drop && dropped_stale_in_pass > 0 {
@@ -4249,6 +4243,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
+        self.discard_pending_tx_stopped();
         let mut err = None;
         for idx in 0..self.motor_ids.len() {
             let frame = damiao::build_clear_faults_frame(self.motor_ids[idx]);
@@ -4349,9 +4344,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             backpressured: false,
         });
 
-        if self.control_mode == DamiaoControlMode::PosVel
-            && (self.mit_fence.is_some() || self.mit_fence_trip.is_some())
-        {
+        if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
             // MIT tracking owns joints: the fence is checked before every transmit; a failed
             // or partial batch (or flush), backpressure, or budget exhaustion trips the group
             // and discards every cached or queued frame.
@@ -4439,7 +4432,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 3. Preflight pending queue capacity before mutating or transmitting.
         let mut new_keys = 0usize;
         for (i, target) in targets.iter().enumerate() {
-            for frame in self.target_frames_for_write(i, target) {
+            for frame in self.target_frames(i, target) {
                 if self.pending_tx.find_key(i, frame.id).is_none() {
                     new_keys += 1;
                 }
@@ -4456,7 +4449,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         //    and timestamp so obsolete commands are never replayed over fresher ones.
         let batch_ts = self.now();
         for (i, target) in targets.iter().enumerate() {
-            for frame in self.target_frames_for_write(i, target) {
+            for frame in self.target_frames(i, target) {
                 let ok = self.pending_tx.upsert(i, frame, batch_ts);
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
@@ -4699,8 +4692,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     Err(_) => false,
                 };
                 self.tick_tx = Some(pass);
-                if recovery_sent && !self.recovery_written_joints.contains(&i) {
-                    self.recovery_written_joints.push(i);
+                if recovery_sent {
+                    self.discard_pending_tx_stopped();
+                    if !self.recovery_written_joints.contains(&i) {
+                        self.recovery_written_joints.push(i);
+                    }
                 }
             }
         }
@@ -4745,6 +4741,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
+        crate::diagnostics::tick::record_tx_deferred(0, self.pending_tx.len() as u32);
         Ok(())
     }
 }

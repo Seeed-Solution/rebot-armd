@@ -61,6 +61,7 @@ struct VirtualBusState {
     flush_error: Option<TxRule>,
     clock: MockClock,
     on_tx: Option<Arc<dyn Fn(usize, &CanFrame) + Send + Sync>>,
+    on_flush: Option<Arc<dyn Fn() + Send + Sync>>,
     tx_attempts: usize,
     /// Optional busy-work loop per transmit to produce nonzero CLOCK_THREAD_CPUTIME_ID on Linux.
     cpu_spin_iters: u64,
@@ -84,6 +85,7 @@ impl VirtualBusState {
             flush_error: None,
             clock,
             on_tx: None,
+            on_flush: None,
             tx_attempts: 0,
             cpu_spin_iters: 0,
         }
@@ -253,7 +255,13 @@ impl CanTransport for VirtualBus {
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
-        let err = self.0.lock().unwrap().flush_error.take();
+        let (err, cb) = {
+            let mut s = self.0.lock().unwrap();
+            (s.flush_error.take(), s.on_flush.clone())
+        };
+        if let Some(cb) = cb {
+            cb();
+        }
         match err {
             None | Some(TxRule::Ok) => Ok(()),
             Some(TxRule::WouldBlock) => Err(TransportError::WouldBlock),
@@ -809,4 +817,60 @@ fn legacy_supervisor_fails_closed_on_backpressured_final_release_batch() {
     let action = inner.last_action.as_ref().unwrap();
     assert_ne!(action.state, "done", "backpressured final release must not report done: {action:?}");
     assert!(inner.releasing, "backpressured final release must not clear releasing flag");
+}
+
+#[test]
+fn wrapper_default_bounded_write_fails_closed_and_flush_estop_drops_pending() {
+    // Part A: ZeroOffsetDriver uses ArmDriver::write_joint_targets_bounded default impl.
+    // Because DamiaoArmDriver::write_joint_targets discards pending frames on TxDeferred,
+    // the default impl must propagate Err(TxDeferred) instead of falsely returning Ok(Deferred).
+    let (mut d, bus, _clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 3, max_duration: ms(5), frame_max_age: ms(45) });
+    let mut wrapped = armd::joint_zero::ZeroOffsetDriver::new(Box::new(d), &[0.0; 7]);
+    reset_tx_metrics();
+    let err = wrapped.write_joint_targets_bounded(&targets_const(0.2)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::TxDeferred { pending: 4 }), "{err:?}");
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.deferred, m.dropped_stopped, m.pending), (3, 4, 4, 0));
+    assert_eq!(bus.with(|s| s.tx_accepted.len()), 3);
+
+    // Part B: E-stop arriving during flush() after partial send + WouldBlock drops remaining pending frames.
+    let (mut d, bus, _) = enabled_driver();
+    let req = Arc::new(AtomicU64::new(0));
+    let app = Arc::new(AtomicU64::new(0));
+    d.set_estop_gate(EstopGate::new(req.clone(), app));
+    let req_hook = req.clone();
+    bus.with(|s| {
+        s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
+        s.tx_script.push_back((TxRule::WouldBlock, Duration::ZERO));
+        s.on_flush = Some(Arc::new(move || {
+            req_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+    });
+    reset_tx_metrics();
+    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "{err:?}");
+    assert_eq!(d.pending_tx_len(), 0, "E-stop during flush must clear pending queue");
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.would_block, m.dropped_stopped, m.pending), (1, 1, 6, 0));
+
+    // Part C: clear_fault() drops pending motion frames; read_joint_states() preserves tx_pending gauge.
+    let (mut d, bus, _clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    reset_tx_metrics();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    let m_rx = take_tx_metrics();
+    assert_eq!(m_rx.pending, 3, "RX-only tick keeps accurate tx_pending gauge");
+    assert_eq!(m_rx.deferred, 0);
+
+    reset_tx_metrics();
+    d.clear_fault().unwrap();
+    assert_eq!(d.pending_tx_len(), 0);
+    let m_cf = take_tx_metrics();
+    assert_eq!((m_cf.dropped_stopped, m_cf.pending), (3, 0));
 }
