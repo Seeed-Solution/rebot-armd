@@ -2844,7 +2844,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::new(),
             range_check: None,
-            recovery_written_joints: Vec::new(),
+            recovery_written_joints: Vec::with_capacity(dof),
             strict_mode_handover: false,
             register_reply_log: Vec::new(),
             clock,
@@ -4412,7 +4412,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
 
     fn take_recovery_writes(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.recovery_written_joints)
+        self.recovery_written_joints.drain(..).collect()
     }
 
     fn set_strict_mode_handover(&mut self, strict: bool) {

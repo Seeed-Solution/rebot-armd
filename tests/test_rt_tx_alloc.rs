@@ -612,3 +612,52 @@ fn supervisor_tick_publish_with_damiao_tx_instrumentation_does_not_allocate() {
     let snap = stats.snapshot();
     assert_eq!(snap.tx.frames_total, 20 * 7, "7 frames per tick over 20 ticks");
 }
+
+#[test]
+fn first_recovery_write_does_not_allocate_or_free() {
+    let limits = b601_limits();
+    let bus = NoAllocDamiaoBus::new(&limits);
+    let clock = bus.clock.clone();
+    let mut driver = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    driver.can_mut().push_all_feedback();
+    driver.read_joint_states().unwrap();
+    driver.set_torque(true).expect("enable");
+    // Drain replies from enable and warm up TX thread-local without triggering recovery.
+    let mut states = Vec::with_capacity(7);
+    let mut recovered = Vec::with_capacity(7);
+    driver.read_joint_states_into(&mut states).unwrap();
+    reset_tx_metrics();
+
+    // First autonomous recovery across all 7 joints (50 ms >= 45 ms recovery threshold, < 100 ms refresh):
+    // recovery_written_joints must be preallocated so pushing all 7 indices does 0 allocs, 0 frees.
+    clock.advance(Duration::from_millis(50));
+    driver.can_mut().rx.clear();
+    let (res, a, f) = counted(|| {
+        driver.read_joint_states_into(&mut states)?;
+        driver.take_recovery_writes_into(&mut recovered);
+        Ok::<(), ArmDriverError>(())
+    });
+    res.unwrap();
+    assert_eq!(recovered, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!((a, f), (0, 0), "first recovery write touched allocator");
+
+    // Owned take_recovery_writes() must preserve capacity so subsequent recoveries stay zero-alloc.
+    clock.advance(Duration::from_millis(50));
+    driver.can_mut().rx.clear();
+    driver.read_joint_states_into(&mut states).unwrap();
+    let taken = driver.take_recovery_writes();
+    assert_eq!(taken, vec![0, 1, 2, 3, 4, 5, 6]);
+
+    clock.advance(Duration::from_millis(50));
+    driver.can_mut().rx.clear();
+    let (res, a, f) = counted(|| {
+        driver.read_joint_states_into(&mut states)?;
+        driver.take_recovery_writes_into(&mut recovered);
+        Ok::<(), ArmDriverError>(())
+    });
+    res.unwrap();
+    assert_eq!(recovered, vec![0, 1, 2, 3, 4, 5, 6]);
+    assert_eq!((a, f), (0, 0), "recovery write after take_recovery_writes() touched allocator");
+}
