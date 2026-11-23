@@ -428,4 +428,12 @@ impl CanTransport for MockCanTransport {
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
 }

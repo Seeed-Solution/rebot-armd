@@ -51,6 +51,7 @@ fn run_until_ended(fx: &mut Fx, max: usize) -> (ActionId, Outcome) {
 
 #[test]
 fn a_prepared_cartesian_path_commits_without_planning_and_runs_to_its_end() {
+    use armd::motion::Reference;
     let (mut fx, mut b) = fixture();
     let path = planned_path(&fx);
     let last = path.last();
@@ -60,11 +61,19 @@ fn a_prepared_cartesian_path_commits_without_planning_and_runs_to_its_end() {
     let r = submit(&mut b, 1, auth(&fx), &slot);
     let rep = fx.step();
     assert!(matches!(rep.command, Some((req, Ok(_))) if req == r), "{rep:?}");
+    let borrows = matches!(
+        fx.core.active_trajectory.as_ref().map(|a| &a.reference),
+        Some(Reference::Path(p)) if p.borrows_plan_slot()
+    );
+    assert!(borrows, "prepared Cartesian path must borrow directly from the pinned plan slot");
+    b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 0, "pinned plan slot must not be reclaimed while Cartesian path runs");
     let action = fx.active().unwrap();
     assert_eq!(fx.core.last_action.as_ref().map(|a| a.kind.as_str()), Some("move_to"));
     assert_eq!(run_until_ended(&mut fx, 400), (action, Outcome::Completed));
     for (c, q) in fx.core.commanded_positions.iter().zip(last) { assert!((c - q).abs() < 1e-3, "{:?} vs {last:?}", fx.core.commanded_positions); }
     let got = { let mut v = Vec::new(); b.poll(|_, r| { v.push(r); true }); v };
+    assert_eq!(b.stats().retired, 1, "pinned plan slot reclaimed after Cartesian path terminal");
     assert!(matches!(got.last(), Some(Reply::Terminal { outcome: Outcome::Completed, .. })), "{got:?}");
 }
 
@@ -147,4 +156,79 @@ fn a_prepared_path_child_of_a_running_macro() {
     // the same child again is stale
     submit(&mut b, 2, auth(&fx), &slot);
     assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
+}
+
+#[test]
+fn a_prepared_replay_borrows_its_plan_slot_until_terminal_retirement() {
+    use armd::motion::Reference;
+    let (mut fx, mut b) = fixture();
+    let tool = tool_digest_hash(&fx.core.config.active_tool.config_digest);
+    submit(&mut b, 1, auth(&fx), &replay_slot(&fx, tool));
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let borrows = matches!(
+        fx.core.active_trajectory.as_ref().map(|a| &a.reference),
+        Some(Reference::Replay(r)) if r.borrows_plan_slot() && r.episode_str() == "ep1" && r.sample_count() == 51
+    );
+    assert!(borrows, "prepared replay must hold a pinned PlanSlotRef rather than copying samples");
+    b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 0, "pinned plan slot must not be reclaimed while replay runs");
+    let action = fx.active().unwrap();
+    assert_eq!(run_until_ended(&mut fx, 400), (action, Outcome::Completed));
+    let mut got = Vec::new();
+    b.poll(|_, r| { got.push(r); true });
+    assert_eq!(b.stats().retired, 1, "pinned plan slot reclaimed after terminal retirement");
+    assert!(got.iter().any(|r| matches!(r, Reply::Terminal { outcome: Outcome::Completed, .. })));
+}
+
+#[test]
+fn a_prepared_path_or_replay_with_stale_boot_or_overtaken_stop_is_refused() {
+    use armd::rt_core::broker::{CommandKind, Descriptor, Stamp};
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::ops::CommitCtx;
+
+    let mut inner = common::sim_at(ArmConfig { collision: None, ..ArmConfig::rebot_dm() }, &INSPECT);
+    for _ in 0..5 { inner.tick(0.02); }
+    let live_boot = BootId::fresh();
+    let stale_boot = BootId::fresh();
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, live_boot, Capacities { commands: 4, plans: 2, replies: 16 });
+    let path = planned_path(&fx);
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
+    let cart_slot = prepare_cartesian_path(&snap, &path, None).unwrap();
+    let tool = tool_digest_hash(&fx.core.config.active_tool.config_digest);
+    let rep_slot = replay_slot(&fx, tool);
+
+    // Overtaken stop refuses queued prepared Cartesian path and prepared Replay.
+    let pre_stop_auth = auth(&fx);
+    submit(&mut b, 1, pre_stop_auth, &cart_slot);
+    submit(&mut b, 2, pre_stop_auth, &rep_slot);
+    stop.request();
+    assert_eq!(fx.step().command.unwrap().1, Err("STOPPED"));
+    assert_eq!(fx.step().command.unwrap().1, Err("STOPPED"));
+    assert!(fx.core.active_trajectory.is_none());
+
+    // Stale boot id and zero boot id are refused fail-closed on commit_prepared_slot.
+    let (mut pw, mut pr) = armd::rt_core::broker::plan_slots(2, PlanSlot::default);
+    let hc = pw.stage(|s| s.copy_from(&cart_slot).unwrap()).unwrap();
+    let hr = pw.stage(|s| s.copy_from(&rep_slot).unwrap()).unwrap();
+    let ctx = CommitCtx { arm: ArmId::LOCAL, boot: live_boot, now: fx.now(), stop_generation: stop.current() };
+    let cur_auth = auth(&fx);
+    let make_desc = |boot: BootId, plan| Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot,
+            request: RequestId(99),
+            client: ClientId(1),
+            client_seq: 1,
+            authority: cur_auth,
+            deadline: later(),
+        },
+        kind: CommandKind::Install { plan },
+    };
+    assert_eq!(fx.core.commit_prepared_slot(&make_desc(stale_boot, hc), pr.pin(hc).unwrap(), &ctx), Err("WRONG_TARGET"));
+    assert_eq!(fx.core.commit_prepared_slot(&make_desc(BootId(0), hc), pr.pin(hc).unwrap(), &ctx), Err("WRONG_TARGET"));
+    assert_eq!(fx.core.commit_prepared_slot(&make_desc(stale_boot, hr), pr.pin(hr).unwrap(), &ctx), Err("WRONG_TARGET"));
+    assert_eq!(fx.core.commit_prepared_slot(&make_desc(BootId(0), hr), pr.pin(hr).unwrap(), &ctx), Err("WRONG_TARGET"));
+    assert!(fx.core.active_trajectory.is_none());
+    assert!(pr.retire(hc) && pr.retire(hr));
+    assert_eq!(pw.reclaim(), 2, "refused commits must not leak plan slot pins");
 }

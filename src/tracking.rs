@@ -117,7 +117,7 @@ impl JointTrackingConfig {
     /// Tracking is enabled and at least one joint selects `mit` (each such joint carries the
     /// MIT-only keys `hold_kp` / `hold_kd`, so no Phase 1 profile can request it).
     pub fn mit_requested(&self) -> bool {
-        self.enabled && !self.mit_joint_slots().is_empty()
+        self.enabled && self.joints.iter().any(|j| j.strategy == TrackingStrategy::Mit)
     }
 
     /// Validate schema invariants. `position` and `position_lead` as in Phase 1. `mit` (Phase 2,
@@ -334,6 +334,11 @@ pub struct TrackingRuntime {
     /// Ticks whose issued output was the lead withdrawal after the lead candidate failed
     /// validation (`TrackingOutput::withdrawn`); diagnostics only.
     pub withdrawal_ticks: u64,
+    /// Preallocated spare buffers returned on [`Self::invalidate`] and reused by [`Self::seed`]
+    /// so PositionLead enable completion on RT wakes never allocates or frees.
+    spare_issued_positions: Option<Vec<f32>>,
+    spare_issued_velocities: Option<Vec<f32>>,
+    spare_nominal: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 /// Rejection-fallback braking ramp state (`TrackingRuntime::fallback_ramp`).
@@ -365,13 +370,50 @@ pub struct PendingFallback {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl TrackingRuntime {
+    /// Preallocate spare output-history vectors for `dof` joints so RT enable completion
+    /// (`seed`) and `invalidate` reuse buffers with zero heap allocation or drop.
+    pub fn with_capacity(dof: usize) -> Self {
+        Self {
+            spare_issued_positions: Some(Vec::with_capacity(dof)),
+            spare_issued_velocities: Some(Vec::with_capacity(dof)),
+            spare_nominal: Some((Vec::with_capacity(dof), Vec::with_capacity(dof))),
+            ..Self::default()
+        }
+    }
+
     /// Seed output history from fresh measurements as a confirmed stationary baseline.
     pub fn seed(&mut self, positions: &[f32]) {
         if positions.iter().all(|q| q.is_finite()) {
             self.history_state = TrackingHistoryState::Stationary;
-            self.last_issued_positions = Some(positions.to_vec());
-            self.last_issued_velocities = Some(vec![0.0; positions.len()]);
-            self.last_nominal = Some((positions.to_vec(), vec![0.0; positions.len()]));
+            let mut pos_buf = self
+                .last_issued_positions
+                .take()
+                .or_else(|| self.spare_issued_positions.take())
+                .unwrap_or_else(|| Vec::with_capacity(positions.len()));
+            pos_buf.clear();
+            pos_buf.extend_from_slice(positions);
+            self.last_issued_positions = Some(pos_buf);
+
+            let mut vel_buf = self
+                .last_issued_velocities
+                .take()
+                .or_else(|| self.spare_issued_velocities.take())
+                .unwrap_or_else(|| Vec::with_capacity(positions.len()));
+            vel_buf.clear();
+            vel_buf.resize(positions.len(), 0.0);
+            self.last_issued_velocities = Some(vel_buf);
+
+            let (mut nom_q, mut nom_v) = self
+                .last_nominal
+                .take()
+                .or_else(|| self.spare_nominal.take())
+                .unwrap_or_else(|| (Vec::with_capacity(positions.len()), Vec::with_capacity(positions.len())));
+            nom_q.clear();
+            nom_q.extend_from_slice(positions);
+            nom_v.clear();
+            nom_v.resize(positions.len(), 0.0);
+            self.last_nominal = Some((nom_q, nom_v));
+
             self.ws_min_depths = None;
             self.ws_keepout_min_depths = None;
             self.recovery_suspended = false;
@@ -490,9 +532,21 @@ impl TrackingRuntime {
     /// Invalidate output history (partial writes, suspension, holds/faults, mode changes).
     pub fn invalidate(&mut self) {
         self.history_state = TrackingHistoryState::Unknown;
-        self.last_issued_positions = None;
-        self.last_issued_velocities = None;
-        self.last_nominal = None;
+        if let Some(v) = self.last_issued_positions.take() {
+            if self.spare_issued_positions.is_none() {
+                self.spare_issued_positions = Some(v);
+            }
+        }
+        if let Some(v) = self.last_issued_velocities.take() {
+            if self.spare_issued_velocities.is_none() {
+                self.spare_issued_velocities = Some(v);
+            }
+        }
+        if let Some(pair) = self.last_nominal.take() {
+            if self.spare_nominal.is_none() {
+                self.spare_nominal = Some(pair);
+            }
+        }
         self.ws_min_depths = None;
         self.ws_keepout_min_depths = None;
         self.fallback_ramp = None;

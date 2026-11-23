@@ -173,6 +173,14 @@ impl CanTransport for SocketCanTransport {
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
 }
 
 /// Map a Linux SocketCAN transmit `io::Error` without heap allocation on any outcome
@@ -239,5 +247,13 @@ impl CanTransport for SocketCanTransport {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
     }
 }

@@ -7,16 +7,18 @@
 //! enable handshake (80 ms enable, 25 ms disable), for the simulator to confirm.
 //!
 //! Wire protocol (version 1), one JSON object per UDP datagram:
-//! - armd -> sim `{"v":1,"type":"cmd","seq":N,"enable":bool,"targets":[...]|null}`;
+//! - armd -> sim `{"v":1,"type":"cmd","seq":N,"enable":bool|null,"targets":[...]|null}`;
 //!   a target is `{"mode":"pos_vel","q":rad,"vlim":rad/s}` or
 //!   `{"mode":"mit","q":rad,"dq":rad/s,"kp":Nm/rad,"kd":Nm·s/rad,"tau":Nm}`.
-//!   `targets: null` (enable / disable / keep-alive) leaves the motor targets unchanged.
+//!   `enable` is explicit (`true`/`false`) only on enable/disable commands (`targets: null`);
+//!   target packets omit `enable` so they preserve the simulator's current torque state and can
+//!   never energize a disabled or restarted peer under E-stop.
 //! - sim -> armd `{"v":1,"type":"state","session":u64,"seq":N,"ack":N,"enabled":bool,
 //!   "q":[..],"dq":[..],"tau":[..],"temp":[..],"t":s}` with one entry per joint.
 //!   `ack` is the highest command `seq` applied; `session` changes when the simulator restarts.
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -51,7 +53,8 @@ pub struct SimCommand {
     #[serde(rename = "type")]
     pub kind: String,
     pub seq: u64,
-    pub enable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
     pub targets: Option<Vec<SimTarget>>,
 }
 
@@ -95,7 +98,31 @@ pub fn parse_state(bytes: &[u8], dof: usize) -> Option<SimState> {
 struct Shared {
     latest: Option<SimState>,
     received_at: Option<Instant>,
-    rejected: u64,
+}
+
+/// Opaque test handle allowing another thread to hold `SimArmDriver`'s internal RX mutex
+/// to verify that RT releases never block behind `armd-sim-rx`.
+#[doc(hidden)]
+pub struct SimRxLockHandle(Arc<Mutex<Shared>>);
+
+#[doc(hidden)]
+impl SimRxLockHandle {
+    pub fn lock(&self) -> impl Drop + '_ {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Opaque test guard simulating `armd-sim-rx` paused inside its keepalive send window,
+/// verifying that `set_rt_mode(true)` sleeps on the condvar rather than busy-yielding.
+#[doc(hidden)]
+pub struct SimRxKeepaliveGuard(Arc<(Mutex<bool>, Condvar)>);
+
+impl Drop for SimRxKeepaliveGuard {
+    fn drop(&mut self) {
+        let mut active = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        *active = false;
+        self.0 .1.notify_all();
+    }
 }
 
 /// Datagrams not sent because the socket buffer was full (non-blocking send).
@@ -113,11 +140,38 @@ fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
     }
 }
 
+#[derive(Serialize)]
+struct SimCommandRef<'a> {
+    v: u32,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable: Option<bool>,
+    targets: Option<&'a [SimTarget]>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendGate {
+    /// Target write: inhibited while an unapplied urgent E-stop is pending (an applied E-stop
+    /// still holds position with active torque).
+    Target,
+    /// Enable command: inhibited whenever E-stop is latched or pending.
+    Enable,
+    /// Disable command: never inhibited by E-stop.
+    Disable,
+}
+
 pub struct SimArmDriver {
     socket: UdpSocket,
     dof: usize,
     shared: Arc<Mutex<Shared>>,
+    rejected: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    rt_mode: Arc<AtomicBool>,
+    rx_keepalive_sync: Arc<(Mutex<bool>, Condvar)>,
+    rx_keepalives_sent: Arc<AtomicU64>,
+    owner_keepalives_sent: u64,
     last_send_ms: Arc<AtomicU64>,
     epoch: Instant,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -129,12 +183,28 @@ pub struct SimArmDriver {
     cached: Vec<JointState>,
     cached_loads: Vec<f32>,
     cached_torques: Vec<f32>,
+    /// Owner-local coherent metadata updated from non-blocking `try_lock()` in RT mode.
+    cached_ack: u64,
+    cached_enabled: bool,
+    cached_received_at: Option<Instant>,
+    cached_has_state: bool,
+    /// Preallocated outbound target scratch, JSON serialization buffer, and RT poll keepalive (0 alloc).
+    cmd_targets: Vec<SimTarget>,
+    tx_buf: Vec<u8>,
+    keepalive_bytes: Vec<u8>,
     load_only_feedback: bool,
     /// Simulated encoder zero (raw simulator angle of each joint's zero); None = the
     /// simulator's own zero. Set by `set_zero_position`, lost when armd restarts.
     zero_offsets: Option<Vec<f32>>,
     /// Pending torque transition: requested state and the deadline of its acknowledgement.
     torque_hs: Option<(bool, Deadline)>,
+    /// Physical E-stop latch inhibiting any new enable command.
+    abort_flag: Option<Arc<AtomicBool>>,
+    /// Pending-E-stop gate checked immediately before target and enable sends.
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
+    /// immediately before the final E-stop send gate and socket transmit.
+    before_send_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SimArmDriver {
@@ -146,25 +216,70 @@ impl SimArmDriver {
         socket.connect(peer)?;
         socket.set_read_timeout(Some(Duration::from_millis(10)))?;
         let shared = Arc::new(Mutex::new(Shared::default()));
+        let rejected = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let rt_mode = Arc::new(AtomicBool::new(false));
+        let rx_keepalive_sync = Arc::new((Mutex::new(false), Condvar::new()));
+        let rx_keepalives_sent = Arc::new(AtomicU64::new(0));
         let last_send_ms = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
+        let keepalive_bytes = serde_json::to_vec(&SimCommand {
+            v: PROTOCOL_VERSION,
+            kind: "poll".into(),
+            seq: 0,
+            enable: None,
+            targets: None,
+        })
+        .expect("serialisable");
         let thread = {
-            let (socket, shared, stop, last_send_ms) = (socket.try_clone()?, shared.clone(), stop.clone(), last_send_ms.clone());
+            let (socket, shared, rejected, stop, rt_mode, rx_keepalive_sync, rx_keepalives_sent, last_send_ms, keepalive) = (
+                socket.try_clone()?,
+                shared.clone(),
+                rejected.clone(),
+                stop.clone(),
+                rt_mode.clone(),
+                rx_keepalive_sync.clone(),
+                rx_keepalives_sent.clone(),
+                last_send_ms.clone(),
+                keepalive_bytes.clone(),
+            );
             std::thread::Builder::new().name("armd-sim-rx".into()).spawn(move || {
-                receiver_loop(socket, dof, shared, stop, last_send_ms, epoch)
+                receiver_loop(
+                    socket,
+                    dof,
+                    shared,
+                    rejected,
+                    stop,
+                    rt_mode,
+                    rx_keepalive_sync,
+                    rx_keepalives_sent,
+                    last_send_ms,
+                    epoch,
+                    keepalive,
+                )
             })?
         };
         Ok(Self {
-            socket, dof, shared, stop, last_send_ms, epoch, thread: Some(thread),
+            socket, dof, shared, rejected, stop, rt_mode, rx_keepalive_sync, rx_keepalives_sent,
+            owner_keepalives_sent: 0, last_send_ms, epoch, thread: Some(thread),
             seq: 0, enable_requested: false, enable_seq: 0,
             modes: vec![JointMode::Position; dof],
             cached: vec![JointState::default(); dof],
             cached_loads: vec![0.0; dof],
             cached_torques: vec![0.0; dof],
+            cached_ack: 0,
+            cached_enabled: false,
+            cached_received_at: None,
+            cached_has_state: false,
+            cmd_targets: Vec::with_capacity(dof),
+            tx_buf: Vec::with_capacity(1024),
+            keepalive_bytes,
             load_only_feedback: false,
             zero_offsets: None,
             torque_hs: None,
+            abort_flag: None,
+            estop_gate: None,
+            before_send_hook: None,
         })
     }
 
@@ -173,8 +288,42 @@ impl SimArmDriver {
         self
     }
 
-    /// Datagrams dropped as malformed, out of order or for the wrong joint count.
-    pub fn rejected_datagrams(&self) -> u64 { self.shared.lock().map_or(0, |s| s.rejected) }
+    /// Installs a deterministic test hook invoked inside `send_ref` right after serialization and
+    /// immediately before the final E-stop send gate + `send_nonblocking`.
+    #[doc(hidden)]
+    pub fn set_before_send_hook(&mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.before_send_hook = hook;
+    }
+
+    /// Count of keepalive polls transmitted by the background `armd-sim-rx` thread (must remain
+    /// constant after RT ownership transfer via `set_rt_mode(true)`).
+    pub fn rx_keepalives_sent(&self) -> u64 { self.rx_keepalives_sent.load(Ordering::Acquire) }
+
+    /// Shared handle to the `armd-sim-rx` keepalive counter for external single-writer audits.
+    pub fn rx_keepalives_counter(&self) -> Arc<AtomicU64> { Arc::clone(&self.rx_keepalives_sent) }
+
+    /// Count of keepalive polls transmitted by the RT owner thread.
+    pub fn owner_keepalives_sent(&self) -> u64 { self.owner_keepalives_sent }
+
+    /// Test helper: cloneable handle to the internal RX shared mutex so another thread can hold
+    /// it while RT releases execute (proving strictly non-blocking RT reads).
+    #[doc(hidden)]
+    pub fn test_rx_lock_handle(&self) -> SimRxLockHandle {
+        SimRxLockHandle(Arc::clone(&self.shared))
+    }
+
+    /// Test helper: mark the RX keepalive handshake active until the returned guard drops, so tests
+    /// can verify `set_rt_mode(true)` waits cleanly on the condvar without spinning.
+    #[doc(hidden)]
+    pub fn test_hold_rx_keepalive(&self) -> SimRxKeepaliveGuard {
+        let mut active = self.rx_keepalive_sync.0.lock().unwrap_or_else(|e| e.into_inner());
+        *active = true;
+        drop(active);
+        SimRxKeepaliveGuard(Arc::clone(&self.rx_keepalive_sync))
+    }
+
+    /// Datagrams dropped as malformed, out of order or for the wrong joint count (lock-free).
+    pub fn rejected_datagrams(&self) -> u64 { self.rejected.load(Ordering::Relaxed) }
 
     /// Commands dropped because the send buffer was full (all sim drivers of the process).
     pub fn dropped_sends() -> u64 { SEND_DROPS.load(Ordering::Relaxed) }
@@ -193,25 +342,136 @@ impl SimArmDriver {
         }
     }
 
-    fn send(&mut self, targets: Option<Vec<SimTarget>>) -> u64 {
-        self.seq += 1;
-        let cmd = SimCommand { v: PROTOCOL_VERSION, kind: "cmd".into(), seq: self.seq, enable: self.enable_requested, targets };
-        if let Ok(bytes) = serde_json::to_vec(&cmd) {
+    /// Err([`ArmDriverError::EstopInhibited`]) while an E-stop request is pending and not yet
+    /// applied by the release (once applied, E-stop holds position with active torque).
+    fn estop_check(&self) -> Result<(), ArmDriverError> {
+        if self.estop_gate.as_ref().is_some_and(|g| g.pending()) {
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        Ok(())
+    }
+
+    /// Aborts an enable attempt if E-stop is latched or an urgent stop is pending.
+    fn enable_estop_inhibited(&mut self) -> Result<(), ArmDriverError> {
+        let latched = self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+        let pending = self.estop_gate.as_ref().is_some_and(|g| g.pending());
+        if latched || pending {
+            if matches!(self.torque_hs, Some((true, _))) {
+                self.torque_hs = None;
+            }
+            self.enable_requested = false;
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        Ok(())
+    }
+
+    fn send_ref(&mut self, with_targets: bool, enable: Option<bool>, gate: SendGate) -> Result<u64, ArmDriverError> {
+        let next_seq = self.seq + 1;
+        let cmd = SimCommandRef {
+            v: PROTOCOL_VERSION,
+            kind: "cmd",
+            seq: next_seq,
+            enable,
+            targets: with_targets.then_some(self.cmd_targets.as_slice()),
+        };
+        self.tx_buf.clear();
+        let serialized = serde_json::to_writer(&mut self.tx_buf, &cmd).is_ok();
+        if let Some(hook) = self.before_send_hook.as_ref() {
+            hook();
+        }
+        // Final pending-E-stop gate right before the socket send.
+        match gate {
+            SendGate::Target => self.estop_check()?,
+            SendGate::Enable => self.enable_estop_inhibited()?,
+            SendGate::Disable => {}
+        }
+        self.seq = next_seq;
+        if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
-            send_nonblocking(&self.socket, &bytes);
+            send_nonblocking(&self.socket, &self.tx_buf);
             self.last_send_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
-        self.seq
+        Ok(self.seq)
+    }
+
+    /// In RT mode, the single RT owner transmits keepalive polls on idle periods instead of
+    /// `armd-sim-rx`, preserving the single transport-writer invariant.
+    fn maybe_send_owner_keepalive(&mut self) {
+        if !self.rt_mode.load(Ordering::Relaxed) {
+            return;
+        }
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        if now_ms.saturating_sub(self.last_send_ms.load(Ordering::Relaxed)) >= KEEPALIVE.as_millis() as u64 {
+            send_nonblocking(&self.socket, &self.keepalive_bytes);
+            self.last_send_ms.store(now_ms, Ordering::Relaxed);
+            self.owner_keepalives_sent += 1;
+        }
+    }
+
+    /// Refreshes the owner-local coherent snapshot from the receiver cache. In RT mode uses
+    /// strictly non-blocking `try_lock()`, retaining the last coherent snapshot if contended.
+    fn refresh_from_rx(&mut self) {
+        let guard = if self.rt_mode.load(Ordering::Relaxed) {
+            self.shared.try_lock().ok()
+        } else {
+            self.shared.lock().ok()
+        };
+        if let Some(s) = guard {
+            if let Some(ref state) = s.latest {
+                self.cached_ack = state.ack;
+                self.cached_enabled = state.enabled;
+                self.cached_received_at = s.received_at;
+                self.cached_has_state = true;
+                self.cached_torques.clear();
+                self.cached_torques.extend_from_slice(&state.tau);
+                if self.load_only_feedback {
+                    self.cached_loads.clear();
+                    if let Some(ref loads) = state.loads {
+                        if loads.len() == self.dof {
+                            self.cached_loads.extend(loads.iter().map(|&l| l.clamp(-1.0, 1.0)));
+                        } else {
+                            self.cached_loads.extend(state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)));
+                        }
+                    } else {
+                        self.cached_loads.extend(state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)));
+                    }
+                }
+                let off = self.zero_offsets.as_deref();
+                for (i, js) in self.cached.iter_mut().enumerate() {
+                    *js = JointState {
+                        position: off.map_or(state.q[i], |o| state.q[i] - o[i]),
+                        velocity: state.dq[i],
+                        torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
+                        temperature: state.temp[i],
+                    };
+                }
+            }
+        }
+    }
+
+    /// Coherent `(Option<(ack, enabled)>, received_at)` without blocking in RT mode (reads
+    /// owner-local cached metadata populated by `refresh_from_rx`).
+    fn rx_metadata(&self) -> (Option<(u64, bool)>, Option<Instant>) {
+        if self.rt_mode.load(Ordering::Relaxed) {
+            let st = self.cached_has_state.then_some((self.cached_ack, self.cached_enabled));
+            return (st, self.cached_received_at);
+        }
+        let Ok(s) = self.shared.lock() else { return (None, None); };
+        (s.latest.as_ref().map(|st| (st.ack, st.enabled)), s.received_at)
     }
 
     fn snapshot(&self) -> (Option<SimState>, Option<Duration>) {
         self.shared.lock().map_or((None, None), |s| (s.latest.clone(), s.received_at.map(|t| t.elapsed())))
     }
 
-    /// The simulator applied command `seq` and reports `enabled` in fresh feedback.
+    /// The simulator applied command `seq` and reports `enabled` in fresh feedback (no allocation,
+    /// no blocking lock in RT mode).
     fn acked(&self, seq: u64, enabled: bool) -> bool {
-        matches!(self.snapshot(), (Some(state), Some(age)) if state.ack >= seq && state.enabled == enabled && age <= SIM_FEEDBACK_STALE)
+        matches!(
+            self.rx_metadata(),
+            (Some((ack, en)), Some(rx)) if ack >= seq && en == enabled && rx.elapsed() <= SIM_FEEDBACK_STALE
+        )
     }
 }
 
@@ -228,33 +488,65 @@ fn resolve(addr: &str) -> std::io::Result<SocketAddr> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("cannot resolve {addr}")))
 }
 
-fn receiver_loop(socket: UdpSocket, dof: usize, shared: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, last_send_ms: Arc<AtomicU64>, epoch: Instant) {
+#[allow(clippy::too_many_arguments)]
+fn receiver_loop(
+    socket: UdpSocket,
+    dof: usize,
+    shared: Arc<Mutex<Shared>>,
+    rejected: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    rt_mode: Arc<AtomicBool>,
+    rx_keepalive_sync: Arc<(Mutex<bool>, Condvar)>,
+    rx_keepalives_sent: Arc<AtomicU64>,
+    last_send_ms: Arc<AtomicU64>,
+    epoch: Instant,
+    keepalive: Vec<u8>,
+) {
     let mut buf = [0u8; 4096];
-    let keepalive = serde_json::to_vec(&SimCommand { v: PROTOCOL_VERSION, kind: "poll".into(), seq: 0, enable: false, targets: None })
-        .expect("serialisable");
     while !stop.load(Ordering::SeqCst) {
-        let now_ms = epoch.elapsed().as_millis() as u64;
-        if now_ms.saturating_sub(last_send_ms.load(Ordering::Relaxed)) >= KEEPALIVE.as_millis() as u64 {
-            send_nonblocking(&socket, &keepalive);
-            last_send_ms.store(now_ms, Ordering::Relaxed);
+        if !rt_mode.load(Ordering::Acquire) {
+            let now_ms = epoch.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(last_send_ms.load(Ordering::Relaxed)) >= KEEPALIVE.as_millis() as u64 {
+                {
+                    let mut active = rx_keepalive_sync.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *active = true;
+                }
+                if !rt_mode.load(Ordering::SeqCst) {
+                    send_nonblocking(&socket, &keepalive);
+                    last_send_ms.store(now_ms, Ordering::Relaxed);
+                    rx_keepalives_sent.fetch_add(1, Ordering::Relaxed);
+                }
+                {
+                    let mut active = rx_keepalive_sync.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *active = false;
+                    rx_keepalive_sync.1.notify_all();
+                }
+            }
         }
         let n = match socket.recv(&mut buf) {
             Ok(n) => n,
             // Timeout, or ECONNREFUSED while no simulator listens: keep polling.
             Err(_) => continue,
         };
-        // parse outside the lock; the lock only guards the swap
+        // Parse and drop replaced heap state strictly outside the lock; the lock only guards the swap.
         let parsed = parse_state(&buf[..n], dof);
-        let Ok(mut s) = shared.lock() else { return };
-        match parsed {
-            // Same session: drop duplicates and reordered datagrams. A new session
-            // (simulator restart) starts a new sequence.
-            Some(state) if s.latest.as_ref().is_none_or(|l| l.session != state.session || state.seq > l.seq) => {
-                s.latest = Some(state);
-                s.received_at = Some(Instant::now());
+        let displaced = {
+            let Ok(mut s) = shared.lock() else { return };
+            match parsed {
+                // Same session: drop duplicates and reordered datagrams. A new session
+                // (simulator restart) starts a new sequence.
+                Some(state) if s.latest.as_ref().is_none_or(|l| l.session != state.session || state.seq > l.seq) => {
+                    let prev = s.latest.replace(state);
+                    s.received_at = Some(Instant::now());
+                    prev
+                }
+                _ => {
+                    rejected.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
             }
-            _ => s.rejected += 1,
-        }
+        };
+        drop(displaced);
     }
 }
 
@@ -284,21 +576,91 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn enable_state(&self) -> EnableState {
-        match self.snapshot() {
-            (Some(state), Some(age)) if age <= SIM_FEEDBACK_STALE && state.ack >= self.enable_seq => {
-                if state.enabled { EnableState::Enabled } else { EnableState::Disabled }
+        match self.rx_metadata() {
+            (Some((ack, enabled)), Some(rx)) if rx.elapsed() <= SIM_FEEDBACK_STALE && ack >= self.enable_seq => {
+                if enabled { EnableState::Enabled } else { EnableState::Disabled }
             }
             _ => EnableState::Unknown,
         }
     }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
-        vec![self.snapshot().1; self.dof]
+        let age = self.rx_metadata().1.map(|t| t.elapsed());
+        vec![age; self.dof]
+    }
+
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        if dof != self.dof { return false; }
+        self.rx_metadata().1.map(|t| t.elapsed()).is_some_and(|age| age <= max_age)
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        let age = self.rx_metadata().1.map(|t| t.elapsed());
+        out.clear();
+        out.resize(self.dof, age);
+    }
+
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        let age_ms = self
+            .rx_metadata()
+            .1
+            .map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        out.clear();
+        out.resize(self.dof, age_ms);
+    }
+
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let rx = self.rx_metadata().1;
+        out.clear();
+        out.resize(self.dof, rx);
     }
 
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
-        let rx = self.shared.lock().ok().and_then(|s| s.received_at);
+        let rx = self.rx_metadata().1;
         vec![rx; self.dof]
+    }
+
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+        let rx = self.rx_metadata().1;
+        out.clear();
+        out.resize(self.dof, rx);
+    }
+
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+    }
+
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) {
+        out.clear();
+    }
+
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
+    }
+
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
+        out.clear();
+        if self.load_only_feedback {
+            out.extend_from_slice(&self.cached_loads);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        match self.enable_state() {
+            EnableState::Enabled => {
+                out.resize(self.dof, 1);
+                true
+            }
+            EnableState::Disabled => {
+                out.resize(self.dof, 0);
+                true
+            }
+            EnableState::Unknown => false,
+        }
     }
 
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
@@ -306,30 +668,32 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        if let (Some(state), _) = self.snapshot() {
-            self.cached_torques = state.tau.clone();
-            if self.load_only_feedback {
-                if let Some(ref loads) = state.loads {
-                    if loads.len() == self.dof {
-                        self.cached_loads = loads.iter().map(|&l| l.clamp(-1.0, 1.0)).collect();
-                    } else {
-                        self.cached_loads = state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)).collect();
-                    }
-                } else {
-                    self.cached_loads = state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)).collect();
-                }
-            }
-            let off = self.zero_offsets.as_deref();
-            for (i, js) in self.cached.iter_mut().enumerate() {
-                *js = JointState {
-                    position: off.map_or(state.q[i], |o| state.q[i] - o[i]),
-                    velocity: state.dq[i],
-                    torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
-                    temperature: state.temp[i],
-                };
-            }
-        }
-        Ok(self.cached.clone())
+        let mut out = Vec::with_capacity(self.dof);
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        self.refresh_from_rx();
+        out.clear();
+        out.extend_from_slice(&self.cached);
+        Ok(())
+    }
+
+    fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _deadline: Instant, _max_rx_frames: u16) -> Result<(u16, bool), ArmDriverError> {
+        self.maybe_send_owner_keepalive();
+        self.read_joint_states_into(out)?;
+        Ok((0, false))
+    }
+
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        out.clear();
+        out.extend_from_slice(&self.cached);
+        Some(())
+    }
+
+    fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
+        Ok(())
     }
 
     fn joint_loads(&self) -> Option<Vec<f32>> {
@@ -347,8 +711,10 @@ impl ArmDriver for SimArmDriver {
         if targets.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
         }
+        self.estop_check()?;
         let off = self.zero_offsets.as_deref();
-        let wire = targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| match mode {
+        self.cmd_targets.clear();
+        self.cmd_targets.extend(targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| match mode {
             JointMode::Position => SimTarget::PosVel { q: off.map_or(t.position, |o| t.position + o[i]), vlim: POS_VEL_VLIM },
             JointMode::Mit => SimTarget::Mit {
                 q: off.map_or(t.position, |o| t.position + o[i]),
@@ -357,8 +723,10 @@ impl ArmDriver for SimArmDriver {
                 kd: t.kd.unwrap_or(0.0),
                 tau: t.torque.filter(|v| v.is_finite()).unwrap_or(0.0),
             },
-        }).collect();
-        self.send(Some(wire));
+        }));
+        // Target packets omit `enable` so they preserve the peer's torque state; torque changes
+        // go exclusively through explicit enable/disable commands (`begin_torque`).
+        self.send_ref(true, None, SendGate::Target)?;
         Ok(())
     }
 
@@ -383,8 +751,13 @@ impl ArmDriver for SimArmDriver {
         if enabled && self.torque_hs.is_some() {
             return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
         }
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
+        let gate = if enabled { SendGate::Enable } else { SendGate::Disable };
+        let seq = self.send_ref(false, Some(enabled), gate)?;
         self.enable_requested = enabled;
-        self.enable_seq = self.send(None);
+        self.enable_seq = seq;
         let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
         let now = Instant::now();
         self.torque_hs = Some((enabled, Deadline::after(now, timeout)));
@@ -396,6 +769,14 @@ impl ArmDriver for SimArmDriver {
         let Some((enabled, deadline)) = self.torque_hs else {
             return Err(ArmDriverError::Protocol("no torque transition pending".into()));
         };
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
+        self.maybe_send_owner_keepalive();
+        self.refresh_from_rx();
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
         // the acknowledgement is checked before the deadline (an ack seen at the deadline counts)
         let outcome = if self.acked(self.enable_seq, enabled) {
             TorqueOutcome::Confirmed
@@ -415,8 +796,35 @@ impl ArmDriver for SimArmDriver {
 
     fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
 
+    fn abort_enable(&mut self) {
+        if matches!(self.torque_hs, Some((true, _))) {
+            self.torque_hs = None;
+            self.enable_requested = false;
+        }
+    }
+
+    fn supports_rt_executor(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+
+    fn set_rt_mode(&mut self, rt: bool) {
+        self.rt_mode.store(rt, Ordering::SeqCst);
+        if rt {
+            // Sleep on the condvar (never busy-yield, avoiding single-CPU SCHED_FIFO priority
+            // inversion) until any in-flight `armd-sim-rx` keepalive finishes.
+            let mut active = self.rx_keepalive_sync.0.lock().unwrap_or_else(|e| e.into_inner());
+            while *active {
+                active = self.rx_keepalive_sync.1.wait(active).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(active);
+            self.refresh_from_rx();
+        }
+    }
+
     fn is_feedback_valid(&self) -> bool {
-        self.snapshot().1.is_some_and(|age| age <= SIM_FEEDBACK_STALE)
+        self.rx_metadata()
+            .1
+            .is_some_and(|rx| rx.elapsed() <= SIM_FEEDBACK_STALE)
     }
 
     fn is_enabled(&self) -> bool {
@@ -433,6 +841,10 @@ impl ArmDriver for SimArmDriver {
 
     fn set_torque_flag(&mut self, enabled: bool) { self.enable_requested = enabled; }
 
+    fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
+
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+
     fn supports_mit_mode_switch(&self) -> bool { true }
 
     /// The simulator switches a joint's control law with the next command, so the
@@ -441,8 +853,14 @@ impl ArmDriver for SimArmDriver {
         if modes.len() != self.dof || hold.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: modes.len().min(hold.len()) });
         }
+        self.estop_check()?;
+        let prev = self.modes.clone();
         self.modes.copy_from_slice(modes);
-        self.write_joint_targets(hold)
+        if let Err(e) = self.write_joint_targets(hold) {
+            self.modes = prev;
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {
@@ -569,7 +987,8 @@ mod tests {
         let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
         let handle = std::thread::spawn(move || {
             let cmd = peer.recv_kind("cmd");
-            assert!(cmd.enable && cmd.targets.is_none());
+            assert_eq!(cmd.enable, Some(true));
+            assert!(cmd.targets.is_none());
             peer.send_state(1, 1, cmd.seq, true, 0.0);
             peer
         });

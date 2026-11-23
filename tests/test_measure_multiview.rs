@@ -561,7 +561,7 @@ async fn lease_loss_during_a_view_motion_ends_the_action() {
         common::drain(&mut r.ws, 5).await;
         let moving = {
             let inner = r.sup.inner().read().await;
-            inner.last_action.as_ref().and_then(|a| a.phase.clone()).is_some_and(|p| p.starts_with("move:")) && inner.active_trajectory.is_some()
+            inner.last_action.as_ref().and_then(|a| a.phase).is_some_and(|p| p.starts_with("move:")) && inner.active_trajectory.is_some()
         };
         if moving { break; }
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1104,7 +1104,7 @@ async fn the_camera_hold_is_released_on_failure_and_on_lease_loss() {
         assert!(Instant::now() < until, "no view motion");
         common::send(&mut r.ws, json!({"type":"heartbeat", "generation": r.generation, "epoch_id": r.epoch})).await;
         common::drain(&mut r.ws, 5).await;
-        let moving = r.sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase.clone()).is_some_and(|p| p.starts_with("move:"));
+        let moving = r.sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase).is_some_and(|p| p.starts_with("move:"));
         if moving { break; }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }

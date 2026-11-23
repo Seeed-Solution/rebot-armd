@@ -11,21 +11,38 @@ Profile block `damiao_gripper` (B601-DM default):
 | Field | Default | Meaning |
 |---|---|---|
 | `mode` | `pos_force` | `pos_force` = Damiao CTRL_MODE 4; `pos_vel` = legacy CTRL_MODE 2, no motor current cap |
-| `current_ceiling_raw` | 220 | current limit on every J7 frame, in 1/10000 of the motor's maximum phase current |
+| `current_ceiling_raw` | 460 | current limit on every J7 frame, in 1/10000 of the motor's maximum phase current |
 | `close_speed_rad_s` | 0.30 | speed limit of closing frames |
 | `calibrated` | false | the ceiling's torque equivalent was measured (needs `ceiling_torque_nm`) |
 | `ceiling_torque_nm` | none | measured torque equivalent of the ceiling |
 | `torque_reference` | none | `external` (independent force / torque reference) or `feedback_equivalent` (motor feedback only) |
 
-Raw 220 is the value armd sent this gripper before 2026-11-06. It is an **uncalibrated placeholder**: its torque equivalent has not been measured. 2.2 % of the DM-J4310-2EC datasheet peak torque (7 N·m) would be about 0.15 N·m; that figure is a datasheet estimate, not a measurement on this unit.
+Measurements on **2026-11-23** (office B601-DM, J7 `sw_ver 942747703`, build `1.6.0-dev8j7` / `027e46c`, method: motor feedback torque at stall on empty jaws, no external force/torque reference):
 
-- **Enable.** At a full enable with torque off, the driver writes J7's CTRL_MODE to 4 in RAM (never flash). It does this only on fresh (≤ 100 ms), stationary (|v| ≤ 0.05 rad/s), state-0 feedback.
-  - It then requires the matching register acknowledgement and a separate readback. The readback request goes out after an observed-empty receive queue, and only a reply dequeued after that counts.
-  - Every later full enable reads the mode back again, since a motor power cycle resets the RAM mode.
-  - Any failure fails the enable: wrong value, missing reply within 50 ms, or a request that was not sent. Capped operation is then unavailable: target batches are refused before their first frame, and J7 never receives a frame of another mode.
-- **Final writer.** Every J7 frame is `0x300 + id`: position f32, speed u16 in 0.01 rad/s, current u16 = `current_ceiling_raw`. This covers targets, holds, measured-position recovery holds, mode-switch holds, servo streams and policies.
+- Directly measured stall feedback-torque plateaus:
+  - raw 220: `0.42 N·m` (jaw stalls at `−3.6 rad`);
+  - raw 300: `0.55–0.57 N·m` (opens to `−5.64 rad`, stalls at `−5.55 rad` closing from full open).
+  - Ratio from these two stall plateaus: **≈ 0.0019 N·m per raw unit**.
+- Higher ceiling steps on the same unit (with ceilings extrapolated from `0.0019 N·m/raw`; in that run every close from `−5.69 rad` moved smoothly at `~0.30 rad/s` until stopped around `−3.2 rad` by the pre-fix 8.5 s timeout, so full-stroke close to `0.0 rad` was not yet observed):
+
+| `current_ceiling_raw` | Extrapolated ceiling (feedback-equivalent) | Observation (`2026-11-23`, empty jaw) |
+|---|---|---|
+| 220 | — (measured stall plateau `0.42 N·m`) | stalls at `−3.6 rad` |
+| 300 | — (measured stall plateau `0.55–0.57 N·m`) | opens to `−5.64 rad`, stalls at `−5.55 rad` closing from full open |
+| 400 | `≈ 0.76 N·m` | opens to `−5.69 rad`; closes at `~0.30 rad/s`, peak `0.76 N·m` (at ceiling), stopped at `−3.21 rad` by 8.5 s timeout |
+| 460 | `≈ 0.87 N·m` | opens to `−5.69 rad`; closes at `~0.30 rad/s`, peak `0.79 N·m`, stopped at `−3.19 rad` by 8.5 s timeout |
+| 520 | `≈ 0.99 N·m` | opens to `−5.69 rad`; closes at `~0.30 rad/s`, peak `0.75 N·m`, stopped at `−3.19 rad` by 8.5 s timeout |
+
+Earlier `pos_vel` runs measured free-motion torque up to `0.79 N·m` near full open. Default `current_ceiling_raw: 460` (`calibrated: false`) is therefore a **feedback-equivalent ≈ 0.87 N·m estimate**, not an external calibration.
+
+- **Enable.** At a full enable with torque off, the driver drains buffered RX traffic while applying drained telemetry (bound for J1–J6 to each motor's own CAN ID `motor_id`, `0x10 + motor_id`, `0x00`, or `master_id`, while J7 in `PosForce` accepts only its expected reply ID — configured `master_id`, or `0x10 + motor_id`, i.e. `0x17` for J7) to the feedback cache, then writes J7's CTRL_MODE to 4 in RAM (never flash) only on provably fresh (decode time and receive-queue bound ≤ 100 ms), stationary (|v| ≤ 0.05 rad/s), state-0 feedback. If J7 feedback is stale or unbounded at the mode-write precondition or before the pre-enable hold, the driver sends a `0xCC` refresh for J7 and keeps the handshake pending (within the 50 ms reply deadline, without widening the 100 ms freshness bound), failing closed if no timely post-request reply arrives.
+  - It then requires the matching register acknowledgement and a separate readback. The readback request goes out after an observed-empty receive queue; only a read reply dequeued after that, carrying the motor's expected master CAN arbitration ID (configured `master_id`, or `0x10 + motor_id`, i.e. `0x17` for J7) and `RID_CTRL_MODE`, and arriving strictly before the 50 ms deadline counts.
+  - Every later full enable (including after a host restart with J7 already in mode 4, verified during startup range checks only from post-boundary replies on the motor's expected master CAN ID) reads the mode back again, since a motor power cycle resets the RAM mode. Once readback confirms mode 4, the driver sends a capped `0x307` hold at the freshly measured J7 position (≤ `close_speed_rad_s`) before `CMD_ENABLE` so the motor cannot resume a stale firmware target. The already-enabled fast path also requires verified mode 4 and fresh ≤ 100 ms J7 feedback.
+  - Any failure fails the enable: wrong value, wrong CAN ID or register ID, reply at or after the 50 ms deadline, missing/unbounded fresh measured position, or a request/hold that was not sent. Capped operation is then unavailable: target batches are refused before their first frame, and J7 never receives a frame of another mode.
+- **Final writer.** Every J7 frame is `0x300 + id`: position f32, speed u16 in 0.01 rad/s (quantized downward via `f64` floor so wire speed never exceeds the limit), current u16 = `current_ceiling_raw`. This covers targets, holds, pre-enable holds, measured-position recovery holds, mode-switch holds, servo streams and policies.
   - The speed field is the requested speed (`JointTarget::velocity`, else the POS_VEL ceiling, at most 4 rad/s).
-  - It is limited to `close_speed_rad_s` when the frame moves the jaw toward `closed_rad`. Explicit fast closes are therefore capped too; this is a behaviour change.
+  - Speed may exceed `close_speed_rad_s` only when provably fresh (≤ 100 ms) finite feedback proves the frame moves the jaw strictly toward `open_rad`. Closing frames, holds (target == measured), explicit fast closes, and recovery holds stay capped at `close_speed_rad_s`. Once J7 feedback exceeds 100 ms (at batch entry, mid-batch, or across a `WouldBlock` retry) or a J7 target position/velocity is non-finite, stale-feedback recovery emits no J7 motion frame (read-only `0xCC` refresh only), `write_joint_targets` refuses to transmit a J7 frame, and enabled mode handovers back to `PosForce` fail before writing `CTRL_MODE`.
+- **E-stop hold.** `StopPolicy::EStopLatch` locks onto `measured_positions` only when every joint reading is finite and the supervisor's own coherent feedback snapshot (`core.feedback()` decode instants and, for receive-queued drivers, `joint_feedback_queue_bounds`, evaluated against `driver.clock_now()` via non-blocking `try_lock`) is provably within the 250 ms feedback freshness bound; when the driver mutex is contended or that snapshot is stale, unread past 250 ms, or lacks a receive-queue bound (even if a driver-side drain later updated the driver's cache), E-stop completes without waiting on a lock and holds `commanded_positions` instead.
 - **Unchanged.** J1–J6 frames are byte-identical to the legacy profile (test `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`). The host-side lead cap, contact regulator and software torque cap remain as the second layer.
 - **Reporting.** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` returns:
   - `mode`, `current_raw`, `close_speed_rad_s`;
@@ -34,7 +51,27 @@ Raw 220 is the value armd sent this gripper before 2026-11-06. It is an **uncali
 
   The legacy profile reports `"no motor current cap (legacy POS_VEL gripper)"`.
 
-Not verified on the device: mode 4 on this J7 firmware (sw_ver 942747703), the readback after a restart, speed tracking at low setpoints, the current plateau against the command, feedback scaling in mode 4, holding after a slip, and CAN loss while holding (`TIMEOUT=0`).
+Not yet verified on the device: full-stroke close to `0.0 rad` at raw 460 after the close-speed timeout fix, external force/torque calibration at the jaws, readback after a host/motor power-cycle restart, holding after a slip, and CAN loss while holding (`TIMEOUT=0`).
+
+### Stall and contact thresholds
+
+Thresholds are anchored to office B601-DM J7 measurements (raw 460, 50 Hz loop):
+
+- Free-motion torque near full open peaks at **`0.80 N·m`** (feedback-equivalent raw-460 ceiling estimate **`≈ 0.87 N·m`** at `0.0019 N·m/raw`).
+- Stall encoder jitter is **`~0.0008 rad`** (2 LSB).
+- One median closing tick at 50 Hz (`0.30 rad/s`) advances **`0.0057 rad`**.
+- Rigid stall plateau at raw 300 (`c300`) is **`0.55–0.57 N·m`**.
+
+Resulting supervisor and gripper-motion rules:
+
+| Parameter / rule | Value | Basis |
+|---|---|---|
+| Net progress epsilon (`GRIPPER_STALL_PROGRESS_EPS` / `GRIPPER_STILL_PROGRESS_EPS`) | **`0.002 rad`** | ~2.5× the `0.0008 rad` stall jitter; well below the `0.0057 rad` median 50 Hz closing tick and below `0.006 rad / 100 ms` at `0.06 rad/s`. Measured as monotonic **net progress along the commanded direction** (`(pos − watermark) · dir >= 0.002 rad`), so jam oscillation cannot keep resetting the stall timer. |
+| Stall / no-progress window (`GRIPPER_STALL_WINDOW_MAX_S`) | **`0.10–0.50 s`** (hard cap **`<= 0.50 s`**) | `max(base_window_s, min(2 × 0.002 / speed + 0.06, 0.50))` (`base_window_s = 0.10 s` with torque feedback, `0.18 s` without). Bounds real-jam detection to **`<= 0.50 s`** after progress stops, independent of the action timeout. |
+| Non-grasp move stall (`Move`, `Open`, `Close(grasp=false)`) | `|τ| >= 0.444 N·m` **and** no net progress over the window | Requires lack of net progress rather than torque alone, so `0.75–0.80 N·m` free-motion torque bumps while moving do not trip stall, while the `c300` rigid stall (`0.56 N·m`, no progress) fails within the bound. |
+| Grasp moving-jaw contact (`GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM`) | 2 ticks at **`>= max(contact_torque_nm, 0.82 N·m, 0.9 × ceiling_estimate)`** | Strictly above the **`0.80 N·m`** free-motion peak (and `>= 0.9 ×` calibrated or `raw × 0.0019` ceiling estimate when higher) and below the `0.85 N·m` first-contact incident sample. |
+| Grasp stopped-progress contact | `|τ| >= contact_torque_nm` (`0.60 N·m`) **or** following lag `>= 0.30 rad`, **and** no closing net progress over the window (`<= 0.50 s`) | Retains `0.60 N·m` sensitivity once the jaw actually stops progressing against an object, without false-triggering during `0.75 N·m` empty-jaw free motion. |
+| Torque cap (`max_close_torque_nm`) | **`1.0 N·m`** (2 ticks) | Unchanged second-layer guard above the free-motion peak and raw-460 ceiling. |
 
 ### Commissioning: `current_ceiling_raw` to N·m
 
@@ -74,21 +111,38 @@ Profile 块 `damiao_gripper`（B601-DM 默认）：
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `mode` | `pos_force` | `pos_force` = 达妙 CTRL_MODE 4；`pos_vel` = 旧版 CTRL_MODE 2，无电机电流上限 |
-| `current_ceiling_raw` | 220 | 每个 J7 帧的电流上限，单位为电机最大相电流的 1/10000 |
+| `current_ceiling_raw` | 460 | 每个 J7 帧的电流上限，单位为电机最大相电流的 1/10000 |
 | `close_speed_rad_s` | 0.30 | 闭合帧的速度上限 |
 | `calibrated` | false | 上限对应的力矩已实测（需要 `ceiling_torque_nm`） |
 | `ceiling_torque_nm` | 无 | 上限对应的实测力矩 |
 | `torque_reference` | 无 | `external`（独立力 / 力矩参考）或 `feedback_equivalent`（仅电机反馈） |
 
-raw 220 是 2026-11-06 之前 armd 发给该夹爪的值，属于**未标定的占位值**，对应力矩未实测。按 DM-J4310-2EC 数据手册峰值 7 N·m 的 2.2 % 约为 0.15 N·m；该数值为手册估算，未在本机实测。
+**2026-11-23** 实机测量记录（办公室 B601-DM，J7 `sw_ver 942747703`，构建 `1.6.0-dev8j7` / `027e46c`，方法：空夹爪堵转时的电机反馈力矩，无外部力/力矩参考）：
 
-- **使能。** 完整使能时，在力矩关闭状态下把 J7 的 CTRL_MODE 写为 4（RAM，不写 flash）。前提是反馈新鲜（≤ 100 ms）、静止（|v| ≤ 0.05 rad/s）且状态为 0。
-  - 写入后要求收到匹配的寄存器应答，并单独回读。回读请求在观察到接收队列为空之后发出，只有此后出队的回复才计入。
-  - 之后每次完整使能都会重新回读，因为电机断电会复位 RAM 中的模式。
-  - 任一失败都使使能失败：值不符、50 ms 内无回复、请求未发出。此时受限运行不可用：目标批次在第一帧之前被拒，J7 不会收到其他模式的帧。
-- **最终写入。** 每个 J7 帧都是 `0x300 + id`：位置 f32、速度 u16（0.01 rad/s）、电流 u16 = `current_ceiling_raw`。覆盖目标、保持、实测位置恢复保持、模式切换保持、servo 流和策略。
+- 直接测得的堵转反馈力矩平台：
+  - raw 220：`0.42 N·m`（夹爪在 `−3.6 rad` 处堵转）；
+  - raw 300：`0.55–0.57 N·m`（可完全张开至 `−5.64 rad`，从全开闭合时在 `−5.55 rad` 处堵转）。
+  - 由以上两档堵转平台折算比例为 **≈ 0.0019 N·m / raw**。
+- 同一台设备上的更高档位测试（上限按 `0.0019 N·m / raw` 推算；该次测试中各档位从 `−5.69 rad` 闭合时均以约 `0.30 rad/s` 平稳运动，但受修复前的 8.5 s 超时限制在约 `−3.2 rad` 处停止，完整闭合至 `0.0 rad` 尚待修复后复测）：
+
+| `current_ceiling_raw` | 推算上限（反馈等效） | 观测结果（`2026-11-23`，空夹爪） |
+|---|---|---|
+| 220 | —（实测堵转平台 `0.42 N·m`） | 在 `−3.6 rad` 处堵转 |
+| 300 | —（实测堵转平台 `0.55–0.57 N·m`） | 可张开至 `−5.64 rad`，全开闭合在 `−5.55 rad` 处堵转 |
+| 400 | `≈ 0.76 N·m` | 张开至 `−5.69 rad`；闭合速度 `~0.30 rad/s`，峰值 `0.76 N·m`（触及上限），因 8.5 s 超时停于 `−3.21 rad` |
+| 460 | `≈ 0.87 N·m` | 张开至 `−5.69 rad`；闭合速度 `~0.30 rad/s`，峰值 `0.79 N·m`，因 8.5 s 超时停于 `−3.19 rad` |
+| 520 | `≈ 0.99 N·m` | 张开至 `−5.69 rad`；闭合速度 `~0.30 rad/s`，峰值 `0.75 N·m`，因 8.5 s 超时停于 `−3.19 rad` |
+
+此前 `pos_vel` 测试在接近全开位置测得自由运动力矩最高 `0.79 N·m`。因此默认 `current_ceiling_raw: 460`（`calibrated: false`）属于**反馈等效约 0.87 N·m 的估算值**，并非外部标定结果。
+
+- **使能。** 完整使能时，驱动先清空接收队列并将排出的遥测帧更新到反馈缓存（J1–J6 绑定至各自 `motor_id`、`0x10 + motor_id`、`0x00` 或 `master_id`，而处于 `PosForce` 模式的 J7 仅接受其预期回复 CAN ID——即配置的 `master_id` 或 `0x10 + motor_id`，J7 默认为 `0x17`），再在力矩关闭状态下把 J7 的 CTRL_MODE 写为 4（RAM，不写 flash）；前提是反馈可证新鲜（解码时间与接收队列边界均 ≤ 100 ms）、静止（|v| ≤ 0.05 rad/s）且状态为 0。若写模式前置检查或使能前保持检查时 J7 反馈不新鲜或无队列边界，驱动发送 J7 的 `0xCC` 刷新并保持握手挂起（沿用 50 ms 应答截止时间，不放宽 100 ms 新鲜度窗口），截止前未收到请求后新鲜回复则失效关闭。
+  - 写入后要求收到匹配的寄存器应答，并单独回读。回读请求在观察到接收队列为空之后发出，仅接受此后出队、来源 CAN ID 等于电机预期主站 ID（配置的 `master_id`，或默认 `0x10 + motor_id`，J7 为 `0x17`）、寄存器号为 `RID_CTRL_MODE` 且严格在 50 ms 截止时间前到达的读回复。
+  - 之后每次完整使能（含主机重启时 J7 已处于模式 4 的情况；启动量程检查仅凭接收边界后来自电机预期主站 CAN ID 的回复确认模式 4）都会重新回读，因为电机断电会复位 RAM 中的模式。回读确认模式 4 后，驱动先在新鲜实测的 J7 位置发出一帧受限 `0x307` 保持帧（速度 ≤ `close_speed_rad_s`），再发 `CMD_ENABLE`，避免电机恢复旧的固件目标。已使能快速路径同样要求模式 4 已验证且 J7 反馈 ≤ 100 ms 新鲜。
+  - 任一失败都使使能失败：值不符、CAN ID 或寄存器号不符、在 50 ms 截止时间及之后到达、缺少有界新鲜实测位置、请求或保持帧未发出。此时受限运行不可用：目标批次在第一帧之前被拒，J7 不会收到其他模式的帧。
+- **最终写入。** 每个 J7 帧都是 `0x300 + id`：位置 f32、速度 u16（0.01 rad/s，按 `f64` 向下取整确保线速不超过上限）、电流 u16 = `current_ceiling_raw`。覆盖目标、保持、使能前保持、实测位置恢复保持、模式切换保持、servo 流和策略。
   - 速度字段为请求速度（`JointTarget::velocity`，否则为 POS_VEL 上限，最大 4 rad/s）。
-  - 当帧把夹爪推向 `closed_rad` 时限制为 `close_speed_rad_s`。因此显式的快速闭合也会被限速，这是行为变化。
+  - 仅当可证新鲜（≤ 100 ms）且有限的反馈证明帧将夹爪严格移向 `open_rad` 时才允许超过 `close_speed_rad_s`。闭合帧、保持帧（目标等于实测）、显式快速闭合及恢复保持均限制在 `close_speed_rad_s` 以内。J7 反馈超过 100 ms（含批次入口、批次中途或 `WouldBlock` 重试期间）或目标位置/速度非有限时，陈旧反馈恢复不再发送 J7 运动帧（仅发只读 `0xCC` 刷新），`write_joint_targets` 拒绝发送 J7 帧，且使能状态下切回 `PosForce` 的模式切换在写 `CTRL_MODE` 之前失败。
+- **急停保持。** `StopPolicy::EStopLatch` 仅在所有关节实测位置有限且监管器自身一致性反馈快照（与 `measured_positions` 同步记录的 `core.feedback()` 解码时间以及带接收队列驱动的 `joint_feedback_queue_bounds`，经非阻塞 `try_lock` 按 `driver.clock_now()` 判定）可证在 250 ms 反馈新鲜度上限内时锁定到 `measured_positions`；若驱动互斥锁被占用，或快照陈旧、在队列中积压超 250 ms 或无接收队列边界（即使之后驱动侧排空刷新了驱动缓存），急停不等待锁，直接改用 `commanded_positions` 保持。
 - **不变部分。** J1–J6 帧与旧版 profile 逐字节相同（测试 `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`）。主机侧领先量上限、接触调节和软件力矩上限保留为第二层。
 - **上报。** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` 返回：
   - `mode`、`current_raw`、`close_speed_rad_s`；
@@ -97,7 +151,27 @@ raw 220 是 2026-11-06 之前 armd 发给该夹爪的值，属于**未标定的�
 
   旧版 profile 上报 `"no motor current cap (legacy POS_VEL gripper)"`。
 
-尚未在设备上验证：该 J7 固件（sw_ver 942747703）对模式 4 的支持、重启后的回读、低设定值下的速度跟随、电流平台与指令的关系、模式 4 下的反馈缩放、打滑后的保持、保持期间 CAN 断开（`TIMEOUT=0`）。
+尚未在设备上验证：闭合超时修复后 raw 460 全行程闭合至 `0.0 rad`、夹爪处外部力/力矩标定、主机或电机断电重启后的回读、打滑后的保持、保持期间 CAN 断开（`TIMEOUT=0`）。
+
+### 堵转与接触阈值
+
+阈值依据办公室 B601-DM J7 实机测量数据设定（raw 460，50 Hz 控制循环）：
+
+- 接近全开位置的自由运动力矩峰值：**`0.80 N·m`**（按 `0.0019 N·m/raw` 推算 raw 460 反馈等效上限 **`≈ 0.87 N·m`**）。
+- 堵转编码器抖动：**`~0.0008 rad`**（2 LSB）。
+- 50 Hz（`0.30 rad/s`）单周期中位闭合步长：**`0.0057 rad`**。
+- raw 300（`c300`）刚性堵转平台：**`0.55–0.57 N·m`**。
+
+对应的监管器与夹爪运动判定规则：
+
+| 参数 / 规则 | 取值 | 依据 |
+|---|---|---|
+| 净位移阈值（`GRIPPER_STALL_PROGRESS_EPS` / `GRIPPER_STILL_PROGRESS_EPS`） | **`0.002 rad`** | 约为 `0.0008 rad` 堵转抖动的 2.5 倍，远小于 `0.0057 rad` 的 50 Hz 中位步长及 `0.06 rad/s` 下的 `0.006 rad / 100 ms`。按指令方向单调**净位移**（`(pos − watermark) · dir >= 0.002 rad`）判定，卡滞振荡不会反复重置堵转计时器。 |
+| 堵转 / 无进展窗口（`GRIPPER_STALL_WINDOW_MAX_S`） | **`0.10–0.50 s`**（硬上限 **`<= 0.50 s`**） | `max(base_window_s, min(2 × 0.002 / speed + 0.06, 0.50))`（有力矩反馈时 `base_window_s = 0.10 s`，无力矩反馈时 `0.18 s`）。保证真实卡滞在停止进展后 **`<= 0.50 s`** 内检出，与动作总超时解耦。 |
+| 非抓取移动堵转（`Move`、`Open`、`Close(grasp=false)`） | `|τ| >= 0.444 N·m` **且** 窗口内无净位移 | 不能仅凭力矩触发，从而允许自由行程中 `0.75–0.80 N·m` 力矩波动顺利完成，同时保持 `c300` 刚性堵转（`0.56 N·m`、无进展）在时限内失败。 |
+| 抓取运动中接触阈值（`GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM`） | 连续 2 周期 **`>= max(contact_torque_nm, 0.82 N·m, 0.9 × ceiling_estimate)`** | 严格高于 **`0.80 N·m`** 自由运动峰值（若已标定或按 `raw × 0.0019` 推算的 `0.9 ×` 上限更高则取后者），且低于事故日志中的 `0.85 N·m` 首次接触采样。 |
+| 抓取停止进展接触 | `|τ| >= contact_torque_nm`（`0.60 N·m`）**或** 跟随滞后 `>= 0.30 rad`，**且** 闭合方向在窗口（`<= 0.50 s`）内无净位移 | 夹爪真正停止推进后仍保持 `0.60 N·m` 灵敏度，避免空夹爪自由运动中 `0.75 N·m` 波动误触发接触。 |
+| 软件力矩上限（`max_close_torque_nm`） | **`1.0 N·m`**（连续 2 周期） | 保留为高于自由运动峰值与 raw 460 上限的第二层保护。 |
 
 ### 标定：`current_ceiling_raw` 对应 N·m
 

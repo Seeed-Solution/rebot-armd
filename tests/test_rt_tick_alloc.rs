@@ -300,9 +300,9 @@ fn scenarios(with_driver: bool) {
     // counted while the jaw moves (the tick that ends the action is a transition)
     let mut counts = Vec::new();
     while inner.active_trajectory.is_some() && counts.len() < 200 {
-        let before = inner.last_action.as_ref().map(|a| a.state.clone());
+        let before = inner.last_action.as_ref().map(|a| a.state);
         let c = tick_counted(&mut inner);
-        if inner.active_trajectory.is_some() && inner.last_action.as_ref().map(|a| a.state.clone()) == before { counts.push(c); }
+        if inner.active_trajectory.is_some() && inner.last_action.as_ref().map(|a| a.state) == before { counts.push(c); }
     }
     assert!(counts.len() >= 10, "gripper close: {} ticks counted", counts.len());
     assert_zero(&format!("{tag} gripper close"), &counts);
@@ -477,4 +477,721 @@ fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
     g.phase = Some(HolderLabel::new("active"));
     let ((), a, f) = counted(|| inner.gravity_comp_observation_into(&mut g));
     assert_eq!((a, f, g.phase), (0, 0, None), "clearing the phase on the tick");
+}
+
+/// Plan-slot memory: the 8 default slots are write-touched (pre-faulted) at construction,
+/// reserve exactly 655,360 payload bytes, fill to full capacity without touching the
+/// allocator, and refuse a 9th concurrent stage (`PlansFull` / `None`).
+#[test]
+fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
+    use armd::rt_core::broker::{plan_slots, PLAN_SLOTS};
+    use armd::rt_core::mailbox::MAX_DOF;
+    use armd::rt_core::ops::{
+        PlanSlot, ALL_PLAN_SLOTS_PAYLOAD_BYTES, MAX_PATH_SAMPLES, PLAN_SLOT_PAYLOAD_BYTES,
+    };
+
+    assert_eq!(PLAN_SLOTS, 8);
+    assert_eq!(MAX_PATH_SAMPLES, 2048);
+    assert_eq!(MAX_DOF, 8);
+    assert_eq!(PLAN_SLOT_PAYLOAD_BYTES, 81_920);
+    assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
+
+    let sample = [0.25f32; MAX_DOF];
+    let mut handles = [None; PLAN_SLOTS];
+    let mut total_payload_bytes = 0usize;
+
+    // Warm up the staging/pin/retire/reclaim code pages on a 1-slot scratch pool so first-call
+    // `.text` / stack page faults are settled before we construct and measure the 8-slot pool.
+    {
+        let (mut w0, mut r0) = plan_slots(1, || PlanSlot::with_path_capacity(1));
+        let ((), a0, f0) = counted(|| {
+            let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
+            let p = r0.pin(h).unwrap();
+            assert_eq!(p.path.len(), 1);
+            drop(p);
+            assert!(r0.retire(h));
+            assert_eq!(w0.reclaim(), 1);
+        });
+        assert_eq!((a0, f0), (0, 0));
+    }
+
+    let (mut writer, mut reader) = plan_slots(PLAN_SLOTS, PlanSlot::default);
+    assert_eq!((writer.capacity(), reader.capacity()), (PLAN_SLOTS, PLAN_SLOTS));
+
+    #[cfg(target_os = "linux")]
+    let thread_faults = || -> (i64, i64) {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+        assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD) failed");
+        (ru.ru_minflt, ru.ru_majflt)
+    };
+    #[cfg(target_os = "linux")]
+    let (min_before, maj_before) = {
+        let _ = thread_faults();
+        thread_faults()
+    };
+
+    // Filling all 8 pre-faulted slots to MAX_PATH_SAMPLES, pinning, reading, retiring and
+    // reclaiming must perform zero allocations, zero frees, and zero page faults.
+    let (exhausted_none, allocs, frees) = counted(|| {
+        for (idx, slot_h) in handles.iter_mut().enumerate() {
+            let h = writer
+                .stage(|slot| {
+                    slot.path.clear();
+                    for k in 0..MAX_PATH_SAMPLES {
+                        slot.path.push(&sample, k as f64 / (MAX_PATH_SAMPLES - 1) as f64).unwrap();
+                    }
+                })
+                .expect("slot available");
+            let pinned = reader.pin(h).expect("slot live");
+            assert_eq!(pinned.path.len(), MAX_PATH_SAMPLES);
+            assert_eq!(pinned.path.capacity(), MAX_PATH_SAMPLES);
+            assert_eq!(pinned.payload_bytes(), PLAN_SLOT_PAYLOAD_BYTES);
+            assert_eq!(pinned.path.samples()[0][0], 0.25);
+            assert_eq!(pinned.path.samples()[MAX_PATH_SAMPLES - 1][MAX_DOF - 1], 0.25);
+            total_payload_bytes += pinned.payload_bytes();
+            drop(pinned);
+            *slot_h = Some(h);
+            assert_eq!(writer.free(), PLAN_SLOTS - 1 - idx);
+        }
+        let exhausted = writer.stage(|_| {}).is_none();
+        for h in handles.iter().flatten().copied() {
+            assert!(reader.retire(h));
+        }
+        assert_eq!(writer.reclaim(), PLAN_SLOTS);
+        exhausted
+    });
+
+    #[cfg(target_os = "linux")]
+    {
+        let (min_after, maj_after) = thread_faults();
+        assert_eq!(maj_after - maj_before, 0, "pre-faulted plan slots triggered major page faults");
+        assert_eq!(min_after - min_before, 0, "pre-faulted plan slots triggered minor page faults on write");
+    }
+
+    assert!(exhausted_none, "9th concurrent stage must fail when all 8 slots are held");
+    assert_eq!(total_payload_bytes, 655_360);
+    assert_eq!((allocs, frees), (0, 0), "staging/pinning/retiring 8 full plan slots touched the allocator");
+}
+
+fn watchdog_park_supervisor() -> SupervisorInner {
+    use armd::model::{JointLimit, RestingPosePolicy};
+
+    let mut cfg = ArmConfig::default();
+    cfg.dof = 2;
+    cfg.limits = vec![
+        JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0),
+        JointLimit::new("j2", -3.0, 3.0, 2.0, 5.0),
+    ];
+    cfg.home_positions = vec![0.0, 0.0];
+    cfg.lease_timeout_ms = 1_000;
+    cfg.resting_pose = Some(RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.08; 2],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![(0, 1.0)],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 100,
+    });
+    let mut inner = SupervisorInner::new(cfg);
+    inner.tick(0.02);
+    inner.set_torque(true).expect("arm");
+    let _gen = inner.acquire_lease("client").expect("lease");
+    let epoch = inner.safety.epoch_id();
+    inner.jog(vec![0.5, 0.2], Some(0.2), Some(epoch)).expect("jog");
+    for _ in 0..40 {
+        inner.active_lease.as_mut().unwrap().acquired_at = Instant::now();
+        inner.last_heartbeat = Instant::now();
+        inner.tick(0.02);
+    }
+    // Expire lease so the watchdog starts a park.
+    let past = Duration::from_millis(1_100);
+    inner.active_lease.as_mut().unwrap().acquired_at = Instant::now() - past;
+    inner.last_heartbeat = Instant::now() - past;
+    inner.tick(0.02);
+    assert!(inner.watchdog_park.is_some() && inner.pending_normal_unload);
+    inner
+}
+
+static STOP_DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `authorized_stop` during a watchdog park records fields into the preallocated diagnostic
+/// slot without tracing, allocating or freeing; an off-thread caller drains and logs it.
+#[test]
+fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
+    use armd::rt_core::ops::stop_diag;
+    let _guard = STOP_DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut inner = watchdog_park_supervisor();
+
+    let mut seen = stop_diag().count();
+    let (stopped, allocs, frees) = counted(|| inner.authorized_stop());
+    assert!(!stopped, "watchdog park continues");
+    assert_eq!((allocs, frees), (0, 0), "authorized_stop during watchdog park touched allocator");
+
+    let rec = stop_diag().drain_and_log(&mut seen).expect("diagnostic recorded");
+    assert_eq!(rec.arm, inner.core.id());
+    assert!(rec.count >= 1);
+    assert!(rec.park_budget_us > 0);
+    assert!(stop_diag().drain_and_log(&mut seen).is_none(), "drained once");
+
+    // Normal authorized_stop when idle / servo active also performs zero allocations and frees.
+    let mut idle = supervisor(false);
+    let q = idle.commanded_positions.clone();
+    let ep = idle.safety.epoch_id();
+    idle.servo(q, ep).expect("servo");
+    let (stopped_idle, a2, f2) = counted(|| idle.authorized_stop());
+    assert!(stopped_idle);
+    assert_eq!((a2, f2), (0, 0), "idle/servo authorized_stop touched allocator");
+}
+
+/// Normal-priority periodic publication refresh (`StateHub::latest` / `try_latest`, called by
+/// the supervisor dispatcher loop at 50 Hz) drains deferred RT stop diagnostics off the RT
+/// thread and logs each recorded watchdog-park stop event exactly once.
+#[test]
+fn watchdog_park_stop_diagnostic_is_drained_and_logged_once_off_rt_thread() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    let _guard = STOP_DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufGuard;
+        fn make_writer(&'a self) -> Self::Writer { BufGuard(self.0.clone()) }
+    }
+    struct BufGuard(Arc<Mutex<Vec<u8>>>);
+    impl Write for BufGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    let mut inner = watchdog_park_supervisor();
+
+    // Clear any prior un-drained count before capturing logs for this test.
+    let _ = inner.core.hub().latest();
+
+    let buf = BufWriter::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let captured = || String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+    tracing::subscriber::with_default(sub, || {
+        // 1. RT authorized_stop records into the lock-free slot without logging or allocating.
+        let (stopped, a, f) = counted(|| inner.authorized_stop());
+        assert!(!stopped);
+        assert_eq!((a, f), (0, 0), "authorized_stop during watchdog park must not touch allocator");
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 0, "must not log on RT call");
+
+        // 2. RT tick publication does NOT drain/log the stop diagnostic.
+        let _ = inner.tick_publish(0.02, 1, false);
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 0, "must not log on RT tick");
+
+        // 3. Normal-priority StateHub::latest() (dispatcher loop path) drains and logs once.
+        let _ = inner.core.hub().latest();
+        let text = captured();
+        assert_eq!(text.matches("Stop during a watchdog park").count(), 1, "expected 1 log line: {text}");
+        assert!(text.contains("the park continues"), "missing park-continues message: {text}");
+
+        // 4. Subsequent normal-priority polls do not re-log the same event.
+        let _ = inner.core.hub().latest();
+        let _ = inner.core.hub().try_latest();
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 1, "must log record only once");
+
+        // 5. A second watchdog-park stop event is drained once more.
+        assert!(!inner.authorized_stop());
+        let _ = inner.core.hub().latest();
+        let _ = inner.core.hub().latest();
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 2, "second event logged once");
+    });
+}
+
+/// Commit-time RT boundaries for path, replay, jog, and config reservation:
+/// - Refused commits (stale boot, zero boot, overtaken stop, stale plan, config busy) across
+///   path, replay, jog and config perform zero allocations and zero frees.
+/// - In-place path/replay target activation (`start_path_motion_slice`, `start_replay_motion`)
+///   and slot-borrowed `ReplayMotion` sampling + steady-state stepping perform zero allocations
+///   and zero frees.
+#[test]
+fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
+    use armd::motion::Reference;
+    use armd::rt_core::broker::{
+        Authority, BootId, Capacities, ClientId, CommandKind, Descriptor, RequestId, Stamp, Submit,
+    };
+    use armd::rt_core::config_iface::{ConfigAuthority, ConfigDomain, Reserved};
+    use armd::rt_core::ids::ArmId;
+    use armd::rt_core::mailbox::MAX_DOF;
+    use armd::rt_core::ops::{
+        tool_digest_hash, CommitCtx, CoreOps, EpisodeRef, PathKind, PlanSlot, Primitive, ReleaseFixture,
+    };
+    use armd::rt_core::urgent::StopRequests;
+
+    let boot = BootId::fresh();
+    let stale_boot = BootId::fresh();
+    assert_ne!(boot, stale_boot);
+
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(supervisor(false), boot, Capacities::default());
+    let now = fx.now();
+    let deadline = now + Duration::from_secs(30);
+    let auth = fx.core.authority(&fx.ctx(now));
+    let dof = fx.core.commanded_positions.len();
+    let mut start = [0.0f32; MAX_DOF];
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut goal = start;
+    goal[0] += 0.05;
+
+    // 1. Pre-stage a Cartesian path slot and a Replay slot (off-RT).
+    let tool = tool_digest_hash(&fx.core.config.active_tool.config_digest);
+    let mut cart_slot = PlanSlot::default();
+    for k in 0..=10 {
+        let f = k as f32 / 10.0;
+        let mut q = start;
+        q[0] += 0.05 * f;
+        cart_slot.path.push(&q[..dof], f64::from(f)).unwrap();
+    }
+    cart_slot.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Cartesian,
+        duration_s: 0.5,
+        power_scale: None,
+    };
+
+    let mut replay_slot = PlanSlot::default();
+    for k in 0..=20 {
+        let f = k as f32 / 20.0;
+        let mut q = start;
+        q[0] += 0.05 * f;
+        replay_slot.path.push(&q[..dof], k as f64).unwrap();
+    }
+    replay_slot.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("alloc_ep").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            tool_digest: tool,
+        },
+        duration_s: 0.4,
+        power_scale: None,
+    };
+
+    let jog_prim = Primitive::JointQuintic { dof: dof as u8, start, q: goal, duration_s: 0.5 };
+
+    // 2. Direct commit checks for stale boot id, zero boot id, overtaken stop, stale start,
+    //    invalid prepared path, and mismatched replay tool digest across jog, path, and replay
+    //    must perform (0, 0) allocs/frees.
+    let mut bad_path_slot = PlanSlot::default();
+    bad_path_slot.path.push(&start[..dof], 0.0).unwrap();
+    bad_path_slot.primitive = cart_slot.primitive;
+
+    let mut bad_tool_replay = replay_slot.clone();
+    bad_tool_replay.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("alloc_ep").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            tool_digest: tool ^ 1,
+        },
+        duration_s: 0.4,
+        power_scale: None,
+    };
+
+    let (mut pw, mut pr) = armd::rt_core::broker::plan_slots(4, PlanSlot::default);
+    let h_cart = pw.stage(|s| s.copy_from(&cart_slot).unwrap()).unwrap();
+    let h_rep = pw.stage(|s| s.copy_from(&replay_slot).unwrap()).unwrap();
+    let h_bad_path = pw.stage(|s| s.copy_from(&bad_path_slot).unwrap()).unwrap();
+    let h_bad_tool = pw.stage(|s| s.copy_from(&bad_tool_replay).unwrap()).unwrap();
+
+    let ctx_ok = CommitCtx { arm: ArmId::LOCAL, boot, now, stop_generation: 0 };
+    let ctx_stopped = CommitCtx { stop_generation: 1, ..ctx_ok };
+    let desc = |b_id: BootId, stop_gen: u64, kind: CommandKind| Descriptor {
+        stamp: Stamp {
+            arm: ArmId::LOCAL,
+            boot: b_id,
+            request: RequestId(1),
+            client: ClientId(1),
+            client_seq: 1,
+            authority: Authority { stop_generation: stop_gen, ..auth },
+            deadline,
+        },
+        kind,
+    };
+    let mut stale_start = start;
+    stale_start[0] += 0.01;
+    let stale_jog = Primitive::JointQuintic { dof: dof as u8, start: stale_start, q: goal, duration_s: 0.5 };
+
+    let (codes, allocs, frees) = counted(|| {
+        let d_stale_boot = desc(stale_boot, 0, CommandKind::Install { plan: h_cart });
+        let d_zero_boot = desc(BootId(0), 0, CommandKind::Install { plan: h_cart });
+        let d_ok = desc(boot, 0, CommandKind::Install { plan: h_cart });
+        let d_rep = desc(boot, 0, CommandKind::Install { plan: h_rep });
+        let d_bad_path = desc(boot, 0, CommandKind::Install { plan: h_bad_path });
+        let d_bad_tool = desc(boot, 0, CommandKind::Install { plan: h_bad_tool });
+
+        let c1 = fx.core.commit_primitive(&d_stale_boot, &jog_prim, &ctx_ok).unwrap_err();
+        let c2 = fx.core.commit_primitive(&d_zero_boot, &jog_prim, &ctx_ok).unwrap_err();
+        let c3 = fx.core.commit_primitive(&d_ok, &jog_prim, &ctx_stopped).unwrap_err();
+        let c4 = fx.core.commit_primitive(&d_ok, &stale_jog, &ctx_ok).unwrap_err();
+
+        let p1 = fx.core.commit_prepared_slot(&d_stale_boot, pr.pin(h_cart).unwrap(), &ctx_ok).unwrap_err();
+        let p2 = fx.core.commit_prepared_slot(&d_ok, pr.pin(h_cart).unwrap(), &ctx_stopped).unwrap_err();
+        let p3 = fx.core.commit_prepared_slot(&d_bad_path, pr.pin(h_bad_path).unwrap(), &ctx_ok).unwrap_err();
+
+        let r1 = fx.core.commit_prepared_slot(&d_stale_boot, pr.pin(h_rep).unwrap(), &ctx_ok).unwrap_err();
+        let r2 = fx.core.commit_prepared_slot(&d_rep, pr.pin(h_rep).unwrap(), &ctx_stopped).unwrap_err();
+        let r3 = fx.core.commit_prepared_slot(&d_bad_tool, pr.pin(h_bad_tool).unwrap(), &ctx_ok).unwrap_err();
+
+        [c1, c2, c3, c4, p1, p2, p3, r1, r2, r3]
+    });
+    assert_eq!(
+        codes,
+        [
+            "WRONG_TARGET", "WRONG_TARGET", "STOPPED", "PLAN_STALE",
+            "WRONG_TARGET", "STOPPED", "INVALID_COMMAND",
+            "WRONG_TARGET", "STOPPED", "TOOL_MISMATCH",
+        ]
+    );
+    assert_eq!((allocs, frees), (0, 0), "refused commits touched the allocator");
+    assert!(pr.retire(h_cart) && pr.retire(h_rep) && pr.retire(h_bad_path) && pr.retire(h_bad_tool));
+    assert_eq!(pw.reclaim(), 4, "no leaked plan slot pins after refused commits");
+
+    // 3. In-place path and replay target activation perform (0, 0) allocs/frees.
+    let epoch = fx.core.safety.epoch_id();
+    let (res, a_act, f_act) = counted(|| {
+        let d1 = fx.core.start_path_motion_slice(epoch, &goal[..dof], 0.5).unwrap();
+        fx.core.start_replay_motion(&start[..dof]).unwrap();
+        d1
+    });
+    assert_eq!(res, 0.5);
+    assert_eq!((a_act, f_act), (0, 0), "in-place path/replay target activation touched the allocator");
+    fx.core.stop_motion();
+
+    // 4. Config reserve (refused for stale/zero boot and overtaken stop, and granted+released)
+    //    performs (0, 0) allocs/frees.
+    let live_stops = StopRequests::new();
+    let cfg_ctx = fx.core.config_ctx_with(boot, &live_stops, now);
+    let prop = fx.core.config_proposal(ConfigDomain::Keepout, fx.core.revision(ConfigDomain::Keepout), 0, &cfg_ctx);
+    let mut bad_boot_prop = prop;
+    bad_boot_prop.stamp.boot = stale_boot;
+    let mut zero_boot_prop = prop;
+    zero_boot_prop.stamp.boot = BootId(0);
+    let zero_ctx = CommitCtx { boot: BootId(0), ..cfg_ctx };
+
+    let (cfg_ok, a_cfg, f_cfg) = counted(|| {
+        let r_bad = matches!(fx.core.reserve(&bad_boot_prop, &cfg_ctx), Reserved::Refused { code: "WRONG_TARGET", .. });
+        let r_zero = matches!(fx.core.reserve(&zero_boot_prop, &zero_ctx), Reserved::Refused { code: "WRONG_TARGET", .. });
+        live_stops.request();
+        let after_stop = fx.core.config_ctx_with(boot, &live_stops, now);
+        let r_stop = matches!(fx.core.reserve(&prop, &after_stop), Reserved::Refused { code: "STOPPED", .. });
+        let fresh_prop = fx.core.config_proposal(ConfigDomain::Keepout, fx.core.revision(ConfigDomain::Keepout), 0, &after_stop);
+        let granted = match fx.core.reserve(&fresh_prop, &after_stop) {
+            Reserved::Granted(r) => {
+                fx.core.release(r);
+                true
+            }
+            _ => false,
+        };
+        r_bad && r_zero && r_stop && granted
+    });
+    assert!(cfg_ok);
+    assert_eq!((a_cfg, f_cfg), (0, 0), "config reserve/release touched the allocator");
+
+    // 5. Accepted prepared replay commit (via `fx.step()`) performs (0, 0) allocs/frees,
+    //    borrows the immutable plan slot (no sample vector copy, no `Box`, inline approach),
+    //    and runs approach + follow ticks with (0, 0) allocs/frees.
+    // Warm publication triple-buffer slots before counting full releases.
+    for _ in 0..4 { fx.step(); }
+    let _ = fx.core.core.hub().latest();
+
+    let rep_copy = replay_slot.clone();
+    b.submit(
+        ClientId(1),
+        1,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&rep_copy).unwrap()),
+    )
+    .unwrap();
+    let (step_rep, a_rep_commit, f_rep_commit) = counted(|| fx.step());
+    assert!(step_rep.command.unwrap().1.is_ok(), "prepared replay committed");
+    assert_eq!(
+        (a_rep_commit, f_rep_commit),
+        (0, 0),
+        "accepted prepared replay commit + tick touched the allocator"
+    );
+
+    let mut sample_buf = Vec::with_capacity(dof);
+    let mut step_out = armd::motion::StepOut {
+        positions: Vec::with_capacity(dof),
+        velocities: Vec::with_capacity(dof),
+        ..Default::default()
+    };
+    let cmd_q = fx.core.commanded_positions.clone();
+    let cmd_v = fx.core.commanded_velocities.clone();
+    let meas_q = fx.core.measured_positions.clone();
+    let meas_v = fx.core.measured_velocities.clone();
+    let torques = fx.core.torques.clone();
+    let loads = fx.core.loads.clone();
+    let ((borrows_slot, phase_after, t_after), a_samp, f_samp) = counted(|| match fx.core.active_trajectory.as_mut().map(|a| &mut a.reference) {
+        Some(Reference::Replay(rm)) => {
+            rm.sample_at_into(0.1, &mut sample_buf);
+            rm.sample_at_into(0.25, &mut sample_buf);
+            let ctx = armd::motion::StepCtx {
+                dt: 0.02,
+                time_scale: 1.0,
+                measured: &meas_q,
+                measured_velocities: &meas_v,
+                commanded: &cmd_q,
+                commanded_velocities: &cmd_v,
+                torques: &torques,
+                loads: &loads,
+                feedback_fresh: true,
+                torque_feedback: true,
+                load_feedback: false,
+                gripper_stalled: false,
+                gripper_stall_sign: 0.0,
+                gripper_force_capped: false,
+            };
+            // Step through approach into slot-borrowed follow phase without allocating or freeing.
+            for _ in 0..10 {
+                rm.step_into(&ctx, &mut step_out);
+            }
+            (rm.borrows_plan_slot(), rm.phase_name(), rm.t_s())
+        }
+        _ => (false, "", 0.0),
+    });
+    assert!(borrows_slot, "prepared replay must borrow directly from the immutable plan slot");
+    assert_eq!(phase_after, "replay", "must transition from inline approach to slot-borrowed follow phase");
+    assert!(t_after > 0.0, "follow phase must advance recording time");
+    assert_eq!((a_samp, f_samp), (0, 0), "sampling/stepping slot-borrowed ReplayMotion touched the allocator");
+    assert_eq!(sample_buf.len(), dof);
+    assert_eq!(step_out.positions.len(), dof);
+
+    // Steady-state replay ticks through `fx.core.tick_publish` also perform (0, 0) allocs/frees.
+    assert_zero("prepared replay steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
+
+    // Overtaken stop ends the replay cleanly and retires its pinned slot.
+    stop.request();
+    let (stopped_rep, a_stop, f_stop) = counted(|| fx.step());
+    assert!(stopped_rep.stopped);
+    assert_eq!((a_stop, f_stop), (0, 0), "urgent stop ending slot-borrowed replay touched the allocator");
+    assert!(fx.core.active_trajectory.is_none());
+    b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 1, "slot reclaimed after replay terminal");
+    // Let post-stop deceleration reach rest before preparing the next Cartesian path.
+    for _ in 0..20 {
+        if fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+        fx.step();
+    }
+    let _ = fx.core.core.hub().latest();
+
+    // 6. Accepted prepared Cartesian path commit (via `fx.step()`) performs (0, 0) allocs/frees,
+    //    borrows the immutable plan slot, and executes steady-state ticks with (0, 0) allocs/frees.
+    let mut cart_now = cart_slot.clone();
+    let mut cur_start = [0.0f32; MAX_DOF];
+    cur_start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    cart_now.path.clear();
+    for k in 0..=10 {
+        let f = k as f32 / 10.0;
+        let mut q = cur_start;
+        q[0] += 0.05 * f;
+        cart_now.path.push(&q[..dof], f64::from(f)).unwrap();
+    }
+    cart_now.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start: cur_start,
+        kind: PathKind::Cartesian,
+        duration_s: 1.0,
+        power_scale: None,
+    };
+    b.submit(
+        ClientId(1),
+        2,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart_now).unwrap()),
+    )
+    .unwrap();
+    let (step_cart, a_cart_commit, f_cart_commit) = counted(|| fx.step());
+    assert!(step_cart.command.unwrap().1.is_ok(), "prepared path committed");
+    assert_eq!(
+        (a_cart_commit, f_cart_commit),
+        (0, 0),
+        "accepted prepared Cartesian path commit + tick touched the allocator"
+    );
+    assert!(
+        matches!(fx.core.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Path(p)) if p.borrows_plan_slot()),
+        "prepared Cartesian path must borrow directly from the immutable plan slot"
+    );
+    assert_zero("prepared Cartesian path steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
+    stop.request();
+    let (stopped_cart, a_stop2, f_stop2) = counted(|| fx.step());
+    assert!(stopped_cart.stopped);
+    assert_eq!((a_stop2, f_stop2), (0, 0), "urgent stop ending slot-borrowed path touched the allocator");
+    b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 2, "slot reclaimed after Cartesian path terminal");
+    for _ in 0..20 {
+        if fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+        fx.step();
+    }
+    let _ = fx.core.core.hub().latest();
+
+    // 7. Accepted Jog commit (`Primitive::JointQuintic` via `fx.step()`) performs (0, 0)
+    //    allocs/frees (including inline quintic planner + stack workspace sweep) and runs
+    //    steady-state ticks with (0, 0) allocs/frees.
+    let mut jog_start = [0.0f32; MAX_DOF];
+    jog_start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut jog_goal = jog_start;
+    jog_goal[0] -= 0.05;
+    let jog_after = Primitive::JointQuintic { dof: dof as u8, start: jog_start, q: jog_goal, duration_s: 1.0 };
+    b.submit(
+        ClientId(1),
+        3,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.set(jog_after)),
+    )
+    .unwrap();
+    let (step_jog, a_jog_commit, f_jog_commit) = counted(|| fx.step());
+    assert!(step_jog.command.unwrap().1.is_ok(), "jog committed via jog_action_slice");
+    assert_eq!(
+        (a_jog_commit, f_jog_commit),
+        (0, 0),
+        "accepted jog commit + tick touched the allocator"
+    );
+    assert!(fx.core.active_trajectory.is_some());
+    assert_zero("RT-committed jog steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
+}
+
+/// Accepted commits for prepared Cartesian path, prepared replay, and jog also perform
+/// `(0, 0)` allocations/frees under the real device profile (`rebot-b601dm.json`:
+/// workspace policy + link capsules + self-collision pairs + power-budget planning enabled).
+#[test]
+fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_allocate_or_free() {
+    use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit};
+    use armd::rt_core::mailbox::MAX_DOF;
+    use armd::rt_core::ops::{
+        tool_digest_hash, CoreOps, EpisodeRef, PathKind, PlanSlot, Primitive, ReleaseFixture,
+    };
+
+    DEVICE.with(|d| d.set(true));
+    let mut inner = supervisor(false);
+    DEVICE.with(|d| d.set(false));
+    assert!(inner.workspace_policy().is_some(), "device profile must exercise workspace sweep");
+    assert!(inner.power_budget().is_some_and(|b| b.planning.enabled), "device profile must exercise power planning");
+    warm(&mut inner, 4);
+
+    let boot = BootId::fresh();
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
+    for _ in 0..4 { fx.step(); }
+    let _ = fx.core.core.hub().latest();
+    let deadline = fx.now() + Duration::from_secs(30);
+    let dof = fx.core.commanded_positions.len();
+    let tool = tool_digest_hash(&fx.core.config.active_tool.config_digest);
+
+    // 1. Accepted prepared Cartesian path commit on device profile.
+    let mut start = [0.0f32; MAX_DOF];
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut cart = PlanSlot::default();
+    for k in 0..=10 {
+        let f = k as f32 / 10.0;
+        let mut q = start;
+        q[0] += 0.04 * f;
+        cart.path.push(&q[..dof], f64::from(f)).unwrap();
+    }
+    cart.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Cartesian,
+        duration_s: 0.8,
+        power_scale: None,
+    };
+    b.submit(
+        ClientId(1),
+        1,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart).unwrap()),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile prepared path committed");
+    assert_eq!((a, f), (0, 0), "device profile prepared path commit touched allocator");
+    stop.request();
+    fx.step();
+    b.poll(|_, _| true);
+
+    // 2. Accepted prepared replay commit on device profile (exercises approach quintic + power planning + workspace sweep).
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut replay = PlanSlot::default();
+    for k in 0..=20 {
+        let f = k as f32 / 20.0;
+        let mut q = start;
+        q[0] += 0.04 * f;
+        replay.path.push(&q[..dof], k as f64).unwrap();
+    }
+    replay.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("dev_ep").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            tool_digest: tool,
+        },
+        duration_s: 0.4,
+        power_scale: None,
+    };
+    b.submit(
+        ClientId(1),
+        2,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&replay).unwrap()),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile prepared replay committed");
+    assert_eq!((a, f), (0, 0), "device profile prepared replay commit touched allocator");
+    stop.request();
+    fx.step();
+    b.poll(|_, _| true);
+
+    // 3. Accepted jog commit on device profile (exercises quintic planner + power planning + workspace sweep).
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut goal = start;
+    goal[0] -= 0.04;
+    let jog = Primitive::JointQuintic { dof: dof as u8, start, q: goal, duration_s: 0.8 };
+    b.submit(
+        ClientId(1),
+        3,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.set(jog)),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile jog committed");
+    assert_eq!((a, f), (0, 0), "device profile jog commit touched allocator");
 }

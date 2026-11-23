@@ -85,6 +85,16 @@ impl SupervisorInner {
 
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
+        self.begin_action_inner(kind, tag, true)
+    }
+
+    /// RT-safe [`Self::begin_action`]: no tag and no heap-formatted superseded message, so
+    /// starting or superseding an RT action performs zero allocations and zero frees.
+    pub(crate) fn begin_action_rt(&mut self, kind: &str) -> u64 {
+        self.begin_action_inner(kind, None, false)
+    }
+
+    fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         let now = self.now_s();
         // any new action ends a running macro (its orchestrator sees the record cancelled)
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
@@ -102,15 +112,18 @@ impl SupervisorInner {
             if old.is_running() {
                 old.state = "cancelled".into();
                 old.code = Some("SUPERSEDED".into());
-                old.message = Some(format!("Replaced by a new {kind} action"));
+                if format_superseded_msg {
+                    old.message = Some(format!("Replaced by a new {kind} action"));
+                }
                 old.finished_at = Some(now);
             }
             self.previous_action = Some((old, now + 2.0));
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
+        let state = crate::model::HolderLabel::new("running");
         self.last_action = Some(ActionStatus {
-            id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
+            id, kind: kind.into(), tag, state, code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             task: None, phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
@@ -170,7 +183,14 @@ impl SupervisorInner {
                     }
                 }
             }
-            tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
+            tracing::info!(
+                "Action {} ({}) {}{}{}",
+                id,
+                a.kind,
+                state,
+                if code.is_some() { " " } else { "" },
+                code.unwrap_or(""),
+            );
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -195,21 +215,35 @@ impl SupervisorInner {
                     };
                     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
                     if self.defer_zero_check_persist {
-                        // Hold action as running until atomic persist-before-commit completes outside the lock.
-                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                            a.state = "running".into();
-                            a.finished_at = None;
+                        if !self.persist_capacity_available {
+                            tracing::warn!("Persistence worker unavailable or saturated; failing zero_check(store_offset=true) cleanly");
+                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                a.state = "failed".into();
+                                a.code = Some("PERSIST_FAILED".into());
+                                a.message = Some("Persistence channel unavailable or saturated".into());
+                            }
+                        } else {
+                            // Hold action as running until atomic persist-before-commit completes outside the lock.
+                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                a.state = crate::model::HolderLabel::new("running");
+                                a.finished_at = None;
+                            }
+                            self.zero_check_persisting = Some(id);
+                            let gripper_limit = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx)).cloned();
+                            self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
+                                action_id: id,
+                                offset_rad,
+                                jaw_opening: candidate_jaw,
+                                base_revision: self.gripper_calib_revision,
+                                lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
+                                operator_auth,
+                                write: crate::persist::PendingWrite::new(path, text),
+                                base_gripper_policy: self.base_gripper_policy.clone().or_else(|| self.config.gripper_policy.clone()),
+                                current_calib_jaw: self.gripper_calib_jaw_opening.clone(),
+                                gripper_limit,
+                                active_tool_is_stock: self.config.active_tool.is_stock,
+                            });
                         }
-                        self.zero_check_persisting = Some(id);
-                        self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
-                            action_id: id,
-                            offset_rad,
-                            jaw_opening: candidate_jaw,
-                            base_revision: self.gripper_calib_revision,
-                            lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
-                            operator_auth,
-                            write: crate::persist::PendingWrite::new(path, text),
-                        });
                     } else {
                         let auth_ok = operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
                         if !auth_ok {
@@ -267,7 +301,7 @@ impl SupervisorInner {
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state.clone(), a.code.clone())) {
+            if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state, a.code)) {
                 self.record_macro_terminal(id, &state, code.as_deref());
             }
             self.macro_run = None;
@@ -659,6 +693,34 @@ impl SupervisorInner {
         Ok(duration + 0.5)
     }
 
+    /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
+    /// [`crate::rt_core::broker::PlanSlotRef`] as a sub-motion of macro action `id` (zero
+    /// sample/param vector copies). Returns its planned duration.
+    pub(crate) fn install_macro_prepared_path_slot(
+        &mut self,
+        id: u64,
+        dof: usize,
+        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        duration_s: f64,
+        power_scale: Option<f64>,
+    ) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
+        self.validate_prepared_joint_path(dof, &slot.path, duration_s)
+            .map_err(|_| ArmError::Motion(MotionError::InvalidCommand("invalid prepared Cartesian path".into())))?;
+        self.check_prepared_fresh(epoch)?;
+        let last = &slot.path.samples()[slot.path.len() - 1][..dof];
+        let duration = self.start_path_motion_slice(epoch, last, duration_s)?;
+        let scale = power_scale.unwrap_or(1.0);
+        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
+        let arm_dof = self.config.arm_dof();
+        self.active_trajectory = Some(ActiveTrajectory::new(
+            Some(id),
+            Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
+        ));
+        self.set_macro_sub_running(id);
+        Ok(duration + 0.5)
+    }
+
     /// Ends the running macro without its orchestrator (a guard, a fault, a newer action):
     /// records its terminal (`state`, `code`, child count) unless `finish_action` already did,
     /// so `CoreOps::action_outcome` / `action_children` answer for it.
@@ -715,8 +777,52 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Effective closing speed limit enforced by the attached driver in position-force mode
+    /// (`None` for legacy POS_VEL or drivers without a pos-force motor current cap).
+    pub(crate) fn gripper_close_speed_limit(&self) -> Option<f32> {
+        let gripper_idx = self.config.gripper_index()?;
+        self.driver.as_ref()
+            .and_then(|d| d.lock().ok())
+            .and_then(|drv| drv.motor_current_cap())
+            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
+            .and_then(|cap| cap.close_speed_rad_s)
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
+    /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
+    /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
+    /// `current_raw * 0.0019 N·m/raw`.
+    pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
+        let gripper_idx = self.config.gripper_index()?;
+        self.driver.as_ref()
+            .and_then(|d| d.lock().ok())
+            .and_then(|drv| drv.motor_current_cap())
+            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
+            .and_then(|cap| {
+                cap.ceiling_torque_nm.or_else(|| {
+                    cap.current_raw
+                        .map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW)
+                })
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        self.start_macro_gripper_within(id, request, None, false).map(|(dur, _, _)| dur)
+    }
+
+    /// Start a gripper sub-motion of macro action `id`, verifying before installation that
+    /// `max_budget_s` is positive/finite and (for pos-force closes) covers the planned duration.
+    /// Returns `(expected_duration, timeout_s, is_pos_force_close)`.
+    #[doc(hidden)]
+    pub fn start_macro_gripper_within(
+        &mut self,
+        id: u64,
+        request: GripperRequest,
+        max_budget_s: Option<f64>,
+        extend_pos_force_close_timeout: bool,
+    ) -> Result<(f64, f64, bool), ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -727,9 +833,33 @@ impl SupervisorInner {
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
+        let mut motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?.with_ceiling_torque_estimate(ceiling_est);
+        let is_pos_force_close = close_cap.is_some() && motion.is_closing();
+        if is_pos_force_close && extend_pos_force_close_timeout {
+            motion.request.timeout_s = None;
+            motion.timeout_s = motion.default_timeout_s();
+        }
         let duration = motion.expected_duration();
+        let timeout_s = motion.timeout_s;
+        if let Some(budget_s) = max_budget_s {
+            if !(budget_s.is_finite() && budget_s > 0.0) {
+                return Err(MotionError::InvalidCommand(format!(
+                    "remaining macro budget exhausted ({budget_s:.3} s <= 0)"
+                )).into());
+            }
+            if is_pos_force_close && duration > budget_s {
+                return Err(MotionError::InvalidCommand(format!(
+                    "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
+                )).into());
+            }
+        }
+        self.releasing = matches!(motion.request.command, GripperCommand::Open);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -740,7 +870,7 @@ impl SupervisorInner {
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         self.set_macro_sub_running(id);
-        Ok(duration)
+        Ok((duration, timeout_s, is_pos_force_close))
     }
 
     /// Start a joint-space quintic sub-motion of macro action `id` (sequence pose step) to
@@ -760,6 +890,9 @@ impl SupervisorInner {
         let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        if self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.gripper_hold_vel_ceiling = None;
+        }
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.target_positions = target;
@@ -825,8 +958,14 @@ impl SupervisorInner {
         }
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
+        let motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?.with_ceiling_torque_estimate(ceiling_est);
+        self.releasing = matches!(motion.request.command, GripperCommand::Open);
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
         self.servo_target = None;
@@ -892,8 +1031,14 @@ impl SupervisorInner {
             tag: None,
         };
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
+        let motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?.with_ceiling_torque_estimate(ceiling_est);
         let duration = motion.expected_duration();
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -1018,12 +1163,12 @@ impl SupervisorInner {
                 }
                 return;
             }
-            let ended: Option<(&str, &str, String)> = if superseded {
-                Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into()))
+            let ended: Option<(&str, &str)> = if superseded {
+                Some(("cancelled", "SUPERSEDED"))
             } else if run.sub == SubState::Running || run.stop_requested {
-                Some(("cancelled", "STOPPED", "Motion stopped".into()))
+                Some(("cancelled", "STOPPED"))
             } else { None };
-            if let Some((state, code, message)) = ended { self.finish_action(id, state, Some(code), Some(message), None, None, None); }
+            if let Some((state, code)) = ended { self.finish_action(id, state, Some(code), None, None, None, None); }
             return;
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
@@ -1035,7 +1180,7 @@ impl SupervisorInner {
             } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
                 self.finish_action(id, "done", None, None, None, None, None);
             } else if superseded {
-                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
             } else {
                 self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
             }
@@ -1044,7 +1189,7 @@ impl SupervisorInner {
         if carried || self.zero_check_persisting == Some(id) { return; }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
             if superseded {
-                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
                 return;
             }
             if !tick_output_accepted { return; }
@@ -1056,9 +1201,9 @@ impl SupervisorInner {
             return;
         }
         if superseded {
-            self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+            self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
         } else {
-            self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+            self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
         }
     }
 
@@ -1094,7 +1239,7 @@ impl SupervisorInner {
                     }
                     self.active_trajectory = None;
                     self.commanded_velocities.fill(0.0);
-                    self.target_positions = self.commanded_positions.clone();
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                     if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                     if macro_sub {
                         if let Some(m) = self.macro_run.as_mut() {
@@ -1127,6 +1272,12 @@ impl SupervisorInner {
                     self.commanded_accelerations.fill(0.0);
                 } else {
                     self.active_trajectory = None;
+                }
+                if action_id.is_none() && self.park_release == Some(ParkRelease::Opening) {
+                    tracing::warn!("Park release opening failed ({code}: {message}); skipping re-close and keeping held state");
+                    self.park_release = None;
+                    self.park_gripper_contact = false;
+                    self.releasing = false;
                 }
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();

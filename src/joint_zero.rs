@@ -143,6 +143,22 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(())
     }
+    fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, deadline: Instant, max_rx_frames: u16) -> Result<(u16, bool), ArmDriverError> {
+        let rx = self.inner.read_joint_states_budgeted(out, deadline, max_rx_frames)?;
+        for (i, s) in out.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Ok(rx)
+    }
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        self.inner.read_cached_joint_states_into(out)?;
+        for (i, s) in out.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
+        }
+        Some(())
+    }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_joint_targets(targets); }
         let mut m = std::mem::take(&mut self.motor_targets);
@@ -170,13 +186,28 @@ impl ArmDriver for ZeroOffsetDriver {
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.inner.motor_status_into(out) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
     fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
+    fn begin_torque_budgeted(&mut self, enabled: bool, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.begin_torque_budgeted(enabled, max_rx_frames)
+    }
     fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
+    fn poll_torque_budgeted(&mut self, deadline: Instant, max_rx_frames: u16) -> Result<crate::driver::TorqueProgress, ArmDriverError> {
+        self.inner.poll_torque_budgeted(deadline, max_rx_frames)
+    }
+    fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> { self.inner.take_last_poll_rx() }
     fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+    fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        self.inner.panic_disable_step(first, deadline)
+    }
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> { self.inner.unconfirmed_disable_joints() }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
+    fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.inner.clear_fault() }
+    fn clear_fault_budgeted(&mut self, deadline: Instant) -> Result<(), ArmDriverError> { self.inner.clear_fault_budgeted(deadline) }
     fn clear_fault_disables_joints(&self) -> Vec<usize> { self.inner.clear_fault_disables_joints() }
     fn has_known_partial_enable(&self) -> bool { self.inner.has_known_partial_enable() }
     fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }

@@ -330,6 +330,9 @@ impl From<ArmError> for ApiError {
                 crate::safety::SafetyError::NotArmed(_) => {
                     ApiError(StatusCode::PRECONDITION_FAILED, safety_err.to_string(), "NOT_ARMED".to_string())
                 }
+                crate::safety::SafetyError::OwnerTransferred => {
+                    ApiError(StatusCode::SERVICE_UNAVAILABLE, safety_err.to_string(), "OWNER_TRANSFERRED".to_string())
+                }
                 _ => ApiError(StatusCode::BAD_REQUEST, safety_err.to_string(), "SAFETY_ERROR".to_string()),
             },
             ArmError::Trajectory(traj_err) => {
@@ -533,12 +536,12 @@ pub async fn action_requires_lease(
 /// POST /api/v1/safety/e_stop
 pub async fn safety_e_stop(
     State(supervisor): State<Arc<ArmSupervisor>>,
-) -> Json<SafetyResponse> {
-    let (safety_state, epoch_id) = supervisor.trigger_e_stop().await;
-    Json(SafetyResponse {
+) -> Result<Json<SafetyResponse>, ApiError> {
+    let (safety_state, epoch_id) = supervisor.trigger_e_stop_checked().await?;
+    Ok(Json(SafetyResponse {
         safety_state,
         epoch_id,
-    })
+    }))
 }
 
 /// POST /api/v1/safety/clear_fault

@@ -84,7 +84,7 @@ fn test_sim_so101_handshake_enable_disable() {
 
     let handle = std::thread::spawn(move || {
         let cmd = sim.recv_kind("cmd");
-        assert!(cmd.enable);
+        assert_eq!(cmd.enable, Some(true));
         assert_eq!(cmd.targets, None);
         let st = SimState {
             v: 1,
@@ -112,7 +112,7 @@ fn test_sim_so101_handshake_enable_disable() {
     // Now disable
     let handle2 = std::thread::spawn(move || {
         let cmd = sim.recv_kind("cmd");
-        assert!(!cmd.enable);
+        assert_eq!(cmd.enable, Some(false));
         let st = SimState {
             v: 1,
             kind: "state".into(),

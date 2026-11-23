@@ -130,7 +130,7 @@ impl TargetFrame {
     /// `STREAM_NOT_AUTHORIZED`, `POLICY_REVOKED`, `INPUT_STALE`, `VISION_STALE`.
     pub fn check(&self, arm: ArmId, boot: BootId, now: Instant, current: &Authority, targets: &TargetAuthority) -> Option<&'static str> {
         if self.dof == 0 || usize::from(self.dof) > MAX_DOF { return Some("INVALID_COMMAND"); }
-        if self.arm != arm || self.boot != boot { return Some("WRONG_TARGET"); }
+        if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
         if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
         if let Some(code) = self.authority.admits(current) { return Some(code); }
         if targets.stream != Some(self.stream) { return Some("STREAM_NOT_AUTHORIZED"); }
@@ -350,6 +350,9 @@ mod tests {
         assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &a, &ta), None);
         assert_eq!(ok.check(ArmId(1), BootId(1), now, &a, &ta), Some("WRONG_TARGET"));
         assert_eq!(ok.check(ArmId::LOCAL, BootId(2), now, &a, &ta), Some("WRONG_TARGET"));
+        let zero_boot = TargetFrame { boot: BootId(0), ..ok };
+        assert_eq!(zero_boot.check(ArmId::LOCAL, BootId(0), now, &a, &ta), Some("WRONG_TARGET"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &Authority { stop_generation: 1, ..a }, &ta), Some("STOPPED"));
         assert_eq!(ok.check(ArmId::LOCAL, BootId(1), ok.deadline + Duration::from_millis(1), &a, &ta), Some("DEADLINE_EXPIRED"));
         assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &Authority { epoch: 1, ..a }, &ta), Some("EPOCH_MISMATCH"));
         assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &a, &TargetAuthority { stream: Some(StreamId(2)), ..ta }), Some("STREAM_NOT_AUTHORIZED"));

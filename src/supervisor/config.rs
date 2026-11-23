@@ -385,6 +385,187 @@ impl SupervisorInner {
         res
     }
 
+    /// Standalone off-thread validation and construction of a gripper calibration candidate
+    /// (`armd-persist` runs this off `armd-control` so policy cloning and error formatting never
+    /// touch the RT allocator).
+    pub(crate) fn validate_gripper_calibration_off_thread(
+        base_policy: Option<&crate::model::GripperPolicy>,
+        current_calib_jaw: Option<&crate::model::JawOpening>,
+        gripper_limit: Option<&crate::model::JointLimit>,
+        is_stock_tool: bool,
+        offset_rad: Option<f32>,
+        jaw_opening: Option<&crate::model::JawOpening>,
+    ) -> Result<crate::model::GripperPolicy, String> {
+        let base = base_policy.ok_or_else(|| "No base gripper policy available".to_string())?;
+        let offset = offset_rad.unwrap_or(0.0);
+        if !offset.is_finite() {
+            return Err("offset_rad must be finite".into());
+        }
+        let closed_rad = base.closed_rad + offset;
+        let mut open_rad = base.open_rad + offset;
+        if !closed_rad.is_finite() || !open_rad.is_finite() {
+            return Err("Computed closed_rad or open_rad is not finite".into());
+        }
+        if let Some(lim) = gripper_limit {
+            if closed_rad < lim.min_position || closed_rad > lim.max_position {
+                return Err(format!(
+                    "Calibrated closed_rad {closed_rad:.4} exceeds joint limits [{}, {}]",
+                    lim.min_position, lim.max_position
+                ));
+            }
+            open_rad = open_rad.clamp(lim.min_position, lim.max_position);
+        }
+        if (closed_rad - open_rad).abs() < 0.1 {
+            return Err(format!(
+                "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
+            ));
+        }
+        let candidate_jo = jaw_opening
+            .cloned()
+            .or_else(|| current_calib_jaw.cloned())
+            .or_else(|| base.jaw_opening.clone());
+        let mut jo = match candidate_jo {
+            Some(jo) => jo,
+            None if is_stock_tool => crate::model::JawOpening::sim_default(),
+            None => return Err("Non-stock tool requires an explicit jaw_opening calibration curve".into()),
+        };
+        let mut policy = base.clone();
+        policy.closed_rad = closed_rad;
+        policy.open_rad = open_rad;
+        if let Err(e) = jo.validate(gripper_limit) {
+            return Err(format!("Invalid jaw_opening calibration against joint limits: {e}"));
+        }
+        for pt in &mut jo.points {
+            pt[0] += offset;
+        }
+        if let Err(e) = jo.validate(None) {
+            return Err(format!("Invalid jaw_opening calibration: {e}"));
+        }
+        policy.jaw_opening = Some(jo);
+        crate::model::validate_effective_gripper_policy_ex(&policy, gripper_limit, None, false)?;
+        Ok(policy)
+    }
+
+    /// In-place swap of validated gripper calibration fields on the RT executor thread,
+    /// returning replaced heap values so the caller drops them off the RT thread.
+    pub(crate) fn swap_gripper_calibration_in_place(
+        &mut self,
+        offset_rad: f32,
+        new_policy: crate::model::GripperPolicy,
+        new_jaw: Option<crate::model::JawOpening>,
+    ) -> (Option<crate::model::GripperPolicy>, Option<crate::model::JawOpening>) {
+        let old_policy = self.config.gripper_policy.replace(new_policy);
+        let returned_policy = if self.base_gripper_policy.is_none() {
+            self.base_gripper_policy = old_policy;
+            None
+        } else {
+            old_policy
+        };
+        let old_jaw = match new_jaw {
+            Some(j) => self.gripper_calib_jaw_opening.replace(j),
+            None => None,
+        };
+        self.gripper_calib_offset = Some(offset_rad);
+        self.gripper_calib_invalid = false;
+        self.gripper_calib_revision += 1;
+        (returned_policy, old_jaw)
+    }
+
+    /// In-place terminal update for a failed or cancelled zero-check action on `armd-control`:
+    /// writes inline [`HolderLabel`] `state`/`code` without allocation and reuses preallocated
+    /// `msg_buf` (or worker-provided strings), returning any replaced/unused `(code_buf, old_msg)`
+    /// for off-thread reclamation.
+    pub(crate) fn finish_zero_check_action_in_place(
+        &mut self,
+        action_id: u64,
+        terminal_state: &str,
+        code: &str,
+        message: &str,
+        code_buf: Option<String>,
+        msg_buf: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
+            a.state = crate::model::HolderLabel::new(terminal_state);
+            a.code = Some(crate::model::HolderLabel::new(code));
+            let old_msg = match msg_buf {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf.push_str(message);
+                    a.message.replace(buf)
+                }
+                None => {
+                    if let Some(existing) = a.message.as_mut() {
+                        existing.clear();
+                        existing.push_str(message);
+                        None
+                    } else {
+                        a.message = Some(message.into());
+                        None
+                    }
+                }
+            };
+            a.finished_at = Some(now);
+            return (code_buf, old_msg);
+        }
+        (code_buf, msg_buf)
+    }
+
+    /// In-place terminal update writing inline [`HolderLabel`] `state`/`code` and moving
+    /// worker-allocated `message` into `ActionStatus` without allocating or freeing on
+    /// `armd-control`, returning `(Some(code), old_msg)` for off-thread reclamation.
+    pub(crate) fn fail_zero_check_action_owned(
+        &mut self,
+        action_id: u64,
+        code: String,
+        message: String,
+    ) -> (Option<String>, Option<String>) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
+            a.state = crate::model::HolderLabel::new("failed");
+            a.code = Some(crate::model::HolderLabel::new(&code));
+            let old_msg = a.message.replace(message);
+            a.finished_at = Some(now);
+            return (Some(code), old_msg);
+        }
+        (Some(code), Some(message))
+    }
+
+    pub(crate) fn complete_zero_check_action(
+        &mut self,
+        action_id: u64,
+        durability: crate::rt_core::config_iface::Durability,
+        warning: Option<String>,
+    ) -> Option<String> {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+            if a.is_running() {
+                a.state = crate::model::HolderLabel::new("done");
+                a.progress = 1.0;
+                a.finished_at = Some(now);
+            }
+            match durability {
+                crate::rt_core::config_iface::Durability::Durable => {
+                    a.durability_confirmed = Some(true);
+                    let prev = a.durability_warning.take();
+                    return warning.or(prev);
+                }
+                crate::rt_core::config_iface::Durability::DurableUnconfirmed => {
+                    a.durability_confirmed = Some(false);
+                    return match warning {
+                        Some(w) => a.durability_warning.replace(w),
+                        None => a.durability_warning.take(),
+                    };
+                }
+                crate::rt_core::config_iface::Durability::Volatile => {
+                    a.durability_confirmed = Some(false);
+                    return warning;
+                }
+            }
+        }
+        warning
+    }
+
     /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
     pub fn commit_gripper_calibration_candidate(&mut self, cand: GripperCalibrationCandidate) {
         self.config = cand.config;
@@ -447,20 +628,39 @@ static NEXT_CONFIG_CANDIDATE: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// proposal that is not reserved at once.
 pub const CONFIG_PROPOSAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Boot identity used by the legacy commit boundary for stamps and commit contexts (the
-/// supervisor has no boot id; proposals never leave this process run).
-const LEGACY_BOOT: crate::rt_core::broker::BootId = crate::rt_core::broker::BootId(0);
-
 /// Versioned configuration at the existing commit boundary (track B, [`crate::rt_core::config_iface`]).
 ///
 /// The worker holds the candidate payload (keyed by the reservation's `CandidateId`) and the
 /// [`Reservation`](crate::rt_core::config_iface::Reservation) token; it passes the token by
 /// value to exactly one of activate or release.
 impl SupervisorInner {
-    /// The commit context of the legacy boundary at `now` (no urgent-stop generation is
-    /// owned by the supervisor yet: 0).
+    /// Commit context at `now` threading the real non-zero process boot identity
+    /// (`BootId::process()`). Live `stop_generation` requires the executor's `StopRequests`
+    /// handle ([`Self::config_ctx_with`]); this legacy overload uses `0` until step 1 moves
+    /// executor-owned `BootId` and `StopRequests` onto `ArmCore`.
     pub fn config_ctx(&self, now: Instant) -> crate::rt_core::ops::CommitCtx {
-        crate::rt_core::ops::CommitCtx { arm: self.core.id(), boot: LEGACY_BOOT, now, stop_generation: 0 }
+        crate::rt_core::ops::CommitCtx {
+            arm: self.core.id(),
+            boot: crate::rt_core::broker::BootId::process(),
+            now,
+            stop_generation: 0,
+        }
+    }
+
+    /// Commit context at `now` threading the executor's real `boot` identity and live urgent
+    /// stop generation (`stops.current()`).
+    pub fn config_ctx_with(
+        &self,
+        boot: crate::rt_core::broker::BootId,
+        stops: &crate::rt_core::urgent::StopRequests,
+        now: Instant,
+    ) -> crate::rt_core::ops::CommitCtx {
+        crate::rt_core::ops::CommitCtx {
+            arm: self.core.id(),
+            boot,
+            now,
+            stop_generation: stops.current(),
+        }
     }
 
     /// A proposal for `domain` built from `expected_revision`, stamped at `ctx` with the
@@ -486,18 +686,42 @@ impl SupervisorInner {
         }
     }
 
+    /// Reserves a pre-stamped `proposal` against a live `ctx` (real boot identity, live stop
+    /// generation, monotonic clock), translating refusals to `ArmError`.
+    pub fn reserve_config_proposal(
+        &mut self,
+        proposal: &crate::rt_core::config_iface::ConfigProposal,
+        ctx: &crate::rt_core::ops::CommitCtx,
+    ) -> Result<crate::rt_core::config_iface::Reservation, ArmError> {
+        use crate::rt_core::config_iface::{ConfigAuthority, Reserved};
+        match ConfigAuthority::reserve(self, proposal, ctx) {
+            Reserved::Granted(r) => Ok(r),
+            Reserved::Refused { code: "REVISION_MISMATCH", current } => {
+                Err(ArmError::PolicyRevisionMismatch { expected: proposal.expected_revision, current })
+            }
+            Reserved::Refused { code, .. } => Err(config_refusal(code)),
+        }
+    }
+
     /// Reserves `domain` at `expected_revision` now ([`crate::rt_core::config_iface::ConfigAuthority::reserve`]),
     /// with the refusal as the error the existing commit path reports
     /// (`REVISION_MISMATCH` -> `POLICY_REVISION_MISMATCH`, others 409 with the code).
     pub fn reserve_config(&mut self, domain: crate::rt_core::config_iface::ConfigDomain, expected_revision: u64, lease_generation: u64) -> Result<crate::rt_core::config_iface::Reservation, ArmError> {
-        use crate::rt_core::config_iface::{ConfigAuthority, Reserved};
         let ctx = self.config_ctx(Instant::now());
         let proposal = self.config_proposal(domain, expected_revision, lease_generation, &ctx);
-        match ConfigAuthority::reserve(self, &proposal, &ctx) {
-            Reserved::Granted(r) => Ok(r),
-            Reserved::Refused { code: "REVISION_MISMATCH", current } => Err(ArmError::PolicyRevisionMismatch { expected: expected_revision, current }),
-            Reserved::Refused { code, .. } => Err(config_refusal(code)),
-        }
+        self.reserve_config_proposal(&proposal, &ctx)
+    }
+
+    /// Reserves a pre-stamped `proposal` against live `ctx`, applies the candidate and
+    /// activates it (`Volatile`).
+    pub fn commit_config_proposal<T>(
+        &mut self,
+        proposal: &crate::rt_core::config_iface::ConfigProposal,
+        ctx: &crate::rt_core::ops::CommitCtx,
+        apply: impl FnOnce(&mut Self) -> Result<T, ArmError>,
+    ) -> Result<(T, u64), ArmError> {
+        let r = self.reserve_config_proposal(proposal, ctx)?;
+        self.activate_config_candidate(r, apply)
     }
 
     /// Reports the reservation's candidate renamed into place
@@ -579,6 +803,9 @@ fn config_refusal(code: &'static str) -> ArmError {
             "CONFIG_BUSY" => "another configuration change is being activated or reconciled".into(),
             "EPOCH_MISMATCH" => "Command epoch is no longer current".into(),
             "LEASE_LOST" => "This connection lost the lease while persisting configuration".into(),
+            "STOPPED" => "configuration change overtaken by an authorized stop".into(),
+            "WRONG_TARGET" => "configuration proposal targets another arm or stale boot identity".into(),
+            "DEADLINE_EXPIRED" => "configuration proposal deadline expired before reservation".into(),
             _ => format!("configuration change refused: {code}"),
         },
     }

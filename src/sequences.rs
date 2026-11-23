@@ -611,9 +611,15 @@ pub fn expected_duration(inner: &SupervisorInner, steps: &[(usize, PinnedStep)],
                         (Some(g), Some(policy)) => {
                             let request = gripper_request(*action, *fraction);
                             let start = q.as_ref().map_or(inner.commanded_positions[g], |q| q[g]);
-                            let m = crate::motion::GripperMotion::new(request, policy, inner.config.limits[g].clone(), start, g);
-                            if let Some(q) = q.as_mut() { q[g] = m.target; }
-                            m.expected_duration()
+                            match crate::motion::GripperMotion::try_with_close_speed_limit(
+                                request, policy, inner.config.limits[g].clone(), start, g, inner.gripper_close_speed_limit(),
+                            ) {
+                                Ok(m) => {
+                                    if let Some(q) = q.as_mut() { q[g] = m.target; }
+                                    m.expected_duration()
+                                }
+                                Err(_) => 0.0,
+                            }
                         }
                         _ => 0.0,
                     };

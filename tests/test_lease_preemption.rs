@@ -179,6 +179,7 @@ async fn test_preempt_lease_cooldown_enforcement() {
         PreemptError::Cooldown(remaining_ms) => {
             assert!(remaining_ms > 0 && remaining_ms <= 3000);
         }
+        other => panic!("expected PreemptError::Cooldown, got {other:?}"),
     }
 
     // 4. Simulate elapsed 3.1s -> cooldown clears and conn:3 succeeds

@@ -1197,7 +1197,8 @@ pub struct DamiaoGripperDrive {
     pub current_ceiling_raw: u16,
     /// Speed limit of closing frames (rad/s).
     pub close_speed_rad_s: f32,
-    /// The ceiling's torque equivalent was measured; false: `current_ceiling_raw` is a placeholder.
+    /// The ceiling's torque equivalent was measured (commissioning); false: uncalibrated
+    /// (estimate or default, not externally commissioned).
     #[serde(default)]
     pub calibrated: bool,
     /// Measured torque equivalent of the ceiling (N·m), from commissioning.
@@ -1210,12 +1211,17 @@ pub struct DamiaoGripperDrive {
 }
 
 impl DamiaoGripperDrive {
-    /// B601-DM J7 default: position-force with raw 220, the value armd sent this gripper before
-    /// 2026-11-06 (2.2 % of the maximum phase current). UNCALIBRATED placeholder: its torque
-    /// equivalent was never measured (2.2 % of the DM-J4310-2EC datasheet peak of 7 N·m would
-    /// be about 0.15 N·m; datasheet value, not verified on this unit).
+    /// Feedback-equivalent torque ratio (N·m per raw current unit) measured from office B601-DM J7
+    /// stall plateaus on 2026-11-23 (raw 220 -> 0.42 N·m, raw 300 -> 0.55–0.57 N·m).
+    pub const FEEDBACK_EQUIVALENT_NM_PER_RAW: f32 = 0.0019;
+
+    /// B601-DM J7 default: position-force with raw 460 (4.6 % of maximum phase current),
+    /// `calibrated: false`. On 2026-11-23 (office B601-DM, build 1.6.0-dev8j7 / 027e46c),
+    /// stalled feedback-torque plateaus measured 0.42 N·m at raw 220 and 0.55-0.57 N·m at raw 300
+    /// (~0.0019 N·m/raw, no external reference), making raw 460 a feedback-equivalent ~0.87 N·m
+    /// estimate above the 0.79 N·m free-motion peak near full open, not an external calibration.
     pub fn rebot_dm() -> Self {
-        Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 220, close_speed_rad_s: 0.30,
+        Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 460, close_speed_rad_s: 0.30,
             calibrated: false, ceiling_torque_nm: None, torque_reference: None }
     }
 
@@ -1224,12 +1230,45 @@ impl DamiaoGripperDrive {
         Self { mode: DamiaoGripperMode::PosVel, ..Self::rebot_dm() }
     }
 
+    /// Wire speed quantization from `f64` (0.01 rad/s units, floored in f64 so wire speed never
+    /// exceeds `speed_rad_s`; non-finite -> 0). Single authority shared by protocol encoding,
+    /// config validation, driver checks and gripper motion planning.
+    pub fn quantize_vel_raw_f64(speed_rad_s: f64) -> u16 {
+        if !speed_rad_s.is_finite() { return 0; }
+        (speed_rad_s.abs() * 100.0).floor().clamp(0.0, f64::from(u16::MAX)) as u16
+    }
+
+    /// Wire speed quantization from `f32` (delegates to [`Self::quantize_vel_raw_f64`]).
+    pub fn quantize_vel_raw(speed_rad_s: f32) -> u16 {
+        Self::quantize_vel_raw_f64(f64::from(speed_rad_s))
+    }
+
+    /// Smallest `f32` that encodes back to `raw` (preventing double-flooring when the planned
+    /// trajectory velocity is re-encoded by `pos_force_vel_raw`).
+    pub fn wire_speed_f32(raw: u16) -> f32 {
+        if raw == 0 { return 0.0; }
+        let v = (f64::from(raw) / 100.0) as f32;
+        if Self::quantize_vel_raw(v) < raw { v.next_up() } else { v }
+    }
+
+    /// Largest `f32` not exceeding `raw * 0.01` rad/s: used for trajectory stepping so
+    /// `bounded_servo_step` never advances the target faster than the wire speed `raw * 0.01`.
+    pub fn step_speed_f32(raw: u16) -> f32 {
+        if raw == 0 { return 0.0; }
+        let exact = f64::from(raw) / 100.0;
+        let v = exact as f32;
+        if f64::from(v) > exact { v.next_down() } else { v }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=10_000).contains(&self.current_ceiling_raw) {
             return Err("damiao_gripper.current_ceiling_raw must be 1..=10000".into());
         }
         if !(self.close_speed_rad_s.is_finite() && self.close_speed_rad_s > 0.0) {
             return Err("damiao_gripper.close_speed_rad_s must be positive".into());
+        }
+        if self.mode == DamiaoGripperMode::PosForce && Self::quantize_vel_raw(self.close_speed_rad_s) == 0 {
+            return Err("damiao_gripper.close_speed_rad_s encodes to 0 on the wire (must quantize to >= 0.01 rad/s)".into());
         }
         if self.calibrated && !self.ceiling_torque_nm.is_some_and(|t| t.is_finite() && t > 0.0) {
             return Err("damiao_gripper: calibrated needs a positive ceiling_torque_nm".into());
@@ -2137,6 +2176,15 @@ impl ArmConfig {
                 return Err(format!("Joint {} max_velocity must be positive finite", i));
             }
         }
+        if let (Some(g), Some(dg)) = (self.gripper_index(), &self.damiao_gripper) {
+            if dg.mode == DamiaoGripperMode::PosForce
+                && self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0)
+            {
+                return Err(format!(
+                    "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                ));
+            }
+        }
         if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {
             return Err("Home positions must be finite and within joint limits".into());
         }
@@ -2388,6 +2436,18 @@ impl From<&str> for HolderLabel {
     fn from(s: &str) -> Self { Self::new(s) }
 }
 
+impl From<String> for HolderLabel {
+    fn from(s: String) -> Self { Self::new(&s) }
+}
+
+impl From<&String> for HolderLabel {
+    fn from(s: &String) -> Self { Self::new(s) }
+}
+
+impl AsRef<str> for HolderLabel {
+    fn as_ref(&self) -> &str { self.as_str() }
+}
+
 impl std::fmt::Debug for HolderLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
 }
@@ -2398,6 +2458,22 @@ impl std::fmt::Display for HolderLabel {
 
 impl PartialEq<str> for HolderLabel {
     fn eq(&self, other: &str) -> bool { self.as_str() == other }
+}
+
+impl PartialEq<&str> for HolderLabel {
+    fn eq(&self, other: &&str) -> bool { self.as_str() == *other }
+}
+
+impl PartialEq<HolderLabel> for &str {
+    fn eq(&self, other: &HolderLabel) -> bool { *self == other.as_str() }
+}
+
+impl PartialEq<String> for HolderLabel {
+    fn eq(&self, other: &String) -> bool { self.as_str() == other.as_str() }
+}
+
+impl PartialEq<HolderLabel> for String {
+    fn eq(&self, other: &HolderLabel) -> bool { self.as_str() == other.as_str() }
 }
 
 impl Serialize for HolderLabel {

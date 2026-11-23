@@ -319,6 +319,30 @@ pub trait CanTransport: Send {
     /// Receive a CAN frame
     fn receive(&mut self) -> Result<CanFrame, TransportError>;
 
+    /// Receive a CAN frame together with its optional transport-measured monotonic receive time
+    /// (on the same clock domain as [`Self::clock`], or `Instant::now()` when `clock()` is `None`).
+    /// Transports that do not capture arrival timestamps inherit the default (`None`) and callers
+    /// fall back to the host decode instant.
+    fn receive_timestamped(
+        &mut self,
+    ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+        self.receive().map(|f| (f, None))
+    }
+
     /// Flush pending CAN frames
     fn flush(&mut self) -> Result<(), TransportError>;
+
+    /// True when [`Self::flush`] is non-blocking / time-bounded (e.g. SocketCAN or in-memory
+    /// test transports). Serial transports (`SlcanTransport`) default to `false` so bounded
+    /// RT maintenance fails closed rather than stalling the executor thread.
+    fn supports_bounded_flush(&self) -> bool {
+        false
+    }
+
+    /// True when [`Self::receive`], [`Self::transmit`], and [`Self::flush`] are all non-blocking
+    /// and safe to drive directly from the synchronous RT executor (`armd-control`).
+    /// Blocking serial transports (`SlcanTransport`) default to `false`.
+    fn supports_nonblocking_rt(&self) -> bool {
+        false
+    }
 }

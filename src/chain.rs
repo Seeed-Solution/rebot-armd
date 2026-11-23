@@ -998,7 +998,62 @@ impl WorkspaceFailure {
     }
 }
 
-/// The vectors of a [`WorkspaceEvaluator`], kept between evaluators
+/// Stack-backed small vector for zero-allocation workspace evaluators (falls back to `Vec`
+/// only when a configuration exceeds `N`).
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+enum SmallBuf<T: Copy, const N: usize> {
+    Stack { data: [T; N], len: usize },
+    Heap(Vec<T>),
+}
+
+impl<T: Copy, const N: usize> SmallBuf<T, N> {
+    fn new(zero: T, recycled: &mut Vec<T>, needed: usize) -> Self {
+        if needed <= N {
+            Self::Stack { data: [zero; N], len: 0 }
+        } else {
+            let mut v = std::mem::take(recycled);
+            v.clear();
+            v.reserve(needed);
+            Self::Heap(v)
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, val: T) {
+        match self {
+            Self::Stack { data, len } if *len < N => {
+                data[*len] = val;
+                *len += 1;
+            }
+            Self::Stack { data, len } => {
+                let mut v = Vec::with_capacity(N * 2);
+                v.extend_from_slice(&data[..*len]);
+                v.push(val);
+                *self = Self::Heap(v);
+            }
+            Self::Heap(v) => v.push(val),
+        }
+    }
+
+    fn recycle_into(self, dst: &mut Vec<T>) {
+        if let Self::Heap(v) = self {
+            *dst = v;
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> std::ops::Deref for SmallBuf<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Stack { data, len } => &data[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+}
+
+/// The overflow vectors of a [`WorkspaceEvaluator`], kept between evaluators
 /// ([`WorkspaceEvaluator::new_with_tcp_in`] / [`WorkspaceEvaluator::recycle`]).
 #[derive(Debug, Default)]
 pub struct EvalBufs {
@@ -1019,16 +1074,16 @@ pub struct WorkspaceEvaluator<'a> {
     floor: f64,
     box_lo: [f64; 3],
     box_hi: [f64; 3],
-    keepouts: Vec<([f64; 3], [f64; 3])>,
-    end_locals: Vec<[f64; 3]>,
+    keepouts: SmallBuf<([f64; 3], [f64; 3]), 16>,
+    end_locals: SmallBuf<[f64; 3], 16>,
     tcp_offset: [f64; 3],
     has_tcp_reach: bool,
     has_cam: bool,
-    capsules: Vec<(Option<FrameRef>, [f64; 3], [f64; 3], f64)>,
-    self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
+    capsules: SmallBuf<(Option<FrameRef>, [f64; 3], [f64; 3], f64), { crate::model::MAX_LINK_CAPSULES }>,
+    self_pairs: SmallBuf<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>, 32>,
     self_collision_min_clearance: f64,
     pub end_reach: [f64; MAX_CHAIN_JOINTS],
-    pub cap_reaches: Vec<[f64; MAX_CHAIN_JOINTS]>,
+    cap_reaches: SmallBuf<[f64; MAX_CHAIN_JOINTS], { crate::model::MAX_LINK_CAPSULES }>,
     pub slots_per_geom: usize,
     pub num_end_pts: usize,
     pub num_geoms: usize,
@@ -1057,8 +1112,9 @@ impl<'a> WorkspaceEvaluator<'a> {
         Self::new_with_tcp_in(model, ws, cam, tcp_offset, &mut EvalBufs::default())
     }
 
-    /// [`Self::new_with_tcp`] with its vectors taken from `bufs` (no allocation once they
-    /// have the capacity); [`Self::recycle`] gives them back. The control tick's form.
+    /// [`Self::new_with_tcp`] using stack storage for standard profiles (zero heap allocations
+    /// even on first call) and reusing `bufs` when counts exceed inline bounds;
+    /// [`Self::recycle`] returns any spilled heap buffers.
     pub fn new_with_tcp_in(
         model: &'a ArmModel,
         ws: &'a crate::model::WorkspacePolicy,
@@ -1066,14 +1122,13 @@ impl<'a> WorkspaceEvaluator<'a> {
         tcp_offset: [f64; 3],
         bufs: &mut EvalBufs,
     ) -> Self {
-        let mut end_locals = std::mem::take(&mut bufs.end_locals);
-        end_locals.clear();
-        end_locals.reserve(1 + ws.check_points_end_m.len() + 1);
+        let has_cam = cam.offset_m.is_some();
+        let need_end = 1 + ws.check_points_end_m.len() + usize::from(has_cam);
+        let mut end_locals = SmallBuf::new([0.0; 3], &mut bufs.end_locals, need_end);
         end_locals.push([0.0; 3]);
         for p in &ws.check_points_end_m {
             end_locals.push(p.map(f64::from));
         }
-        let has_cam = cam.offset_m.is_some();
         if let Some(o) = cam.offset_m {
             end_locals.push(o.map(f64::from));
         }
@@ -1084,12 +1139,8 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
         let end_reach = model.joint_reach(max_end_off);
 
-        let mut capsules = std::mem::take(&mut bufs.capsules);
-        capsules.clear();
-        capsules.reserve(ws.link_capsules.len());
-        let mut cap_reaches = std::mem::take(&mut bufs.cap_reaches);
-        cap_reaches.clear();
-        cap_reaches.reserve(ws.link_capsules.len());
+        let mut capsules = SmallBuf::new((None, [0.0; 3], [0.0; 3], 0.0), &mut bufs.capsules, ws.link_capsules.len());
+        let mut cap_reaches = SmallBuf::new([0.0; MAX_CHAIN_JOINTS], &mut bufs.cap_reaches, ws.link_capsules.len());
         for c in &ws.link_capsules {
             let fr = model.resolve_frame(&c.frame);
             let a = c.a_m.map(f64::from);
@@ -1104,10 +1155,13 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
 
         let arm_dof = model.arm_dof();
-        let mut self_pairs = std::mem::take(&mut bufs.self_pairs);
-        self_pairs.clear();
+        let need_pairs = if ws.self_collision_enabled && !ws.link_capsules.is_empty() {
+            ws.self_collision_pairs.len()
+        } else {
+            0
+        };
+        let mut self_pairs = SmallBuf::new(None, &mut bufs.self_pairs, need_pairs);
         if ws.self_collision_enabled && !ws.link_capsules.is_empty() {
-            self_pairs.reserve(ws.self_collision_pairs.len());
             for [id_a, id_b] in &ws.self_collision_pairs {
                 let ia = ws.link_capsules.iter().position(|c| c.id == *id_a);
                 let ib = ws.link_capsules.iter().position(|c| c.id == *id_b);
@@ -1128,9 +1182,10 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
 
-        let mut keepouts = std::mem::take(&mut bufs.keepouts);
-        keepouts.clear();
-        keepouts.extend(ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))));
+        let mut keepouts = SmallBuf::new(([0.0; 3], [0.0; 3]), &mut bufs.keepouts, ws.keepout_boxes.len());
+        for b in &ws.keepout_boxes {
+            keepouts.push((b.min_m.map(f64::from), b.max_m.map(f64::from)));
+        }
 
         let num_end_pts = end_locals.len();
         let num_geoms = num_end_pts + capsules.len();
@@ -1169,13 +1224,13 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
     }
 
-    /// Gives the evaluator's vectors back to `bufs` for the next [`Self::new_with_tcp_in`].
+    /// Gives any spilled heap vectors back to `bufs` for the next [`Self::new_with_tcp_in`].
     pub fn recycle(self, bufs: &mut EvalBufs) {
-        bufs.end_locals = self.end_locals;
-        bufs.capsules = self.capsules;
-        bufs.cap_reaches = self.cap_reaches;
-        bufs.self_pairs = self.self_pairs;
-        bufs.keepouts = self.keepouts;
+        self.end_locals.recycle_into(&mut bufs.end_locals);
+        self.capsules.recycle_into(&mut bufs.capsules);
+        self.cap_reaches.recycle_into(&mut bufs.cap_reaches);
+        self.self_pairs.recycle_into(&mut bufs.self_pairs);
+        self.keepouts.recycle_into(&mut bufs.keepouts);
     }
 
     pub fn with_escape_tol(mut self, escape_tol: f64) -> Self {
@@ -1676,5 +1731,132 @@ impl<'a> WorkspaceEvaluator<'a> {
             c_prev = c_next;
         }
         Ok(samples)
+    }
+
+    /// Zero-allocation chronological adaptive sweep of a [`crate::trajectory::MultiJointQuinticTrajectory`]
+    /// over 21 uniform knots (`0..=20`), matching [`Self::sweep_knots`] + monotonic path check
+    /// using only fixed stack buffers (no `Vec<Vec<f32>>`, no heap stack).
+    pub fn check_quintic_inline(
+        &self,
+        traj: &crate::trajectory::MultiJointQuinticTrajectory,
+        budget: usize,
+        phase: &str,
+    ) -> Result<(), WorkspaceFailure> {
+        const KNOTS: usize = 20;
+        const MAX_DEPTH: usize = 64;
+        let dof = traj.polynomials.len();
+        let arm_dof = self.model.arm_dof();
+        if dof > crate::trajectory::INLINE_POLYS || arm_dof > MAX_CHAIN_JOINTS {
+            return Err(WorkspaceFailure::invalid(phase, "dof exceeds inline sweep capacity"));
+        }
+        let mut q_buf = [0.0f32; crate::trajectory::INLINE_POLYS];
+        let mut tr_buf = [0.0f64; MAX_CHAIN_JOINTS];
+        traj.sample_positions_into(0.0, &mut q_buf[..dof]);
+        let mut c_prev = self.alloc_buf();
+        self.eval_into(&q_buf[..dof], &mut c_prev, phase)?;
+        let mut min_depths = self.init_min_depths(&c_prev);
+        let mut c_next = self.alloc_buf();
+        let mut c_mid = self.alloc_buf();
+        let mut evals = 0usize;
+        let mut pending = [(0.0f64, 0.0f64); MAX_DEPTH];
+        let mut t_prev = 0.0f64;
+
+        for k in 1..=KNOTS {
+            let t_knot = traj.duration * k as f64 / KNOTS as f64;
+            let mut sp = 0usize;
+            let mut cur_t0 = t_prev;
+            let mut cur_t1 = t_knot;
+            traj.sample_positions_into(cur_t1, &mut q_buf[..dof]);
+            self.eval_into(&q_buf[..dof], &mut c_next, phase)?;
+            self.check_readonly(&c_next, &min_depths, phase)?;
+
+            loop {
+                traj.travel_bound_into(cur_t0, cur_t1, &mut tr_buf[..arm_dof]);
+                let Some((slot, d_max, min_d)) = self.interval_needs_split(&c_prev, &c_next, &min_depths, &tr_buf[..arm_dof], arm_dof)? else {
+                    self.check_and_advance(&c_next, &mut min_depths, phase)?;
+                    std::mem::swap(&mut c_prev, &mut c_next);
+                    if sp == 0 {
+                        break;
+                    }
+                    sp -= 1;
+                    let (nt0, nt1) = pending[sp];
+                    cur_t0 = nt0;
+                    cur_t1 = nt1;
+                    traj.sample_positions_into(cur_t1, &mut q_buf[..dof]);
+                    self.eval_into(&q_buf[..dof], &mut c_next, phase)?;
+                    self.check_readonly(&c_next, &min_depths, phase)?;
+                    continue;
+                };
+                if cur_t1 - cur_t0 <= 1e-9 {
+                    return Err(self.describe_failure(slot, -d_max, d_max, min_d, phase));
+                }
+                if evals >= budget || sp >= MAX_DEPTH {
+                    return Err(self.budget_failure(budget, phase));
+                }
+                evals += 1;
+                let tm = 0.5 * (cur_t0 + cur_t1);
+                traj.sample_positions_into(tm, &mut q_buf[..dof]);
+                self.eval_into(&q_buf[..dof], &mut c_mid, phase)?;
+                self.check_readonly(&c_mid, &min_depths, phase)?;
+                pending[sp] = (tm, cur_t1);
+                sp += 1;
+                cur_t1 = tm;
+                std::mem::swap(&mut c_next, &mut c_mid);
+            }
+            t_prev = t_knot;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ArmConfig, KeepoutBox};
+    use crate::trajectory::TrajectoryPlanner;
+
+    #[test]
+    fn check_quintic_inline_matches_sweep_knots_on_valid_and_violating_paths() {
+        let mut cfg: ArmConfig = serde_json::from_reader(
+            std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json")).unwrap(),
+        )
+        .unwrap();
+        let dof = cfg.dof;
+        let zeros = vec![0.0; dof];
+        let start = cfg.home_positions.clone();
+
+        // 1. Valid short move inside workspace
+        let mut ok_goal = start.clone();
+        ok_goal[0] += 0.08;
+        let traj_ok = TrajectoryPlanner::plan(&start, &zeros, &ok_goal, &zeros, Some(0.6), &cfg.limits).unwrap();
+        let ws = cfg.workspace.as_ref().unwrap();
+        let eval = WorkspaceEvaluator::new_with_tcp(&cfg.arm_model, ws, &cfg.camera_mount, cfg.tcp_offset)
+            .with_escape_tol(k::WORKSPACE_EPS);
+        let knots: Vec<f64> = (0..=20).map(|i| traj_ok.duration * i as f64 / 20.0).collect();
+        let ref_ok = eval.sweep_knots(&|t| traj_ok.sample(t).positions, &|a, b| traj_ok.travel_bound(a, b), &knots, 128, "sweep");
+        let inl_ok = eval.check_quintic_inline(&traj_ok, 128, "sweep");
+        assert!(ref_ok.is_ok() && inl_ok.is_ok(), "ref={ref_ok:?} inl={inl_ok:?}");
+
+        // 2. Keepout box placed directly on the midpoint of a swing in J1
+        let mut swing_goal = start.clone();
+        swing_goal[0] += 0.5;
+        let traj_bad = TrajectoryPlanner::plan(&start, &zeros, &swing_goal, &zeros, Some(0.8), &cfg.limits).unwrap();
+        let mid_q = traj_bad.sample(traj_bad.duration * 0.5).positions;
+        let mid_p = cfg.arm_model.fk(&k::q6(&mid_q)).p;
+        cfg.workspace.as_mut().unwrap().keepout_boxes.push(KeepoutBox {
+            name: "mid_block".into(),
+            min_m: [mid_p[0] as f32 - 0.03, mid_p[1] as f32 - 0.03, mid_p[2] as f32 - 0.03],
+            max_m: [mid_p[0] as f32 + 0.03, mid_p[1] as f32 + 0.03, mid_p[2] as f32 + 0.03],
+        });
+        let ws2 = cfg.workspace.as_ref().unwrap();
+        let eval2 = WorkspaceEvaluator::new_with_tcp(&cfg.arm_model, ws2, &cfg.camera_mount, cfg.tcp_offset)
+            .with_escape_tol(k::WORKSPACE_EPS);
+        let knots2: Vec<f64> = (0..=20).map(|i| traj_bad.duration * i as f64 / 20.0).collect();
+        let ref_bad = eval2.sweep_knots(&|t| traj_bad.sample(t).positions, &|a, b| traj_bad.travel_bound(a, b), &knots2, 128, "sweep");
+        let inl_bad = eval2.check_quintic_inline(&traj_bad, 128, "sweep");
+        let ref_err = ref_bad.expect_err("reference sweep rejects keepout intrusion");
+        let inl_err = inl_bad.expect_err("inline sweep rejects keepout intrusion");
+        assert_eq!(inl_err.detail.constraint_id, ref_err.detail.constraint_id);
+        assert_eq!(inl_err.detail.geometry_id, ref_err.detail.geometry_id);
     }
 }

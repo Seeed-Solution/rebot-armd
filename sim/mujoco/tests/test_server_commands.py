@@ -51,6 +51,42 @@ def test_malformed_commands_change_nothing():
         sim.sock.close()
 
 
+def test_target_only_command_preserves_torque_state():
+    sim = Simulator(free_udp_port())
+    try:
+        good = [pos(0.2 * i) for i in range(DOF)]
+        # Disabled peer stays disabled on target-only packet (no `enable` field or `enable: null`).
+        assert not sim.motors.enabled
+        sim.handle(
+            json.dumps({"v": PROTOCOL_VERSION, "type": "cmd", "seq": 1, "targets": good}).encode(),
+            ("127.0.0.1", 1),
+        )
+        assert sim.ack == 1 and not sim.motors.enabled and sim.rejected == 0
+        sim.handle(
+            json.dumps({"v": PROTOCOL_VERSION, "type": "cmd", "seq": 2, "enable": None, "targets": good}).encode(),
+            ("127.0.0.1", 1),
+        )
+        assert sim.ack == 2 and not sim.motors.enabled and sim.rejected == 0
+
+        # Explicit enable energizes; subsequent target-only packet preserves enabled state.
+        sim.handle(cmd(seq=3, enable=True), ("127.0.0.1", 1))
+        assert sim.ack == 3 and sim.motors.enabled
+        sim.handle(
+            json.dumps({"v": PROTOCOL_VERSION, "type": "cmd", "seq": 4, "targets": good}).encode(),
+            ("127.0.0.1", 1),
+        )
+        assert sim.ack == 4 and sim.motors.enabled
+
+        # Empty cmd (neither enable nor targets) is rejected.
+        sim.handle(
+            json.dumps({"v": PROTOCOL_VERSION, "type": "cmd", "seq": 5}).encode(),
+            ("127.0.0.1", 1),
+        )
+        assert sim.ack == 4 and sim.rejected == 1
+    finally:
+        sim.sock.close()
+
+
 def test_j2_j3_rest_on_their_stops_at_home():
     # at q = 0 (J2 / J3 upper stops) gravity pushes both into the stop: it carries the load
     # and the motor torque stays near 0, as on the real arm; off the stop the motor holds it

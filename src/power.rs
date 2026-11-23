@@ -708,11 +708,11 @@ impl SupervisorInner {
 pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::chain::ArmModel, dof: usize,
     traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
     limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
-        use crate::power_plan::{plan_scale, quintic_samples};
+        use crate::power_plan::plan_scale_quintic;
         let Some(b) = budget.filter(|b| b.planning.enabled) else { return Ok((traj, None)); };
         let t0 = std::time::Instant::now();
         let p = b.planning;
-        let fit = |t: &crate::trajectory::MultiJointQuinticTrajectory| plan_scale(b, arm, &quintic_samples(&p, t, dof));
+        let fit = |t: &crate::trajectory::MultiJointQuinticTrajectory| plan_scale_quintic(b, arm, dof, t);
         let mut s = match fit(&traj) {
             Ok(f) if f.scale >= 1.0 => return Ok((traj, Some(1.0))),
             Ok(f) => f.scale,
@@ -720,10 +720,17 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
             Err(_) => p.min_scale,
         };
         let full = traj.duration;
-        let zeros = vec![0.0; target.len()];
+        let zero_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let zero_vec;
+        let zeros: &[f32] = if target.len() <= zero_buf.len() {
+            &zero_buf[..target.len()]
+        } else {
+            zero_vec = vec![0.0; target.len()];
+            &zero_vec
+        };
         // from rest the longer quintic is an exact time scaling of this one: no re-check
         if v0.iter().all(|v| v.abs() < 1e-6) {
-            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, &zeros, Some(full / s), limits)?;
+            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, zeros, Some(full / s), limits)?;
             let scale = full / t2.duration;
             tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
             return Ok((t2, Some(scale)));
@@ -731,7 +738,7 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
         // with a start velocity the longer quintic is not an exact time scaling: re-check it
         let mut best = None;
         for _ in 0..6 {
-            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, &zeros, Some(full / s), limits)?;
+            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, zeros, Some(full / s), limits)?;
             let ok = fit(&t2).is_ok_and(|f| f.scale >= 0.999);
             best = Some(t2);
             if ok || s <= p.min_scale + 1e-9 { break; }

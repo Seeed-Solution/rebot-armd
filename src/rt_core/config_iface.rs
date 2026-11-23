@@ -287,6 +287,19 @@ impl ConfigHold {
         }
     }
 
+    /// Unconditionally enters `HoldState::Reconciling` for `domain`, inhibiting motion even
+    /// when another hold occupies the slot (fail-closed after an ambiguous post-rename error).
+    pub fn force_reconcile(&mut self, domain: ConfigDomain, active: u64) {
+        self.held = Some(HeldConfig {
+            grant: None,
+            domain,
+            from: active,
+            candidate: None,
+            inhibits_motion: true,
+            state: HoldState::Reconciling,
+        });
+    }
+
     pub fn finish_reconcile(&mut self, domain: ConfigDomain) -> bool {
         if self.held.is_some_and(|h| h.domain == domain && h.state == HoldState::Reconciling) { self.held = None; return true; }
         false

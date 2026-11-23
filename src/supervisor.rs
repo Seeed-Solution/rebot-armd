@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -29,6 +29,7 @@ mod actions;
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
+pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -96,12 +97,21 @@ impl From<crate::recording::StoreError> for ArmError {
 pub enum PreemptError {
     #[error("Preemption cooldown active: {0}ms remaining")]
     Cooldown(u64),
+    #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
+    OwnerTransferred,
 }
 
-/// J7 stall latch: |τ7| at or above this (N·m) with the jaw still, for 6 ticks.
-/// Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's TMAX
-/// is 10, so the same physical torque is 0.80 × 10 / 18.
+/// J7 stall latch: |τ7| at or above this (N·m) with the jaw making no progress over the
+/// stall window. Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's
+/// TMAX is 10, so the same physical torque is 0.80 × 10 / 18.
 pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
+/// Minimum measured net position progress (rad) along the commanded direction proving the jaw
+/// is advancing under load (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7,
+/// well below the 0.0057 rad median 50 Hz closing tick).
+pub const GRIPPER_STALL_PROGRESS_EPS: f32 = 0.002;
+/// Hard upper bound (s) on the stall-detection window so a real jam fails within <= 0.5 s after
+/// progress stops, independent of the action timeout.
+pub const GRIPPER_STALL_WINDOW_MAX_S: f64 = 0.50;
 /// J7 stall release: |τ7| below this (N·m) for 6 ticks (formerly 0.40 at TMAX 18;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
@@ -312,6 +322,10 @@ pub struct SupervisorInner {
     pub servo_blocked_hold: bool,
     /// Persistent monotonic escape baseline across a servo stream & its braking phase, tagged with `workspace_revision`.
     pub servo_ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    /// Persistent velocity ceiling (rad/s) for the gripper's current hold target, set when a
+    /// `GripperMotion` starts/steps and retained across completion and post-completion holds
+    /// until replaced by a new gripper motion, an explicit non-gripper J7 move, or torque-off.
+    pub(crate) gripper_hold_vel_ceiling: Option<f32>,
     pub is_torqued: bool,
     pub pending_rearm: bool,
     pub active_trajectory: Option<ActiveTrajectory>,
@@ -352,6 +366,9 @@ pub struct SupervisorInner {
     pub gripper_stalled: bool,
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
+    pub gripper_stall_anchor_pos: Option<f32>,
+    pub gripper_stall_anchor_dir: f32,
+    pub gripper_stall_window_s: f64,
     pub gripper_stall_sign: f32,
     pub gripper_prev_hw_overload: bool,
     /// The stall latch was set (or refreshed) by the gripper torque cap.
@@ -541,6 +558,46 @@ pub struct SupervisorInner {
     pub tool_commissioning_confirmed_at: Option<String>,
     /// Monotonic revision for tool commissioning state.
     pub tool_commissioning_revision: u64,
+    /// Single-pass Step-2 hardware poll state consumed once by `tick_control` in the same release.
+    pub(crate) pending_rx_poll: PendingRxPoll,
+    /// Authorized-stop generations wired into `estop_gate()` when owned by an RT executor.
+    pub(crate) stop_requests: Option<crate::rt_core::urgent::StopRequests>,
+    /// True on the empty shell left inside `ArmSupervisor::inner` after executor ownership transfer.
+    pub(crate) detached: bool,
+    /// True when deferred zero-check persistence can accept a job (false if the dedicated
+    /// persistence worker channel is saturated or disconnected).
+    pub persist_capacity_available: bool,
+    /// True once ownership has been transferred to the synchronous RT executor thread
+    /// (`armd-control`); internal driver disable paths stay non-blocking and budgeted.
+    pub rt_executor_owned: bool,
+    /// Irreversibly set by [`Self::commit_shutdown`] under the owner's authority once final
+    /// shutdown readiness is confirmed; permanently blocks `clear_fault`, torque enable, and
+    /// actuator motion admission while keeping hardware disable paths permitted.
+    pub shutdown_committed: bool,
+    /// True after a shutdown request was refused because hardware `enable_state()` was `Unknown`,
+    /// so a repeated shutdown signal issues a bounded disable request instead of only re-checking.
+    pub(crate) shutdown_refused_unknown: bool,
+    /// Preallocated bounded journal of immutable E-stop acknowledgements recorded at the exact
+    /// moment [`Self::consume_pending_estop`] applies each urgent request (cap 64; never grows).
+    pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
+    /// Highest E-stop request generation dropped if `pending_estop_acks` ever reached capacity 64.
+    pub(crate) estop_ack_overflow_gen: u64,
+    /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
+    pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
+/// without allocating or re-reading the bus.
+#[derive(Debug, Default)]
+pub(crate) struct PendingRxPoll {
+    pub active: bool,
+    pub invalid_feedback: bool,
+    pub driver_torque_lost: bool,
+    pub recovery_ages: bool,
+    pub hw_rx: bool,
+    pub reset_stillness_on_read_err: bool,
+    pub rx_frames: u16,
+    pub budget_exhausted: bool,
 }
 
 /// Complete validated gripper calibration snapshot ready for infallible commit after disk rename.
@@ -574,6 +631,10 @@ pub struct PendingZeroCheckPersist {
     pub lease_owner: Option<(String, u64)>,
     pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
     pub write: crate::persist::PendingWrite,
+    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
+    pub current_calib_jaw: Option<crate::model::JawOpening>,
+    pub gripper_limit: Option<crate::model::JointLimit>,
+    pub active_tool_is_stock: bool,
 }
 
 impl SupervisorInner {
@@ -665,6 +726,7 @@ impl SupervisorInner {
             motion_limit_seen_s: 0.0,
             servo_blocked_hold: false,
             servo_ws_min_depths: None,
+            gripper_hold_vel_ceiling: None,
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
@@ -693,6 +755,9 @@ impl SupervisorInner {
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
+            gripper_stall_anchor_pos: None,
+            gripper_stall_anchor_dir: 0.0,
+            gripper_stall_window_s: 0.0,
             gripper_stall_sign: 0.0,
             gripper_prev_hw_overload: false,
             gripper_force_capped: false,
@@ -758,7 +823,7 @@ impl SupervisorInner {
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
             torque_guard: crate::torque_guard::TorqueGuard::default(),
-            tracking: crate::tracking::TrackingRuntime::default(),
+            tracking: crate::tracking::TrackingRuntime::with_capacity(dof),
             power: crate::power::PowerMonitor::default(),
             follower: None,
             base_gripper_policy,
@@ -787,7 +852,33 @@ impl SupervisorInner {
             tool_commissioning_path: None,
             tool_commissioning_confirmed_at: None,
             tool_commissioning_revision: 1,
+            pending_rx_poll: PendingRxPoll::default(),
+            stop_requests: None,
+            detached: false,
+            persist_capacity_available: true,
+            rt_executor_owned: false,
+            shutdown_committed: false,
+            shutdown_refused_unknown: false,
+            pending_estop_acks: std::collections::VecDeque::with_capacity(
+                crate::rt_core::executor::ESTOP_ACK_CAPACITY,
+            ),
+            estop_ack_overflow_gen: 0,
+            before_publish_hook: None,
         }
+    }
+
+    /// Minimal empty shell left inside `ArmSupervisor::inner` once ownership transfers to
+    /// the synchronous RT executor; all legacy lock paths reject it when `detached == true`.
+    pub(crate) fn detached_shell(
+        config: &ArmConfig,
+        e_stop_latched: Arc<AtomicBool>,
+        requested_estop_count: Arc<AtomicU64>,
+    ) -> Self {
+        let mut shell = Self::new(config.clone());
+        shell.e_stop_latched = e_stop_latched;
+        shell.requested_estop_count = requested_estop_count;
+        shell.detached = true;
+        shell
     }
 
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
@@ -817,15 +908,39 @@ impl SupervisorInner {
         schema
     }
 
-    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick.
+    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick
+    /// (plus authorized-stop generations when attached to an RT executor).
     pub fn estop_gate(&self) -> crate::rt_core::urgent::EstopGate {
-        crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone())
+        let gate = crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone());
+        match self.stop_requests.as_ref() {
+            Some(stops) => gate.with_stops(stops.clone()),
+            None => gate,
+        }
+    }
+
+    /// Attaches the executor's authorized-stop generation tracker and updates the bus
+    /// driver's `EstopGate` so mid-batch writes also stop on authorized stop requests.
+    pub fn attach_stop_requests(&mut self, stops: crate::rt_core::urgent::StopRequests) {
+        self.stop_requests = Some(stops);
+        let gate = self.estop_gate();
+        if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                drv.set_estop_gate(gate);
+            }
+        }
     }
 
     /// An E-stop request the tick has not applied yet (not the latch: hold output while
     /// latched still reaches the motors).
     pub(crate) fn estop_request_unapplied(&self) -> bool {
         self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+    }
+
+    /// True when either an E-stop request or an attached authorized-stop request has not
+    /// yet been applied by the control tick / release engine.
+    pub(crate) fn urgent_stop_unapplied(&self) -> bool {
+        self.estop_request_unapplied()
+            || self.stop_requests.as_ref().is_some_and(crate::rt_core::urgent::StopRequests::pending)
     }
 
     pub(crate) fn estop_pending(&self) -> bool {
@@ -838,6 +953,9 @@ impl SupervisorInner {
         self.gripper_prev_hw_overload = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_anchor_dir = 0.0;
+        self.gripper_stall_window_s = 0.0;
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
         self.gripper_stream_target = None;
@@ -1065,7 +1183,10 @@ impl SupervisorInner {
         let sampled = self.start_time + Duration::from_secs_f64(obs.timestamp.max(0.0));
         let mut until = sampled + max_age;
         if let Some(lease) = self.active_lease.as_ref() {
-            until = until.min(lease.acquired_at + self.lease_timeout);
+            let expires = lease.acquired_at + self.lease_timeout;
+            if expires > sampled {
+                until = until.min(expires);
+            }
         }
         if let Some((_, end)) = self.previous_action.as_ref() {
             if obs.timestamp < *end { until = until.min(self.start_time + Duration::from_secs_f64(*end)); }
@@ -1078,13 +1199,18 @@ impl SupervisorInner {
         (sampled, until.max(sampled))
     }
 
-    /// The control loop's tick under the write guard of lock generation `generation`:
-    /// [`Self::tick_control`], the observation filled in place into the publication's back
-    /// slot ([`Self::fill_observation`]), and its publication (before the guard drops: no
-    /// other write can come in between). No allocation in a steady-state tick; `keep` copies
-    /// the observation for the caller (tests).
-    pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
-        let timestamp = self.tick_control(dt);
+    pub(crate) fn begin_tick_phases(&mut self, start: Instant) {
+        self.tick_phases_us = [0; 5];
+        self.tick_phase_mark = Some(start);
+    }
+
+    pub(crate) fn take_tick_phases(&mut self) -> ([u32; 5], Option<Instant>) {
+        (self.tick_phases_us, self.tick_phase_mark.take())
+    }
+
+    /// Publishes an observation filled in place at `timestamp` with lock/release generation
+    /// `generation` without re-running `tick_control`.
+    pub fn publish_at(&mut self, timestamp: f64, generation: u64, keep: bool) -> TickPublished {
         let mut obs = self.core.take_observation_buffer();
         self.fill_observation(timestamp, &mut obs);
         self.tick_phase(4);
@@ -1092,9 +1218,22 @@ impl SupervisorInner {
         let control_hz = self.config.control_frequency_hz;
         let (sampled_at, valid_until) = self.observation_valid_until(&obs, Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1))));
         let kept = keep.then(|| (*obs).clone());
+        if let Some(ref hook) = self.before_publish_hook {
+            hook();
+        }
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
         core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
         TickPublished { kept, body_end }
+    }
+
+    /// The control loop's tick under the write guard of lock generation `generation`:
+    /// [`Self::tick_control`], the observation filled in place into the publication's back
+    /// slot ([`Self::fill_observation`]), and its publication (before the guard drops: no
+    /// other write can come in between). No allocation in a steady-state tick; `keep` copies
+    /// the observation for the caller (tests).
+    pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
+        let timestamp = self.tick_control(dt);
+        self.publish_at(timestamp, generation, keep)
     }
 
     pub fn current_observation(&self) -> ArmObservation {
@@ -1465,11 +1604,29 @@ impl SupervisorInner {
     pub(crate) fn consume_pending_estop(&mut self) -> bool {
         let req = self.requested_estop_count.load(Ordering::SeqCst);
         if req > self.applied_estop_count {
-            self.applied_estop_count = req;
-            self.estop_applied.store(req, Ordering::SeqCst);
+            let first_gen = self.applied_estop_count + 1;
             self.e_stop_latched.store(true, Ordering::SeqCst);
+            if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable { .. })) {
+                if let Some(ref d) = self.driver {
+                    if let Ok(mut drv) = d.lock() {
+                        drv.abort_enable();
+                    }
+                }
+            }
             if !matches!(self.safety.state(), SafetyState::Fault(_)) {
                 self.apply_stop_policy(StopPolicy::EStopLatch);
+            }
+            self.applied_estop_count = req;
+            self.estop_applied.store(req, Ordering::SeqCst);
+            if self.pending_estop_acks.len() < crate::rt_core::executor::ESTOP_ACK_CAPACITY {
+                self.pending_estop_acks.push_back(crate::rt_core::executor::EstopAck {
+                    first_gen,
+                    last_gen: req,
+                    state: self.safety.state_arc(),
+                    epoch: self.safety.epoch_id(),
+                });
+            } else {
+                self.estop_ack_overflow_gen = self.estop_ack_overflow_gen.max(req);
             }
             true
         } else {
@@ -1484,8 +1641,47 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Thermal protection remains active while torqued or while torque disable is unconfirmed.
+    /// `was_active` preserves thermal protection when a torque transition confirmed disable on
+    /// the exact same Step 2 poll that delivered an over-temperature sample.
+    pub(crate) fn check_thermal_protection(&mut self, was_active: bool) {
+        let temperature_available = self
+            .driver
+            .as_ref()
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+        if (self.is_torqued || self.disable_pending || was_active)
+            && temperature_available
+            && self
+                .temperatures
+                .iter()
+                .any(|t| t.is_finite() && *t > self.config.max_temperature)
+            && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }))
+        {
+            self.apply_stop_policy(StopPolicy::ThermalTrip);
+        }
+    }
+
+    /// Consumes confirmation of a non-broker background disable once fresh valid hardware
+    /// feedback reports every motor disabled. Returns `true` when no background disable
+    /// remains pending.
+    pub(crate) fn confirm_background_disable_if_ready(&mut self) -> bool {
+        if !self.disable_pending || self.torque_transition.is_some() {
+            return true;
+        }
+        let confirmed = self.driver.as_ref().is_none_or(|d| {
+            d.lock()
+                .is_ok_and(|drv| drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled)
+        });
+        if confirmed {
+            self.disable_confirmed();
+        }
+        confirmed
+    }
+
     pub fn shutdown_ready(&self) -> bool {
-        if self.disable_pending { return false; }
+        if self.disable_pending || self.gravity_comp.is_some() || self.torque_transition_pending() {
+            return false;
+        }
         match &self.driver {
             None => !self.is_torqued,
             Some(driver) => !self.is_torqued
@@ -1497,6 +1693,69 @@ impl SupervisorInner {
                     }
                 }),
         }
+    }
+
+    fn driver_enable_state_unknown(&self) -> bool {
+        self.driver.as_ref().is_some_and(|d| {
+            d.lock().is_ok_and(|drv| {
+                drv.capabilities().enable_feedback && drv.enable_state() == EnableState::Unknown
+            })
+        })
+    }
+
+    /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
+    /// Returns `true` when safe to stop the control loop and exit; returns `false` after
+    /// latching stop when hardware disable is not yet confirmed. When shutdown was refused
+    /// because the hardware enable state is `Unknown`, a repeated shutdown signal issues a
+    /// bounded disable request rather than only re-checking.
+    pub fn request_shutdown(&mut self) -> bool {
+        if self.driver.is_none() || self.shutdown_ready() {
+            self.shutdown_refused_unknown = false;
+            tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
+            self.e_stop_latched.store(true, Ordering::SeqCst);
+            return true;
+        }
+        if !self.safety.state().is_stopped() {
+            self.execute_stop(StopPolicy::EStopLatch);
+        }
+        let unknown = self.driver_enable_state_unknown();
+        if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
+            if self.rt_executor_owned {
+                if self.torque_transition.is_none() {
+                    let _ = self.request_disable();
+                }
+            } else {
+                let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
+                outcome.log("Repeated shutdown disable while state Unknown", PANIC_DISABLE_TIMEOUT);
+            }
+            if self.shutdown_ready() {
+                self.shutdown_refused_unknown = false;
+                tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
+                self.e_stop_latched.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        self.shutdown_refused_unknown = unknown;
+        false
+    }
+
+    /// Final shutdown admission executed under the owner's exclusive authority.
+    /// Returns `true` and irreversibly sets `shutdown_committed` + `e_stop_latched` when
+    /// shutdown is safe so no concurrent `clear_fault`, torque enable, or motion command can
+    /// re-energize the arm before process exit; hardware disable paths remain permitted.
+    pub fn commit_shutdown(&mut self) -> bool {
+        let ready = self.driver.is_none()
+            || (self.shutdown_ready()
+                && !self.is_torqued
+                && !self.disable_pending
+                && !self.torque_transition_pending());
+        if !ready {
+            return false;
+        }
+        self.shutdown_committed = true;
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.stop_motion();
+        true
     }
 
     pub fn is_fully_settled_hold(&self) -> bool {
@@ -1545,7 +1804,7 @@ impl SupervisorInner {
 
     // ---- actions ----
 
-    fn now_s(&self) -> f64 { self.start_time.elapsed().as_secs_f64() }
+    pub(crate) fn now_s(&self) -> f64 { self.start_time.elapsed().as_secs_f64() }
 
     // ---- grasp ----
 
@@ -1652,17 +1911,32 @@ impl SupervisorInner {
             ParkRelease::Closing => (GripperCommand::Close, None),
         };
         let request = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
+        let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
+        let motion = match GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        ) {
+            Ok(m) => m.with_ceiling_torque_estimate(ceiling_est),
+            Err(e) => {
+                tracing::error!("Park release skipped: {e}");
+                return false;
+            }
+        };
         // the stall latch of the carry would block the opening move's first ticks otherwise
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_anchor_dir = 0.0;
+        self.gripper_stall_window_s = 0.0;
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
+        self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.target_positions[gripper_idx] = motion.target;
         self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
@@ -1741,53 +2015,84 @@ impl SupervisorInner {
         obs
     }
 
-    /// One control tick without building the observation; returns the tick's observation
-    /// timestamp (the recording sample's). The control loop fills its published sample with
-    /// [`Self::fill_observation`] at this timestamp.
-    pub fn tick_control(&mut self, dt: f64) -> f64 {
-        self.consume_pending_estop();
-        // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
-            self.apply_stop_policy(StopPolicy::EStopLatch);
-        }
-
-        // Polling a cached sample never refreshes its hardware receive timestamp.
-        // The driver is read into the tick's preallocated buffers (`self.scratch`).
-        let mut invalid_feedback = false;
+    /// Single-pass hardware receive + feedback intake.
+    ///
+    /// Called at Step 2 (`CoreOps::poll_hardware`) with `budget: Some(...)` so Step 3 commits
+    /// and Step 4 targets see fresh feedback and Step 5 `tick_control` does not re-read the bus.
+    /// Legacy callers invoking `tick_control` directly without a prior `poll_hardware` call this
+    /// with `budget: None`.
+    pub(crate) fn poll_hardware_rx(
+        &mut self,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+        transition_rx: Option<(u16, bool)>,
+    ) -> PendingRxPoll {
+        let mut out = PendingRxPoll { active: true, ..PendingRxPoll::default() };
         let mut new_motor_errors = None;
-        let mut driver_torque_lost = false;
-        let mut recovery_ages = false;
-        let mut hw_rx = false;
-        let mut reset_stillness_on_read_err = false;
         let mut sc = std::mem::take(&mut self.scratch);
         sc.recovered.clear();
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             match d.lock() {
                 Ok(mut driver) => {
-                    match driver.read_joint_states_into(&mut sc.states) {
-                        Ok(()) => {
+                    let read_res = match (budget, transition_rx) {
+                        (Some(b), Some((frames, exhausted))) => {
+                            if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
+                                Ok((frames, exhausted))
+                            } else {
+                                let remaining = b.max_rx_frames.saturating_sub(frames);
+                                if remaining == 0 {
+                                    Ok((frames, true))
+                                } else {
+                                    let drv_now = driver.clock_now();
+                                    let span = b.deadline.saturating_duration_since(b.now);
+                                    driver
+                                        .read_joint_states_budgeted(&mut sc.states, drv_now + span, remaining)
+                                        .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
+                                }
+                            }
+                        }
+                        (Some(b), None) => {
+                            let drv_now = driver.clock_now();
+                            let span = b.deadline.saturating_duration_since(b.now);
+                            driver.read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
+                        }
+                        (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
+                    };
+                    match read_res {
+                        Ok((frames, exhausted)) => {
+                            out.rx_frames = frames;
+                            out.budget_exhausted = exhausted;
                             driver.take_recovery_writes_into(&mut sc.recovered);
                             let has_loads = driver.joint_loads_into(&mut sc.loads);
-                            self.feedback_numeric_valid = Self::states_valid(&sc.states, driver.capabilities(), self.config.dof, has_loads.then_some(sc.loads.as_slice()));
-                            invalid_feedback = !self.feedback_numeric_valid;
+                            self.feedback_numeric_valid = Self::states_valid(
+                                &sc.states,
+                                driver.capabilities(),
+                                self.config.dof,
+                                has_loads.then_some(sc.loads.as_slice()),
+                            );
+                            out.invalid_feedback = !self.feedback_numeric_valid;
                             driver.feedback_ages_into(&mut sc.ages);
                             if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
-                                recovery_ages = true;
+                                out.recovery_ages = true;
                             }
                             let driver_valid = driver.is_feedback_valid();
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
-                                // the oldest joint's sample; None when a joint has none
                                 let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                                self.last_can_feedback_instant = oldest.filter(|_| !sc.ages.is_empty())
+                                self.last_can_feedback_instant = oldest
+                                    .filter(|_| !sc.ages.is_empty())
                                     .and_then(|age| Instant::now().checked_sub(age));
                             } else {
                                 self.last_can_feedback_instant = None;
                             }
                             if self.feedback_numeric_valid {
-                                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut sc.fb);
+                                self.core.poll_feedback(
+                                    &mut self.joint_feedback_queue_bounds,
+                                    self.config.dof,
+                                    driver.as_ref(),
+                                    &mut sc.fb,
+                                );
                                 Self::apply_feedback(
                                     &mut self.measured_positions,
                                     &mut self.measured_velocities,
@@ -1804,37 +2109,49 @@ impl SupervisorInner {
                                 if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
                                     sc.rx_vals.clear();
                                     sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
-                                    hw_rx = true;
+                                    out.hw_rx = true;
                                 }
                             }
                         }
                         Err(_) => {
                             self.last_can_feedback_instant = None;
-                            reset_stillness_on_read_err = true;
+                            out.reset_stillness_on_read_err = true;
                         }
                     }
                     if driver.motor_status_into(&mut sc.status) {
-                        // decoded (a String per code) only when a code changed
                         let changed = sc.status.len() != self.motor_errors.len()
                             || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
                                 let decoded = e.as_ref().map(|e| e.code);
                                 decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
                             });
                         if changed {
-                            new_motor_errors = Some(sc.status.iter().map(|&code| {
-                                driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
-                            }).collect());
+                            new_motor_errors = Some(
+                                sc.status
+                                    .iter()
+                                    .map(|&code| {
+                                        driver
+                                            .decode_motor_error(code)
+                                            .map(|name| crate::model::MotorError { code, name })
+                                    })
+                                    .collect(),
+                            );
                         }
                     }
-                    if self.is_torqued && !self.disable_pending && self.gravity_comp.is_none() && self.safety.state().is_operational()
-                        && driver.capabilities().enable_feedback && driver.is_feedback_valid() && driver.enable_state() != EnableState::Enabled
-                        && !(self.pending_rearm && driver.has_known_partial_enable()) {
-                        driver_torque_lost = true;
+                    if self.is_torqued
+                        && !self.disable_pending
+                        && self.gravity_comp.is_none()
+                        && self.safety.state().is_operational()
+                        && driver.capabilities().enable_feedback
+                        && driver.is_feedback_valid()
+                        && driver.enable_state() != EnableState::Enabled
+                        && !(self.pending_rearm && driver.has_known_partial_enable())
+                    {
+                        out.driver_torque_lost = true;
                     }
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;
-                    reset_stillness_on_read_err = true;
+                    out.reset_stillness_on_read_err = true;
                 }
             }
         } else {
@@ -1842,13 +2159,39 @@ impl SupervisorInner {
             self.core.simulate_feedback(self.config.dof, Instant::now());
             self.joint_feedback_queue_bounds.clear();
         }
+        self.scratch = sc;
         if let Some(errors) = new_motor_errors {
             self.update_motor_errors(errors);
         }
-        if reset_stillness_on_read_err {
+        if out.reset_stillness_on_read_err {
             self.reset_table_stillness();
         }
         self.tick_phase(0);
+        out
+    }
+
+    /// One control tick without building the observation; returns the tick's observation
+    /// timestamp (the recording sample's). The control loop fills its published sample with
+    /// [`Self::fill_observation`] at this timestamp.
+    pub fn tick_control(&mut self, dt: f64) -> f64 {
+        self.consume_pending_estop();
+        // Immediate atomic e-stop latch check before any processing
+        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
+            self.apply_stop_policy(StopPolicy::EStopLatch);
+        }
+
+        // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
+        // a preceding `poll_hardware` perform the receive pass here.
+        let rx = if self.pending_rx_poll.active {
+            std::mem::take(&mut self.pending_rx_poll)
+        } else {
+            self.poll_hardware_rx(None, None)
+        };
+        let invalid_feedback = rx.invalid_feedback;
+        let driver_torque_lost = rx.driver_torque_lost;
+        let recovery_ages = rx.recovery_ages;
+        let hw_rx = rx.hw_rx;
+        let mut sc = std::mem::take(&mut self.scratch);
         // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
         // tracking output history and suspend compensated writes until fresh post-recovery
         // feedback confirms a clean baseline across every joint.
@@ -1902,7 +2245,9 @@ impl SupervisorInner {
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
-            self.safety.trigger_fault_coded(FaultCode::InvalidTelemetry, FaultReason::Other("Invalid hardware telemetry".into()));
+            self.safety.trigger_fault_coded_lazy(FaultCode::InvalidTelemetry, || {
+                FaultReason::Other("Invalid hardware telemetry".into())
+            });
         } else if driver_torque_lost && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.tracking.invalidate();
@@ -1912,10 +2257,9 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault_coded(
-                FaultCode::HardwareFault,
-                FaultReason::Other("Unexpected motor torque loss detected while operational".into()),
-            );
+            self.safety.trigger_fault_coded_lazy(FaultCode::HardwareFault, || {
+                FaultReason::Other("Unexpected motor torque loss detected while operational".into())
+            });
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors
@@ -1931,7 +2275,9 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault_coded(FaultCode::ControlDeadline, FaultReason::Other("Control loop deadline exceeded".into()));
+            self.safety.trigger_fault_coded_lazy(FaultCode::ControlDeadline, || {
+                FaultReason::Other("Control loop deadline exceeded".into())
+            });
         }
         self.step_zero_convention();
         let dt_raw = dt;
@@ -2188,11 +2534,11 @@ impl SupervisorInner {
                     }
                 }
             } else if !self.gripper_stalled && !gripper_hw_overload {
-                let is_stalled = if has_torque_feedback {
+                let high_effort = if has_torque_feedback {
                     // the stream contact regulator holds the grip instead of the stall hold at
                     // the measured jaw (which reads ~0 N·m on a rigid object and re-squeezes)
                     self.gripper_stream_contact.is_none()
-                        && tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
+                        && tau_g.abs() >= GRIPPER_STALL_LATCH_NM
                 } else {
                     let stall_load_thresh = self.config.gripper_policy.as_ref()
                         .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)
@@ -2200,29 +2546,80 @@ impl SupervisorInner {
                         .map(|frac| (frac * 1.25).clamp(0.18, 0.35))
                         .unwrap_or(0.35);
                     let load_condition = if has_load_feedback { load_g.abs() > stall_load_thresh } else { true };
-                    gap.abs() > 0.08 && v_g.abs() < 0.05 && load_condition
+                    gap.abs() > 0.08 && load_condition
                 };
-                let required_ticks = if has_torque_feedback { 6 } else { 10 };
+                let active_gripper_motion = self.active_trajectory.as_ref().and_then(|a| match &a.reference {
+                    crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm),
+                    _ => None,
+                });
+                let active_gripper_speed = active_gripper_motion
+                    .map(|gm| gm.planned_speed)
+                    .or_else(|| {
+                        let v = f64::from(v_cmd.abs());
+                        (v > 1e-4).then_some(v)
+                    })
+                    .filter(|v| v.is_finite() && *v > 0.0);
+                let travel_dir = active_gripper_motion
+                    .and_then(|gm| {
+                        let d = gm.target - gm.start;
+                        (d.abs() > 1e-6).then_some(d.signum())
+                    })
+                    .or_else(|| (gap.abs() > 1e-3).then_some(gap.signum()))
+                    .or_else(|| ((desired_g - p_meas).abs() > 1e-3).then_some((desired_g - p_meas).signum()))
+                    .or_else(|| (v_cmd.abs() > 1e-4).then_some(v_cmd.signum()))
+                    .or_else(|| (tau_g.abs() > 1e-3).then_some(tau_g.signum()))
+                    .unwrap_or(close_dir);
+                let base_window_s: f64 = if has_torque_feedback { 0.10 } else { 0.18 };
+                let stall_window_s = match active_gripper_speed {
+                    Some(speed) => base_window_s.max(
+                        (2.0 * f64::from(GRIPPER_STALL_PROGRESS_EPS) / speed + 0.06)
+                            .min(GRIPPER_STALL_WINDOW_MAX_S),
+                    ),
+                    None => base_window_s,
+                };
 
-                if is_stalled {
-                    self.gripper_high_torque_ticks += 1;
-                    if self.gripper_high_torque_ticks >= required_ticks {
-                        self.gripper_stalled = true;
-                        let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
-                        self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
-                        self.gripper_low_torque_ticks = 0;
-                        if let Some(&hold) = self.measured_positions.get(g_idx) {
-                            if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
-                            if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
-                            if let Some(ref mut st) = self.servo_target {
-                                if st.len() > g_idx {
-                                    st[g_idx] = hold;
+                if high_effort && p_meas.is_finite() {
+                    let same_dir = self.gripper_stall_anchor_dir == travel_dir;
+                    // Monotonic net progress along `travel_dir`: backward rebounds or jam
+                    // oscillations never lower the watermark and cannot keep resetting the timer.
+                    let net_progressed = self.gripper_high_torque_ticks > 0
+                        && same_dir
+                        && self.gripper_stall_anchor_pos
+                            .is_some_and(|anchor| (p_meas - anchor) * travel_dir >= GRIPPER_STALL_PROGRESS_EPS);
+                    if self.gripper_high_torque_ticks == 0 || !same_dir || net_progressed {
+                        self.gripper_stall_anchor_pos = Some(p_meas);
+                        self.gripper_stall_anchor_dir = travel_dir;
+                        self.gripper_high_torque_ticks = 1;
+                        self.gripper_stall_window_s = 0.0;
+                    } else {
+                        self.gripper_high_torque_ticks += 1;
+                        self.gripper_stall_window_s += dt;
+                        if self.gripper_high_torque_ticks >= 2
+                            && self.gripper_stall_window_s >= stall_window_s - 1e-9
+                        {
+                            self.gripper_stalled = true;
+                            self.gripper_stall_anchor_pos = None;
+                            self.gripper_stall_anchor_dir = 0.0;
+                            self.gripper_stall_window_s = 0.0;
+                            let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
+                            self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
+                            self.gripper_low_torque_ticks = 0;
+                            if let Some(&hold) = self.measured_positions.get(g_idx) {
+                                if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
+                                if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
+                                if let Some(ref mut st) = self.servo_target {
+                                    if st.len() > g_idx {
+                                        st[g_idx] = hold;
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
                     self.gripper_high_torque_ticks = 0;
+                    self.gripper_stall_anchor_pos = None;
+                    self.gripper_stall_anchor_dir = 0.0;
+                    self.gripper_stall_window_s = 0.0;
                 }
             } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
                 // torque-cap latch under a stream: held until the stream opens (intake) or ends
@@ -2338,7 +2735,9 @@ impl SupervisorInner {
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
-                        self.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other(e.to_string()));
+                        self.safety.trigger_fault_coded_lazy(FaultCode::HardwareFault, || {
+                            FaultReason::Other(e.to_string())
+                        });
                     }
                 }
             }
@@ -2386,22 +2785,13 @@ impl SupervisorInner {
         self.supervise_watchdog_park(dt);
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
-        let temperature_available = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
-        if (self.is_torqued || self.disable_pending) && temperature_available
-            && self.temperatures.iter().any(|t| t.is_finite() && *t > self.config.max_temperature)
-                && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
-                self.apply_stop_policy(StopPolicy::ThermalTrip);
-            }
+        self.check_thermal_protection(false);
         // (a torque transition in flight confirms its own disable: `service_torque_transition`)
-        if self.disable_pending && self.torque_transition.is_none() {
-            let confirmed = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv|
-                drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
-            if confirmed {
-                self.is_torqued = false;
-                self.pending_rearm = false;
-                self.disable_pending = false;
-            } else if self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
-                if let Err(e) = self.request_disable() { tracing::warn!("Torque shutdown remains unconfirmed: {e}"); }
+        if !self.confirm_background_disable_if_ready()
+            && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+        {
+            if let Err(e) = self.request_disable() {
+                tracing::warn!("Torque shutdown remains unconfirmed: {e}");
             }
         }
         // Detect sustained physical tracking error, never compare against stale samples.
@@ -2429,8 +2819,12 @@ impl SupervisorInner {
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault_coded(FaultCode::FollowingError, FaultReason::Other(format!(
-                        "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad", joint + 1)));
+                    self.safety.trigger_fault_coded_lazy(FaultCode::FollowingError, || {
+                        FaultReason::Other(format!(
+                            "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad",
+                            joint + 1
+                        ))
+                    });
                 }
             } else { self.following_error_since = None; }
         } else { self.following_error_since = None; }
@@ -2484,6 +2878,7 @@ impl SupervisorInner {
         } else {
             None
         };
+        let gripper_idx_for_ceiling = self.config.gripper_index();
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -2515,6 +2910,13 @@ impl SupervisorInner {
                     Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
                 }
             };
+            // Keep the persistent gripper hold ceiling synchronized with `GripperMotion` (including
+            // contact speed reduction) so completion and subsequent hold ticks preserve it.
+            if let Reference::Gripper(gm) = &active.reference {
+                if gripper_idx_for_ceiling == Some(gm.gripper_index) {
+                    self.gripper_hold_vel_ceiling = Some(gm.wire_velocity_ceiling());
+                }
+            }
             // same-side approach: progress over both legs; the first leg's end starts the short
             // segment (src/backlash.rs)
             let out = match (active.span.is_some(), out) {
@@ -2633,6 +3035,11 @@ impl SupervisorInner {
                         "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
                 } else {
                     reference_stepped = true;
+                    if let Some(g) = gripper_idx {
+                        if target.get(g).is_some_and(|&tgt| (tgt - self.commanded_positions[g]).abs() > 1e-4) {
+                            self.gripper_hold_vel_ceiling = None;
+                        }
+                    }
                     let mut reached_flags = std::mem::take(&mut self.scratch.reached);
                     fill_n(&mut reached_flags, false, self.config.dof);
                     let mut next_positions = std::mem::take(&mut self.scratch.next_positions);
@@ -2915,7 +3322,7 @@ impl SupervisorInner {
         let mut tick_output_accepted = false;
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
-        if self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
+        if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
@@ -2931,7 +3338,7 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if self.is_torqued && !self.disable_pending && !transition_owns_bus {
+        } else if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
@@ -3155,12 +3562,21 @@ impl SupervisorInner {
         }
 
         self.tick_phase(2);
-        // An E-stop requested during this tick: its output did not reach the bus (or the batch
-        // stopped at the next frame, `ArmDriver::set_estop_gate`); apply it now instead of one
-        // period later. A batch the gate stopped is not a driver failure.
-        if self.estop_request_unapplied() {
+        // An E-stop or authorized stop requested during this tick: its output did not reach
+        // the bus (or the batch stopped at the next frame, `ArmDriver::set_estop_gate`); apply
+        // it now instead of one period later. A batch the gate stopped is not a driver failure.
+        if self.urgent_stop_unapplied() {
             tick_output_accepted = false;
-            self.consume_pending_estop();
+            if self.estop_request_unapplied() {
+                self.consume_pending_estop();
+            }
+            if let Some(stops) = self.stop_requests.clone() {
+                let generation = stops.current();
+                if generation != stops.applied() {
+                    self.authorized_stop();
+                    stops.mark_applied(generation);
+                }
+            }
             if output_error.as_deref().is_some_and(|e| e.contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
         }
         if let Some(error) = output_error {
@@ -3444,27 +3860,52 @@ pub fn check_path_with_tcp_tol<'a>(
     Ok(())
 }
 
+/// Ownership mode of [`ArmSupervisor`], mirrored atomically for lock-free routing checks.
+pub const OWNER_LEGACY: u8 = 0;
+pub const OWNER_TRANSFERRING: u8 = 1;
+pub const OWNER_EXECUTOR: u8 = 2;
+pub const OWNER_FAILED: u8 = 3;
+
+enum OwnerSlot {
+    Legacy,
+    Transferring,
+    Executor(crate::rt_core::executor::RtExecutorHandle),
+    Failed,
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
-    tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
     /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
     tick_stats_wait_us: AtomicU64,
-    control_sched: std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>,
+    control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
     hub: Arc<crate::rt_core::publish::StateHub>,
     /// Serializes the start of the dispatcher thread.
     dispatcher_start: std::sync::Mutex<()>,
     /// Control period of the last tick (µs): bounds how long a reader waits for a sample.
-    control_period_us: AtomicU64,
+    control_period_us: Arc<AtomicU64>,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
     obs_waits: AtomicU64,
     obs_unavailable: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
+    /// Lock order: always `self.inner` before `self.owner`.
+    owner: std::sync::Mutex<OwnerSlot>,
+    owner_mode: AtomicU8,
+    /// `self.inner.generation()` captured at the moment ownership transfers to the RT executor.
+    /// In `OWNER_EXECUTOR` mode `fresh()` requires `s.meta.generation >= executor_base_gen + 1`
+    /// so rejected legacy lock attempts on the detached shell cannot skew observation freshness.
+    executor_base_gen: AtomicU64,
+    /// Always-present lock-serialized E-stop waiter registry (never touched by `armd-control`).
+    estop_reg: Arc<std::sync::Mutex<crate::rt_core::executor::EstopRegistry>>,
+    /// Off-thread consumer sinks installed when ownership transfers to the RT executor.
+    sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -3477,6 +3918,40 @@ pub const OBS_LOCK_WAIT: Duration = Duration::from_millis(500);
 fn observation_unavailable() -> ArmError {
     ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
         message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() }
+}
+
+fn owner_transferred() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "OWNER_TRANSFERRED".into(),
+        message: "ArmCore is owned by the synchronous RT executor; legacy lock path is disabled".into(),
+    }
+}
+
+fn executor_unavailable() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor ownership is transitioning or unavailable".into(),
+    }
+}
+
+/// RAII rollback guard for the single `.await` inside [`ArmSupervisor::start_executor_with_hooks`].
+struct TransferGuard<'a> {
+    sup: &'a ArmSupervisor,
+    armed: bool,
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*slot, OwnerSlot::Transferring) {
+                *slot = OwnerSlot::Legacy;
+                self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// A published sample, or the read guard when no sample answers (no control loop running).
@@ -3504,17 +3979,200 @@ impl ArmSupervisor {
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
-            tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
+            tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
             tick_stats_wait_us: AtomicU64::new(0),
-            control_sched: std::sync::Mutex::new(None),
+            control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
-            control_period_us: AtomicU64::new(control_period_us),
+            control_period_us: Arc::new(AtomicU64::new(control_period_us)),
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
             obs_waits: AtomicU64::new(0),
             obs_unavailable: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            owner: std::sync::Mutex::new(OwnerSlot::Legacy),
+            owner_mode: AtomicU8::new(OWNER_LEGACY),
+            executor_base_gen: AtomicU64::new(0),
+            estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
+            sinks: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Current ownership mode (`OWNER_LEGACY`, `OWNER_TRANSFERRING`, `OWNER_EXECUTOR`, `OWNER_FAILED`).
+    pub fn owner_mode(&self) -> u8 {
+        self.owner_mode.load(Ordering::Acquire)
+    }
+
+    /// Handle to the synchronous RT executor when ownership has transferred.
+    pub fn executor_handle(&self) -> Option<crate::rt_core::executor::RtExecutorHandle> {
+        let slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            OwnerSlot::Executor(h) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
+    fn check_legacy_under_guard(&self, inner: &SupervisorInner) -> Result<(), ArmError> {
+        if !inner.detached {
+            Ok(())
+        } else if self.owner_mode.load(Ordering::Acquire) == OWNER_EXECUTOR {
+            Err(owner_transferred())
+        } else {
+            Err(executor_unavailable())
+        }
+    }
+
+    fn drain_diag(&self) {
+        let sink = self.sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = sink {
+            s.drain_diag(&self.tick_stats);
+        }
+    }
+
+    /// Transfers ownership of `SupervisorInner` (`ArmCore` + bus driver) once at startup
+    /// into the synchronous RT executor OS thread.
+    pub async fn start_executor(
+        &self,
+        cfg: crate::rt_core::executor::ExecutorConfig,
+    ) -> Result<crate::rt_core::executor::RtExecutorHandle, ArmError> {
+        self.start_executor_with_hooks(cfg, crate::rt_core::executor::PersistTestHooks::default()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn start_executor_with_hooks(
+        &self,
+        cfg: crate::rt_core::executor::ExecutorConfig,
+        hooks: crate::rt_core::executor::PersistTestHooks,
+    ) -> Result<crate::rt_core::executor::RtExecutorHandle, ArmError> {
+        self.ensure_dispatcher()?;
+        {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*slot, OwnerSlot::Legacy) {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "OWNER_ALREADY_TRANSFERRED".into(),
+                    message: "RT executor ownership can only be transferred once from Legacy mode".into(),
+                });
+            }
+            *slot = OwnerSlot::Transferring;
+            self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
+        }
+        let mut rollback = TransferGuard { sup: self, armed: true };
+
+        // The single `.await` point in handoff: if cancelled here, `TransferGuard` rolls back to `Legacy`.
+        let mut guard = self.inner.write().await;
+
+        let restore_legacy = |rollback: &mut TransferGuard<'_>| {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*slot, OwnerSlot::Transferring) {
+                *slot = OwnerSlot::Legacy;
+                self.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+            }
+            rollback.armed = false;
+        };
+
+        // Zero `.await` points below this line: swap + synchronous spawn + commit/rollback.
+        if guard.detached
+            || guard.calibration_busy
+            || guard.motor_zero_busy
+            || guard.zero_check_persisting.is_some()
+            || guard.gravity_comp.is_some()
+            || guard.mit_active()
+            || guard.mit.revoke_pending
+        {
+            restore_legacy(&mut rollback);
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "TRANSFER_BLOCKED".into(),
+                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, or MIT tracking is active".into(),
+            });
+        }
+        #[cfg(feature = "policy-runtime")]
+        if guard.policy_loading || guard.policy_run.is_some() {
+            restore_legacy(&mut rollback);
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "TRANSFER_BLOCKED".into(),
+                message: "Cannot transfer ownership while policy runtime is active or loading".into(),
+            });
+        }
+        if !crate::mit::mit_joints(&guard.config).is_empty() {
+            restore_legacy(&mut rollback);
+            return Err(ArmError::Rejected {
+                status: 503,
+                code: "UNSUPPORTED_RT_CONFIG".into(),
+                message: "MIT-configured profiles require synchronous qualification/handover and are not supported under synchronous RT executor step 1".into(),
+            });
+        }
+        if let Some(ref d) = guard.driver {
+            let cap_res = match d.lock() {
+                Ok(drv) => drv.supports_rt_executor(),
+                Err(_) => Err("driver mutex poisoned"),
+            };
+            if let Err(reason) = cap_res {
+                restore_legacy(&mut rollback);
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "UNSUPPORTED_RT_DRIVER".into(),
+                    message: format!("Cannot transfer ownership: {reason}"),
+                });
+            }
+        }
+
+        // Flush any legacy E-stop acks already applied before handoff so waiting callers
+        // receive their exact recorded (state, epoch) instead of stalling after transfer,
+        // and drop any legacy retired fault Arcs off-thread before transferring ownership.
+        Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
+        guard.safety.drain_retired_state_arcs_off_thread();
+
+        let initial_gen = self.inner.generation();
+        let shell = SupervisorInner::detached_shell(
+            &guard.config,
+            self.e_stop_latched.clone(),
+            self.requested_estop_count.clone(),
+        );
+        let real = std::mem::replace(&mut *guard, shell);
+
+        match crate::rt_core::executor::spawn_executor(
+            real,
+            cfg,
+            initial_gen,
+            Arc::clone(&self.config_write_mutex),
+            Arc::clone(&self.estop_reg),
+            Arc::clone(&self.tick_stats),
+            Arc::clone(&self.control_sched),
+            Arc::clone(&self.control_period_us),
+            hooks,
+        ) {
+            Ok((handle, sinks)) => {
+                *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
+                self.executor_base_gen.store(initial_gen, Ordering::Release);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Executor(handle.clone());
+                    self.owner_mode.store(OWNER_EXECUTOR, Ordering::Release);
+                }
+                rollback.armed = false;
+                drop(guard);
+                self.hub.wake();
+                Ok(handle)
+            }
+            Err((Some(real), msg)) => {
+                *guard = *real;
+                restore_legacy(&mut rollback);
+                drop(guard);
+                Err(ArmError::Internal(msg))
+            }
+            Err((None, msg)) => {
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                rollback.armed = false;
+                drop(guard);
+                Err(ArmError::Internal(msg))
+            }
         }
     }
 
@@ -3523,7 +4181,10 @@ impl ArmSupervisor {
     }
 
     pub async fn set_operator_auth_enforced(&self, enforced: bool) {
-        self.inner.write().await.operator_auth_enforced = enforced;
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.operator_auth_enforced = enforced;
+        }
     }
 
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it
@@ -3540,14 +4201,21 @@ impl ArmSupervisor {
     pub fn start_dispatcher(&self) -> Result<(), ArmError> { self.ensure_dispatcher() }
 
     /// Starts the dispatcher thread once: a normal-priority thread woken by every
-    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers and
-    /// drains the recording ring.
+    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers,
+    /// drains the recording ring, and drains executor diagnostics/reclamation sinks.
     pub(crate) fn ensure_dispatcher(&self) -> Result<(), ArmError> {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx) = (Arc::clone(&self.hub), self.telemetry_tx.clone());
-        let handle = std::thread::Builder::new().name("armd-dispatch".into()).spawn(move || dispatch_loop(&hub, &tx))
+        let (hub, tx, sinks, tick_stats) = (
+            Arc::clone(&self.hub),
+            self.telemetry_tx.clone(),
+            Arc::clone(&self.sinks),
+            Arc::clone(&self.tick_stats),
+        );
+        let handle = std::thread::Builder::new()
+            .name("armd-dispatch".into())
+            .spawn(move || dispatch_loop(&hub, &tx, &sinks, &tick_stats))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
@@ -3558,19 +4226,13 @@ impl ArmSupervisor {
         &self.inner
     }
 
+    #[doc(hidden)]
+    pub fn hub(&self) -> &Arc<crate::rt_core::publish::StateHub> {
+        &self.hub
+    }
+
     /// The current observation, without the supervisor lock while the control loop runs
     /// (`GET /api/v1/observation`).
-    ///
-    /// Served from the tick's publication (`crate::rt_core::publish`): a sample answers when
-    /// it was taken after every write that completed before this call (its lock generation is
-    /// at least the one seen here) and its validity deadline has not passed (lease expiry,
-    /// previous-action window, feedback freshness, two control periods). Otherwise, while a
-    /// sample younger than two control periods shows the control loop running, the call waits
-    /// for the next tick's sample (at most two periods). Without a running loop the
-    /// observation is computed under the read lock, waiting for it at most
-    /// [`OBS_LOCK_WAIT`]; when neither gives fresh state in time the call fails with 503
-    /// `OBSERVATION_UNAVAILABLE` instead of waiting further. The hub is only polled
-    /// (never waited for), and not at all while the read guard is held.
     pub async fn observation(&self) -> Result<ArmObservation, ArmError> {
         match self.fresh(true).await? {
             Fresh::Sample(s) => Ok(s.obs.clone()),
@@ -3578,12 +4240,36 @@ impl ArmSupervisor {
         }
     }
 
-    /// [`Self::observation`] for in-process callers and tests: when it is unavailable, waits
-    /// for the read lock without a bound (the 1.5 behaviour).
+    /// [`Self::observation`] for in-process callers and tests: when it is unavailable in Legacy
+    /// mode, waits for the read lock without a bound; in Executor mode, routes through the RT owner
+    /// (never reading the detached shell).
     pub async fn get_observation(&self) -> ArmObservation {
         match self.observation().await {
             Ok(obs) => obs,
-            Err(_) => self.inner.read().await.current_observation(),
+            Err(_) => {
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    if let Some(h) = self.executor_handle() {
+                        if let Ok(obs) = h.observation_async().await {
+                            return obs;
+                        }
+                    }
+                    if let Some(s) = self.hub.latest() {
+                        return s.obs.clone();
+                    }
+                    return ArmObservation::blank();
+                }
+                let inner = self.inner.read().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return inner.current_observation();
+                }
+                drop(inner);
+                if let Some(h) = self.executor_handle() {
+                    if let Ok(obs) = h.observation_async().await {
+                        return obs;
+                    }
+                }
+                self.hub.latest().map_or_else(ArmObservation::blank, |s| s.obs.clone())
+            }
         }
     }
 
@@ -3595,17 +4281,25 @@ impl ArmSupervisor {
 
     async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
         use crate::rt_core::publish::Poll;
-        let want = self.inner.generation();
+        let mode = self.owner_mode();
+        if mode == OWNER_TRANSFERRING || mode == OWNER_FAILED {
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(observation_unavailable());
+        }
+        let want = if mode == OWNER_EXECUTOR {
+            self.executor_base_gen.load(Ordering::Acquire).saturating_add(1)
+        } else {
+            self.inner.generation()
+        };
         let started = Instant::now();
         let bound = self.wait_bound();
         let mut waited = false;
         loop {
             let poll = self.hub.try_latest();
-            // read after the refresh: reclamation or preemption inside it must not let an
-            // expired sample through
             let now = Instant::now();
             match poll {
-                Poll::Ready(None) => break,
+                Poll::Ready(None) if mode != OWNER_EXECUTOR => break,
+                Poll::Ready(None) => {}
                 Poll::Ready(Some(s)) => {
                     if Self::answers(&s, want, now) {
                         if count {
@@ -3614,19 +4308,29 @@ impl ArmSupervisor {
                         }
                         return Ok(Fresh::Sample(s));
                     }
-                    if now.saturating_duration_since(s.meta.sampled_at) > bound { break; }
+                    if mode != OWNER_EXECUTOR && now.saturating_duration_since(s.meta.sampled_at) > bound {
+                        break;
+                    }
                 }
-                // another reader holds the hub: look again
                 Poll::Busy => {}
             }
             if now.duration_since(started) >= bound { break; }
             waited = true;
             tokio::time::sleep(OBS_POLL).await;
         }
+        // Executor mode NEVER falls back to reading the detached shell under `self.inner`.
+        if self.owner_mode() != OWNER_LEGACY {
+            if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+                if Self::answers(&s, want, Instant::now()) {
+                    if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                    return Ok(Fresh::Sample(s));
+                }
+            }
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(observation_unavailable());
+        }
         let seen_seq = self.hub.published_seq();
-        // one deadline for every wait for the read lock below (not one per attempt)
         let lock_deadline = tokio::time::Instant::now() + OBS_LOCK_WAIT;
-        // a stalled tick (or writer) holds the lock: one last non-blocking look, then 503
         let unavailable = || {
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
                 if Self::answers(&s, want, Instant::now()) {
@@ -3638,9 +4342,10 @@ impl ArmSupervisor {
             Err(observation_unavailable())
         };
         let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
-        // a tick may have published while this call waited for the lock. Only the atomic
-        // sequence is read under the guard: refreshing the hub (reclamation, the snapshot's
-        // allocation) happens after the guard is dropped
+        if self.check_legacy_under_guard(&inner).is_err() {
+            drop(inner);
+            return unavailable();
+        }
         if self.hub.published_seq() != seen_seq {
             drop(inner);
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
@@ -3650,6 +4355,10 @@ impl ArmSupervisor {
                 }
             }
             let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
+            if self.check_legacy_under_guard(&inner).is_err() {
+                drop(inner);
+                return unavailable();
+            }
             if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
             return Ok(Fresh::Locked(inner));
         }
@@ -3657,30 +4366,43 @@ impl ArmSupervisor {
         Ok(Fresh::Locked(inner))
     }
 
-    /// The newest sample while the control loop runs (one younger than two control
-    /// periods), for feedback reads: the per-joint feedback fields are written by the tick
-    /// (and by torque and fault handshakes, whose feedback the next sample carries).
     fn running_sample(&self) -> Option<Arc<crate::rt_core::publish::Snapshot>> {
         self.hub.latest().filter(|s| s.meta.sampled_at.elapsed() <= self.wait_bound())
     }
 
-    /// [`SupervisorInner::arm_feedback_snapshot`] from the newest sample while the control
-    /// loop runs, else under the read lock. `arm`: the profile's arm joint indices
-    /// (`config.arm_joint_indices()`).
     pub async fn arm_feedback_snapshot(&self, arm: &[usize]) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
-        match self.running_sample() {
-            Some(s) => s.rt.arm_feedback(arm),
-            None => self.inner.read().await.arm_feedback_snapshot(),
+        if let Some(s) = self.running_sample() {
+            return s.rt.arm_feedback(arm);
         }
+        if self.owner_mode() != OWNER_LEGACY {
+            return self
+                .hub
+                .latest()
+                .map_or_else(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()), |s| s.rt.arm_feedback(arm));
+        }
+        let inner = self.inner.read().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.arm_feedback_snapshot();
+        }
+        drop(inner);
+        self.hub
+            .latest()
+            .map_or_else(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()), |s| s.rt.arm_feedback(arm))
     }
 
-    /// The measured joint positions from the newest sample while the control loop runs,
-    /// else under the read lock.
     pub async fn measured_positions(&self) -> Vec<f32> {
-        match self.running_sample() {
-            Some(s) => s.rt.positions.clone(),
-            None => self.inner.read().await.measured_positions.clone(),
+        if let Some(s) = self.running_sample() {
+            return s.rt.positions.clone();
         }
+        if self.owner_mode() != OWNER_LEGACY {
+            return self.hub.latest().map_or_else(Vec::new, |s| s.rt.positions.clone());
+        }
+        let inner = self.inner.read().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.measured_positions.clone();
+        }
+        drop(inner);
+        self.hub.latest().map_or_else(Vec::new, |s| s.rt.positions.clone())
     }
 
     /// Scheduling of the control thread, reported by it after its real-time request.
@@ -3694,7 +4416,10 @@ impl ArmSupervisor {
 
     /// Records the `--follower` model name for `GET /api/v1/safety/describe`.
     pub async fn set_follower(&self, name: &str) {
-        self.inner.write().await.follower = Some(name.to_string());
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.follower = Some(name.to_string());
+        }
     }
 
     pub async fn get_config(&self) -> ArmConfig {
@@ -3702,9 +4427,10 @@ impl ArmSupervisor {
         inner.config.clone()
     }
 
-    pub async fn set_driver(&self, mut driver: Box<dyn ArmDriver>) {
+    pub async fn try_set_driver(&self, mut driver: Box<dyn ArmDriver>) -> Result<(), ArmError> {
         driver.set_abort_flag(self.e_stop_latched.clone());
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         driver.set_estop_gate(inner.estop_gate());
         driver.set_gripper_index(inner.config.gripper_index());
         let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
@@ -3726,20 +4452,27 @@ impl ArmSupervisor {
         }
         inner.apply_driver_limits(drv.as_ref());
         inner.driver = Some(std::sync::Mutex::new(drv));
+        Ok(())
+    }
+
+    pub async fn set_driver(&self, driver: Box<dyn ArmDriver>) {
+        let _ = self.try_set_driver(driver).await;
     }
 
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
-            driver.set_estop_gate(inner.estop_gate());
-            driver.set_gripper_index(inner.config.gripper_index());
-            driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
-            if driver.capabilities().load_feedback {
-                inner.loads = vec![f32::NAN; inner.config.dof];
+            if self.check_legacy_under_guard(&inner).is_ok() {
+                driver.set_estop_gate(inner.estop_gate());
+                driver.set_gripper_index(inner.config.gripper_index());
+                driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
+                if driver.capabilities().load_feedback {
+                    inner.loads = vec![f32::NAN; inner.config.dof];
+                }
+                let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+                inner.apply_driver_limits(driver.as_ref());
+                inner.driver = Some(std::sync::Mutex::new(driver));
             }
-            let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
-            inner.apply_driver_limits(driver.as_ref());
-            inner.driver = Some(std::sync::Mutex::new(driver));
         }
         self
     }
@@ -3749,6 +4482,7 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.clone().write_owned().await;
+        self.check_legacy_under_guard(&inner)?;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
         if enable && inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
@@ -3761,42 +4495,83 @@ impl ArmSupervisor {
 
     pub async fn heartbeat(&self, client_id: &str, epoch_id: u64) -> Result<(), SafetyError> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(SafetyError::OwnerTransferred);
+        }
         inner.heartbeat(client_id, epoch_id)
     }
 
     pub async fn acquire_lease(&self, client_id: &str) -> Result<u64, (String, u64)> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(("OWNER_TRANSFERRED".into(), 0));
+        }
         inner.acquire_lease(client_id)
     }
 
     pub async fn preempt_lease(&self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(PreemptError::OwnerTransferred);
+        }
         inner.preempt_lease(conn, label)
     }
 
     pub async fn is_handover_settling(&self) -> bool {
         let inner = self.inner.read().await;
-        inner.handover_settling_since.is_some()
+        self.check_legacy_under_guard(&inner).is_ok() && inner.handover_settling_since.is_some()
     }
 
     pub async fn release_lease(&self, client_id: &str, generation: u64) -> bool {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return false;
+        }
         inner.release_lease(client_id, generation)
     }
 
+    fn executor_lease_active(&self) -> bool {
+        if self.owner_mode() != OWNER_EXECUTOR {
+            return false;
+        }
+        let Some(handle) = self.executor_handle() else {
+            return false;
+        };
+        if handle.is_exited() {
+            return false;
+        }
+        let want = self.executor_base_gen.load(Ordering::Acquire).saturating_add(1);
+        let now = Instant::now();
+        self.hub
+            .latest()
+            .is_some_and(|s| Self::answers(&s, want, now) && s.obs.lease_holder.is_some())
+    }
+
     pub async fn is_lease_active(&self) -> bool {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            return self.executor_lease_active();
+        }
         let inner = self.inner.read().await;
-        inner.is_lease_active()
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.is_lease_active();
+        }
+        drop(inner);
+        self.executor_lease_active()
     }
 
     pub async fn validate_servo_lease(&self, client_id: &str, generation: u64) -> bool {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return false;
+        }
         inner.validate_servo_lease(client_id, generation)
     }
 
     pub async fn set_torques(&self, torques: Vec<f32>) {
         let mut inner = self.inner.write().await;
-        inner.torques = torques;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.torques = torques;
+        }
     }
 
     pub async fn is_gripper_stalled(&self) -> bool {
@@ -3816,7 +4591,9 @@ impl ArmSupervisor {
 
     pub async fn set_gravity_compensated(&self, enabled: bool) {
         let mut inner = self.inner.write().await;
-        inner.gravity_compensated = enabled;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.gravity_compensated = enabled;
+        }
     }
 
     pub async fn get_gravity_scale(&self) -> f32 {
@@ -3826,7 +4603,9 @@ impl ArmSupervisor {
 
     pub async fn set_gravity_scale(&self, scale: f32) {
         let mut inner = self.inner.write().await;
-        inner.gravity_scale = scale.clamp(0.0, 1.0);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.gravity_scale = scale.clamp(0.0, 1.0);
+        }
     }
 
     pub async fn get_gravity_torques_ramped(&self) -> Vec<f32> {
@@ -3839,6 +4618,7 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
@@ -3848,17 +4628,23 @@ impl ArmSupervisor {
 
     pub async fn execute_stop(&self, policy: StopPolicy) {
         let mut inner = self.inner.write().await;
-        inner.execute_stop(policy);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.execute_stop(policy);
+        }
     }
 
     pub async fn set_lease_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().await;
-        inner.lease_enabled = enabled;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.lease_enabled = enabled;
+        }
     }
 
     pub async fn set_temperatures(&self, temps: Vec<f32>) {
         let mut inner = self.inner.write().await;
-        inner.temperatures = temps;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.temperatures = temps;
+        }
     }
 
     pub async fn jog(
@@ -3868,6 +4654,7 @@ impl ArmSupervisor {
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         inner.jog(target_positions, duration_secs, epoch_id)
     }
 
@@ -3877,54 +4664,292 @@ impl ArmSupervisor {
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         let home_pos = inner.config.home_positions.clone();
         inner.jog_action(home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
-    pub async fn stop_motion(&self) { self.inner.write().await.stop_motion(); }
+    pub async fn stop_motion(&self) {
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.stop_motion();
+        }
+    }
 
-    pub async fn shutdown_ready(&self) -> bool { self.inner.read().await.shutdown_ready() }
+    pub async fn shutdown_ready(&self) -> bool {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => match self.executor_handle() {
+                Some(h) => h.shutdown_ready_async().await.unwrap_or(false),
+                None => false,
+            },
+            OWNER_LEGACY => {
+                let inner = self.inner.read().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return inner.shutdown_ready();
+                }
+                drop(inner);
+                match self.executor_handle() {
+                    Some(h) => h.shutdown_ready_async().await.unwrap_or(false),
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Authoritative shutdown gate routed through whichever single owner holds `ArmCore`.
+    /// Bounded last-chance hardware disable for the legacy control-thread panic handler.
+    /// Latches E-stop immediately and attempts one disable through the legacy driver within
+    /// `timeout` without ever blocking indefinitely (even if another task holds `inner` or a
+    /// blocking transport syscall stalls).
+    pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>, deadline: Instant| -> PanicDisableOutcome {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = loop {
+                    if let Ok(g) = inner.try_write() {
+                        break g;
+                    }
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        return PanicDisableOutcome::TimedOut;
+                    }
+                    std::thread::sleep(rem.min(Duration::from_millis(2)));
+                };
+                if guard.detached {
+                    return PanicDisableOutcome::NoDriver;
+                }
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return PanicDisableOutcome::TimedOut;
+                }
+                guard.attempt_panic_disable(rem)
+            }))
+            .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
+        };
+
+        let deadline = Instant::now() + timeout;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let inner = Arc::clone(&self.inner);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            match std::thread::Builder::new()
+                .name("armd-panic-disable".into())
+                .spawn(move || {
+                    let outcome = run_inline(inner, deadline);
+                    let _ = tx.send(outcome);
+                }) {
+                Ok(_) => match rx.recv_timeout(timeout) {
+                    Ok(outcome) => outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                    }
+                },
+                Err(e) => {
+                    // Never fall back to an unbounded inline driver call when the bounded
+                    // helper thread cannot be spawned; only confirm NoDriver via non-blocking try_write.
+                    if let Ok(guard) = self.inner.try_write() {
+                        if guard.detached || guard.driver.is_none() {
+                            return PanicDisableOutcome::NoDriver;
+                        }
+                    }
+                    PanicDisableOutcome::Failed(format!(
+                        "failed to spawn bounded panic-disable helper thread: {e}"
+                    ))
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            run_inline(Arc::clone(&self.inner), deadline)
+        }
+    }
+
+    pub async fn request_shutdown(&self) -> Result<bool, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => match self.executor_handle() {
+                Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                None => Err(executor_unavailable()),
+            },
+            OWNER_LEGACY => {
+                let mut inner = self.inner.clone().write_owned().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return tokio::task::spawn_blocking(move || inner.request_shutdown())
+                        .await
+                        .map_err(|e| ArmError::Internal(format!("request_shutdown blocking task failed: {e}")));
+                }
+                drop(inner);
+                match self.executor_handle() {
+                    Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                    None => Err(executor_unavailable()),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
 
     pub async fn is_at_safe_resting_pose(&self) -> bool {
         let inner = self.inner.read().await;
         inner.is_at_safe_resting_pose()
     }
 
-    pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
-        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
-        self.e_stop_latched.store(true, Ordering::SeqCst);
-        let inner = Arc::clone(&self.inner);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let jh = handle.spawn(async move {
-                let mut guard = inner.write().await;
-                guard.consume_pending_estop();
-                (guard.safety.state().clone(), guard.safety.epoch_id())
-            });
-            match jh.await {
-                Ok(res) => res,
+    async fn await_estop_waiter(
+        &self,
+        mut rx: tokio::sync::oneshot::Receiver<Result<(SafetyState, u64), ArmError>>,
+    ) -> Result<(SafetyState, u64), ArmError> {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
+                Ok(Ok(res)) => return res,
+                Ok(Err(_)) => {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_STOPPED".into(),
+                        message: "RT executor stopped before acknowledging E-stop".into(),
+                    });
+                }
                 Err(_) => {
-                    let guard = self.inner.read().await;
-                    (guard.safety.state().clone(), guard.safety.epoch_id())
+                    self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
                 }
             }
-        } else {
-            let mut guard = inner.write().await;
-            guard.consume_pending_estop();
-            (guard.safety.state().clone(), guard.safety.epoch_id())
         }
     }
 
-    pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
-        let mut inner = self.inner.clone().write_owned().await;
-        let res = tokio::task::spawn_blocking(move || inner.clear_fault())
+    pub(crate) fn flush_legacy_estop_acks_into(
+        estop_reg: &std::sync::Mutex<crate::rt_core::executor::EstopRegistry>,
+        inner: &mut SupervisorInner,
+    ) {
+        if inner.pending_estop_acks.is_empty() && inner.estop_ack_overflow_gen == 0 {
+            return;
+        }
+        let mut reg = estop_reg.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(ack) = inner.pending_estop_acks.pop_front() {
+            reg.record_ack(ack);
+        }
+        if inner.estop_ack_overflow_gen > 0 {
+            let ov = std::mem::replace(&mut inner.estop_ack_overflow_gen, 0);
+            reg.record_overflow(ov);
+        }
+    }
+
+    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
+    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
+    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
+        // Set the physical E-stop latch FIRST before touching any lock.
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        let (req, mut rx, mode) = {
+            let mut reg = self.estop_reg.lock().unwrap_or_else(|e| e.into_inner());
+            let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let rx = reg.register(req);
+            let mode = self.owner_mode.load(Ordering::Acquire);
+            if mode == OWNER_EXECUTOR {
+                reg.drain();
+            }
+            (req, rx, mode)
+        };
+        match mode {
+            OWNER_EXECUTOR => self.await_estop_waiter(rx).await,
+            OWNER_LEGACY | OWNER_TRANSFERRING => {
+                if let Ok(res) = rx.try_recv() {
+                    return res;
+                }
+                let inner = Arc::clone(&self.inner);
+                let mut guard = inner.write().await;
+                if let Ok(res) = rx.try_recv() {
+                    drop(guard);
+                    return res;
+                }
+                if !guard.detached {
+                    guard.consume_pending_estop();
+                    Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
+                    let fallback = (guard.safety.state().clone(), guard.safety.epoch_id());
+                    drop(guard);
+                    return rx.try_recv().unwrap_or(Ok(fallback));
+                }
+                drop(guard);
+                // Ownership changed while waiting on `inner.write()`: if a concurrent legacy
+                // call or the newly attached executor already applied `req`, return that pinned result.
+                if let Ok(res) = rx.try_recv() {
+                    return res;
+                }
+                match self.owner_mode() {
+                    OWNER_EXECUTOR => {
+                        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+                        self.await_estop_waiter(rx).await
+                    }
+                    _ => {
+                        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).cancel_waiter(
+                            req,
+                            503,
+                            "EXECUTOR_UNAVAILABLE",
+                            "RT executor ownership unavailable while applying E-stop",
+                        );
+                        if let Ok(res) = rx.try_recv() {
+                            return res;
+                        }
+                        Err(executor_unavailable())
+                    }
+                }
+            }
+            _ => {
+                self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).cancel_waiter(
+                    req,
+                    503,
+                    "EXECUTOR_UNAVAILABLE",
+                    "RT executor ownership is unavailable",
+                );
+                Err(executor_unavailable())
+            }
+        }
+    }
+
+    pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop");
+        self.trigger_e_stop_checked()
             .await
-            .map_err(|e| ArmError::Internal(format!("clear_fault blocking task failed: {e}")))?;
-        res.map_err(ArmError::Safety)
+            .unwrap_or((SafetyState::EStop, 0))
+    }
+
+    pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                res.map_err(ArmError::Safety)
+            }
+            OWNER_LEGACY => {
+                let mut inner = self.inner.clone().write_owned().await;
+                if self.check_legacy_under_guard(&inner).is_err() {
+                    drop(inner);
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                        let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                        return res.map_err(ArmError::Safety);
+                    }
+                    return Err(executor_unavailable());
+                }
+                let estop_reg = Arc::clone(&self.estop_reg);
+                let res = tokio::task::spawn_blocking(move || {
+                    let r = inner.clear_fault();
+                    inner.safety.drain_retired_state_arcs_off_thread();
+                    ArmSupervisor::flush_legacy_estop_acks_into(&estop_reg, &mut inner);
+                    r
+                })
+                    .await
+                    .map_err(|e| ArmError::Internal(format!("clear_fault blocking task failed: {e}")))?;
+                res.map_err(ArmError::Safety)
+            }
+            _ => Err(executor_unavailable()),
+        }
     }
 
     pub async fn apply_stop_policy(&self, policy: StopPolicy) {
         let mut inner = self.inner.write().await;
-        inner.apply_stop_policy(policy);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.apply_stop_policy(policy);
+        }
     }
 
     pub async fn is_unloading(&self) -> bool {
@@ -3939,22 +4964,31 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick");
         self.tick_shared(dt, true).await.expect("tick keeps a copy when asked")
     }
 
     /// [`Self::tick`] for the control loop, which does not use the observation: saves a copy.
     pub async fn control_tick(&self, dt: f64) {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::control_tick");
         self.tick_shared(dt, false).await;
     }
 
     /// One tick; publishes its observation (`crate::rt_core::publish`) and returns a copy
     /// when `keep`.
     async fn tick_shared(&self, dt: f64, keep: bool) -> Option<ArmObservation> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
+        if self.owner_mode() != OWNER_LEGACY {
+            return None;
+        }
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
         let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
+            if inner.detached || self.owner_mode() != OWNER_LEGACY {
+                return None;
+            }
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
             let _ = crate::diagnostics::alloc::take();
@@ -3972,6 +5006,7 @@ impl ArmSupervisor {
             let control_hz = inner.config.control_frequency_hz;
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
+            Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
             (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
                 body_start - locked, lock_end - body_end, allocs)
         };
@@ -4242,12 +5277,14 @@ impl ArmSupervisor {
 
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
+        self.drain_diag();
         self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
     }
 
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
     /// the stats mutex and sorted after it is released, so this route does not delay a tick.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
+        self.drain_diag();
         let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
         let mut snap = window.snapshot();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -4264,7 +5301,10 @@ impl ArmSupervisor {
     }
 
     pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {
-        self.inner.write().await.mock_gripper_stall_offset = offset;
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.mock_gripper_stall_offset = offset;
+        }
     }
 
     pub async fn gripper_calibration_response(&self) -> crate::gripper_calib::GripperCalibrationResponse {
@@ -4273,8 +5313,15 @@ impl ArmSupervisor {
 }
 
 /// The dispatcher thread: forwards each new sample to the telemetry receivers (one clone
-/// per sample, off the control thread) until the supervisor is dropped.
-fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender<ArmObservation>) {
+/// per sample, off the control thread), drains the recording ring, and drains RT executor
+/// diagnostics / E-stop acks / maintenance replies / orphaned persistence replies until
+/// the supervisor is dropped.
+fn dispatch_loop(
+    hub: &crate::rt_core::publish::StateHub,
+    tx: &broadcast::Sender<ArmObservation>,
+    sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
+    tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+) {
     #[cfg(target_os = "linux")]
     {
         // a normal-priority thread even when started from a real-time one
@@ -4286,8 +5333,15 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
             libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
         }
     }
+    let drain_sinks = || {
+        let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = s {
+            s.drain_all(tick_stats);
+        }
+    };
     let mut last = 0;
     while !hub.is_closed() {
+        drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
@@ -4297,6 +5351,10 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
         }
         std::thread::park_timeout(Duration::from_millis(50));
     }
+    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded.
+    drain_sinks();
+    if let Some(ring) = hub.record_ring() { ring.drain(); }
+    let _ = hub.latest();
 }
 
 #[cfg(test)]
@@ -4582,6 +5640,17 @@ mod observation_snapshot_tests {
         // within two periods of the tick, but the lease has expired: recomputed
         assert_eq!(sup.get_observation().await.lease_holder, None);
         assert_eq!(sup.tick_stats().observation_cache.misses, 1);
+
+        // An already-expired lease record does not collapse `valid_until` to `sampled` forever.
+        {
+            let inner = sup.inner().read().await;
+            let mut obs = inner.current_observation();
+            assert_eq!(obs.lease_holder, None);
+            obs.feedback_age_ms.clear();
+            let cap = Duration::from_secs(1);
+            let (at, until) = inner.observation_valid_until(&obs, cap);
+            assert_eq!(until - at, cap);
+        }
 
         let mut inner = sup.inner().write().await;
         inner.active_lease = None;

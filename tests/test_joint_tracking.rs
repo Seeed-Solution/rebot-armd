@@ -462,9 +462,20 @@ fn tracking_off_wire_equivalence() {
     );
     assert_targets_bit_eq(&frames_none, &frames_disabled, "tracking_off_wire_equivalence");
     assert_obs_equiv(&obs_none, &obs_disabled, "tracking_off_wire_equivalence");
+    assert_targets_bit_eq(&frames_none, &frames_mit_disabled, "disabled block with MIT joints + record");
+    assert_obs_equiv(&obs_none, &obs_mit_disabled, "disabled block with MIT joints + record");
+    assert_targets_bit_eq(&frames_none, &frames_mit_record, "no block + MIT record");
+    assert_obs_equiv(&obs_none, &obs_mit_record, "no block + MIT record");
 
-    // M7: Compare BOTH disabled modes bit-for-bit against the pre-change trace fixture
+    // M7: Compare ALL disabled modes bit-for-bit against the pre-change trace fixture
     // recorded on baseline commit e4f72b6 (before joint_tracking existed).
+    // Note: in e4f72b6, tick 1027 ended `ParkRelease::Opening` early under the legacy
+    // instantaneous-velocity stillness rule (`|v7| < 0.05` while J7 was still moving toward
+    // the opening target); under the net-progress stillness/stall rule, J7 finishes moving
+    // before closing (+26 ticks). All four disabled-tracking variants remain bit-identical
+    // over the full completed trace above, and bit-identical to e4f72b6 over all 1027 ticks
+    // prior to that ParkRelease settle cutoff (quintic, path, replay, servo, braking, grasp
+    // jaw contact, and park approach).
     #[derive(serde::Deserialize)]
     struct RecordedTarget {
         p: u32,
@@ -521,9 +532,14 @@ fn tracking_off_wire_equivalence() {
     assert_eq!(baseline.frames.len(), meta.frames);
     assert_eq!(baseline.obs.len(), meta.obs);
 
+    const LEGACY_PARK_RELEASE_STILL_TICK: usize = 1027;
     let check_against_baseline = |label: &str, frames: &[Vec<JointTarget>], obs: &[ArmObservation]| {
-        assert_eq!(frames.len(), baseline.frames.len(), "{label}: frame count vs e4f72b6");
-        for (k, (got, exp)) in frames.iter().zip(baseline.frames.iter()).enumerate() {
+        assert!(frames.len() >= LEGACY_PARK_RELEASE_STILL_TICK, "{label}: frame count too short");
+        for (k, (got, exp)) in frames[..LEGACY_PARK_RELEASE_STILL_TICK]
+            .iter()
+            .zip(baseline.frames[..LEGACY_PARK_RELEASE_STILL_TICK].iter())
+            .enumerate()
+        {
             assert_eq!(got.len(), exp.len(), "{label}: tick {k} dof vs e4f72b6");
             for (j, (gt, et)) in got.iter().zip(exp.iter()).enumerate() {
                 assert_eq!(gt.position.to_bits(), et.p, "{label}: tick {k} joint {j} position vs e4f72b6");
@@ -533,9 +549,13 @@ fn tracking_off_wire_equivalence() {
                 assert_eq!(gt.kd.map(f32::to_bits), et.kd, "{label}: tick {k} joint {j} kd vs e4f72b6");
             }
         }
-        assert_eq!(obs.len(), baseline.obs.len(), "{label}: obs count vs e4f72b6");
+        assert!(obs.len() >= LEGACY_PARK_RELEASE_STILL_TICK, "{label}: obs count too short");
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
-        for (k, (go, eo)) in obs.iter().zip(baseline.obs.iter()).enumerate() {
+        for (k, (go, eo)) in obs[..LEGACY_PARK_RELEASE_STILL_TICK]
+            .iter()
+            .zip(baseline.obs[..LEGACY_PARK_RELEASE_STILL_TICK].iter())
+            .enumerate()
+        {
             assert_eq!(bits(&go.positions), eo.positions, "{label}: tick {k} positions vs e4f72b6");
             assert_eq!(bits(&go.velocities), eo.velocities, "{label}: tick {k} velocities vs e4f72b6");
             assert_eq!(bits(&go.torques), eo.torques, "{label}: tick {k} torques vs e4f72b6");
@@ -550,6 +570,7 @@ fn tracking_off_wire_equivalence() {
                 "{label}: tick {k} motion_limit vs e4f72b6"
             );
         }
+        assert!(obs.iter().all(|o| o.fault.is_none()), "{label}: unexpected fault during completed trace");
     };
     check_against_baseline("joint_tracking=None vs e4f72b6", &frames_none, &obs_none);
     check_against_baseline("joint_tracking=enabled:false vs e4f72b6", &frames_disabled, &obs_disabled);
@@ -1077,7 +1098,7 @@ fn tracking_safety_references() {
         for _ in 0..100 {
             let obs = inner.tick(DT);
             if let Some(a) = obs.action.as_ref().filter(|a| a.id == id && !a.is_running()) {
-                stall_code = a.code.clone();
+                stall_code = a.code;
                 break;
             }
         }

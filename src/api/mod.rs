@@ -340,9 +340,55 @@ pub fn create_router_full_with_sandbox(
         .layer(axum::Extension(diagnostics))
         .layer(axum::Extension(sandbox))
         .layer(axum::Extension(auth.clone()))
+        .layer(middleware::from_fn_with_state(supervisor.clone(), gate_executor_owner))
         .layer(middleware::from_fn_with_state(auth, same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
+}
+
+async fn gate_executor_owner(
+    axum::extract::State(supervisor): axum::extract::State<Arc<ArmSupervisor>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match supervisor.owner_mode() {
+        crate::supervisor::OWNER_LEGACY => next.run(request).await,
+        crate::supervisor::OWNER_EXECUTOR => {
+            let path = request.uri().path();
+            let method = request.method();
+            let allowed = match *method {
+                axum::http::Method::GET | axum::http::Method::HEAD => {
+                    path == "/"
+                        || path.starts_with("/assets/")
+                        || matches!(
+                            path,
+                            "/api/v1/observation"
+                                | "/api/v1/diagnostics/tick"
+                                | "/api/v1/diagnostics/boots"
+                                | "/api/v1/diagnostics/blackbox"
+                        )
+                }
+                axum::http::Method::POST => path == "/api/v1/safety/e_stop",
+                _ => false,
+            };
+            if allowed {
+                next.run(request).await
+            } else {
+                axum::response::IntoResponse::into_response(rest::ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Route {method} {path} is disabled while RT executor owns ArmCore in stage 3 step 1"
+                    ),
+                    "EXECUTOR_ROUTING_PENDING".into(),
+                ))
+            }
+        }
+        _ => axum::response::IntoResponse::into_response(rest::ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "RT executor ownership is transitioning or unavailable".into(),
+            "EXECUTOR_UNAVAILABLE".into(),
+        )),
+    }
 }
 
 async fn require_operator(

@@ -376,16 +376,44 @@ impl MacroCtx {
         sub_res.map_err(|s| (s, true))
     }
 
-    /// Run a gripper open / close sub-motion and wait for it.
-    pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
-        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: Some(8.0), tag: None };
+    /// Reconcile a planned gripper sub-motion with the remaining macro budget before installation,
+    /// arm its RT child deadline under the same write lock, and wait on its `ChildTicket`:
+    /// pos-force closes arm up to `(timeout_s + 10 s).min(self.deadline)` (not clamped to
+    /// `phase_timeout_s`), while pos-vel and opening moves use `arm_child` (`phase_timeout_s`).
+    async fn run_gripper(&self, phase: &str, request: GripperRequest) -> Result<SubDone, Stop> {
         let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            let limit = inner.start_macro_gripper(self.id, request).map_err(arm_fail)?;
-            self.arm_child(&mut inner, phase, limit + 10.0)
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(fail(self.timeout_code, self.timeout_message.clone()));
+            }
+            let remaining_s = self.deadline.duration_since(now).as_secs_f64();
+            let (duration, timeout_s, is_pos_force_close) = inner
+                .start_macro_gripper_within(self.id, request, Some(remaining_s), true)
+                .map_err(|e| match e {
+                    ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg))
+                        if msg.contains("remaining macro budget") =>
+                    {
+                        fail(self.timeout_code, format!("Phase {phase}: {msg}"))
+                    }
+                    other => arm_fail(other),
+                })?;
+            if is_pos_force_close {
+                let s = if timeout_s.is_finite() { (timeout_s + 10.0).clamp(0.0, 1e6) } else { 1e6 };
+                let deadline = (now + Duration::from_secs_f64(s)).min(self.deadline);
+                inner.arm_macro_child(self.id, deadline, self.timeout_code, format!("Phase {phase} did not finish in time"))
+            } else {
+                self.arm_child(&mut inner, phase, duration + 10.0)
+            }
         };
         self.wait_child(ticket.ok_or(Stop::Cancelled)?).await
+    }
+
+    /// Run a gripper open / close sub-motion and wait for it.
+    pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
+        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: Some(8.0), tag: None };
+        self.run_gripper(phase, request).await
     }
 
     /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it.
@@ -398,13 +426,7 @@ impl MacroCtx {
             timeout_s: Some(8.0),
             tag: None,
         };
-        let ticket = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            let limit = inner.start_macro_gripper(self.id, request).map_err(arm_fail)?;
-            self.arm_child(&mut inner, phase, limit + 10.0)
-        };
-        self.wait_child(ticket.ok_or(Stop::Cancelled)?).await
+        self.run_gripper(phase, request).await
     }
 
     /// [`phase`](Self::phase) followed by [`gripper`](Self::gripper).
