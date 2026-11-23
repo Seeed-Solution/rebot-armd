@@ -7884,8 +7884,11 @@ impl ArmSupervisor {
         let bound = self.wait_bound();
         let mut waited = false;
         loop {
+            let poll = self.hub.try_latest();
+            // read after the refresh: reclamation or preemption inside it must not let an
+            // expired sample through
             let now = Instant::now();
-            match self.hub.try_latest() {
+            match poll {
                 Poll::Ready(None) => break,
                 Poll::Ready(Some(s)) => {
                     if Self::answers(&s, want, now) {
