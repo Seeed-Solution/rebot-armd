@@ -1202,6 +1202,9 @@ pub struct GripperMotion {
     pub target: f32,
     pub start: f32,
     pub gripper_index: usize,
+    /// Effective travel speed (rad/s) used for trajectory stepping, `expected_duration()` and
+    /// default timeout: capped at `close_speed_rad_s` when closing in position-force mode.
+    pub planned_speed: f64,
     pub elapsed: f64,
     /// Deadline (s): the request's timeout_s, else the default rule.
     pub timeout_s: f64,
@@ -1218,25 +1221,74 @@ pub struct GripperMotion {
 #[cfg(not(target_arch = "wasm32"))]
 impl GripperMotion {
     pub fn new(request: GripperRequest, policy: GripperPolicy, limit: JointLimit, start: f32, gripper_index: usize) -> Self {
+        Self::try_with_close_speed_limit(request, policy, limit, start, gripper_index, None)
+            .expect("non-pos-force GripperMotion construction is infallible")
+    }
+
+    /// Construct a gripper motion, optionally planning against a position-force driver's
+    /// 0.01 rad/s wire speed quantization (closing additionally capped at `close_speed_limit`).
+    /// Rejects any effective speed that encodes to 0 on the pos-force wire before action state is
+    /// committed.
+    pub fn try_with_close_speed_limit(
+        request: GripperRequest,
+        policy: GripperPolicy,
+        limit: JointLimit,
+        start: f32,
+        gripper_index: usize,
+        close_speed_limit: Option<f32>,
+    ) -> Result<Self, MotionError> {
+        let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
         let target = match request.command {
             GripperCommand::Open => policy.open_rad,
             GripperCommand::Close => policy.closed_rad,
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
-            GripperCommand::Seek => {
-                let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
-                policy.closed_rad + dir * 0.6
-            }
+            GripperCommand::Seek => policy.closed_rad + dir * 0.6,
         }.clamp(limit.min_position, limit.max_position);
-        let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        let mut m = Self { request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0 };
+        let closing = (target - start) * dir > 1e-6;
+        let (planned_speed, max_velocity) = match close_speed_limit {
+            Some(cap) => {
+                if !(cap.is_finite() && cap > 0.0) {
+                    return Err(MotionError::InvalidCommand(
+                        "pos-force gripper close_speed_rad_s must be positive and finite".into(),
+                    ));
+                }
+                let max_v = if limit.max_velocity.is_finite() && limit.max_velocity > 0.0 {
+                    f64::from(limit.max_velocity)
+                } else {
+                    request.speed
+                };
+                let effective = if closing {
+                    request.speed.min(max_v).min(f64::from(cap))
+                } else {
+                    request.speed.min(max_v)
+                };
+                // Derive planned speed from the exact 0.01 rad/s wire quantization in f64 (never
+                // rounding upward across a quantum via f64->f32 cast) so trajectory, expected
+                // duration and default timeout agree with what DamiaoArmDriver transmits.
+                let raw = crate::model::DamiaoGripperDrive::quantize_vel_raw_f64(effective);
+                if raw == 0 {
+                    return Err(MotionError::InvalidCommand(format!(
+                        "Gripper speed {effective:.4} rad/s encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                    )));
+                }
+                (f64::from(raw) / 100.0, crate::model::DamiaoGripperDrive::wire_speed_f32(raw))
+            }
+            None => (request.speed, request.speed as f32),
+        };
+        let limit = JointLimit { max_velocity, ..limit };
+        let mut m = Self {
+            request, policy, limit, target, start, gripper_index, planned_speed,
+            elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving,
+            contact_rad: None, contact_ticks: 0,
+        };
         m.timeout_s = m.request.timeout_s
             .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
-        m
+        Ok(m)
     }
 
-    /// Expected duration (s) for the travel at the requested speed, plus settle.
+    /// Expected duration (s) for the travel at the planned speed, plus settle.
     pub fn expected_duration(&self) -> f64 {
-        f64::from((self.target - self.start).abs()) / self.request.speed + 0.5 + self.policy.settle_ms as f64 / 1000.0
+        f64::from((self.target - self.start).abs()) / self.planned_speed + 0.5 + self.policy.settle_ms as f64 / 1000.0
     }
 
     /// Grasp: contact + squeeze_rad toward closed (not past closed_rad), once contact is known.
@@ -1386,7 +1438,7 @@ impl GripperMotion {
             let torque_hit = ctx.torque_feedback && self.moved
                 && self.policy.contact_torque_nm.is_some_and(|c| tau_g.abs() >= c);
             let lag_hit = (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD
-                && mv_g * dir < GRIPPER_CONTACT_SLOW_FRACTION * self.request.speed as f32;
+                && mv_g * dir < GRIPPER_CONTACT_SLOW_FRACTION * self.planned_speed as f32;
             self.contact_ticks = if torque_hit || lag_hit { self.contact_ticks + 1 } else { 0 };
             if self.contact_ticks >= GRIPPER_CONTACT_TICKS {
                 self.contact_rad = Some(m_g);

@@ -2304,8 +2304,11 @@ pub fn gripper_drive_from_profile(cfg: &crate::model::ArmConfig) -> Result<Optio
         DamiaoGripperMode::PosVel => GripperDrive::PosVel(joint),
         DamiaoGripperMode::PosForce => {
             let p = cfg.gripper_policy.as_ref().ok_or("damiao_gripper pos_force needs gripper_policy (closed_rad / open_rad)")?;
+            let close_speed_rad_s = cfg.limits.get(joint)
+                .filter(|l| l.max_velocity.is_finite() && l.max_velocity > 0.0)
+                .map_or(g.close_speed_rad_s, |l| g.close_speed_rad_s.min(l.max_velocity));
             GripperDrive::PosForce(GripperPosForce {
-                joint, current_raw: g.current_ceiling_raw, close_speed_rad_s: g.close_speed_rad_s,
+                joint, current_raw: g.current_ceiling_raw, close_speed_rad_s,
                 closed_rad: p.closed_rad, open_rad: p.open_rad, calibrated: g.calibrated,
                 ceiling_torque_nm: g.ceiling_torque_nm, torque_reference: g.torque_reference.clone(),
             })
@@ -2537,8 +2540,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         if cfg.current_raw == 0 || cfg.current_raw > damiao::POS_FORCE_I_DES_FULL
             || !(cfg.close_speed_rad_s.is_finite() && cfg.close_speed_rad_s > 0.0)
+            || damiao::pos_force_vel_raw(cfg.close_speed_rad_s) == 0
             || !(cfg.closed_rad.is_finite() && cfg.open_rad.is_finite()) || cfg.closed_rad == cfg.open_rad {
-            return Err(ArmDriverError::Protocol("pos-force gripper: current_raw 1..=10000, close_speed > 0, closed_rad != open_rad".into()));
+            return Err(ArmDriverError::Protocol("pos-force gripper: current_raw 1..=10000, close_speed quantizing >= 0.01 rad/s, closed_rad != open_rad".into()));
         }
         self.base_modes[cfg.joint] = DamiaoControlMode::PosForce;
         self.pos_force = Some(cfg);
@@ -2746,10 +2750,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Final writer of the position-force gripper: the configured current ceiling on every frame;
-    /// requires finite position/velocity and provably fresh measured feedback (<= 100 ms), failing
-    /// closed (`None`) otherwise. The speed field is the requested speed (`target.velocity`, else
-    /// the POS_VEL ceiling), limited to `close_speed_rad_s` unless fresh finite feedback proves
-    /// the frame moves the jaw strictly toward `open_rad`.
+    /// requires finite position/velocity, nonzero wire speed encoding (>= 0.01 rad/s), and
+    /// provably fresh measured feedback (<= 100 ms), failing closed (`None`) otherwise. The speed
+    /// field is the requested speed (`target.velocity`, else the POS_VEL ceiling when `None` or
+    /// `0.0` hold), limited to `close_speed_rad_s` unless fresh finite feedback proves the frame
+    /// moves the jaw strictly toward `open_rad`.
     fn pos_force_frame(&self, i: usize, target: &JointTarget) -> Option<CanFrame> {
         let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
         if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
@@ -2759,8 +2764,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let requested = target.velocity.filter(|v| *v != 0.0).map_or(self.vlim(), f32::abs).min(self.vlim());
         let strictly_opening = (target.position - measured) * (pf.closed_rad - pf.open_rad) < 0.0;
         let speed = if strictly_opening { requested } else { requested.min(pf.close_speed_rad_s) };
+        let vel_raw = damiao::pos_force_vel_raw(speed);
+        if vel_raw == 0 {
+            return None;
+        }
         Some(damiao::build_pos_force_frame(damiao::POS_FORCE_BASE_ID, self.motor_ids[i], target.position,
-            damiao::pos_force_vel_raw(speed), pf.current_raw))
+            vel_raw, pf.current_raw))
     }
 
     /// Hold frames of joint `i` in `mode` (`dual`: its mode is unknown, so both position
@@ -2834,6 +2843,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if self.fresh_measured_position(pf.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
                 return Some(ArmDriverError::HardwareFault(format!(
                     "joint {} position-force feedback stale: holding (no motion), no frame sent", pf.joint + 1)));
+            }
+            if targets.get(pf.joint).is_some_and(|t| self.pos_force_frame(pf.joint, t).is_none()) {
+                return Some(ArmDriverError::Protocol(format!(
+                    "joint {} position-force speed encodes to 0 on the wire, no frame sent", pf.joint + 1)));
             }
         }
         None
@@ -4717,9 +4730,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.pos_force.as_ref().filter(|pf| pf.joint == i),
                             self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE),
                         ) {
+                            // Bound autonomous recovery holds by both `pf.close_speed_rad_s` and
+                            // the last authorized pos-force frame's speed (preserving lower action
+                            // or joint ceilings during transient feedback gaps).
+                            let last_raw = self.last_target_frames[i]
+                                .filter(|f| f.id == u32::from(damiao::POS_FORCE_BASE_ID + id))
+                                .map(|f| u16::from_le_bytes([f.data[4], f.data[5]]))
+                                .filter(|&r| r >= 1);
+                            let recovery_vel = last_raw
+                                .map(crate::model::DamiaoGripperDrive::wire_speed_f32)
+                                .map_or(pf.close_speed_rad_s, |v| v.min(pf.close_speed_rad_s));
                             let hold = JointTarget {
                                 position: pos,
-                                velocity: Some(pf.close_speed_rad_s),
+                                velocity: Some(recovery_vel),
                                 ..JointTarget::position(pos)
                             };
                             if let Some(frame) = self.pos_force_frame(i, &hold) {

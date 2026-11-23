@@ -883,6 +883,9 @@ impl SupervisorInner {
         // 3. Only renew lease AFTER command validation and planning succeed
         self.last_heartbeat = Instant::now();
 
+        if self.config.gripper_index().is_some_and(|g| (target_positions[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.gripper_hold_vel_ceiling = None;
+        }
         self.servo_target = None;
         self.servo_ws_min_depths = None;
         self.target_positions = target_positions;

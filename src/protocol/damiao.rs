@@ -332,8 +332,7 @@ pub const POS_FORCE_I_DES_FULL: u16 = 10_000;
 /// Speed limit of a position-force frame: |speed| in 0.01 rad/s, quantized downward in f64
 /// so the encoded wire speed never exceeds `speed_rad_s`, saturated to u16 (non-finite: 0).
 pub fn pos_force_vel_raw(speed_rad_s: f32) -> u16 {
-    if !speed_rad_s.is_finite() { return 0; }
-    (f64::from(speed_rad_s.abs()) * 100.0).floor().clamp(0.0, f64::from(u16::MAX)) as u16
+    crate::model::DamiaoGripperDrive::quantize_vel_raw(speed_rad_s)
 }
 /// Feedback (master) CAN ID of the motor (u32).
 pub const RID_MST_ID: u8 = 7;

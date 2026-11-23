@@ -126,6 +126,10 @@ impl MacroCtx {
     /// Wait for the installed sub-motion; stop it on a timeout.
     pub async fn wait_sub(&self, phase: &str, limit_s: f64) -> Result<SubDone, Stop> {
         let until = Instant::now() + Duration::from_secs_f64(limit_s.min(self.phase_timeout_s));
+        self.wait_sub_until(phase, until).await
+    }
+
+    async fn wait_sub_until(&self, phase: &str, until: Instant) -> Result<SubDone, Stop> {
         loop {
             tokio::time::sleep(POLL).await;
             {
@@ -280,15 +284,31 @@ impl MacroCtx {
         sub_res.map_err(|s| (s, true))
     }
 
-    /// Run a gripper open / close sub-motion and wait for it.
-    pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
-        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: Some(8.0), tag: None };
-        let limit = {
+    /// Reconcile a planned gripper sub-motion with the remaining macro budget before installation,
+    /// and wait up to its planned deadline (not clamped to `phase_timeout_s`, bounded by `self.deadline`).
+    async fn run_gripper(&self, phase: &str, request: GripperRequest) -> Result<SubDone, Stop> {
+        let remaining_s = self.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
+        let (_, timeout_s) = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.start_macro_gripper(self.id, request).map_err(arm_fail)?
+            inner.start_macro_gripper_within(self.id, request, Some(remaining_s))
+                .map_err(|e| match e {
+                    ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg))
+                        if msg.contains("remaining macro budget") =>
+                    {
+                        fail(self.timeout_code, format!("Phase {phase}: {msg}"))
+                    }
+                    other => arm_fail(other),
+                })?
         };
-        self.wait_sub(phase, limit + 10.0).await
+        let until = (Instant::now() + Duration::from_secs_f64(timeout_s + 10.0)).min(self.deadline);
+        self.wait_sub_until(phase, until).await
+    }
+
+    /// Run a gripper open / close sub-motion and wait for it.
+    pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
+        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: None, tag: None };
+        self.run_gripper(phase, request).await
     }
 
     /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it.
@@ -298,15 +318,10 @@ impl MacroCtx {
             fraction: Some(fraction),
             grasp: false,
             speed: 1.0,
-            timeout_s: Some(8.0),
+            timeout_s: None,
             tag: None,
         };
-        let limit = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.start_macro_gripper(self.id, request).map_err(arm_fail)?
-        };
-        self.wait_sub(phase, limit + 10.0).await
+        self.run_gripper(phase, request).await
     }
 
     /// [`phase`](Self::phase) followed by [`gripper`](Self::gripper).

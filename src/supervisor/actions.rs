@@ -493,8 +493,31 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Effective closing speed limit enforced by the attached driver in position-force mode
+    /// (`None` for legacy POS_VEL or drivers without a pos-force motor current cap).
+    pub(crate) fn gripper_close_speed_limit(&self) -> Option<f32> {
+        let gripper_idx = self.config.gripper_index()?;
+        self.driver.as_ref()
+            .and_then(|d| d.lock().ok())
+            .and_then(|drv| drv.motor_current_cap())
+            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
+            .and_then(|cap| cap.close_speed_rad_s)
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        self.start_macro_gripper_within(id, request, None).map(|(dur, _)| dur)
+    }
+
+    /// Start a gripper sub-motion of macro action `id`, optionally verifying before installation
+    /// that its planned duration fits within `max_budget_s`. Returns `(expected_duration, timeout_s)`.
+    pub(crate) fn start_macro_gripper_within(
+        &mut self,
+        id: u64,
+        request: GripperRequest,
+        max_budget_s: Option<f64>,
+    ) -> Result<(f64, f64), ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -505,9 +528,22 @@ impl SupervisorInner {
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?;
         let duration = motion.expected_duration();
+        let timeout_s = motion.timeout_s;
+        if let Some(budget_s) = max_budget_s {
+            if duration > budget_s {
+                return Err(MotionError::InvalidCommand(format!(
+                    "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
+                )).into());
+            }
+        }
+        self.releasing = matches!(motion.request.command, GripperCommand::Open);
+        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -518,7 +554,7 @@ impl SupervisorInner {
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
-        Ok(duration)
+        Ok((duration, timeout_s))
     }
 
     /// Start a joint-space quintic sub-motion of macro action `id` (sequence pose step) to
@@ -538,6 +574,9 @@ impl SupervisorInner {
         let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target, limits, true)?;
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        if self.config.gripper_index().is_some_and(|g| (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.gripper_hold_vel_ceiling = None;
+        }
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.target_positions = target;
@@ -602,8 +641,13 @@ impl SupervisorInner {
         }
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?;
+        self.releasing = matches!(motion.request.command, GripperCommand::Open);
+        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
         self.servo_target = None;
@@ -669,8 +713,13 @@ impl SupervisorInner {
             tag: None,
         };
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
+        let close_cap = self.gripper_close_speed_limit();
+        let motion = GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        )?;
         let duration = motion.expected_duration();
+        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;

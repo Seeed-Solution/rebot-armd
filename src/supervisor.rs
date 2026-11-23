@@ -303,6 +303,10 @@ pub struct SupervisorInner {
     pub servo_blocked_hold: bool,
     /// Persistent monotonic escape baseline across a servo stream & its braking phase, tagged with `workspace_revision`.
     pub servo_ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
+    /// Persistent velocity ceiling (rad/s) for the gripper's current hold target, set when a
+    /// `GripperMotion` starts/steps and retained across completion and post-completion holds
+    /// until replaced by a new gripper motion, an explicit non-gripper J7 move, or torque-off.
+    pub(crate) gripper_hold_vel_ceiling: Option<f32>,
     pub is_torqued: bool,
     pub pending_rearm: bool,
     pub active_trajectory: Option<ActiveTrajectory>,
@@ -650,6 +654,7 @@ impl SupervisorInner {
             motion_limit_seen_s: 0.0,
             servo_blocked_hold: false,
             servo_ws_min_depths: None,
+            gripper_hold_vel_ceiling: None,
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
@@ -1635,17 +1640,28 @@ impl SupervisorInner {
             ParkRelease::Closing => (GripperCommand::Close, None),
         };
         let request = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
+        let close_cap = self.gripper_close_speed_limit();
+        let motion = match GripperMotion::try_with_close_speed_limit(
+            request, policy, self.config.limits[gripper_idx].clone(),
+            self.commanded_positions[gripper_idx], gripper_idx, close_cap,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("Park release skipped: {e}");
+                return false;
+            }
+        };
         // the stall latch of the carry would block the opening move's first ticks otherwise
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
-        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
+        self.gripper_hold_vel_ceiling = Some(motion.limit.max_velocity);
         self.target_positions[gripper_idx] = motion.target;
         self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
@@ -2462,6 +2478,7 @@ impl SupervisorInner {
         } else {
             None
         };
+        let gripper_idx_for_ceiling = self.config.gripper_index();
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -2493,6 +2510,13 @@ impl SupervisorInner {
                     Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
                 }
             };
+            // Keep the persistent gripper hold ceiling synchronized with `GripperMotion` (including
+            // contact speed reduction) so completion and subsequent hold ticks preserve it.
+            if let Reference::Gripper(gm) = &active.reference {
+                if gripper_idx_for_ceiling == Some(gm.gripper_index) {
+                    self.gripper_hold_vel_ceiling = Some(gm.limit.max_velocity);
+                }
+            }
             // same-side approach: progress over both legs; the first leg's end starts the short
             // segment (src/backlash.rs)
             let out = match (active.span.is_some(), out) {
@@ -2611,6 +2635,11 @@ impl SupervisorInner {
                         "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
                 } else {
                     reference_stepped = true;
+                    if let Some(g) = gripper_idx {
+                        if target.get(g).is_some_and(|&tgt| (tgt - self.commanded_positions[g]).abs() > 1e-4) {
+                            self.gripper_hold_vel_ceiling = None;
+                        }
+                    }
                     let mut reached_flags = std::mem::take(&mut self.scratch.reached);
                     fill_n(&mut reached_flags, false, self.config.dof);
                     let mut next_positions = std::mem::take(&mut self.scratch.next_positions);

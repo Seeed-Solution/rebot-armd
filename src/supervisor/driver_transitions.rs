@@ -299,6 +299,7 @@ impl SupervisorInner {
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;
+        self.gripper_hold_vel_ceiling = None;
         Ok(())
     }
 
@@ -504,6 +505,7 @@ impl SupervisorInner {
             self.servo_target = None;
             self.servo_stream_active = false;
             self.servo_ws_min_depths = None;
+            self.gripper_hold_vel_ceiling = None;
 
             let state = self.safety.set_torque(true)?;
             self.is_torqued = true;
@@ -548,6 +550,7 @@ impl SupervisorInner {
         }
         let state = self.safety.set_torque(false)?;
         self.reset_gripper_stall();
+        self.gripper_hold_vel_ceiling = None;
         if self.driver.is_none() { self.measured_velocities.fill(0.0); }
         Ok(state)
     }
@@ -576,6 +579,7 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_stall_sign = 0.0;
         self.gripper_prev_hw_overload = false;
+        self.gripper_hold_vel_ceiling = None;
         self.stop_motion();
         self.servo_stream_active = false;
         self.tracking.invalidate();

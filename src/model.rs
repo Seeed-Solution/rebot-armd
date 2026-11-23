@@ -1224,12 +1224,36 @@ impl DamiaoGripperDrive {
         Self { mode: DamiaoGripperMode::PosVel, ..Self::rebot_dm() }
     }
 
+    /// Wire speed quantization from `f64` (0.01 rad/s units, floored in f64 so wire speed never
+    /// exceeds `speed_rad_s`; non-finite -> 0). Single authority shared by protocol encoding,
+    /// config validation, driver checks and gripper motion planning.
+    pub fn quantize_vel_raw_f64(speed_rad_s: f64) -> u16 {
+        if !speed_rad_s.is_finite() { return 0; }
+        (speed_rad_s.abs() * 100.0).floor().clamp(0.0, f64::from(u16::MAX)) as u16
+    }
+
+    /// Wire speed quantization from `f32` (delegates to [`Self::quantize_vel_raw_f64`]).
+    pub fn quantize_vel_raw(speed_rad_s: f32) -> u16 {
+        Self::quantize_vel_raw_f64(f64::from(speed_rad_s))
+    }
+
+    /// Smallest `f32` that encodes back to `raw` (preventing double-flooring when the planned
+    /// trajectory velocity is re-encoded by `pos_force_vel_raw`).
+    pub fn wire_speed_f32(raw: u16) -> f32 {
+        if raw == 0 { return 0.0; }
+        let v = (f64::from(raw) / 100.0) as f32;
+        if Self::quantize_vel_raw(v) < raw { v.next_up() } else { v }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !(1..=10_000).contains(&self.current_ceiling_raw) {
             return Err("damiao_gripper.current_ceiling_raw must be 1..=10000".into());
         }
         if !(self.close_speed_rad_s.is_finite() && self.close_speed_rad_s > 0.0) {
             return Err("damiao_gripper.close_speed_rad_s must be positive".into());
+        }
+        if self.mode == DamiaoGripperMode::PosForce && Self::quantize_vel_raw(self.close_speed_rad_s) == 0 {
+            return Err("damiao_gripper.close_speed_rad_s encodes to 0 on the wire (must quantize to >= 0.01 rad/s)".into());
         }
         if self.calibrated && !self.ceiling_torque_nm.is_some_and(|t| t.is_finite() && t > 0.0) {
             return Err("damiao_gripper: calibrated needs a positive ceiling_torque_nm".into());
@@ -2135,6 +2159,15 @@ impl ArmConfig {
             }
             if lim.max_velocity <= 0.0 || !lim.max_velocity.is_finite() || lim.max_acceleration <= 0.0 || !lim.max_acceleration.is_finite() {
                 return Err(format!("Joint {} max_velocity must be positive finite", i));
+            }
+        }
+        if let (Some(g), Some(dg)) = (self.gripper_index(), &self.damiao_gripper) {
+            if dg.mode == DamiaoGripperMode::PosForce
+                && self.limits.get(g).is_some_and(|l| DamiaoGripperDrive::quantize_vel_raw(l.max_velocity) == 0)
+            {
+                return Err(format!(
+                    "Joint {g} max_velocity encodes to 0 on the pos-force wire (must quantize to >= 0.01 rad/s)"
+                ));
             }
         }
         if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {

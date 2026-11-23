@@ -1886,3 +1886,527 @@ fn enable_refresh_deadline_boundaries_and_failure_paths() {
         }
     }
 }
+
+#[test]
+fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
+    use std::sync::Arc;
+    use armd::motion::{GripperCommand, GripperRequest};
+    use armd::supervisor::SupervisorInner;
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    const DT: f64 = 0.02;
+
+    /// Wraps `FakeBus` so J7 moves at the wire-encoded speed limit (`vel_raw * 0.01` rad/s in
+    /// pos-force 0x307; `vlim` in POS_VEL 0x107) instead of teleporting instantaneously.
+    #[derive(Clone)]
+    struct RateLimitedBus {
+        inner: FakeBus,
+        dt: f32,
+    }
+
+    impl CanTransport for RateLimitedBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let prev_q = self.inner.with(|s| s.motors[J7].q);
+            self.inner.transmit(frame)?;
+            if frame.id == 0x307 || frame.id == 0x107 {
+                self.inner.with(|s| {
+                    let m = &mut s.motors[J7];
+                    if !m.enabled { return; }
+                    let target_p = f32::from_le_bytes([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                    let wire_v = if frame.id == 0x307 {
+                        f32::from(u16::from_le_bytes([frame.data[4], frame.data[5]])) * 0.01
+                    } else {
+                        f32::from_le_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]).abs()
+                    };
+                    let max_step = wire_v * self.dt;
+                    let delta = (target_p - prev_q).clamp(-max_step, max_step);
+                    let mut next_q = prev_q + delta;
+                    if let Some(stop) = m.stop_at {
+                        if next_q > stop {
+                            next_q = stop;
+                            m.tau = f32::from(u16::from_le_bytes([frame.data[6], frame.data[7]])) * 0.002;
+                        }
+                    }
+                    m.q = next_q;
+                    m.v = (next_q - prev_q) / self.dt;
+                    // Replace the feedback frame pushed by FakeBus with the rate-limited state.
+                    let updated = m.feedback_frame();
+                    if let Some(last) = s.pending.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    } else if let Some(last) = s.rx.back_mut().filter(|f| f.id == updated.id) {
+                        *last = updated;
+                    }
+                });
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+    }
+
+    let make_sup = |pos_force_speed: Option<f32>, start_j7: f32| {
+        let clock = MockClock::new();
+        let inner_bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        inner_bus.with(|s| {
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.0; if i == J7 { m.q = start_j7; } }
+        });
+        let bus = RateLimitedBus { inner: inner_bus.clone(), dt: DT as f32 };
+        let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap();
+        let mut cfg = ArmConfig::rebot_dm();
+        if let Some(close_speed) = pos_force_speed {
+            d = d.with_gripper_pos_force(GripperPosForce { close_speed_rad_s: close_speed, ..pf() }).unwrap();
+            cfg.damiao_gripper = Some(DamiaoGripperDrive { close_speed_rad_s: close_speed, ..DamiaoGripperDrive::rebot_dm() });
+        } else {
+            d = d.with_gripper_pos_vel(J7);
+            cfg.damiao_gripper = Some(DamiaoGripperDrive::legacy_pos_vel());
+        }
+        d.read_joint_states().unwrap();
+        inner_bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        let mut sup = SupervisorInner::new(cfg).with_driver(Box::new(d));
+        sup.lease_enabled = false;
+        sup.tick(DT);
+        sup.set_torque(true).unwrap();
+        sup.tick(DT);
+        (sup, inner_bus, clock)
+    };
+
+    let run_to_end = |sup: &mut SupervisorInner, clock: &MockClock, id: u64, max_s: f64| {
+        for _ in 0..(max_s / DT) as usize {
+            clock.advance(Duration::from_millis(20));
+            sup.tick(DT);
+            let a = sup.last_action.clone().unwrap();
+            assert_eq!(a.id, id);
+            if !a.is_running() { return a; }
+        }
+        panic!("action {id} still running after {max_s} s: {:?}", sup.last_action);
+    };
+
+    // 1. Pos-force full-stroke close (-5.7 -> 0.0) via Move(0.0) and Close(grasp=false):
+    //    expected duration >= 5.7 / 0.30 s, completes without GRIPPER_TIMEOUT, all close frames <= 0.30 rad/s.
+    for req in [
+        GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+        GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
+    ] {
+        let (mut sup, inner_bus, clock) = make_sup(Some(0.30), -5.7);
+        inner_bus.clear_log();
+        let epoch = sup.safety.epoch_id();
+        let (id, expected) = sup.start_gripper(req.clone(), epoch).unwrap();
+        assert!(expected >= 5.7 / 0.30, "req={req:?}: expected_duration {expected:.2} s < {:.2} s", 5.7 / 0.30);
+        let a = run_to_end(&mut sup, &clock, id, 25.0);
+        assert_eq!(a.state, "done", "req={req:?}: {a:?}");
+        assert!(sup.measured_positions[J7].abs() < 0.05, "req={req:?}: J7 ended at {}", sup.measured_positions[J7]);
+        let close_frames = j7_commands(&inner_bus.tx_log());
+        assert!(!close_frames.is_empty());
+        let close_raw = damiao::pos_force_vel_raw(0.30);
+        assert!(close_frames.iter().all(|f| {
+            let r = u16::from_le_bytes([f.data[4], f.data[5]]);
+            f.id == 0x307 && (1..=close_raw).contains(&r)
+        }), "closing frame out of 1..={close_raw} vel_raw range");
+    }
+
+    // 2. Pos-force opening (0.0 -> -5.7) keeps the requested 1.0 rad/s speed limit (not slowed to 0.30).
+    let (mut sup, inner_open, clock) = make_sup(Some(0.30), 0.0);
+    inner_open.clear_log();
+    let epoch = sup.safety.epoch_id();
+    let open_req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None };
+    let (id, expected_open) = sup.start_gripper(open_req, epoch).unwrap();
+    assert!(expected_open > 5.7 && expected_open < 8.0, "opening slowed unexpectedly: {expected_open:.2} s");
+    let a = run_to_end(&mut sup, &clock, id, 10.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!((sup.measured_positions[J7] - (-5.7)).abs() < 0.05, "J7 open {}", sup.measured_positions[J7]);
+    assert!(j7_commands(&inner_open.tx_log()).iter().all(|f| f.id == 0x307 && u16::from_le_bytes([f.data[4], f.data[5]]) >= 1),
+        "opening emitted zero vel_raw frame");
+
+    // 3. Legacy pos_vel mode full-stroke close (-5.7 -> 0.0) is unchanged (1.0 rad/s, expected < 8.0 s).
+    let (mut sup, _inner_bus, clock) = make_sup(None, -5.7);
+    let epoch = sup.safety.epoch_id();
+    let close_req = GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None };
+    let (id, expected_pv) = sup.start_gripper(close_req, epoch).unwrap();
+    assert!(expected_pv > 5.7 && expected_pv < 8.0, "pos_vel expected_duration changed: {expected_pv:.2} s");
+    let a = run_to_end(&mut sup, &clock, id, 10.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!(sup.measured_positions[J7].abs() < 0.05, "pos_vel J7 {}", sup.measured_positions[J7]);
+
+    // 4. Quantization boundary (0.03_f32 floors to raw 2 = 0.02 rad/s on the wire):
+    //    planner uses the quantized 0.02 rad/s rate (not unquantized 0.03), does not double-floor
+    //    wire velocity to raw 1 (0.01 rad/s), and never emits vel_raw == 0 (even during braking).
+    assert_eq!(damiao::pos_force_vel_raw(0.03), 2);
+    let (mut sup_full, _, _) = make_sup(Some(0.03), -5.7);
+    let ep_full = sup_full.safety.epoch_id();
+    let (_, expected_full_q) = sup_full.start_gripper(
+        GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+        ep_full,
+    ).unwrap();
+    assert!(expected_full_q >= 5.7 / 0.02, "expected quantized duration >= 285 s, got {expected_full_q:.2} s");
+
+    // 0.20 rad at 0.02 rad/s takes ~10.25 s: fails under unquantized 0.03 timeout (~9.4 s) AND
+    // fails if double-floored to raw 1 (20 s vs 12.75 s timeout).
+    let (mut sup_q, inner_q, clock_q) = make_sup(Some(0.03), -0.20);
+    inner_q.clear_log();
+    let ep_q = sup_q.safety.epoch_id();
+    let (id_q, expected_q) = sup_q.start_gripper(
+        GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+        ep_q,
+    ).unwrap();
+    assert!(expected_q >= 0.20 / 0.02, "quantized expected_duration {expected_q:.2} s < 10.0 s");
+    let aq = run_to_end(&mut sup_q, &clock_q, id_q, 15.0);
+    assert_eq!(aq.state, "done", "quantized 0.03->0.02 close failed: {aq:?}");
+    assert!(sup_q.measured_positions[J7].abs() < 0.05, "quantized J7 {}", sup_q.measured_positions[J7]);
+    let q_vel_raws: Vec<u16> = j7_commands(&inner_q.tx_log()).iter()
+        .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+        .collect();
+    assert!(!q_vel_raws.is_empty());
+    assert!(q_vel_raws.iter().all(|&r| (1..=2).contains(&r)), "wire speed out of 1..=2: {q_vel_raws:?}");
+    assert!(q_vel_raws.contains(&2), "wire speed double-floored below raw 2: {q_vel_raws:?}");
+
+    // 5. Zero-encoding speeds (< 0.01 rad/s wire quantization, including 0.01_f32 which rounds
+    //    below 0.01 in IEEE-754) are rejected across config validation, driver builder, per-action
+    //    admission (without mutating supervisor state), and direct final-writer batches (0 frames sent).
+    for bad_speed in [0.005_f32, 0.01_f32] {
+        assert_eq!(damiao::pos_force_vel_raw(bad_speed), 0);
+        let mut bad_cfg = ArmConfig {
+            damiao_gripper: Some(DamiaoGripperDrive { close_speed_rad_s: bad_speed, ..DamiaoGripperDrive::rebot_dm() }),
+            ..ArmConfig::rebot_dm()
+        };
+        assert!(bad_cfg.validate().is_err(), "PosForce config accepted zero-encoding close_speed {bad_speed}");
+        let bus = FakeBus::new(&b601_limits());
+        assert!(
+            DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+                .with_gripper_pos_force(GripperPosForce { close_speed_rad_s: bad_speed, ..pf() })
+                .is_err(),
+            "driver accepted zero-encoding close_speed {bad_speed}"
+        );
+
+        // Per-action admission rejects both closing and opening zero-encoding speeds without
+        // committing action state or mutating releasing / target_positions.
+        for cmd in [GripperCommand::Close, GripperCommand::Open] {
+            let (mut sup_bad, _, _) = make_sup(Some(0.30), -1.0);
+            let ep = sup_bad.safety.epoch_id();
+            let prev_targets = sup_bad.target_positions.clone();
+            let prev_releasing = sup_bad.releasing;
+            let err = sup_bad.start_gripper(
+                GripperRequest { command: cmd, fraction: None, grasp: false, speed: f64::from(bad_speed), timeout_s: None, tag: None },
+                ep,
+            );
+            assert!(err.is_err(), "start_gripper accepted zero-encoding speed {bad_speed} for {cmd:?}");
+            assert!(sup_bad.active_trajectory.is_none() && sup_bad.last_action.is_none());
+            assert_eq!(sup_bad.releasing, prev_releasing);
+            assert_eq!(sup_bad.target_positions, prev_targets);
+        }
+
+        // Direct final-writer batch with nonzero sub-quantum velocity fails closed before frame 0.
+        let (mut d, bus, _) = rig(true);
+        d.set_torque(true).unwrap();
+        d.read_joint_states().unwrap();
+        bus.clear_log();
+        let mut t = targets(-0.5);
+        t[J7].velocity = Some(bad_speed);
+        assert!(d.write_joint_targets(&t).is_err(), "final writer accepted zero-encoding velocity {bad_speed}");
+        assert!(bus.tx_log().is_empty(), "sent partial batch on zero-encoding velocity {bad_speed}: {:?}", bus.tx_log());
+        // Hold (velocity = Some(0.0) or None) stays valid with vel_raw >= 1.
+        t[J7].velocity = Some(0.0);
+        d.write_joint_targets(&t).expect("hold velocity=0.0 must succeed");
+        let hold_f = j7_commands(&bus.tx_log())[0];
+        assert_eq!(u16::from_le_bytes([hold_f.data[4], hold_f.data[5]]), damiao::pos_force_vel_raw(0.30));
+    }
+    assert_eq!(damiao::pos_force_vel_raw(0.0101), 1);
+    ArmConfig {
+        damiao_gripper: Some(DamiaoGripperDrive { close_speed_rad_s: 0.0101, ..DamiaoGripperDrive::rebot_dm() }),
+        ..ArmConfig::rebot_dm()
+    }.validate().expect("0.0101 rad/s quantizes to raw 1 and must validate");
+    ArmConfig {
+        damiao_gripper: Some(DamiaoGripperDrive { close_speed_rad_s: 0.005, ..DamiaoGripperDrive::legacy_pos_vel() }),
+        ..ArmConfig::rebot_dm()
+    }.validate().expect("legacy PosVel ignores pos-force wire quantization");
+
+    // 6. Joint max_velocity ceiling contract across config validation, servo streaming,
+    //    whole-arm quintic references, and stream braking:
+    //    - ArmConfig::validate rejects J7 max_velocity < 0.01 rad/s in PosForce mode.
+    //    - Even if an unvalidated config sets J7 max_velocity = 0.005, streaming does NOT silently
+    //      raise velocity to raw 1 (0.01 rad/s): it fails closed with 0 CAN frames sent.
+    //    - With valid limits (>= 0.01 rad/s), whole-arm quintic and servo stream + braking complete
+    //      without fault and emit only nonzero vel_raw (>= 1) frames.
+    for bad_lim in [0.005_f32, 0.01_f32] {
+        let mut cfg_bad_lim = ArmConfig::rebot_dm();
+        cfg_bad_lim.limits[J7].max_velocity = bad_lim;
+        assert!(cfg_bad_lim.validate().is_err(), "PosForce config accepted sub-quantum J7 max_velocity {bad_lim}");
+    }
+    let mut cfg_ok_lim = ArmConfig::rebot_dm();
+    cfg_ok_lim.limits[J7].max_velocity = 0.0101;
+    cfg_ok_lim.validate().expect("J7 max_velocity 0.0101 must validate");
+    let mut cfg_pv_lim = ArmConfig { damiao_gripper: Some(DamiaoGripperDrive::legacy_pos_vel()), ..ArmConfig::rebot_dm() };
+    cfg_pv_lim.limits[J7].max_velocity = 0.005;
+    cfg_pv_lim.validate().expect("legacy PosVel ignores pos-force J7 max_velocity quantization");
+
+    // Unvalidated sub-quantum J7 limit on servo stream: must NOT silently bump 0.005 -> raw 1 (0.01).
+    {
+        let (mut sup_lim, inner_lim, clock_lim) = make_sup(Some(0.30), -1.0);
+        sup_lim.config.limits[J7].max_velocity = 0.005;
+        sup_lim.config.joint_tracking = None;
+        let mut tgt = sup_lim.commanded_positions.clone();
+        tgt[J7] = -0.5;
+        sup_lim.servo_target = Some(tgt);
+        sup_lim.last_motion_frame = std::time::Instant::now();
+        inner_lim.clear_log();
+        clock_lim.advance(Duration::from_millis(20));
+        sup_lim.tick(DT);
+        assert!(j7_commands(&inner_lim.tx_log()).is_empty(),
+            "sub-quantum J7 limit 0.005 was silently bumped and transmitted: {:?}", inner_lim.tx_log());
+        assert!(sup_lim.safety.state().is_stopped(), "expected fault on unrepresentable stream ceiling");
+    }
+
+    // Valid J7 limit (2.0 rad/s): whole-arm quintic (jog) moving J7 and servo stream + stream
+    // braking both emit exclusively vel_raw >= 1 (zero faults, zero vel_raw == 0 frames).
+    {
+        let (mut sup_qnt, inner_qnt, clock_qnt) = make_sup(Some(0.30), -1.0);
+        sup_qnt.config.joint_tracking = None;
+        let ep = sup_qnt.safety.epoch_id();
+        let mut goal = sup_qnt.commanded_positions.clone();
+        goal[J7] = -0.8;
+        inner_qnt.clear_log();
+        let (_, id, _) = sup_qnt.jog_action(goal, Some(1.0), Some(ep), "jog").unwrap();
+        let a = run_to_end(&mut sup_qnt, &clock_qnt, id, 5.0);
+        assert_eq!(a.state, "done", "whole-arm quintic moving J7 failed: {a:?}");
+        let qnt_raws: Vec<u16> = j7_commands(&inner_qnt.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!qnt_raws.is_empty());
+        assert!(qnt_raws.iter().all(|&r| (1..=damiao::pos_force_vel_raw(0.30)).contains(&r)),
+            "quintic emitted invalid vel_raw: {qnt_raws:?}");
+
+        // Servo stream moving J7 followed by stream drop -> stream braking to 0.0.
+        let mut tgt = sup_qnt.commanded_positions.clone();
+        tgt[J7] = -0.5;
+        sup_qnt.servo_target = Some(tgt);
+        sup_qnt.last_motion_frame = std::time::Instant::now();
+        inner_qnt.clear_log();
+        for _ in 0..10 {
+            clock_qnt.advance(Duration::from_millis(20));
+            sup_qnt.tick(DT);
+            assert!(!sup_qnt.safety.state().is_stopped(), "servo stream faulted: {:?}", sup_qnt.safety.state());
+        }
+        sup_qnt.servo_target = None; // trigger stream braking
+        for _ in 0..20 {
+            clock_qnt.advance(Duration::from_millis(20));
+            sup_qnt.tick(DT);
+            assert!(!sup_qnt.safety.state().is_stopped(), "stream braking faulted: {:?}", sup_qnt.safety.state());
+        }
+        assert_eq!(sup_qnt.commanded_velocities[J7], 0.0, "stream braking did not come to rest");
+        let stream_raws: Vec<u16> = j7_commands(&inner_qnt.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!stream_raws.is_empty());
+        assert!(stream_raws.iter().all(|&r| (1..=damiao::pos_force_vel_raw(0.30)).contains(&r)),
+            "servo stream/braking emitted invalid vel_raw: {stream_raws:?}");
+    }
+
+    // 7. Zero-velocity position targets (grasp squeeze, settle, and idle holds) must respect the
+    //    active authorized speed ceiling and never jump to close_speed_rad_s (0.30 -> raw 30).
+    {
+        // 7a. Low-speed grasp (request.speed = 0.025 -> raw 2 = 0.02 rad/s) hitting an object stop:
+        //     travel, contact, squeeze (v == 0.0 with displaced target), settle, and the final
+        //     completion tick all stay in 1..=2 (never jumping to close_speed_rad_s raw 30).
+        let (mut sup_g, inner_g, clock_g) = make_sup(Some(0.30), -0.60);
+        inner_g.with(|s| s.motors[J7].stop_at = Some(-0.50));
+        inner_g.clear_log();
+        let ep = sup_g.safety.epoch_id();
+        let (gid, _) = sup_g.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.025, timeout_s: None, tag: None },
+            ep,
+        ).unwrap();
+        let ga = run_to_end(&mut sup_g, &clock_g, gid, 15.0);
+        assert_eq!((ga.state.as_str(), ga.holding), ("done", Some(true)), "low-speed grasp failed: {ga:?}");
+        let grasp_raws: Vec<u16> = j7_commands(&inner_g.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!grasp_raws.is_empty());
+        assert!(grasp_raws.iter().all(|&r| (1..=2).contains(&r)),
+            "low-speed grasp squeeze/settle exceeded requested raw 2: {grasp_raws:?}");
+        assert!(grasp_raws.contains(&2));
+
+        // 7a-post. Persistent post-completion hold + object yield + autonomous driver recovery:
+        //          retained squeeze target must stay at raw 1..=2 across idle ticks, when the
+        //          held object yields, and during a 60 ms feedback-gap recovery hold.
+        inner_g.clear_log();
+        for _ in 0..15 {
+            clock_g.advance(Duration::from_millis(20));
+            sup_g.tick(DT);
+        }
+        // Object yields: jaw now chases the retained squeeze target at <= 0.02 rad/s (raw 2).
+        inner_g.with(|s| s.motors[J7].stop_at = None);
+        for _ in 0..15 {
+            clock_g.advance(Duration::from_millis(20));
+            sup_g.tick(DT);
+        }
+        let post_raws: Vec<u16> = j7_commands(&inner_g.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!post_raws.is_empty());
+        assert!(post_raws.iter().all(|&r| (1..=2).contains(&r)),
+            "post-completion hold / object yield exceeded requested raw 2: {post_raws:?}");
+
+        // Autonomous driver recovery hold (60 ms J7 feedback gap, still <= 100 ms freshness bound)
+        // during the low-speed hold stays at raw 2 (never jumps to close_speed_rad_s raw 30).
+        inner_g.with(|s| s.motors[J7].mute_feedback = true);
+        clock_g.advance(Duration::from_millis(60));
+        inner_g.with(|s| for i in 0..6 { s.push_feedback(i); });
+        inner_g.clear_log();
+        sup_g.tick(DT);
+        let rec_low_raws: Vec<u16> = j7_commands(&inner_g.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!rec_low_raws.is_empty(), "expected recovery hold frame at 60 ms");
+        assert!(rec_low_raws.iter().all(|&r| (1..=2).contains(&r)),
+            "autonomous recovery bypassed low-speed ceiling raw 2: {rec_low_raws:?}");
+
+        // Subsequent explicit Open at 1.0 rad/s replaces the low-speed hold ceiling.
+        inner_g.with(|s| { s.motors[J7].mute_feedback = false; s.push_all_feedback(); });
+        sup_g.tick(DT);
+        inner_g.clear_log();
+        let ep_open = sup_g.safety.epoch_id();
+        let (oid, _) = sup_g.start_gripper(
+            GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            ep_open,
+        ).unwrap();
+        let oa = run_to_end(&mut sup_g, &clock_g, oid, 10.0);
+        assert_eq!(oa.state, "done", "{oa:?}");
+        let open_raws: Vec<u16> = j7_commands(&inner_g.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(open_raws.contains(&100), "subsequent Open stayed stuck at old hold ceiling: {open_raws:?}");
+
+        // 7b. Joint ceiling below close_speed_rad_s (0.15 < 0.30): gripper_drive_from_profile
+        //     caps close_speed_rad_s to 0.15, idle holds use raw 15, AND autonomous driver
+        //     recovery at 60 ms stays at raw 15 (never jumps to raw 30).
+        let mut cfg_15 = ArmConfig::rebot_dm();
+        cfg_15.limits[J7].max_velocity = 0.15;
+        match gripper_drive_from_profile(&cfg_15).unwrap() {
+            Some(GripperDrive::PosForce(p)) => assert_eq!(p.close_speed_rad_s, 0.15),
+            other => panic!("expected PosForce capped at 0.15, got {other:?}"),
+        }
+        let (mut sup_low, inner_low, clock_low) = make_sup(Some(0.30), -1.0);
+        sup_low.config.limits[J7].max_velocity = 0.15;
+        inner_low.clear_log();
+        clock_low.advance(Duration::from_millis(20));
+        sup_low.tick(DT);
+        let low_raws: Vec<u16> = j7_commands(&inner_low.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!low_raws.is_empty());
+        assert!(low_raws.iter().all(|&r| r == 15), "zero-velocity hold bypassed J7 ceiling 0.15: {low_raws:?}");
+
+        // Autonomous driver recovery (60 ms gap) under J7 ceiling 0.15 stays at raw 15 (not 30).
+        inner_low.with(|s| s.motors[J7].mute_feedback = true);
+        clock_low.advance(Duration::from_millis(60));
+        inner_low.with(|s| for i in 0..6 { s.push_feedback(i); });
+        inner_low.clear_log();
+        sup_low.tick(DT);
+        let rec_15_raws: Vec<u16> = j7_commands(&inner_low.tx_log()).iter()
+            .map(|f| { assert_eq!(f.id, 0x307); u16::from_le_bytes([f.data[4], f.data[5]]) })
+            .collect();
+        assert!(!rec_15_raws.is_empty(), "expected recovery hold at 60 ms under 0.15 ceiling");
+        assert!(rec_15_raws.iter().all(|&r| r == 15),
+            "autonomous recovery bypassed J7 ceiling 0.15: {rec_15_raws:?}");
+
+        // 7c. Unvalidated sub-quantum J7 ceiling (0.005) on a zero-velocity tick fails closed (0 frames).
+        inner_low.with(|s| { s.motors[J7].mute_feedback = false; s.push_all_feedback(); });
+        sup_low.tick(DT);
+        sup_low.config.limits[J7].max_velocity = 0.005;
+        inner_low.clear_log();
+        clock_low.advance(Duration::from_millis(20));
+        sup_low.tick(DT);
+        assert!(j7_commands(&inner_low.tx_log()).is_empty(),
+            "zero-velocity tick bypassed unrepresentable ceiling 0.005: {:?}", inner_low.tx_log());
+        assert!(sup_low.safety.state().is_stopped());
+    }
+
+    // 8. Macro gripper waits reconcile with planned slow-close duration and overall macro deadline:
+    //    - A close whose expected_duration exceeds remaining macro budget is rejected before install.
+    //    - A close whose expected_duration exceeds phase_timeout_s but fits within the overall macro
+    //      deadline is NOT killed at phase_timeout_s and completes cleanly.
+    {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        rt.block_on(async {
+            // 8a. Close needing ~285 s inside a 60 s macro budget -> rejected before installing.
+            let (sup_inner, _, _) = make_sup(Some(0.03), -5.7);
+            let sup = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
+            let id = {
+                let mut inner = sup.inner().write().await;
+                *inner = sup_inner;
+                let ep = inner.safety.epoch_id();
+                inner.begin_sequence_action(None, ep).unwrap()
+            };
+            let ctx = armd::macro_action::MacroCtx {
+                sup: sup.clone(),
+                id,
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+                phase_timeout_s: 25.0,
+                timeout_code: "GRASP_TIMEOUT",
+                timeout_message: "macro timeout".into(),
+            };
+            let res = ctx.gripper("close", GripperCommand::Close).await;
+            match res {
+                Err(armd::macro_action::Stop::Fail(code, msg)) => {
+                    assert_eq!(code, "GRASP_TIMEOUT");
+                    assert!(msg.contains("remaining macro budget"), "{msg}");
+                }
+                other => panic!("expected insufficient-budget rejection, got {other:?}"),
+            }
+            assert!(sup.inner().read().await.active_trajectory.is_none(), "installed over-budget sub-motion");
+
+            // 8b. Close exceeding phase_timeout_s (0.05 s) but fitting overall deadline (60 s) completes.
+            let (sup_inner2, _, clock2) = make_sup(Some(0.10), -0.10);
+            let sup2 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
+            let id2 = {
+                let mut inner = sup2.inner().write().await;
+                *inner = sup_inner2;
+                let ep = inner.safety.epoch_id();
+                inner.begin_sequence_action(None, ep).unwrap()
+            };
+            let ctx2 = armd::macro_action::MacroCtx {
+                sup: sup2.clone(),
+                id: id2,
+                deadline: std::time::Instant::now() + Duration::from_secs(60),
+                phase_timeout_s: 0.05, // deliberately shorter than the ~120 ms real wait
+                timeout_code: "GRASP_TIMEOUT",
+                timeout_message: "macro timeout".into(),
+            };
+            let sup_tick = sup2.clone();
+            let ticker = tokio::spawn(async move {
+                // Pace ticks past the 50 ms phase_timeout_s so any clamp to phase_timeout_s fails.
+                for _ in 0..100 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    clock2.advance(Duration::from_millis(20));
+                    let mut inner = sup_tick.inner().write().await;
+                    inner.tick(DT);
+                    if inner.active_trajectory.is_none() && inner.measured_positions[J7].abs() < 0.05 {
+                        break;
+                    }
+                }
+            });
+            let done = ctx2.gripper_move("close", 0.0).await.expect("slow macro close killed at phase_timeout_s");
+            ticker.await.unwrap();
+            assert!(done.gripper_gap_rad.is_some());
+            assert!(sup2.inner().read().await.measured_positions[J7].abs() < 0.05);
+        });
+    }
+
+    // 9. f64 speed quantization never rounds upward across a wire quantum via f64->f32 cast.
+    for (req_speed, want_raw) in [(0.299_999_999_f64, 29u16), (0.049_999_999_f64, 4u16)] {
+        assert_eq!(DamiaoGripperDrive::quantize_vel_raw_f64(req_speed), want_raw);
+        let policy = ArmConfig::rebot_dm().gripper_policy.unwrap();
+        let lim = ArmConfig::rebot_dm().limits[J7].clone();
+        let gm = armd::motion::GripperMotion::try_with_close_speed_limit(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: req_speed, timeout_s: None, tag: None },
+            policy, lim, -1.0, J7, Some(0.30),
+        ).unwrap();
+        assert_eq!(gm.planned_speed, f64::from(want_raw) / 100.0);
+        assert!(gm.planned_speed <= req_speed, "planned_speed {} exceeded request {}", gm.planned_speed, req_speed);
+        assert_eq!(damiao::pos_force_vel_raw(gm.limit.max_velocity), want_raw);
+    }
+}
