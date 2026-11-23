@@ -65,6 +65,12 @@ pub struct FakeMotor {
     pub watchdog_expired_at: Option<Instant>,
     /// Number of command frames received.
     pub commands: usize,
+    /// The next `n` enable / disable frames are lost on the way to this motor (no state change,
+    /// no reply): only a retry reaches it.
+    pub drop_torque_frames: usize,
+    /// The feedback answering an enable / disable frame reaches the receive queue this long
+    /// after the frame (fake clock): a late confirmation.
+    pub torque_reply_delay: Duration,
 }
 
 impl FakeMotor {
@@ -80,7 +86,8 @@ impl FakeMotor {
         regs.insert(damiao::RID_TIMEOUT, 0u32.to_le_bytes());
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
-            mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0 }
+            mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
+            drop_torque_frames: 0, torque_reply_delay: Duration::ZERO }
     }
 
     pub fn reg_u32(&self, rid: u8) -> u32 { u32::from_le_bytes(self.regs[&rid]) }
@@ -170,6 +177,10 @@ pub struct FakeBusState {
     pub poll_feeds_watchdog: bool,
     /// The motor plant follows the commanded position at once.
     pub follow_commands: bool,
+    /// Frames entering the receive queue at a later fake time (`torque_reply_delay`).
+    pub delayed: Vec<(Instant, CanFrame)>,
+    /// Called on every transmit attempt, after it was logged (inject events between attempts).
+    pub on_tx: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FakeBusState {
@@ -254,6 +265,11 @@ impl FakeBusState {
         }
         let cmd = frame.data;
         if let Some(k) = self.motors.iter().position(|m| u32::from(m.id) == frame.id) {
+            let torque_frame = cmd == damiao::CMD_ENABLE || cmd == damiao::CMD_DISABLE;
+            if torque_frame && self.motors[k].drop_torque_frames > 0 {
+                self.motors[k].drop_torque_frames -= 1;
+                return;
+            }
             if cmd == damiao::CMD_ENABLE {
                 let m = &mut self.motors[k];
                 m.enabled = true;
@@ -266,6 +282,14 @@ impl FakeBusState {
             } else if self.motors[k].ctrl_mode() == damiao::CTRL_MODE_MIT {
                 let c = decode_mit(&cmd, &self.motors[k].limits);
                 self.command(k, Some(c));
+            }
+            let delay = self.motors[k].torque_reply_delay;
+            if torque_frame && !delay.is_zero() {
+                if let Some(now) = self.now() {
+                    let m = &self.motors[k];
+                    if !m.silent && !m.mute_feedback && !m.no_feedback { self.delayed.push((now + delay, m.feedback_frame())); }
+                    return;
+                }
             }
             self.push_feedback(k);
             return;
@@ -294,7 +318,7 @@ impl FakeBus {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
         Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), immediate_replies: false, on_disable: None, tx_log: Vec::new(), tx_times: Vec::new(), clock,
             tx_lost: false, tx_error: false, tx_stall: false, stall_reg_writes: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
-            fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true })))
+            fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true, delayed: Vec::new(), on_tx: None })))
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeBusState) -> R) -> R { f(&mut self.0.lock().unwrap()) }
     pub fn tx_log(&self) -> Vec<CanFrame> { self.with(|s| s.tx_log.clone()) }
@@ -311,6 +335,7 @@ impl CanTransport for FakeBus {
         let t = s.now();
         s.tx_log.push(*frame);
         s.tx_times.push(t);
+        if let Some(h) = s.on_tx.clone() { h(); }
         if s.stall_reg_writes && frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
             return Err(TransportError::WouldBlock);
         }
@@ -347,6 +372,11 @@ impl CanTransport for FakeBus {
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
+        if let Some(now) = s.now() {
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut s.delayed).into_iter().partition(|(t, _)| *t <= now);
+            s.delayed = later;
+            s.rx.extend(due.into_iter().map(|(_, f)| f));
+        }
         match s.rx.pop_front() {
             Some(f) => {
                 if let Some(c) = &s.clock { c.advance(s.rx_step); }
