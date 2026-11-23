@@ -19,7 +19,7 @@
 //! a stub or test double ([`StubCore`]) can refuse but never acknowledge success, and has no
 //! way to move hardware.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -495,17 +495,121 @@ pub trait CoreOps {
     fn advance(&mut self, dt: f64, generation: u64);
 }
 
-/// The protocol code of a delegated error, as a static string (unknown codes: `REJECTED`).
+/// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
+/// watchdog park; formatted and logged off-thread via [`StopDiagSlot::drain_and_log`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopDiagRecord {
+    pub count: u64,
+    pub arm: ArmId,
+    pub park_elapsed_us: u64,
+    pub park_budget_us: u64,
+}
+
+/// Preallocated, lock-free diagnostic slot for `authorized_stop` on the RT thread.
+///
+/// The RT path only performs plain atomic stores (zero allocations, zero formatting, zero
+/// tracing); a normal-priority caller drains and formats via [`Self::drain_and_log`].
+#[derive(Debug)]
+pub struct StopDiagSlot {
+    count: AtomicU64,
+    arm: AtomicU32,
+    park_elapsed_us: AtomicU64,
+    park_budget_us: AtomicU64,
+}
+
+impl StopDiagSlot {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            arm: AtomicU32::new(0),
+            park_elapsed_us: AtomicU64::new(0),
+            park_budget_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Records an authorized stop ignored because a watchdog park is running (RT thread:
+    /// atomic stores only).
+    pub fn record_park_ignored(&self, arm: ArmId, elapsed_s: f64, budget_s: f64) {
+        let to_us = |s: f64| if s.is_finite() && s >= 0.0 { (s * 1_000_000.0).min(u64::MAX as f64) as u64 } else { 0 };
+        self.arm.store(u32::from(arm.0), Ordering::Relaxed);
+        self.park_elapsed_us.store(to_us(elapsed_s), Ordering::Relaxed);
+        self.park_budget_us.store(to_us(budget_s), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Total park-ignored stop events recorded so far.
+    pub fn count(&self) -> u64 { self.count.load(Ordering::Acquire) }
+
+    /// Returns newly recorded events since `*seen` and advances `*seen` (off-thread).
+    pub fn poll(&self, seen: &mut u64) -> Option<StopDiagRecord> {
+        let now = self.count.load(Ordering::Acquire);
+        if now == *seen { return None; }
+        let delta = now.wrapping_sub(*seen);
+        *seen = now;
+        Some(StopDiagRecord {
+            count: delta,
+            arm: ArmId(self.arm.load(Ordering::Relaxed) as u16),
+            park_elapsed_us: self.park_elapsed_us.load(Ordering::Relaxed),
+            park_budget_us: self.park_budget_us.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Off-thread drain: formats and emits `tracing::info!` for newly recorded events.
+    pub fn drain_and_log(&self, seen: &mut u64) -> Option<StopDiagRecord> {
+        let rec = self.poll(seen)?;
+        tracing::info!(
+            "Stop during a watchdog park (arm {}, elapsed {:.2} s / budget {:.2} s, {} event(s)): the park continues (only a new lease takes it over)",
+            rec.arm.0,
+            rec.park_elapsed_us as f64 / 1_000_000.0,
+            rec.park_budget_us as f64 / 1_000_000.0,
+            rec.count,
+        );
+        Some(rec)
+    }
+}
+
+impl Default for StopDiagSlot {
+    fn default() -> Self { Self::new() }
+}
+
+static STOP_DIAG: StopDiagSlot = StopDiagSlot::new();
+
+/// Preallocated diagnostic slot written by [`SupervisorInner::authorized_stop`] until step 1
+/// moves it onto `ArmCore` / `ExecutorStats`.
+pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
+
+/// The protocol code of a delegated error, as a static string without allocating
+/// (unknown codes: `REJECTED`).
 fn static_code(e: ArmError) -> &'static str {
+    use crate::safety::SafetyError as S;
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE",
     ];
-    if let ArmError::Motion(m) = &e { return m.code(); }
-    let code = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
-    KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
+    match &e {
+        ArmError::Motion(m) => m.code(),
+        ArmError::Safety(s) => match s {
+            S::EStopActive => "ESTOP_ACTIVE",
+            S::FaultActive(_) => "FAULT_ACTIVE",
+            S::NotArmed(_) => "NOT_ARMED",
+            S::EpochMismatch { .. } => "EPOCH_MISMATCH",
+            S::CollisionHold(_) => "COLLISION_HOLD",
+            S::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
+            S::MotionBusy => "MOTION_BUSY",
+            S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+            S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
+            S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            _ => "REJECTED",
+        },
+        ArmError::Unsupported(_) => "UNSUPPORTED",
+        ArmError::WorkspaceRejected { .. } => "WORKSPACE_VIOLATION",
+        ArmError::Rejected { code, .. } | ArmError::Detailed { code, .. } => {
+            KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
+        }
+        ArmError::Trajectory(_) | ArmError::Recording(_) | ArmError::PolicyRevisionMismatch { .. } | ArmError::Internal(_) => "REJECTED",
+    }
 }
 
 impl SupervisorInner {
@@ -582,8 +686,7 @@ impl CoreOps for SupervisorInner {
                 let n = usize::from(*dof);
                 if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
-                let target = q[..n].to_vec();
-                self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
+                self.jog_action_slice(&q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
             }
@@ -617,6 +720,41 @@ impl CoreOps for SupervisorInner {
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
                         let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
+                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+        }
+    }
+
+    fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        let primitive = slot.primitive;
+        self.check_motion_commit(d, &primitive, ctx)?;
+        let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else { return Err("INVALID_COMMAND"); };
+        let n = usize::from(dof);
+        if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
+        let epoch = d.stamp.authority.epoch;
+        let committed = |r: Result<u64, ArmError>| r.map(|id| Committed::authorized(d, Some(ActionId(id)))).map_err(static_code);
+        match kind {
+            PathKind::Cartesian => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                let joint_path = self.prepared_joint_path(n, &slot.path, duration_s, power_scale)?;
+                match child {
+                    None => committed(self.install_prepared_path(epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        this.install_macro_prepared_path(id, joint_path, power_scale.is_some()).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+            PathKind::Replay { .. } => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                match child {
+                    None => {
+                        let prepared = self.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch).map_err(static_code)?;
+                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                    }
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
                         this.install_macro_prepared_replay(id, prepared).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
