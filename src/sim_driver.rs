@@ -147,6 +147,17 @@ struct SimCommandRef<'a> {
     targets: Option<&'a [SimTarget]>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SendGate {
+    /// Target write: inhibited while an unapplied urgent E-stop is pending (an applied E-stop
+    /// still holds position with active torque).
+    Target,
+    /// Enable command: inhibited whenever E-stop is latched or pending.
+    Enable,
+    /// Disable command: never inhibited by E-stop.
+    Disable,
+}
+
 pub struct SimArmDriver {
     socket: UdpSocket,
     dof: usize,
@@ -183,6 +194,10 @@ pub struct SimArmDriver {
     zero_offsets: Option<Vec<f32>>,
     /// Pending torque transition: requested state and the deadline of its acknowledgement.
     torque_hs: Option<(bool, Deadline)>,
+    /// Physical E-stop latch inhibiting any new enable command.
+    abort_flag: Option<Arc<AtomicBool>>,
+    /// Pending-E-stop gate checked immediately before target and enable sends.
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
 }
 
 impl SimArmDriver {
@@ -255,6 +270,8 @@ impl SimArmDriver {
             load_only_feedback: false,
             zero_offsets: None,
             torque_hs: None,
+            abort_flag: None,
+            estop_gate: None,
         })
     }
 
@@ -310,23 +327,54 @@ impl SimArmDriver {
         }
     }
 
-    fn send_ref(&mut self, with_targets: bool) -> u64 {
-        self.seq += 1;
+    /// Err([`ArmDriverError::EstopInhibited`]) while an E-stop request is pending and not yet
+    /// applied by the release (once applied, E-stop holds position with active torque).
+    fn estop_check(&self) -> Result<(), ArmDriverError> {
+        if self.estop_gate.as_ref().is_some_and(|g| g.pending()) {
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        Ok(())
+    }
+
+    /// Aborts an enable attempt if E-stop is latched or an urgent stop is pending.
+    fn enable_estop_inhibited(&mut self) -> Result<(), ArmDriverError> {
+        let latched = self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst));
+        let pending = self.estop_gate.as_ref().is_some_and(|g| g.pending());
+        if latched || pending {
+            if matches!(self.torque_hs, Some((true, _))) {
+                self.torque_hs = None;
+            }
+            self.enable_requested = false;
+            return Err(ArmDriverError::EstopInhibited);
+        }
+        Ok(())
+    }
+
+    fn send_ref(&mut self, with_targets: bool, enable: bool, gate: SendGate) -> Result<u64, ArmDriverError> {
+        let next_seq = self.seq + 1;
         let cmd = SimCommandRef {
             v: PROTOCOL_VERSION,
             kind: "cmd",
-            seq: self.seq,
-            enable: self.enable_requested,
+            seq: next_seq,
+            enable,
             targets: with_targets.then_some(self.cmd_targets.as_slice()),
         };
         self.tx_buf.clear();
-        if serde_json::to_writer(&mut self.tx_buf, &cmd).is_ok() {
+        let serialized = serde_json::to_writer(&mut self.tx_buf, &cmd).is_ok();
+        // Final pending-E-stop gate right before the socket send.
+        match gate {
+            SendGate::Target => self.estop_check()?,
+            SendGate::Enable => self.enable_estop_inhibited()?,
+            SendGate::Disable => {}
+        }
+        self.seq = next_seq;
+        if serialized {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
             send_nonblocking(&self.socket, &self.tx_buf);
             self.last_send_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
-        self.seq
+        Ok(self.seq)
     }
 
     /// In RT mode, the single RT owner transmits keepalive polls on idle periods instead of
@@ -645,6 +693,7 @@ impl ArmDriver for SimArmDriver {
         if targets.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
         }
+        self.estop_check()?;
         let off = self.zero_offsets.as_deref();
         self.cmd_targets.clear();
         self.cmd_targets.extend(targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| match mode {
@@ -657,7 +706,7 @@ impl ArmDriver for SimArmDriver {
                 tau: t.torque.filter(|v| v.is_finite()).unwrap_or(0.0),
             },
         }));
-        self.send_ref(true);
+        self.send_ref(true, self.enable_requested, SendGate::Target)?;
         Ok(())
     }
 
@@ -682,8 +731,13 @@ impl ArmDriver for SimArmDriver {
         if enabled && self.torque_hs.is_some() {
             return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
         }
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
+        let gate = if enabled { SendGate::Enable } else { SendGate::Disable };
+        let seq = self.send_ref(false, enabled, gate)?;
         self.enable_requested = enabled;
-        self.enable_seq = self.send_ref(false);
+        self.enable_seq = seq;
         let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
         let now = Instant::now();
         self.torque_hs = Some((enabled, Deadline::after(now, timeout)));
@@ -695,8 +749,14 @@ impl ArmDriver for SimArmDriver {
         let Some((enabled, deadline)) = self.torque_hs else {
             return Err(ArmDriverError::Protocol("no torque transition pending".into()));
         };
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
         self.maybe_send_owner_keepalive();
         self.refresh_from_rx();
+        if enabled {
+            self.enable_estop_inhibited()?;
+        }
         // the acknowledgement is checked before the deadline (an ack seen at the deadline counts)
         let outcome = if self.acked(self.enable_seq, enabled) {
             TorqueOutcome::Confirmed
@@ -761,6 +821,10 @@ impl ArmDriver for SimArmDriver {
 
     fn set_torque_flag(&mut self, enabled: bool) { self.enable_requested = enabled; }
 
+    fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
+
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+
     fn supports_mit_mode_switch(&self) -> bool { true }
 
     /// The simulator switches a joint's control law with the next command, so the
@@ -769,8 +833,14 @@ impl ArmDriver for SimArmDriver {
         if modes.len() != self.dof || hold.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: modes.len().min(hold.len()) });
         }
+        self.estop_check()?;
+        let prev = self.modes.clone();
         self.modes.copy_from_slice(modes);
-        self.write_joint_targets(hold)
+        if let Err(e) = self.write_joint_targets(hold) {
+            self.modes = prev;
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn motor_zero_support(&self) -> MotorZeroSupport {

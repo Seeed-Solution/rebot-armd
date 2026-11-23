@@ -686,6 +686,20 @@ impl CoreOps for SupervisorInner {
         let rx_frames = rx.rx_frames;
         let rx_exhausted = rx.budget_exhausted;
         self.pending_rx_poll = rx;
+        // If a background disable (non-broker, e.g. failed enable or thermal trip) was pending
+        // and Step 2's fresh feedback just confirmed every motor disabled, clear `disable_pending`
+        // immediately so Step 2b maintenance (`ClearFault`/`RequestShutdown`) and Step 3 commits
+        // observe the confirmed torque-off on this release rather than waiting until Step 5.
+        if self.disable_pending && self.torque_transition.is_none() {
+            let confirmed = self.driver.as_ref().is_none_or(|d| {
+                d.lock().is_ok_and(|drv| drv.is_feedback_valid() && drv.enable_state() == crate::driver::EnableState::Disabled)
+            });
+            if confirmed {
+                self.is_torqued = false;
+                self.pending_rearm = false;
+                self.disable_pending = false;
+            }
+        }
         let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
         let Some(driver) = self.driver.as_ref() else {
             return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
@@ -993,19 +1007,52 @@ impl ReleaseEngine {
     pub fn step<O: CoreOps>(
         &mut self,
         core: &mut O,
+        now_fn: impl FnMut() -> Instant,
+        dt: f64,
+        release_deadline: Instant,
+        publish_generation: u64,
+    ) -> ReleaseReport {
+        self.step_with_pre_commit(core, now_fn, dt, release_deadline, publish_generation, |_, _| false)
+    }
+
+    /// Runs one full release on `core`, invoking `pre_commit(core, ctx)` strictly AFTER Step 2's
+    /// hardware poll and strictly BEFORE Step 3 (`BeforeCommit`), Step 4 (`BeforeTarget`), Step 5
+    /// (`BeforeOutput` / `advance_output`), Step 6 (`publish`), and Step 7 (`terminals`).
+    ///
+    /// When `pre_commit` returns `true` (an accepted `CommitShutdown`), Steps 3–5 are skipped so
+    /// no ordinary command, target, or actuator output runs before the owner thread stops.
+    pub fn step_with_pre_commit<O: CoreOps>(
+        &mut self,
+        core: &mut O,
         mut now_fn: impl FnMut() -> Instant,
         dt: f64,
         release_deadline: Instant,
         publish_generation: u64,
+        mut pre_commit: impl FnMut(&mut O, &CommitCtx) -> bool,
     ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
         // 1. Urgent requests (E-stop + authorized stop), independent of command ring capacity
         if self.apply_pending_urgent(core) { report.stopped = true; }
-        // 2. Single budgeted hardware poll (frees `self.transition`, defers terminal delivery until after Step 6 publish)
+        // 2. Single budgeted hardware poll (frees `self.transition`, defers terminal delivery until after Step 6 publish).
+        // NOTE: `DamiaoArmDriver::receive_feedback` still has a legacy stale-joint RX-poll
+        // recovery TX path (`src/driver.rs:4701`) outside Step 5's `BeforeOutput` checkpoint;
+        // that path is addressed on branch `feat/rt-tx-budget`, which merges after stage 3 step 1.
         let budget = ServiceBudget::for_release(now_fn(), release_deadline);
         report.poll = core.poll_hardware(&budget);
         let finished_transition = self.take_finished_transition(&mut report);
+        // 2b. Owner persistence and bounded maintenance run strictly after Step 2 feedback intake
+        // and strictly before Step 3–6 commit, output, and publication.
+        let pre_ctx = self.ctx(now_fn());
+        let stopping = pre_commit(core, &pre_ctx);
+        if stopping {
+            if let Some((t, outcome)) = finished_transition {
+                let ts = core.now_timestamp();
+                core.publish(ts, publish_generation);
+                self.intake.terminal(t, outcome);
+            }
+            return report;
+        }
         // 3. Urgent recheck + at most one ordinary command
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);

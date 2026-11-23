@@ -971,3 +971,149 @@ async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
     assert_eq!(outcome_to, PanicDisableOutcome::TimedOut);
     assert!(t_to.elapsed() < Duration::from_millis(400), "bounded timeout overran: {:?}", t_to.elapsed());
 }
+
+// ============================================================================
+// 6. SimArmDriver pending-E-stop send gate & pre-publish maintenance ordering
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
+    // (a) Direct SimArmDriver UDP peer capturing every outbound "cmd" datagram.
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(40))).unwrap();
+    let addr = format!("udp://{}", peer.local_addr().unwrap());
+
+    let mut drv = SimArmDriver::connect(&addr, 3).unwrap();
+    let req = Arc::new(AtomicU64::new(0));
+    let app = Arc::new(AtomicU64::new(0));
+    let latched = Arc::new(AtomicBool::new(false));
+    drv.set_estop_gate(EstopGate::new(req.clone(), app.clone()));
+    drv.set_abort_flag(latched.clone());
+
+    let drain_cmds = |sock: &UdpSocket| -> Vec<SimCommand> {
+        let mut cmds = Vec::new();
+        let mut buf = [0u8; 4096];
+        let until = Instant::now() + Duration::from_millis(45);
+        while Instant::now() < until {
+            let rem = until.saturating_duration_since(Instant::now());
+            let _ = sock.set_read_timeout(Some(rem.max(Duration::from_millis(1))));
+            match sock.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&buf[..n]) {
+                        if cmd.kind == "cmd" {
+                            cmds.push(cmd);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        cmds
+    };
+    let _ = drain_cmds(&peer);
+
+    // Pending E-stop inhibits write_joint_targets, set_joint_modes (without mutating modes), and begin_torque(true).
+    req.store(1, Ordering::SeqCst);
+    let targets = [JointTarget::position(0.1), JointTarget::position(0.2), JointTarget::position(0.3)];
+    let err_t = drv.write_joint_targets(&targets).unwrap_err();
+    assert!(is_estop_inhibited(&err_t), "expected EstopInhibited on target write: {err_t:?}");
+
+    let err_m = drv
+        .set_joint_modes(&[JointMode::Mit, JointMode::Mit, JointMode::Mit], &targets)
+        .unwrap_err();
+    assert!(is_estop_inhibited(&err_m), "expected EstopInhibited on set_joint_modes: {err_m:?}");
+    assert!(
+        drv.max_command_velocity(0).is_some(),
+        "failed set_joint_modes under pending E-stop must not mutate joint modes"
+    );
+
+    let err_en = drv.begin_torque(true).unwrap_err();
+    assert!(is_estop_inhibited(&err_en), "expected EstopInhibited on begin_torque(true): {err_en:?}");
+    assert!(!drv.torque_transition_pending(), "refused enable must not leave pending torque transition");
+    assert!(
+        drain_cmds(&peer).is_empty(),
+        "zero UDP cmd datagrams may be transmitted while E-stop is pending"
+    );
+
+    // Disable (`begin_torque(false)`) is NEVER inhibited by pending or latched E-stop!
+    latched.store(true, Ordering::SeqCst);
+    let _ = drv.begin_torque(false).unwrap();
+    let dis_cmds = drain_cmds(&peer);
+    assert_eq!(dis_cmds.len(), 1, "disable cmd must still transmit under E-stop: {dis_cmds:?}");
+    assert!(!dis_cmds[0].enable && dis_cmds[0].targets.is_none());
+
+    // Clear torque_hs by advancing past disable or abort; test latched E-stop (with applied == requested)
+    // still inhibits enable while allowing E-stop hold target writes!
+    let peer2 = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer2.set_read_timeout(Some(Duration::from_millis(40))).unwrap();
+    let mut drv2 = SimArmDriver::connect(&format!("udp://{}", peer2.local_addr().unwrap()), 3).unwrap();
+    let req2 = Arc::new(AtomicU64::new(1));
+    let app2 = Arc::new(AtomicU64::new(1)); // E-stop already applied
+    let latched2 = Arc::new(AtomicBool::new(true));
+    drv2.set_estop_gate(EstopGate::new(req2, app2));
+    drv2.set_abort_flag(latched2);
+    let _ = drain_cmds(&peer2);
+
+    assert!(is_estop_inhibited(&drv2.begin_torque(true).unwrap_err()));
+    assert!(drain_cmds(&peer2).is_empty(), "latched E-stop must inhibit enable send");
+    // Applied E-stop still permits position-hold target writes so the arm does not drop under gravity.
+    drv2.write_joint_targets(&targets).unwrap();
+    let hold_cmds = drain_cmds(&peer2);
+    assert_eq!(hold_cmds.len(), 1, "applied E-stop hold write must succeed: {hold_cmds:?}");
+    assert!(hold_cmds[0].targets.is_some());
+
+    // (b) Maintenance mutating state runs BEFORE publication: when `request_shutdown()` (refused ->
+    // `StopPolicy::EStopLatch` while torqued) or `clear_fault()` returns, the already-published
+    // `StateHub` snapshot MUST immediately reflect the new state without waiting for another tick!
+    let bus_m = FakeBus::new(&dm_limits());
+    bus_m.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv_m = DamiaoArmDriver::new(bus_m.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_m.read_joint_states().unwrap();
+    drv_m.check_mapping_ranges();
+    let sup_m = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_m)));
+    sup_m.set_lease_enabled(false).await;
+    // Use a long period (80 ms) so if maintenance had mutated state AFTER Step 6 publish,
+    // immediately inspecting `hub().latest()` upon receiving the reply would observe the stale
+    // pre-mutation state for up to 80 ms!
+    let h_m = sup_m
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(80)))
+        .await
+        .unwrap();
+    let req_on = submit_broker_transition(&h_m, 1, TransitionOp::TorqueOn);
+    assert_eq!(wait_broker_terminal(&h_m, req_on, Duration::from_secs(2)), Outcome::Completed);
+
+    // Refused `request_shutdown` runs `EStopLatch` BEFORE Step 6 publish -> `hub().latest()`
+    // IMMEDIATELY reports `SafetyState::EStop` the instant the maintenance reply arrives!
+    let seq_before_sd = sup_m.hub().published_seq();
+    assert!(!sup_m.request_shutdown().await.unwrap());
+    let snap_sd = sup_m.hub().latest().expect("published snapshot after refused request_shutdown");
+    assert!(
+        snap_sd.meta.seq > seq_before_sd,
+        "refused request_shutdown must publish a fresh snapshot before replying ({} <= {})",
+        snap_sd.meta.seq,
+        seq_before_sd
+    );
+    assert_eq!(
+        snap_sd.obs.safety_state,
+        SafetyState::EStop,
+        "StateHub snapshot must already reflect EStop when refused request_shutdown replies"
+    );
+
+    // `clear_fault` runs BEFORE Step 6 publish -> `hub().latest()` IMMEDIATELY reports `SafetyState::Idle`!
+    let seq_before_cf = sup_m.hub().published_seq();
+    assert_eq!(sup_m.clear_fault().await.unwrap(), SafetyState::Idle);
+    let snap_cf = sup_m.hub().latest().expect("published snapshot after clear_fault");
+    assert!(snap_cf.meta.seq > seq_before_cf);
+    assert_eq!(
+        snap_cf.obs.safety_state,
+        SafetyState::Idle,
+        "StateHub snapshot must already reflect Idle when clear_fault replies"
+    );
+
+    h_m.stop_and_join();
+}

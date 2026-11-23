@@ -1009,15 +1009,17 @@ pub(crate) fn spawn_executor(
 }
 
 struct ControlState {
-    core: SupervisorInner,
-    engine: ReleaseEngine,
     shutdown_committed: bool,
     control_stop: Arc<AtomicBool>,
+    stop_requests: StopRequests,
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
+    /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
+    /// strictly after Step 6 publication (or flushed immediately when `CommitShutdown` stops).
+    pending_maint_reply: Option<MaintReply>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -1030,58 +1032,63 @@ struct ControlState {
 }
 
 impl ControlState {
-    fn emit_estop_ack_if_advanced(&mut self) {
+    fn emit_estop_ack_if_advanced(&mut self, core: &mut SupervisorInner) {
         let mut woke = false;
-        while let Some(ack) = self.core.pending_estop_acks.pop_front() {
+        while let Some(ack) = core.pending_estop_acks.pop_front() {
             let last_gen = ack.last_gen;
             if self.estop_ack_tx.push(ack).is_err() {
                 self.estop_overflow_gen.fetch_max(last_gen, Ordering::Release);
             }
             woke = true;
         }
-        if self.core.estop_ack_overflow_gen > 0 {
-            let ov = std::mem::replace(&mut self.core.estop_ack_overflow_gen, 0);
+        if core.estop_ack_overflow_gen > 0 {
+            let ov = std::mem::replace(&mut core.estop_ack_overflow_gen, 0);
             self.estop_overflow_gen.fetch_max(ov, Ordering::Release);
             woke = true;
         }
         if woke {
-            self.core.core.hub().wake();
+            core.core.hub().wake();
         }
     }
 
     /// Moves retired fault `Arc<SafetyState>` snapshots off `armd-control` into the bounded SPSC
     /// reclamation ring (never pops when the ring is full so no `Arc` can drop on `armd-control`).
-    fn drain_retired_states(&mut self) {
+    fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
-            let Some(arc) = self.core.safety.pop_retired_state_arc() else {
+            let Some(arc) = core.safety.pop_retired_state_arc() else {
                 break;
             };
             let _ = self.reclaim_state_tx.push(arc);
             drained = true;
         }
         if drained {
-            self.core.core.hub().wake();
+            core.core.hub().wake();
         }
     }
 
-    fn service_one_maintenance(&mut self, release_deadline: Instant) {
+    fn service_one_maintenance(
+        &mut self,
+        core: &mut SupervisorInner,
+        ctx: &super::ops::CommitCtx,
+        release_deadline: Instant,
+    ) {
         let Ok(req) = self.maint_req_rx.pop() else { return; };
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let result = match req.op {
             MaintenanceOp::RequestShutdown => {
-                let confirmed = self.core.request_shutdown();
+                let confirmed = core.request_shutdown();
                 self.shutdown_committed = confirmed;
                 MaintenanceResult::ShutdownRequested(confirmed)
             }
             MaintenanceOp::CommitShutdown => {
                 let valid = self.shutdown_committed
-                    && (self.core.driver.is_none()
-                        || (self.core.shutdown_ready()
-                            && !self.core.is_torqued
-                            && !self.core.disable_pending
-                            && !self.core.torque_transition_pending()));
+                    && (core.driver.is_none()
+                        || (core.shutdown_ready()
+                            && !core.is_torqued
+                            && !core.disable_pending
+                            && !core.torque_transition_pending()));
                 if valid {
                     self.control_stop.store(true, Ordering::Release);
                 } else {
@@ -1089,40 +1096,39 @@ impl ControlState {
                 }
                 MaintenanceResult::ShutdownCommitted(valid)
             }
-            MaintenanceOp::ShutdownReady => MaintenanceResult::ShutdownReady(self.core.shutdown_ready()),
+            MaintenanceOp::ShutdownReady => MaintenanceResult::ShutdownReady(core.shutdown_ready()),
             MaintenanceOp::PlanningSnapshot => {
-                let ctx = self.engine.ctx(Instant::now());
-                MaintenanceResult::PlanningSnapshot(self.core.planning_snapshot(&ctx))
+                MaintenanceResult::PlanningSnapshot(core.planning_snapshot(ctx))
             }
-            MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(self.core.current_observation())),
+            MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(core.current_observation())),
             MaintenanceOp::ClearFault => {
                 self.shutdown_committed = false;
-                let res = self.core.clear_fault_executor(release_deadline);
+                let res = core.clear_fault_executor(release_deadline);
                 MaintenanceResult::FaultCleared(res)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
-                let res = if *self.core.safety.state() != SafetyState::Idle
-                    || self.core.is_torqued
-                    || self.core.disable_pending
-                    || self.core.active_trajectory.is_some()
+                let res = if *core.safety.state() != SafetyState::Idle
+                    || core.is_torqued
+                    || core.disable_pending
+                    || core.active_trajectory.is_some()
                 {
                     Err("Arm must be Idle with torque off and no active trajectory to set joint zero offsets".into())
                 } else {
-                    self.core.set_joint_zero_offsets(&offsets)
+                    core.set_joint_zero_offsets(&offsets)
                 };
                 returned_offsets = Some(offsets);
                 MaintenanceResult::JointZeroOffsetsSet(res)
             }
             MaintenanceOp::SetMotorZero { joint } => {
-                let res = if self.core.driver.is_some() {
+                let res = if core.driver.is_some() {
                     Err("UNSUPPORTED: motor zero requires legacy path when hardware driver is attached".into())
-                } else if *self.core.safety.state() != SafetyState::Idle
-                    || self.core.is_torqued
-                    || self.core.disable_pending
+                } else if *core.safety.state() != SafetyState::Idle
+                    || core.is_torqued
+                    || core.disable_pending
                 {
                     Err("Arm must be Idle with torque off to set motor zero".into())
                 } else {
-                    self.core.set_motor_zero(joint)
+                    core.set_motor_zero(joint)
                 };
                 MaintenanceResult::MotorZeroSet(res)
             }
@@ -1131,16 +1137,30 @@ impl ControlState {
                 MaintenanceResult::ProbeReturned
             }
         };
-        let _ = self.maint_rep_tx.push(MaintReply {
+        self.pending_maint_reply = Some(MaintReply {
             id: req.id,
             result,
             returned_offsets,
             returned_probe,
         });
-        self.core.core.hub().wake();
+    }
+
+    fn flush_pending_maint_reply(&mut self, core: &SupervisorInner) {
+        if let Some(reply) = self.pending_maint_reply.take() {
+            let _ = self.maint_rep_tx.push(reply);
+            core.core.hub().wake();
+        }
     }
 
     fn drain_maintenance_stopped(&mut self) {
+        if let Some(reply) = self.pending_maint_reply.take() {
+            let _ = self.maint_rep_tx.push(MaintReply {
+                id: reply.id,
+                result: MaintenanceResult::Stopped,
+                returned_offsets: reply.returned_offsets,
+                returned_probe: reply.returned_probe,
+            });
+        }
         while let Ok(req) = self.maint_req_rx.pop() {
             let (returned_offsets, returned_probe) = match req.op {
                 MaintenanceOp::SetJointZeroOffsets { offsets } => (Some(offsets), None),
@@ -1156,7 +1176,7 @@ impl ControlState {
         }
     }
 
-    fn service_persistence(&mut self) {
+    fn service_persistence(&mut self, core: &mut SupervisorInner, ctx: &super::ops::CommitCtx) {
         // B1 race-free abandonment rule: sample `is_abandoned()` BEFORE draining queued commands!
         // Because `rtrb` preserves queued items after producer drop, nothing can be pushed after
         // `abandoned == true` is observed.
@@ -1165,16 +1185,16 @@ impl ControlState {
             hook();
         }
         while let Ok(cmd) = self.persist_cmd_rx.pop() {
-            self.handle_persist_cmd(cmd);
+            self.handle_persist_cmd(core, ctx, cmd);
         }
         if abandoned {
             if let Some((action_id, domain)) = self.persist_granted.take() {
-                let active_rev = ConfigAuthority::revision(&self.core, domain);
-                self.core.core.config_mut().force_reconcile(domain, active_rev);
-                if self.core.zero_check_persisting == Some(action_id) {
-                    self.core.zero_check_persisting = None;
+                let active_rev = ConfigAuthority::revision(core, domain);
+                core.core.config_mut().force_reconcile(domain, active_rev);
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
                 }
-                let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                     action_id,
                     "failed",
                     "PERSIST_FAILED",
@@ -1191,7 +1211,7 @@ impl ControlState {
                         _returned_warning: None,
                         _returned_probe: None,
                     });
-                    self.core.core.hub().wake();
+                    core.core.hub().wake();
                 }
             }
         }
@@ -1204,13 +1224,13 @@ impl ControlState {
             .and_then(|p| p.lock().ok().and_then(|mut g| g.take()))
     }
 
-    fn handle_persist_cmd(&mut self, cmd: PersistCmd) {
+    fn handle_persist_cmd(&mut self, core: &mut SupervisorInner, ctx: &super::ops::CommitCtx, cmd: PersistCmd) {
         match cmd {
             PersistCmd::Fail { action_id, code, message, unused_policy, unused_jaw } => {
-                if self.core.zero_check_persisting == Some(action_id) {
-                    self.core.zero_check_persisting = None;
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
                 }
-                let (old_code, old_msg) = self.core.fail_zero_check_action_owned(action_id, code, message);
+                let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
                 let _ = self.persist_rep_tx.push(PersistReply::Done {
                     _returned_policy: unused_policy,
                     _returned_jaw: unused_jaw,
@@ -1220,7 +1240,7 @@ impl ControlState {
                     _returned_probe: self.take_reply_probe(),
                 });
                 self.persist_wake.unpark();
-                self.core.core.hub().wake();
+                core.core.hub().wake();
             }
             PersistCmd::Reserve {
                 action_id,
@@ -1232,25 +1252,25 @@ impl ControlState {
                 code_buf,
                 msg_buf,
             } => {
-                let now = Instant::now();
-                let still_persisting = self.core.zero_check_persisting == Some(action_id);
-                let action_running = self.core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
+                let now = ctx.now;
+                let still_persisting = core.zero_check_persisting == Some(action_id);
+                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
                 let lease_ok = match &lease_owner {
                     None => true,
-                    Some((c, g)) => self.core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < self.core.lease_timeout
+                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
+                        l.acquired_at.elapsed() < core.lease_timeout
                             && l.generation == *g
                             && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
                     }),
                 };
-                let rev_ok = self.core.gripper_calib_revision == base_revision;
-                let urgent_pending = self.core.estop_pending()
-                    || self.engine.stop_requests().current() != self.engine.stop_requests().applied();
-                let stopped = self.core.safety.state().is_stopped() || urgent_pending;
+                let rev_ok = core.gripper_calib_revision == base_revision;
+                let urgent_pending = core.estop_pending()
+                    || self.stop_requests.current() != self.stop_requests.applied();
+                let stopped = core.safety.state().is_stopped() || urgent_pending;
 
                 if !still_persisting || !action_running || !lease_ok || stopped {
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
                     let (old_code, old_msg) = if action_running {
                         let (code, msg) = if stopped {
@@ -1260,7 +1280,7 @@ impl ControlState {
                         } else {
                             ("CANCELLED", "Gripper zero check cancelled before calibration persisted")
                         };
-                        self.core.finish_zero_check_action_in_place(
+                        core.finish_zero_check_action_in_place(
                             action_id,
                             "cancelled",
                             code,
@@ -1280,14 +1300,14 @@ impl ControlState {
                         _returned_probe: probe,
                     });
                     self.persist_wake.unpark();
-                    self.core.core.hub().wake();
+                    core.core.hub().wake();
                     return;
                 }
                 if !rev_ok {
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
-                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                         action_id,
                         "failed",
                         "POLICY_REVISION_MISMATCH",
@@ -1304,14 +1324,14 @@ impl ControlState {
                         _returned_probe: probe,
                     });
                     self.persist_wake.unpark();
-                    self.core.core.hub().wake();
+                    core.core.hub().wake();
                     return;
                 }
-                if self.core.driver_config_error.is_some() {
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                if core.driver_config_error.is_some() {
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
-                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                         action_id,
                         "failed",
                         "INVALID_CALIBRATION",
@@ -1328,11 +1348,10 @@ impl ControlState {
                         _returned_probe: probe,
                     });
                     self.persist_wake.unpark();
-                    self.core.core.hub().wake();
+                    core.core.hub().wake();
                     return;
                 }
-                let ctx = self.engine.ctx(now);
-                let auth = self.core.authority(&ctx);
+                let auth = core.authority(ctx);
                 self.next_persist_req += 1;
                 let proposal = ConfigProposal {
                     domain: ConfigDomain::GripperCalibration,
@@ -1348,7 +1367,7 @@ impl ControlState {
                         deadline: now + Duration::from_secs(5),
                     },
                 };
-                match ConfigAuthority::reserve(&mut self.core, &proposal, &ctx) {
+                match ConfigAuthority::reserve(core, &proposal, ctx) {
                     Reserved::Granted(reservation) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
                         let _ = self.persist_rep_tx.push(PersistReply::Reserved {
@@ -1361,10 +1380,10 @@ impl ControlState {
                         });
                     }
                     Reserved::Refused { code, .. } => {
-                        if self.core.zero_check_persisting == Some(action_id) {
-                            self.core.zero_check_persisting = None;
+                        if core.zero_check_persisting == Some(action_id) {
+                            core.zero_check_persisting = None;
                         }
-                        let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                        let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                             action_id,
                             "failed",
                             code,
@@ -1383,15 +1402,15 @@ impl ControlState {
                     }
                 }
                 self.persist_wake.unpark();
-                self.core.core.hub().wake();
+                core.core.hub().wake();
             }
             PersistCmd::Abort { action_id, reservation, code, message, unused_policy, unused_jaw } => {
                 self.persist_granted = None;
-                let _ = ConfigAuthority::release(&mut self.core, reservation);
-                if self.core.zero_check_persisting == Some(action_id) {
-                    self.core.zero_check_persisting = None;
+                let _ = ConfigAuthority::release(core, reservation);
+                if core.zero_check_persisting == Some(action_id) {
+                    core.zero_check_persisting = None;
                 }
-                let (old_code, old_msg) = self.core.fail_zero_check_action_owned(action_id, code, message);
+                let (old_code, old_msg) = core.fail_zero_check_action_owned(action_id, code, message);
                 let _ = self.persist_rep_tx.push(PersistReply::Done {
                     _returned_policy: unused_policy,
                     _returned_jaw: unused_jaw,
@@ -1401,7 +1420,7 @@ impl ControlState {
                     _returned_probe: self.take_reply_probe(),
                 });
                 self.persist_wake.unpark();
-                self.core.core.hub().wake();
+                core.core.hub().wake();
             }
             PersistCmd::Activate {
                 action_id,
@@ -1425,17 +1444,17 @@ impl ControlState {
                 let persisted_res = if simulated_err {
                     Err("SIMULATED_PERSISTED_ERR")
                 } else {
-                    ConfigAuthority::persisted(&mut self.core, &reservation, durability)
+                    ConfigAuthority::persisted(core, &reservation, durability)
                 };
                 if persisted_res.is_err() {
                     // Persistence #5: disk may already have been renamed — unconditionally force
                     // Reconciling (inhibiting motion even if another domain occupied the slot).
-                    let active_rev = ConfigAuthority::revision(&self.core, ConfigDomain::GripperCalibration);
-                    self.core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                    let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                    core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
-                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                    let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                         action_id,
                         "failed",
                         "PERSIST_FAILED",
@@ -1452,35 +1471,35 @@ impl ControlState {
                         _returned_probe: self.take_reply_probe(),
                     });
                     self.persist_wake.unpark();
-                    self.core.core.hub().wake();
+                    core.core.hub().wake();
                     return;
                 }
 
-                let still_persisting = self.core.zero_check_persisting == Some(action_id);
-                let action_running = self.core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
+                let still_persisting = core.zero_check_persisting == Some(action_id);
+                let action_running = core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
                 let lease_ok = match &lease_owner {
                     None => true,
-                    Some((c, g)) => self.core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < self.core.lease_timeout
+                    Some((c, g)) => core.active_lease.as_ref().is_some_and(|l| {
+                        l.acquired_at.elapsed() < core.lease_timeout
                             && l.generation == *g
                             && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
                     }),
                 };
-                let rev_ok = self.core.gripper_calib_revision == base_revision;
-                let urgent_pending = self.core.estop_pending()
-                    || self.engine.stop_requests().current() != self.engine.stop_requests().applied();
-                let stopped = self.core.safety.state().is_stopped() || urgent_pending;
+                let rev_ok = core.gripper_calib_revision == base_revision;
+                let urgent_pending = core.estop_pending()
+                    || self.stop_requests.current() != self.stop_requests.applied();
+                let stopped = core.safety.state().is_stopped() || urgent_pending;
 
                 if still_persisting && action_running && lease_ok && rev_ok && !stopped {
-                    let (old_policy, old_jaw) = self.core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
-                    if !matches!(ConfigAuthority::activate(&mut self.core, reservation), Activated::Active { .. }) {
-                        let active_rev = ConfigAuthority::revision(&self.core, ConfigDomain::GripperCalibration);
-                        self.core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                    let (old_policy, old_jaw) = core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
+                    if !matches!(ConfigAuthority::activate(core, reservation), Activated::Active { .. }) {
+                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
                     }
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
-                    let unused_warning = self.core.complete_zero_check_action(action_id, durability, warning);
+                    let unused_warning = core.complete_zero_check_action(action_id, durability, warning);
                     // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
                     let _ = self.persist_rep_tx.push(PersistReply::Done {
                         _returned_policy: old_policy,
@@ -1501,15 +1520,15 @@ impl ControlState {
                     } else {
                         "CANCELLED"
                     };
-                    if !matches!(self.core.core.config_mut().activation_failed(reservation, code), Activated::Reconciling { .. }) {
-                        let active_rev = ConfigAuthority::revision(&self.core, ConfigDomain::GripperCalibration);
-                        self.core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
+                    if !matches!(core.core.config_mut().activation_failed(reservation, code), Activated::Reconciling { .. }) {
+                        let active_rev = ConfigAuthority::revision(core, ConfigDomain::GripperCalibration);
+                        core.core.config_mut().force_reconcile(ConfigDomain::GripperCalibration, active_rev);
                     }
-                    if self.core.zero_check_persisting == Some(action_id) {
-                        self.core.zero_check_persisting = None;
+                    if core.zero_check_persisting == Some(action_id) {
+                        core.zero_check_persisting = None;
                     }
                     let (old_code, old_msg) = if action_running {
-                        self.core.finish_zero_check_action_in_place(
+                        core.finish_zero_check_action_in_place(
                             action_id,
                             "cancelled",
                             code,
@@ -1530,7 +1549,7 @@ impl ControlState {
                     });
                 }
                 self.persist_wake.unpark();
-                self.core.core.hub().wake();
+                core.core.hub().wake();
             }
         }
     }
@@ -1887,16 +1906,18 @@ fn control_thread_main(
         crate::diagnostics::alloc::time_this_thread();
     }
 
+    let mut engine = engine;
+    let stop_requests = engine.stop_requests().clone();
     let mut state = ControlState {
-        core,
-        engine,
         shutdown_committed: false,
         control_stop: Arc::clone(&control_stop),
+        stop_requests,
         estop_ack_tx,
         estop_overflow_gen,
         reclaim_state_tx,
         maint_req_rx,
         maint_rep_tx,
+        pending_maint_reply: None,
         persist_job_tx,
         persist_cmd_rx,
         persist_rep_tx,
@@ -1962,21 +1983,45 @@ fn control_thread_main(
             }
             let _ = crate::diagnostics::alloc::take();
             let body_start = Instant::now();
-            state.core.defer_zero_check_persist = true;
-            state.core.persist_capacity_available =
+            core.defer_zero_check_persist = true;
+            core.persist_capacity_available =
                 !state.persist_job_tx.is_abandoned() && state.persist_job_tx.slots() > 0;
-            state.core.begin_tick_phases(body_start);
+            core.begin_tick_phases(body_start);
 
-            let mut report = state
-                .engine
-                .step(&mut state.core, Instant::now, dt, release_deadline, publish_gen);
-            let (phases, body_end) = state.core.take_tick_phases();
+            let mut report = engine.step_with_pre_commit(
+                &mut core,
+                Instant::now,
+                dt,
+                release_deadline,
+                publish_gen,
+                |core, ctx| {
+                    // Strict Arc lifetime ordering: drain all pending E-stop acks / retired states
+                    // from Steps 1-2 BEFORE maintenance can run `ClearFault` and retire a fault Arc,
+                    // then run persistence reconciliation and at most one bounded maintenance op
+                    // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3 commit,
+                    // Step 5 output, and Step 6 publication.
+                    state.emit_estop_ack_if_advanced(core);
+                    state.drain_retired_states(core);
+                    state.service_persistence(core, ctx);
+                    state.service_one_maintenance(core, ctx, release_deadline);
+                    state.emit_estop_ack_if_advanced(core);
+                    state.drain_retired_states(core);
+                    control_stop.load(Ordering::Acquire)
+                },
+            );
+            if control_stop.load(Ordering::Acquire) {
+                state.flush_pending_maint_reply(&core);
+                state.emit_estop_ack_if_advanced(&mut core);
+                state.drain_retired_states(&mut core);
+                return;
+            }
+            let (phases, body_end) = core.take_tick_phases();
             let body_end = body_end.unwrap_or_else(Instant::now);
-            state.core.defer_zero_check_persist = false;
-            if let Some(job) = state.core.pending_zero_check_persist.take() {
+            core.defer_zero_check_persist = false;
+            if let Some(job) = core.pending_zero_check_persist.take() {
                 if state.persist_job_tx.push(job).is_err() {
-                    if let Some(id) = state.core.zero_check_persisting.take() {
-                        let (old_code, old_msg) = state.core.finish_zero_check_action_in_place(
+                    if let Some(id) = core.zero_check_persisting.take() {
+                        let (old_code, old_msg) = core.finish_zero_check_action_in_place(
                             id,
                             "failed",
                             "PERSIST_FAILED",
@@ -1999,17 +2044,12 @@ fn control_thread_main(
                     state.persist_wake.unpark();
                 }
             }
-            // Strict Arc lifetime ordering: drain all pending E-stop acks (or record overflow while
-            // `SafetyManager` still retains its own `Arc<SafetyState>` with refcount >= 2) BEFORE
-            // maintenance can run `ClearFault` and retire the fault `Arc` off-thread!
-            state.emit_estop_ack_if_advanced();
-            state.drain_retired_states();
-            // Service persistence commands and at most one bounded maintenance op per release.
-            state.service_persistence();
-            state.service_one_maintenance(release_deadline);
-            state.emit_estop_ack_if_advanced();
-            state.drain_retired_states();
-            let control_hz = state.core.config.control_frequency_hz;
+            // Deliver the pre-commit maintenance reply strictly AFTER Step 6 publication, then
+            // drain any E-stop acks / retired states produced during Steps 3-7.
+            state.flush_pending_maint_reply(&core);
+            state.emit_estop_ack_if_advanced(&mut core);
+            state.drain_retired_states(&mut core);
+            let control_hz = core.config.control_frequency_hz;
             let done = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
             let usage_done = UsageMark::now();
@@ -2079,9 +2119,8 @@ fn control_thread_main(
                     tokio::runtime::Handle::try_current().is_err(),
                     "RT executor thread must never enter a Tokio runtime during a sub-release wake"
                 );
-                let published = state
-                    .engine
-                    .service_wake(&mut state.core, Instant::now(), release_deadline, publish_gen + 1, &mut report);
+                let published = engine
+                    .service_wake(&mut core, Instant::now(), release_deadline, publish_gen + 1, &mut report);
                 if published {
                     publish_gen += 1;
                     hub.wake();
@@ -2096,8 +2135,8 @@ fn control_thread_main(
                     std::hint::black_box(&v);
                     drop(v);
                 }
-                state.emit_estop_ack_if_advanced();
-                state.drain_retired_states();
+                state.emit_estop_ack_if_advanced(&mut core);
+                state.drain_retired_states(&mut core);
                 let wake_allocs = crate::diagnostics::alloc::take();
                 if wake_allocs.calls > 0 {
                     stats.wake_alloc_calls.fetch_add(wake_allocs.calls, Ordering::Relaxed);
@@ -2110,7 +2149,7 @@ fn control_thread_main(
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
+                core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
             }))
             .unwrap_or_else(|_| {
                 crate::supervisor::PanicDisableOutcome::Failed("secondary panic during RT executor panic-disable".into())
@@ -2131,8 +2170,9 @@ fn control_thread_main(
     // Clean exit drain: return queued maintenance payloads off-thread, reconcile any abandoned
     // persistence reservation, flush unacked E-stops, and signal exit before waking sinks.
     state.drain_maintenance_stopped();
-    state.service_persistence();
-    state.emit_estop_ack_if_advanced();
+    let exit_ctx = engine.ctx(Instant::now());
+    state.service_persistence(&mut core, &exit_ctx);
+    state.emit_estop_ack_if_advanced(&mut core);
     exited.store(true, Ordering::Release);
     hub.wake();
 }
