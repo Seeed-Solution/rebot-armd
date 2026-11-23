@@ -104,22 +104,30 @@ impl NonBlocking {
         let dropped_w = Arc::clone(&dropped);
         std::thread::Builder::new().name(name.into()).spawn(move || {
             let _close_guard = CloseOnExit(closed_w);
+            let mut reported: u64 = 0;
+            let report_dropped = |sink: &mut dyn Write, reported: &mut u64| {
+                let total = dropped_w.load(Ordering::Relaxed);
+                let delta = total.saturating_sub(*reported);
+                if delta > 0 {
+                    let _ = writeln!(sink, "armd log: {delta} lines dropped (log writer busy)");
+                    *reported = total;
+                }
+            };
             while let Ok(msg) = rx.recv() {
                 match msg {
                     Msg::Line(line) => {
                         queued_w.fetch_sub(1, Ordering::AcqRel);
-                        let lost = dropped_w.swap(0, Ordering::Relaxed);
-                        if lost > 0 {
-                            let _ = writeln!(sink, "armd log: {lost} lines dropped (log writer busy)");
-                        }
+                        report_dropped(&mut sink, &mut reported);
                         let _ = sink.write_all(line.as_bytes());
                     }
                     Msg::Flush(done) => {
+                        report_dropped(&mut sink, &mut reported);
                         let _ = sink.flush();
                         let _ = done.send(());
                     }
                 }
             }
+            report_dropped(&mut sink, &mut reported);
             let _ = sink.flush();
         })?;
         Ok(Self { tx, capacity, queued, closed, dropped })
@@ -147,7 +155,7 @@ impl NonBlocking {
         }
     }
 
-    /// Lines dropped since the writer last reported them.
+    /// Monotonic total lines dropped since this writer started (never reset).
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -170,6 +178,15 @@ impl NonBlocking {
         }
         done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_ok()
     }
+}
+
+/// Monotonic total lines dropped across every writer registered with [`NonBlocking::spawn`].
+pub fn total_dropped() -> u64 {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .fold(0u64, |acc, w| acc.saturating_add(w.dropped()))
 }
 
 /// Flushes every writer started with [`NonBlocking::spawn`] (before the process exits).
@@ -268,7 +285,9 @@ mod tests {
         let reported: u64 = text.lines().filter_map(|l| l.strip_prefix("armd log: ")?.strip_suffix(" lines dropped (log writer busy)")).map(|n| n.parse::<u64>().unwrap()).sum();
         assert!(written.windows(2).all(|p| p[0] < p[1]), "{text}");
         assert_eq!(written.len() as u64 + reported, 20, "every line is written or counted: {text}");
-        assert_eq!(w.dropped(), 0);
+        // Counter is strictly monotonic and never reset after flush/report.
+        assert_eq!(w.dropped(), reported);
+        assert!(w.dropped() >= 15);
     }
 
     /// The path the control tick takes (`tracing::info!` inside `finish_action`) through a

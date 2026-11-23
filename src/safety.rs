@@ -768,12 +768,23 @@ impl From<ClearFaultError> for SafetyError {
     }
 }
 
-/// Emits a warning off-thread when bounded deferred safety log events were dropped.
-pub fn emit_safety_log_dropped(dropped: u64) {
-    if dropped > 0 {
+/// Emits a best-effort warning off-thread when bounded deferred safety log events were dropped.
+/// The monotonic `total` counter remains authoritative even if this warning line itself is dropped.
+pub fn emit_safety_log_dropped(delta: u64, total: u64) {
+    if delta > 0 {
         tracing::warn!(
             target: "armd::safety",
-            "Safety log: {dropped} events dropped (safety log queue full)"
+            "Safety log: {delta} events dropped (safety log queue full; total {total})"
+        );
+    }
+}
+
+/// Emits a best-effort shutdown summary when any safety log events were dropped during the run.
+pub fn emit_safety_log_shutdown_summary(total: u64) {
+    if total > 0 {
+        tracing::warn!(
+            target: "armd::safety",
+            "Safety log shutdown: {total} total events dropped"
         );
     }
 }
@@ -799,17 +810,21 @@ pub struct SafetyManager {
     retired_len: usize,
     off_thread_reclaim: bool,
     deferred_logging: bool,
-    log_events: [Option<SafetyLogEvent>; SAFETY_LOG_CAPACITY],
+    /// Preallocated once at startup (`SAFETY_LOG_CAPACITY` slots) to keep `SafetyManager` small
+    /// on debug stacks while performing zero heap allocations/frees on the RT thread.
+    log_events: Box<[Option<SafetyLogEvent>]>,
     log_head: usize,
     log_len: usize,
     log_dropped: u64,
+    log_dropped_forwarded: u64,
     epoch_id: u64,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
     /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
     latched_fault_kinds: u8,
-    /// Fixed-size inline record of the last detail per latched [`FaultKind`].
-    latched_fault_details: [Option<LatchedFaultDetail>; FaultKind::COUNT],
+    /// Fixed-size preallocated record of the last detail per latched [`FaultKind`]
+    /// (`FaultKind::COUNT` slots, allocated once at startup; zero RT heap ops).
+    latched_fault_details: Box<[Option<LatchedFaultDetail>]>,
 }
 
 impl Clone for SafetyManager {
@@ -838,14 +853,15 @@ impl Clone for SafetyManager {
             retired_len: self.retired_len,
             off_thread_reclaim: self.off_thread_reclaim,
             deferred_logging: self.deferred_logging,
-            log_events: self.log_events,
+            log_events: self.log_events.clone(),
             log_head: self.log_head,
             log_len: self.log_len,
             log_dropped: self.log_dropped,
+            log_dropped_forwarded: self.log_dropped_forwarded,
             epoch_id: self.epoch_id,
             fault_code: self.fault_code,
             latched_fault_kinds: self.latched_fault_kinds,
-            latched_fault_details: self.latched_fault_details,
+            latched_fault_details: self.latched_fault_details.clone(),
         }
     }
 }
@@ -882,14 +898,15 @@ impl Default for SafetyManager {
             retired_len: 0,
             off_thread_reclaim: false,
             deferred_logging: false,
-            log_events: [None; SAFETY_LOG_CAPACITY],
+            log_events: vec![None; SAFETY_LOG_CAPACITY].into_boxed_slice(),
             log_head: 0,
             log_len: 0,
             log_dropped: 0,
+            log_dropped_forwarded: 0,
             epoch_id: 1,
             fault_code: None,
             latched_fault_kinds: 0,
-            latched_fault_details: [None; FaultKind::COUNT],
+            latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
         }
     }
 }
@@ -941,15 +958,25 @@ impl SafetyManager {
         ev
     }
 
-    /// Returns and resets the number of deferred safety log events dropped because the ring was full.
-    pub fn take_log_dropped(&mut self) -> u64 {
-        std::mem::replace(&mut self.log_dropped, 0)
+    /// Monotonic total of deferred safety log events dropped because the inline ring was full
+    /// (never reset).
+    #[inline]
+    pub fn log_dropped(&self) -> u64 {
+        self.log_dropped
+    }
+
+    /// Returns newly dropped inline safety log events since the previous forward call, without
+    /// ever resetting [`Self::log_dropped`].
+    pub fn advance_log_dropped_forwarded(&mut self) -> u64 {
+        let delta = self.log_dropped.saturating_sub(self.log_dropped_forwarded);
+        self.log_dropped_forwarded = self.log_dropped;
+        delta
     }
 
     /// Emits all queued deferred safety log events on a non-RT thread.
     pub fn drain_log_events_off_thread(&mut self) {
-        let lost = self.take_log_dropped();
-        emit_safety_log_dropped(lost);
+        let lost = self.advance_log_dropped_forwarded();
+        emit_safety_log_dropped(lost, self.log_dropped);
         while let Some(ev) = self.pop_log_event() {
             ev.emit();
         }
@@ -1397,7 +1424,7 @@ impl SafetyManager {
                 }
                 self.fault_code = None;
                 self.latched_fault_kinds = 0;
-                self.latched_fault_details = [None; FaultKind::COUNT];
+                self.latched_fault_details.fill(None);
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(SafetyState::Idle)
             }

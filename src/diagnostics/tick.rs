@@ -241,6 +241,12 @@ pub struct TickSnapshot {
     /// Control thread scheduling; None until the control thread reported it (tests).
     pub control_thread: Option<ControlThreadSched>,
     pub observation_cache: ObservationCacheStats,
+    /// Monotonic count of deferred safety log events dropped on overflow (never reset).
+    #[serde(default)]
+    pub safety_log_dropped: u64,
+    /// Monotonic count of log lines dropped by registered non-blocking log writers (never reset).
+    #[serde(default)]
+    pub log_writer_dropped: u64,
 }
 
 impl Default for TickStats {
@@ -385,6 +391,8 @@ impl TickWindow {
             max_lock: self.max_by(|r| r.lock_us),
             control_thread: None,
             observation_cache: ObservationCacheStats::default(),
+            safety_log_dropped: 0,
+            log_writer_dropped: 0,
         }
     }
 }

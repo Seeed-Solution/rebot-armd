@@ -207,6 +207,8 @@ pub struct ExecutorStats {
     pub skipped_releases: AtomicU64,
     /// Diagnostic `TickSample` values dropped because the off-thread ring was full.
     pub diag_dropped: AtomicU64,
+    /// Monotonic count of deferred safety log events dropped due to queue overflow (never reset).
+    pub safety_log_dropped: AtomicU64,
     /// Sub-release transition wakes executed by `armd-control`.
     pub wakes: AtomicU64,
     /// Allocator calls observed across full sub-release wake bodies (when `alloc_timing` is enabled).
@@ -701,14 +703,21 @@ pub(crate) struct OffThreadSinks {
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
-    safety_log_rx: Mutex<Consumer<SafetyLogEvent>>,
-    safety_log_dropped: Arc<AtomicU64>,
+    /// `(consumer, last_reported_dropped, shutdown_reported_total)` guarded by one mutex so
+    /// best-effort warning deltas never race and never reset `stats.safety_log_dropped`.
+    safety_log_rx: Mutex<(Consumer<SafetyLogEvent>, u64, u64)>,
+    stats: Arc<ExecutorStats>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
 }
 
 impl OffThreadSinks {
+    /// Authoritative monotonic count of dropped deferred safety log events (never reset).
+    pub(crate) fn safety_log_dropped(&self) -> u64 {
+        self.stats.safety_log_dropped.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn drain_diag(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
         let mut rx = self.diag_rx.lock().unwrap_or_else(|e| e.into_inner());
         let mut batch = Vec::new();
@@ -742,10 +751,14 @@ impl OffThreadSinks {
             }
         }
         {
-            let lost = self.safety_log_dropped.swap(0, Ordering::Relaxed);
-            crate::safety::emit_safety_log_dropped(lost);
-            let mut log_rx = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
-            while let Ok(ev) = log_rx.pop() {
+            let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+            let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
+            let delta = total.saturating_sub(log_g.1);
+            if delta > 0 {
+                log_g.1 = total;
+                crate::safety::emit_safety_log_dropped(delta, total);
+            }
+            while let Ok(ev) = log_g.0.pop() {
                 ev.emit();
             }
         }
@@ -755,6 +768,18 @@ impl OffThreadSinks {
             while let Ok(rep) = rx.pop() {
                 drop(rep);
             }
+        }
+    }
+
+    /// Final off-thread drain at executor/dispatcher shutdown: emits any remaining events and a
+    /// shutdown summary carrying the authoritative monotonic safety drop count.
+    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
+        self.drain_all(tick_stats);
+        let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+        let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
+        if total > 0 && total != log_g.2 {
+            log_g.2 = total;
+            crate::safety::emit_safety_log_shutdown_summary(total);
         }
     }
 }
@@ -912,7 +937,7 @@ impl RtExecutorShared {
 
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
-        self.sinks.drain_all(&self.tick_stats);
+        self.sinks.flush_and_report_shutdown(&self.tick_stats);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
         }
@@ -1108,7 +1133,6 @@ pub(crate) fn spawn_executor(
     let (reclaim_return_tx, reclaim_return_rx) =
         RingBuffer::<Arc<SafetyState>>::new(FAULT_ARC_POOL_CAPACITY + FORMATTED_FAULT_ARC_POOL_CAPACITY);
     let (safety_log_tx, safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(SAFETY_LOG_CAPACITY);
-    let safety_log_dropped = Arc::new(AtomicU64::new(0));
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -1130,8 +1154,8 @@ pub(crate) fn spawn_executor(
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
         reclaim_return_tx: Mutex::new(reclaim_return_tx),
-        safety_log_rx: Mutex::new(safety_log_rx),
-        safety_log_dropped: safety_log_dropped.clone(),
+        safety_log_rx: Mutex::new((safety_log_rx, 0, 0)),
+        stats: stats.clone(),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -1190,7 +1214,6 @@ pub(crate) fn spawn_executor(
                 reclaim_state_tx,
                 reclaim_return_rx,
                 safety_log_tx,
-                safety_log_dropped,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1274,7 +1297,7 @@ struct ControlState {
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
-    safety_log_dropped: Arc<AtomicU64>,
+    stats: Arc<ExecutorStats>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
@@ -1333,14 +1356,15 @@ impl ControlState {
             let _ = self.reclaim_state_tx.push(arc);
             drained = true;
         }
-        let lost_inline = core.safety.take_log_dropped();
+        let lost_inline = core.safety.advance_log_dropped_forwarded();
         if lost_inline > 0 {
-            self.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
+            self.stats.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
             drained = true;
         }
         while let Some(ev) = core.safety.pop_log_event() {
             if self.safety_log_tx.push(ev).is_err() {
-                self.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+                core.safety_log_ring_dropped = core.safety_log_ring_dropped.saturating_add(1);
+                self.stats.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
             }
             drained = true;
         }
@@ -2223,7 +2247,6 @@ fn control_thread_main(
     reclaim_state_tx: Producer<Arc<SafetyState>>,
     reclaim_return_rx: Consumer<Arc<SafetyState>>,
     safety_log_tx: Producer<SafetyLogEvent>,
-    safety_log_dropped: Arc<AtomicU64>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2290,7 +2313,7 @@ fn control_thread_main(
         reclaim_state_tx,
         reclaim_return_rx,
         safety_log_tx,
-        safety_log_dropped,
+        stats: Arc::clone(&stats),
         maint_req_rx,
         maint_rep_tx,
         pending_maint_reply: None,
@@ -2877,7 +2900,7 @@ mod tests {
             reclaim_state_tx,
             reclaim_return_rx,
             safety_log_tx,
-            safety_log_dropped: Arc::new(AtomicU64::new(0)),
+            stats: Arc::new(ExecutorStats::default()),
             maint_req_rx,
             maint_rep_tx,
             pending_maint_reply: None,

@@ -582,6 +582,8 @@ pub struct SupervisorInner {
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
     /// Highest E-stop request generation dropped if `pending_estop_acks` ever reached capacity 64.
     pub(crate) estop_ack_overflow_gen: u64,
+    /// Monotonic count of deferred safety log events dropped at the RT->off-thread SPSC ring.
+    pub(crate) safety_log_ring_dropped: u64,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -863,6 +865,7 @@ impl SupervisorInner {
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
             estop_ack_overflow_gen: 0,
+            safety_log_ring_dropped: 0,
             before_publish_hook: None,
         };
         inner.prepare_workspace_eval_bufs();
@@ -1347,6 +1350,7 @@ impl SupervisorInner {
         self.policy_observation_into(&mut out.policy);
         #[cfg(not(feature = "policy-runtime"))]
         { out.policy = None; }
+        out.safety_log_dropped = self.safety.log_dropped().saturating_add(self.safety_log_ring_dropped);
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
@@ -5316,6 +5320,16 @@ impl ArmSupervisor {
             published: self.hub.published_seq(),
             tick_frees: self.hub.tick_frees(),
         };
+        snap.safety_log_dropped = self
+            .sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or_else(
+                || self.inner.try_read().map_or(0, |g| g.safety.log_dropped().saturating_add(g.safety_log_ring_dropped)),
+                |s| s.safety_log_dropped(),
+            );
+        snap.log_writer_dropped = crate::diagnostics::logwriter::total_dropped();
         snap
     }
 
@@ -5370,8 +5384,12 @@ fn dispatch_loop(
         }
         std::thread::park_timeout(Duration::from_millis(50));
     }
-    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded.
-    drain_sinks();
+    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded,
+    // and emit any final safety overflow summary.
+    let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(s) = s {
+        s.flush_and_report_shutdown(tick_stats);
+    }
     if let Some(ring) = hub.record_ring() { ring.drain(); }
     let _ = hub.latest();
 }

@@ -2575,7 +2575,12 @@ pub struct ArmObservation {
     /// Active or most recent policy-runtime run; omitted when none has run or feature disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyObservation>,
+    /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub safety_log_dropped: u64,
 }
+
+fn is_zero_u64(v: &u64) -> bool { *v == 0 }
 
 impl ArmObservation {
     /// An observation with every field empty (filled by `SupervisorInner::fill_observation`).
@@ -2588,12 +2593,12 @@ impl ArmObservation {
             action: None, previous_action: None, control_mode: ControlMode::default(), gravity_comp: GravityCompObservation::default(),
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
-            loads: None, policy: None,
+            loads: None, policy: None, safety_log_dropped: 0,
         }
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]

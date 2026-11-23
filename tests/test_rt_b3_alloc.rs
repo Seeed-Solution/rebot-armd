@@ -39,9 +39,23 @@ impl Write for SharedBuf {
 }
 
 #[derive(Clone)]
-struct GatedSink { gate: Arc<(Mutex<bool>, Condvar)>, out: Arc<Mutex<Vec<u8>>> }
+struct GatedSink {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    out: Arc<Mutex<Vec<u8>>>,
+}
+impl GatedSink {
+    fn new() -> Self {
+        Self {
+            gate: Arc::new((Mutex::new(false), Condvar::new())),
+            entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            out: Arc::default(),
+        }
+    }
+}
 impl Write for GatedSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.entered.store(true, Ordering::Release);
         let (m, cv) = &*self.gate;
         let mut open = m.lock().unwrap();
         while !*open { open = cv.wait(open).unwrap(); }
@@ -177,7 +191,7 @@ impl ArmDriver for RestingSupportDriver {
 
 #[test]
 fn logwriter_zero_alloc_inline_and_zero_copy_on_reject() {
-    let sink = GatedSink { gate: Arc::new((Mutex::new(false), Condvar::new())), out: Arc::default() };
+    let sink = GatedSink::new();
     let w = NonBlocking::spawn_unregistered("b3-lw", sink.clone(), 4).unwrap();
     let (inline, oversized) = ([b'x'; 128], [b'y'; INLINE_LINE_BYTES * 4]);
     alloc::time_this_thread();
@@ -186,9 +200,16 @@ fn logwriter_zero_alloc_inline_and_zero_copy_on_reject() {
     tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(&inline).unwrap();
     assert_eq!(alloc::take().calls, 0, "accepted inline write must do 0 heap ops");
 
+    // Wait until the writer thread is blocked inside the gated sink so the queue fill is deterministic.
+    let wait_start = Instant::now();
+    while !sink.entered.load(Ordering::Acquire) {
+        assert!(wait_start.elapsed() < Duration::from_secs(2), "writer did not reach gated sink");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
     for _ in 0..8 { tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(b"fill\n").unwrap(); }
     let dropped_before = w.dropped();
-    assert!(dropped_before >= 3, "queue must saturate: dropped={dropped_before}");
+    assert_eq!(dropped_before, 4, "queue of 4 with writer blocked drops 4 of 8 writes");
     let _ = alloc::take();
     tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(&inline).unwrap();
     tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(&oversized).unwrap();
@@ -801,5 +822,92 @@ async fn remaining_safety_paths_zero_alloc_fault_producers_gravity_comp_estop_an
     assert_api_clear_fault_text(
         err_ws,
         &format!("Cannot disable faulted supporting arm joint away from resting pose ({legacy_ws_msg}); support the arm at rest first"),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn safety_and_logwriter_drop_counters_are_monotonic_published_and_reported_at_flush_and_shutdown() {
+    let log = global_log();
+    let _serial = log.guard.lock().await;
+    let _ = take_global_logs(log);
+
+    // 1. LogWriter drop counter is monotonic (never resets) and reports drops on flush() and shutdown
+    //    even without another line being written.
+    let sink = GatedSink::new();
+    let w = NonBlocking::spawn_unregistered("b3-mono-lw", sink.clone(), 2).unwrap();
+    for i in 0..10 {
+        tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(format!("l{i}\n").as_bytes()).unwrap();
+    }
+    let dropped_after_burst = w.dropped();
+    assert!(dropped_after_burst >= 7, "expected >= 7 drops, got {dropped_after_burst}");
+    *sink.gate.0.lock().unwrap() = true;
+    sink.gate.1.notify_all();
+    assert!(w.flush(Duration::from_secs(2)));
+    // Counter MUST remain monotonic after flush/report.
+    assert_eq!(w.dropped(), dropped_after_burst, "logwriter dropped counter must never reset on flush");
+    let flushed_text = String::from_utf8(sink.out.lock().unwrap().clone()).unwrap();
+    assert!(flushed_text.contains("armd log:") && flushed_text.contains("lines dropped"), "flush must report drops: {flushed_text}");
+
+    // Second burst while gated again -> drop count strictly increases, and drop(w) reports on shutdown.
+    *sink.gate.0.lock().unwrap() = false;
+    for i in 0..8 {
+        tracing_subscriber::fmt::MakeWriter::make_writer(&w).write_all(format!("m{i}\n").as_bytes()).unwrap();
+    }
+    let dropped_second = w.dropped();
+    assert!(dropped_second > dropped_after_burst);
+    *sink.gate.0.lock().unwrap() = true;
+    sink.gate.1.notify_all();
+    drop(w);
+    wait_until_async(Duration::from_secs(2), || {
+        let s = String::from_utf8(sink.out.lock().unwrap().clone()).unwrap();
+        s.matches("lines dropped").count() >= 2
+    }).await;
+
+    // 2. SafetyManager inline drop counter is monotonic across drains, and live RtExecutor publishes
+    //    it in ExecutorStats, TickSnapshot diagnostics, and ArmObservation, and reports at shutdown.
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let expected_drops = {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.safety.set_off_thread_reclaim(true);
+        // Overflow the inline safety log ring before handing off to the executor so drops are
+        // guaranteed even if the dispatcher thread drains promptly.
+        for _ in 0..(SAFETY_LOG_CAPACITY + 10) {
+            inner.safety.trigger_e_stop();
+            let _ = inner.safety.clear_fault_bounded().unwrap();
+        }
+        let d = inner.safety.log_dropped();
+        assert!(d >= 10, "expected >= 10 inline safety log drops, got {d}");
+        d
+    };
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(4));
+    cfg.alloc_timing = true;
+    let handle = sup.start_executor(cfg).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || {
+        handle.stats().safety_log_dropped.load(Ordering::Relaxed) >= expected_drops
+            && sup.tick_stats().safety_log_dropped >= expected_drops
+    }).await;
+
+    // Even after dispatch has drained and emitted best-effort warnings, every counter remains
+    // monotonic and authoritative (NEVER reset to 0).
+    let stats_drops = handle.stats().safety_log_dropped.load(Ordering::Relaxed);
+    let diag_drops = sup.tick_stats().safety_log_dropped;
+    let obs = sup.observation().await.unwrap();
+    assert_eq!(stats_drops, expected_drops);
+    assert_eq!(diag_drops, expected_drops);
+    assert_eq!(obs.safety_log_dropped, expected_drops);
+    let obs_json = serde_json::to_value(&obs).unwrap();
+    assert_eq!(obs_json["safety_log_dropped"], expected_drops);
+
+    // Clear captured logs, then stop executor: shutdown summary must still report the monotonic total
+    // and counters must still equal expected_drops.
+    let _ = take_global_logs(log);
+    handle.stop_and_join();
+    assert_eq!(handle.stats().safety_log_dropped.load(Ordering::Relaxed), expected_drops);
+    assert_eq!(sup.tick_stats().safety_log_dropped, expected_drops);
+    let shutdown_logs = take_global_logs(log);
+    assert!(
+        shutdown_logs.contains(&format!("Safety log shutdown: {expected_drops} total events dropped")),
+        "missing shutdown summary in:\n{shutdown_logs}"
     );
 }
