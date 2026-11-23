@@ -510,10 +510,11 @@ impl SupervisorInner {
         self.start_macro_gripper_within(id, request, None, false).map(|(dur, _, _)| dur)
     }
 
-    /// Start a gripper sub-motion of macro action `id`, optionally verifying before installation
-    /// that a pos-force close's planned duration fits within `max_budget_s`. Returns
-    /// `(expected_duration, timeout_s, is_pos_force_close)`.
-    pub(crate) fn start_macro_gripper_within(
+    /// Start a gripper sub-motion of macro action `id`, verifying before installation that
+    /// `max_budget_s` is positive/finite and (for pos-force closes) covers the planned duration.
+    /// Returns `(expected_duration, timeout_s, is_pos_force_close)`.
+    #[doc(hidden)]
+    pub fn start_macro_gripper_within(
         &mut self,
         id: u64,
         request: GripperRequest,
@@ -542,13 +543,16 @@ impl SupervisorInner {
         }
         let duration = motion.expected_duration();
         let timeout_s = motion.timeout_s;
-        if is_pos_force_close {
-            if let Some(budget_s) = max_budget_s {
-                if duration > budget_s {
-                    return Err(MotionError::InvalidCommand(format!(
-                        "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
-                    )).into());
-                }
+        if let Some(budget_s) = max_budget_s {
+            if !(budget_s.is_finite() && budget_s > 0.0) {
+                return Err(MotionError::InvalidCommand(format!(
+                    "remaining macro budget exhausted ({budget_s:.3} s <= 0)"
+                )).into());
+            }
+            if is_pos_force_close && duration > budget_s {
+                return Err(MotionError::InvalidCommand(format!(
+                    "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
+                )).into());
             }
         }
         self.releasing = matches!(motion.request.command, GripperCommand::Open);

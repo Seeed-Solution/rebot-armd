@@ -2774,6 +2774,52 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
                     other => panic!("expected Gripper reference, got {other:?}"),
                 }
             }
+
+            // 8e. Remaining macro budget computed under the supervisor write lock refuses installation
+            //     if the lock was held past `ctx.deadline` (pos-force close, pos-force open, pos_vel close),
+            //     and direct `start_macro_gripper_within` with budget <= 0 refuses before installing.
+            for (label, speed_cfg, start_q, cmd) in [
+                ("pos_force_close", Some(0.30_f32), -5.7_f32, GripperCommand::Close),
+                ("pos_force_open", Some(0.30_f32), 0.0_f32, GripperCommand::Open),
+                ("pos_vel_close", None, -5.7_f32, GripperCommand::Close),
+            ] {
+                let (sup_inner_b, _, _) = make_sup(speed_cfg, start_q);
+                let sup_b = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
+                let id_b = {
+                    let mut inner = sup_inner_b;
+                    let ep = inner.safety.epoch_id();
+                    let id = inner.begin_sequence_action(None, ep).unwrap();
+                    // Direct zero / negative budget checks before installing any trajectory.
+                    let req = GripperRequest { command: cmd, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(8.0), tag: None };
+                    for bad_budget in [0.0_f64, -1.0_f64] {
+                        let err = inner.start_macro_gripper_within(id, req.clone(), Some(bad_budget), true).unwrap_err();
+                        assert!(err.to_string().contains("remaining macro budget"), "{label} budget={bad_budget}: {err}");
+                        assert!(inner.active_trajectory.is_none());
+                        assert_ne!(inner.macro_sub(id), Some(armd::macro_action::SubState::Running));
+                    }
+                    *sup_b.inner().write().await = inner;
+                    id
+                };
+                let guard = sup_b.inner().write().await;
+                let ctx_b = armd::macro_action::MacroCtx {
+                    sup: sup_b.clone(),
+                    id: id_b,
+                    deadline: std::time::Instant::now() + Duration::from_millis(40),
+                    phase_timeout_s: 25.0,
+                    timeout_code: "GRASP_TIMEOUT",
+                    timeout_message: "macro timeout".into(),
+                };
+                let handle = tokio::spawn(async move { ctx_b.gripper(label, cmd).await });
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                drop(guard);
+                match handle.await.unwrap() {
+                    Err(armd::macro_action::Stop::Fail(code, _)) => assert_eq!(code, "GRASP_TIMEOUT", "{label}"),
+                    other => panic!("{label}: expected GRASP_TIMEOUT after held lock past deadline, got {other:?}"),
+                }
+                let inner_after = sup_b.inner().read().await;
+                assert!(inner_after.active_trajectory.is_none(), "{label} installed trajectory past deadline");
+                assert_ne!(inner_after.macro_sub(id_b), Some(armd::macro_action::SubState::Running), "{label} left sub running");
+            }
         });
     }
 

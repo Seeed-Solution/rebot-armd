@@ -288,10 +288,14 @@ impl MacroCtx {
     /// pos-force closes wait up to their planned deadline (bounded by `self.deadline`), while
     /// pos-vel and opening moves keep `phase_timeout_s`.
     async fn run_gripper(&self, phase: &str, request: GripperRequest) -> Result<SubDone, Stop> {
-        let remaining_s = self.deadline.saturating_duration_since(Instant::now()).as_secs_f64();
         let (duration, timeout_s, is_pos_force_close) = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(fail(self.timeout_code, self.timeout_message.clone()));
+            }
+            let remaining_s = self.deadline.duration_since(now).as_secs_f64();
             inner.start_macro_gripper_within(self.id, request, Some(remaining_s), true)
                 .map_err(|e| match e {
                     ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg))
