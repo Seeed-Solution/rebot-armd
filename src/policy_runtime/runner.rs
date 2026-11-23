@@ -448,7 +448,7 @@ pub struct PreparedPolicy {
     step_out_norm: Vec<f32>,
     policy_act_units: Vec<f32>,
     arm_target_rad: Vec<f32>,
-    chunk_step: usize,
+    periods_since_replan: usize,
     /// Per-future-step queue of overlapping normalized action predictions (`len <= chunk_size`).
     chunk_ring: std::collections::VecDeque<Vec<Vec<f32>>>,
 }
@@ -514,7 +514,7 @@ impl PreparedPolicy {
             step_out_norm: vec![0.0; dim],
             policy_act_units: vec![0.0; dim],
             arm_target_rad: vec![0.0; dim],
-            chunk_step: 0,
+            periods_since_replan: 0,
             chunk_ring: std::collections::VecDeque::with_capacity(chunk_cap),
         })
     }
@@ -578,7 +578,17 @@ impl PreparedPolicy {
 
     /// Run one full state -> units -> normalize -> infer -> denormalize -> radians -> reorder step.
     pub fn step_infer(&mut self, measured_arm_rad: &[f32]) -> Result<Vec<f32>, PolicyError> {
-        self.step_infer_with_vision(measured_arm_rad, None)
+        self.step_infer_with_vision_periods(measured_arm_rad, None, 1)
+    }
+
+    /// Run one inference step advancing the action-chunk timeline by `periods_elapsed` control
+    /// periods (clamped to at least 1).
+    pub fn step_infer_periods(
+        &mut self,
+        measured_arm_rad: &[f32],
+        periods_elapsed: u32,
+    ) -> Result<Vec<f32>, PolicyError> {
+        self.step_infer_with_vision_periods(measured_arm_rad, None, periods_elapsed)
     }
 
     /// Run one full inference step, optionally appending pre-extracted vision features after the
@@ -587,6 +597,17 @@ impl PreparedPolicy {
         &mut self,
         measured_arm_rad: &[f32],
         vision_features: Option<&[f32]>,
+    ) -> Result<Vec<f32>, PolicyError> {
+        self.step_infer_with_vision_periods(measured_arm_rad, vision_features, 1)
+    }
+
+    /// Run one full inference step, advancing the action-chunk timeline by `periods_elapsed`
+    /// control periods since the previous step (clamped to at least 1).
+    pub fn step_infer_with_vision_periods(
+        &mut self,
+        measured_arm_rad: &[f32],
+        vision_features: Option<&[f32]>,
+        periods_elapsed: u32,
     ) -> Result<Vec<f32>, PolicyError> {
         let dim = self.contract.action_dim;
         let vision_dim = self.contract.vision_feature_dim();
@@ -660,11 +681,7 @@ impl PreparedPolicy {
         }
 
         let chunking = self.contract.chunking;
-        let need_replan = chunking.chunk_size <= 1
-            || self.chunk_ring.is_empty()
-            || (self.chunk_step % chunking.replan_every == 0);
-
-        if need_replan {
+        if chunking.chunk_size <= 1 {
             self.backend.infer(&self.infer_in, &mut self.infer_out)?;
             for (idx, &v) in self.infer_out.iter().enumerate() {
                 if !v.is_finite() {
@@ -673,7 +690,36 @@ impl PreparedPolicy {
                     )));
                 }
             }
-            if chunking.chunk_size > 1 {
+            self.step_out_norm.copy_from_slice(&self.infer_out[..dim]);
+        } else {
+            let elapsed = periods_elapsed.max(1) as usize;
+            let skipped = if self.chunk_ring.is_empty() {
+                0
+            } else {
+                elapsed - 1
+            };
+            let remaining_after_skip = self.chunk_ring.len().saturating_sub(skipped);
+            let next_periods_since_replan = self.periods_since_replan.saturating_add(elapsed);
+            let need_replan =
+                remaining_after_skip == 0 || next_periods_since_replan >= chunking.replan_every;
+
+            if need_replan {
+                self.backend.infer(&self.infer_in, &mut self.infer_out)?;
+                for (idx, &v) in self.infer_out.iter().enumerate() {
+                    if !v.is_finite() {
+                        return Err(PolicyError::NonFinite(format!(
+                            "model output[{idx}] is non-finite: {v}"
+                        )));
+                    }
+                }
+            }
+
+            // Discard entries for skipped control periods before taking or ensembling the current step.
+            for _ in 0..skipped.min(self.chunk_ring.len()) {
+                self.chunk_ring.pop_front();
+            }
+
+            if need_replan {
                 if chunking.temporal_ensemble_k.is_none() {
                     self.chunk_ring.clear();
                 }
@@ -684,30 +730,28 @@ impl PreparedPolicy {
                     let slice = &self.infer_out[offset * dim..(offset + 1) * dim];
                     self.chunk_ring[offset].push(slice.to_vec());
                 }
+                self.periods_since_replan = 0;
+            } else {
+                self.periods_since_replan = next_periods_since_replan;
             }
-        }
 
-        if chunking.chunk_size <= 1 {
-            self.step_out_norm.copy_from_slice(&self.infer_out[..dim]);
-        } else {
             let preds = self
                 .chunk_ring
                 .pop_front()
                 .ok_or_else(|| PolicyError::InferenceFailed("action chunk buffer unexpectedly empty".into()))?;
-            self.chunk_step = self.chunk_step.saturating_add(1);
             if let Some(k) = chunking.temporal_ensemble_k.filter(|_| preds.len() > 1) {
                 self.step_out_norm.fill(0.0);
                 let mut w_sum = 0.0f32;
                 for (age_idx, p) in preds.iter().enumerate() {
                     let w = (-k * (age_idx as f32)).exp();
                     w_sum += w;
-                    for j in 0..dim {
-                        self.step_out_norm[j] += w * p[j];
+                    for (dst, &src) in self.step_out_norm.iter_mut().zip(p.iter()) {
+                        *dst += w * src;
                     }
                 }
                 if w_sum > 0.0 {
-                    for j in 0..dim {
-                        self.step_out_norm[j] /= w_sum;
+                    for v in &mut self.step_out_norm {
+                        *v /= w_sum;
                     }
                 }
             } else if let Some(latest) = preds.last() {
@@ -1114,8 +1158,11 @@ pub fn spawn_policy_runner(
         let run_started_at = Instant::now();
         let mut locked_generation: Option<u64> = None;
 
-        let mut interval = tokio::time::interval(period);
+        let interval_origin = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval_at(interval_origin, period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let period_ns = period.as_nanos().max(1);
+        let mut last_infer_period: Option<u64> = None;
 
         loop {
             if let Some(dl) = tokio_dl {
@@ -1131,6 +1178,10 @@ pub fn spawn_policy_runner(
             } else {
                 interval.tick().await;
             }
+            let tick_now = tokio::time::Instant::now();
+            let cur_period = (tick_now.saturating_duration_since(interval_origin).as_nanos()
+                / period_ns)
+                .min(u64::MAX as u128) as u64;
             let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
@@ -1242,11 +1293,18 @@ pub fn spawn_policy_runner(
                     (None, None, None, None, None)
                 };
 
+            let periods_elapsed = match last_infer_period {
+                None => 1u32,
+                Some(prev) => cur_period.saturating_sub(prev).clamp(1, u32::MAX as u64) as u32,
+            };
+            last_infer_period = Some(cur_period);
+
             let infer_handle = tokio::task::spawn_blocking(move || {
                 let t0 = Instant::now();
-                let res = prepared.step_infer_with_vision(
+                let res = prepared.step_infer_with_vision_periods(
                     &measured,
                     vision_features.as_deref(),
+                    periods_elapsed,
                 );
                 let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 (prepared, res.map(|t| (t, infer_us)))
@@ -1439,12 +1497,28 @@ pub fn spawn_policy_runner(
 mod chunking_tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingChunkBackend {
         in_dim: usize,
         out_dim: usize,
-        calls: usize,
+        calls: Arc<AtomicUsize>,
         chunks: Vec<Vec<f32>>,
+    }
+
+    impl CountingChunkBackend {
+        fn new(in_dim: usize, out_dim: usize, chunks: Vec<Vec<f32>>) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    in_dim,
+                    out_dim,
+                    calls: Arc::clone(&calls),
+                    chunks,
+                },
+                calls,
+            )
+        }
     }
 
     impl PolicyBackend for CountingChunkBackend {
@@ -1458,9 +1532,9 @@ mod chunking_tests {
             self.out_dim
         }
         fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
-            let src = &self.chunks[self.calls.min(self.chunks.len() - 1)];
+            let idx = self.calls.fetch_add(1, Ordering::Relaxed);
+            let src = &self.chunks[idx.min(self.chunks.len() - 1)];
             output.copy_from_slice(src);
-            self.calls += 1;
             Ok(())
         }
     }
@@ -1520,18 +1594,14 @@ mod chunking_tests {
             c0.extend(std::iter::repeat_n((k + 1) as f32 * 0.1, dim));
             c1.extend(std::iter::repeat_n((k + 5) as f32 * 0.1, dim));
         }
-        let backend = CountingChunkBackend {
-            in_dim: dim,
-            out_dim: 4 * dim,
-            calls: 0,
-            chunks: vec![c0.clone(), c1.clone()],
-        };
+        let (backend, calls) = CountingChunkBackend::new(dim, 4 * dim, vec![c0.clone(), c1.clone()]);
         let mut prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
         let state = vec![0.0f32; dim];
         let a0 = prep.step_infer(&state).unwrap(); // replans chunk 0 -> 0.1
         let a1 = prep.step_infer(&state).unwrap(); // consumes chunk 0[1] -> 0.2
         let a2 = prep.step_infer(&state).unwrap(); // replans chunk 1 -> 0.5
         let a3 = prep.step_infer(&state).unwrap(); // consumes chunk 1[1] -> 0.6
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert!((a0[0] - 0.1).abs() < 1e-6);
         assert!((a1[0] - 0.2).abs() < 1e-6);
         assert!((a2[0] - 0.5).abs() < 1e-6);
@@ -1539,22 +1609,161 @@ mod chunking_tests {
 
         // Test 2: Temporal ensembling (chunk_size=4, replan_every=2, k=0.01)
         let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(4, 2, Some(0.01));
-        let backend2 = CountingChunkBackend {
-            in_dim: dim,
-            out_dim: 4 * dim,
-            calls: 0,
-            chunks: vec![c0, c1],
-        };
+        let (backend2, calls2) = CountingChunkBackend::new(dim, 4 * dim, vec![c0, c1]);
         let mut prep2 = PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
         let e0 = prep2.step_infer(&state).unwrap(); // only c0[0] = 0.1
         let e1 = prep2.step_infer(&state).unwrap(); // only c0[1] = 0.2
         let e2 = prep2.step_infer(&state).unwrap(); // overlaps c0[2]=0.3 (age 0) and c1[0]=0.5 (age 1)
+        assert_eq!(calls2.load(Ordering::Relaxed), 2);
         assert!((e0[0] - 0.1).abs() < 1e-6);
         assert!((e1[0] - 0.2).abs() < 1e-6);
         let w0 = 1.0f32;
         let w1 = (-0.01f32).exp();
         let expected_e2 = (w0 * 0.3 + w1 * 0.5) / (w0 + w1);
         assert!((e2[0] - expected_e2).abs() < 1e-5, "got {}, expected {}", e2[0], expected_e2);
+    }
+
+    fn make_constant_chunk(dim: usize, vals: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(vals.len() * dim);
+        for &v in vals {
+            out.extend(std::iter::repeat_n(v, dim));
+        }
+        out
+    }
+
+    #[test]
+    fn chunking_skips_elapsed_periods_without_timeline_drift() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+
+        // Case 1: Skip within chunk (chunk_size=4, replan_every=4):
+        // step 0 takes c0[0], next step reports 2 elapsed periods -> takes c0[2], not c0[1], without replanning.
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, calls) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone(), c1.clone()]);
+        let mut prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let a0 = prep.step_infer_periods(&state, 1).unwrap();
+        let a2 = prep.step_infer_periods(&state, 2).unwrap(); // period 1 skipped -> c0[2]
+        let a3 = prep.step_infer_periods(&state, 1).unwrap(); // period 3 -> c0[3]
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!((a0[0] - 0.1).abs() < 1e-6);
+        assert!((a2[0] - 0.3).abs() < 1e-6, "expected chunk[2]=0.3, got {}", a2[0]);
+        assert!((a3[0] - 0.4).abs() < 1e-6);
+        // Next period (t=4) hits replan_every=4 and empty buffer -> replans c1.
+        let a4 = prep.step_infer_periods(&state, 1).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!((a4[0] - 0.5).abs() < 1e-6);
+
+        // Case 2: chunk_size=4, replan_every=2 with 2 elapsed periods:
+        // elapsed periods since last replan reaches 2 >= replan_every -> triggers replan immediately.
+        let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(4, 2, None);
+        let (backend2, calls2) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0, c1]);
+        let mut prep2 = PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
+        let b0 = prep2.step_infer_periods(&state, 1).unwrap();
+        let b2 = prep2.step_infer_periods(&state, 2).unwrap();
+        assert_eq!(calls2.load(Ordering::Relaxed), 2);
+        assert!((b0[0] - 0.1).abs() < 1e-6);
+        assert!((b2[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn chunking_skip_larger_than_buffer_triggers_immediate_replan() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+
+        // Open-loop: skip 5 periods when only 3 remain -> discard all and replan immediately.
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, calls) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone(), c1.clone()]);
+        let mut prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let a0 = prep.step_infer_periods(&state, 1).unwrap();
+        let a5 = prep.step_infer_periods(&state, 5).unwrap();
+        let a6 = prep.step_infer_periods(&state, 1).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!((a0[0] - 0.1).abs() < 1e-6);
+        assert!((a5[0] - 0.5).abs() < 1e-6);
+        assert!((a6[0] - 0.6).abs() < 1e-6);
+
+        // Temporal ensembling: skip larger than buffer discards all stale entries so c1[0] is unblended.
+        let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(4, 2, Some(0.01));
+        let (backend2, calls2) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0, c1]);
+        let mut prep2 = PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
+        let e0 = prep2.step_infer_periods(&state, 1).unwrap();
+        let e5 = prep2.step_infer_periods(&state, 5).unwrap();
+        assert_eq!(calls2.load(Ordering::Relaxed), 2);
+        assert!((e0[0] - 0.1).abs() < 1e-6);
+        assert!((e5[0] - 0.5).abs() < 1e-6, "stale entries should be discarded, got {}", e5[0]);
+    }
+
+    #[test]
+    fn chunking_temporal_ensemble_discards_skipped_periods() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+        let c2 = make_constant_chunk(state_dim, &[0.9, 1.0, 1.1, 1.2]);
+
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, Some(0.01));
+        let (backend, calls) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0, c1, c2]);
+        let mut prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let e0 = prep.step_infer_periods(&state, 1).unwrap(); // t=0: c0[0]=0.1
+        assert!((e0[0] - 0.1).abs() < 1e-6);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // t=2 (periods_elapsed=2): skips c0[1]=0.2, triggers replan c1, ensembles c0[2]=0.3 with c1[0]=0.5.
+        let e2 = prep.step_infer_periods(&state, 2).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let w0 = 1.0f32;
+        let w1 = (-0.01f32).exp();
+        let expected_e2 = (w0 * 0.3 + w1 * 0.5) / (w0 + w1);
+        assert!((e2[0] - expected_e2).abs() < 1e-5, "got {}, expected {}", e2[0], expected_e2);
+
+        // t=3 (periods_elapsed=1): no replan, ensembles c0[3]=0.4 with c1[1]=0.6.
+        let e3 = prep.step_infer_periods(&state, 1).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let expected_e3 = (w0 * 0.4 + w1 * 0.6) / (w0 + w1);
+        assert!((e3[0] - expected_e3).abs() < 1e-5, "got {}, expected {}", e3[0], expected_e3);
+
+        // t=5 (periods_elapsed=2): skips c1[2]=0.7, triggers replan c2, ensembles c1[3]=0.8 with c2[0]=0.9.
+        let e5 = prep.step_infer_periods(&state, 2).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let expected_e5 = (w0 * 0.8 + w1 * 0.9) / (w0 + w1);
+        assert!((e5[0] - expected_e5).abs() < 1e-5, "got {}, expected {}", e5[0], expected_e5);
+    }
+
+    #[test]
+    fn chunking_size_one_is_unchanged_with_elapsed_periods() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let chunks = vec![
+            make_constant_chunk(state_dim, &[0.1]),
+            make_constant_chunk(state_dim, &[0.25]),
+            make_constant_chunk(state_dim, &[-0.3]),
+            make_constant_chunk(state_dim, &[0.42]),
+        ];
+
+        let (snap_a, contract_a, cfg_a) = make_chunk_snapshot_and_contract(1, 1, None);
+        let (backend_a, calls_a) = CountingChunkBackend::new(state_dim, state_dim, chunks.clone());
+        let mut prep_a = PreparedPolicy::from_backend(snap_a, contract_a, Box::new(backend_a), &cfg_a).unwrap();
+
+        let (snap_b, contract_b, cfg_b) = make_chunk_snapshot_and_contract(1, 1, None);
+        let (backend_b, calls_b) = CountingChunkBackend::new(state_dim, state_dim, chunks);
+        let mut prep_b = PreparedPolicy::from_backend(snap_b, contract_b, Box::new(backend_b), &cfg_b).unwrap();
+
+        for elapsed in [1u32, 3, 10, 0] {
+            let ref_out = prep_a.step_infer(&state).unwrap();
+            let per_out = prep_b.step_infer_periods(&state, elapsed).unwrap();
+            assert_eq!(
+                per_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                ref_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "chunk_size=1 must stay byte-identical for periods_elapsed={elapsed}"
+            );
+        }
+        assert_eq!(calls_a.load(Ordering::Relaxed), 4);
+        assert_eq!(calls_b.load(Ordering::Relaxed), 4);
     }
 
     #[test]
