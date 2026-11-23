@@ -249,9 +249,6 @@ struct DeferredActionDone {
 pub struct TickPublished {
     /// A copy of the published observation (asked for with `keep`).
     pub kept: Option<ArmObservation>,
-    /// An observation the publication slot held and the caller frees after the lock (None
-    /// when the tick filled the slot's own observation, the steady state).
-    pub displaced: Option<ArmObservation>,
     /// End of the tick body (the tick phase mark), None without phase timing.
     pub body_end: Option<Instant>,
 }
@@ -1071,16 +1068,16 @@ impl SupervisorInner {
     /// the observation for the caller (tests).
     pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
         let timestamp = self.tick_control(dt);
-        let mut obs = self.core.take_observation_buffer().unwrap_or_else(ArmObservation::blank);
+        let mut obs = self.core.take_observation_buffer();
         self.fill_observation(timestamp, &mut obs);
         self.tick_phase(4);
         let body_end = self.tick_phase_mark.take();
         let control_hz = self.config.control_frequency_hz;
         let (sampled_at, valid_until) = self.observation_valid_until(&obs, Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1))));
-        let kept = keep.then(|| obs.clone());
+        let kept = keep.then(|| (*obs).clone());
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
-        let displaced = core.publish(generation, sampled_at, valid_until, obs, measured_positions, measured_velocities);
-        TickPublished { kept, displaced, body_end }
+        core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
+        TickPublished { kept, body_end }
     }
 
     pub fn current_observation(&self) -> ArmObservation {
@@ -1093,7 +1090,7 @@ impl SupervisorInner {
     /// control tick fills its published sample this way, without allocating while no value
     /// changes its shape (armd 1.6 RT core). Every field is overwritten.
     pub fn fill_observation(&self, timestamp: f64, out: &mut ArmObservation) {
-        use crate::rt_core::scratch::{fill_n, set_opt, set_opt_eq, set_opt_str};
+        use crate::rt_core::scratch::{fill_n, set_opt, set_opt_eq};
         let tcp = if self.config.kinematics.is_some() {
             self.config.tcp_pose_f32(&self.measured_positions).map(|pose| {
                 let rpy = crate::kinematics::r_to_rpy(&pose.r);
@@ -1161,7 +1158,9 @@ impl SupervisorInner {
             Some(Ok(drv)) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
             _ => out.driver_range_check = None,
         }
-        set_opt_str(&mut out.lease_holder, self.lease_holder_str());
+        // inline label: setting or clearing it never allocates or frees on the tick
+        let holder = self.lease_holder_str();
+        if out.lease_holder.as_deref() != holder { out.lease_holder = holder.map(crate::model::HolderLabel::new); }
         out.motion_limit.clone_from(&self.motion_limit);
         set_opt_eq(&mut out.workspace_violation, self.workspace_violation.as_ref());
         if out.motor_errors != self.motor_errors { out.motor_errors.clone_from(&self.motor_errors); }
@@ -3930,7 +3929,7 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, displaced, pre, publish, allocs) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
@@ -3941,7 +3940,7 @@ impl ArmSupervisor {
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
-            let TickPublished { kept, displaced, body_end } = inner.tick_publish(dt, generation, keep);
+            let TickPublished { kept, body_end } = inner.tick_publish(dt, generation, keep);
             let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
@@ -3949,13 +3948,11 @@ impl ArmSupervisor {
             let control_hz = inner.config.control_frequency_hz;
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
-            (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, displaced,
+            (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
                 body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
-        // freeing an observation is several deallocations: after the lock
-        drop(displaced);
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
@@ -4331,7 +4328,7 @@ mod observation_snapshot_tests {
         published.timestamp = 123.0;
         let generation = sup.inner().generation();
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *writer;
-        let _ = core.publish(generation, Instant::now(), Instant::now() + Duration::from_secs(1), published, measured_positions, measured_velocities);
+        let _ = core.publish_displacing(generation, Instant::now(), Instant::now() + Duration::from_secs(1), published, measured_positions, measured_velocities);
         drop(writer);
         assert_eq!(reader.await.unwrap().timestamp, 123.0);
         let c = sup.tick_stats().observation_cache;

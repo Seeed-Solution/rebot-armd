@@ -14,6 +14,20 @@ use crate::driver::ArmDriver;
 use crate::model::ArmObservation;
 use crate::rt_core::scratch::{copy_into, FeedbackScratch};
 
+/// The publication slot's observation, out for filling ([`ArmCore::take_observation_buffer`]);
+/// only [`ArmCore::publish`] takes it back.
+#[derive(Debug)]
+pub struct ObservationBuffer(ArmObservation);
+
+impl std::ops::Deref for ObservationBuffer {
+    type Target = ArmObservation;
+    fn deref(&self) -> &ArmObservation { &self.0 }
+}
+
+impl std::ops::DerefMut for ObservationBuffer {
+    fn deref_mut(&mut self) -> &mut ArmObservation { &mut self.0 }
+}
+
 /// Per-joint feedback bookkeeping (profile dof): receive instants and sample counters.
 /// Written only by [`ArmCore::poll_feedback`] / [`ArmCore::simulate_feedback`].
 pub struct FeedbackState {
@@ -50,6 +64,9 @@ pub struct ArmCore {
     publisher: StatePublisher,
     /// Recording samples of the running teach session.
     record: RecordProducer,
+    /// An [`ObservationBuffer`] is out (taken, not yet published): the displacing publish
+    /// is refused meanwhile, so the in-place publish never displaces anything.
+    buffer_out: bool,
     config: ConfigHold,
     /// The target stream the core consumes from (`mailbox::TargetFrame::check`).
     targets: TargetAuthority,
@@ -67,6 +84,7 @@ impl ArmCore {
             feedback: FeedbackState { instants: vec![None; dof], seqs: vec![0; dof] },
             publisher,
             record: RecordProducer::new(dof),
+            buffer_out: false,
             config: ConfigHold::default(),
             targets: TargetAuthority::default(),
             transition: None,
@@ -133,16 +151,33 @@ impl ArmCore {
 
     /// The observation of the publication slot the next [`Self::publish`] writes, moved
     /// out to be filled in place (`SupervisorInner::fill_observation`) and handed back by
-    /// `publish`: the tick reuses its memory instead of building a new observation. None
-    /// before the slot held one.
-    pub fn take_observation_buffer(&mut self) -> Option<ArmObservation> { self.publisher.take_back_observation() }
+    /// `publish`: the tick reuses its memory instead of building a new observation (a blank
+    /// one, allocated, only before the slot held one: the first ticks).
+    pub fn take_observation_buffer(&mut self) -> ObservationBuffer {
+        self.buffer_out = true;
+        ObservationBuffer(self.publisher.take_back_observation().unwrap_or_else(ArmObservation::blank))
+    }
 
-    /// Publishes one tick's observation (see [`StatePublisher::publish`]); returns the
-    /// displaced observation for the caller to drop after releasing the lock.
-    #[must_use]
-    pub fn publish(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, positions: &[f32], velocities: &[f32]) -> Option<ArmObservation> {
+    /// Publishes one tick's observation, filled in place, back into the slot it came from:
+    /// nothing is displaced, so the tick never frees an observation (whatever the readers
+    /// and the retire ring do).
+    pub fn publish(&mut self, buffer: ObservationBuffer, generation: u64, sampled_at: Instant, valid_until: Instant, positions: &[f32], velocities: &[f32]) {
+        self.buffer_out = false;
         let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
-        self.publisher.publish(generation, sampled_at, valid_until, obs, rt)
+        let displaced = self.publisher.publish(generation, sampled_at, valid_until, buffer.0, rt);
+        // the slot was emptied by take_observation_buffer and nothing wrote it since
+        debug_assert!(displaced.is_none(), "an in-place publication displaced an observation");
+        if let Some(d) = displaced { self.publisher.restore_back_observation(d); }
+    }
+
+    /// Publishes an observation built elsewhere (not the tick: tests, start-up). The one it
+    /// displaces goes to the retire ring; when that ring is full it comes back, for the
+    /// caller to drop off the control thread. Refused (the observation comes back as Err)
+    /// while an [`ObservationBuffer`] is out.
+    pub fn publish_displacing(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, positions: &[f32], velocities: &[f32]) -> Result<Option<ArmObservation>, ArmObservation> {
+        if self.buffer_out { return Err(obs); }
+        let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
+        Ok(self.publisher.publish(generation, sampled_at, valid_until, obs, rt))
     }
 
     // -- recording ------------------------------------------------------------------------

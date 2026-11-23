@@ -194,6 +194,18 @@ impl StatePublisher {
     /// Moves the observation out of the slot the next [`Self::publish`] writes (see
     /// `ArmCore::take_observation_buffer`).
     pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
+
+    /// Puts `obs` into the back slot when it is empty (else back to the retire ring; never
+    /// freed here when that ring has room). `ArmCore::publish`'s fallback for a displaced
+    /// observation, which its encapsulation makes unreachable.
+    pub(super) fn restore_back_observation(&mut self, obs: ArmObservation) {
+        let slot = self.producer.back_mut();
+        if slot.obs.is_none() { slot.obs = Some(obs); return; }
+        if let Some(back) = self.hub.retire.push(&mut self.retire_head, obs) {
+            self.hub.tick_frees.fetch_add(1, Ordering::Relaxed);
+            drop(back);
+        }
+    }
 }
 
 struct HubState {

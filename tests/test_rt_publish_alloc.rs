@@ -67,8 +67,8 @@ fn publish_and_record_push_do_not_touch_the_allocator() {
         // readers lag (one read every 7 ticks), so most publications displace an unread
         // observation, which must go to the retire ring and be freed by the reader
         let ((none_back, pushed), a, f) = counted(|| {
-            let back = core.publish(i, now, now + Duration::from_millis(40), obs, &q, &q);
-            let none_back = back.is_none();
+            let back = core.publish_displacing(i, now, now + Duration::from_millis(40), obs, &q, &q);
+            let none_back = matches!(back, Ok(None));
             drop(back);
             (none_back, core.record_sample(i, i as f64, &q, &q))
         });

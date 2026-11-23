@@ -369,11 +369,69 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     let n = armd::rt_core::record_ring::RECORD_RING_CAPACITY + 2 * armd::rt_core::publish::RETIRE_CAPACITY + 20;
     let counts: Vec<(u64, u64)> = (0..n).map(|_| {
         let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
-        assert!(published.displaced.is_none(), "the tick displaced an observation");
+        assert!(published.kept.is_none());
         (a, f)
     }).collect();
     assert_zero("stalled readers and dispatcher", &counts);
     assert!(inner.active_trajectory.is_some(), "still moving");
     assert_eq!(hub.tick_frees(), 0);
     assert!(inner.core.record_dropped() > 0, "the recording ring overflowed");
+}
+
+/// Lease transitions in the observation: the holder label is set while a lease is valid
+/// and cleared when it expires; neither the tick that publishes the new holder nor the one
+/// that clears it allocates or frees (the label is stored inline).
+#[test]
+fn lease_holder_set_and_clear_ticks_do_not_touch_the_allocator() {
+    DEVICE.with(|d| d.set(true));
+    DAMIAO.with(|d| d.set(true));
+    let mut inner = supervisor(true);
+    // no holder -> holder
+    let generation = inner.acquire_lease("conn-1").unwrap();
+    inner.set_lease_label("conn-1", generation, "a-fairly-long-client-label-that-would-need-a-heap-buffer");
+    let set = tick_counted(&mut inner);
+    assert_eq!(inner.core.hub().latest().unwrap().obs.lease_holder.as_deref(), Some("a-fairly-long-client-label-that-would-need-a-heap-buffer"));
+    // holder -> none (expiry; the stored lease stays until the watchdog runs)
+    inner.active_lease.as_mut().unwrap().acquired_at -= inner.lease_timeout;
+    let cleared = tick_counted(&mut inner);
+    let after = count_ticks(&mut inner, 5, |_, _| {});
+    assert_eq!(inner.core.hub().latest().unwrap().obs.lease_holder, None);
+    assert_zero("lease holder set / clear", &[set, cleared]);
+    assert_zero("after the lease cleared", &after);
+}
+
+/// The retire ring full: publications that displaced observations (not the tick: the
+/// displacing API) filled it while no reader ran; the tick still neither allocates nor
+/// frees, because it publishes its slot's own observation back in place.
+#[test]
+fn ticks_with_a_full_retire_ring_do_not_touch_the_allocator() {
+    DEVICE.with(|d| d.set(true));
+    DAMIAO.with(|d| d.set(true));
+    let mut inner = supervisor(true);
+    let hub = inner.core.hub().clone();
+    let _reader = hub.reader_guard();
+    let template = inner.current_observation();
+    let q = inner.commanded_positions.clone();
+    let mut handed_back = 0;
+    for i in 0..armd::rt_core::publish::RETIRE_CAPACITY + 3 {
+        let now = Instant::now();
+        match inner.core.publish_displacing(100 + i as u64, now, now, template.clone(), &q, &q) {
+            Ok(Some(back)) => { handed_back += 1; drop(back); }
+            Ok(None) => {}
+            Err(_) => panic!("no buffer is out"),
+        }
+    }
+    assert!(handed_back > 0, "the retire ring did not fill");
+    let counts = count_ticks_stalled(&mut inner, 2 * armd::rt_core::publish::RETIRE_CAPACITY);
+    assert_zero("full retire ring", &counts);
+    // the displacing API is refused while the tick's buffer is out
+    let buf = inner.core.take_observation_buffer();
+    let now = Instant::now();
+    assert!(inner.core.publish_displacing(1, now, now, template.clone(), &q, &q).is_err());
+    inner.core.publish(buf, 1, now, now, &q, &q);
+}
+
+/// Like [`count_ticks`] without the reader between ticks (the hub reader is held).
+fn count_ticks_stalled(inner: &mut SupervisorInner, n: usize) -> Vec<(u64, u64)> {
+    (0..n).map(|_| { let (p, a, f) = counted(|| inner.tick_publish(0.02, 1, false)); drop(p); (a, f) }).collect()
 }

@@ -86,7 +86,7 @@ struct Record<'a> {
     safety_state: &'a crate::safety::SafetyState,
     is_torqued: bool,
     enable_state: &'a crate::driver::EnableState,
-    lease_holder: &'a Option<String>,
+    lease_holder: &'a Option<crate::model::HolderLabel>,
     control_mode: &'a crate::model::ControlMode,
     positions: R3<'a>,
     commanded_positions: R3<'a>,

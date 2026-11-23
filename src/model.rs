@@ -2273,6 +2273,65 @@ pub struct GripperObs {
     pub force_limit_trips: u64,
 }
 
+/// A lease holder's label, stored inline (at most [`HolderLabel::CAPACITY`] bytes, the
+/// limit `acquire_lease` enforces): copying, setting and clearing it never allocate or free.
+/// Serializes as a JSON string; a longer string is cut at a character boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct HolderLabel {
+    len: u8,
+    buf: [u8; HolderLabel::CAPACITY],
+}
+
+impl HolderLabel {
+    pub const CAPACITY: usize = 128;
+
+    /// `s`, cut at the last character boundary within [`Self::CAPACITY`] bytes.
+    pub fn new(s: &str) -> Self {
+        let mut n = s.len().min(Self::CAPACITY);
+        while !s.is_char_boundary(n) { n -= 1; }
+        let mut buf = [0u8; Self::CAPACITY];
+        buf[..n].copy_from_slice(&s.as_bytes()[..n]);
+        Self { len: n as u8, buf }
+    }
+
+    pub fn as_str(&self) -> &str {
+        // SAFETY-free: `new` copies a prefix ending at a char boundary of a `str`
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for HolderLabel {
+    type Target = str;
+    fn deref(&self) -> &str { self.as_str() }
+}
+
+impl From<&str> for HolderLabel {
+    fn from(s: &str) -> Self { Self::new(s) }
+}
+
+impl std::fmt::Debug for HolderLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
+}
+
+impl std::fmt::Display for HolderLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
+}
+
+impl PartialEq<str> for HolderLabel {
+    fn eq(&self, other: &str) -> bool { self.as_str() == other }
+}
+
+impl Serialize for HolderLabel {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> { s.serialize_str(self.as_str()) }
+}
+
+impl<'de> Deserialize<'de> for HolderLabel {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Self::new(&s))
+    }
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -2317,9 +2376,10 @@ pub struct ArmObservation {
     #[serde(default)]
     pub driver_range_check: Option<DriverRangeCheck>,
     /// `client_id` label of the client holding the control lease (empty when it sent
-    /// none); null when no lease is held.
+    /// none); null when no lease is held. Stored inline ([`HolderLabel`]): the tick sets and
+    /// clears it without touching the allocator.
     #[serde(default)]
-    pub lease_holder: Option<String>,
+    pub lease_holder: Option<HolderLabel>,
     /// Limit that is shaping servo motion right now (speed / lead cap, joint limit,
     /// workspace, blocked hold); null when none applies. See docs/control_safety_contract.md.
     #[serde(default)]
