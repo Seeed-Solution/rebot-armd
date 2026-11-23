@@ -91,7 +91,7 @@ impl JointLimit {
 }
 
 /// Dynamic state of a single joint
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct JointState {
     pub position: f32,
     pub velocity: f32,

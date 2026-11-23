@@ -127,6 +127,55 @@ pub trait ArmDriver: Send {
     /// Hardware receive timestamps for each joint's latest feedback packet (if tracked).
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> { Vec::new() }
 
+    // Allocation-free forms of the per-tick reads (the RT executor calls these with
+    // preallocated buffers; armd 1.6 RT core). Each fills `out` with what the allocating
+    // method returns. The defaults call the allocating method; drivers on the control path
+    // override them so a steady-state tick does not touch the allocator.
+
+    /// Every one of the first `dof` joints has feedback no older than `max_age` (and there are
+    /// exactly `dof` ages): [`Self::feedback_ages`] without building the vector.
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        let ages = self.feedback_ages();
+        ages.len() == dof && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
+    }
+    /// [`Self::feedback_ages`] as whole milliseconds (the observation's `feedback_age_ms`).
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.extend(self.feedback_ages().iter().map(|a| a.map(|v| v.as_millis().min(u64::MAX as u128) as u64)));
+    }
+    /// Calls `f` with [`Self::range_check`] (a driver that stores the result passes a
+    /// reference instead of a copy).
+    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check().as_ref()) }
+    /// [`Self::read_joint_states`] into `out`.
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        let states = self.read_joint_states()?;
+        out.clear();
+        out.extend_from_slice(&states);
+        Ok(())
+    }
+    /// [`Self::feedback_ages`] into `out`.
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { out.clear(); out.extend_from_slice(&self.feedback_ages()); }
+    /// [`Self::feedback_instants`] into `out`.
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_instants()); }
+    /// [`Self::feedback_seqs`] into `out`.
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { out.clear(); out.extend_from_slice(&self.feedback_seqs()); }
+    /// [`Self::feedback_queue_bounds`] into `out`.
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_queue_bounds()); }
+    /// [`Self::feedback_receive_instants`] into `out`.
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_receive_instants()); }
+    /// [`Self::take_recovery_writes`] into `out`.
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { let w = self.take_recovery_writes(); out.clear(); out.extend_from_slice(&w); }
+    /// [`Self::joint_loads`] into `out`; false (and `out` empty) when the driver has none.
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool {
+        out.clear();
+        match self.joint_loads() { Some(l) => { out.extend_from_slice(&l); true } None => false }
+    }
+    /// [`Self::motor_status`] into `out`; false (and `out` empty) when the driver has none.
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool {
+        out.clear();
+        match self.motor_status() { Some(s) => { out.extend_from_slice(&s); true } None => false }
+    }
+
     /// Fixed device-side velocity ceiling, when the active output mode has one.
     fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
 
@@ -179,6 +228,7 @@ pub trait ArmDriver: Send {
 
     /// Set an atomic abort flag that hardware loops should check to abort early on E-stop
     fn set_abort_flag(&mut self, _flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
+
 
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
@@ -2426,12 +2476,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Frames for joint `i` in its confirmed mode; both kinds when the mode is unconfirmed.
-    fn target_frames(&self, i: usize, target: &JointTarget) -> Vec<CanFrame> {
-        match self.joint_modes[i] {
-            Some(DamiaoControlMode::PosVel) => vec![self.pos_vel_frame(i, target.position)],
-            Some(DamiaoControlMode::Mit) => vec![self.mit_frame(i, target)],
-            None => vec![self.pos_vel_frame(i, target.position), self.mit_frame(i, target)],
-        }
+    /// The frames of joint `i`'s target (one, or both kinds while its mode is unconfirmed),
+    /// on the stack: the control tick's write does not allocate.
+    fn target_frames(&self, i: usize, target: &JointTarget) -> impl Iterator<Item = CanFrame> {
+        let (a, b) = match self.joint_modes[i] {
+            Some(DamiaoControlMode::PosVel) => (self.pos_vel_frame(i, target.position), None),
+            Some(DamiaoControlMode::Mit) => (self.mit_frame(i, target), None),
+            None => (self.pos_vel_frame(i, target.position), Some(self.mit_frame(i, target))),
+        };
+        std::iter::once(a).chain(b)
     }
 
     /// Poll feedback until every `(joint, write, rid)` has a reply or the timeout passes.
@@ -3490,7 +3543,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.fence_check()?;
                 // Each joint's command is dated by its first frame: flush (SocketCAN: queued in the
                 // kernel) does not bound when the frames reach the wire, so the earlier stamp is safe.
-                let mut started: Vec<Option<Instant>> = vec![None; targets.len()];
+                // on the stack (no allocation in the tick); more joints than this are refused above
+                let mut started = [None::<Instant>; 16];
+                if targets.len() > started.len() {
+                    return Err(ArmDriverError::JointCountMismatch { expected: started.len(), actual: targets.len() });
+                }
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
                         if started[i].is_none() { started[i] = Some(self.now()); }
@@ -3507,7 +3564,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 // a batch completing past the deadline trips and never resets it
                 self.fence_check()?;
-                for (i, t) in started.into_iter().enumerate() { if t.is_some() { self.mit_fence_last_cmd[i] = t; } }
+                for (i, t) in started.into_iter().enumerate().take(targets.len()) { if t.is_some() { self.mit_fence_last_cmd[i] = t; } }
                 return Ok(());
             }
             DamiaoControlMode::PosVel => {
@@ -3548,6 +3605,45 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        self.receive_feedback()?;
+        Ok(self.cached_states.clone())
+    }
+
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        self.receive_feedback()?;
+        out.clear();
+        out.extend_from_slice(&self.cached_states);
+        Ok(())
+    }
+
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t))));
+    }
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+        self.last_feedback_instant.len() == dof && self.last_feedback_instant.iter().all(|t| t.is_some_and(|t| self.since(t) <= max_age))
+    }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.extend(self.last_feedback_instant.iter().map(|t| t.map(|t| self.since(t).as_millis().min(u64::MAX as u128) as u64)));
+    }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.last_feedback_instant); }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { out.clear(); out.extend_from_slice(&self.feedback_seq); }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.feedback_queue_bound); }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.extend_from_slice(&self.last_feedback_instant); }
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { out.clear(); out.extend_from_slice(&self.motor_status); true }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend_from_slice(&self.recovery_written_joints);
+        self.recovery_written_joints.clear();
+    }
+    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
+}
+
+impl<C: CanTransport> DamiaoArmDriver<C> {
+    /// The bounded receive of `read_joint_states` (at most 64 frames or 5 ms) with its
+    /// recovery holds and stale-motor refresh; updates `cached_states`.
+    fn receive_feedback(&mut self) -> Result<(), ArmDriverError> {
         const MAX_RX_DURATION: Duration = Duration::from_millis(5);
         let t0 = self.now();
         let mut frames_processed = 0;
@@ -3726,18 +3822,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling && self.poll_tx_allowed()
             && self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER)
         {
-            let stale: Vec<u16> = self.motor_ids.iter().zip(&self.last_feedback_instant)
-                .filter(|(_, t)| t.is_none_or(|t| self.since(t) >= REFRESH_AFTER))
-                .map(|(&id, _)| id).collect();
-            if !stale.is_empty() {
-                for id in stale {
+            // the stale motors as a bit set taken before the first transmit (no allocation)
+            let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+            let stale = (0..n).filter(|&i| self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER))
+                .fold(0u64, |m, i| m | (1 << i));
+            if stale != 0 {
+                for i in (0..n).filter(|i| stale & (1 << i) != 0) {
+                    let id = self.motor_ids[i];
                     let _ = self.can.transmit(&damiao::build_refresh_frame(id));
                 }
                 let _ = self.can.flush();
                 self.last_refresh_instant = Some(self.now());
             }
         }
-        Ok(self.cached_states.clone())
+        Ok(())
     }
 }
 
