@@ -29,12 +29,13 @@ fn fixture(caps: Capacities) -> Fx { ReleaseFixture::new(supervisor(), BOOT, cap
 
 fn later() -> Instant { Instant::now() + Duration::from_secs(10) }
 
-fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(fx.ctx(Instant::now()).stop_generation) }
+fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(&fx.ctx(Instant::now())) }
 
 fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Primitive {
-    let mut q = fx.core.commanded_positions.clone();
+    let start = fx.core.commanded_positions.clone();
+    let mut q = start.clone();
     q[0] += d0;
-    Primitive::joint_quintic(&q, duration_s)
+    Primitive::joint_quintic(&start, &q, duration_s)
 }
 
 fn submit_install(b: &mut Broker<Primitive>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
@@ -78,7 +79,7 @@ fn an_install_is_acked_then_completes_and_retires_its_slot() {
 
 #[test]
 fn saturated_admission_and_a_stalled_consumer_leave_the_active_motion_unchanged() {
-    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 2, plans: 1, replies: 4 });
+    let ((mut fx, mut b, _tw, _stop), _) = leased_with(600_000, Capacities { commands: 2, plans: 1, replies: 4 });
     let a = auth(&fx);
     submit_install(&mut b, 1, a, later(), quintic(&fx, 0.2, 2.0)).unwrap();
     fx.step();
@@ -197,7 +198,7 @@ fn targets_are_rechecked_at_consumption() {
 fn a_stub_core_never_acknowledges_success() {
     let (mut fx, mut b, mut tw, _stop) = ReleaseFixture::new(StubCore::default(), BOOT, Capacities { commands: 4, plans: 2, replies: 8 });
     let a = Authority::default();
-    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.1; 7], 1.0))).unwrap();
+    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0))).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
     tw.submit(TargetFrame { stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
@@ -211,10 +212,104 @@ fn a_planning_snapshot_is_stamped_with_the_publication_and_authority() {
     let (mut fx, _b, _tw, stop) = fixture(Capacities::default());
     fx.step();
     stop.request();
-    let snap = fx.core.planning_snapshot(stop.current());
+    let snap = fx.core.planning_snapshot(&fx.ctx(Instant::now()));
     assert_eq!(snap.published_seq, fx.core.core.published_seq());
     assert_eq!(snap.authority.stop_generation, 1);
     assert_eq!(snap.measured.len(), fx.core.config.dof);
     assert!(!snap.motion_active);
     assert!(fx.core.poll_hardware().driverless);
+}
+
+/// A supervisor that enforces leases, with `client` holding one (`lease_timeout_ms`).
+fn leased(lease_timeout_ms: u64) -> (Fx, u64) { leased_with(lease_timeout_ms, Capacities { commands: 4, plans: 2, replies: 16 }) }
+
+fn leased_with(lease_timeout_ms: u64, caps: Capacities) -> (Fx, u64) {
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms, ..ArmConfig::rebot_dm() });
+    inner.lease_enabled = true;
+    inner.tick(0.02);
+    let generation = inner.acquire_lease("client").expect("lease");
+    inner.set_torque(true).expect("arm");
+    (ReleaseFixture::new(inner, BOOT, caps), generation)
+}
+
+#[test]
+fn a_queued_command_is_refused_once_its_lease_expired_before_the_watchdog_ran() {
+    let ((mut fx, mut b, _tw, _stop), generation) = leased(1_000);
+    let a = auth(&fx);
+    assert_eq!(a.lease_generation, generation);
+    submit_install(&mut b, 1, a, later(), quintic(&fx, 0.05, 0.5)).unwrap();
+    // the lease expires while the command waits; the stored lease is still in place
+    fx.core.active_lease.as_mut().unwrap().acquired_at -= Duration::from_millis(1_001);
+    let before = target_of(&fx);
+    assert_eq!(fx.step().command.unwrap().1, Err("LEASE_LOST"));
+    assert_eq!(target_of(&fx), before, "a refused commit touched the motion");
+    assert_eq!(fx.core.active_lease.as_ref().map(|l| l.generation), Some(generation), "the commit did not clean up");
+    // without a lease generation, nothing commits while leases are enforced
+    submit_install(&mut b, 2, armd::rt_core::broker::Authority { lease_generation: 0, ..a }, later(), quintic(&fx, 0.05, 0.5)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("NO_LEASE"));
+}
+
+#[test]
+fn a_heartbeat_renews_its_valid_lease_and_cannot_resurrect_an_expired_one() {
+    let ((mut fx, mut b, _tw, _stop), generation) = leased(1_000);
+    let a = auth(&fx);
+    // nearly expired: the heartbeat renews it at the commit instant
+    fx.core.active_lease.as_mut().unwrap().acquired_at -= Duration::from_millis(900);
+    b.submit(ClientId(1), 1, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let held = fx.core.active_lease.as_ref().unwrap().acquired_at.elapsed();
+    assert!(held < Duration::from_millis(100), "not renewed: {held:?}");
+    // expired while the heartbeat was queued: refused, the lease stays expired
+    b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    fx.core.active_lease.as_mut().unwrap().acquired_at -= Duration::from_millis(1_001);
+    assert_eq!(fx.step().command.unwrap().1, Err("LEASE_LOST"));
+    assert!(!fx.core.is_lease_active(), "a late heartbeat resurrected the lease");
+    assert_eq!(fx.core.active_lease.as_ref().map(|l| l.generation), Some(generation));
+}
+
+#[test]
+fn a_child_commits_only_while_its_parent_is_the_running_action() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    assert_eq!(a.parent_generation, 0, "no running action");
+    submit_install(&mut b, 1, a, later(), quintic(&fx, 0.1, 2.0)).unwrap();
+    fx.step();
+    let parent = fx.active().unwrap();
+    let a = auth(&fx);
+    assert_eq!(a.parent_generation, parent.0);
+    // a child of an action that is no longer running
+    let stale = armd::rt_core::broker::Authority { parent_generation: parent.0 + 100, ..a };
+    let start = fx.core.commanded_positions.clone();
+    let mut q = start.clone();
+    q[0] -= 0.05;
+    submit_install(&mut b, 2, stale, later(), Primitive::joint_quintic(&start, &q, 1.0)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
+    assert_eq!(fx.active(), Some(parent));
+    // a child of the running parent, prepared from the current commanded position
+    let start = fx.core.commanded_positions.clone();
+    let mut q = start.clone();
+    q[0] -= 0.05;
+    submit_install(&mut b, 3, a, later(), Primitive::joint_quintic(&start, &q, 1.0)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+}
+
+#[test]
+fn a_primitive_prepared_from_another_start_is_refused_including_the_gripper() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    let start = fx.core.commanded_positions.clone();
+    let gripper = fx.core.config.gripper_index().expect("rebot_dm has a gripper");
+    let mut q = start.clone();
+    q[0] += 0.05;
+    // the gripper moved by 2e-4 since the plan: stale
+    let mut moved = start.clone();
+    moved[gripper] += 2e-4;
+    submit_install(&mut b, 1, a, later(), Primitive::joint_quintic(&moved, &q, 0.5)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
+    assert!(fx.active().is_none() && fx.core.active_trajectory.is_none());
+    // below the 1e-4 threshold it is the same start
+    let mut close = start.clone();
+    close[gripper] += 5e-5;
+    submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&close, &q, 0.5)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
 }

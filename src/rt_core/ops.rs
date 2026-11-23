@@ -70,17 +70,32 @@ impl Committed {
 pub enum Primitive {
     #[default]
     None,
-    /// Joint-space quintic to `q[..dof]` in `duration_s` (`SupervisorInner::jog_action`).
-    JointQuintic { dof: u8, q: [f32; MAX_DOF], duration_s: f64 },
+    /// Joint-space quintic from `start[..dof]` to `q[..dof]` in `duration_s`
+    /// (`SupervisorInner::jog_action`). `start` is the commanded position the plan was
+    /// prepared from, every joint including the gripper: the commit refuses it (`PLAN_STALE`)
+    /// when any commanded joint differs from it by `>= START_TOLERANCE`.
+    JointQuintic { dof: u8, start: [f32; MAX_DOF], q: [f32; MAX_DOF], duration_s: f64 },
 }
 
+/// A prepared start differs from the commanded position when a joint (gripper included)
+/// moved by at least this much (rad; `SupervisorInner::check_plan_fresh`).
+pub const START_TOLERANCE: f32 = 1e-4;
+
 impl Primitive {
-    pub fn joint_quintic(q: &[f32], duration_s: f64) -> Self {
-        let mut a = [0.0; MAX_DOF];
+    /// A joint quintic prepared from `start` (the planning snapshot's commanded positions).
+    pub fn joint_quintic(start: &[f32], q: &[f32], duration_s: f64) -> Self {
+        let (mut a, mut s0) = ([0.0; MAX_DOF], [0.0; MAX_DOF]);
         let n = q.len().min(MAX_DOF);
         a[..n].copy_from_slice(&q[..n]);
-        Self::JointQuintic { dof: n as u8, q: a, duration_s }
+        let m = start.len().min(n);
+        s0[..m].copy_from_slice(&start[..m]);
+        Self::JointQuintic { dof: n as u8, start: s0, q: a, duration_s }
     }
+}
+
+/// The prepared start of a primitive matches `commanded` (every joint, gripper included).
+fn start_matches(start: &[f32], commanded: &[f32]) -> bool {
+    start.len() == commanded.len() && start.iter().zip(commanded).all(|(s, c)| (s - c).abs() < START_TOLERANCE)
 }
 
 /// The state a worker plans from: an owned copy, stamped with the publication sequence and
@@ -120,9 +135,11 @@ pub struct HardwarePoll {
 
 /// The narrow operations of one arm's core.
 pub trait CoreOps {
-    /// Current authority at `stop_generation` (the urgent-stop generation is not core state).
-    fn authority(&self, stop_generation: u64) -> Authority;
-    fn planning_snapshot(&self, stop_generation: u64) -> PlanningSnapshot;
+    /// Current authority at `ctx.now` and `ctx.stop_generation` (the urgent-stop generation
+    /// is not core state): the lease generation of a lease valid at `ctx.now` (0: none), the
+    /// generation of the parent that may install children (0: none).
+    fn authority(&self, ctx: &CommitCtx) -> Authority;
+    fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot;
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
@@ -149,38 +166,56 @@ fn static_code(e: ArmError) -> &'static str {
     KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
 }
 
+impl SupervisorInner {
+    /// The lease valid at `now` (its generation names its holder).
+    fn lease_valid_at(&self, now: Instant) -> Option<&crate::supervisor::ActiveLease> {
+        self.active_lease.as_ref().filter(|l| now.saturating_duration_since(l.acquired_at) < self.lease_timeout)
+    }
+
+    /// The stamp checks every commit shares: identity, deadline, the current authority, and
+    /// a lease when leases are enforced.
+    fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
+        if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
+        if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        Ok(())
+    }
+}
+
 impl CoreOps for SupervisorInner {
-    fn authority(&self, stop_generation: u64) -> Authority {
+    fn authority(&self, ctx: &CommitCtx) -> Authority {
         Authority {
-            lease_generation: self.active_lease.as_ref().map_or(0, |l| l.generation),
+            lease_generation: self.lease_valid_at(ctx.now).map_or(0, |l| l.generation),
             epoch: self.safety.epoch_id(),
-            stop_generation,
+            stop_generation: ctx.stop_generation,
             config_revision: self.workspace_revision,
-            parent_generation: 0,
+            // the running action is the parent its children are installed for
+            parent_generation: self.last_action.as_ref().filter(|a| a.is_running()).map_or(0, |a| a.id),
         }
     }
 
-    fn planning_snapshot(&self, stop_generation: u64) -> PlanningSnapshot {
+    fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot {
         PlanningSnapshot {
             arm: self.core.id(),
             published_seq: self.core.published_seq(),
-            authority: self.authority(stop_generation),
+            authority: self.authority(ctx),
             measured: self.measured_positions.clone(),
             commanded: self.commanded_positions.clone(),
             feedback_instants: self.core.feedback().instants().to_vec(),
             feedback_seqs: self.core.feedback().seqs().to_vec(),
             motion_active: self.active_trajectory.is_some(),
-            taken_at: Instant::now(),
+            taken_at: ctx.now,
         }
     }
 
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx.stop_generation)) { return Err(code); }
+        self.check_commit(d, ctx)?;
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
         match primitive {
             Primitive::None => Err("INVALID_COMMAND"),
-            Primitive::JointQuintic { dof, q, duration_s } => {
-                let target = q[..usize::from(*dof)].to_vec();
+            Primitive::JointQuintic { dof, start, q, duration_s } => {
+                let n = usize::from(*dof);
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                let target = q[..n].to_vec();
                 self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
@@ -189,9 +224,21 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx.stop_generation)) { return Err(code); }
+        self.check_commit(d, ctx)?;
         let r = match op {
-            ImmediateOp::Heartbeat => Ok(()),
+            // renews the lease the command was admitted under, if it is still valid at the
+            // commit instant (a queued renewal cannot resurrect an expired lease)
+            ImmediateOp::Heartbeat => {
+                let generation = d.stamp.authority.lease_generation;
+                match self.active_lease.as_mut().filter(|l| l.generation == generation && generation != 0) {
+                    Some(l) => {
+                        l.acquired_at = ctx.now;
+                        self.last_heartbeat = ctx.now;
+                        Ok(())
+                    }
+                    None => return Err(if generation == 0 { "NO_LEASE" } else { "LEASE_LOST" }),
+                }
+            }
             ImmediateOp::TorqueOn => self.set_torque(true).map(drop).map_err(ArmError::Safety),
             ImmediateOp::TorqueOff => self.set_torque(false).map(drop).map_err(ArmError::Safety),
         };
@@ -199,7 +246,7 @@ impl CoreOps for SupervisorInner {
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
-        if let Some(code) = frame.authority.admits(&self.authority(ctx.stop_generation)) { return Err(code); }
+        if let Some(code) = frame.authority.admits(&self.authority(ctx)) { return Err(code); }
         self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| static_code(ArmError::Safety(e)))
     }
 
@@ -273,10 +320,10 @@ pub struct StubCore {
 }
 
 impl CoreOps for StubCore {
-    fn authority(&self, stop_generation: u64) -> Authority { Authority { stop_generation, ..Authority::default() } }
-    fn planning_snapshot(&self, stop_generation: u64) -> PlanningSnapshot {
-        PlanningSnapshot { arm: ArmId::LOCAL, published_seq: 0, authority: self.authority(stop_generation), measured: Vec::new(), commanded: Vec::new(),
-            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), motion_active: false, taken_at: Instant::now() }
+    fn authority(&self, ctx: &CommitCtx) -> Authority { Authority { stop_generation: ctx.stop_generation, ..Authority::default() } }
+    fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot {
+        PlanningSnapshot { arm: ArmId::LOCAL, published_seq: 0, authority: self.authority(ctx), measured: Vec::new(), commanded: Vec::new(),
+            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), motion_active: false, taken_at: ctx.now }
     }
     fn commit_primitive(&mut self, _: &Descriptor, _: &Primitive, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_immediate(&mut self, _: &Descriptor, _: ImmediateOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }

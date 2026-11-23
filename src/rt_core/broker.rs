@@ -81,19 +81,26 @@ pub struct Authority {
     pub stop_generation: u64,
     /// Configuration revision the plan was computed against (`workspace_revision`).
     pub config_revision: u64,
-    /// Parent action generation for a child primitive (0: none).
+    /// Parent action generation for a child primitive (0: not a child). In the current
+    /// authority: the generation of the parent action that may install children now (0: none).
     pub parent_generation: u64,
 }
 
 impl Authority {
     /// The rejection code when a command admitted under `self` may not commit under
     /// `current`, None when it may. Checked in this order: stop, epoch, lease, config, parent.
+    ///
+    /// `current` is the core's authority at the commit instant ([`super::ops::CoreOps::authority`]):
+    /// its `lease_generation` is that of a lease **valid at that instant** (0 when none is, so
+    /// a command queued before its lease expired is refused even before the watchdog runs).
+    /// Lease generations are unique per acquisition, so an equal generation names the same
+    /// holder. The parent is compared for children only (`parent_generation != 0`).
     pub fn admits(&self, current: &Authority) -> Option<&'static str> {
         if self.stop_generation != current.stop_generation { return Some("STOPPED"); }
         if self.epoch != current.epoch { return Some("EPOCH_MISMATCH"); }
         if self.lease_generation != current.lease_generation { return Some("LEASE_LOST"); }
         if self.config_revision != current.config_revision { return Some("PLAN_STALE"); }
-        if self.parent_generation != current.parent_generation { return Some("PARENT_REPLACED"); }
+        if self.parent_generation != 0 && self.parent_generation != current.parent_generation { return Some("PARENT_REPLACED"); }
         None
     }
 }
@@ -739,7 +746,11 @@ mod tests {
         assert_eq!(a.admits(&Authority { epoch: 5, ..a }), Some("EPOCH_MISMATCH"));
         assert_eq!(a.admits(&Authority { lease_generation: 4, ..a }), Some("LEASE_LOST"));
         assert_eq!(a.admits(&Authority { config_revision: 10, ..a }), Some("PLAN_STALE"));
-        assert_eq!(a.admits(&Authority { parent_generation: 1, ..a }), Some("PARENT_REPLACED"));
+        assert_eq!(a.admits(&Authority { parent_generation: 1, ..a }), None, "not a child: the parent is not compared");
+        let child = Authority { parent_generation: 7, ..a };
+        assert_eq!(child.admits(&Authority { parent_generation: 7, ..a }), None);
+        assert_eq!(child.admits(&Authority { parent_generation: 8, ..a }), Some("PARENT_REPLACED"));
+        assert_eq!(child.admits(&a), Some("PARENT_REPLACED"), "the parent ended");
         let s = Stamp { arm: ArmId::LOCAL, boot: BootId(1), request: RequestId(1), client: ClientId(1), client_seq: 1, authority: a, deadline: Instant::now() };
         assert_eq!(s.check(ArmId::LOCAL, BootId(2), Instant::now(), &a), Some("WRONG_TARGET"));
         assert_eq!(s.check(ArmId::LOCAL, BootId(1), s.deadline + Duration::from_millis(1), &a), Some("DEADLINE_EXPIRED"));
