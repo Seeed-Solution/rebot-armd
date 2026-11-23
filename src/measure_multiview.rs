@@ -1248,21 +1248,21 @@ async fn move_to_goal(ctx: &MacroCtx, plan: &Plan, phase: &str, goal: Pose) -> R
 
 /// Joint-space quintic sub-motion to the arm joints `q` (gripper kept).
 async fn move_joints(ctx: &MacroCtx, plan: &Plan, phase: &str, q: &[f64; 6]) -> Result<(), (Stop, bool)> {
-    let limit = {
+    let ticket = {
         let mut inner = ctx.sup.inner().write().await;
         if !inner.macro_alive(ctx.id) { return Err((Stop::Cancelled, false)); }
         let target = inner.joint_goal_target(q);
         let limits = inner.joint_goal_limits(plan.request.speed_scale);
         inner.set_action_phase(ctx.id, phase, 0.0, None, None);
         match inner.install_macro_quintic(ctx.id, target, &limits) {
-            Ok(l) => l,
+            Ok(l) => ctx.arm_child(&mut inner, phase, l * 2.0 + 5.0).ok_or((Stop::Cancelled, true))?,
             Err(e) => {
                 if let Some(detail) = e.workspace_detail() { inner.set_action_workspace_violation(ctx.id, detail); }
                 return Err((arm_fail(e), false));
             }
         }
     };
-    ctx.wait_sub(phase, limit * 2.0 + 5.0).await.map(|_| ()).map_err(|s| (s, true))
+    ctx.wait_child(ticket).await.map(|_| ()).map_err(|s| (s, true))
 }
 
 fn is_refusal(s: &Stop) -> bool { matches!(s, Stop::Fail(code, _) if PLAN_REFUSALS.contains(&code.as_str())) }
