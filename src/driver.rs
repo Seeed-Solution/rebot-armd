@@ -3380,6 +3380,31 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    #[inline]
+    fn stop_gate_for_kind(&self, kind: TxKind) -> Result<bool, TxRefusal> {
+        let pending = self.is_stop_pending();
+        let latched = self.is_stop_latched();
+        match kind {
+            TxKind::Disable => {}
+            TxKind::Refresh | TxKind::RollbackHold(_) => {
+                if pending {
+                    return Err(TxRefusal::StopInhibited);
+                }
+            }
+            TxKind::Target
+            | TxKind::Hold
+            | TxKind::ModeWrite
+            | TxKind::Recovery
+            | TxKind::ClearFault
+            | TxKind::Handshake => {
+                if pending || latched {
+                    return Err(TxRefusal::StopInhibited);
+                }
+            }
+        }
+        Ok(latched)
+    }
+
     /// Single choke point for EVERY Damiao CAN transmit (including safety disable and
     /// panic-disable). Enforces all invariants in fixed order immediately before transmitting,
     /// without heap allocation:
@@ -3391,7 +3416,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     ///      (`RollbackHold` additionally requires fresh `<= 100 ms` feedback in step 4).
     ///    - All other kinds: refused while pending OR latched.
     /// 4. Optional MIT deadline fence + build frame at send time via `build` (`None` fails closed).
-    /// 5. Stop-generation stamp check (deferred target frames and mid-operation stop advances).
+    /// 5. Post-build re-read of the physical stop latch, pending gate, and stop-generation stamp
+    ///    immediately before `can.transmit` (closes the race where `trigger_e_stop_checked` sets
+    ///    `e_stop_latched` before advancing `requested_estop_count`).
     /// 6. Account budget attempt, transmit, and record per-frame wall/CPU diagnostics.
     fn send(
         &mut self,
@@ -3416,26 +3443,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         // 3. Stop gate by TxKind.
-        let pending = self.is_stop_pending();
-        let latched = self.is_stop_latched();
-        match kind {
-            TxKind::Disable => {}
-            TxKind::Refresh | TxKind::RollbackHold(_) => {
-                if pending {
-                    return Err(TxRefusal::StopInhibited);
-                }
-            }
-            TxKind::Target
-            | TxKind::Hold
-            | TxKind::ModeWrite
-            | TxKind::Recovery
-            | TxKind::ClearFault
-            | TxKind::Handshake => {
-                if pending || latched {
-                    return Err(TxRefusal::StopInhibited);
-                }
-            }
-        }
+        let latched_before = self.stop_gate_for_kind(kind)?;
 
         // 4. MIT deadline fence (when fenced) + build frame fresh at send time.
         if fenced {
@@ -3444,7 +3452,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         if let TxKind::RollbackHold(joint) = kind {
-            if latched && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+            if latched_before && self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
                 return Err(TxRefusal::BuildRefused);
             }
         }
@@ -3452,7 +3460,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Err(TxRefusal::BuildRefused);
         };
 
-        // 5. Stop-generation stamp check (deferred target frames & mid-operation stop advances).
+        // 5. Re-read physical stop latch, pending gate, and stop-generation stamp AFTER `build`,
+        //    immediately before `can.transmit`. Checking only the generation stamp would miss an
+        //    E-stop latch flip before `requested_estop_count` advances; also reject `RollbackHold`
+        //    if the latch transitioned false -> true during `build` (frame built unlatched).
+        let latched_after = self.stop_gate_for_kind(kind)?;
+        if matches!(kind, TxKind::RollbackHold(_)) && !latched_before && latched_after {
+            return Err(TxRefusal::StopInhibited);
+        }
         if !matches!(kind, TxKind::Disable)
             && expected_stamp.is_some_and(|stamp| self.current_stop_stamp() != stamp)
         {
@@ -8657,5 +8672,100 @@ mod tx_chokepoint_tests {
             "drain_restore_deferred must stop starting frames once deadline passes: {:?}",
             bus.tx_frames()
         );
+    }
+
+    #[test]
+    fn send_chokepoint_rechecks_latch_and_pending_after_build() {
+        let limits = DamiaoLimits::default();
+
+        // A. Flip the physical E-stop latch (`abort_flag`) INSIDE `build` WITHOUT advancing the
+        //    stop generation (simulates `trigger_e_stop_checked` setting `e_stop_latched` before
+        //    acquiring `estop_reg` and incrementing `requested_estop_count`).
+        //    Every latch-inhibited kind AND an unlatched->latched `RollbackHold` MUST be refused
+        //    with `StopInhibited` and transmit ZERO frames.
+        for &kind in &[
+            TxKind::Target,
+            TxKind::Hold,
+            TxKind::ModeWrite,
+            TxKind::Recovery,
+            TxKind::Handshake,
+            TxKind::RollbackHold(0),
+        ] {
+            let (bus, _clock) = TestBus::new();
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
+            drv.read_joint_states().unwrap();
+            bus.push_feedback(1, 0.25, 1, &limits);
+            drv.read_joint_states().unwrap();
+            bus.clear_tx();
+
+            let req = Arc::new(AtomicU64::new(0));
+            let app = Arc::new(AtomicU64::new(0));
+            let latched = Arc::new(AtomicBool::new(false));
+            drv.set_estop_gate(EstopGate::new(req, app));
+            drv.set_abort_flag(latched.clone());
+
+            let stamp = drv.current_stop_stamp();
+            let mut build_ran = false;
+            let res = drv.send(kind, Some(stamp), None, false, |d| {
+                build_ran = true;
+                // Flip latch mid-build; generation (`req`/`app`) deliberately unchanged!
+                latched.store(true, Ordering::SeqCst);
+                Some(d.pos_vel_frame(0, 0.25))
+            });
+            assert!(build_ran, "build must have executed before post-build latch check for {kind:?}");
+            assert!(
+                matches!(res, Err(TxRefusal::StopInhibited)),
+                "latch flip during build must refuse {kind:?} with StopInhibited, got {res:?}"
+            );
+            assert_eq!(
+                bus.tx_len(),
+                0,
+                "latch flip during build must transmit 0 frames for {kind:?}"
+            );
+        }
+
+        // B. Flip pending stop (`req > app`) INSIDE `build` with `expected_stamp = None` so only
+        //    the post-build `stop_gate_for_kind` re-read catches it: even latch-allowed kinds
+        //    (`Refresh`, latched `RollbackHold`) must refuse with `StopInhibited` and 0 TX.
+        for &kind in &[TxKind::Refresh, TxKind::RollbackHold(0)] {
+            let (bus, _clock) = TestBus::new();
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
+            drv.read_joint_states().unwrap();
+            bus.push_feedback(1, 0.25, 1, &limits);
+            drv.read_joint_states().unwrap();
+            bus.clear_tx();
+
+            let req = Arc::new(AtomicU64::new(1));
+            let app = Arc::new(AtomicU64::new(1));
+            let latched = Arc::new(AtomicBool::new(true));
+            drv.set_estop_gate(EstopGate::new(req.clone(), app));
+            drv.set_abort_flag(latched);
+
+            let res = drv.send(kind, None, None, false, |d| {
+                req.fetch_add(1, Ordering::SeqCst);
+                Some(damiao::build_refresh_frame(d.motor_ids[0]))
+            });
+            assert!(
+                matches!(res, Err(TxRefusal::StopInhibited)),
+                "pending stop raised during build must refuse {kind:?} with StopInhibited, got {res:?}"
+            );
+            assert_eq!(bus.tx_len(), 0);
+        }
+
+        // C. Safety `Disable` still transmits even if both latch and pending flip during `build`.
+        let (bus, _clock) = TestBus::new();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
+        let req = Arc::new(AtomicU64::new(0));
+        let app = Arc::new(AtomicU64::new(0));
+        let latched = Arc::new(AtomicBool::new(false));
+        drv.set_estop_gate(EstopGate::new(req.clone(), app));
+        drv.set_abort_flag(latched.clone());
+        let res = drv.send(TxKind::Disable, None, None, false, |d| {
+            latched.store(true, Ordering::SeqCst);
+            req.fetch_add(1, Ordering::SeqCst);
+            Some(damiao::build_disable_frame(d.motor_ids[0]))
+        });
+        assert!(res.is_ok(), "Disable must remain ungated across build-time stop flip: {res:?}");
+        assert_eq!(bus.tx_len(), 1);
     }
 }
