@@ -873,3 +873,109 @@ fn safety_describe_reports_the_gripper_current_cap() {
     let cap = SupervisorInner::new(cfg).safety_describe()["hardware"]["gripper_current_cap"].clone();
     assert_eq!(cap["note"], "no motor current cap (legacy POS_VEL gripper)");
 }
+
+#[test]
+fn estop_holds_measured_position_only_when_feedback_is_fresh_else_commanded() {
+    use armd::supervisor::SupervisorInner;
+    let run_estop = |age: Duration, measured_j7: f32, commanded_j7: f32| -> (f32, f32, f32) {
+        let (mut d, bus, clock) = rig(true);
+        d.set_torque(true).unwrap();
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+        inner.is_torqued = true;
+        // Move the fake jaw and sample it through tick() so measured_positions and the supervisor's
+        // coherent feedback snapshot come from real hardware feedback (not manual field writes).
+        inner.tick(0.02);
+        bus.with(|s| {
+            s.motors[J7].q = measured_j7;
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        let decoded_j7 = inner.measured_positions[J7];
+        assert!((decoded_j7 - measured_j7).abs() < 1e-3, "decoded={decoded_j7} want={measured_j7}");
+        inner.commanded_positions[J7] = commanded_j7;
+        bus.with(|s| for m in &mut s.motors { m.mute_feedback = true; });
+        clock.advance(age);
+        inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+        (inner.commanded_positions[J7], inner.target_positions[J7], decoded_j7)
+    };
+
+    // Fresh feedback (50 ms and 249 ms <= 250 ms): locks onto measured position.
+    for age_ms in [50u64, 249] {
+        let (cmd, tgt, decoded) = run_estop(Duration::from_millis(age_ms), -1.2, -0.6);
+        assert!((cmd - decoded).abs() < 1e-5 && (tgt - decoded).abs() < 1e-5, "age={age_ms}ms: cmd={cmd} tgt={tgt} decoded={decoded}");
+    }
+
+    // Stale feedback (251 ms and 300 ms > 250 ms): falls back to commanded position.
+    for age_ms in [251u64, 300] {
+        let (cmd, tgt, _) = run_estop(Duration::from_millis(age_ms), -2.0, -0.6);
+        assert!((cmd - (-0.6)).abs() < 1e-5 && (tgt - (-0.6)).abs() < 1e-5, "age={age_ms}ms: cmd={cmd} tgt={tgt}");
+    }
+
+    // Aged unread RX queue (> 250 ms old) decoded immediately before E-stop: decode age is 0 ms,
+    // but feedback_queue_bounds is 300 ms old -> must still fall back to commanded position.
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+    inner.is_torqued = true;
+    inner.tick(0.02);
+    bus.with(|s| {
+        s.motors[J7].q = -2.2;
+        s.push_all_feedback();
+        for m in &mut s.motors { m.mute_feedback = true; }
+    });
+    clock.advance(Duration::from_millis(300));
+    inner.tick(0.02); // decodes the 300 ms-old queued frames right before E-stop
+    assert!((inner.measured_positions[J7] - (-2.2)).abs() < 1e-3, "aged sample decoded");
+    inner.commanded_positions[J7] = -0.6;
+    inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+    assert!((inner.commanded_positions[J7] - (-0.6)).abs() < 1e-5, "snapped to aged unread queue sample: {}", inner.commanded_positions[J7]);
+    assert!((inner.target_positions[J7] - (-0.6)).abs() < 1e-5);
+
+    // Pre-boundary startup frames (decoded before any empty queue was observed -> feedback_queue_bounds == None)
+    // have unknown receive age -> E-stop must hold commanded position.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock);
+    bus.with(|s| {
+        s.motors[J7].q = -2.2;
+        s.push_all_feedback();
+        for m in &mut s.motors { m.mute_feedback = true; }
+    });
+    let d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(pf()).unwrap();
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+    inner.tick(0.02);
+    assert!((inner.measured_positions[J7] - (-2.2)).abs() < 1e-3);
+    inner.commanded_positions[J7] = -0.6;
+    inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+    assert!((inner.commanded_positions[J7] - (-0.6)).abs() < 1e-5, "snapped to unknown-age startup sample: {}", inner.commanded_positions[J7]);
+    assert!((inner.target_positions[J7] - (-0.6)).abs() < 1e-5);
+
+    // Driver-side drain divergence: supervisor's measured_positions is 300 ms old (-1.0), while a
+    // direct driver read refreshes the driver's own cache to 0 ms (-2.2) without updating the
+    // supervisor snapshot -> E-stop must hold commanded (-0.6), never the stale -1.0 snapshot.
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+    inner.is_torqued = true;
+    inner.tick(0.02);
+    assert!((inner.measured_positions[J7] - (-1.0)).abs() < 1e-3);
+    clock.advance(Duration::from_millis(300));
+    // Establish a fresh empty-queue boundary on the driver and decode fresh -2.2 feedback
+    // directly into the driver cache without running inner.tick().
+    {
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        drv.read_joint_states().unwrap();
+        bus.with(|s| {
+            s.motors[J7].q = -2.2;
+            s.push_all_feedback();
+        });
+        drv.read_joint_states().unwrap();
+        assert!(drv.feedback_all_within(7, Duration::from_millis(250)));
+    }
+    assert!((inner.measured_positions[J7] - (-1.0)).abs() < 1e-3, "supervisor still holds stale -1.0");
+    inner.commanded_positions[J7] = -0.6;
+    inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+    assert!((inner.commanded_positions[J7] - (-0.6)).abs() < 1e-5, "driver drain authorized stale supervisor snapshot: {}", inner.commanded_positions[J7]);
+    assert!((inner.target_positions[J7] - (-0.6)).abs() < 1e-5);
+}

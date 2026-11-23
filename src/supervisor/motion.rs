@@ -289,8 +289,38 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.active_trajectory = None;
                 self.servo_target = None;
+                // Lock onto measured_positions only when finite and the supervisor's own coherent
+                // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
+                // alongside `measured_positions`) is provably within the 250 ms freshness bound
+                // against the driver's clock. Evaluating the supervisor's snapshot rather than the
+                // driver's mutable cache prevents a driver-side drain from authorizing an older
+                // `measured_positions` vector; stale or unknown-age telemetry holds `commanded_positions`.
+                const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
+                let snapshot_fresh = match &self.driver {
+                    None => self.feedback_numeric_valid,
+                    Some(d) => self.feedback_numeric_valid && d.lock().is_ok_and(|drv| {
+                        let now = drv.clock_now();
+                        let dof = self.config.dof;
+                        let fb = self.core.feedback();
+                        if !(0..dof).all(|i| {
+                            fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                        }) {
+                            return false;
+                        }
+                        drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
+                        if self.scratch.fb.bounds.is_empty() {
+                            true
+                        } else {
+                            self.joint_feedback_queue_bounds.len() == dof
+                                && self.joint_feedback_queue_bounds.iter().all(|b| {
+                                    b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                                })
+                        }
+                    }),
+                };
                 let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
+                    && snapshot_fresh
                 {
                     self.measured_positions.clone()
                 } else {

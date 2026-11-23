@@ -19,13 +19,14 @@ Profile block `damiao_gripper` (B601-DM default):
 
 Raw 220 is the value armd sent this gripper before 2026-11-06. It is an **uncalibrated placeholder**: its torque equivalent has not been measured. 2.2 % of the DM-J4310-2EC datasheet peak torque (7 N·m) would be about 0.15 N·m; that figure is a datasheet estimate, not a measurement on this unit.
 
-- **Enable.** At a full enable with torque off, the driver writes J7's CTRL_MODE to 4 in RAM (never flash). It does this only on fresh (≤ 100 ms), stationary (|v| ≤ 0.05 rad/s), state-0 feedback.
-  - It then requires the matching register acknowledgement and a separate readback. The readback request goes out after an observed-empty receive queue, and only a reply dequeued after that counts.
-  - Every later full enable reads the mode back again, since a motor power cycle resets the RAM mode.
-  - Any failure fails the enable: wrong value, missing reply within 50 ms, or a request that was not sent. Capped operation is then unavailable: target batches are refused before their first frame, and J7 never receives a frame of another mode.
-- **Final writer.** Every J7 frame is `0x300 + id`: position f32, speed u16 in 0.01 rad/s, current u16 = `current_ceiling_raw`. This covers targets, holds, measured-position recovery holds, mode-switch holds, servo streams and policies.
+- **Enable.** At a full enable with torque off, the driver drains buffered RX traffic while applying drained telemetry (bound to each motor's own CAN ID or shared master ID) to the feedback cache, then writes J7's CTRL_MODE to 4 in RAM (never flash) only on provably fresh (decode time and receive-queue bound ≤ 100 ms), stationary (|v| ≤ 0.05 rad/s), state-0 feedback.
+  - It then requires the matching register acknowledgement and a separate readback. The readback request goes out after an observed-empty receive queue; only a read reply dequeued after that, carrying the motor's expected master CAN arbitration ID (configured `master_id`, or `0x10 + motor_id`, i.e. `0x17` for J7) and `RID_CTRL_MODE`, and arriving strictly before the 50 ms deadline counts.
+  - Every later full enable (including after a host restart with J7 already in mode 4, verified during startup range checks only from post-boundary replies on the motor's expected master CAN ID) reads the mode back again, since a motor power cycle resets the RAM mode. Once readback confirms mode 4, the driver sends a capped `0x307` hold at the freshly measured J7 position (≤ `close_speed_rad_s`) before `CMD_ENABLE` so the motor cannot resume a stale firmware target. The already-enabled fast path also requires verified mode 4 and fresh ≤ 100 ms J7 feedback.
+  - Any failure fails the enable: wrong value, wrong CAN ID or register ID, reply at or after the 50 ms deadline, missing/unbounded fresh measured position, or a request/hold that was not sent. Capped operation is then unavailable: target batches are refused before their first frame, and J7 never receives a frame of another mode.
+- **Final writer.** Every J7 frame is `0x300 + id`: position f32, speed u16 in 0.01 rad/s (quantized downward via `f64` floor so wire speed never exceeds the limit), current u16 = `current_ceiling_raw`. This covers targets, holds, pre-enable holds, measured-position recovery holds, mode-switch holds, servo streams and policies.
   - The speed field is the requested speed (`JointTarget::velocity`, else the POS_VEL ceiling, at most 4 rad/s).
-  - It is limited to `close_speed_rad_s` when the frame moves the jaw toward `closed_rad`. Explicit fast closes are therefore capped too; this is a behaviour change.
+  - Speed may exceed `close_speed_rad_s` only when provably fresh (≤ 100 ms) finite feedback proves the frame moves the jaw strictly toward `open_rad`. Closing frames, holds (target == measured), explicit fast closes, and recovery holds stay capped at `close_speed_rad_s`. Once J7 feedback exceeds 100 ms (at batch entry, mid-batch, or across a `WouldBlock` retry) or a J7 target position/velocity is non-finite, stale-feedback recovery emits no J7 motion frame (read-only `0xCC` refresh only), `write_joint_targets` refuses to transmit a J7 frame, and enabled mode handovers back to `PosForce` fail before writing `CTRL_MODE`.
+- **E-stop hold.** `StopPolicy::EStopLatch` locks onto `measured_positions` only when every joint reading is finite and the supervisor's own coherent feedback snapshot (`core.feedback()` decode instants and, for receive-queued drivers, `joint_feedback_queue_bounds`, evaluated against `driver.clock_now()`) is provably within the 250 ms feedback freshness bound; when that snapshot is stale, unread past 250 ms, or lacks a receive-queue bound (even if a driver-side drain later updated the driver's cache), E-stop holds `commanded_positions` instead.
 - **Unchanged.** J1–J6 frames are byte-identical to the legacy profile (test `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`). The host-side lead cap, contact regulator and software torque cap remain as the second layer.
 - **Reporting.** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` returns:
   - `mode`, `current_raw`, `close_speed_rad_s`;
@@ -82,13 +83,14 @@ Profile 块 `damiao_gripper`（B601-DM 默认）：
 
 raw 220 是 2026-11-06 之前 armd 发给该夹爪的值，属于**未标定的占位值**，对应力矩未实测。按 DM-J4310-2EC 数据手册峰值 7 N·m 的 2.2 % 约为 0.15 N·m；该数值为手册估算，未在本机实测。
 
-- **使能。** 完整使能时，在力矩关闭状态下把 J7 的 CTRL_MODE 写为 4（RAM，不写 flash）。前提是反馈新鲜（≤ 100 ms）、静止（|v| ≤ 0.05 rad/s）且状态为 0。
-  - 写入后要求收到匹配的寄存器应答，并单独回读。回读请求在观察到接收队列为空之后发出，只有此后出队的回复才计入。
-  - 之后每次完整使能都会重新回读，因为电机断电会复位 RAM 中的模式。
-  - 任一失败都使使能失败：值不符、50 ms 内无回复、请求未发出。此时受限运行不可用：目标批次在第一帧之前被拒，J7 不会收到其他模式的帧。
-- **最终写入。** 每个 J7 帧都是 `0x300 + id`：位置 f32、速度 u16（0.01 rad/s）、电流 u16 = `current_ceiling_raw`。覆盖目标、保持、实测位置恢复保持、模式切换保持、servo 流和策略。
+- **使能。** 完整使能时，驱动先清空接收队列并将排出的遥测帧（按各电机自身 CAN ID 或共享主站 ID 绑定）更新到反馈缓存，再在力矩关闭状态下把 J7 的 CTRL_MODE 写为 4（RAM，不写 flash）；前提是反馈可证新鲜（解码时间与接收队列边界均 ≤ 100 ms）、静止（|v| ≤ 0.05 rad/s）且状态为 0。
+  - 写入后要求收到匹配的寄存器应答，并单独回读。回读请求在观察到接收队列为空之后发出，仅接受此后出队、来源 CAN ID 等于电机预期主站 ID（配置的 `master_id`，或默认 `0x10 + motor_id`，J7 为 `0x17`）、寄存器号为 `RID_CTRL_MODE` 且严格在 50 ms 截止时间前到达的读回复。
+  - 之后每次完整使能（含主机重启时 J7 已处于模式 4 的情况；启动量程检查仅凭接收边界后来自电机预期主站 CAN ID 的回复确认模式 4）都会重新回读，因为电机断电会复位 RAM 中的模式。回读确认模式 4 后，驱动先在新鲜实测的 J7 位置发出一帧受限 `0x307` 保持帧（速度 ≤ `close_speed_rad_s`），再发 `CMD_ENABLE`，避免电机恢复旧的固件目标。已使能快速路径同样要求模式 4 已验证且 J7 反馈 ≤ 100 ms 新鲜。
+  - 任一失败都使使能失败：值不符、CAN ID 或寄存器号不符、在 50 ms 截止时间及之后到达、缺少有界新鲜实测位置、请求或保持帧未发出。此时受限运行不可用：目标批次在第一帧之前被拒，J7 不会收到其他模式的帧。
+- **最终写入。** 每个 J7 帧都是 `0x300 + id`：位置 f32、速度 u16（0.01 rad/s，按 `f64` 向下取整确保线速不超过上限）、电流 u16 = `current_ceiling_raw`。覆盖目标、保持、使能前保持、实测位置恢复保持、模式切换保持、servo 流和策略。
   - 速度字段为请求速度（`JointTarget::velocity`，否则为 POS_VEL 上限，最大 4 rad/s）。
-  - 当帧把夹爪推向 `closed_rad` 时限制为 `close_speed_rad_s`。因此显式的快速闭合也会被限速，这是行为变化。
+  - 仅当可证新鲜（≤ 100 ms）且有限的反馈证明帧将夹爪严格移向 `open_rad` 时才允许超过 `close_speed_rad_s`。闭合帧、保持帧（目标等于实测）、显式快速闭合及恢复保持均限制在 `close_speed_rad_s` 以内。J7 反馈超过 100 ms（含批次入口、批次中途或 `WouldBlock` 重试期间）或目标位置/速度非有限时，陈旧反馈恢复不再发送 J7 运动帧（仅发只读 `0xCC` 刷新），`write_joint_targets` 拒绝发送 J7 帧，且使能状态下切回 `PosForce` 的模式切换在写 `CTRL_MODE` 之前失败。
+- **急停保持。** `StopPolicy::EStopLatch` 仅在所有关节实测位置有限且监管器自身一致性反馈快照（与 `measured_positions` 同步记录的 `core.feedback()` 解码时间以及带接收队列驱动的 `joint_feedback_queue_bounds`，按 `driver.clock_now()` 判定）可证在 250 ms 反馈新鲜度上限内时锁定到 `measured_positions`；快照陈旧、在队列中积压超 250 ms 或无接收队列边界时（即使之后驱动侧排空刷新了驱动缓存），改用 `commanded_positions` 保持。
 - **不变部分。** J1–J6 帧与旧版 profile 逐字节相同（测试 `final_writer_caps_every_j7_frame_and_j1_j6_frames_are_unchanged`）。主机侧领先量上限、接触调节和软件力矩上限保留为第二层。
 - **上报。** `GET /api/v1/safety/describe` → `hardware.gripper_current_cap` 返回：
   - `mode`、`current_raw`、`close_speed_rad_s`；
