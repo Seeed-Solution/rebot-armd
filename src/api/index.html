@@ -1291,6 +1291,8 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 body.op-locked :is([data-op], [data-op-mark])::after { content: "\00a0🔒"; font-size: 0.85em; }
 body.op-locked label.tgl[data-op] { margin-left: 22px; }
 body.op-locked label.tgl[data-op]::after { position: absolute; right: calc(100% + 6px); top: 50%; transform: translateY(-50%); content: "🔒"; font-size: 13px; line-height: 1; }
+body.op-locked .tool-item[data-op]::after { content: none; }
+body.op-locked .tool-item[data-op] > b::after { content: "\00a0🔒"; font-size: 0.85em; }
 
 /* ---------- lease preemption ---------- */
 .btn.btn-park-off { width: 100%; flex-direction: column; gap: 2px; justify-content: center; margin-top: 8px; min-height: 48px; font-weight: 600; }
