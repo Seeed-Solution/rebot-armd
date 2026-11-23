@@ -310,8 +310,8 @@ impl Drop for Delay {
     fn drop(&mut self) { armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed); }
 }
 
-/// Two candidates built from revision 1 while the first one persists: the first activates
-/// (revision 2, on disk), the second is refused at its reservation with the revision it lost to.
+/// Two candidates built from revision 1, sent back to back while persistence is slow: one
+/// activates (revision 2, on disk), the other is refused with the revision it lost to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn competing_updates_activate_once() {
     let _serial = WRITE_DELAY.lock().await;
@@ -325,16 +325,17 @@ async fn competing_updates_activate_once() {
         let id_9102 = next_id();
         common::send(&mut ws, keepout_cmd(id_9102, g, epoch, vec![cube("second", 0.3)], 1)).await;
         let mut got = replies_for(&mut ws, &[id_9101, id_9102]).await;
-        let (a, b) = (got.remove(&id_9101).unwrap(), got.remove(&id_9102).unwrap());
+        let (first, second) = (got.remove(&id_9101).unwrap(), got.remove(&id_9102).unwrap());
+        // both persist tasks race for the reservation: either one wins, exactly one activates
+        let first_won = first["type"] == "command_ack";
+        let (a, b, name) = if first_won { (first, second, "first") } else { (second, first, "second") };
         assert_eq!((a["type"].as_str(), a["revision"].as_u64()), (Some("command_ack"), Some(2)), "{a}");
         assert_eq!(a["durability_confirmed"], true, "{a}");
         assert_eq!(b["type"], "command_reject", "{b}");
         assert_eq!(b["code"], "POLICY_REVISION_MISMATCH", "{b}");
-    }
-    assert_eq!(disk_boxes(&path).unwrap(), ["first"]);
-    {
+        assert_eq!(disk_boxes(&path).unwrap(), [name]);
         let inner = sup.inner().read().await;
-        assert_eq!((inner.keepout.revision, runtime_boxes(&inner)), (2, vec!["first".to_string()]));
+        assert_eq!((inner.keepout.revision, runtime_boxes(&inner)), (2, vec![name.to_string()]));
     }
     assert_eq!(files(dir.path()), ["keepout.json"]);
     assert_motion_eligible(&mut ws, g, epoch, &sup).await;
