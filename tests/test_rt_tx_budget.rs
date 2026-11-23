@@ -2776,8 +2776,198 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
     assert!(!d2.torque_transition_pending() && !d2.is_enabled());
 }
 
+/// Strip Rust `//` line comments, nested `/* ... */` block comments, string/raw-string contents,
+/// and character literal contents while keeping all code tokens and braces intact.
+fn strip_rust_comments_and_literals(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+    while i < len {
+        // Line comment: // ... \n
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < len {
+                out.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+        // Nested block comment: /* ... */
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut depth = 1usize;
+            i += 2;
+            while i < len && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        // Raw string literal: r"...", r#"..."#, br#"..."#
+        let raw_prefix = if bytes[i] == b'b' && bytes.get(i + 1) == Some(&b'r') {
+            Some(i + 2)
+        } else if bytes[i] == b'r'
+            && !i
+                .checked_sub(1)
+                .is_some_and(|p| bytes[p].is_ascii_alphanumeric() || bytes[p] == b'_')
+        {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(mut j) = raw_prefix {
+            let mut hashes = 0usize;
+            while j < len && bytes[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < len && bytes[j] == b'"' {
+                j += 1;
+                while j < len {
+                    if bytes[j] == b'"'
+                        && j + hashes < len
+                        && bytes[j + 1..j + 1 + hashes].iter().all(|&b| b == b'#')
+                    {
+                        j += 1 + hashes;
+                        break;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j;
+                continue;
+            }
+        }
+        // Regular string literal: "..." (or b"...")
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str("\"\"");
+            continue;
+        }
+        // Char literal (distinguished from lifetime `'a`): `'...'`
+        if bytes[i] == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\\') {
+                i += 2;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push_str("''");
+                continue;
+            }
+            let mut chars = src[i + 1..].char_indices();
+            if let (Some((_, _ch)), Some((end_idx, '\''))) = (chars.next(), chars.next()) {
+                out.push_str("''");
+                i = i + 1 + end_idx + 1;
+                continue;
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Partition `dm_section` into `(outside_send_compact, send_body_compact)` after stripping
+/// comments/literals and removing all ASCII whitespace so multi-line calls such as
+/// `self.can\n    .transmit(&frame)` or `CanTransport::\n    transmit(...)` are always caught.
+fn partition_damiao_send_body_compact(dm_section: &str) -> (String, String) {
+    let clean = strip_rust_comments_and_literals(dm_section);
+    let send_matches: Vec<usize> = clean.match_indices("fn send(").map(|(idx, _)| idx).collect();
+    assert_eq!(
+        send_matches.len(),
+        1,
+        "expected exactly one `fn send(` definition in DamiaoArmDriver, found {}",
+        send_matches.len()
+    );
+    let send_start = send_matches[0];
+    let body_open = clean[send_start..]
+        .find('{')
+        .map(|rel| send_start + rel)
+        .expect("fn send body opening brace");
+    let mut depth = 0usize;
+    let mut body_end = None;
+    for (rel, ch) in clean[body_open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = Some(body_open + rel);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body_end = body_end.expect("fn send body closing brace");
+    let send_body = &clean[body_open..=body_end];
+    let outside = format!("{}{}", &clean[..send_start], &clean[body_end + 1..]);
+    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    (compact(&outside), compact(send_body))
+}
+
 #[test]
 fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
+    // Self-check: verify the whitespace/comment normalizer catches multi-line `.transmit(` and
+    // UFCS `::transmit(` splits while ignoring comments and string literals.
+    let synthetic_split = r#"
+        impl Foo {
+            // self.can.transmit(&commented_out);
+            /* self.can
+                .transmit(&block_commented); */
+            fn send(&mut self) {
+                let _s = "self.can.transmit(&in_string)";
+                self.can
+                    .transmit(&frame);
+            }
+            fn sneaky_dot(&mut self) {
+                self
+                    .can
+                    .transmit(&bad);
+            }
+            fn sneaky_ufcs(&mut self) {
+                CanTransport::
+                    transmit(&mut self.can, &bad);
+            }
+        }
+    "#;
+    let (syn_out, syn_in) = partition_damiao_send_body_compact(synthetic_split);
+    assert_eq!(syn_in.matches(".transmit(").count(), 1);
+    assert_eq!(syn_out.matches(".transmit(").count(), 1, "must catch multi-line .transmit(: {syn_out}");
+    assert_eq!(syn_out.matches("::transmit(").count(), 1, "must catch multi-line ::transmit(: {syn_out}");
+
+    // Production check over the entire Damiao driver section of src/driver.rs.
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver.rs"))
         .expect("read src/driver.rs");
     let dm_start = src
@@ -2788,54 +2978,551 @@ fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
         .expect("RobStride driver section header");
     assert!(dm_start < rs_start);
     let dm_section = &src[dm_start..rs_start];
-    let base_line = src[..dm_start].lines().count();
-
-    let mut transmit_sites = Vec::new();
-    let mut in_send_fn = false;
-    let mut send_brace_depth = 0isize;
-    for (idx, raw_line) in dm_section.lines().enumerate() {
-        let code = raw_line.split("//").next().unwrap_or("");
-        let trimmed = code.trim();
-        if trimmed.starts_with("fn send(") || trimmed == "fn send(" {
-            in_send_fn = true;
-            send_brace_depth = 0;
-        }
-        if code.contains("can.transmit") || code.contains(".transmit(") {
-            transmit_sites.push((base_line + idx + 1, in_send_fn, raw_line.trim().to_string()));
-        }
-        if in_send_fn {
-            send_brace_depth += code.matches('{').count() as isize;
-            send_brace_depth -= code.matches('}').count() as isize;
-            if send_brace_depth <= 0 && code.contains('}') {
-                in_send_fn = false;
-            }
-        }
-    }
+    let (outside_compact, send_compact) = partition_damiao_send_body_compact(dm_section);
 
     assert_eq!(
-        transmit_sites.len(),
+        outside_compact.matches(".transmit(").count(),
+        0,
+        "DamiaoArmDriver must have ZERO `.transmit(` calls outside `fn send`"
+    );
+    assert_eq!(
+        outside_compact.matches("::transmit(").count(),
+        0,
+        "DamiaoArmDriver must have ZERO `::transmit(` UFCS calls outside `fn send`"
+    );
+    assert_eq!(
+        send_compact.matches(".transmit(").count(),
         1,
-        "Damiao driver must have EXACTLY ONE can.transmit call site (inside DamiaoArmDriver::send), found: {transmit_sites:?}"
+        "DamiaoArmDriver::send must contain EXACTLY ONE `.transmit(` call"
+    );
+    assert_eq!(
+        send_compact.matches("::transmit(").count(),
+        0,
+        "DamiaoArmDriver::send must not contain UFCS `::transmit(` calls"
     );
     assert!(
-        transmit_sites[0].1,
-        "Damiao's single can.transmit call must reside inside DamiaoArmDriver::send, found at line {}: {}",
-        transmit_sites[0].0,
-        transmit_sites[0].2
+        send_compact.contains("self.can.transmit(&frame)"),
+        "DamiaoArmDriver::send must transmit via `self.can.transmit(&frame)`"
     );
 
-    // Ensure no legacy bypass helpers were reintroduced in DamiaoArmDriver.
+    // Ensure no legacy bypass or raw-frame helper exists in DamiaoArmDriver.
+    let clean_dm = strip_rust_comments_and_literals(dm_section);
     for forbidden in [
         "fn transmit_instrumented",
         "fn transmit_budgeted_gated",
         "fn transmit_checked",
         "fn tx_mit_gated",
         "fn transmit_with_retry_gated",
+        "fn transmit_with_retry",
         "fn retransmit(",
     ] {
         assert!(
-            !dm_section.contains(forbidden),
-            "forbidden legacy TX bypass helper `{forbidden}` found in DamiaoArmDriver"
+            !clean_dm.contains(forbidden),
+            "forbidden legacy/raw TX helper `{forbidden}` found in DamiaoArmDriver"
         );
     }
+}
+
+#[test]
+fn production_damiao_operations_under_latched_estop_table() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Outcome {
+        RefusedZeroTx,
+        AllowedTx,
+    }
+
+    let latch_driver = |d: &mut DamiaoArmDriver<VirtualBus>| {
+        // Applied, latched E-stop: requested == applied == 1 (!pending), abort_flag == true.
+        let req = Arc::new(AtomicU64::new(1));
+        let app = Arc::new(AtomicU64::new(1));
+        d.set_estop_gate(EstopGate::new(req, app));
+        d.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    };
+
+    let disabled_confirmed_driver = || {
+        let (mut d, bus, clock) = enabled_driver();
+        d.set_torque(false).expect("disable before test");
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        assert_eq!(d.enable_state(), armd::driver::EnableState::Disabled);
+        (d, bus, clock)
+    };
+
+    type CaseFn = fn(
+        &dyn Fn(&mut DamiaoArmDriver<VirtualBus>),
+        &dyn Fn() -> (DamiaoArmDriver<VirtualBus>, VirtualBus, MockClock),
+    ) -> (bool, Vec<CanFrame>);
+
+    // Declarative table over every production public `DamiaoArmDriver` / `ArmDriver` operation
+    // that can emit CAN frames, exercised under a latched E-stop (no synthetic `send()` calls).
+    let table: &[(&str, Outcome, CaseFn, fn(&[CanFrame]))] = &[
+        (
+            "write_joint_targets",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let res = d.write_joint_targets(&targets_const(0.2));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "write_joint_targets_bounded (unfenced)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let res = d.write_joint_targets_bounded(&targets_const(0.2));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "write_joint_targets_bounded (fenced MIT)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                let mut modes = [JointMode::Position; 7];
+                modes[3] = JointMode::Mit;
+                d.set_joint_modes_confirmed(&modes, &targets_const(0.0)).unwrap();
+                d.set_mit_deadline_fence(Some(ms(45)), ms(250));
+                latch(&mut d);
+                bus.clear();
+                let res = d.write_joint_targets_bounded(&targets_const(0.2));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                assert!(d.mit_fence_trip().is_some(), "fenced MIT under latched E-stop must trip fence");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "drain_pending_tx (deferred targets queued before latch)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+                assert_eq!(
+                    d.write_joint_targets_bounded(&targets_const(0.25)).unwrap(),
+                    TxBatchOutcome::Deferred { pending: 3 }
+                );
+                latch(&mut d);
+                bus.clear();
+                d.begin_tx_tick();
+                let res = d.drain_pending_tx();
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                assert_eq!(d.pending_tx_len(), 0, "latched drain must drop staged frames");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "begin_torque(true)",
+            Outcome::RefusedZeroTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.begin_torque(true);
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "begin_torque_budgeted(true, 16)",
+            Outcome::RefusedZeroTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.begin_torque_budgeted(true, 16);
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "set_joint_modes (forward PosVel->MIT)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let mut modes = [JointMode::Position; 7];
+                modes[3] = JointMode::Mit;
+                let res = d.set_joint_modes(&modes, &targets_const(0.0));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "set_joint_modes (rollback MIT->PosVel, fresh feedback)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                let mut modes = [JointMode::Position; 7];
+                modes[3] = JointMode::Mit;
+                d.set_joint_modes(&modes, &targets_const(0.0)).unwrap();
+                latch(&mut d);
+                d.read_joint_states().unwrap();
+                bus.with(|s| s.push_all_feedback());
+                d.read_joint_states().unwrap();
+                bus.clear();
+                let res = d.set_joint_modes(&[JointMode::Position; 7], &targets_const(0.0));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "set_joint_modes_confirmed (forward PosVel->MIT)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let mut modes = [JointMode::Position; 7];
+                modes[3] = JointMode::Mit;
+                let res = d.set_joint_modes_confirmed(&modes, &targets_const(0.0));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "set_joint_modes_confirmed (rollback MIT->PosVel, fresh feedback)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                let mut modes = [JointMode::Position; 7];
+                modes[3] = JointMode::Mit;
+                d.set_joint_modes_confirmed(&modes, &targets_const(0.0)).unwrap();
+                latch(&mut d);
+                d.read_joint_states().unwrap();
+                bus.with(|s| s.push_all_feedback());
+                d.read_joint_states().unwrap();
+                bus.clear();
+                let res = d.set_joint_modes_confirmed(&[JointMode::Position; 7], &targets_const(0.0));
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "set_zero_position",
+            Outcome::RefusedZeroTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.set_zero_position(0);
+                assert!(res.as_ref().is_err_and(is_estop_inhibited), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "commission_motor_timeout",
+            Outcome::RefusedZeroTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.commission_motor_timeout(&[0], 2000);
+                assert!(
+                    res.as_ref().is_err_and(|e| is_estop_inhibited(&e.error)),
+                    "{res:?}"
+                );
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "read_joint_states (50 ms recovery window)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, clock) = enabled_driver();
+                latch(&mut d);
+                clock.advance(ms(50)); // >= 45 ms recovery, < 100 ms refresh
+                bus.clear();
+                let res = d.read_joint_states();
+                assert!(res.is_ok(), "{res:?}");
+                // Recovery TX is refused while latched (0 frames transmitted).
+                (false, bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "recovery must emit 0 frames while latched: {tx:?}"),
+        ),
+        (
+            "write_estop_hold (stale feedback > 100 ms)",
+            Outcome::RefusedZeroTx,
+            |latch, _| {
+                let (mut d, bus, clock) = enabled_driver();
+                latch(&mut d);
+                clock.advance(ms(120));
+                bus.clear();
+                let res = d.write_estop_hold(&targets_const(0.5));
+                assert!(res.is_err(), "stale write_estop_hold must fail closed: {res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_log.clone()))
+            },
+            |tx| assert!(tx.is_empty(), "{tx:?}"),
+        ),
+        (
+            "write_estop_hold (fresh feedback <= 100 ms)",
+            Outcome::AllowedTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                d.read_joint_states().unwrap();
+                bus.with(|s| {
+                    s.motors[0].2 = 0.33;
+                    s.push_all_feedback();
+                });
+                d.read_joint_states().unwrap();
+                bus.clear();
+                let res = d.write_estop_hold(&targets_const(1.9));
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 stationary hold frames: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| (0x101..=0x107).contains(&f.id)),
+                    "expected POS_VEL hold frames only (0 CTRL_MODE): {tx:?}"
+                );
+                let j1_pos = f32::from_le_bytes([tx[0].data[0], tx[0].data[1], tx[0].data[2], tx[0].data[3]]);
+                assert!((j1_pos - 0.33).abs() < 1e-3, "expected fresh measured ~0.33, got {j1_pos}");
+            },
+        ),
+        (
+            "read_joint_states (120 ms 0xCC refresh window)",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, clock) = mk_dis();
+                latch(&mut d);
+                clock.advance(ms(120));
+                bus.clear();
+                let res = d.read_joint_states();
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 refresh frames: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+                    "expected read-only 0xCC refresh frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "mit_fresh_status",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.mit_fresh_status();
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 status poll frames: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+                    "expected read-only 0xCC frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "read_motor_identity",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let res = d.read_motor_identity(&[0]);
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 8, "expected 8 identity register reads: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ),
+                    "expected read-only REG_READ frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "check_mapping_ranges",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                latch(&mut d);
+                bus.clear();
+                let _ = d.check_mapping_ranges();
+                (true, bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 28, "expected 4 register reads x 7 motors: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.id == 0x7FF && f.data[2] == damiao::REG_READ),
+                    "expected read-only REG_READ frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "clear_fault",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, _) = mk_dis();
+                bus.with(|s| {
+                    s.motor_faults[2] = 0x0A;
+                    s.push_all_feedback();
+                });
+                d.read_joint_states().unwrap();
+                latch(&mut d);
+                bus.clear();
+                let res = d.clear_fault();
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 CMD_CLEAR_FAULTS frames: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.data == damiao::CMD_CLEAR_FAULTS),
+                    "expected CMD_CLEAR_FAULTS frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "clear_fault_budgeted",
+            Outcome::AllowedTx,
+            |latch, mk_dis| {
+                let (mut d, bus, clock) = mk_dis();
+                bus.with(|s| {
+                    s.motor_faults[2] = 0x0A;
+                    s.push_all_feedback();
+                });
+                d.read_joint_states().unwrap();
+                latch(&mut d);
+                bus.clear();
+                let res = d.clear_fault_budgeted(clock.now() + ms(10));
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 CMD_CLEAR_FAULTS frames: {tx:?}");
+                assert!(
+                    tx.iter().all(|f| f.data == damiao::CMD_CLEAR_FAULTS),
+                    "expected CMD_CLEAR_FAULTS frames only: {tx:?}"
+                );
+            },
+        ),
+        (
+            "mit_expiry_recover",
+            Outcome::AllowedTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                bus.with(|s| {
+                    s.motor_faults[3] = 0x0E;
+                    s.push_all_feedback();
+                });
+                d.read_joint_states().unwrap();
+                latch(&mut d);
+                bus.clear();
+                let res = d.mit_expiry_recover();
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert!(
+                    tx.iter().any(|f| f.id == 4 && f.data == damiao::CMD_CLEAR_FAULTS),
+                    "expected CMD_CLEAR_FAULTS for faulted J4: {tx:?}"
+                );
+                assert_eq!(
+                    tx.iter().filter(|f| f.data == damiao::CMD_DISABLE).count(),
+                    7,
+                    "expected 7 CMD_DISABLE frames: {tx:?}"
+                );
+                assert!(
+                    tx.iter().all(|f| f.data == damiao::CMD_CLEAR_FAULTS || f.data == damiao::CMD_DISABLE),
+                    "mit_expiry_recover must only transmit CMD_CLEAR_FAULTS and CMD_DISABLE: {tx:?}"
+                );
+            },
+        ),
+        (
+            "begin_torque(false)",
+            Outcome::AllowedTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let res = d.begin_torque(false);
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 CMD_DISABLE frames: {tx:?}");
+                assert!(tx.iter().all(|f| f.data == damiao::CMD_DISABLE), "{tx:?}");
+            },
+        ),
+        (
+            "begin_torque_budgeted(false, 16)",
+            Outcome::AllowedTx,
+            |latch, _| {
+                let (mut d, bus, _) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let res = d.begin_torque_budgeted(false, 16);
+                assert!(res.is_ok(), "{res:?}");
+                (res.is_ok(), bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 CMD_DISABLE frames: {tx:?}");
+                assert!(tx.iter().all(|f| f.data == damiao::CMD_DISABLE), "{tx:?}");
+            },
+        ),
+        (
+            "panic_disable_step",
+            Outcome::AllowedTx,
+            |latch, _| {
+                let (mut d, bus, clock) = enabled_driver();
+                latch(&mut d);
+                bus.clear();
+                let _ = d.panic_disable_step(true, clock.now() + ms(10));
+                (true, bus.with(|s| s.tx_accepted.clone()))
+            },
+            |tx| {
+                assert_eq!(tx.len(), 7, "expected 7 CMD_DISABLE frames: {tx:?}");
+                assert!(tx.iter().all(|f| f.data == damiao::CMD_DISABLE), "{tx:?}");
+            },
+        ),
+    ];
+
+    let mut refused_checked = 0usize;
+    let mut allowed_checked = 0usize;
+    for &(name, expected, run, verify_tx) in table {
+        let (ok, tx) = run(&latch_driver, &disabled_confirmed_driver);
+        match expected {
+            Outcome::RefusedZeroTx => {
+                assert!(!ok, "production op `{name}` must refuse/emit no TX while E-stop is latched");
+                assert!(tx.is_empty(), "production op `{name}` transmitted while latched: {tx:?}");
+                refused_checked += 1;
+            }
+            Outcome::AllowedTx => {
+                assert!(ok, "production op `{name}` must succeed while E-stop is latched");
+                assert!(!tx.is_empty(), "production op `{name}` expected TX while latched");
+                allowed_checked += 1;
+            }
+        }
+        verify_tx(&tx);
+    }
+    assert_eq!(refused_checked + allowed_checked, table.len());
+    assert_eq!(table.len(), 25, "expected all 25 production Damiao TX operations verified");
 }
