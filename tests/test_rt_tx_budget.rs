@@ -2061,10 +2061,11 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
         bus.with(|s| s.tx_log.clone())
     );
 
-    // Part C: Base-mode rollback while stopped/latched:
-    // (C1) Stale feedback (> 100 ms) -> sends 0 frames and fails closed.
-    // (C2) Fresh feedback at measured q = 0.42 while caller passes bogus hold 1.75 ->
-    //      allowed, and the transmitted POS_VEL hold targets the fresh measured 0.42 (NOT 1.75).
+    // Part C: Latched E-stop + rollback:
+    // - CTRL_MODE writes (both `set_joint_modes` and `set_joint_modes_confirmed` rollbacks) are
+    //   `ModeWrite`: refused while pending OR latched with ZERO CTRL_MODE frames sent.
+    // - Only a stationary hold frame (`write_estop_hold` -> `RollbackHold`) built from fresh
+    //   (<= 100 ms) measured feedback may transmit while latched (stale feedback -> 0 frames).
     let (mut d, bus, clock) = enabled_driver();
     // Establish empty-queue boundary + fresh feedback, then switch J4 into MIT.
     d.read_joint_states().unwrap();
@@ -2082,7 +2083,7 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
     d.set_abort_flag(Arc::new(AtomicBool::new(true)));
     let pending_gen = stops.request();
 
-    // C0: While a stop is PENDING (not yet applied), even base-mode rollback is refused (0 frames).
+    // C0: While a stop is PENDING (not yet applied), both mode rollback and estop hold are refused (0 frames).
     bus.clear();
     let pos_modes = [JointMode::Position; 7];
     let err_pending = d.set_joint_modes(&pos_modes, &targets_const(1.75)).unwrap_err();
@@ -2090,31 +2091,60 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
         is_estop_inhibited(&err_pending),
         "pending stop must refuse base-mode rollback: {err_pending:?}"
     );
+    let err_hold_pending = d.write_estop_hold(&targets_const(1.75)).unwrap_err();
+    assert!(
+        is_estop_inhibited(&err_hold_pending),
+        "pending stop must refuse estop hold: {err_hold_pending:?}"
+    );
     assert!(
         bus.with(|s| s.tx_log.is_empty()),
-        "pending stop rollback refusal must send 0 frames: {:?}",
+        "pending stop must send 0 frames: {:?}",
         bus.with(|s| s.tx_log.clone())
     );
 
     // Apply the stop so the gate is no longer pending while E-stop remains LATCHED.
     stops.mark_applied(pending_gen);
 
-    // C1: Age J4 feedback past 100 ms -> base-mode rollback while latched MUST send 0 frames and fail closed.
-    clock.advance(ms(120));
+    // C1: Even with fresh feedback while LATCHED, rollback CTRL_MODE writes (`set_joint_modes` and
+    // `set_joint_modes_confirmed`) are refused and transmit ZERO CTRL_MODE frames!
+    d.read_joint_states().unwrap();
+    bus.with(|s| {
+        s.motors[3].2 = 0.42;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
     bus.clear();
-    let err_stale = d.set_joint_modes(&pos_modes, &targets_const(1.75)).unwrap_err();
+    let err_rb_plain = d.set_joint_modes(&pos_modes, &targets_const(0.42)).unwrap_err();
     assert!(
-        err_stale.to_string().contains("fresh feedback"),
-        "expected stale rollback failure, got {err_stale:?}"
+        is_estop_inhibited(&err_rb_plain),
+        "latched E-stop must refuse rollback set_joint_modes: {err_rb_plain:?}"
+    );
+    let err_rb_conf = d.set_joint_modes_confirmed(&pos_modes, &targets_const(0.42)).unwrap_err();
+    assert!(
+        is_estop_inhibited(&err_rb_conf),
+        "latched E-stop must refuse rollback set_joint_modes_confirmed: {err_rb_conf:?}"
     );
     assert!(
         bus.with(|s| s.tx_log.is_empty()),
-        "base-mode rollback without fresh feedback must send 0 frames: {:?}",
+        "latched E-stop + rollback must send 0 CTRL_MODE frames: {:?}",
         bus.with(|s| s.tx_log.clone())
     );
 
-    // C2: Deliver fresh feedback at measured q = 0.42 -> base-mode rollback while latched succeeds
-    // and overrides caller's stale/arbitrary 1.75 hold with the fresh measured 0.42 position.
+    // C2: Stale feedback (> 100 ms) while latched -> `write_estop_hold` sends 0 frames and fails closed.
+    clock.advance(ms(120));
+    bus.clear();
+    assert!(
+        d.write_estop_hold(&targets_const(1.75)).is_err(),
+        "stale feedback must refuse write_estop_hold while latched"
+    );
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "stale write_estop_hold must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // C3: Fresh feedback at measured q = 0.42 while latched -> `write_estop_hold` succeeds,
+    // emits 0 CTRL_MODE frames, and holds J4 at fresh measured ~0.42 (not caller's bogus 1.75).
     d.read_joint_states().unwrap(); // refresh empty-queue boundary (read-only 0xCC allowed while latched)
     bus.with(|s| {
         s.motors[3].2 = 0.42;
@@ -2122,20 +2152,21 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
     });
     d.read_joint_states().unwrap();
     bus.clear();
-    d.set_joint_modes(&pos_modes, &targets_const(1.75))
-        .expect("base-mode rollback with fresh feedback while latched must succeed");
+    d.write_estop_hold(&targets_const(1.75))
+        .expect("write_estop_hold with fresh feedback while latched must succeed");
     let tx = bus.with(|s| s.tx_accepted.clone());
-    let hold_frames: Vec<_> = tx.iter().filter(|f| f.id == 0x104).copied().collect();
-    assert_eq!(hold_frames.len(), 1, "expected 1 POS_VEL hold frame for J4: {tx:?}");
-    let wire_pos = f32::from_le_bytes([
-        hold_frames[0].data[0],
-        hold_frames[0].data[1],
-        hold_frames[0].data[2],
-        hold_frames[0].data[3],
-    ]);
+    assert!(
+        !tx.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+        "latched hold must emit 0 CTRL_MODE register writes: {tx:?}"
+    );
+    let j4_mit: Vec<_> = tx.iter().filter(|f| f.id == 4).copied().collect();
+    assert_eq!(j4_mit.len(), 1, "expected 1 MIT hold frame for J4: {tx:?}");
+    let p_u = ((j4_mit[0].data[0] as u16) << 8) | (j4_mit[0].data[1] as u16);
+    let lim = b601_limits()[3];
+    let wire_pos = damiao::uint_to_float(p_u, lim.p_min, lim.p_max, 16);
     assert!(
         (wire_pos - 0.42).abs() < 1e-2,
-        "rollback hold must use fresh measured position ~0.42, not caller 1.75 (got {wire_pos})"
+        "latched hold must use fresh measured position ~0.42, not caller 1.75 (got {wire_pos})"
     );
 }
 

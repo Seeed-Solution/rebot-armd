@@ -2827,9 +2827,10 @@ enum TxKind {
     Target,
     /// Non-rollback mode-switch hold frame.
     Hold,
-    /// Base-mode rollback frame (mode write or hold for `joint`): refused while a stop/E-stop
-    /// is pending; allowed while latched only when `joint` has fresh (`<= 100 ms`) measured
-    /// feedback and the frame is rebuilt in step 4.
+    /// Base-mode rollback or post-E-stop stationary hold frame for `joint`: refused while a
+    /// stop/E-stop is pending; allowed while latched only when `joint` has fresh (`<= 100 ms`)
+    /// measured feedback and the hold frame is rebuilt in step 4. Never used for `CTRL_MODE`
+    /// register writes (those are always `ModeWrite`).
     RollbackHold(usize),
     /// `CTRL_MODE` write or non-read-only configuration write (`RID_TIMEOUT`, `CMD_SET_ZERO`).
     ModeWrite,
@@ -4187,7 +4188,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 unsent_len += 1;
                 continue;
             }
-            let ctrl_kind = if is_rollback { TxKind::RollbackHold(i) } else { TxKind::ModeWrite };
+            let ctrl_kind = TxKind::ModeWrite;
             let hold_kind = if is_rollback { TxKind::RollbackHold(i) } else { TxKind::Hold };
             match self.send_with_retry(ctrl_kind, expected_stamp, None, false, |d| {
                 if restoring_pf {
@@ -4820,7 +4821,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 failed.push(i);
                 continue;
             }
-            let ctrl_kind = if is_rollback { TxKind::RollbackHold(i) } else { TxKind::ModeWrite };
+            let ctrl_kind = TxKind::ModeWrite;
             let hold_kind = if is_rollback { TxKind::RollbackHold(i) } else { TxKind::Hold };
             match self.send_with_retry(ctrl_kind, expected_stamp, None, fenced, |d| {
                 let rb_fresh = d.rollback_requires_fresh(policy);
@@ -5027,30 +5028,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if changing.is_empty() { return Ok(()); }
         let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
         let is_base_restore = changing.iter().all(|&i| target[i] == self.base_mode(i));
-        // Pending stops always refuse; latched stops only allow unfenced base-mode rollback with fresh feedback.
-        self.pending_stop_check(Some(start_stamp))?;
-        let latched = self.is_stop_latched();
-        let (effective_hold, forward_policy) = if !is_base_restore || fenced {
-            if latched {
-                return Err(ArmDriverError::EstopInhibited);
-            }
-            (hold.to_vec(), ModeWritePolicy::Strict(start_stamp))
-        } else if latched {
-            let mut fresh_hold = hold.to_vec();
-            for &i in &changing {
-                let Some(fresh) = self.fresh_rollback_hold_target(i) else {
-                    return Err(ArmDriverError::HardwareFault(format!(
-                        "base-mode rollback refused for joint {}: fresh feedback (<= {} ms) required while stop/E-stop is active",
-                        i + 1,
-                        POS_FORCE_FEEDBACK_MAX_AGE.as_millis()
-                    )));
-                };
-                fresh_hold[i] = fresh;
-            }
-            (fresh_hold, ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: true })
+        // CTRL_MODE writes (forward and rollback alike) are refused while a stop/E-stop is pending OR latched.
+        self.strict_stop_check(Some(start_stamp))?;
+        let forward_policy = if !is_base_restore || fenced {
+            ModeWritePolicy::Strict(start_stamp)
         } else {
-            (hold.to_vec(), ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false })
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
         };
+        let effective_hold = hold.to_vec();
         self.validate_pos_force_holds(&changing, &target, &effective_hold, true)?;
         let to_mit: Vec<usize> = changing.iter().copied()
             .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
@@ -5077,30 +5062,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         for &i in &changing { self.joint_modes[i] = None; }
         let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.base_mode(i))).collect();
         let back_is_base = changing.iter().all(|&i| back[i] == self.base_mode(i));
-        let rollback_stamp = self.current_stop_stamp();
-        self.pending_stop_check(Some(rollback_stamp))?;
-        let latched_now = self.is_stop_latched();
-        let (rollback_hold, rollback_policy) = if !back_is_base || fenced {
-            if latched_now || rollback_stamp != start_stamp {
-                return Err(ArmDriverError::EstopInhibited);
-            }
-            (hold.to_vec(), ModeWritePolicy::Strict(start_stamp))
-        } else if latched_now || rollback_stamp != start_stamp {
-            let mut fresh_hold = hold.to_vec();
-            for &i in &changing {
-                let Some(fresh) = self.fresh_rollback_hold_target(i) else {
-                    return Err(ArmDriverError::HardwareFault(format!(
-                        "Control-mode switch not confirmed for joints {:?} (no {why}); base-mode rollback refused without fresh feedback for joint {}",
-                        failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
-                        i + 1
-                    )));
-                };
-                fresh_hold[i] = fresh;
-            }
-            (fresh_hold, ModeWritePolicy::BaseRollback { start_stamp: rollback_stamp, force_fresh_hold: true })
+        // Rollback CTRL_MODE writes are also ModeWrite: refused while pending, latched, or after a stop.
+        self.strict_stop_check(Some(start_stamp))?;
+        let rollback_policy = if !back_is_base || fenced {
+            ModeWritePolicy::Strict(start_stamp)
         } else {
-            (hold.to_vec(), ModeWritePolicy::BaseRollback { start_stamp: rollback_stamp, force_fresh_hold: false })
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
         };
+        let rollback_hold = hold.to_vec();
         // the rollback is confirmed like the forward switch (acknowledgement + fresh feedback)
         let (unrecovered, _) = self.write_modes_confirmed(&changing, &back, &rollback_hold, true, rollback_policy)?;
         Err(ArmDriverError::HardwareFault(format!(
@@ -6461,30 +6430,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
         if changing.is_empty() { return Ok(()); }
         let is_base_restore = changing.iter().all(|&i| target[i] == self.base_mode(i));
-        // Pending stops always refuse; latched stops only allow base-mode rollback with fresh feedback.
-        self.pending_stop_check(Some(start_stamp))?;
-        let latched = self.is_stop_latched();
-        let (effective_hold, forward_policy) = if !is_base_restore {
-            if latched {
-                return Err(ArmDriverError::EstopInhibited);
-            }
-            (hold.to_vec(), ModeWritePolicy::Strict(start_stamp))
-        } else if latched {
-            let mut fresh_hold = hold.to_vec();
-            for &i in &changing {
-                let Some(fresh) = self.fresh_rollback_hold_target(i) else {
-                    return Err(ArmDriverError::HardwareFault(format!(
-                        "base-mode rollback refused for joint {}: fresh feedback (<= {} ms) required while stop/E-stop is active",
-                        i + 1,
-                        POS_FORCE_FEEDBACK_MAX_AGE.as_millis()
-                    )));
-                };
-                fresh_hold[i] = fresh;
-            }
-            (fresh_hold, ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: true })
+        // CTRL_MODE writes (forward and rollback alike) are refused while a stop/E-stop is pending OR latched.
+        self.strict_stop_check(Some(start_stamp))?;
+        let forward_policy = if !is_base_restore {
+            ModeWritePolicy::Strict(start_stamp)
         } else {
-            (hold.to_vec(), ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false })
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
         };
+        let effective_hold = hold.to_vec();
         self.validate_pos_force_holds(&changing, &target, &effective_hold, false)?;
         let to_mit: Vec<usize> = changing.iter().copied()
             .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
@@ -6500,30 +6453,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         for &i in &changing { self.joint_modes[i] = None; }
         let back: Vec<DamiaoControlMode> = (0..n).map(|i| previous[i].unwrap_or(self.base_mode(i))).collect();
         let back_is_base = changing.iter().all(|&i| back[i] == self.base_mode(i));
-        let rollback_stamp = self.current_stop_stamp();
-        self.pending_stop_check(Some(rollback_stamp))?;
-        let latched_now = self.is_stop_latched();
-        let (rollback_hold, rollback_policy) = if !back_is_base {
-            if latched_now || rollback_stamp != start_stamp {
-                return Err(ArmDriverError::EstopInhibited);
-            }
-            (hold.to_vec(), ModeWritePolicy::Strict(start_stamp))
-        } else if latched_now || rollback_stamp != start_stamp {
-            let mut fresh_hold = hold.to_vec();
-            for &i in &changing {
-                let Some(fresh) = self.fresh_rollback_hold_target(i) else {
-                    return Err(ArmDriverError::HardwareFault(format!(
-                        "Control-mode switch not confirmed for joints {:?}; base-mode rollback refused without fresh feedback for joint {}",
-                        failed.iter().map(|i| i + 1).collect::<Vec<_>>(),
-                        i + 1
-                    )));
-                };
-                fresh_hold[i] = fresh;
-            }
-            (fresh_hold, ModeWritePolicy::BaseRollback { start_stamp: rollback_stamp, force_fresh_hold: true })
+        // Rollback CTRL_MODE writes are also ModeWrite: refused while pending, latched, or after a stop.
+        self.strict_stop_check(Some(start_stamp))?;
+        let rollback_policy = if !back_is_base {
+            ModeWritePolicy::Strict(start_stamp)
         } else {
-            (hold.to_vec(), ModeWritePolicy::BaseRollback { start_stamp: rollback_stamp, force_fresh_hold: false })
+            ModeWritePolicy::BaseRollback { start_stamp, force_fresh_hold: false }
         };
+        let rollback_hold = hold.to_vec();
         let unrecovered = self.write_modes(&changing, &back, &rollback_hold, true, rollback_policy)?;
         Err(ArmDriverError::HardwareFault(format!(
             "Control-mode switch not confirmed for joints {:?}; switched back{}",

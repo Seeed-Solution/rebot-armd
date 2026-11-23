@@ -215,8 +215,11 @@ fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() 
     assert_eq!(bus_r.flush_calls.load(Ordering::SeqCst), 0, "flush must NOT run after retry E-stop");
     assert!(!drv_r.torque_transition_pending());
 
-    // Legacy `set_joint_modes` (gravity-comp exit after E-stop, `check_estop == false`) still retries
-    // through WouldBlock and succeeds even while `abort_flag` + `estop_gate` are latched!
+    // Legacy `set_joint_modes` rollback:
+    // - While E-stop is latched (`abort_flag = true`), CTRL_MODE writes are `ModeWrite` and are
+    //   refused with 0 TX frames (no mode register changes during latched E-stop).
+    // - Once the E-stop latch is cleared, `set_joint_modes` still retries through `WouldBlock`
+    //   and succeeds on the off-tick legacy path.
     let raw_gc = FakeBus::with_clock(&dm_limits(), base_clock.clone());
     raw_gc.with(|s| {
         s.immediate_replies = true;
@@ -232,7 +235,7 @@ fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() 
         .with_joint_limits(dm_limits())
         .unwrap();
     let hold = vec![JointTarget::position(0.0); 7];
-    // Enter MIT mode on J1..J6 first (like gravity_comp), then latch E-stop and exit back to Position!
+    // Enter MIT mode on J1..J6 first (like gravity_comp), then latch E-stop and attempt rollback.
     let mit_modes = vec![
         JointMode::Mit, JointMode::Mit, JointMode::Mit,
         JointMode::Mit, JointMode::Mit, JointMode::Mit,
@@ -242,19 +245,28 @@ fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() 
     drv_gc.set_joint_modes(&mit_modes, &hold).unwrap();
     let gc_req = Arc::new(AtomicU64::new(1));
     let gc_app = Arc::new(AtomicU64::new(1));
+    let gc_abort = Arc::new(AtomicBool::new(true));
     drv_gc.set_estop_gate(EstopGate::new(gc_req, gc_app));
-    drv_gc.set_abort_flag(Arc::new(AtomicBool::new(true)));
-    // Refresh fresh feedback (empty-queue boundary + state) so latched rollback has <= 100 ms feedback.
+    drv_gc.set_abort_flag(gc_abort.clone());
+    // Refresh fresh feedback (empty-queue boundary + state).
     drv_gc.read_joint_states().unwrap();
     raw_gc.with(|s| s.push_all_feedback());
     drv_gc.read_joint_states().unwrap();
     bus_gc.tx_calls.store(0, Ordering::SeqCst);
     gc_clock.sleeps.store(0, Ordering::SeqCst);
-    bus_gc.would_block_first_n.store(1, Ordering::SeqCst);
     let pos_modes = vec![JointMode::Position; 7];
+    let latched_err = drv_gc
+        .set_joint_modes(&pos_modes, &hold)
+        .expect_err("latched E-stop must refuse CTRL_MODE rollback writes");
+    assert!(is_estop_inhibited(&latched_err), "expected EstopInhibited, got {latched_err:?}");
+    assert_eq!(bus_gc.tx_calls.load(Ordering::SeqCst), 0, "latched rollback must transmit 0 CTRL_MODE frames");
+
+    // After latch clearance, legacy off-tick rollback retries WouldBlock and succeeds.
+    gc_abort.store(false, Ordering::SeqCst);
+    bus_gc.would_block_first_n.store(1, Ordering::SeqCst);
     drv_gc
         .set_joint_modes(&pos_modes, &hold)
-        .expect("legacy gravity-comp exit set_joint_modes must still retry and succeed while latched");
+        .expect("legacy gravity-comp exit set_joint_modes retries WouldBlock after latch clear");
     assert!(gc_clock.sleeps.load(Ordering::SeqCst) >= 1, "legacy gravity-comp exit should retry WouldBlock");
 
     // (b1) Normal PosVel target batch: E-stop arrives during the 7th (final) target transmit ->
