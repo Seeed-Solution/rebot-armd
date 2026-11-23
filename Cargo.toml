@@ -125,3 +125,10 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.zune-core]
 opt-level = 3
+
+# dev and test builds: the image matching and third-party crates at opt-level 2. The multi-view
+# measurement and grasp tests spend most of their time in this code.
+[profile.dev.package.mview-stereo]
+opt-level = 2
+[profile.dev.package."*"]
+opt-level = 2
