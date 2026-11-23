@@ -1697,11 +1697,14 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     let body = axum::body::to_bytes(torque_resp.into_body(), 4096).await.unwrap();
     assert!(String::from_utf8_lossy(&body).contains("EXECUTOR_ROUTING_PENDING"), "{body:?}");
 
+    // Stage 3 §2 A1: `/api/v1/ws` is allowed through the executor gate (for WS E-stop and
+    // urgent Stop); a plain HTTP GET without WS upgrade headers fails WebSocket extraction
+    // rather than `503 EXECUTOR_ROUTING_PENDING`.
     let ws_resp = app
         .oneshot(Request::builder().uri("/api/v1/ws").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    assert_eq!(ws_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(ws_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     h_wd.stop_and_join();
 }

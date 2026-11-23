@@ -366,6 +366,7 @@ async fn gate_executor_owner(
                                 | "/api/v1/diagnostics/tick"
                                 | "/api/v1/diagnostics/boots"
                                 | "/api/v1/diagnostics/blackbox"
+                                | "/api/v1/ws"
                         )
                 }
                 axum::http::Method::POST => path == "/api/v1/safety/e_stop",

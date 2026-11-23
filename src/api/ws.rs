@@ -56,7 +56,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
                         axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
                         axum::Extension(sandbox): axum::Extension<Arc<crate::api::sandbox::SandboxState>>,
                         axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
-    let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
+    let control_hz = supervisor.control_frequency_hz().max(1);
     let obs_rate = match query.get("obs_hz") {
         None => None,
         Some(v) => match v.trim().parse::<u64>() {
@@ -144,9 +144,12 @@ fn runs_during_macro_check(kind: &str, value: &Value) -> bool {
 
 /// The reply to a message cancelled by a stop / e-stop before it ran (`code` STOPPED /
 /// ESTOP_ACTIVE). None for messages that are not acknowledged.
-fn cancelled_reply(value: &Value, code: &str, epoch: u64) -> Option<Value> {
+fn cancelled_reply(value: &Value, code: &str, epoch: Option<u64>) -> Option<Value> {
     let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-    let mut reply = json!({"status":409, "code":code, "error":code, "message":"Cancelled by a stop before it began", "epoch_id":epoch});
+    let mut reply = json!({"status":409, "code":code, "error":code, "message":"Cancelled by a stop before it began"});
+    if let Some(ep) = epoch {
+        reply["epoch_id"] = json!(ep);
+    }
     if kind == "command" {
         reply["type"] = json!("command_reject");
         reply["request_id"] = value.get("request_id").cloned().unwrap_or(Value::Null);
@@ -160,6 +163,134 @@ fn cancelled_reply(value: &Value, code: &str, epoch: u64) -> Option<Value> {
         return None;
     }
     Some(reply)
+}
+
+fn validate_stop_body(body: &Value) -> Option<&'static str> {
+    if !body.is_object() { return Some("Command body must be an object"); }
+    if body.get("duration_secs").filter(|v| !v.is_null()).is_some_and(|d| d.as_f64().is_none()) {
+        return Some("duration_secs must be numeric");
+    }
+    None
+}
+
+fn executor_routing_reject(kind: &str, value: &Value, owner_mode: u8) -> Option<Value> {
+    let (code, msg) = if owner_mode == crate::supervisor::OWNER_EXECUTOR {
+        ("EXECUTOR_ROUTING_PENDING", "WebSocket message is not yet routed through the RT executor")
+    } else {
+        ("EXECUTOR_UNAVAILABLE", "RT executor ownership is transitioning or unavailable")
+    };
+    if kind == "acquire_lease" {
+        let mut r = json!({"type":"lease_rejected", "status":503, "code":code, "error":code, "message":msg});
+        if let Some(s) = value.get("seq").and_then(Value::as_u64) { r["seq"] = json!(s); }
+        Some(r)
+    } else if kind == "release_lease" {
+        Some(json!({"type":"lease_released", "success":false, "status":503, "code":code, "error":code, "message":msg}))
+    } else if kind == "command" {
+        Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":503, "code":code, "error":code, "message":msg}))
+    } else if kind == "preset" {
+        Some(json!({"type":"preset_reject", "name":value.get("name"), "status":503, "code":code, "error":code, "message":msg}))
+    } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
+        Some(json!({"type":"servo_reject", "reason":"executor_routing_pending", "status":503, "code":code, "error":code, "message":msg}))
+    } else {
+        None
+    }
+}
+
+struct PendingUrgentStop {
+    raw_request_id: Value,
+    parsed_request_id: Option<u64>,
+    client: Arc<crate::rt_core::urgent::UrgentStopClient>,
+    rx: tokio::sync::oneshot::Receiver<Result<crate::rt_core::urgent::UrgentStopOutcome, crate::rt_core::urgent::UrgentStopError>>,
+}
+
+fn format_urgent_stop_outcome(
+    raw_request_id: &Value,
+    parsed_request_id: Option<u64>,
+    last_request: &mut Option<u64>,
+    outcome: Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError>,
+) -> (Value, bool) {
+    use crate::rt_core::urgent::{UrgentStopError, UrgentStopOutcome};
+    let reject_err = |err: ArmError| {
+        let api: ApiError = err.into();
+        (json!({"type":"command_reject", "request_id":raw_request_id, "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message}), false)
+    };
+    match outcome {
+        Ok(UrgentStopOutcome::Applied { stop_generation, epoch, safety_state, is_torqued, control_mode_gravity_comp, .. }) => {
+            *last_request = parsed_request_id;
+            let mode = if control_mode_gravity_comp { "gravity_comp" } else { "position" };
+            let mut ack = json!({"type":"command_ack", "request_id":raw_request_id, "status":"accepted", "epoch_id":epoch, "safety_state":&*safety_state, "is_torqued":is_torqued, "control_mode":mode});
+            if stop_generation > 0 { ack["stop_generation"] = json!(stop_generation); }
+            (ack, true)
+        }
+        Ok(UrgentStopOutcome::LeaseLost { epoch }) => (
+            json!({"type":"command_reject", "request_id":raw_request_id, "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":epoch}),
+            false,
+        ),
+        Ok(UrgentStopOutcome::EpochMismatch { epoch }) => (
+            json!({"type":"command_reject", "request_id":raw_request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch}),
+            false,
+        ),
+        Ok(UrgentStopOutcome::InvalidRequestId) => (
+            json!({"type":"command_reject", "request_id":raw_request_id, "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}),
+            false,
+        ),
+        Ok(UrgentStopOutcome::InvalidBody { message, epoch }) => {
+            *last_request = parsed_request_id;
+            let mut reply = rejection(invalid_command(message), "command_reject", epoch);
+            reply["request_id"] = raw_request_id.clone();
+            (reply, false)
+        }
+        Ok(UrgentStopOutcome::ExecutorStopped) => reject_err(ArmError::from(UrgentStopError::Stopped)),
+        Err(err) => reject_err(err),
+    }
+}
+
+async fn cancel_macro_and_backlog(
+    macro_check: &mut Option<MacroCheck>,
+    backlog: &mut std::collections::VecDeque<Message>,
+    out_tx: &mpsc::Sender<Message>,
+    code: &str,
+    epoch: Option<u64>,
+) -> bool {
+    let mut cancelled = Vec::new();
+    if let Some(check) = macro_check.take() {
+        check.task.abort();
+        let mut r = json!({"type":"command_reject", "request_id":check.request_id, "status":409, "code":code, "error":code, "message":"Stopped before the action began"});
+        if let Some(ep) = epoch { r["epoch_id"] = json!(ep); }
+        cancelled.push(r);
+    }
+    cancelled.extend(backlog.drain(..).filter_map(|queued| match queued {
+        Message::Text(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| cancelled_reply(&v, code, epoch)),
+        _ => None,
+    }));
+    for reply in cancelled {
+        if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { return false; }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_urgent_stop(
+    raw_request_id: &Value,
+    parsed_request_id: Option<u64>,
+    last_request: &mut Option<u64>,
+    stop_res: Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError>,
+    macro_check: &mut Option<MacroCheck>,
+    backlog: &mut std::collections::VecDeque<Message>,
+    out_tx: &mpsc::Sender<Message>,
+    #[cfg(feature = "policy-runtime")] policy_stop_gen: &AtomicU64,
+) -> bool {
+    let (reply, accepted) = format_urgent_stop_outcome(raw_request_id, parsed_request_id, last_request, stop_res);
+    if accepted {
+        #[cfg(feature = "policy-runtime")]
+        policy_stop_gen.fetch_add(1, Ordering::SeqCst);
+        if macro_check.is_some()
+            && !cancel_macro_and_backlog(macro_check, backlog, out_tx, "STOPPED", reply.get("epoch_id").and_then(Value::as_u64)).await
+        {
+            return false;
+        }
+    }
+    out_tx.send(Message::Text(reply.to_string().into())).await.is_ok()
 }
 
 // Under the write lock, after lease / epoch / request_id checks.
@@ -581,43 +712,89 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         #[cfg(feature = "policy-runtime")]
         let pending_policy_loads = Arc::new(AtomicUsize::new(0));
         let mut macro_check: Option<MacroCheck> = None;
+        let mut pending_urgent_stop: Option<PendingUrgentStop> = None;
         let mut backlog: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
         loop {
             let message = match backlog.pop_front() {
-                Some(queued) if macro_check.is_none() => queued,
+                Some(queued) if macro_check.is_none() && pending_urgent_stop.is_none() => queued,
                 queued => {
                     if let Some(queued) = queued { backlog.push_front(queued); }
                     tokio::select! {
                         biased;
                         Some(mut reply) = ack_rx.recv() => {
-                            {
+                            let stamped_from_legacy = if recv_supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
                                 let inner = recv_supervisor.inner().read().await;
-                                reply["epoch_id"] = json!(inner.safety.epoch_id());
-                                reply["safety_state"] = json!(inner.safety.state());
-                                reply["is_torqued"] = json!(inner.is_torqued);
+                                if !inner.detached {
+                                    reply["epoch_id"] = json!(inner.safety.epoch_id());
+                                    reply["safety_state"] = json!(inner.safety.state());
+                                    reply["is_torqued"] = json!(inner.is_torqued);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if !stamped_from_legacy {
+                                if let Some(s) = recv_supervisor.hub().latest() {
+                                    reply["epoch_id"] = json!(s.obs.epoch_id);
+                                    reply["safety_state"] = json!(s.obs.safety_state);
+                                    reply["is_torqued"] = json!(s.obs.is_torqued);
+                                }
                             }
                             test_ack_stamp_delay().await;
                             if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                             continue;
                         }
-                        joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").task).await }, if macro_check.is_some() => {
+                        stop_res = async {
+                            let p = pending_urgent_stop.as_mut().expect("guarded by the precondition");
+                            loop {
+                                match tokio::time::timeout(std::time::Duration::from_millis(2), &mut p.rx).await {
+                                    Ok(Ok(res)) => break res.map_err(ArmError::from),
+                                    Ok(Err(_)) => break Err(ArmError::from(crate::rt_core::urgent::UrgentStopError::Stopped)),
+                                    Err(_) => p.client.drain_replies(),
+                                }
+                            }
+                        }, if pending_urgent_stop.is_some() => {
+                            let pending = pending_urgent_stop.take().expect("checked above");
+                            if !deliver_urgent_stop(
+                                &pending.raw_request_id, pending.parsed_request_id, &mut last_request, stop_res,
+                                &mut macro_check, &mut backlog, &out_tx,
+                                #[cfg(feature = "policy-runtime")] &policy_stop_gen,
+                            ).await { break; }
+                            continue;
+                        }
+                        joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").task).await }, if macro_check.is_some() && pending_urgent_stop.is_none() => {
                             let MacroCheck { request_id, generation, .. } = macro_check.take().expect("checked above");
-                            let mut inner = recv_supervisor.inner().write().await;
-                            let reply = match joined {
-                                Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                                Ok(Ok(planned)) => {
-                                    if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                        json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                    } else {
-                                        match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
-                                            Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                            Err(error) => command_reject(&inner, &request_id, error.into()),
+                            let owner_transferred = || {
+                                let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
+                                if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
+                                r
+                            };
+                            let reply = if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
+                                owner_transferred()
+                            } else {
+                                let mut inner = recv_supervisor.inner().write().await;
+                                if inner.detached {
+                                    drop(inner);
+                                    owner_transferred()
+                                } else {
+                                    match joined {
+                                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                                        Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
+                                        Ok(Ok(planned)) => {
+                                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                            } else {
+                                                match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
+                                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             };
-                            drop(inner);
                             if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                             continue;
                         }
@@ -634,6 +811,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            if pending_urgent_stop.is_some() && !matches!(kind, "estop" | "e_stop" | "auth") {
+                backlog.push_back(Message::Text(text));
+                continue;
+            }
             if macro_check.is_some() && !runs_during_macro_check(kind, &value) {
                 backlog.push_back(Message::Text(text));
                 continue;
@@ -647,6 +828,75 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
                     "role":status.role, "expires_in_s":status.expires_in_s});
                 if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                continue;
+            }
+            // Urgent E-stop: routed through shared `trigger_e_stop_checked`; never synthesizes epoch-0 success.
+            if kind == "estop" || kind == "e_stop" {
+                let (reply, cancel_epoch) = match recv_supervisor.trigger_e_stop_checked().await {
+                    Ok((state, epoch)) => (json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}), Some(epoch)),
+                    Err(err) => {
+                        let api: ApiError = err.into();
+                        let mut r = json!({"type":"estop_reject", "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message, "latched":true});
+                        if let Some(req_id) = value.get("request_id") { r["request_id"] = req_id.clone(); }
+                        (r, recv_supervisor.hub().latest().map(|s| s.obs.epoch_id))
+                    }
+                };
+                if (macro_check.is_some() || !backlog.is_empty())
+                    && !cancel_macro_and_backlog(&mut macro_check, &mut backlog, &out_tx, "ESTOP_ACTIVE", cancel_epoch).await
+                {
+                    break;
+                }
+                if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                continue;
+            }
+            // Urgent authorized stop (`/api/v1/motion/stop`): extracted before the generic writer.
+            if kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop") {
+                let local_gen = recv_generation.load(Ordering::SeqCst);
+                let supplied_gen = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+                let label_ok = value.get("client_id").is_none_or(|id| id.as_str() == client_label.as_deref());
+                let conn_label = crate::model::HolderLabel::try_new(&recv_connection);
+                let effective_gen = if conn_label.is_some() && local_gen != 0 && supplied_gen == local_gen && label_ok { local_gen } else { 0 };
+                let raw_request_id = value.get("request_id").cloned().unwrap_or(Value::Null);
+                let parsed_request_id = value.get("request_id").and_then(Value::as_u64);
+                let stop = crate::rt_core::urgent::UrgentStop {
+                    connection: conn_label.unwrap_or_default(),
+                    lease_generation: effective_gen,
+                    epoch: value.get("epoch_id").and_then(Value::as_u64),
+                    request_id: parsed_request_id.unwrap_or(0),
+                    request_id_valid: parsed_request_id.is_some_and(|id| last_request.is_none_or(|last| id > last)),
+                    body_error: validate_stop_body(&value["body"]),
+                };
+                match recv_supervisor.try_enqueue_executor_urgent_stop(stop) {
+                    Ok(Some((client, rx))) => {
+                        pending_urgent_stop = Some(PendingUrgentStop { raw_request_id, parsed_request_id, client, rx });
+                        continue;
+                    }
+                    Ok(None) => {
+                        let stop_res = recv_supervisor.urgent_stop(stop).await;
+                        if !deliver_urgent_stop(
+                            &raw_request_id, parsed_request_id, &mut last_request, stop_res,
+                            &mut macro_check, &mut backlog, &out_tx,
+                            #[cfg(feature = "policy-runtime")] &policy_stop_gen,
+                        ).await { break; }
+                        continue;
+                    }
+                    Err(err) => {
+                        if !deliver_urgent_stop(
+                            &raw_request_id, parsed_request_id, &mut last_request, Err(err),
+                            &mut macro_check, &mut backlog, &out_tx,
+                            #[cfg(feature = "policy-runtime")] &policy_stop_gen,
+                        ).await { break; }
+                        continue;
+                    }
+                }
+            }
+            // Fail closed before any legacy lock/reader path (including depth/teach) whenever
+            // `ArmCore` is not owned by the legacy supervisor lock.
+            let owner_mode = recv_supervisor.owner_mode();
+            if owner_mode != crate::supervisor::OWNER_LEGACY {
+                if let Some(reply) = executor_routing_reject(kind, &value, owner_mode) {
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                }
                 continue;
             }
             // depth measurement: read-only, no motion, no lease
@@ -708,13 +958,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
-            if kind == "estop" || kind == "e_stop" {
-                let (state, epoch) = recv_supervisor.trigger_e_stop().await;
-                response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
-            } else {
-                {
-                    let mut inner = recv_supervisor.inner().write().await;
-                    if kind == "acquire_lease" {
+            {
+                let mut inner = recv_supervisor.inner().write().await;
+                if inner.detached {
+                    drop(inner);
+                    if let Some(reply) = executor_routing_reject(kind, &value, recv_supervisor.owner_mode()) {
+                        if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    }
+                    continue;
+                }
+                if kind == "acquire_lease" {
                         let label = value.get("client_id").and_then(Value::as_str).unwrap_or("");
                         let seq = value.get("seq").and_then(Value::as_u64);
                         let force_val = value.get("force");
@@ -942,10 +1195,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         }
                                     } else {
                                         let result = execute_command(&mut inner, path, &value["body"], epoch);
-                                        #[cfg(feature = "policy-runtime")]
-                                        if path == "/api/v1/motion/stop" && result.is_ok() {
-                                            policy_stop_gen.fetch_add(1, Ordering::SeqCst);
-                                        }
                                         response = Some(match result {
                                             Ok(started) => command_ack(&inner, &value["request_id"], started),
                                             Err(error) => command_reject(&inner, &value["request_id"], error),
@@ -1395,30 +1644,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     }
                 }
-            }
-            // A stop / e-stop during a macro check cancels it and every message queued behind
-            // it: none of them begins after the stop.
-            let stop_code = if kind == "estop" || kind == "e_stop" {
-                Some("ESTOP_ACTIVE")
-            } else if kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop")
-                && response.as_ref().is_some_and(|r| r["type"] == "command_ack") {
-                Some("STOPPED")
-            } else { None };
-            if let (Some(code), Some(check)) = (stop_code, macro_check.as_ref()) {
-                check.task.abort();
-                let epoch = recv_supervisor.inner().read().await.safety.epoch_id();
-                let mut cancelled = vec![json!({"type":"command_reject", "request_id":check.request_id, "status":409, "code":code, "error":code, "message":"Stopped before the action began", "epoch_id":epoch})];
-                macro_check = None;
-                cancelled.extend(backlog.drain(..).filter_map(|queued| match queued {
-                    Message::Text(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| cancelled_reply(&v, code, epoch)),
-                    _ => None,
-                }));
-                let mut closed = false;
-                for reply in cancelled {
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { closed = true; break; }
-                }
-                if closed { break; }
-            }
             // Do not silently lose control acknowledgements behind telemetry.
             if let Some(response) = response {
                 if out_tx.send(Message::Text(response.to_string().into())).await.is_err() { break; }
@@ -1429,10 +1654,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
-    supervisor.recorder_connection_closed(&connection).await;
-    let generation = connection_generation.load(Ordering::SeqCst);
-    let mut inner = supervisor.inner().write().await;
-    if generation != 0 && inner.release_lease(&connection, generation) {
-        inner.stop_motion();
+    if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
+        supervisor.recorder_connection_closed(&connection).await;
+        let generation = connection_generation.load(Ordering::SeqCst);
+        let mut inner = supervisor.inner().write().await;
+        if !inner.detached && generation != 0 && inner.release_lease(&connection, generation) {
+            inner.stop_motion();
+        }
     }
 }
