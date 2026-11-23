@@ -3444,8 +3444,10 @@ impl SupervisorInner {
                 }
             }
         } else if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus {
-            let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
-                d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
+            let send_to_bus = feedback_fresh
+                && self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
+                && self.driver.as_ref().is_none_or(|d|
+                    d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
             if send_to_bus {
                 let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
