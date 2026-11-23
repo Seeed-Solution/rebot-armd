@@ -3480,7 +3480,12 @@ async fn measure_refuses_a_moving_arm() {
     assert_eq!((e.status.as_u16(), e.code.as_deref()), (409, Some("ARM_MOVING")), "{}", e.message);
     // a servo stream running: refused before the trigger
     let calls = w.rig.sim.trigger_calls.lock().unwrap().len();
-    { let mut inner = w.rig.sup.inner().write().await; let q = inner.commanded_positions.clone(); inner.servo_target = Some(q); }
+    {
+        let mut inner = w.rig.sup.inner().write().await;
+        let q = inner.commanded_positions.clone();
+        inner.servo_target = Some(q);
+        inner.last_motion_frame = Instant::now();
+    }
     let (status, v) = post_measure(&w, json!({})).await;
     assert_eq!((status, v["code"].as_str()), (409, Some("ARM_MOVING")), "{v}");
     assert_eq!(w.rig.sim.trigger_calls.lock().unwrap().len(), calls, "no trigger");

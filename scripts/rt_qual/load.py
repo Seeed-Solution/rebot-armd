@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""SG2002 real-time qualification load driver (Stage 3 §6).
+
+Runs on the office Raspberry Pi (Python 3.11+, stdlib + rebot SDK only).
+Drives concurrent loads against armd and samples GET /api/v1/diagnostics/tick
+every N seconds to a JSONL file.
+
+Safety invariants:
+- speed_scale is hard-capped at <= 0.3;
+- motion and recording run inside `with Arm(...)`;
+- stops immediately on any detected fault or E-stop and never clears faults;
+- every worker loop is bounded by stop_event and a monotonic deadline.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import signal
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from rebot import Arm
+from rebot import _ws as rebot_ws
+from rebot.client import ArmdClient
+from rebot.errors import RebotError
+
+MAX_SPEED_SCALE = 0.3
+
+# Default J1 joint-path waypoints matching qual-ref/tickload.py (B601-RS workspace).
+DEFAULT_RPY = (0.0, math.radians(41.0), 0.0)
+DEFAULT_POINT_A = (0.255, 0.08, 0.43)
+DEFAULT_POINT_B = (0.255, 0.12, 0.43)
+
+BLACKBOX_LOG_NOTE = (
+    "No documented armd endpoint injects synthetic blackbox or log writes. "
+    "Blackbox writes at 5 Hz automatically while the arm is torqued or moving "
+    "(src/diagnostics/blackbox.rs); this load adds periodic "
+    "GET /api/v1/diagnostics/blackbox?seconds=60 reads and HTTP TraceLayer log traffic."
+)
+
+
+def utc_iso(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def percentile_nearest(values: list[float], p: int) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    idx = max(1, (len(s) * p + 99) // 100) - 1
+    return s[idx]
+
+
+def extract_fault_info(obs: Any) -> tuple[str | None, str | None]:
+    """Return (fault_str, safety_state_str) from either an ArmStatus or raw dict."""
+    if obs is None:
+        return None, None
+    if isinstance(obs, dict):
+        safety_raw = obs.get("safety_state")
+        fault_raw = obs.get("fault")
+        if isinstance(safety_raw, dict):
+            safety_str = next(iter(safety_raw.keys()), str(safety_raw))
+        elif safety_raw is None:
+            safety_str = None
+        else:
+            safety_str = str(safety_raw)
+        fault_str = None if fault_raw is None else (
+            json.dumps(fault_raw, sort_keys=True) if isinstance(fault_raw, (dict, list)) else str(fault_raw)
+        )
+        if fault_str is None and safety_str in ("Fault", "EStop", "E_STOP", "FAULT"):
+            fault_str = f"safety_state={safety_str}"
+        return fault_str, safety_str
+
+    safety_str = getattr(obs, "safety_state", None)
+    fault_raw = getattr(obs, "fault", None)
+    fault_str = None if fault_raw is None else str(fault_raw)
+    if fault_str is None and (getattr(obs, "faulted", False) or getattr(obs, "e_stopped", False)):
+        fault_str = f"safety_state={safety_str}"
+    return fault_str, str(safety_str) if safety_str is not None else None
+
+
+def extract_rx_ages_ms(obs: Any) -> list[float]:
+    raw = obs.get("feedback_age_ms") if isinstance(obs, dict) else getattr(obs, "feedback_age_ms", None)
+    if not isinstance(raw, list):
+        return []
+    out: list[float] = []
+    for item in raw:
+        if isinstance(item, (int, float)) and math.isfinite(item) and item >= 0:
+            out.append(float(item))
+    return out
+
+
+class SharedState:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.phase: str = "init"
+        self.fault: str | None = None
+        self.safety_state: str | None = None
+        self.stop_reason: str = "completed"
+        self.rx_ages_ms: list[float] = []
+        self.counters: dict[str, Any] = {
+            "obs_ok": 0,
+            "obs_err": {},
+            "ws_msgs": 0,
+            "ws_bytes": 0,
+            "ws_reconnects": 0,
+            "ws_err": {},
+            "measure_ok": 0,
+            "measure_err": {},
+            "blackbox_ok": 0,
+            "blackbox_err": {},
+            "bulk_ok": 0,
+            "bulk_bytes": 0,
+            "bulk_err": {},
+            "motion_cycles_done": 0,
+            "motion_moves_done": 0,
+            "record_state": "disabled",
+            "record_episode_id": None,
+        }
+
+    def set_phase(self, phase: str) -> None:
+        with self._lock:
+            self.phase = phase
+
+    def get_phase(self) -> str:
+        with self._lock:
+            return self.phase
+
+    def inc(self, key: str, delta: int = 1) -> None:
+        with self._lock:
+            self.counters[key] += delta
+
+    def inc_err(self, key: str, err_code: str) -> None:
+        with self._lock:
+            bucket = self.counters[key]
+            bucket[err_code] = bucket.get(err_code, 0) + 1
+
+    def set_counter(self, key: str, value: Any) -> None:
+        with self._lock:
+            self.counters[key] = value
+
+    def record_rx_ages(self, ages: list[float]) -> None:
+        if not ages:
+            return
+        with self._lock:
+            # Keep bounded memory even at high poll + WS rates (cap 20k values/interval).
+            if len(self.rx_ages_ms) < 20_000:
+                self.rx_ages_ms.extend(ages)
+
+    def note_observation(self, obs: Any) -> bool:
+        """Update safety_state / rx_ages; return True if fault tripped."""
+        self.record_rx_ages(extract_rx_ages_ms(obs))
+        fault_str, safety_str = extract_fault_info(obs)
+        with self._lock:
+            if safety_str is not None:
+                self.safety_state = safety_str
+            if fault_str is not None and self.fault is None:
+                self.fault = fault_str
+                self.stop_reason = f"fault:{fault_str}"
+                self.stop_event.set()
+                return True
+            return self.fault is not None
+
+    def trip_fault(self, reason: str) -> None:
+        with self._lock:
+            if self.fault is None:
+                self.fault = reason
+                self.stop_reason = f"fault:{reason}"
+            self.stop_event.set()
+
+    def has_fault(self) -> bool:
+        with self._lock:
+            return self.fault is not None
+
+    def drain_interval_snapshot(self) -> tuple[str, dict[str, Any] | None, dict[str, Any], str | None, str | None]:
+        with self._lock:
+            phase = self.phase
+            ages = self.rx_ages_ms
+            self.rx_ages_ms = []
+            counters_copy = {
+                k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in self.counters.items()
+            }
+            fault = self.fault
+            safety = self.safety_state
+        rx_summary = None
+        if ages:
+            rx_summary = {
+                "count": len(ages),
+                "p50": round(percentile_nearest(ages, 50) or 0.0, 3),
+                "p99": round(percentile_nearest(ages, 99) or 0.0, 3),
+                "max": round(max(ages), 3),
+            }
+        return phase, rx_summary, counters_copy, fault, safety
+
+
+def http_get_bytes(url: str, timeout: float) -> tuple[int, bytes]:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return int(resp.status), resp.read()
+
+
+def http_get_json(url: str, timeout: float) -> Any:
+    _, raw = http_get_bytes(url, timeout)
+    return json.loads(raw.decode("utf-8"))
+
+
+def err_tag(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP_{exc.code}"
+    code = getattr(exc, "code", None)
+    if code:
+        return str(code)
+    return type(exc).__name__
+
+
+def build_base_urls(host: str, port: int) -> tuple[str, str]:
+    if host.startswith(("http://", "https://")):
+        parsed = urllib.parse.urlsplit(host)
+        scheme = parsed.scheme
+        hostname = parsed.hostname or "127.0.0.1"
+        eff_port = parsed.port or port
+    else:
+        scheme = "http"
+        hostname = host
+        eff_port = port
+    http_base = f"{scheme}://{hostname}:{eff_port}"
+    ws_scheme = "wss" if scheme == "https" else "ws"
+    ws_base = f"{ws_scheme}://{hostname}:{eff_port}"
+    return http_base, ws_base
+
+
+def run_obs_poll(base_url: str, hz: float, deadline: float, state: SharedState) -> None:
+    url = f"{base_url}/api/v1/observation"
+    period = 1.0 / max(hz, 0.1)
+    next_t = time.monotonic()
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            obs = http_get_json(url, timeout=min(1.5, max(0.5, period * 4)))
+            state.inc("obs_ok")
+            state.note_observation(obs)
+        except Exception as exc:
+            state.inc_err("obs_err", err_tag(exc))
+        next_t += period
+        sleep_s = next_t - time.monotonic()
+        if sleep_s > 0:
+            state.stop_event.wait(min(sleep_s, max(0.0, deadline - time.monotonic())))
+        else:
+            next_t = time.monotonic()
+
+
+def run_ws_stream(ws_base: str, ws_obs_hz: int | None, deadline: float, state: SharedState) -> None:
+    path = "/api/v1/ws" if ws_obs_hz is None else f"/api/v1/ws?obs_hz={ws_obs_hz}"
+    ws_url = f"{ws_base}{path}"
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        ws = None
+        try:
+            ws = rebot_ws.connect(ws_url, timeout=3.0, origin=True)
+            while not state.stop_event.is_set() and time.monotonic() < deadline:
+                try:
+                    msg = ws.recv(timeout=0.5)
+                except TimeoutError:
+                    continue
+                state.inc("ws_msgs")
+                state.inc("ws_bytes", len(msg.encode("utf-8") if isinstance(msg, str) else msg))
+                if isinstance(msg, str) and msg.startswith("{"):
+                    try:
+                        parsed = json.loads(msg)
+                        if isinstance(parsed, dict) and "safety_state" in parsed:
+                            state.note_observation(parsed)
+                    except json.JSONDecodeError:
+                        pass
+        except Exception as exc:
+            if not state.stop_event.is_set():
+                state.inc_err("ws_err", err_tag(exc))
+                state.inc("ws_reconnects")
+                state.stop_event.wait(0.5)
+        finally:
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+
+def run_measure_loop(
+    base_url: str,
+    deadline: float,
+    state: SharedState,
+    operator_pin: str | None,
+    operator_token: str | None,
+    allow_insecure_auth: bool,
+) -> None:
+    client = ArmdClient(
+        base_url,
+        timeout_sec=5.0,
+        operator_pin=operator_pin,
+        operator_token=operator_token,
+        allow_insecure_operator_auth=allow_insecure_auth,
+    )
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            client.measure(timeout=15.0)
+            state.inc("measure_ok")
+        except Exception as exc:
+            state.inc_err("measure_err", err_tag(exc))
+            state.stop_event.wait(0.3)
+
+
+def run_blackbox_log_loop(base_url: str, hz: float, deadline: float, state: SharedState) -> None:
+    url = f"{base_url}/api/v1/diagnostics/blackbox?seconds=60"
+    period = 1.0 / max(hz, 0.1)
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            http_get_bytes(url, timeout=3.0)
+            state.inc("blackbox_ok")
+        except Exception as exc:
+            state.inc_err("blackbox_err", err_tag(exc))
+        state.stop_event.wait(min(period, max(0.0, deadline - time.monotonic())))
+
+
+def run_bulk_http_loop(base_url: str, bulk_path: str, interval_s: float, deadline: float, state: SharedState) -> None:
+    path = bulk_path if bulk_path.startswith("/") else "/" + bulk_path
+    url = f"{base_url}{path}"
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        try:
+            _, data = http_get_bytes(url, timeout=3.0)
+            state.inc("bulk_ok")
+            state.inc("bulk_bytes", len(data))
+        except Exception as exc:
+            state.inc_err("bulk_err", err_tag(exc))
+            state.stop_event.wait(min(max(interval_s, 0.2), max(0.0, deadline - time.monotonic())))
+            continue
+        if interval_s > 0:
+            state.stop_event.wait(min(interval_s, max(0.0, deadline - time.monotonic())))
+
+
+def write_jsonl_line(fh: Any, write_lock: threading.Lock, record: dict[str, Any]) -> None:
+    line = json.dumps(record, separators=(",", ":"), sort_keys=False)
+    with write_lock:
+        fh.write(line + "\n")
+        fh.flush()
+
+
+def sample_tick_once(
+    base_url: str,
+    run_id: str,
+    t0: float,
+    state: SharedState,
+    enabled_loads: dict[str, bool],
+    phase_override: str | None = None,
+) -> dict[str, Any]:
+    now_unix = time.time()
+    elapsed = time.monotonic() - t0
+    phase, rx_summary, counters, fault, safety = state.drain_interval_snapshot()
+    if phase_override is not None:
+        phase = phase_override
+    tick_data: dict[str, Any] | None = None
+    tick_err: str | None = None
+    try:
+        tick_data = http_get_json(f"{base_url}/api/v1/diagnostics/tick", timeout=2.0)
+    except Exception as exc:
+        tick_err = f"{err_tag(exc)}: {exc}"
+    return {
+        "type": "sample",
+        "run_id": run_id,
+        "ts_unix": round(now_unix, 6),
+        "ts_iso": utc_iso(now_unix),
+        "elapsed_s": round(elapsed, 3),
+        "phase": phase,
+        "enabled_loads": enabled_loads,
+        "tick": tick_data,
+        "tick_error": tick_err,
+        "rx_age_ms": rx_summary,
+        "counters": counters,
+        "fault": fault,
+        "safety_state": safety,
+    }
+
+
+def run_tick_sampler(
+    base_url: str,
+    run_id: str,
+    t0: float,
+    interval_s: float,
+    deadline: float,
+    state: SharedState,
+    enabled_loads: dict[str, bool],
+    fh: Any,
+    write_lock: threading.Lock,
+) -> None:
+    # Take an initial sample immediately, then every interval_s.
+    rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
+    write_jsonl_line(fh, write_lock, rec)
+    next_t = time.monotonic() + interval_s
+    while not state.stop_event.is_set() and time.monotonic() < deadline:
+        wait_s = min(max(0.0, next_t - time.monotonic()), max(0.0, deadline - time.monotonic()))
+        if wait_s > 0:
+            state.stop_event.wait(wait_s)
+        if state.stop_event.is_set() or time.monotonic() >= deadline:
+            break
+        rec = sample_tick_once(base_url, run_id, t0, state, enabled_loads)
+        write_jsonl_line(fh, write_lock, rec)
+        next_t += interval_s
+        if next_t < time.monotonic():
+            next_t = time.monotonic() + interval_s
+
+
+def check_arm_state(arm: Arm, state: SharedState) -> bool:
+    """Return True if healthy, False if faulted or stopped."""
+    if state.stop_event.is_set():
+        return False
+    st = arm.state()
+    if state.note_observation(st):
+        return False
+    return True
+
+
+def execute_one_cycle(
+    arm: Arm,
+    motion_mode: str,
+    speed_scale: float,
+    dwell_s: float,
+    j1_delta_rad: float,
+    deadline: float,
+    state: SharedState,
+    home_joints: list[float] | None,
+) -> bool:
+    """Run one bounded motion cycle. Returns False if stopped/faulted/deadline."""
+    if state.stop_event.is_set() or time.monotonic() >= deadline:
+        return False
+    if motion_mode == "tickload":
+        targets = (DEFAULT_POINT_B, DEFAULT_POINT_A)
+        for tgt in targets:
+            if not check_arm_state(arm, state) or time.monotonic() >= deadline:
+                return False
+            arm.move_to(tgt, rpy=DEFAULT_RPY, yaw="outward", path="joint", speed_scale=speed_scale)
+            state.inc("motion_moves_done")
+            if not check_arm_state(arm, state):
+                return False
+            if dwell_s > 0:
+                state.stop_event.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+    else:
+        assert home_joints is not None
+        p_plus = list(home_joints)
+        p_minus = list(home_joints)
+        p_plus[0] += j1_delta_rad
+        p_minus[0] -= j1_delta_rad
+        # Duration scales inversely with speed_scale (safe slow default >= 2.0 s).
+        dur = max(1.5, 0.6 / max(speed_scale, 0.05))
+        for tgt_j in (p_plus, p_minus):
+            if not check_arm_state(arm, state) or time.monotonic() >= deadline:
+                return False
+            arm.move_joints(tgt_j, duration=dur)
+            state.inc("motion_moves_done")
+            if not check_arm_state(arm, state):
+                return False
+            if dwell_s > 0:
+                state.stop_event.wait(min(dwell_s, max(0.0, deadline - time.monotonic())))
+    state.inc("motion_cycles_done")
+    return True
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="SG2002 RT qualification load driver (Stage 3 §6).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--host", default=os.environ.get("REBOT_HOST", "127.0.0.1"), help="armd host or URL")
+    p.add_argument("--port", type=int, default=8765, help="armd HTTP/WS port")
+    p.add_argument("--run-id", default=None, help="Run identifier (default: UTC timestamp)")
+    p.add_argument("--output", required=True, help="Output JSONL path")
+    p.add_argument("--duration", type=float, default=120.0, help="Maximum total run duration in seconds")
+    p.add_argument("--sample-interval", type=float, default=5.0, help="Seconds between GET /api/v1/diagnostics/tick samples")
+    p.add_argument("--baseline-s", type=float, default=5.0, help="Idle baseline phase duration before starting load (0 disables)")
+    p.add_argument("--cooldown-s", type=float, default=5.0, help="Post-motion cooldown duration before final sample")
+
+    # Toggleable load pieces (all enabled by default).
+    p.add_argument("--motion", action=argparse.BooleanOptionalAction, default=True, help="J1 joint moves (bounded cycles)")
+    p.add_argument("--obs-poll", action=argparse.BooleanOptionalAction, default=True, help="20 Hz GET /api/v1/observation")
+    p.add_argument("--ws-stream", action=argparse.BooleanOptionalAction, default=True, help="WebSocket /api/v1/ws observation subscriber")
+    p.add_argument("--measure", action=argparse.BooleanOptionalAction, default=True, help="Continuous single-view measure loop")
+    p.add_argument("--record", action=argparse.BooleanOptionalAction, default=True, help="Record one episode via arm.record()")
+    p.add_argument("--blackbox-log", action=argparse.BooleanOptionalAction, default=True, help="Periodic blackbox reads + TraceLayer log pressure")
+    p.add_argument("--bulk-http", action=argparse.BooleanOptionalAction, default=True, help="Bulk HTTP download loop (USB gadget traffic)")
+
+    # Rates & motion parameters.
+    p.add_argument("--speed-scale", type=float, default=0.3, help="Motion speed_scale (hard cap <= 0.3)")
+    p.add_argument("--cycles", type=int, default=4, help="Maximum bounded motion cycles")
+    p.add_argument("--dwell-s", type=float, default=2.0, help="Dwell seconds between waypoints")
+    p.add_argument(
+        "--motion-mode",
+        choices=("tickload", "joint-j1"),
+        default="tickload",
+        help="tickload: Cartesian A/B joint-path moves as in qual-ref/tickload.py; joint-j1: direct J1 joint moves around home",
+    )
+    p.add_argument("--j1-delta-rad", type=float, default=0.15, help="J1 excursion (rad) when --motion-mode=joint-j1")
+    p.add_argument("--obs-hz", type=float, default=20.0, help="GET /api/v1/observation polling rate (Hz)")
+    p.add_argument("--ws-obs-hz", type=int, default=None, help="Optional ?obs_hz=N for WS subscriber (default: every tick)")
+    p.add_argument("--blackbox-hz", type=float, default=1.0, help="GET /api/v1/diagnostics/blackbox polling rate (Hz)")
+    p.add_argument("--bulk-path", default="/api/v1/camera/snapshot", help="HTTP path for bulk download loop")
+    p.add_argument("--bulk-interval-s", type=float, default=0.05, help="Sleep seconds between bulk HTTP downloads")
+    p.add_argument("--record-dataset", default="rt_qual", help="Dataset name for recorded episode")
+    p.add_argument("--record-task", default="rt-qual-harness", help="Task label for recorded episode")
+    p.add_argument("--record-seconds", type=float, default=15.0, help="Recording window when --no-motion is set")
+    p.add_argument(
+        "--allow-insecure-auth",
+        action="store_true",
+        default=os.environ.get("REBOT_ALLOW_INSECURE_OPERATOR_AUTH", "").lower() in ("1", "true", "yes"),
+        help="Allow sending operator PIN/token over plain http:// to non-loopback host",
+    )
+    p.add_argument("--force-lease", action="store_true", default=False, help="Force-take arm lease if another client holds it")
+    args = p.parse_args(argv)
+
+    if not (0.0 < args.speed_scale <= MAX_SPEED_SCALE):
+        p.error(f"--speed-scale must be in (0, {MAX_SPEED_SCALE}], got {args.speed_scale}")
+    if args.duration <= 0:
+        p.error("--duration must be > 0")
+    if args.sample_interval <= 0:
+        p.error("--sample-interval must be > 0")
+    if args.cycles < 1:
+        p.error("--cycles must be >= 1")
+    if args.obs_hz <= 0:
+        p.error("--obs-hz must be > 0")
+    if args.blackbox_hz <= 0:
+        p.error("--blackbox-hz must be > 0")
+    if args.run_id is None:
+        args.run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return args
+
+
+def fetch_boot_meta(base_url: str) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    try:
+        boots = http_get_json(f"{base_url}/api/v1/diagnostics/boots", timeout=2.0)
+        meta["boots_enabled"] = boots.get("enabled")
+        meta["boot"] = boots.get("boot")
+        entries = boots.get("boots") or []
+        if entries:
+            latest = entries[-1]
+            meta["armd_version"] = latest.get("armd_version")
+            meta["kernel_boot_id"] = latest.get("kernel_boot_id")
+            meta["reset_reason"] = latest.get("reset_reason")
+    except Exception as exc:
+        meta["boots_error"] = err_tag(exc)
+    try:
+        schema = http_get_json(f"{base_url}/api/v1/observation/schema", timeout=2.0)
+        meta["dof"] = schema.get("dof")
+        meta["joint_names"] = schema.get("joint_names")
+    except Exception as exc:
+        meta["schema_error"] = err_tag(exc)
+    return meta
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    http_base, ws_base = build_base_urls(args.host, args.port)
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    enabled_loads = {
+        "motion": args.motion,
+        "obs_poll": args.obs_poll,
+        "ws_stream": args.ws_stream,
+        "measure": args.measure,
+        "record": args.record,
+        "blackbox_log": args.blackbox_log,
+        "bulk_http": args.bulk_http,
+    }
+    state = SharedState()
+    if args.record:
+        state.set_counter("record_state", "pending")
+    write_lock = threading.Lock()
+
+    def on_signal(signum: int, _frame: Any) -> None:
+        state.stop_reason = f"signal:{signum}"
+        state.stop_event.set()
+
+    prev_sigint = signal.signal(signal.SIGINT, on_signal)
+    prev_sigterm = signal.signal(signal.SIGTERM, on_signal)
+
+    t0 = time.monotonic()
+    deadline = t0 + args.duration
+    started_unix = time.time()
+    boot_meta = fetch_boot_meta(http_base)
+    operator_pin = os.environ.get("REBOT_OPERATOR_PIN")
+    operator_token = os.environ.get("REBOT_OPERATOR_TOKEN")
+
+    workers: list[threading.Thread] = []
+    sampler_thread: threading.Thread | None = None
+
+    try:
+        with out_path.open("w", encoding="utf-8") as fh:
+            meta_record = {
+                "type": "meta",
+                "run_id": args.run_id,
+                "ts_unix": round(started_unix, 6),
+                "ts_iso": utc_iso(started_unix),
+                "target": http_base,
+                "duration_s": args.duration,
+                "sample_interval_s": args.sample_interval,
+                "enabled_loads": enabled_loads,
+                "rates": {
+                    "obs_hz": args.obs_hz if args.obs_poll else 0,
+                    "ws_obs_hz": args.ws_obs_hz if args.ws_stream else 0,
+                    "blackbox_hz": args.blackbox_hz if args.blackbox_log else 0,
+                    "bulk_interval_s": args.bulk_interval_s if args.bulk_http else None,
+                    "bulk_path": args.bulk_path if args.bulk_http else None,
+                },
+                "motion_config": {
+                    "mode": args.motion_mode,
+                    "speed_scale": args.speed_scale,
+                    "cycles": args.cycles,
+                    "dwell_s": args.dwell_s,
+                },
+                "armd": boot_meta,
+                "blackbox_log_note": BLACKBOX_LOG_NOTE,
+            }
+            write_jsonl_line(fh, write_lock, meta_record)
+
+            # Start tick sampler first so baseline + load + cooldown are all captured.
+            state.set_phase("baseline" if args.baseline_s > 0 else "full_load")
+            sampler_thread = threading.Thread(
+                target=run_tick_sampler,
+                args=(http_base, args.run_id, t0, args.sample_interval, deadline, state, enabled_loads, fh, write_lock),
+                name="tick-sampler",
+                daemon=True,
+            )
+            sampler_thread.start()
+
+            if args.baseline_s > 0 and not state.stop_event.is_set():
+                state.stop_event.wait(min(args.baseline_s, max(0.0, deadline - time.monotonic())))
+
+            # Spawn background load threads.
+            if not state.stop_event.is_set() and time.monotonic() < deadline:
+                if args.obs_poll:
+                    workers.append(threading.Thread(
+                        target=run_obs_poll, args=(http_base, args.obs_hz, deadline, state),
+                        name="obs-poll", daemon=True,
+                    ))
+                if args.ws_stream:
+                    workers.append(threading.Thread(
+                        target=run_ws_stream, args=(ws_base, args.ws_obs_hz, deadline, state),
+                        name="ws-stream", daemon=True,
+                    ))
+                if args.measure:
+                    workers.append(threading.Thread(
+                        target=run_measure_loop,
+                        args=(http_base, deadline, state, operator_pin, operator_token, args.allow_insecure_auth),
+                        name="measure-loop", daemon=True,
+                    ))
+                if args.blackbox_log:
+                    workers.append(threading.Thread(
+                        target=run_blackbox_log_loop, args=(http_base, args.blackbox_hz, deadline, state),
+                        name="blackbox-log", daemon=True,
+                    ))
+                if args.bulk_http:
+                    workers.append(threading.Thread(
+                        target=run_bulk_http_loop,
+                        args=(http_base, args.bulk_path, args.bulk_interval_s, deadline, state),
+                        name="bulk-http", daemon=True,
+                    ))
+                for w in workers:
+                    w.start()
+
+            # Foreground motion + recording inside `with Arm(...)`.
+            needs_arm = args.motion or args.record
+            if needs_arm and not state.stop_event.is_set() and time.monotonic() < deadline:
+                arm_kwargs: dict[str, Any] = {
+                    "host": http_base,
+                    "enable": args.motion,
+                    "park_on_exit": args.motion,
+                    "force": args.force_lease,
+                    "handle_sigterm": False,
+                    "operator_pin": operator_pin,
+                    "operator_token": operator_token,
+                    "allow_insecure_operator_auth": args.allow_insecure_auth,
+                }
+                try:
+                    with Arm(**arm_kwargs) as arm:
+                        if not check_arm_state(arm, state):
+                            raise RuntimeError(f"arm faulted on connect: {state.fault}")
+
+                        home_joints: list[float] | None = None
+                        if args.motion:
+                            state.set_phase("motion_setup")
+                            arm.home()
+                            if not check_arm_state(arm, state):
+                                raise RuntimeError(f"arm faulted after home: {state.fault}")
+                            home_joints = list(arm.state().joint_positions)
+                            if args.motion_mode == "tickload" and time.monotonic() < deadline:
+                                arm.move_to(
+                                    DEFAULT_POINT_A,
+                                    rpy=DEFAULT_RPY,
+                                    yaw="outward",
+                                    path="joint",
+                                    speed_scale=args.speed_scale,
+                                )
+                                state.inc("motion_moves_done")
+                                if not check_arm_state(arm, state):
+                                    raise RuntimeError(f"arm faulted after move A: {state.fault}")
+                                if args.dwell_s > 0:
+                                    state.stop_event.wait(min(args.dwell_s, max(0.0, deadline - time.monotonic())))
+
+                        cycle_idx = 0
+                        # Record one episode (wraps cycle 0 when motion is enabled, else timed window).
+                        if args.record and not state.stop_event.is_set() and time.monotonic() < deadline:
+                            state.set_phase("motion_record" if args.motion else "record_load")
+                            try:
+                                arm.create_dataset(args.record_dataset, exist_ok=True)
+                                with arm.record(dataset=args.record_dataset, task=args.record_task) as rec:
+                                    state.set_counter("record_state", "recording")
+                                    if args.motion and cycle_idx < args.cycles:
+                                        ok = execute_one_cycle(
+                                            arm, args.motion_mode, args.speed_scale, args.dwell_s,
+                                            args.j1_delta_rad, deadline, state, home_joints,
+                                        )
+                                        cycle_idx += 1
+                                        if not ok and state.has_fault():
+                                            raise RuntimeError(f"arm faulted during recorded cycle: {state.fault}")
+                                    else:
+                                        rec_wait = min(args.record_seconds, max(0.0, deadline - time.monotonic()))
+                                        state.stop_event.wait(rec_wait)
+                                state.set_counter("record_episode_id", rec.episode_id)
+                                state.set_counter("record_state", "saved" if rec.episode_id else "discarded")
+                            except RebotError as exc:
+                                # Non-fault recording unavailability (e.g. --episodes-dir off) is noted, not a fault.
+                                state.set_counter("record_state", f"unavailable:{err_tag(exc)}")
+                                if not check_arm_state(arm, state):
+                                    raise
+
+                        # Remaining motion cycles under full load.
+                        if args.motion:
+                            state.set_phase("full_load")
+                            while cycle_idx < args.cycles and not state.stop_event.is_set() and time.monotonic() < deadline:
+                                ok = execute_one_cycle(
+                                    arm, args.motion_mode, args.speed_scale, args.dwell_s,
+                                    args.j1_delta_rad, deadline, state, home_joints,
+                                )
+                                cycle_idx += 1
+                                if not ok:
+                                    break
+                            if not state.has_fault() and not state.stop_event.is_set():
+                                state.set_phase("cooldown")
+                                arm.home()
+                                check_arm_state(arm, state)
+                                if args.cooldown_s > 0:
+                                    state.stop_event.wait(min(args.cooldown_s, max(0.0, deadline - time.monotonic())))
+                        else:
+                            state.set_phase("full_load")
+                            remaining = max(0.0, deadline - time.monotonic())
+                            if remaining > 0:
+                                state.stop_event.wait(remaining)
+                except RebotError as exc:
+                    # Check whether the arm faulted; never clear faults.
+                    try:
+                        obs = http_get_json(f"{http_base}/api/v1/observation", timeout=1.5)
+                        state.note_observation(obs)
+                    except Exception:
+                        pass
+                    if not state.has_fault():
+                        state.trip_fault(f"{err_tag(exc)}: {exc}")
+                except RuntimeError as exc:
+                    if not state.has_fault():
+                        state.trip_fault(str(exc))
+            else:
+                state.set_phase("full_load")
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    state.stop_event.wait(remaining)
+
+            # Stop all background loads cleanly before final sample.
+            state.stop_event.set()
+            for w in workers:
+                w.join(timeout=3.0)
+            if sampler_thread is not None:
+                sampler_thread.join(timeout=3.0)
+
+            final_sample = sample_tick_once(http_base, args.run_id, t0, state, enabled_loads, phase_override="final")
+            write_jsonl_line(fh, write_lock, final_sample)
+
+            blackbox_tail = None
+            if state.has_fault():
+                try:
+                    blackbox_tail = http_get_json(f"{http_base}/api/v1/diagnostics/blackbox?seconds=30", timeout=2.0)
+                except Exception:
+                    blackbox_tail = None
+
+            summary = {
+                "type": "summary",
+                "run_id": args.run_id,
+                "ts_unix": round(time.time(), 6),
+                "ts_iso": utc_iso(time.time()),
+                "elapsed_s": round(time.monotonic() - t0, 3),
+                "stop_reason": state.stop_reason,
+                "fault": state.fault,
+                "safety_state": state.safety_state,
+                "counters": final_sample["counters"],
+                "blackbox_tail_on_fault": blackbox_tail,
+            }
+            write_jsonl_line(fh, write_lock, summary)
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
+
+    print(
+        f"rt_qual load finished: run_id={args.run_id} elapsed={time.monotonic() - t0:.1f}s "
+        f"stop_reason={state.stop_reason} fault={state.fault} output={out_path}"
+    )
+    return 2 if state.has_fault() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
