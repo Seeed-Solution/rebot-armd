@@ -6,9 +6,12 @@ use serde::{Serialize, Serializer};
 /// Ticks the percentiles cover.
 pub const TICK_WINDOW: usize = 1000;
 
-/// Phases of the tick's own write-lock hold (`SupervisorInner::tick`), µs.
+/// Phases of the tick's own write-lock hold, µs. They cover the hold: `lock_us` is their sum
+/// up to the clock reads between them.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LockPhases {
+    /// From the lock to `SupervisorInner::tick`: thread usage read, hold log taken.
+    pub pre_us: u32,
     /// Driver feedback read (CAN RX) and its bookkeeping.
     pub rx_us: u32,
     /// Safety checks, guards, trajectory / servo step.
@@ -19,6 +22,8 @@ pub struct LockPhases {
     pub finish_us: u32,
     /// Observation build and episode frame (and anything after an early return).
     pub obs_us: u32,
+    /// After `SupervisorInner::tick` until the lock is released: snapshot expiry and publication.
+    pub publish_us: u32,
 }
 
 /// What the control thread did while it waited and while it held the lock, from
@@ -156,11 +161,13 @@ pub struct ObservationCacheStats {
 /// Percentiles of the tick's lock phases.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct LockPhasePercentiles {
+    pub pre_us: Percentiles,
     pub rx_us: Percentiles,
     pub control_us: Percentiles,
     pub tx_us: Percentiles,
     pub finish_us: Percentiles,
     pub obs_us: Percentiles,
+    pub publish_us: Percentiles,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -330,11 +337,13 @@ impl TickWindow {
             reader_acquire_us: self.col(|r| r.reader_acquire_us),
             writer_acquire_us: self.col(|r| r.writer_acquire_us),
             lock_phases: LockPhasePercentiles {
+                pre_us: self.col(|r| r.phases.pre_us),
                 rx_us: self.col(|r| r.phases.rx_us),
                 control_us: self.col(|r| r.phases.control_us),
                 tx_us: self.col(|r| r.phases.tx_us),
                 finish_us: self.col(|r| r.phases.finish_us),
                 obs_us: self.col(|r| r.phases.obs_us),
+                publish_us: self.col(|r| r.phases.publish_us),
             },
             max_tick: self.max_by(|r| r.tick_us),
             max_lock: self.max_by(|r| r.lock_us),

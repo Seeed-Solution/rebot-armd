@@ -7640,18 +7640,19 @@ impl ArmSupervisor {
 
     /// Never blocks the tick: when a reader holds the snapshot mutex the tick skips the
     /// publication; the previous snapshot carries an older generation and is not served.
-    fn publish_observation(&self, snap: ObservationSnapshot) {
+    /// Returns the replaced snapshot (or `snap` when skipped) for the caller to drop after
+    /// it released the supervisor lock: freeing an observation is several deallocations.
+    #[must_use]
+    fn publish_observation(&self, snap: ObservationSnapshot) -> Option<ObservationSnapshot> {
         let mut slot = match self.obs_snapshot.try_lock() {
             Ok(slot) => slot,
             Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 self.obs_publish_skipped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return Some(snap);
             }
         };
-        let old = slot.replace(snap);
-        drop(slot);
-        drop(old);
+        slot.replace(snap)
     }
 
     /// Scheduling of the control thread, reported by it after its real-time request.
@@ -7920,7 +7921,7 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot, pre, publish) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
@@ -7928,10 +7929,11 @@ impl ArmSupervisor {
             let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;
             inner.tick_phases_us = [0; 5];
-            inner.tick_phase_mark = Some(Instant::now());
+            let body_start = Instant::now();
+            inner.tick_phase_mark = Some(body_start);
             let obs = Arc::new(inner.tick(dt));
             inner.tick_phase(4);
-            inner.tick_phase_mark = None;
+            let body_end = inner.tick_phase_mark.take().unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
             let pending_zc = inner.pending_zero_check_persist.take();
@@ -7939,11 +7941,14 @@ impl ArmSupervisor {
             // Published before the guard drops: no other write can come in between.
             let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
                 .min(inner.observation_valid_for(&obs));
-            self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
-            (obs, locked - started, locked.elapsed(), control_hz, pending_zc, phases, log, locked, usage_locked)
+            let old_snapshot = self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
+            let lock_end = Instant::now();
+            (obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot,
+                body_start - locked, lock_end - body_end)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
+        drop(old_snapshot);
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
@@ -8187,7 +8192,9 @@ impl ArmSupervisor {
             writer_acquire_us: us(log.writer_acquire),
             stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
             phases: crate::diagnostics::tick::LockPhases {
+                pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
+                publish_us: us(publish),
             },
             usage: crate::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released),
             waited_for: log.last_release.map(holder),
@@ -8280,7 +8287,7 @@ mod observation_snapshot_tests {
         // what a tick does under its guard
         let mut published = writer.current_observation();
         published.timestamp = 123.0;
-        sup.publish_observation(ObservationSnapshot {
+        let _ = sup.publish_observation(ObservationSnapshot {
             generation: sup.inner().generation(),
             at: Instant::now(),
             max_age: Duration::from_secs(1),

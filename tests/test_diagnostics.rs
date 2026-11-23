@@ -212,10 +212,13 @@ async fn tick_records_lock_wait_and_the_reader_that_caused_it() {
     assert!(w.released_before_lock_us >= 0, "{w:?}");
     // the lock phases add up to at most the hold
     let p = m.phases;
-    assert!(p.rx_us + p.control_us + p.tx_us + p.finish_us + p.obs_us <= m.lock_us, "{p:?}");
+    let sum = p.pre_us + p.rx_us + p.control_us + p.tx_us + p.finish_us + p.obs_us + p.publish_us;
+    assert!(sum <= m.lock_us, "{p:?}");
+    // the phases cover the hold up to the clock reads between them
+    assert!(m.lock_us - sum <= 50, "{} of {} us not in a phase: {p:?}", m.lock_us - sum, m.lock_us);
     let json = serde_json::to_value(&snap).unwrap();
     assert_eq!(json["max_tick"]["waited_for"]["kind"], "read");
-    for key in ["rx_us", "control_us", "tx_us", "finish_us", "obs_us"] {
+    for key in ["pre_us", "rx_us", "control_us", "tx_us", "finish_us", "obs_us", "publish_us"] {
         assert!(json["lock_phases"][key]["max"].is_u64(), "{key}");
         assert!(json["max_lock"][key].is_u64(), "{key}");
     }
