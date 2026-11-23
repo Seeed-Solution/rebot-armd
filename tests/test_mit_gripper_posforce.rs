@@ -164,13 +164,14 @@ fn enable_after_restart_with_j7_already_in_mode_4_emits_readback_hold_enable() {
     assert!(!d.is_enabled());
 
     // A frame queued BEFORE the driver's first empty-queue observation has unknown age and must not
-    // supply the pre-enable hold position on restart either.
+    // supply the pre-enable hold position on restart when the motor does not answer 0xCC refresh.
     let clock = MockClock::new();
     let bus = FakeBus::with_clock(&b601_limits(), clock);
     bus.with(|s| {
         s.motors[J7].q = -1.75;
         s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
         s.push_all_feedback();
+        s.motors[J7].mute_feedback = true;
     });
     let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(b601_limits()).unwrap()
@@ -180,6 +181,7 @@ fn enable_after_restart_with_j7_already_in_mode_4_emits_readback_hold_enable() {
     bus.clear_log();
     let err = d.set_torque(true).unwrap_err().to_string();
     assert!(err.contains("no fresh measured position"), "accepted unknown-age startup sample: {err}");
+    assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh attempt");
     assert!(j7_commands(&bus.tx_log()).is_empty(), "sent J7 hold on unknown-age startup sample");
     assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
     assert!(!d.is_enabled());
@@ -338,26 +340,28 @@ fn handshake_drain_applies_queued_telemetry_before_mode_write_checks() {
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written despite drained state-1 frame");
 
     // 3. A stationary state-0 frame that sat in the RX buffer past 100 ms since the last empty queue
-    //    must not spoof fresh feedback during the pre-write drain.
+    //    must not spoof fresh feedback during the pre-write drain when the motor does not answer 0xCC.
     let (mut d, bus, clock) = rig(true);
-    bus.with(|s| s.push_feedback(J7));
+    bus.with(|s| { s.push_feedback(J7); s.motors[J7].mute_feedback = true; });
     clock.advance(Duration::from_millis(200));
     bus.clear_log();
     let e = d.set_torque(true).unwrap_err().to_string();
     assert!(e.contains("fresh false"), "{e}");
+    assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh attempt");
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written on aged queued frame");
 
     // 4. A stationary state-0 frame already sitting in RX BEFORE the driver's first observed empty
-    //    queue has unknown age and must not authorize a mode write.
+    //    queue has unknown age and must not authorize a mode write when the motor does not answer 0xCC.
     let clock = MockClock::new();
     let bus = FakeBus::with_clock(&b601_limits(), clock);
-    bus.with(|s| { s.motors[J7].q = -1.0; s.push_all_feedback(); });
+    bus.with(|s| { s.motors[J7].q = -1.0; s.push_all_feedback(); s.motors[J7].mute_feedback = true; });
     let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(b601_limits()).unwrap()
         .with_gripper_pos_force(pf()).unwrap();
     bus.clear_log();
     let e = d.set_torque(true).unwrap_err().to_string();
     assert!(e.contains("fresh false"), "accepted pre-boundary startup sample: {e}");
+    assert!(bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh attempt");
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written on pre-boundary sample");
 
     // 5. A feedback frame on J6's arbitration ID (0x16) carrying J7 (id=7) in payload byte 0
@@ -1362,5 +1366,523 @@ fn estop_never_blocks_when_driver_mutex_held_by_another_thread() {
     for i in 0..7 {
         assert!((inner.commanded_positions[i] - pre_cmd[i]).abs() < 1e-5);
         assert!((inner.target_positions[i] - pre_cmd[i]).abs() < 1e-5);
+    }
+}
+
+fn is_j7_refresh(f: &CanFrame) -> bool {
+    f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC
+}
+
+#[test]
+fn enable_refreshes_stale_j7_feedback_across_ages_and_fails_closed_when_silent() {
+    let make_driver = |already_mode_4: bool| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.4;
+            if already_mode_4 {
+                s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            }
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        // Refresh feedback right after check_mapping_ranges so age starts cleanly at 0 ms.
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        bus.clear_log();
+        (d, bus, clock)
+    };
+
+    // 1. Live motor answering 0xCC: ages 0, 60, 99, 101, 150 ms all succeed 20x each
+    //    for both cold-start (CTRL_MODE write + readback) and restart (already mode 4).
+    for already_mode_4 in [false, true] {
+        for age_ms in [0u64, 60, 99, 101, 150] {
+            for iter in 0..20 {
+                let (mut d, bus, clock) = make_driver(already_mode_4);
+                clock.advance(Duration::from_millis(age_ms));
+                d.set_torque(true).unwrap_or_else(|e| {
+                    panic!("already_mode_4={already_mode_4} age={age_ms}ms iter={iter}: enable failed: {e}")
+                });
+                assert!(d.is_enabled() && d.motor_current_cap().unwrap().active,
+                    "already_mode_4={already_mode_4} age={age_ms}ms iter={iter}");
+                let log = bus.tx_log();
+                let hold = log.iter().position(|f| f.id == 0x307).expect("pre-enable 0x307 hold");
+                let enable = log.iter().position(|f| f.id == 7 && f.data == damiao::CMD_ENABLE).expect("CMD_ENABLE");
+                assert!(hold < enable, "hold must precede enable: {log:?}");
+                if age_ms > 100 {
+                    let refresh = log.iter().position(is_j7_refresh).expect("expected 0xCC refresh for stale J7");
+                    if already_mode_4 {
+                        let read = log.iter().position(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)).expect("readback");
+                        assert!(read < refresh && refresh < hold, "order read {read} < refresh {refresh} < hold {hold}");
+                    } else {
+                        let write = log.iter().position(|f| f.id == 0x7FF && f.data == reg_write(7, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)).expect("mode write");
+                        assert!(refresh < write && write < hold, "order refresh {refresh} < write {write} < hold {hold}");
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Silent J7 (does not answer 0xCC): stale ages fail closed 20x each with the exact same errors.
+    for iter in 0..20 {
+        for age_ms in [101u64, 150] {
+            // 2a. Cold-start mode-write precondition fails closed.
+            let (mut d, bus, clock) = make_driver(false);
+            bus.with(|s| s.motors[J7].mute_feedback = true);
+            clock.advance(Duration::from_millis(age_ms));
+            let err = d.set_torque(true).unwrap_err().to_string();
+            assert!(err.contains("position-force mode not written: needs fresh stationary feedback with torque off"),
+                "cold age={age_ms}ms iter={iter}: {err}");
+            assert!(bus.tx_log().iter().any(is_j7_refresh), "expected 0xCC refresh attempt");
+            assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "wrote CTRL_MODE without fresh reply");
+            assert!(j7_commands(&bus.tx_log()).is_empty());
+            assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+            assert!(!d.is_enabled());
+
+            // 2b. Mode-4 restart pre-enable hold fails closed.
+            let (mut d, bus, clock) = make_driver(true);
+            bus.with(|s| s.motors[J7].mute_feedback = true);
+            clock.advance(Duration::from_millis(age_ms));
+            let err = d.set_torque(true).unwrap_err().to_string();
+            assert!(err.contains("no fresh measured position for pre-enable hold"),
+                "mode4 age={age_ms}ms iter={iter}: {err}");
+            assert!(bus.tx_log().iter().any(is_j7_refresh), "expected 0xCC refresh attempt");
+            assert!(j7_commands(&bus.tx_log()).is_empty());
+            assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+            assert!(!d.is_enabled());
+        }
+
+        // 2c. 99 ms at begin_enable ages past 100 ms during readback (tx_step = 1 ms -> 100.5 ms) ->
+        //     pre-enable refresh must fail closed when J7 does not answer 0xCC.
+        let (mut d, bus, clock) = make_driver(true);
+        bus.with(|s| {
+            s.motors[J7].mute_feedback = true;
+            s.tx_step = Duration::from_millis(1);
+        });
+        clock.advance(Duration::from_millis(99));
+        let err = d.set_torque(true).unwrap_err().to_string();
+        assert!(err.contains("no fresh measured position for pre-enable hold"), "99ms silent iter={iter}: {err}");
+        assert!(bus.tx_log().iter().any(is_j7_refresh));
+        assert!(j7_commands(&bus.tx_log()).is_empty());
+        assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+    }
+}
+
+#[test]
+fn enable_refresh_deadline_boundaries_and_failure_paths() {
+    let make_stale = |already_mode_4: bool| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.6;
+            if already_mode_4 {
+                s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            }
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(120));
+        bus.clear_log();
+        (d, bus, clock)
+    };
+
+    // 1. Both Phase 1A (pre-restore) and Phase 1B (pre-enable): reply recorded 1 ms before expiry
+    //    wake is accepted when processed at the exact advertised expiry wake; reply AT expiry wake
+    //    (rx_at == deadline) fails closed.
+    for already_mode_4 in [false, true] {
+        // 1a. Timely reply at wake - 1 ms -> accepted at wake.
+        let (mut d, bus, clock) = make_stale(already_mode_4);
+        bus.with(|s| s.motors[J7].mute_feedback = true);
+        let mut p = d.begin_torque(true).unwrap();
+        let wake = loop {
+            match p {
+                armd::driver::TorqueProgress::Pending { wake }
+                    if bus.tx_log().iter().any(is_j7_refresh) && wake > clock.now() => break wake,
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    clock.advance(Duration::from_micros(500));
+                    p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                }
+                armd::driver::TorqueProgress::Done(_) => panic!("finished before refresh"),
+            }
+        };
+        let to_pre = wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+        clock.advance(to_pre);
+        bus.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.push_feedback(J7);
+        });
+        d.read_joint_states().unwrap(); // recorded at wake - 1 ms (< deadline)
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(clock.now(), wake);
+        let mut p = d.poll_torque(clock.now() + Duration::from_millis(5))
+            .unwrap_or_else(|e| panic!("already_mode_4={already_mode_4}: timely refresh reply rejected at wake: {e}"));
+        while let armd::driver::TorqueProgress::Pending { .. } = p {
+            clock.advance(Duration::from_micros(500));
+            p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        }
+        assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+
+        // 1b. Late reply recorded AT exact expiry wake (rx_at == deadline) -> rejected fail closed.
+        let (mut d, bus, clock) = make_stale(already_mode_4);
+        bus.with(|s| s.motors[J7].mute_feedback = true);
+        let mut p = d.begin_torque(true).unwrap();
+        let wake = loop {
+            match p {
+                armd::driver::TorqueProgress::Pending { wake }
+                    if bus.tx_log().iter().any(is_j7_refresh) && wake > clock.now() => break wake,
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    clock.advance(Duration::from_micros(500));
+                    p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                }
+                armd::driver::TorqueProgress::Done(_) => panic!("finished before refresh"),
+            }
+        };
+        clock.advance(wake.saturating_duration_since(clock.now()));
+        bus.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.push_feedback(J7);
+        });
+        d.read_joint_states().unwrap(); // rx_at == wake (not strictly before deadline)
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        if already_mode_4 {
+            assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+        } else {
+            assert!(err.contains("position-force mode not written"), "{err}");
+        }
+        assert!(!d.is_enabled());
+    }
+
+    // 2. Slow transmit consuming > 50 ms inside the refresh phase must NOT extend the fixed 50 ms deadline.
+    let (mut d, bus, _clock) = make_stale(false);
+    bus.with(|s| {
+        s.tx_step = Duration::from_millis(55);
+        s.immediate_replies = true;
+    });
+    let err = d.set_torque(true).unwrap_err().to_string();
+    assert!(err.contains("position-force mode not written"), "slow transmit extended 50 ms deadline: {err}");
+    assert!(!d.is_enabled() && !d.torque_transition_pending());
+
+    // 3. Wrong feedback CAN IDs (0x00, 0x07, 0x16 carrying J7 payload) must NOT satisfy refresh
+    //    in default mode (expected 0x17); and with configured master_id 0x27, default 0x17 / 0x00 /
+    //    0x07 are rejected while 0x27 succeeds in both refresh phases.
+    for already_mode_4 in [false, true] {
+        for wrong_id in [0x00u32, 0x07, 0x16] {
+            let (mut d, bus, clock) = make_stale(already_mode_4);
+            bus.with(|s| s.motors[J7].mute_feedback = true);
+            let mut p = d.begin_torque(true).unwrap();
+            let wake = loop {
+                match p {
+                    armd::driver::TorqueProgress::Pending { wake }
+                        if bus.tx_log().iter().any(is_j7_refresh) && wake > clock.now() => break wake,
+                    armd::driver::TorqueProgress::Pending { .. } => {
+                        clock.advance(Duration::from_micros(500));
+                        p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                    }
+                    armd::driver::TorqueProgress::Done(_) => panic!("finished before refresh"),
+                }
+            };
+            bus.with(|s| {
+                let mut spoof = s.motors[J7].feedback_frame();
+                spoof.id = wrong_id;
+                s.rx.push_back(spoof);
+            });
+            clock.advance(Duration::from_millis(1));
+            let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }),
+                "already_mode_4={already_mode_4} wrong CAN ID {wrong_id:#x} satisfied refresh");
+            clock.advance(wake.saturating_duration_since(clock.now()));
+            assert!(d.poll_torque(clock.now() + Duration::from_millis(5)).is_err());
+            assert!(!d.is_enabled());
+        }
+
+        // Configured master_id 0x27: rejects 0x17/0x00/0x07, accepts 0x27 in both refresh phases.
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.6;
+            s.motors[J7].reply_id = 0x27;
+            if already_mode_4 {
+                s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            }
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_master_id(0x27)
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(120));
+        bus.clear_log();
+        bus.with(|s| s.motors[J7].mute_feedback = true);
+        let mut p = d.begin_torque(true).unwrap();
+        while !(matches!(p, armd::driver::TorqueProgress::Pending { wake } if wake > clock.now())
+            && bus.tx_log().iter().any(is_j7_refresh))
+        {
+            clock.advance(Duration::from_micros(500));
+            p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        }
+        // Spoofed 0x17, 0x00, 0x07 must be ignored when master_id is 0x27.
+        for wrong_id in [0x17u32, 0x00, 0x07] {
+            bus.with(|s| {
+                let mut spoof = s.motors[J7].feedback_frame();
+                spoof.id = wrong_id;
+                s.rx.push_back(spoof);
+            });
+            clock.advance(Duration::from_millis(1));
+            let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }),
+                "master_id=0x27 accepted wrong CAN ID {wrong_id:#x}");
+        }
+        // Legitimate reply on configured 0x27 completes refresh and enables.
+        bus.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.push_feedback(J7);
+        });
+        clock.advance(Duration::from_millis(1));
+        let mut p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        while let armd::driver::TorqueProgress::Pending { .. } = p {
+            clock.advance(Duration::from_micros(500));
+            p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        }
+        assert!(d.is_enabled() && d.motor_current_cap().unwrap().active,
+            "master_id=0x27 failed to enable after timely 0x27 refresh reply");
+    }
+
+    // 4. Phase 1A (pre-restore) refresh receiving moving (v=0.5) or state-1 feedback refuses mode write.
+    for (moving, state_one, expected) in [(true, false, "still false"), (false, true, "torque off false")] {
+        let (mut d, bus, _) = make_stale(false);
+        bus.with(|s| {
+            if moving { s.motors[J7].v = 0.5; }
+            if state_one { s.motors[J7].state_override = Some(1); }
+        });
+        let err = d.set_torque(true).unwrap_err().to_string();
+        assert!(err.contains(expected), "moving={moving} state_one={state_one}: {err}");
+        assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+        assert!(!d.is_enabled());
+    }
+
+    // 5. Transmit / flush failure on 0xCC immediately cleans up enable state.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock) = make_stale(already_mode_4);
+        if already_mode_4 {
+            // Let readback request flush succeed (1st flush), then fail the 0xCC refresh flush.
+            let _ = d.begin_torque(true).unwrap();
+            while !bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+                clock.advance(Duration::from_micros(500));
+                let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            }
+            bus.with(|s| s.fail_flushes = 1);
+            let mut got_err = false;
+            for _ in 0..20 {
+                clock.advance(Duration::from_micros(500));
+                match d.poll_torque(clock.now() + Duration::from_millis(5)) {
+                    Err(_) => { got_err = true; break; }
+                    Ok(armd::driver::TorqueProgress::Pending { .. }) => {}
+                    Ok(armd::driver::TorqueProgress::Done(_)) => panic!("unexpected Done"),
+                }
+            }
+            assert!(got_err, "expected flush error on PreEnableRefresh");
+        } else {
+            bus.with(|s| s.fail_flushes = 1);
+            assert!(d.begin_torque(true).is_err());
+        }
+        assert!(!d.is_enabled() && !d.torque_transition_pending());
+    }
+
+    // 6. Mid-refresh begin_torque(false) abandons cleanly and completes disable.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock) = make_stale(already_mode_4);
+        bus.with(|s| s.motors[J7].mute_feedback = true);
+        let _ = d.begin_torque(true).unwrap();
+        while !bus.tx_log().iter().any(is_j7_refresh) {
+            clock.advance(Duration::from_micros(500));
+            let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        }
+        assert!(d.torque_transition_pending());
+        bus.with(|s| s.motors[J7].mute_feedback = false);
+        d.set_torque(false).expect("disable mid-refresh must succeed cleanly");
+        assert!(!d.is_enabled() && !d.torque_transition_pending());
+    }
+
+    // 7. RX backlog preventing drain until deadline: PreEnableRefresh must NOT send 0xCC after expiry.
+    let (mut d, bus, clock) = make_stale(true);
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    let mut p = d.begin_torque(true).unwrap();
+    let read_wake = loop {
+        match p {
+            armd::driver::TorqueProgress::Pending { wake }
+                if bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) && wake > clock.now() => break wake,
+            armd::driver::TorqueProgress::Pending { .. } => {
+                clock.advance(Duration::from_micros(500));
+                p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            }
+            armd::driver::TorqueProgress::Done(_) => panic!("finished before readback"),
+        }
+    };
+    // Deliver timely CTRL_MODE=4 readback at read_wake - 1 ms, then advance to read_wake so
+    // poll_readback skips RX drain and enters PreEnableRefresh with boundary = None when queue
+    // is flooded with >64 frames.
+    let b = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+    let rb = CanFrame::new_standard(0x17, &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap();
+    let to_pre = read_wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+    clock.advance(to_pre);
+    bus.with(|s| { s.rx.push_back(rb); });
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(1));
+    // Force last_read_drained = false by reading while 70 frames are queued.
+    bus.with(|s| {
+        let filler = s.motors[0].feedback_frame();
+        for _ in 0..70 { s.rx.push_back(filler); }
+    });
+    d.read_joint_states().unwrap(); // consumes 64 frames -> last_read_drained == false
+    bus.clear_log();
+    // Transition from Readback into PreEnableRefresh (boundary == None), then poll once while
+    // RX stays flooded so PreEnableRefresh advertises its 50 ms deadline without sending 0xCC.
+    let enter = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+    assert!(matches!(enter, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(!bus.tx_log().iter().any(is_j7_refresh), "sent 0xCC without observed empty RX queue");
+    bus.with(|s| {
+        let filler = s.motors[0].feedback_frame();
+        for _ in 0..200 { s.rx.push_back(filler); }
+    });
+    let ref_wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+        armd::driver::TorqueProgress::Pending { wake } => wake,
+        other => panic!("expected PreEnableRefresh pending deadline, got {other:?}"),
+    };
+    assert!(ref_wake > clock.now(), "expected future 50 ms deadline");
+    assert!(!bus.tx_log().iter().any(is_j7_refresh), "sent 0xCC while RX remained flooded");
+    clock.advance(ref_wake.saturating_duration_since(clock.now()));
+    let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+    assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+    assert!(!bus.tx_log().iter().any(is_j7_refresh), "sent 0xCC at/after deadline without drain");
+    assert!(!d.is_enabled());
+
+    // 8. Pre-request queued J7 feedback when poll_readback wakes at its expiry (so it skips RX drain
+    //    while last_read_drained is still true from an earlier read): PreEnableRefresh MUST drain
+    //    first to establish a fresh boundary before sending 0xCC, and MUST NOT accept that pre-request
+    //    frame when J7 never answers 0xCC.
+    let (mut d, bus, clock) = make_stale(true);
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    let mut p = d.begin_torque(true).unwrap();
+    let read_wake = loop {
+        match p {
+            armd::driver::TorqueProgress::Pending { wake }
+                if bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) && wake > clock.now() => break wake,
+            armd::driver::TorqueProgress::Pending { .. } => {
+                clock.advance(Duration::from_micros(500));
+                p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            }
+            armd::driver::TorqueProgress::Done(_) => panic!("finished before readback"),
+        }
+    };
+    let b = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+    let rb = CanFrame::new_standard(0x17, &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap();
+    let to_pre = read_wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+    clock.advance(to_pre);
+    bus.with(|s| s.rx.push_back(rb));
+    // Intervening read records timely CTRL_MODE=4 AND sets last_read_drained = true + fresh rx_empty_instant.
+    d.read_joint_states().unwrap();
+    // Now a pre-request J7 feedback frame sits unread in RX while J7 stays muted (never answers 0xCC).
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(clock.now(), read_wake);
+    bus.with(|s| {
+        let pre_req = s.motors[J7].feedback_frame();
+        s.rx.push_back(pre_req);
+    });
+    bus.clear_log();
+    // poll_readback wakes at read_wake (expired_before_read == true -> skips RX drain) and enters
+    // PreEnableRefresh with boundary = None (must NOT reuse earlier empty-queue boundary).
+    let enter = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+    assert!(matches!(enter, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(!bus.tx_log().iter().any(is_j7_refresh), "reused stale pre-readback boundary without draining");
+    // First refresh poll drains the pre-request J7 frame, establishes a brand-new boundary, then sends 0xCC.
+    let ref_wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+        armd::driver::TorqueProgress::Pending { wake } => wake,
+        other => panic!("expected PreEnableRefresh pending after draining pre-request frame, got {other:?}"),
+    };
+    assert!(bus.tx_log().iter().any(is_j7_refresh), "expected 0xCC after establishing fresh boundary");
+    // J7 is muted and never answers 0xCC -> must still fail closed at deadline.
+    clock.advance(ref_wake.saturating_duration_since(clock.now()));
+    let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+    assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+    assert!(j7_commands(&bus.tx_log()).is_empty());
+    assert!(!d.is_enabled());
+
+    // 9. Multi-joint stray restore where J7 feedback is 99 ms old at begin_enable and crosses
+    //    100 ms while J1..J6 transmit their mode writes: live J7 refreshes via 0xCC mid-restore
+    //    and enables; muted J7 attempts 0xCC and fails closed without writing J7 CTRL_MODE.
+    for mute_j7 in [false, true] {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+                // Put J1..J6 in MIT (mode 1) and J7 in POS_VEL (mode 2) so all 7 joints are stray.
+                if i < J7 {
+                    m.set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_MIT);
+                }
+            }
+            s.motors[J7].q = -1.6;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(99));
+        bus.with(|s| {
+            s.tx_step = Duration::from_millis(1); // J1..J6 writes push J7 age past 100 ms before J7's check
+            s.motors[J7].mute_feedback = mute_j7;
+        });
+        bus.clear_log();
+        if mute_j7 {
+            let err = d.set_torque(true).unwrap_err().to_string();
+            assert!(err.contains("position-force mode not written"), "muted mid-restore: {err}");
+            assert!(bus.tx_log().iter().any(is_j7_refresh), "expected mid-restore 0xCC refresh attempt");
+            assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data == reg_write(7, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)),
+                "wrote J7 CTRL_MODE=4 without fresh refresh reply");
+            assert!(j7_commands(&bus.tx_log()).is_empty());
+            assert!(!d.is_enabled());
+        } else {
+            d.set_torque(true).expect("live J7 should refresh via 0xCC after J1..J6 restore aged J7 past 100 ms");
+            assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+            let log = bus.tx_log();
+            let j1_write = log.iter().position(|f| f.id == 0x7FF && f.data[0] == 1 && f.data[2] == damiao::REG_WRITE).expect("J1 write");
+            let refresh = log.iter().position(is_j7_refresh).expect("mid-restore J7 0xCC refresh");
+            let j7_write = log.iter().position(|f| f.id == 0x7FF && f.data == reg_write(7, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)).expect("J7 write");
+            let hold = log.iter().position(|f| f.id == 0x307).expect("J7 hold");
+            assert!(j1_write < refresh && refresh < j7_write && j7_write < hold,
+                "order j1_write {j1_write} < refresh {refresh} < j7_write {j7_write} < hold {hold}");
+        }
     }
 }
