@@ -1,0 +1,761 @@
+//! Targeted regression tests for RT Stage 3 Step 1 R3 Class-A hardening:
+//! 1. Legacy Damiao mode-restore retry E-stop gate (`transmit_with_retry_guarded`)
+//!    + preservation of legacy gravity-comp exit `set_joint_modes` after E-stop.
+//! 2. Final E-stop recheck before `can.flush()` on Damiao target batches (normal + MIT fenced).
+//! 3. Bounded multi-slot off-thread fault reclamation (`SafetyManager::RETIRED_STATE_CAPACITY`)
+//!    with no overwrite on consecutive faults and fail-closed refusal when full.
+//! 4. PositionLead enable completion on a sub-release wake with 0 alloc/free across enable/disable cycles.
+//! 5. SimArmDriver single transport writer (owner-routed keepalive, 0 `armd-sim-rx` sends after handoff)
+//!    and strictly non-blocking RT reads when `armd-sim-rx` holds the shared state mutex.
+
+mod mit_support;
+
+use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use armd::diagnostics::alloc::TimedAlloc;
+use armd::driver::{
+    is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState,
+    GripperPosForce, JointMode, JointTarget, TorqueOutcome, TorqueProgress,
+};
+use armd::model::{ArmConfig, JointState};
+use armd::protocol::damiao::DamiaoLimits;
+use armd::rt_core::broker::{ClientId, Outcome, Reply, RequestId, Submit, TransitionOp};
+use armd::rt_core::executor::{ExecutorConfig, RtExecutorHandle};
+use armd::rt_core::urgent::EstopGate;
+use armd::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, RETIRED_STATE_CAPACITY};
+use armd::sim_driver::{SimArmDriver, SimCommand, SimState};
+use armd::supervisor::ArmSupervisor;
+use armd::tracking::JointTrackingConfig;
+use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+use mit_support::FakeBus;
+
+#[global_allocator]
+static ALLOC: TimedAlloc = TimedAlloc;
+
+fn dm_limits() -> Vec<DamiaoLimits> {
+    ArmConfig::rebot_dm()
+        .damiao_ranges
+        .unwrap()
+        .iter()
+        .map(|r| r.limits())
+        .collect()
+}
+
+async fn wait_until_async(timeout: Duration, mut pred: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !pred() {
+        assert!(Instant::now() < deadline, "condition timed out after {timeout:?}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+fn submit_broker_transition(handle: &RtExecutorHandle, seq: u64, op: TransitionOp) -> RequestId {
+    let snap = handle.planning_snapshot().expect("planning_snapshot");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut broker = handle.broker().lock().unwrap();
+    broker
+        .submit(ClientId(1), seq, snap.authority, deadline, Submit::Transition(op))
+        .expect("submit transition")
+}
+
+fn wait_broker_terminal(handle: &RtExecutorHandle, req_id: RequestId, timeout: Duration) -> Outcome {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut found = None;
+        {
+            let mut broker = handle.broker().lock().unwrap();
+            broker.poll(|_, reply| {
+                if let Reply::Terminal { request, outcome, .. } = reply {
+                    if request == req_id {
+                        found = Some(outcome);
+                    }
+                }
+                true
+            });
+        }
+        if let Some(outcome) = found {
+            return outcome;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for broker terminal for req {req_id:?}");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Clock wrapper that optionally triggers a hook (e.g., latching E-stop) inside `sleep()`.
+#[derive(Clone)]
+struct HookClock {
+    inner: MockClock,
+    on_sleep: Option<Arc<dyn Fn() + Send + Sync>>,
+    sleeps: Arc<AtomicUsize>,
+}
+
+impl DriverClock for HookClock {
+    fn clock_id(&self) -> u64 { self.inner.clock_id() }
+    fn now(&self) -> Instant { self.inner.now() }
+    fn sleep(&self, d: Duration) {
+        self.sleeps.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref hook) = self.on_sleep {
+            hook();
+        }
+        self.inner.sleep(d);
+    }
+    fn yield_now(&self) { self.inner.yield_now() }
+}
+
+/// Controllable CAN wrapper over `FakeBus` for deterministic WouldBlock + flush E-stop injection.
+#[derive(Clone)]
+struct FaultInjectBus {
+    inner: FakeBus,
+    clock: HookClock,
+    tx_calls: Arc<AtomicUsize>,
+    flush_calls: Arc<AtomicUsize>,
+    would_block_first_n: Arc<AtomicUsize>,
+    estop_on_tx_ordinal: Option<(Arc<AtomicU64>, Arc<AtomicUsize>)>,
+}
+
+impl FaultInjectBus {
+    fn new(inner: FakeBus, clock: HookClock) -> Self {
+        Self {
+            inner,
+            clock,
+            tx_calls: Arc::new(AtomicUsize::new(0)),
+            flush_calls: Arc::new(AtomicUsize::new(0)),
+            would_block_first_n: Arc::new(AtomicUsize::new(0)),
+            estop_on_tx_ordinal: None,
+        }
+    }
+}
+
+impl CanTransport for FaultInjectBus {
+    fn clock(&self) -> Option<Arc<dyn DriverClock>> { Some(Arc::new(self.clock.clone())) }
+    fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+        let ord = self.tx_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let wb = self.would_block_first_n.load(Ordering::SeqCst);
+        if ord <= wb {
+            return Err(TransportError::WouldBlock);
+        }
+        let r = self.inner.transmit(frame);
+        if let Some((ref ctr, ref target)) = self.estop_on_tx_ordinal {
+            let t = target.load(Ordering::SeqCst);
+            if t > 0 && ord == t {
+                ctr.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        r
+    }
+    fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+    fn flush(&mut self) -> Result<(), TransportError> {
+        self.flush_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.flush()
+    }
+    fn supports_bounded_flush(&self) -> bool { true }
+    fn supports_nonblocking_rt(&self) -> bool { true }
+}
+
+// ============================================================================
+// 1 & 2. Damiao legacy mode-restore retry E-stop gate + final flush E-stop check
+// ============================================================================
+
+#[test]
+fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() {
+    let base_clock = MockClock::new();
+
+    // (a) Legacy mode-restore retry (`rt_no_sleep == false`): 1st transmit returns WouldBlock,
+    // E-stop latches inside the 100 us retry sleep -> attempt 2 MUST NOT transmit, flush MUST NOT run,
+    // and `begin_torque(true)` returns `EstopInhibited`!
+    let raw_r = FakeBus::with_clock(&dm_limits(), base_clock.clone());
+    raw_r.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let estop_req_r = Arc::new(AtomicU64::new(0));
+    let estop_app_r = Arc::new(AtomicU64::new(0));
+    let latch_hook = estop_req_r.clone();
+    let hook_clock = HookClock {
+        inner: base_clock.clone(),
+        on_sleep: Some(Arc::new(move || {
+            latch_hook.fetch_add(1, Ordering::SeqCst);
+        })),
+        sleeps: Arc::new(AtomicUsize::new(0)),
+    };
+    let bus_r = FaultInjectBus::new(raw_r.clone(), hook_clock.clone());
+    let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 1500,
+            close_speed_rad_s: 1.0,
+            closed_rad: -0.2,
+            open_rad: 0.6,
+            calibrated: true,
+            ceiling_torque_nm: Some(1.0),
+            torque_reference: Some("bench".into()),
+        })
+        .unwrap();
+    drv_r.set_estop_gate(EstopGate::new(estop_req_r.clone(), estop_app_r));
+    drv_r.read_joint_states().unwrap();
+    // Legacy path (`rt_no_sleep` remains false); inject WouldBlock on attempt 1 of mode restore.
+    bus_r.tx_calls.store(0, Ordering::SeqCst);
+    bus_r.flush_calls.store(0, Ordering::SeqCst);
+    hook_clock.sleeps.store(0, Ordering::SeqCst);
+    bus_r.would_block_first_n.store(1, Ordering::SeqCst);
+    let err = drv_r.begin_torque(true).unwrap_err();
+    assert!(is_estop_inhibited(&err), "expected EstopInhibited on retry pause E-stop, got {err:?}");
+    assert_eq!(hook_clock.sleeps.load(Ordering::SeqCst), 1, "expected exactly one 100us retry sleep");
+    assert_eq!(bus_r.tx_calls.load(Ordering::SeqCst), 1, "retry attempt 2 must NOT transmit after E-stop");
+    assert_eq!(bus_r.flush_calls.load(Ordering::SeqCst), 0, "flush must NOT run after retry E-stop");
+    assert!(!drv_r.torque_transition_pending());
+
+    // Legacy `set_joint_modes` (gravity-comp exit after E-stop, `check_estop == false`) still retries
+    // through WouldBlock and succeeds even while `abort_flag` + `estop_gate` are latched!
+    let raw_gc = FakeBus::with_clock(&dm_limits(), base_clock.clone());
+    raw_gc.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let gc_clock = HookClock {
+        inner: base_clock.clone(),
+        on_sleep: None,
+        sleeps: Arc::new(AtomicUsize::new(0)),
+    };
+    let bus_gc = FaultInjectBus::new(raw_gc.clone(), gc_clock.clone());
+    let mut drv_gc = DamiaoArmDriver::new(bus_gc.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    let hold = vec![JointTarget::position(0.0); 7];
+    // Enter MIT mode on J1..J6 first (like gravity_comp), then latch E-stop and exit back to Position!
+    let mit_modes = vec![
+        JointMode::Mit, JointMode::Mit, JointMode::Mit,
+        JointMode::Mit, JointMode::Mit, JointMode::Mit,
+        JointMode::Position,
+    ];
+    drv_gc.read_joint_states().unwrap();
+    drv_gc.set_joint_modes(&mit_modes, &hold).unwrap();
+    let gc_req = Arc::new(AtomicU64::new(1));
+    let gc_app = Arc::new(AtomicU64::new(0));
+    drv_gc.set_estop_gate(EstopGate::new(gc_req, gc_app));
+    drv_gc.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    bus_gc.tx_calls.store(0, Ordering::SeqCst);
+    gc_clock.sleeps.store(0, Ordering::SeqCst);
+    bus_gc.would_block_first_n.store(1, Ordering::SeqCst);
+    let pos_modes = vec![JointMode::Position; 7];
+    drv_gc
+        .set_joint_modes(&pos_modes, &hold)
+        .expect("legacy gravity-comp exit set_joint_modes must still retry and succeed after E-stop");
+    assert!(gc_clock.sleeps.load(Ordering::SeqCst) >= 1, "legacy gravity-comp exit should retry WouldBlock");
+
+    // (b1) Normal PosVel target batch: E-stop arrives during the 7th (final) target transmit ->
+    // `write_joint_targets` MUST return `EstopInhibited` and skip `can.flush()` (`flush_calls == 0`)!
+    let raw_t = FakeBus::with_clock(&dm_limits(), base_clock.clone());
+    raw_t.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let estop_req_t = Arc::new(AtomicU64::new(0));
+    let estop_app_t = Arc::new(AtomicU64::new(0));
+    let t_clock = HookClock { inner: base_clock.clone(), on_sleep: None, sleeps: Arc::new(AtomicUsize::new(0)) };
+    let trig_t = Arc::new(AtomicUsize::new(0));
+    let mut bus_t = FaultInjectBus::new(raw_t.clone(), t_clock);
+    bus_t.estop_on_tx_ordinal = Some((estop_req_t.clone(), trig_t.clone()));
+    let mut drv_t = DamiaoArmDriver::new(bus_t.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_t.set_estop_gate(EstopGate::new(estop_req_t.clone(), estop_app_t));
+    drv_t.read_joint_states().unwrap();
+    drv_t.check_mapping_ranges();
+    drv_t.set_torque(true).unwrap();
+    bus_t.tx_calls.store(0, Ordering::SeqCst);
+    bus_t.flush_calls.store(0, Ordering::SeqCst);
+    estop_req_t.store(0, Ordering::SeqCst);
+    trig_t.store(7, Ordering::SeqCst); // latches during final frame #7!
+    let targets = vec![JointTarget::position(0.0); 7];
+    let err_t = drv_t.write_joint_targets(&targets).unwrap_err();
+    assert!(is_estop_inhibited(&err_t), "final-frame E-stop must return EstopInhibited, got {err_t:?}");
+    assert_eq!(bus_t.tx_calls.load(Ordering::SeqCst), 7);
+    assert_eq!(bus_t.flush_calls.load(Ordering::SeqCst), 0, "can.flush() must be skipped on final-frame E-stop");
+
+    // (b2) Fenced MIT target batch: E-stop arrives during the 7th (final) target transmit ->
+    // `write_joint_targets` MUST skip `can.flush()`, trip the MIT fence, and return `EstopInhibited`!
+    let raw_f = FakeBus::with_clock(&dm_limits(), base_clock.clone());
+    raw_f.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let estop_req_f = Arc::new(AtomicU64::new(0));
+    let estop_app_f = Arc::new(AtomicU64::new(0));
+    let f_clock = HookClock { inner: base_clock.clone(), on_sleep: None, sleeps: Arc::new(AtomicUsize::new(0)) };
+    let trig_f = Arc::new(AtomicUsize::new(0));
+    let mut bus_f = FaultInjectBus::new(raw_f.clone(), f_clock);
+    bus_f.estop_on_tx_ordinal = Some((estop_req_f.clone(), trig_f.clone()));
+    let mut drv_f = DamiaoArmDriver::new(bus_f.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_f.set_estop_gate(EstopGate::new(estop_req_f.clone(), estop_app_f));
+    drv_f.read_joint_states().unwrap();
+    drv_f.check_mapping_ranges();
+    drv_f.set_torque(true).unwrap();
+    drv_f.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(10));
+    bus_f.tx_calls.store(0, Ordering::SeqCst);
+    bus_f.flush_calls.store(0, Ordering::SeqCst);
+    estop_req_f.store(0, Ordering::SeqCst);
+    trig_f.store(7, Ordering::SeqCst); // latches during final frame #7!
+    let err_f = drv_f.write_joint_targets(&targets).unwrap_err();
+    assert!(is_estop_inhibited(&err_f), "fenced final-frame E-stop must return EstopInhibited, got {err_f:?}");
+    assert_eq!(bus_f.tx_calls.load(Ordering::SeqCst), 7);
+    assert_eq!(bus_f.flush_calls.load(Ordering::SeqCst), 0, "fenced can.flush() must be skipped on final-frame E-stop");
+    assert!(drv_f.mit_fence_trip().is_some(), "interrupted fenced batch must trip MIT fence");
+}
+
+// ============================================================================
+// 3. Bounded multi-slot off-thread fault reclamation + fail-closed when full
+// ============================================================================
+
+#[test]
+fn safety_multi_slot_off_thread_reclaim_preserves_consecutive_faults_and_fails_closed_when_full() {
+    let mut sm = SafetyManager::new();
+    sm.set_off_thread_reclaim(true);
+
+    // (a) Consecutive faults (`Other(String)` -> `ThermalTrip` -> `ClearFault`) without draining in between:
+    // neither slot overwrites the other, and `clear_fault` + popping retired arcs does 0 alloc/free!
+    sm.trigger_fault_coded(FaultCode::Other, FaultReason::Other("sole-ref hardware fault".into()));
+    let hw_arc_weak = Arc::downgrade(&sm.state_arc());
+    sm.trigger_fault_coded(
+        FaultCode::ThermalTrip,
+        FaultReason::ThermalTrip { joint_idx: 0, temperature: 95.0, limit: 85.0 },
+    );
+    assert!(hw_arc_weak.upgrade().is_some(), "consecutive ThermalTrip must NOT drop previous heap Fault");
+    assert_eq!(sm.retired_state_arcs_len(), 1);
+
+    armd::diagnostics::alloc::time_this_thread();
+    let _ = armd::diagnostics::alloc::take();
+    let cleared = sm.clear_fault().expect("clear_fault succeeds while reclaim ring has room");
+    let first = sm.pop_retired_state_arc();
+    let second = sm.pop_retired_state_arc();
+    let clear_allocs = armd::diagnostics::alloc::take();
+    assert_eq!(cleared, SafetyState::Idle);
+    assert_eq!(clear_allocs.calls, 0, "clear_fault + pop_retired_state_arc must do 0 alloc/free: {clear_allocs:?}");
+    assert!(matches!(first.as_deref(), Some(SafetyState::Fault(FaultReason::Other(s))) if s == "sole-ref hardware fault"));
+    assert!(matches!(second.as_deref(), Some(SafetyState::Fault(FaultReason::ThermalTrip { .. }))));
+    assert_eq!(sm.retired_state_arcs_len(), 0);
+    drop(first);
+    drop(second);
+    assert!(hw_arc_weak.upgrade().is_none(), "retired Fault dropped cleanly once released off-thread");
+
+    // (b) Fill all `RETIRED_STATE_CAPACITY` (16) slots + latch a 17th heap Fault -> FAIL CLOSED!
+    let mut weaks = Vec::new();
+    for i in 0..RETIRED_STATE_CAPACITY {
+        sm.trigger_fault_coded(FaultCode::Other, FaultReason::Other(format!("fault-{i}")));
+        weaks.push(Arc::downgrade(&sm.state_arc()));
+        sm.clear_fault().unwrap();
+    }
+    assert!(sm.retired_state_arcs_full());
+    assert_eq!(sm.retired_state_arcs_len(), RETIRED_STATE_CAPACITY);
+
+    sm.trigger_fault_coded(FaultCode::Other, FaultReason::Other("latched-17".into()));
+    let latched_weak = Arc::downgrade(&sm.state_arc());
+
+    // `clear_fault()` MUST fail closed: keep `latched-17` faulted and drop 0 retired arcs!
+    let err = sm.clear_fault().unwrap_err();
+    assert!(matches!(err, SafetyError::ClearFaultRejected(_)), "expected ClearFaultRejected when full, got {err:?}");
+    assert!(matches!(sm.state(), SafetyState::Fault(FaultReason::Other(s)) if s == "latched-17"));
+    assert_eq!(sm.retired_state_arcs_len(), RETIRED_STATE_CAPACITY);
+    assert!(weaks.iter().all(|w| w.upgrade().is_some()), "no queued Fault Arc may be overwritten/dropped");
+
+    // Heap-bearing faults (`Other(String)` and `JointLimitExceeded { joint_name: String }`) while full:
+    //   - `trigger_fault_coded_lazy` MUST NOT invoke the closure (0 alloc / 0 free!)
+    //   - `try_trigger_fault_coded` with a prebuilt heap FaultReason MUST return `Err((epoch, reason))`
+    //     without freeing `reason` on the RT thread (0 alloc / 0 free until dropped off-measurement!)
+    assert!(!sm.can_accept_fault_transition());
+    let ep_before = sm.epoch_id();
+    let lazy_called = AtomicBool::new(false);
+    let prebuilt_other = FaultReason::Other("prebuilt-heap-other-payload".into());
+    let prebuilt_jl = FaultReason::JointLimitExceeded {
+        joint_idx: 2,
+        joint_name: "prebuilt_joint_3_elbow".into(),
+        value: 3.1,
+        min: -2.0,
+        max: 2.0,
+    };
+    let _ = armd::diagnostics::alloc::take();
+    let ep_after_lazy = sm.trigger_fault_coded_lazy(FaultCode::Other, || {
+        lazy_called.store(true, Ordering::SeqCst);
+        FaultReason::Other("must-never-allocate".into())
+    });
+    let res_other = sm.try_trigger_fault_coded(FaultCode::Other, prebuilt_other);
+    let res_jl = sm.try_trigger_fault_coded(FaultCode::JointLimit, prebuilt_jl);
+    let ep_after_th = sm.trigger_fault_coded(
+        FaultCode::ThermalTrip,
+        FaultReason::ThermalTrip { joint_idx: 1, temperature: 96.0, limit: 85.0 },
+    );
+    let overflow_allocs = armd::diagnostics::alloc::take();
+    assert!(!lazy_called.load(Ordering::SeqCst), "lazy closure must not run when reclaim queue is full");
+    assert!(ep_after_lazy > ep_before);
+    assert!(ep_after_th > ep_after_lazy);
+    assert_eq!(
+        overflow_allocs.calls, 0,
+        "fail-closed lazy/fallible heap fault transitions while full must do 0 alloc/free: {overflow_allocs:?}"
+    );
+    let (_, ret_other) = res_other.expect_err("try_trigger_fault_coded must return Err when full");
+    let (_, ret_jl) = res_jl.expect_err("try_trigger_fault_coded(JointLimit) must return Err when full");
+    drop(ret_other);
+    drop(ret_jl);
+    assert!(matches!(sm.state(), SafetyState::Fault(FaultReason::Other(s)) if s == "latched-17"));
+    assert!(latched_weak.upgrade().is_some());
+
+    // Draining 1 slot off-thread restores room so `clear_fault()` now succeeds!
+    let popped = sm.pop_retired_state_arc().unwrap();
+    drop(popped);
+    assert_eq!(sm.clear_fault().unwrap(), SafetyState::Idle);
+    sm.drain_retired_state_arcs_off_thread();
+    assert!(latched_weak.upgrade().is_none());
+}
+
+// ============================================================================
+// 4. PositionLead enable completion on a sub-release wake: 0 alloc / 0 free
+// ============================================================================
+
+struct DelayedWakeDriver {
+    dof: usize,
+    confirm_delay: Duration,
+    states: Vec<JointState>,
+    enabled: bool,
+    pending: Option<(bool, Instant)>,
+}
+
+impl DelayedWakeDriver {
+    fn new(dof: usize, confirm_delay: Duration) -> Self {
+        Self {
+            dof,
+            confirm_delay,
+            states: vec![
+                JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 30.0 };
+                dof
+            ],
+            enabled: false,
+            pending: None,
+        }
+    }
+}
+
+impl ArmDriver for DelayedWakeDriver {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn enable_state(&self) -> EnableState {
+        if self.enabled { EnableState::Enabled } else { EnableState::Disabled }
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> { Ok(self.states.clone()) }
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        out.clear();
+        out.extend_from_slice(&self.states);
+        Ok(())
+    }
+    fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _: Instant, _: u16) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_into(out)?;
+        Ok((self.dof as u16, false))
+    }
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        out.clear();
+        out.extend_from_slice(&self.states);
+        Some(())
+    }
+    fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        self.enabled = enabled;
+        Ok(())
+    }
+    fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+        let ready_at = Instant::now() + self.confirm_delay;
+        self.pending = Some((enabled, ready_at));
+        Ok(TorqueProgress::Pending { wake: ready_at })
+    }
+    fn begin_torque_budgeted(&mut self, enabled: bool, _: u16) -> Result<TorqueProgress, ArmDriverError> {
+        self.begin_torque(enabled)
+    }
+    fn poll_torque(&mut self, _: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        let Some((enabled, ready_at)) = self.pending else {
+            return Err(ArmDriverError::Protocol("no transition".into()));
+        };
+        if Instant::now() >= ready_at {
+            self.pending = None;
+            self.enabled = enabled;
+            Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
+        } else {
+            Ok(TorqueProgress::Pending { wake: ready_at })
+        }
+    }
+    fn poll_torque_budgeted(&mut self, deadline: Instant, _: u16) -> Result<TorqueProgress, ArmDriverError> {
+        self.poll_torque(deadline)
+    }
+    fn torque_transition_pending(&self) -> bool { self.pending.is_some() }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.enabled }
+    fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { dof == self.dof }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { out.clear(); out.resize(self.dof, Some(Duration::from_millis(1))); }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { out.clear(); out.resize(self.dof, Some(1)); }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.resize(self.dof, Some(Instant::now())); }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); out.resize(self.dof, Some(Instant::now())); }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { out.clear(); }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { out.clear(); }
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { out.clear(); out.resize(self.dof, u8::from(self.enabled)); true }
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { out.clear(); false }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { out.clear(); }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn position_lead_enable_completion_on_sub_release_wake_does_zero_allocs() {
+    let mut cfg = ArmConfig::rebot_dm();
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true; // PositionLead on all 6 arm joints (no MIT joints -> admitted by RT gate!)
+    cfg.joint_tracking = Some(jt);
+
+    let drv = DelayedWakeDriver::new(7, Duration::from_millis(14));
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    let mut exec_cfg = ExecutorConfig::for_tests(Duration::from_millis(10));
+    exec_cfg.alloc_timing = true;
+    let handle = sup.start_executor(exec_cfg).await.expect("PositionLead profile admitted");
+    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 4).await;
+
+    // Cycle 1: enable completes on sub-release wake (`TrackingRuntime::seed()` + `arm_joints()`).
+    let r1 = submit_broker_transition(&handle, 1, TransitionOp::TorqueOn);
+    assert_eq!(wait_broker_terminal(&handle, r1, Duration::from_secs(2)), Outcome::Completed);
+    assert!(handle.stats().wakes.load(Ordering::Relaxed) >= 1, "expected >= 1 real sub-release wake");
+    assert_eq!(
+        handle.stats().wake_alloc_calls.load(Ordering::Relaxed),
+        0,
+        "PositionLead enable completion wake must perform 0 alloc/free"
+    );
+
+    // Cycle 2: disable (`invalidate()` parks spare buffers) -> re-enable (`seed()` reuses spares) -> STILL 0!
+    let r2 = submit_broker_transition(&handle, 2, TransitionOp::TorqueOff);
+    assert_eq!(wait_broker_terminal(&handle, r2, Duration::from_secs(2)), Outcome::Completed);
+    let r3 = submit_broker_transition(&handle, 3, TransitionOp::TorqueOn);
+    assert_eq!(wait_broker_terminal(&handle, r3, Duration::from_secs(2)), Outcome::Completed);
+    assert_eq!(
+        handle.stats().wake_alloc_calls.load(Ordering::Relaxed),
+        0,
+        "PositionLead disable -> re-enable wake cycle must perform 0 alloc/free"
+    );
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 5 & 6. SimArmDriver single transport writer + non-blocking RT reads
+// ============================================================================
+
+struct PollCountingSim {
+    addr: String,
+    stop: Arc<AtomicBool>,
+    polls_seen: Arc<AtomicUsize>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PollCountingSim {
+    fn start(dof: usize, init_q: Vec<f32>) -> Self {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = format!("udp://{}", sock.local_addr().unwrap());
+        sock.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let polls_seen = Arc::new(AtomicUsize::new(0));
+        let (stop_c, polls_c) = (stop.clone(), polls_seen.clone());
+        let thread = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut seq = 0u64;
+            let mut ack = 0u64;
+            let mut enabled = false;
+            while !stop_c.load(Ordering::Acquire) {
+                let Ok((n, peer)) = sock.recv_from(&mut buf) else { continue };
+                let Ok(cmd) = serde_json::from_slice::<SimCommand>(&buf[..n]) else { continue };
+                if cmd.kind == "poll" {
+                    polls_c.fetch_add(1, Ordering::SeqCst);
+                } else if cmd.kind == "cmd" {
+                    ack = cmd.seq;
+                    enabled = cmd.enable;
+                }
+                seq += 1;
+                let state = SimState {
+                    v: 1,
+                    kind: "state".into(),
+                    session: 1,
+                    seq,
+                    ack,
+                    enabled,
+                    q: init_q.clone(),
+                    dq: vec![0.0; dof],
+                    tau: vec![0.1; dof],
+                    temp: vec![30.0; dof],
+                    loads: None,
+                    t: seq as f64 * 0.01,
+                };
+                if let Ok(bytes) = serde_json::to_vec(&state) {
+                    let _ = sock.send_to(&bytes, peer);
+                }
+            }
+        });
+        Self { addr, stop, polls_seen, thread: Some(thread) }
+    }
+}
+
+impl Drop for PollCountingSim {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sim_driver_rt_single_transport_writer_and_nonblocking_under_contended_rx_lock() {
+    let init_q = vec![0.05, -0.02, 0.02, -0.02, 0.02, -0.02, 0.0];
+
+    // (a) Single transport writer under RT executor (through `ZeroOffsetDriver` delegation):
+    // after `start_executor`, `armd-sim-rx` sends ZERO keepalive polls across > 120 ms idle
+    // while `armd-control` sends keepalive polls and keeps fresh feedback alive!
+    let sim = PollCountingSim::start(7, init_q.clone());
+    let drv = SimArmDriver::connect(&sim.addr, 7).unwrap();
+    let rx_keepalives = drv.rx_keepalives_counter();
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg.alloc_timing = true;
+    let handle = sup.start_executor(cfg).await.unwrap();
+
+    // Wait 1 step so `set_rt_mode(true)` has completed before snapshotting counters.
+    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 3).await;
+    let rx_ka_at_handoff = rx_keepalives.load(Ordering::Acquire);
+    let sim_polls_at_handoff = sim.polls_seen.load(Ordering::Acquire);
+
+    // Stay completely idle (torque off, no commands) for 130 ms (> 6x the 20 ms keepalive period).
+    tokio::time::sleep(Duration::from_millis(130)).await;
+
+    assert_eq!(
+        rx_keepalives.load(Ordering::Acquire),
+        rx_ka_at_handoff,
+        "armd-sim-rx must send 0 keepalive datagrams after RT ownership transfer"
+    );
+    let owner_polls = sim.polls_seen.load(Ordering::Acquire) - sim_polls_at_handoff;
+    assert!(
+        owner_polls >= 3,
+        "RT owner (armd-control) must transmit keepalive polls during idle periods (saw {owner_polls})"
+    );
+    let obs = sup.observation().await.unwrap();
+    assert!(obs.feedback_valid, "owner-driven keepalives must keep simulator feedback fresh");
+    assert!((obs.positions[0] - 0.05).abs() < 1e-3);
+    handle.stop_and_join();
+
+    // (b) Non-blocking under contended RX mutex: hold the RX mutex on a helper thread while BOTH
+    // direct `read_joint_states_budgeted` AND live RT executor releases continue advancing on schedule!
+    let sim_b = PollCountingSim::start(7, init_q.clone());
+    let mut drv_b = SimArmDriver::connect(&sim_b.addr, 7).unwrap();
+    let rx_lock_b = drv_b.test_rx_lock_handle();
+    drv_b.set_rt_mode(true);
+    let mut states = Vec::with_capacity(7);
+    let mut ages = Vec::with_capacity(7);
+    let mut age_ms = Vec::with_capacity(7);
+    let mut instants = Vec::with_capacity(7);
+    let mut status = Vec::with_capacity(7);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        drv_b.read_joint_states_budgeted(&mut states, Instant::now() + Duration::from_millis(5), 64).unwrap();
+        if drv_b.is_feedback_valid() && (states[0].position - 0.05).abs() < 1e-3 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sim_b feedback did not arrive");
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Hold `shared` mutex from another thread while calling `&mut self` (`read_joint_states_budgeted`)
+    // AND `&self` RT methods -> MUST return immediately without blocking and do 0 alloc/free!
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (rel_tx, rel_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let holder = thread::spawn(move || {
+        let _g = rx_lock_b.lock();
+        let _ = held_tx.send(());
+        let _ = rel_rx.recv();
+    });
+    held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    armd::diagnostics::alloc::time_this_thread();
+    let _ = armd::diagnostics::alloc::take();
+    let t0 = Instant::now();
+    drv_b.read_joint_states_budgeted(&mut states, Instant::now() + Duration::from_millis(5), 64).unwrap();
+    assert_eq!(drv_b.enable_state(), EnableState::Disabled);
+    assert!(drv_b.is_feedback_valid());
+    assert!(drv_b.feedback_all_within(7, Duration::from_secs(1)));
+    assert_eq!(drv_b.rejected_datagrams(), 0);
+    drv_b.feedback_ages_into(&mut ages);
+    drv_b.feedback_age_ms_into(&mut age_ms);
+    drv_b.feedback_instants_into(&mut instants);
+    assert!(drv_b.motor_status_into(&mut status));
+    let elapsed = t0.elapsed();
+    let allocs = armd::diagnostics::alloc::take();
+    rel_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(elapsed < Duration::from_millis(10), "RT reads blocked behind RX lock: {elapsed:?}");
+    assert_eq!(allocs.calls, 0, "contended RT reads allocated: {allocs:?}");
+    assert!((states[0].position - 0.05).abs() < 1e-3);
+    assert_eq!(ages.len(), 7);
+    assert_eq!(status, vec![0u8; 7]);
+
+    // (b2) Keepalive startup handoff synchronization: pause inside the RX keepalive window while
+    // `set_rt_mode(true)` runs on another thread -> waits cleanly on the condvar (no priority
+    // inversion spin) and returns immediately once RX releases the keepalive guard!
+    let mut drv_ka = SimArmDriver::connect(&sim_b.addr, 7).unwrap();
+    let ka_guard = drv_ka.test_hold_rx_keepalive();
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let handoff_thread = thread::spawn(move || {
+        drv_ka.set_rt_mode(true);
+        let _ = done_tx.send(());
+    });
+    // While RX keepalive guard is held, `set_rt_mode(true)` MUST wait cleanly on the condvar.
+    assert!(
+        done_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+        "set_rt_mode(true) must wait until in-flight RX keepalive completes"
+    );
+    drop(ka_guard);
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("set_rt_mode(true) must wake immediately after RX keepalive finishes");
+    handoff_thread.join().unwrap();
+
+    // (c) Live RT executor releases continue advancing while the RX mutex is held continuously!
+    let sim_c = PollCountingSim::start(7, init_q);
+    let drv_c = SimArmDriver::connect(&sim_c.addr, 7).unwrap();
+    let rx_lock_c = drv_c.test_rx_lock_handle();
+    let sup_c = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_c)));
+    sup_c.set_lease_enabled(false).await;
+    let h_c = sup_c.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || {
+        h_c.observation().is_ok_and(|o| o.feedback_valid && (o.positions[0] - 0.05).abs() < 1e-3)
+    })
+    .await;
+    let (h2_tx, h2_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (r2_tx, r2_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let holder_c = thread::spawn(move || {
+        let _g = rx_lock_c.lock();
+        let _ = h2_tx.send(());
+        let _ = r2_rx.recv();
+    });
+    h2_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let steps_before = h_c.stats().steps.load(Ordering::Relaxed);
+    wait_until_async(Duration::from_secs(1), || {
+        h_c.stats().steps.load(Ordering::Relaxed) >= steps_before + 8
+    })
+    .await;
+    r2_tx.send(()).unwrap();
+    holder_c.join().unwrap();
+    h_c.stop_and_join();
+}
