@@ -237,22 +237,297 @@ impl SafetyError {
 
 /// Capacity of [`SafetyManager`]'s inline off-thread fault reclamation queue.
 pub const RETIRED_STATE_CAPACITY: usize = 16;
+/// Capacity of [`SafetyManager`]'s preallocated `Arc<SafetyState>` fault slot pool.
+pub const FAULT_ARC_POOL_CAPACITY: usize = 32;
+/// Capacity of [`SafetyManager`]'s bounded deferred safety log event ring.
+pub const SAFETY_LOG_CAPACITY: usize = 64;
+/// Maximum inline text bytes stored in a deferred safety log event's `FaultReason::Other`.
+pub const SAFETY_LOG_TEXT_CAPACITY: usize = 320;
+/// Maximum inline bytes stored for a joint name in a deferred safety log event.
+pub const SAFETY_JOINT_NAME_CAPACITY: usize = 64;
+
+/// Fixed-capacity UTF-8 text buffer stored inline without heap allocation.
+///
+/// Truncates cleanly at a UTF-8 character boundary if input exceeds `N` bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BoundedText<const N: usize> {
+    len: u16,
+    buf: [u8; N],
+}
+
+impl<const N: usize> BoundedText<N> {
+    /// Creates an empty buffer.
+    pub const fn empty() -> Self {
+        Self { len: 0, buf: [0u8; N] }
+    }
+
+    /// Copies `s` inline, truncating at a UTF-8 character boundary if longer than `N` bytes.
+    pub fn new(s: &str) -> Self {
+        let mut out = Self::empty();
+        out.push_str(s);
+        out
+    }
+
+    /// Appends as much of `s` as fits within `N` bytes without splitting a UTF-8 codepoint.
+    pub fn push_str(&mut self, s: &str) {
+        let used = usize::from(self.len);
+        let avail = N.saturating_sub(used);
+        if avail == 0 {
+            return;
+        }
+        let mut take = s.len().min(avail);
+        while take > 0 && !s.is_char_boundary(take) {
+            take -= 1;
+        }
+        self.buf[used..used + take].copy_from_slice(&s.as_bytes()[..take]);
+        self.len = (used + take) as u16;
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> Default for BoundedText<N> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<const N: usize> std::fmt::Debug for BoundedText<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl<const N: usize> std::fmt::Display for BoundedText<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<const N: usize> core::fmt::Write for BoundedText<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.push_str(s);
+        Ok(())
+    }
+}
+
+/// Stack-allocated mirror of [`FaultReason`] for zero-alloc deferred safety logging.
+///
+/// Its [`std::fmt::Debug`] formatting matches [`FaultReason`] character-for-character
+/// (up to [`SAFETY_LOG_TEXT_CAPACITY`] / [`SAFETY_JOINT_NAME_CAPACITY`] bytes).
+#[derive(Clone, Copy, PartialEq)]
+pub enum BoundedFaultReason {
+    JointLimitExceeded {
+        joint_idx: usize,
+        joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>,
+        value: f32,
+        min: f32,
+        max: f32,
+    },
+    ThermalTrip {
+        joint_idx: usize,
+        temperature: f32,
+        limit: f32,
+    },
+    BusLoss,
+    WatchdogTimeout,
+    Other(BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
+}
+
+impl BoundedFaultReason {
+    pub fn from_reason(reason: &FaultReason) -> Self {
+        match reason {
+            FaultReason::JointLimitExceeded {
+                joint_idx,
+                joint_name,
+                value,
+                min,
+                max,
+            } => Self::JointLimitExceeded {
+                joint_idx: *joint_idx,
+                joint_name: BoundedText::new(joint_name),
+                value: *value,
+                min: *min,
+                max: *max,
+            },
+            FaultReason::ThermalTrip {
+                joint_idx,
+                temperature,
+                limit,
+            } => Self::ThermalTrip {
+                joint_idx: *joint_idx,
+                temperature: *temperature,
+                limit: *limit,
+            },
+            FaultReason::BusLoss => Self::BusLoss,
+            FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::Other(m) => Self::Other(BoundedText::new(m)),
+        }
+    }
+}
+
+impl std::fmt::Debug for BoundedFaultReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JointLimitExceeded {
+                joint_idx,
+                joint_name,
+                value,
+                min,
+                max,
+            } => f
+                .debug_struct("JointLimitExceeded")
+                .field("joint_idx", joint_idx)
+                .field("joint_name", &joint_name.as_str())
+                .field("value", value)
+                .field("min", min)
+                .field("max", max)
+                .finish(),
+            Self::ThermalTrip {
+                joint_idx,
+                temperature,
+                limit,
+            } => f
+                .debug_struct("ThermalTrip")
+                .field("joint_idx", joint_idx)
+                .field("temperature", temperature)
+                .field("limit", limit)
+                .finish(),
+            Self::BusLoss => f.write_str("BusLoss"),
+            Self::WatchdogTimeout => f.write_str("WatchdogTimeout"),
+            Self::Other(m) => f.debug_tuple("Other").field(&m.as_str()).finish(),
+        }
+    }
+}
+
+/// Stack-allocated mirror of [`SafetyState`] for zero-alloc deferred safety logging.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundedSafetyState {
+    Booting,
+    Idle,
+    Armed,
+    Moving,
+    EStop,
+    Fault(BoundedFaultReason),
+}
+
+impl BoundedSafetyState {
+    pub fn from_state(state: &SafetyState) -> Self {
+        match state {
+            SafetyState::Booting => Self::Booting,
+            SafetyState::Idle => Self::Idle,
+            SafetyState::Armed => Self::Armed,
+            SafetyState::Moving => Self::Moving,
+            SafetyState::EStop => Self::EStop,
+            SafetyState::Fault(reason) => Self::Fault(BoundedFaultReason::from_reason(reason)),
+        }
+    }
+}
+
+/// Bounded, heap-free safety log event deferred from the control thread to an off-thread consumer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SafetyLogEvent {
+    EStop {
+        from: BoundedSafetyState,
+    },
+    Fault {
+        from: BoundedSafetyState,
+        reason: BoundedFaultReason,
+        code: FaultCode,
+    },
+    Cleared,
+}
+
+impl SafetyLogEvent {
+    /// Emits the exact tracing event on an off-RT thread.
+    pub fn emit(&self) {
+        match self {
+            Self::EStop { from } => {
+                tracing::warn!(target: "armd::safety", "Safety: {:?} -> EStop", from);
+            }
+            Self::Fault { from, reason, code } => {
+                tracing::warn!(
+                    target: "armd::safety",
+                    "Safety: {:?} -> Fault({:?}) [{code:?}]",
+                    from,
+                    reason
+                );
+            }
+            Self::Cleared => {
+                tracing::info!(target: "armd::safety", "Safety: cleared -> Idle");
+            }
+        }
+    }
+}
+
+/// Emits a warning off-thread when bounded deferred safety log events were dropped.
+pub fn emit_safety_log_dropped(dropped: u64) {
+    if dropped > 0 {
+        tracing::warn!(
+            target: "armd::safety",
+            "Safety log: {dropped} events dropped (safety log queue full)"
+        );
+    }
+}
 
 /// Safety Manager tracking safety state machine and command generation ID
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SafetyManager {
     state_arc: Arc<SafetyState>,
     idle_arc: Arc<SafetyState>,
     armed_arc: Arc<SafetyState>,
     moving_arc: Arc<SafetyState>,
     estop_arc: Arc<SafetyState>,
+    bus_loss_arc: Arc<SafetyState>,
+    watchdog_timeout_arc: Arc<SafetyState>,
+    fault_arc_pool: [Option<Arc<SafetyState>>; FAULT_ARC_POOL_CAPACITY],
+    fault_arc_pool_len: usize,
     retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
     retired_head: usize,
     retired_len: usize,
     off_thread_reclaim: bool,
+    deferred_logging: bool,
+    log_events: [Option<SafetyLogEvent>; SAFETY_LOG_CAPACITY],
+    log_head: usize,
+    log_len: usize,
+    log_dropped: u64,
     epoch_id: u64,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
+}
+
+impl Clone for SafetyManager {
+    fn clone(&self) -> Self {
+        Self {
+            state_arc: Arc::clone(&self.state_arc),
+            idle_arc: Arc::clone(&self.idle_arc),
+            armed_arc: Arc::clone(&self.armed_arc),
+            moving_arc: Arc::clone(&self.moving_arc),
+            estop_arc: Arc::clone(&self.estop_arc),
+            bus_loss_arc: Arc::clone(&self.bus_loss_arc),
+            watchdog_timeout_arc: Arc::clone(&self.watchdog_timeout_arc),
+            // Fresh unique pool slots so `Arc::get_mut` always succeeds on both instances.
+            fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
+            fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
+            retired_state_arcs: self.retired_state_arcs.clone(),
+            retired_head: self.retired_head,
+            retired_len: self.retired_len,
+            off_thread_reclaim: self.off_thread_reclaim,
+            deferred_logging: self.deferred_logging,
+            log_events: self.log_events,
+            log_head: self.log_head,
+            log_len: self.log_len,
+            log_dropped: self.log_dropped,
+            epoch_id: self.epoch_id,
+            fault_code: self.fault_code,
+        }
+    }
 }
 
 impl Default for SafetyManager {
@@ -264,10 +539,19 @@ impl Default for SafetyManager {
             armed_arc: Arc::new(SafetyState::Armed),
             moving_arc: Arc::new(SafetyState::Moving),
             estop_arc: Arc::new(SafetyState::EStop),
+            bus_loss_arc: Arc::new(SafetyState::Fault(FaultReason::BusLoss)),
+            watchdog_timeout_arc: Arc::new(SafetyState::Fault(FaultReason::WatchdogTimeout)),
+            fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
+            fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
             retired_state_arcs: std::array::from_fn(|_| None),
             retired_head: 0,
             retired_len: 0,
             off_thread_reclaim: false,
+            deferred_logging: false,
+            log_events: [None; SAFETY_LOG_CAPACITY],
+            log_head: 0,
+            log_len: 0,
+            log_dropped: 0,
             epoch_id: 1,
             fault_code: None,
         }
@@ -288,9 +572,80 @@ impl SafetyManager {
         Arc::clone(&self.state_arc)
     }
 
-    /// Enables bounded off-thread fault state reclamation (fail-closed when full) for RT executor mode.
+    /// Enables bounded off-thread fault state reclamation and deferred safety log formatting
+    /// (fail-closed when full) for RT executor mode.
     pub fn set_off_thread_reclaim(&mut self, enabled: bool) {
         self.off_thread_reclaim = enabled;
+        self.deferred_logging = enabled;
+    }
+
+    /// Enables or disables deferring safety transition log formatting to an off-thread consumer.
+    pub fn set_deferred_logging(&mut self, enabled: bool) {
+        self.deferred_logging = enabled;
+    }
+
+    /// True when safety transition log formatting is deferred through bounded events.
+    pub fn deferred_logging(&self) -> bool {
+        self.deferred_logging
+    }
+
+    /// Number of queued deferred safety log events awaiting off-thread emission.
+    pub fn log_events_len(&self) -> usize {
+        self.log_len
+    }
+
+    /// Pops the oldest deferred [`SafetyLogEvent`] for off-thread emission (0 alloc, 0 drop).
+    pub fn pop_log_event(&mut self) -> Option<SafetyLogEvent> {
+        if self.log_len == 0 {
+            return None;
+        }
+        let ev = self.log_events[self.log_head].take();
+        self.log_head = (self.log_head + 1) % SAFETY_LOG_CAPACITY;
+        self.log_len -= 1;
+        ev
+    }
+
+    /// Returns and resets the number of deferred safety log events dropped because the ring was full.
+    pub fn take_log_dropped(&mut self) -> u64 {
+        std::mem::replace(&mut self.log_dropped, 0)
+    }
+
+    /// Emits all queued deferred safety log events on a non-RT thread.
+    pub fn drain_log_events_off_thread(&mut self) {
+        let lost = self.take_log_dropped();
+        emit_safety_log_dropped(lost);
+        while let Some(ev) = self.pop_log_event() {
+            ev.emit();
+        }
+    }
+
+    fn queue_log_event(&mut self, ev: SafetyLogEvent) {
+        if self.log_len >= SAFETY_LOG_CAPACITY {
+            self.log_dropped = self.log_dropped.saturating_add(1);
+            return;
+        }
+        let tail = (self.log_head + self.log_len) % SAFETY_LOG_CAPACITY;
+        self.log_events[tail] = Some(ev);
+        self.log_len += 1;
+    }
+
+    /// Number of preallocated clean `Arc<SafetyState>` fault slots currently available.
+    pub fn fault_arc_pool_len(&self) -> usize {
+        self.fault_arc_pool_len
+    }
+
+    /// Returns a clean, uniquely owned `SafetyState::Idle` `Arc` recycled off-thread back into
+    /// the bounded fault slot pool. Callers on the RT thread must check
+    /// `self.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY` first so `arc` is never dropped on RT.
+    pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) {
+        if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY
+            && Arc::strong_count(&arc) == 1
+            && Arc::weak_count(&arc) == 0
+            && *arc == SafetyState::Idle
+        {
+            self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
+            self.fault_arc_pool_len += 1;
+        }
     }
 
     /// True when the inline fault reclamation ring is at capacity.
@@ -314,18 +669,56 @@ impl SafetyManager {
         arc
     }
 
-    /// Drops all queued retired fault states on a non-RT thread (legacy/pre-handoff cleanup).
+    /// Drops all queued retired fault states on a non-RT thread (legacy/pre-handoff cleanup),
+    /// recycling uniquely owned slots (no outstanding strong or weak handles) back to the pool.
     pub fn drain_retired_state_arcs_off_thread(&mut self) {
-        while let Some(arc) = self.pop_retired_state_arc() {
+        while let Some(mut arc) = self.pop_retired_state_arc() {
+            if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY {
+                if let Some(slot) = Arc::get_mut(&mut arc) {
+                    *slot = SafetyState::Idle;
+                    self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
+                    self.fault_arc_pool_len += 1;
+                    continue;
+                }
+            }
             drop(arc);
         }
     }
 
+    fn is_cached_fault_arc(&self, arc: &Arc<SafetyState>) -> bool {
+        Arc::ptr_eq(arc, &self.bus_loss_arc) || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
+    }
+
+    fn allocate_fault_arc(&mut self, reason: FaultReason) -> Result<Arc<SafetyState>, FaultReason> {
+        match reason {
+            FaultReason::BusLoss => Ok(Arc::clone(&self.bus_loss_arc)),
+            FaultReason::WatchdogTimeout => Ok(Arc::clone(&self.watchdog_timeout_arc)),
+            other => {
+                if self.fault_arc_pool_len > 0 {
+                    self.fault_arc_pool_len -= 1;
+                    if let Some(mut arc) = self.fault_arc_pool[self.fault_arc_pool_len].take() {
+                        if let Some(slot) = Arc::get_mut(&mut arc) {
+                            *slot = SafetyState::Fault(other);
+                            return Ok(arc);
+                        }
+                    }
+                }
+                if self.off_thread_reclaim && matches!(*self.state_arc, SafetyState::Fault(_)) {
+                    return Err(other);
+                }
+                Ok(Arc::new(SafetyState::Fault(other)))
+            }
+        }
+    }
+
     /// Replaces `state_arc` with `next`. When `off_thread_reclaim` is active and the current state
-    /// is a `Fault(_)`, queues the replaced `Arc` into `retired_state_arcs` without overwriting any
-    /// occupied slot; returns `false` (fail-closed, keeping the current `Fault` latched) if full.
+    /// is a non-cached `Fault(_)`, queues the replaced `Arc` into `retired_state_arcs` without
+    /// overwriting any occupied slot; returns `false` (fail-closed, keeping the current `Fault`
+    /// latched) if full.
     fn try_replace_state_arc(&mut self, next: Arc<SafetyState>) -> bool {
-        if self.off_thread_reclaim && matches!(*self.state_arc, SafetyState::Fault(_)) {
+        let needs_reclaim = matches!(*self.state_arc, SafetyState::Fault(_))
+            && !self.is_cached_fault_arc(&self.state_arc);
+        if self.off_thread_reclaim && needs_reclaim {
             if self.retired_len >= RETIRED_STATE_CAPACITY {
                 return false;
             }
@@ -335,7 +728,14 @@ impl SafetyManager {
             self.retired_len += 1;
             return true;
         }
-        self.state_arc = next;
+        let mut prev = std::mem::replace(&mut self.state_arc, next);
+        if !self.off_thread_reclaim && needs_reclaim && self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY {
+            if let Some(slot) = Arc::get_mut(&mut prev) {
+                *slot = SafetyState::Idle;
+                self.fault_arc_pool[self.fault_arc_pool_len] = Some(prev);
+                self.fault_arc_pool_len += 1;
+            }
+        }
         true
     }
 
@@ -345,10 +745,21 @@ impl SafetyManager {
 
     /// Advance epoch and latch E-Stop immediately
     pub fn trigger_e_stop(&mut self) -> u64 {
-        if *self.state_arc != SafetyState::EStop {
-            tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
+        let prev_not_estop = *self.state_arc != SafetyState::EStop;
+        if !self.deferred_logging {
+            if prev_not_estop {
+                tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
+            }
+            let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
+        } else {
+            let prev = prev_not_estop.then(|| BoundedSafetyState::from_state(&self.state_arc));
+            let replaced = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
+            if replaced {
+                if let Some(from) = prev {
+                    self.queue_log_event(SafetyLogEvent::EStop { from });
+                }
+            }
         }
-        let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
     }
@@ -383,17 +794,23 @@ impl SafetyManager {
     pub fn can_accept_fault_transition(&self) -> bool {
         !(self.off_thread_reclaim
             && matches!(*self.state_arc, SafetyState::Fault(_))
+            && !self.is_cached_fault_arc(&self.state_arc)
             && self.retired_len >= RETIRED_STATE_CAPACITY)
     }
 
-    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated while already
-    /// faulted, fails closed without invoking `make_reason` (0 heap alloc / 0 drop on RT).
+    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated (or the
+    /// bounded fault slot pool is empty while already faulted), fails closed without invoking
+    /// `make_reason` (0 heap alloc / 0 drop on RT).
     pub fn trigger_fault_coded_lazy(
         &mut self,
         code: FaultCode,
         make_reason: impl FnOnce() -> FaultReason,
     ) -> u64 {
-        if !self.can_accept_fault_transition() {
+        if !self.can_accept_fault_transition()
+            || (self.off_thread_reclaim
+                && matches!(*self.state_arc, SafetyState::Fault(_))
+                && self.fault_arc_pool_len == 0)
+        {
             self.epoch_id = self.epoch_id.wrapping_add(1);
             return self.epoch_id;
         }
@@ -411,9 +828,29 @@ impl SafetyManager {
             self.epoch_id = self.epoch_id.wrapping_add(1);
             return Err((self.epoch_id, reason));
         }
-        tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, reason);
+        let log_ev = if self.deferred_logging {
+            Some(SafetyLogEvent::Fault {
+                from: BoundedSafetyState::from_state(&self.state_arc),
+                reason: BoundedFaultReason::from_reason(&reason),
+                code,
+            })
+        } else {
+            None
+        };
+        let next_arc = match self.allocate_fault_arc(reason) {
+            Ok(arc) => arc,
+            Err(reason) => {
+                self.epoch_id = self.epoch_id.wrapping_add(1);
+                return Err((self.epoch_id, reason));
+            }
+        };
+        if let Some(ev) = log_ev {
+            self.queue_log_event(ev);
+        } else if let SafetyState::Fault(ref stored_reason) = *next_arc {
+            tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, stored_reason);
+        }
         self.fault_code = Some(code);
-        let replaced = self.try_replace_state_arc(Arc::new(SafetyState::Fault(reason)));
+        let replaced = self.try_replace_state_arc(next_arc);
         debug_assert!(replaced);
         self.epoch_id = self.epoch_id.wrapping_add(1);
         Ok(self.epoch_id)
@@ -437,7 +874,11 @@ impl SafetyManager {
                         "Fault state reclamation queue is full; retry after off-thread drain".into(),
                     ));
                 }
-                tracing::info!("Safety: cleared -> Idle");
+                if self.deferred_logging {
+                    self.queue_log_event(SafetyLogEvent::Cleared);
+                } else {
+                    tracing::info!("Safety: cleared -> Idle");
+                }
                 self.fault_code = None;
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(SafetyState::Idle)

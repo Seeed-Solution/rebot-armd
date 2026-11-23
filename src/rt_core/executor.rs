@@ -30,7 +30,7 @@ use super::urgent::StopRequests;
 use crate::diagnostics::tick::{LockPhases, ThreadUsage, TickSample, UsageMark};
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::persist::{PublishOutcome, StagedWrite};
-use crate::safety::{SafetyError, SafetyState};
+use crate::safety::{SafetyError, SafetyLogEvent, SafetyState, FAULT_ARC_POOL_CAPACITY, SAFETY_LOG_CAPACITY};
 use crate::supervisor::{ArmError, PendingZeroCheckPersist, SupervisorInner};
 
 /// Elapsed time above which a tick counts as late in the log (as in 1.5).
@@ -696,6 +696,9 @@ pub(crate) struct OffThreadSinks {
     diag_rx: Mutex<Consumer<TickSample>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
+    reclaim_return_tx: Mutex<Producer<Arc<SafetyState>>>,
+    safety_log_rx: Mutex<Consumer<SafetyLogEvent>>,
+    safety_log_dropped: Arc<AtomicU64>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
@@ -722,8 +725,24 @@ impl OffThreadSinks {
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
-            while let Ok(arc) = rx.pop() {
+            let mut ret_tx = self.reclaim_return_tx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(mut arc) = rx.pop() {
+                if !ret_tx.is_abandoned() && !ret_tx.is_full() {
+                    if let Some(slot) = Arc::get_mut(&mut arc) {
+                        *slot = SafetyState::Idle;
+                        let _ = ret_tx.push(arc);
+                        continue;
+                    }
+                }
                 drop(arc);
+            }
+        }
+        {
+            let lost = self.safety_log_dropped.swap(0, Ordering::Relaxed);
+            crate::safety::emit_safety_log_dropped(lost);
+            let mut log_rx = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(ev) = log_rx.pop() {
+                ev.emit();
             }
         }
         self.maint_client.drain_replies();
@@ -1082,6 +1101,9 @@ pub(crate) fn spawn_executor(
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
+    let (reclaim_return_tx, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(FAULT_ARC_POOL_CAPACITY);
+    let (safety_log_tx, safety_log_rx) = RingBuffer::<SafetyLogEvent>::new(SAFETY_LOG_CAPACITY);
+    let safety_log_dropped = Arc::new(AtomicU64::new(0));
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -1102,6 +1124,9 @@ pub(crate) fn spawn_executor(
         diag_rx: Mutex::new(diag_rx),
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
+        reclaim_return_tx: Mutex::new(reclaim_return_tx),
+        safety_log_rx: Mutex::new(safety_log_rx),
+        safety_log_dropped: safety_log_dropped.clone(),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -1158,6 +1183,9 @@ pub(crate) fn spawn_executor(
                 estop_ack_tx,
                 estop_overflow_gen,
                 reclaim_state_tx,
+                reclaim_return_rx,
+                safety_log_tx,
+                safety_log_dropped,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1239,6 +1267,9 @@ struct ControlState {
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_return_rx: Consumer<Arc<SafetyState>>,
+    safety_log_tx: Producer<SafetyLogEvent>,
+    safety_log_dropped: Arc<AtomicU64>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
@@ -1275,15 +1306,33 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots off `armd-control` into the bounded SPSC
-    /// reclamation ring (never pops when the ring is full so no `Arc` can drop on `armd-control`).
+    /// Moves retired fault `Arc<SafetyState>` snapshots and deferred [`SafetyLogEvent`]s off
+    /// `armd-control` into the bounded SPSC rings, and replenishes clean recycled fault slots
+    /// without allocating or dropping on `armd-control`.
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
+        while core.safety.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY {
+            let Ok(arc) = self.reclaim_return_rx.pop() else {
+                break;
+            };
+            core.safety.return_fault_arc(arc);
+        }
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
             let Some(arc) = core.safety.pop_retired_state_arc() else {
                 break;
             };
             let _ = self.reclaim_state_tx.push(arc);
+            drained = true;
+        }
+        let lost_inline = core.safety.take_log_dropped();
+        if lost_inline > 0 {
+            self.safety_log_dropped.fetch_add(lost_inline, Ordering::Relaxed);
+            drained = true;
+        }
+        while let Some(ev) = core.safety.pop_log_event() {
+            if self.safety_log_tx.push(ev).is_err() {
+                self.safety_log_dropped.fetch_add(1, Ordering::Relaxed);
+            }
             drained = true;
         }
         if drained {
@@ -2163,6 +2212,9 @@ fn control_thread_main(
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_return_rx: Consumer<Arc<SafetyState>>,
+    safety_log_tx: Producer<SafetyLogEvent>,
+    safety_log_dropped: Arc<AtomicU64>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2227,6 +2279,9 @@ fn control_thread_main(
         estop_ack_tx,
         estop_overflow_gen,
         reclaim_state_tx,
+        reclaim_return_rx,
+        safety_log_tx,
+        safety_log_dropped,
         maint_req_rx,
         maint_rep_tx,
         pending_maint_reply: None,
@@ -2783,6 +2838,8 @@ mod tests {
         let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (_, reclaim_return_rx) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (safety_log_tx, _) = RingBuffer::<SafetyLogEvent>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -2809,6 +2866,9 @@ mod tests {
             estop_ack_tx,
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
+            reclaim_return_rx,
+            safety_log_tx,
+            safety_log_dropped: Arc::new(AtomicU64::new(0)),
             maint_req_rx,
             maint_rep_tx,
             pending_maint_reply: None,
