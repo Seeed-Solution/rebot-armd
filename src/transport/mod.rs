@@ -33,6 +33,9 @@ pub enum TransportError {
     #[error("Operation would block")]
     WouldBlock,
 
+    #[error("Transmit queue full (ENOBUFS)")]
+    NoBufferSpace,
+
     #[error("Device not open")]
     NotOpen,
 
@@ -47,6 +50,15 @@ pub enum TransportError {
 
     #[error("Frame too short: expected at least {expected} bytes, got {actual}")]
     FrameTooShort { expected: usize, actual: usize },
+}
+
+impl TransportError {
+    /// Non-blocking TX queue backpressure (`EAGAIN`/`EWOULDBLOCK` or `ENOBUFS`): transient
+    /// queue-full condition rather than a hard transport failure.
+    #[inline]
+    pub fn is_tx_backpressure(&self) -> bool {
+        matches!(self, Self::WouldBlock | Self::NoBufferSpace)
+    }
 }
 
 /// Standard 8-byte CAN frame definition

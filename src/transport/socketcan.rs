@@ -105,13 +105,7 @@ impl CanTransport for SocketCanTransport {
 
         self.socket
             .write_frame(&SkCanFrame::Data(sk_frame))
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    TransportError::WouldBlock
-                } else {
-                    TransportError::Can(format!("SocketCAN send failed: {}", e))
-                }
-            })?;
+            .map_err(map_socketcan_tx_error)?;
 
         Ok(())
     }
@@ -170,6 +164,39 @@ impl CanTransport for SocketCanTransport {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+}
+
+/// Map a Linux SocketCAN transmit `io::Error` without heap allocation on backpressure
+/// (`EAGAIN`/`EWOULDBLOCK` and `ENOBUFS`).
+#[cfg(target_os = "linux")]
+fn map_socketcan_tx_error(e: std::io::Error) -> TransportError {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        TransportError::WouldBlock
+    } else if e.raw_os_error() == Some(libc::ENOBUFS) {
+        TransportError::NoBufferSpace
+    } else {
+        TransportError::Can(format!("SocketCAN send failed: {}", e))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socketcan_tx_error_classifies_would_block_and_enobufs() {
+        let wb = map_socketcan_tx_error(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert!(matches!(wb, TransportError::WouldBlock));
+        assert!(wb.is_tx_backpressure());
+
+        let nb = map_socketcan_tx_error(std::io::Error::from_raw_os_error(libc::ENOBUFS));
+        assert!(matches!(nb, TransportError::NoBufferSpace));
+        assert!(nb.is_tx_backpressure());
+
+        let other = map_socketcan_tx_error(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(matches!(other, TransportError::Can(_)));
+        assert!(!other.is_tx_backpressure());
     }
 }
 
