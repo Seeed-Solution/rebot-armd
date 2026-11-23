@@ -2207,3 +2207,174 @@ fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
         );
     }
 }
+
+// 17. Item 2 (E-stop intake): off-reader auth, bounded O(1) registry, and urgent replies flushed
+//     BEFORE fatal error + Close when a blocked writer recovers, or E-stop visible in CloseFrame
+//     reason when a blocked writer never recovers within bounded grace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn estop_intake_blocked_writer_recovers_vs_never_recovers_and_off_reader_auth() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // (a) Blocked writer that RECOVERS before grace: queued E-stop & Stop replies MUST arrive
+    //     BEFORE the fatal OUTBOUND_QUEUE_FULL error frame and BEFORE Close.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn_id.clone());
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+        // Trigger one ordinary reply so writer enters `write_ws_frame` and blocks.
+        send(&mut ws, json!({"type": "command", "request_id": 7000, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {"target_positions": [0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+        // Send urgent Stop + urgent E-stop while writer is blocked.
+        send(&mut ws, json!({"type": "command", "request_id": 7001, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+        let t_estop = Instant::now();
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(80), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+        assert!(t_estop.elapsed() < Duration::from_millis(80), "E-stop did not latch immediately");
+        wait_until(Duration::from_secs(1), || sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)).await;
+
+        // Overflow ordinary outbound queue (64 capacity + extra) to trigger FatalClose::outbound_queue_full().
+        for k in 0..70u64 {
+            send(&mut ws, json!({"type": "command", "request_id": 7100 + k, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}})).await;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Writer recovers within grace: urgent replies MUST flush BEFORE fatal error and Close.
+        armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+        let mut estop_idx: Option<usize> = None;
+        let mut stop_idx: Option<usize> = None;
+        let mut fatal_idx: Option<usize> = None;
+        let mut close_idx: Option<usize> = None;
+        let mut idx = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if v["type"] == "epoch_sync" && v["safety_state"] == "EStop" && estop_idx.is_none() {
+                        estop_idx = Some(idx);
+                    }
+                    if (v["type"] == "command_ack" || v["type"] == "command_reject") && v["request_id"] == 7001 && stop_idx.is_none() {
+                        stop_idx = Some(idx);
+                    }
+                    if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" && fatal_idx.is_none() {
+                        fatal_idx = Some(idx);
+                    }
+                    idx += 1;
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    close_idx = Some(idx);
+                    break;
+                }
+                Ok(None) | Ok(Some(Err(_))) => break,
+                _ => {}
+            }
+        }
+        let ei = estop_idx.expect("E-stop epoch_sync must be delivered when writer recovers");
+        let si = stop_idx.expect("Stop reply must be delivered when writer recovers");
+        let fi = fatal_idx.expect("fatal OUTBOUND_QUEUE_FULL error frame must be delivered");
+        let ci = close_idx.expect("Close frame must follow fatal error frame");
+        assert!(ei < fi && fi < ci, "expected estop({ei}) < fatal({fi}) < close({ci})");
+        assert!(si < fi && fi < ci, "expected stop({si}) < fatal({fi}) < close({ci})");
+        assert!(sup.e_stop_latched.load(Ordering::SeqCst));
+        assert_eq!(*sup.inner().read().await.safety.state(), SafetyState::EStop);
+    }
+
+    // (b1) Blocked writer that NEVER recovers (write timeout): E-stop still latches immediately
+    //      and client sees ESTOP_LATCHED in the CloseFrame reason after bounded grace.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn_id.clone());
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(120)));
+        armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+        send(&mut ws, json!({"type": "command", "request_id": 8000, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(80), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+        wait_until(Duration::from_secs(1), || sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)).await;
+
+        // Never unpause writer: connection must close after grace with ESTOP_LATCHED in CloseFrame reason.
+        let mut close_reason: Option<String> = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                    close_reason = Some(cf.reason.to_string());
+                    break;
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => break,
+            }
+        }
+        let reason = close_reason.expect("client must observe CloseFrame reason when blocked writer times out");
+        assert!(reason.contains("ESTOP_LATCHED"), "expected ESTOP_LATCHED in close reason, got {reason:?}");
+        assert!(sup.e_stop_latched.load(Ordering::SeqCst));
+        assert_eq!(*sup.inner().read().await.safety.state(), SafetyState::EStop);
+        wait_until(Duration::from_secs(1), || sup.inner().try_read().is_ok_and(|g| g.active_lease.is_none())).await;
+    }
+
+    // (b2) Blocked writer that NEVER recovers + fatal overflow: E-stop latched and visible in CloseFrame reason.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn_id.clone());
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(140)));
+        armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+        send(&mut ws, json!({"type": "command", "request_id": 8100, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(80), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+        for k in 0..70u64 {
+            send(&mut ws, json!({"type": "command", "request_id": 8101 + k, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {}})).await;
+        }
+
+        let mut close_reason: Option<String> = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                    close_reason = Some(cf.reason.to_string());
+                    break;
+                }
+                Ok(Some(Ok(_))) => {}
+                _ => break,
+            }
+        }
+        let reason = close_reason.expect("client must observe CloseFrame reason on fatal close while permanently blocked");
+        assert!(reason.contains("ESTOP_LATCHED"), "expected ESTOP_LATCHED in close reason, got {reason:?}");
+        assert!(sup.e_stop_latched.load(Ordering::SeqCst));
+        wait_until(Duration::from_secs(1), || sup.inner().try_read().is_ok_and(|g| g.active_lease.is_none())).await;
+    }
+
+    // (c) Off-reader auth task: auth messages succeed via dedicated `auth_task`, never blocking reader.
+    {
+        let auth = OperatorAuth::enforced("1234", 300);
+        let (tok, _) = auth.unlock("1234").unwrap();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, armd::create_router_with_auth(sup, auth)).await.unwrap();
+        });
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        let ack = ws_reply(&mut ws, json!({"type": "auth", "seq": 7, "token": tok}), &["auth_ack"]).await;
+        assert_eq!(ack["seq"], 7, "{ack}");
+        assert_eq!(ack["role"], "operator", "{ack}");
+    }
+}

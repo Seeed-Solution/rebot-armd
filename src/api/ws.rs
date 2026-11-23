@@ -31,7 +31,7 @@ pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>
 static CONNECTION_REGISTRY: LazyLock<ConnectionRegistry> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-type FatalCloserEntry = (mpsc::Sender<FatalClose>, Arc<AtomicBool>);
+type FatalCloserEntry = (mpsc::Sender<FatalClose>, Arc<AtomicBool>, Arc<tokio::sync::Notify>);
 
 static CONNECTION_CLOSERS: LazyLock<Mutex<HashMap<String, FatalCloserEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -378,21 +378,42 @@ impl FatalClose {
         }
     }
 
-    fn error_value(&self) -> Value {
-        json!({
+    fn error_value(&self, estop_latched: bool) -> Value {
+        let mut v = json!({
             "type": "error",
             "status": 503,
             "code": self.code,
             "error": self.code,
             "message": self.message,
-        })
+        });
+        if estop_latched {
+            v["estop_latched"] = json!(true);
+        }
+        v
     }
 
-    fn close_frame(&self) -> CloseFrame {
+    fn close_frame(&self, estop_latched: bool) -> CloseFrame {
+        let reason = if estop_latched {
+            format!("ESTOP_LATCHED:{}", self.code)
+        } else {
+            self.code.to_string()
+        };
         CloseFrame {
             code: 1013,
-            reason: self.code.into(),
+            reason: reason.into(),
         }
+    }
+}
+
+struct InFlightUrgentGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InFlightUrgentGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 }
 
@@ -404,11 +425,17 @@ struct WsWriterHandle {
     ordinary_tx: mpsc::Sender<Value>,
     fatal_tx: mpsc::Sender<FatalClose>,
     fatal_triggered: Arc<AtomicBool>,
+    fatal_notify: Arc<tokio::sync::Notify>,
+    estop_admitted_count: Arc<AtomicU64>,
+    in_flight_estops: Arc<AtomicUsize>,
+    in_flight_stops: Arc<AtomicUsize>,
+    urgent_done_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WsWriterHandle {
     fn trigger_fatal(&self, fatal: FatalClose) {
         self.fatal_triggered.store(true, Ordering::Release);
+        self.fatal_notify.notify_waiters();
         let _ = self.fatal_tx.try_send(fatal);
     }
 
@@ -416,16 +443,46 @@ impl WsWriterHandle {
         self.fatal_triggered.load(Ordering::Acquire)
     }
 
-    /// Non-blocking `auth_ack` send via its dedicated reserved queue (isolated from ordinary backlog).
-    fn try_send_auth(&self, reply: Value) -> bool {
+    fn mark_estop_admitted(&self) {
+        self.estop_admitted_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn enter_in_flight_estop(&self) -> InFlightUrgentGuard {
+        self.in_flight_estops.fetch_add(1, Ordering::SeqCst);
+        InFlightUrgentGuard {
+            counter: self.in_flight_estops.clone(),
+            notify: self.urgent_done_notify.clone(),
+        }
+    }
+
+    fn enter_in_flight_stop(&self) -> InFlightUrgentGuard {
+        self.in_flight_stops.fetch_add(1, Ordering::SeqCst);
+        InFlightUrgentGuard {
+            counter: self.in_flight_stops.clone(),
+            notify: self.urgent_done_notify.clone(),
+        }
+    }
+
+    /// `auth_ack` send from the off-reader auth task via its dedicated reserved queue.
+    async fn send_auth(&self, reply: Value) -> bool {
         if self.is_fatal() {
             return false;
         }
         match self.auth_tx.try_send(reply) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.trigger_fatal(FatalClose::outbound_queue_full());
-                false
+            Err(mpsc::error::TrySendError::Full(reply)) => {
+                tokio::task::yield_now().await;
+                if self.is_fatal() {
+                    return false;
+                }
+                match self.auth_tx.try_send(reply) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        self.trigger_fatal(FatalClose::outbound_queue_full());
+                        false
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
@@ -561,12 +618,18 @@ impl ActionTerminalTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteErr {
+    Timeout,
+    Closed,
+}
+
 async fn write_ws_frame(
     connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: Message,
     timeout_dur: Duration,
-) -> Result<(), ()> {
+) -> Result<(), WriteErr> {
     tokio::time::timeout(timeout_dur, async {
         if TEST_WS_WRITE_HOOKS_ACTIVE.load(Ordering::Acquire) {
             let is_paused = || {
@@ -604,26 +667,196 @@ async fn write_ws_frame(
         sender.send(msg).await
     })
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+    .map_err(|_| WriteErr::Timeout)?
+    .map_err(|_| WriteErr::Closed)
 }
 
-async fn write_fatal_and_close(
+async fn write_ws_frame_bounded(
+    connection_id: &str,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: Message,
+    timeout_dur: Duration,
+    fatal_triggered: &AtomicBool,
+    fatal_notify: &tokio::sync::Notify,
+) -> Result<(), WriteErr> {
+    let write_fut = write_ws_frame(connection_id, sender, msg, timeout_dur);
+    let fatal_grace = timeout_dur
+        .min(WS_FATAL_FLUSH_TIMEOUT)
+        .saturating_sub(Duration::from_millis(80))
+        .max(Duration::from_millis(20));
+    tokio::select! {
+        res = write_fut => res,
+        _ = async {
+            if !fatal_triggered.load(Ordering::Acquire) {
+                fatal_notify.notified().await;
+            }
+            tokio::time::sleep(fatal_grace).await;
+        } => Err(WriteErr::Timeout),
+    }
+}
+
+async fn send_best_effort_close(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    frame: CloseFrame,
+) {
+    let _ = tokio::time::timeout(Duration::from_millis(50), sender.send(Message::Close(Some(frame)))).await;
+}
+
+async fn send_timeout_close(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    undelivered_estop: bool,
+) {
+    let reason = if undelivered_estop {
+        "ESTOP_LATCHED:WRITE_TIMEOUT"
+    } else {
+        "WRITE_TIMEOUT"
+    };
+    send_best_effort_close(
+        sender,
+        CloseFrame {
+            code: 1013,
+            reason: reason.into(),
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_urgent_then_fatal_and_close(
     connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     fatal: &FatalClose,
+    last_wire_epoch: &mut Option<(u64, Option<Value>)>,
+    estop_out_rx: &mut mpsc::Receiver<Value>,
+    stop_out_rx: &mut mpsc::Receiver<Value>,
+    estop_admitted_count: &AtomicU64,
+    estop_replies_delivered: &mut u64,
+    in_flight_estops: &AtomicUsize,
+    in_flight_stops: &AtomicUsize,
+    urgent_done_notify: &tokio::sync::Notify,
 ) {
     let grace = ws_write_timeout(connection_id).min(WS_FATAL_FLUSH_TIMEOUT);
     let deadline = tokio::time::Instant::now() + grace;
     let rem = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let r1 = rem();
-    if !r1.is_zero() {
-        let _ = write_ws_frame(connection_id, sender, Message::Text(fatal.error_value().to_string().into()), r1).await;
+    let mut write_failed = false;
+
+    // 1. Flush all already-queued urgent E-stop and Stop replies BEFORE fatal error + Close.
+    while !write_failed {
+        if let Ok(mut val) = estop_out_rx.try_recv() {
+            let r = rem();
+            if r.is_zero() {
+                write_failed = true;
+                break;
+            }
+            enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_ok() {
+                *estop_replies_delivered += 1;
+            } else {
+                write_failed = true;
+            }
+        } else if let Ok(mut val) = stop_out_rx.try_recv() {
+            let r = rem();
+            if r.is_zero() {
+                write_failed = true;
+                break;
+            }
+            enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_err() {
+                write_failed = true;
+            }
+        } else {
+            break;
+        }
     }
-    let r2 = rem();
-    if !r2.is_zero() {
-        let _ = write_ws_frame(connection_id, sender, Message::Close(Some(fatal.close_frame())), r2).await;
+
+    // 2. If urgent E-stop/Stop replies admitted before close are still in-flight, wait within
+    //    the same bounded grace so they flush BEFORE the fatal error frame and Close.
+    while !write_failed
+        && (in_flight_estops.load(Ordering::SeqCst) > 0 || in_flight_stops.load(Ordering::SeqCst) > 0)
+    {
+        let r = rem();
+        if r.is_zero() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            msg = estop_out_rx.recv() => match msg {
+                Some(mut val) => {
+                    let r2 = rem();
+                    if r2.is_zero() { write_failed = true; break; }
+                    enforce_monotonic_epoch(last_wire_epoch, &mut val);
+                    if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r2).await.is_ok() {
+                        *estop_replies_delivered += 1;
+                    } else {
+                        write_failed = true;
+                    }
+                }
+                None => break,
+            },
+            msg = stop_out_rx.recv() => match msg {
+                Some(mut val) => {
+                    let r2 = rem();
+                    if r2.is_zero() { write_failed = true; break; }
+                    enforce_monotonic_epoch(last_wire_epoch, &mut val);
+                    if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r2).await.is_err() {
+                        write_failed = true;
+                    }
+                }
+                None => break,
+            },
+            _ = urgent_done_notify.notified() => {}
+            _ = tokio::time::sleep(r) => { break; }
+        }
     }
+
+    // Drain any final urgent reply pushed right before the in-flight guard dropped.
+    while !write_failed {
+        if let Ok(mut val) = estop_out_rx.try_recv() {
+            let r = rem();
+            if r.is_zero() { write_failed = true; break; }
+            enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_ok() {
+                *estop_replies_delivered += 1;
+            } else {
+                write_failed = true;
+            }
+        } else if let Ok(mut val) = stop_out_rx.try_recv() {
+            let r = rem();
+            if r.is_zero() { write_failed = true; break; }
+            enforce_monotonic_epoch(last_wire_epoch, &mut val);
+            if write_ws_frame(connection_id, sender, Message::Text(val.to_string().into()), r).await.is_err() {
+                write_failed = true;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let undelivered_estop = estop_admitted_count.load(Ordering::SeqCst) > *estop_replies_delivered;
+    let close_frame = fatal.close_frame(undelivered_estop);
+    if !write_failed {
+        let r1 = rem();
+        if !r1.is_zero() {
+            let _ = write_ws_frame(
+                connection_id,
+                sender,
+                Message::Text(fatal.error_value(undelivered_estop).to_string().into()),
+                r1,
+            )
+            .await;
+        }
+        let r2 = rem();
+        if !r2.is_zero()
+            && write_ws_frame(connection_id, sender, Message::Close(Some(close_frame.clone())), r2)
+                .await
+                .is_ok()
+        {
+            return;
+        }
+    }
+    // Grace expired or writer stayed blocked: attempt one bounded direct Close frame so any
+    // undelivered E-stop remains visible to the client in the CloseFrame reason.
+    send_best_effort_close(sender, close_frame).await;
 }
 
 /// Dedicated latest-wins heartbeat handoff isolated from the bounded ordinary queue and slow worker tasks.
@@ -1364,9 +1597,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let (estop_out_tx, mut estop_out_rx) = mpsc::channel::<Value>(URGENT_OUT_CAPACITY);
     let (stop_out_tx, mut stop_out_rx) = mpsc::channel::<Value>(URGENT_OUT_CAPACITY);
     let (auth_out_tx, mut auth_out_rx) = mpsc::channel::<Value>(AUTH_OUT_CAPACITY);
+    let (auth_in_tx, mut auth_in_rx) = mpsc::channel::<Value>(AUTH_OUT_CAPACITY);
     let (ordinary_out_tx, mut ordinary_out_rx) = mpsc::channel::<Value>(ORDINARY_OUT_CAPACITY);
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<FatalClose>(1);
     let fatal_triggered = Arc::new(AtomicBool::new(false));
+    let fatal_notify = Arc::new(tokio::sync::Notify::new());
+    let estop_admitted_count = Arc::new(AtomicU64::new(0));
+    let in_flight_estops = Arc::new(AtomicUsize::new(0));
+    let in_flight_stops = Arc::new(AtomicUsize::new(0));
+    let urgent_done_notify = Arc::new(tokio::sync::Notify::new());
     let writer = WsWriterHandle {
         estop_tx: estop_out_tx,
         stop_tx: stop_out_tx,
@@ -1374,6 +1613,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         ordinary_tx: ordinary_out_tx,
         fatal_tx: fatal_tx.clone(),
         fatal_triggered: fatal_triggered.clone(),
+        fatal_notify: fatal_notify.clone(),
+        estop_admitted_count: estop_admitted_count.clone(),
+        in_flight_estops: in_flight_estops.clone(),
+        in_flight_stops: in_flight_stops.clone(),
+        urgent_done_notify: urgent_done_notify.clone(),
     };
 
     // This identity never comes from a client payload and is never disclosed.
@@ -1410,7 +1654,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     {
         let mut closers = CONNECTION_CLOSERS.lock().unwrap_or_else(|e| e.into_inner());
-        closers.insert(connection.clone(), (fatal_tx, fatal_triggered.clone()));
+        closers.insert(connection.clone(), (fatal_tx, fatal_triggered.clone(), fatal_notify.clone()));
     }
 
     struct ConnectionGuard(String);
@@ -1426,12 +1670,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Task 3: Writer task with urgent-first priority, causal grant-before-loss ordering, monotonic
     // wire epoch guard, action-terminal preservation (never skipped by latest-wins telemetry),
-    // explicit error close on control queue saturation (<= 1 s grace), and bounded write timeout.
+    // explicit error close on control queue saturation (<= 1 s grace, flushing queued urgent
+    // replies BEFORE fatal error + Close), and bounded write timeout.
     let writer_connection = connection.clone();
+    let writer_fatal_triggered = fatal_triggered.clone();
+    let writer_fatal_notify = fatal_notify.clone();
+    let writer_estop_admitted = estop_admitted_count.clone();
+    let writer_in_flight_estops = in_flight_estops.clone();
+    let writer_in_flight_stops = in_flight_stops.clone();
+    let writer_urgent_notify = urgent_done_notify.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut last_sent: Option<f64> = None;
         let mut last_wire_epoch: Option<(u64, Option<Value>)> = None;
         let mut max_granted_gen: u64 = 0;
+        let mut estop_replies_delivered: u64 = 0;
         let mut deferred_losses: VecDeque<(u64, Message)> = VecDeque::new();
         let mut terminal_tracker = ActionTerminalTracker::new();
         let mut pending_terminals: VecDeque<crate::model::ArmObservation> = VecDeque::new();
@@ -1439,10 +1691,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let (mut rev_closed, mut estop_closed, mut stop_closed, mut auth_closed, mut ord_closed) =
             (false, false, false, false, false);
         loop {
-            if let Ok(fatal) = fatal_rx.try_recv() {
-                write_fatal_and_close(&writer_connection, &mut sender, &fatal).await;
-                break;
-            }
             if rev_closed && estop_closed && stop_closed && auth_closed && ord_closed {
                 break;
             }
@@ -1453,7 +1701,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if let Some(loss_gen) = extract_lease_loss_gen(&msg).filter(|&g| g > max_granted_gen) {
                             // Causal order: hold a preemption loss until its lease_granted is written.
                             deferred_losses.push_back((loss_gen, msg));
-                        } else if write_ws_frame(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection)).await.is_err() {
+                        } else if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                            if e == WriteErr::Timeout {
+                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                            }
                             break;
                         }
                     }
@@ -1462,27 +1713,58 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 reply = estop_out_rx.recv(), if !estop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        match write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                            Ok(()) => { estop_replies_delivered += 1; }
+                            Err(e) => {
+                                if e == WriteErr::Timeout {
+                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                }
+                                break;
+                            }
+                        }
                     }
                     None => { estop_closed = true; }
                 },
                 reply = stop_out_rx.recv(), if !stop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                            if e == WriteErr::Timeout {
+                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                            }
+                            break;
+                        }
                     }
                     None => { stop_closed = true; }
                 },
                 fatal = fatal_rx.recv() => match fatal {
                     Some(fatal) => {
-                        write_fatal_and_close(&writer_connection, &mut sender, &fatal).await;
+                        flush_urgent_then_fatal_and_close(
+                            &writer_connection,
+                            &mut sender,
+                            &fatal,
+                            &mut last_wire_epoch,
+                            &mut estop_out_rx,
+                            &mut stop_out_rx,
+                            &writer_estop_admitted,
+                            &mut estop_replies_delivered,
+                            &writer_in_flight_estops,
+                            &writer_in_flight_stops,
+                            &writer_urgent_notify,
+                        )
+                        .await;
                         break;
                     }
                     None => break,
                 },
                 reply = auth_out_rx.recv(), if !auth_closed => match reply {
                     Some(val) => {
-                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                            if e == WriteErr::Timeout {
+                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                            }
+                            break;
+                        }
                     }
                     None => { auth_closed = true; }
                 },
@@ -1494,16 +1776,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             None
                         };
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                            if e == WriteErr::Timeout {
+                                send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                            }
+                            break;
+                        }
                         if let Some(g) = granted_gen {
                             max_granted_gen = max_granted_gen.max(g);
-                            let mut write_failed = false;
+                            let mut write_failed = None;
                             let n = deferred_losses.len();
                             for _ in 0..n {
                                 if let Some((lg, lmsg)) = deferred_losses.pop_front() {
                                     if lg <= max_granted_gen {
-                                        if write_ws_frame(&writer_connection, &mut sender, lmsg, ws_write_timeout(&writer_connection)).await.is_err() {
-                                            write_failed = true;
+                                        if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, lmsg, ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                                            write_failed = Some(e);
                                             break;
                                         }
                                     } else {
@@ -1511,7 +1798,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     }
                                 }
                             }
-                            if write_failed { break; }
+                            if let Some(e) = write_failed {
+                                if e == WriteErr::Timeout {
+                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                }
+                                break;
+                            }
                         }
                     }
                     None => { ord_closed = true; }
@@ -1519,7 +1811,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 _ = std::future::ready(()), if !pending_terminals.is_empty() => {
                     if let Some(obs) = pending_terminals.pop_front() {
                         if let Ok(text) = serde_json::to_string(&obs) {
-                            if write_ws_frame(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                            if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                                if e == WriteErr::Timeout {
+                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                }
+                                break;
+                            }
                         }
                     }
                 },
@@ -1530,7 +1827,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             last_sent = Some(obs.timestamp);
                         }
                         if let Ok(text) = serde_json::to_string(&obs) {
-                            if write_ws_frame(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                            if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
+                                if e == WriteErr::Timeout {
+                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
+                                }
+                                break;
+                            }
                         }
                     }
                 },
@@ -1557,13 +1859,47 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                         }
                         if overflowed {
-                            write_fatal_and_close(&writer_connection, &mut sender, &FatalClose::outbound_queue_full()).await;
+                            flush_urgent_then_fatal_and_close(
+                                &writer_connection,
+                                &mut sender,
+                                &FatalClose::outbound_queue_full(),
+                                &mut last_wire_epoch,
+                                &mut estop_out_rx,
+                                &mut stop_out_rx,
+                                &writer_estop_admitted,
+                                &mut estop_replies_delivered,
+                                &writer_in_flight_estops,
+                                &writer_in_flight_stops,
+                                &writer_urgent_notify,
+                            )
+                            .await;
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                     Err(_) => break,
                 }
+            }
+        }
+    });
+
+    // Dedicated off-reader auth verification task so `OperatorAuth::status` session-table
+    // pruning never stalls urgent E-stop/Stop frame classification in `reader_task`.
+    let auth_ws_auth = ws_auth.clone();
+    let auth_writer = writer.clone();
+    let mut auth_task = tokio::spawn(async move {
+        while let Some(value) = auth_in_rx.recv().await {
+            let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
+            let status = auth_ws_auth.update_token(next_token);
+            let reply = json!({
+                "type": "auth_ack",
+                "seq": value.get("seq"),
+                "auth_enforced": status.auth_enforced,
+                "role": status.role,
+                "expires_in_s": status.expires_in_s
+            });
+            if !auth_writer.send_auth(reply).await {
+                break;
             }
         }
     });
@@ -1629,7 +1965,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let reader_in_flight_stop = in_flight_stop.clone();
     let reader_ordinary_queue = ordinary_queue.clone();
     let reader_heartbeat_slot = heartbeat_slot.clone();
-    let reader_ws_auth = ws_auth.clone();
+    let reader_auth_in_tx = auth_in_tx;
     let reader_tasks = tasks.clone();
     let reader_cancel_tx = cancel_tx.clone();
     let reader_writer = writer.clone();
@@ -1643,14 +1979,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
 
-            // `auth` is handled directly in the reader (O(1) sync RwLock) with reserved outbound
-            // capacity so an ordinary backlog never drops operator unlock updates.
+            // `auth` is classified in O(1) on the reader and verified off-reader by `auth_task`
+            // so `OperatorAuth::sessions` table scans never stall urgent E-stop/Stop intake.
             if kind == "auth" {
-                let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
-                let status = reader_ws_auth.update_token(next_token);
-                let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
-                    "role":status.role, "expires_in_s":status.expires_in_s});
-                if !reader_writer.try_send_auth(reply) { break; }
+                match reader_auth_in_tx.try_send(value) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        reader_writer.trigger_fatal(FatalClose::outbound_queue_full());
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
                 continue;
             }
 
@@ -1665,6 +2004,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // latch immediately in O(1) via the atomic checked path, and never drop the reply even
             // when the urgent reply queue is momentarily full (deliver as soon as a slot frees).
             if kind == "estop" || kind == "e_stop" {
+                reader_writer.mark_estop_admitted();
+                let estop_guard = reader_writer.enter_in_flight_estop();
                 let reserved = reader_writer.try_reserve_estop();
                 let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
                 let ticket = reader_supervisor.begin_e_stop_checked();
@@ -1673,6 +2014,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let cancel_tx = reader_cancel_tx.clone();
                 let writer_c = reader_writer.clone();
                 reader_tasks.spawn(async move {
+                    let _estop_guard = estop_guard;
                     let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
                         Ok((state, epoch)) => (
                             json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
@@ -1799,12 +2141,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     };
                     match reader_supervisor.try_enqueue_executor_urgent_stop(stop) {
                         Ok(Some((client, mut rx))) => {
+                            let stop_guard = reader_writer.enter_in_flight_stop();
                             let in_flight_c = reader_in_flight_stop.clone();
                             let last_req_c = reader_last_request.clone();
                             let cancel_tx_c = reader_cancel_tx.clone();
                             let ord_q_c = reader_ordinary_queue.clone();
                             let writer_c = reader_writer.clone();
                             reader_tasks.spawn(async move {
+                                let _stop_guard = stop_guard;
                                 let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
                                 let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
                                 deliver_urgent_stop_batch(
@@ -1813,6 +2157,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             });
                         }
                         Ok(None) => {
+                            let stop_guard = reader_writer.enter_in_flight_stop();
                             let sup_c = reader_supervisor.clone();
                             let in_flight_c = reader_in_flight_stop.clone();
                             let last_req_c = reader_last_request.clone();
@@ -1820,6 +2165,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             let ord_q_c = reader_ordinary_queue.clone();
                             let writer_c = reader_writer.clone();
                             reader_tasks.spawn(async move {
+                                let _stop_guard = stop_guard;
                                 let mut pre_drained: Option<Vec<Value>> = None;
                                 let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, |applied_epoch, next_gen| {
                                     // Owner `stop_gen` was already advanced under `inner.write()`;
@@ -2832,8 +3178,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::warn!("Urgent revocation queue full for {}; closing evicted connection", evicted_conn);
-                                if let Some((closer, fatal_flag)) = closer_opt {
+                                if let Some((closer, fatal_flag, notify)) = closer_opt {
                                     fatal_flag.store(true, Ordering::Release);
+                                    notify.notify_waiters();
                                     let _ = closer.try_send(FatalClose::urgent_queue_full());
                                 }
                             }
@@ -2847,12 +3194,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
         }
     });
-    enum FirstExit { Writer, Reader, Worker, Heartbeat }
+    enum FirstExit { Writer, Reader, Worker, Heartbeat, Auth }
     let first_exit = tokio::select! {
         _ = &mut writer_task => FirstExit::Writer,
         _ = &mut reader_task => FirstExit::Reader,
         _ = &mut worker_task => FirstExit::Worker,
         _ = &mut heartbeat_task => FirstExit::Heartbeat,
+        _ = &mut auth_task => FirstExit::Auth,
     };
     // Mark connection closing first so any concurrent acquire under the owner lock releases immediately.
     connection_closing.store(true, Ordering::SeqCst);
@@ -2873,6 +3221,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     if !matches!(first_exit, FirstExit::Heartbeat) {
         heartbeat_task.abort();
         let _ = heartbeat_task.await;
+    }
+    if !matches!(first_exit, FirstExit::Auth) {
+        auth_task.abort();
+        let _ = auth_task.await;
     }
     if !matches!(first_exit, FirstExit::Writer) {
         if fatal_triggered.load(Ordering::Acquire) {

@@ -10,7 +10,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -476,32 +476,80 @@ pub struct EstopAck {
 
 type EstopResult = Result<(SafetyState, u64), ArmError>;
 
+/// Bounded capacity of the off-thread E-stop waiter registry (keeps reader intake O(1) with
+/// zero heap allocation under the registry lock; physical E-stop still latches if full).
+pub(crate) const ESTOP_REGISTRY_CAPACITY: usize = 256;
+
 /// Off-thread lock-serialized E-stop waiter registry (never touched by `armd-control`).
-#[derive(Default)]
+///
+/// Waiters are pushed in strictly monotonic `req` order into a fixed-capacity ring so
+/// registration is O(1) and ACK/overflow/drain sweeps pop from the front without `BTreeMap`
+/// scans or temporary `Vec` allocations.
 pub(crate) struct EstopRegistry {
-    waiters: BTreeMap<u64, Vec<tokio::sync::oneshot::Sender<EstopResult>>>,
+    waiters: VecDeque<(u64, tokio::sync::oneshot::Sender<EstopResult>)>,
     ack_rx: Option<Consumer<EstopAck>>,
     overflow_gen: Option<Arc<AtomicU64>>,
     exited: Option<Arc<AtomicBool>>,
 }
 
+impl Default for EstopRegistry {
+    fn default() -> Self {
+        Self {
+            waiters: VecDeque::with_capacity(ESTOP_REGISTRY_CAPACITY),
+            ack_rx: None,
+            overflow_gen: None,
+            exited: None,
+        }
+    }
+}
+
 impl EstopRegistry {
     pub(crate) fn register(&mut self, req: u64) -> tokio::sync::oneshot::Receiver<EstopResult> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters.entry(req).or_default().push(tx);
+        if self.waiters.len() >= ESTOP_REGISTRY_CAPACITY {
+            // Amortized O(1): drop already-abandoned front waiters before rejecting.
+            while self.waiters.front().is_some_and(|(_, s)| s.is_closed()) {
+                self.waiters.pop_front();
+            }
+        }
+        if self.waiters.len() >= ESTOP_REGISTRY_CAPACITY {
+            let _ = tx.send(Err(ArmError::Rejected {
+                status: 503,
+                code: "ESTOP_QUEUE_FULL".into(),
+                message: "E-stop waiter registry is full; physical E-stop is latched".into(),
+            }));
+            return rx;
+        }
+        self.waiters.push_back((req, tx));
         rx
     }
 
     pub(crate) fn record_ack(&mut self, ack: EstopAck) {
-        let matched: Vec<u64> = self
+        // Fast path (monotonic FIFO): pop every front waiter covered by this ACK in O(1) each.
+        while self
             .waiters
-            .range(ack.first_gen..=ack.last_gen)
-            .map(|(&g, _)| g)
-            .collect();
-        for g in matched {
-            if let Some(senders) = self.waiters.remove(&g) {
-                for tx in senders {
-                    let _ = tx.send(Ok(((*ack.state).clone(), ack.epoch)));
+            .front()
+            .is_some_and(|&(g, _)| g >= ack.first_gen && g <= ack.last_gen)
+        {
+            if let Some((_, tx)) = self.waiters.pop_front() {
+                let _ = tx.send(Ok(((*ack.state).clone(), ack.epoch)));
+            }
+        }
+        // Bounded fallback (<= ESTOP_REGISTRY_CAPACITY, zero heap allocation) if an earlier
+        // waiter generation precedes `ack.first_gen`.
+        if self.waiters.front().is_some_and(|&(g, _)| g < ack.first_gen) {
+            let mut i = 0;
+            while i < self.waiters.len() {
+                let g = self.waiters[i].0;
+                if g > ack.last_gen {
+                    break;
+                }
+                if g >= ack.first_gen {
+                    if let Some((_, tx)) = self.waiters.remove(i) {
+                        let _ = tx.send(Ok(((*ack.state).clone(), ack.epoch)));
+                    }
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -511,28 +559,34 @@ impl EstopRegistry {
         if max_dropped == 0 {
             return;
         }
-        let dropped: Vec<u64> = self.waiters.range(..=max_dropped).map(|(&g, _)| g).collect();
-        for g in dropped {
-            if let Some(senders) = self.waiters.remove(&g) {
-                for tx in senders {
-                    let _ = tx.send(Err(ArmError::Rejected {
-                        status: 503,
-                        code: "ESTOP_ACK_OVERFLOW".into(),
-                        message: "E-stop acknowledgement ring overflowed; epoch cannot be pinned".into(),
-                    }));
-                }
+        while self.waiters.front().is_some_and(|&(g, _)| g <= max_dropped) {
+            if let Some((_, tx)) = self.waiters.pop_front() {
+                let _ = tx.send(Err(ArmError::Rejected {
+                    status: 503,
+                    code: "ESTOP_ACK_OVERFLOW".into(),
+                    message: "E-stop acknowledgement ring overflowed; epoch cannot be pinned".into(),
+                }));
             }
         }
     }
 
     pub(crate) fn cancel_waiter(&mut self, req: u64, status: u16, code: &'static str, message: &'static str) {
-        if let Some(senders) = self.waiters.remove(&req) {
-            for tx in senders {
-                let _ = tx.send(Err(ArmError::Rejected {
-                    status,
-                    code: code.into(),
-                    message: message.into(),
-                }));
+        let mut i = 0;
+        while i < self.waiters.len() {
+            let g = self.waiters[i].0;
+            if g > req {
+                break;
+            }
+            if g == req {
+                if let Some((_, tx)) = self.waiters.remove(i) {
+                    let _ = tx.send(Err(ArmError::Rejected {
+                        status,
+                        code: code.into(),
+                        message: message.into(),
+                    }));
+                }
+            } else {
+                i += 1;
             }
         }
     }
@@ -550,14 +604,12 @@ impl EstopRegistry {
     }
 
     fn pop_acks_and_overflow(&mut self) {
-        let mut drained = Vec::new();
-        if let Some(rx) = self.ack_rx.as_mut() {
-            while let Ok(ack) = rx.pop() {
-                drained.push(ack);
+        loop {
+            let next = self.ack_rx.as_mut().and_then(|rx| rx.pop().ok());
+            match next {
+                Some(ack) => self.record_ack(ack),
+                None => break,
             }
-        }
-        for ack in drained {
-            self.record_ack(ack);
         }
         if let Some(ov) = self.overflow_gen.as_ref() {
             let max_dropped = ov.load(Ordering::Acquire);
@@ -572,15 +624,12 @@ impl EstopRegistry {
             // Drain once more after observing `exited` so final acks / overflow recorded before
             // thread exit are never lost to `EXECUTOR_STOPPED`.
             self.pop_acks_and_overflow();
-            let remaining = std::mem::take(&mut self.waiters);
-            for (_, senders) in remaining {
-                for tx in senders {
-                    let _ = tx.send(Err(ArmError::Rejected {
-                        status: 503,
-                        code: "EXECUTOR_STOPPED".into(),
-                        message: "RT executor stopped before acknowledging E-stop".into(),
-                    }));
-                }
+            while let Some((_, tx)) = self.waiters.pop_front() {
+                let _ = tx.send(Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_STOPPED".into(),
+                    message: "RT executor stopped before acknowledging E-stop".into(),
+                }));
             }
         }
     }
@@ -2859,6 +2908,40 @@ mod tests {
         let delivered = rx.try_recv().expect("final estop ack must be delivered, not lost to exited");
         assert_eq!(delivered.unwrap(), (SafetyState::EStop, 42));
         assert!(reg.waiters.is_empty());
+    }
+
+    #[test]
+    fn estop_registry_is_bounded_o1_and_prunes_closed_waiters() {
+        let mut reg = EstopRegistry::default();
+        let mut rxs = Vec::with_capacity(ESTOP_REGISTRY_CAPACITY);
+        for g in 1..=(ESTOP_REGISTRY_CAPACITY as u64) {
+            rxs.push(reg.register(g));
+        }
+        assert_eq!(reg.waiters.len(), ESTOP_REGISTRY_CAPACITY);
+        // Full registry refuses without growing past ESTOP_REGISTRY_CAPACITY.
+        let mut overflow_rx = reg.register(ESTOP_REGISTRY_CAPACITY as u64 + 1);
+        assert_eq!(reg.waiters.len(), ESTOP_REGISTRY_CAPACITY);
+        let err = overflow_rx.try_recv().expect("immediate rejection").unwrap_err();
+        assert!(err.to_string().contains("ESTOP_QUEUE_FULL"), "{err}");
+
+        // Dropping the oldest waiter lets the next register prune it in O(1) and succeed.
+        drop(rxs.remove(0));
+        let mut rx_reused = reg.register(ESTOP_REGISTRY_CAPACITY as u64 + 2);
+        assert_eq!(reg.waiters.len(), ESTOP_REGISTRY_CAPACITY);
+        assert!(rx_reused.try_recv().is_err(), "reused slot must stay pending until ACK");
+
+        // Monotonic ACK pops all matching waiters from the front without allocation.
+        reg.record_ack(EstopAck {
+            first_gen: 1,
+            last_gen: ESTOP_REGISTRY_CAPACITY as u64 + 2,
+            state: Arc::new(SafetyState::EStop),
+            epoch: 99,
+        });
+        assert!(reg.waiters.is_empty());
+        assert_eq!(rx_reused.try_recv().unwrap().unwrap(), (SafetyState::EStop, 99));
+        for mut rx in rxs {
+            assert_eq!(rx.try_recv().unwrap().unwrap(), (SafetyState::EStop, 99));
+        }
     }
 
     #[test]
