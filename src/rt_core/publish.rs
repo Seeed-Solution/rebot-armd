@@ -9,7 +9,9 @@
 //!
 //! - `obs` is exactly what `SupervisorInner::current_observation` returned at that moment;
 //!   `obs.timestamp` is its local monotonic sample time ([`super::ids::MonotonicS`]).
-//! - `meta.seq` counts publications of this process (1, 2, ...; no gaps).
+//! - `meta.seq` counts publications of this process (1, 2, ...; no gaps). The tick
+//!   publishes once per tick, so it is the RT tick counter: a reader that sees it stop
+//!   advancing knows the control tick stopped (`observation_cache.published` exposes it).
 //! - `meta.generation` is the supervisor lock generation of the tick's write guard
 //!   (`SupervisorLock::generation`): every write guard taken later has a higher one, so a
 //!   sample answers for the state while the current generation still equals it, and a

@@ -37,6 +37,20 @@ fn nice_this_thread(nice: i32) {
 #[test]
 #[ignore = "timing dependent load test; run with --ignored --nocapture"]
 fn tick_latency_under_observation_readers_and_cpu_hogs() {
+    run_load(false);
+}
+
+/// As above, plus a writer at 30 Hz (a WS servo stream's lock use): every write makes the
+/// published snapshot older than the state, which readers must not answer with the lock.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing dependent load test; run with --ignored --nocapture"]
+fn tick_latency_under_observation_readers_writer_and_cpu_hogs() {
+    run_load(true);
+}
+
+#[cfg(target_os = "linux")]
+fn run_load(with_writer: bool) {
     const SECONDS: u64 = 20;
     const READERS: usize = 8;
     const READER_PERIOD: Duration = Duration::from_millis(1);
@@ -82,6 +96,19 @@ fn tick_latency_under_observation_readers_and_cpu_hogs() {
         }));
     }
 
+    if with_writer {
+        let sup = supervisor.clone();
+        let stop = stop.clone();
+        rt.spawn(async move {
+            let mut t = 30.0f32;
+            while !stop.load(Ordering::Relaxed) {
+                t = if t > 40.0 { 30.0 } else { t + 0.1 };
+                sup.set_temperatures(vec![t; 7]).await;
+                tokio::time::sleep(Duration::from_millis(33)).await;
+            }
+        });
+    }
+
     let control_sup = supervisor.clone();
     let control_stop = stop.clone();
     let handle = rt.handle().clone();
@@ -113,6 +140,6 @@ fn tick_latency_under_observation_readers_and_cpu_hogs() {
     for h in hogs { h.join().unwrap(); }
     walls.sort_unstable();
     let p = |q: usize| walls[(walls.len() * q).div_ceil(100).max(1) - 1];
-    println!("ticks {} reads {reads}; tick wall p50 {} p99 {} max {} us", walls.len(), p(50), p(99), walls[walls.len() - 1]);
+    println!("writer {with_writer}: ticks {} reads {reads}; tick wall p50 {} p99 {} max {} us", walls.len(), p(50), p(99), walls[walls.len() - 1]);
     println!("TICK_STATS {snapshot}");
 }

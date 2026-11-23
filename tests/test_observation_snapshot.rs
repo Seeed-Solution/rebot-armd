@@ -50,3 +50,74 @@ async fn a_snapshot_older_than_two_periods_is_recomputed() {
     assert!(obs.timestamp >= tick_obs.timestamp + 0.05, "{} vs {}", obs.timestamp, tick_obs.timestamp);
     assert_eq!(sup.tick_stats().observation_cache.misses, 1);
 }
+
+/// Shadow compare: the published sample equals `current_observation()` computed under the
+/// lock at the same state, field by field (time-derived fields aside), across states.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn published_sample_matches_the_locked_observation_field_by_field() {
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    let compare = |label: &str, published: armd::ArmObservation, locked: armd::ArmObservation| {
+        let mut a = serde_json::to_value(&published).unwrap();
+        let mut b = serde_json::to_value(&locked).unwrap();
+        for v in [&mut a, &mut b] {
+            let m = v.as_object_mut().unwrap();
+            m.remove("timestamp");
+        }
+        let (a, b) = (a.as_object().unwrap(), b.as_object().unwrap());
+        let keys: std::collections::BTreeSet<_> = a.keys().chain(b.keys()).collect();
+        for k in keys {
+            assert_eq!(a.get(k), b.get(k), "{label}: field {k}");
+        }
+    };
+    let check = |label: &'static str| {
+        let sup = &sup;
+        async move {
+            sup.tick(0.02).await;
+            let published = sup.get_observation().await;
+            let locked = sup.inner().read().await.current_observation();
+            (label, published, locked)
+        }
+    };
+    let (l, p, c) = check("idle").await;
+    compare(l, p, c);
+    sup.inner().write().await.lease_enabled = false;
+    sup.set_torque(true).await.unwrap();
+    let (l, p, c) = check("torqued").await;
+    compare(l, p, c);
+    let mut target = sup.get_config().await.home_positions.clone();
+    target[0] += 0.2;
+    sup.jog(target, Some(1.0), None).await.unwrap();
+    for i in 0..5 {
+        let (l, p, c) = check(if i == 0 { "jog started" } else { "jog running" }).await;
+        assert!(p.action.is_some());
+        compare(l, p, c);
+    }
+    sup.set_temperatures(vec![44.0; 7]).await;
+    let (l, p, c) = check("after a write").await;
+    assert_eq!(p.temperatures, vec![44.0; 7]);
+    compare(l, p, c);
+    let c = sup.tick_stats().observation_cache;
+    assert_eq!(c.misses, 0, "{c:?}");
+}
+
+/// Expiry: the previous-action window closes without a write; a sample published inside it
+/// is not served after it closes (the observation is computed again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn previous_action_window_expires_like_the_locked_observation() {
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    sup.tick(0.02).await;
+    {
+        let mut inner = sup.inner().write().await;
+        let now = inner.current_observation().timestamp;
+        let a = inner.last_action.clone().unwrap_or_else(|| serde_json::from_value(serde_json::json!({
+            "id": 1, "kind": "home", "state": "done", "progress": 1.0, "started_at": 0.0})).unwrap());
+        inner.previous_action = Some((a, now + 0.015));
+    }
+    let obs = sup.tick(0.02).await;
+    assert!(obs.previous_action.is_some());
+    assert!(sup.get_observation().await.previous_action.is_some());
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let later = sup.get_observation().await;
+    assert!(later.previous_action.is_none());
+    assert_eq!(later.previous_action, sup.inner().read().await.current_observation().previous_action);
+}
