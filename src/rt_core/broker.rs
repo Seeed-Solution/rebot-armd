@@ -121,16 +121,21 @@ impl Stamp {
     }
 }
 
-/// A handle of one published plan slot: slot index and the generation it was staged in.
+/// A handle of one published plan slot: the pool it belongs to, the slot index and the
+/// generation it was staged in. A handle reads only from its own pool ([`PlanSlots`] get a
+/// process-unique pool id), and a slot's generation never repeats: it does not wrap, a slot
+/// whose generation reached [`MAX_PLAN_GENERATION`] is never staged again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanHandle {
+    pool: u64,
     index: u8,
-    generation: u32,
+    generation: u64,
 }
 
 impl PlanHandle {
+    pub fn pool(&self) -> u64 { self.pool }
     pub fn index(&self) -> usize { usize::from(self.index) }
-    pub fn generation(&self) -> u32 { self.generation }
+    pub fn generation(&self) -> u64 { self.generation }
 }
 
 /// Commands that do not need a plan slot. Tracks extend this list through the integrator.
@@ -197,11 +202,20 @@ const WRITING: u64 = 1;
 const READY: u64 = 2;
 const RETIRED: u64 = 3;
 
-fn pack(generation: u32, state: u64) -> u64 { (u64::from(generation) << 2) | state }
-fn unpack(word: u64) -> (u32, u64) { ((word >> 2) as u32, word & 3) }
+/// The last generation a slot is staged in (62 bits of the slot word; the low 2 hold the
+/// state). Unreachable in practice (one install per release at 50 Hz: 2.9e9 years); a slot
+/// that gets there stays out of use instead of reusing generation numbers.
+pub const MAX_PLAN_GENERATION: u64 = (1 << 62) - 1;
+
+fn pack(generation: u64, state: u64) -> u64 { debug_assert!(generation <= MAX_PLAN_GENERATION); (generation << 2) | state }
+fn unpack(word: u64) -> (u64, u64) { (word >> 2, word & 3) }
+
+/// Pool ids of [`plan_slots`]: unique in the process.
+static NEXT_POOL: AtomicU64 = AtomicU64::new(1);
 
 /// `PLAN_SLOTS` (or a test capacity) plan slots shared by one writer and one reader.
 pub struct PlanSlots<P> {
+    pool: u64,
     words: Box<[AtomicU64]>,
     plans: Box<[UnsafeCell<P>]>,
 }
@@ -249,6 +263,7 @@ pub struct PlanReader<P> {
 pub fn plan_slots<P: Send>(capacity: usize, mut make: impl FnMut() -> P) -> (PlanWriter<P>, PlanReader<P>) {
     assert!(capacity > 0 && capacity <= usize::from(u8::MAX));
     let slots = Arc::new(PlanSlots {
+        pool: NEXT_POOL.fetch_add(1, Ordering::Relaxed),
         words: (0..capacity).map(|_| AtomicU64::new(pack(0, FREE))).collect(),
         plans: (0..capacity).map(|_| UnsafeCell::new(make())).collect(),
     });
@@ -273,35 +288,44 @@ impl<P> PlanWriter<P> {
     /// Slots reclaimed so far.
     pub fn retired_total(&self) -> u64 { self.retired }
 
-    /// Free slots (after a reclaim).
+    /// Free slots that can still be staged (after a reclaim).
     pub fn free(&self) -> usize {
-        self.slots.words.iter().filter(|w| unpack(w.load(Ordering::Acquire)).1 == FREE).count()
+        self.slots.words.iter().filter(|w| { let (g, s) = unpack(w.load(Ordering::Acquire)); s == FREE && g < MAX_PLAN_GENERATION }).count()
     }
 
     /// Writes a plan into a free slot (in place, reusing its memory) and publishes it
     /// immutable. None when every slot is taken.
     pub fn stage(&mut self, write: impl FnOnce(&mut P)) -> Option<PlanHandle> {
         self.reclaim();
-        let i = self.slots.words.iter().position(|w| unpack(w.load(Ordering::Acquire)).1 == FREE)?;
+        let i = self.slots.words.iter().position(|w| {
+            let (g, s) = unpack(w.load(Ordering::Acquire));
+            s == FREE && g < MAX_PLAN_GENERATION
+        })?;
         let (g, _) = unpack(self.slots.words[i].load(Ordering::Relaxed));
-        let generation = g.wrapping_add(1);
+        let generation = g + 1;
         self.slots.words[i].store(pack(generation, WRITING), Ordering::Relaxed);
         // SAFETY: WRITING and no handle exists: only this writer accesses the plan.
         write(unsafe { &mut *self.slots.plans[i].get() });
         self.slots.words[i].store(pack(generation, READY), Ordering::Release);
-        Some(PlanHandle { index: i as u8, generation })
+        Some(PlanHandle { pool: self.slots.pool, index: i as u8, generation })
     }
 
     /// Takes back a published slot whose descriptor was never queued (admission failed).
     fn unpublish(&mut self, h: PlanHandle) {
+        if h.pool != self.slots.pool { return; }
         let w = &self.slots.words[h.index()];
         if w.load(Ordering::Acquire) == pack(h.generation, READY) { w.store(pack(h.generation, FREE), Ordering::Relaxed); }
     }
+
+    /// Sets slot `index` to `generation`, free (tests: generation exhaustion).
+    #[cfg(test)]
+    fn force_generation(&mut self, index: usize, generation: u64) { self.slots.words[index].store(pack(generation, FREE), Ordering::Release); }
 }
 
 impl<P> PlanReader<P> {
     /// The plan of `h`, None when the slot was retired or reused since (stale handle).
     pub fn get(&self, h: PlanHandle) -> Option<&P> {
+        if h.pool != self.slots.pool { return None; }
         let w = self.slots.words.get(h.index())?;
         if w.load(Ordering::Acquire) != pack(h.generation, READY) { return None; }
         // SAFETY: READY at this generation: immutable until this reader retires it.
@@ -320,6 +344,7 @@ impl<P> PlanReader<P> {
     /// let _ = *p;
     /// ```
     pub fn retire(&mut self, h: PlanHandle) -> bool {
+        if h.pool != self.slots.pool { return false; }
         let Some(w) = self.slots.words.get(h.index()) else { return false; };
         w.compare_exchange(pack(h.generation, READY), pack(h.generation, RETIRED), Ordering::Release, Ordering::Relaxed).is_ok()
     }
@@ -680,7 +705,7 @@ mod tests {
             assert_eq!(b.poll(|_, r| { got.push(r); true }), 2);
             assert_eq!(got, vec![Reply::Ack { request: r, commit_seq: k + 1, action: Some(ActionId(k)) }, Reply::Terminal { request: r, action: ActionId(k), outcome: Outcome::Completed }]);
         }
-        assert_eq!(gens, (1..=100).collect::<Vec<u32>>(), "one slot, a new generation per reuse");
+        assert_eq!(gens, (1..=100).collect::<Vec<u64>>(), "one slot, a new generation per reuse");
         let s = b.stats();
         assert_eq!((s.admitted, s.acked, s.terminals, s.retired, s.abandoned), (100, 100, 100, 100, 0));
         assert_eq!((b.reserved(), b.outstanding(), rt.reply_overflow()), (0, 0, 0));
@@ -697,6 +722,39 @@ mod tests {
         assert_eq!(r.get(h1), None);
         assert_eq!(r.get(h2), Some(&[2.0; 4]));
         assert!(w.stage(|_| {}).is_none(), "the only slot is live");
+    }
+
+    #[test]
+    fn a_handle_of_another_pool_neither_reads_nor_retires() {
+        let (mut wa, mut ra) = plan_slots(1, || 0u32);
+        let (mut wb, mut rb) = plan_slots(1, || 0u32);
+        let ha = wa.stage(|p| *p = 1).unwrap();
+        let hb = wb.stage(|p| *p = 2).unwrap();
+        // same index and generation, different pools
+        assert_eq!((ha.index(), ha.generation()), (hb.index(), hb.generation()));
+        assert_ne!(ha.pool(), hb.pool());
+        assert_eq!(rb.get(ha), None, "a foreign handle reads nothing");
+        assert!(!rb.retire(ha), "a foreign handle retires nothing");
+        assert_eq!(rb.get(hb), Some(&2), "the pool's own plan is intact");
+        wb.unpublish(ha);
+        assert_eq!(rb.get(hb), Some(&2), "a foreign handle unpublishes nothing");
+        assert_eq!(ra.get(ha), Some(&1));
+        assert!(ra.retire(ha) && rb.retire(hb));
+    }
+
+    #[test]
+    fn a_slot_generation_never_wraps() {
+        let (mut w, mut r) = plan_slots(2, || 0u32);
+        w.force_generation(0, MAX_PLAN_GENERATION - 1);
+        let last = w.stage(|p| *p = 1).unwrap();
+        assert_eq!((last.index(), last.generation()), (0, MAX_PLAN_GENERATION));
+        assert!(r.retire(last));
+        // slot 0 is exhausted: the next stage takes slot 1, then nothing
+        let h = w.stage(|p| *p = 2).unwrap();
+        assert_eq!((h.index(), h.generation()), (1, 1));
+        assert!(w.stage(|_| {}).is_none(), "an exhausted slot is not reused");
+        assert_eq!(r.get(last), None, "the old handle stays stale");
+        assert_eq!(r.get(h), Some(&2));
     }
 
     #[test]
