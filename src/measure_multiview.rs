@@ -651,6 +651,22 @@ fn max_feedback_age_ms(now: Instant, instants: &[Option<Instant>]) -> Option<f64
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
+/// The arm joints' receive progress from one planning snapshot (`CoreOps::planning_snapshot`):
+/// `(measured positions, feedback instants, feedback sequence counters, receive-queue bounds)`
+/// of the arm joints. A joint without a reported queue bound (no receive queue) uses its
+/// receive instant as the bound, as `SupervisorInner::arm_feedback_queue_bounds` does.
+fn arm_receive_progress(inner: &SupervisorInner) -> (Vec<f32>, Vec<Option<Instant>>, Vec<u64>, Vec<Option<Instant>>) {
+    use crate::rt_core::ops::{CommitCtx, CoreOps};
+    let ctx = CommitCtx { arm: inner.core.id(), boot: crate::rt_core::broker::BootId(0), now: Instant::now(), stop_generation: 0 };
+    let snap = inner.planning_snapshot(&ctx);
+    let arm = inner.config.arm_joint_indices();
+    let instant = |i: usize| snap.feedback_instants.get(i).copied().flatten();
+    let instants = arm.iter().map(|&i| instant(i)).collect();
+    let seqs = arm.iter().map(|&i| snap.feedback_seqs.get(i).copied().unwrap_or(0)).collect();
+    let bounds = arm.iter().map(|&i| match snap.feedback_queue_bounds.get(i) { Some(b) => *b, None => instant(i) }).collect();
+    (snap.measured, instants, seqs, bounds)
+}
+
 /// Wait until every arm joint has a hardware feedback sample that was enqueued after `after`,
 /// bounded by [`FEEDBACK_WAIT_MAX`] and the action deadline / `recheck` invariants.
 ///
@@ -675,8 +691,7 @@ async fn sample_fresh_after(
         recheck(ctx, plan).await?;
         let (pos, instants, seqs, bounds) = {
             let inner = ctx.sup.inner().read().await;
-            let (pos, _, instants, seqs) = inner.arm_feedback_snapshot();
-            (pos, instants, seqs, inner.arm_feedback_queue_bounds())
+            arm_receive_progress(&inner)
         };
         let ready = !instants.is_empty()
             && instants.len() == fence_seqs.len()
