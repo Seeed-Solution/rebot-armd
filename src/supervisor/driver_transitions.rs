@@ -65,13 +65,103 @@ impl PanicDisableOutcome {
     }
 }
 
-/// Attempts one bounded hardware torque disable directly through the bus owner's driver.
-/// Never blocks indefinitely when the driver implements non-blocking `begin_torque`/`poll_torque`;
-/// wall-clock bounded to `timeout`.
+/// Runs `work` on the bus owner thread (strictly preserving single-bus-writer ownership) while
+/// an independent deadline observer thread waits up to `timeout` without touching the bus or
+/// driver. If `work` blocks past `timeout` (e.g. a driver implementing only blocking `set_torque`
+/// or a stalled transport syscall), the observer fires `on_timeout` at the deadline and this
+/// function returns `None` if `work` later unblocks.
+pub fn run_with_panic_deadline_observer(
+    timeout: Duration,
+    work: impl FnOnce() -> PanicDisableOutcome,
+    on_timeout: impl FnOnce() + Send + 'static,
+) -> Option<PanicDisableOutcome> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ObserverState {
+            Running,
+            Completed,
+            TimedOut,
+        }
+
+        let state = Arc::new((std::sync::Mutex::new(ObserverState::Running), std::sync::Condvar::new()));
+        let on_timeout_slot: Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>> =
+            Arc::new(std::sync::Mutex::new(Some(Box::new(on_timeout))));
+        let state_obs = Arc::clone(&state);
+        let on_timeout_obs = Arc::clone(&on_timeout_slot);
+        let deadline = Instant::now() + timeout;
+        let observer = match std::thread::Builder::new()
+            .name("armd-panic-watchdog".into())
+            .spawn(move || {
+                let mut g = state_obs.0.lock().unwrap_or_else(|e| e.into_inner());
+                while *g == ObserverState::Running {
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        *g = ObserverState::TimedOut;
+                        drop(g);
+                        if let Some(cb) = on_timeout_obs.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                            cb();
+                        }
+                        return;
+                    }
+                    let (next, res) = state_obs.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+                    g = next;
+                    if res.timed_out() && *g == ObserverState::Running {
+                        *g = ObserverState::TimedOut;
+                        drop(g);
+                        if let Some(cb) = on_timeout_obs.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                            cb();
+                        }
+                        return;
+                    }
+                }
+            }) {
+            Ok(jh) => jh,
+            Err(e) => {
+                // Never fall back to an unbounded inline driver call without a deadline observer.
+                tracing::error!("Failed to spawn panic deadline observer ({e}); aborting without unbounded bus call");
+                if let Some(cb) = on_timeout_slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    cb();
+                }
+                return None;
+            }
+        };
+
+        let outcome = work();
+        let won = {
+            let mut g = state.0.lock().unwrap_or_else(|e| e.into_inner());
+            if *g == ObserverState::Running {
+                *g = ObserverState::Completed;
+                true
+            } else {
+                false
+            }
+        };
+        if won {
+            state.1.notify_all();
+            let _ = observer.join();
+            Some(outcome)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (timeout, on_timeout);
+        Some(work())
+    }
+}
+
+/// Attempts one bounded hardware torque disable directly through the bus owner's driver using
+/// budgeted non-blocking driver operations (`begin_torque_budgeted`, `poll_torque_budgeted`,
+/// `read_joint_states_budgeted`). Wall-clock bounded to `timeout`; callers on panic paths wrap
+/// this with [`run_with_panic_deadline_observer`] to bound drivers whose fallback `begin_torque`
+/// or transport I/O may block inside a call.
 pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) -> PanicDisableOutcome {
     let wall_deadline = Instant::now() + timeout;
-    let driver_deadline = drv.clock_now() + timeout;
-    let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.begin_torque(false)));
+    let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drv.begin_torque_budgeted(false, 0)
+    }));
     let mut progress = match begin_res {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
@@ -79,11 +169,14 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
     };
 
     while matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
-        let now_wall = Instant::now();
-        if now_wall >= wall_deadline {
+        let rem = wall_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
             break;
         }
-        let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.poll_torque(driver_deadline)));
+        let drv_deadline = drv.clock_now() + rem;
+        let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.poll_torque_budgeted(drv_deadline, 64)
+        }));
         match poll_res {
             Ok(Ok(p)) => progress = p,
             Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
@@ -104,8 +197,16 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
     if DisableConfirm::confirmed(drv) {
         return PanicDisableOutcome::Confirmed;
     }
+    let mut states_buf = Vec::new();
     while Instant::now() < wall_deadline {
-        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.read_joint_states()));
+        let rem = wall_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let drv_deadline = drv.clock_now() + rem;
+        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.read_joint_states_budgeted(&mut states_buf, drv_deadline, 64)
+        }));
         if read_res.is_err() {
             return PanicDisableOutcome::Failed("driver panicked while confirming disable".into());
         }
@@ -1489,6 +1590,7 @@ impl SupervisorInner {
     }
 
     /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
+    /// Uses bounded `try_lock()` so a contended driver mutex cannot block indefinitely past `timeout`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
         self.e_stop_latched.store(true, Ordering::SeqCst);
         self.disable_requested();
@@ -1496,9 +1598,26 @@ impl SupervisorInner {
             self.disable_confirmed();
             return PanicDisableOutcome::NoDriver;
         };
+        let wall_deadline = Instant::now() + timeout;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut drv = d.lock().unwrap_or_else(|e| e.into_inner());
-            bounded_panic_disable_driver(&mut **drv, timeout)
+            let mut drv = loop {
+                match d.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        let rem = wall_deadline.saturating_duration_since(Instant::now());
+                        if rem.is_zero() {
+                            return PanicDisableOutcome::TimedOut;
+                        }
+                        std::thread::sleep(rem.min(Duration::from_millis(1)));
+                    }
+                }
+            };
+            let rem = wall_deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                return PanicDisableOutcome::TimedOut;
+            }
+            bounded_panic_disable_driver(&mut **drv, rem)
         }))
         .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
         if outcome == PanicDisableOutcome::Confirmed {

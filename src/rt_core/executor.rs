@@ -582,6 +582,11 @@ pub struct PersistTestHooks {
     pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
     /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
     pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Overrides `PANIC_DISABLE_TIMEOUT` for deterministic deadline-observer tests.
+    pub panic_disable_timeout: Option<Duration>,
+    /// Invoked by the independent panic deadline observer when a blocking driver call stalls
+    /// past the panic-disable deadline under `PanicPolicy::StopExecutor`.
+    pub on_panic_disable_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 enum PersistCmd {
@@ -739,6 +744,7 @@ struct RtExecutorShared {
     persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     shutdown_confirmed: Arc<AtomicBool>,
     teardown_disable: Arc<TeardownDisable>,
+    teardown_disable_timeout: Duration,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
     control_thread: Mutex<Option<JoinHandle<()>>>,
     monitor_thread: Mutex<Option<JoinHandle<()>>>,
@@ -968,7 +974,7 @@ impl RtExecutorHandle {
     /// refused or failed, and never stalls behind persistence I/O.
     pub fn emergency_disable_and_join(&self) -> crate::supervisor::PanicDisableOutcome {
         self.shared.teardown_disable.requested.store(true, Ordering::Release);
-        let bound = crate::supervisor::PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
+        let bound = self.shared.teardown_disable_timeout + Duration::from_millis(100);
         self.shared.teardown_and_join_inner(Some(bound));
         self.shared
             .teardown_disable
@@ -1140,6 +1146,9 @@ pub(crate) fn spawn_executor(
         persist_exited_cv,
         shutdown_confirmed: Arc::new(AtomicBool::new(false)),
         teardown_disable,
+        teardown_disable_timeout: hooks
+            .panic_disable_timeout
+            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT),
         persist_thread: Mutex::new(Some(persist_thread)),
         control_thread: Mutex::new(Some(control_thread)),
         monitor_thread: Mutex::new(monitor_thread),
@@ -2299,35 +2308,96 @@ fn control_thread_main(
             panicked = true;
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
-            }))
-            .unwrap_or_else(|_| {
-                crate::supervisor::PanicDisableOutcome::Failed("secondary panic during RT executor panic-disable".into())
-            });
-            outcome.log("RT executor panic", crate::supervisor::PANIC_DISABLE_TIMEOUT);
-            teardown_disable.set_outcome(outcome);
-            match cfg.panic_policy {
-                PanicPolicy::AbortProcess => {
-                    crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
-                    std::process::exit(1);
+            let disable_timeout = state
+                .hooks
+                .panic_disable_timeout
+                .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+            let policy = cfg.panic_policy;
+            let td_obs = Arc::clone(&teardown_disable);
+            let exited_obs = Arc::clone(&exited);
+            let cv_obs = Arc::clone(&control_exited_cv);
+            let hub_obs = Arc::clone(&hub);
+            let timeout_hook = state.hooks.on_panic_disable_timeout.clone();
+            let completed = crate::supervisor::run_with_panic_deadline_observer(
+                disable_timeout,
+                || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        core.attempt_panic_disable(disable_timeout)
+                    }))
+                    .unwrap_or_else(|_| {
+                        crate::supervisor::PanicDisableOutcome::Failed(
+                            "secondary panic during RT executor panic-disable".into(),
+                        )
+                    })
+                },
+                move || {
+                    let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+                    timed_out.log("RT executor panic", disable_timeout);
+                    td_obs.set_outcome(timed_out);
+                    match policy {
+                        PanicPolicy::AbortProcess => {
+                            crate::diagnostics::logwriter::flush_all(Duration::from_millis(200));
+                            std::process::exit(1);
+                        }
+                        PanicPolicy::StopExecutor => {
+                            exited_obs.store(true, Ordering::Release);
+                            *cv_obs.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                            cv_obs.1.notify_all();
+                            hub_obs.wake();
+                            if let Some(hook) = timeout_hook {
+                                hook();
+                            }
+                        }
+                    }
+                },
+            );
+            if let Some(outcome) = completed {
+                outcome.log("RT executor panic", disable_timeout);
+                teardown_disable.set_outcome(outcome);
+                match cfg.panic_policy {
+                    PanicPolicy::AbortProcess => {
+                        crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
+                        std::process::exit(1);
+                    }
+                    PanicPolicy::StopExecutor => {
+                        break;
+                    }
                 }
-                PanicPolicy::StopExecutor => {
-                    break;
-                }
+            } else {
+                // Deadline observer already handled timeout logging / exit signaling.
+                break;
             }
         }
     }
 
     if !panicked && teardown_disable.requested.load(Ordering::Acquire) {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
-        }))
-        .unwrap_or_else(|_| {
-            crate::supervisor::PanicDisableOutcome::Failed("panic during emergency teardown disable".into())
-        });
-        outcome.log("RT executor emergency shutdown", crate::supervisor::PANIC_DISABLE_TIMEOUT);
-        teardown_disable.set_outcome(outcome);
+        let disable_timeout = state
+            .hooks
+            .panic_disable_timeout
+            .unwrap_or(crate::supervisor::PANIC_DISABLE_TIMEOUT);
+        let td_obs = Arc::clone(&teardown_disable);
+        let completed = crate::supervisor::run_with_panic_deadline_observer(
+            disable_timeout,
+            || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    core.attempt_panic_disable(disable_timeout)
+                }))
+                .unwrap_or_else(|_| {
+                    crate::supervisor::PanicDisableOutcome::Failed(
+                        "panic during emergency teardown disable".into(),
+                    )
+                })
+            },
+            move || {
+                let timed_out = crate::supervisor::PanicDisableOutcome::TimedOut;
+                timed_out.log("RT executor emergency shutdown", disable_timeout);
+                td_obs.set_outcome(timed_out);
+            },
+        );
+        if let Some(outcome) = completed {
+            outcome.log("RT executor emergency shutdown", disable_timeout);
+            teardown_disable.set_outcome(outcome);
+        }
     }
 
     // Clean exit drain: return queued maintenance payloads off-thread, reconcile any abandoned

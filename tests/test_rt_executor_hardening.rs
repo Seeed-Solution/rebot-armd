@@ -1294,3 +1294,211 @@ async fn emergency_disable_reaches_driver_while_persistence_stalled_in_dir_sync(
     wait_until_async(Duration::from_secs(2), || handle.persist_worker_exited()).await;
     handle.stop_and_join();
 }
+
+// ============================================================================
+// 9. Panic deadline observer bounds blocking driver calls & preserves single bus writer
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_single_writer() {
+    struct BlockingDisableDriver {
+        enabled: bool,
+        driver_tids: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+        entered_disable: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
+        release_disable: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    }
+
+    impl ArmDriver for BlockingDisableDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            if self.enabled {
+                EnableState::Enabled
+            } else {
+                EnableState::Disabled
+            }
+        }
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::ZERO); 7]
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            self.driver_tids.lock().unwrap().push(thread::current().id());
+            Ok(vec![JointState::default(); 7])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.driver_tids.lock().unwrap().push(thread::current().id());
+            Ok(())
+        }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            self.driver_tids.lock().unwrap().push(thread::current().id());
+            if enable {
+                self.enabled = true;
+                return Ok(());
+            }
+            if let Some(tx) = self.entered_disable.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.release_disable.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+            self.enabled = false;
+            Ok(())
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    // (a) RT executor panic path with a blocking `set_torque(false)` (used via default `begin_torque`):
+    // independent deadline observer must fire at ~60 ms while the owner is still blocked inside
+    // `set_torque(false)`, without ever touching the driver (single-bus-writer preserved).
+    let driver_tids = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let drv = BlockingDisableDriver {
+        enabled: false,
+        driver_tids: driver_tids.clone(),
+        entered_disable: Arc::new(std::sync::Mutex::new(Some(entered_tx))),
+        release_disable: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+    };
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.set_torque(true).await.unwrap();
+    driver_tids.lock().unwrap().clear();
+
+    let (obs_tx, obs_rx) = std::sync::mpsc::sync_channel::<std::thread::ThreadId>(1);
+    let obs_tx = Arc::new(std::sync::Mutex::new(Some(obs_tx)));
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg.panic_policy = PanicPolicy::StopExecutor;
+    let hooks = PersistTestHooks {
+        panic_on_release: Some(2),
+        panic_disable_timeout: Some(Duration::from_millis(60)),
+        on_panic_disable_timeout: Some(Arc::new(move || {
+            if let Some(tx) = obs_tx.lock().unwrap().take() {
+                let _ = tx.send(thread::current().id());
+            }
+        })),
+        ..Default::default()
+    };
+    let t_start = Instant::now();
+    let handle = sup.start_executor_with_hooks(cfg, hooks).await.unwrap();
+    let exec_tid = handle.executor_thread_id();
+
+    tokio::task::spawn_blocking(move || {
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("owner must enter blocking set_torque(false)");
+    })
+    .await
+    .unwrap();
+
+    // While `release_tx` is STILL NOT SENT (driver call is still blocked!), the independent
+    // deadline observer must fire within bounded time and mark the executor exited.
+    let observer_tid = tokio::task::spawn_blocking(move || {
+        obs_rx
+            .recv_timeout(Duration::from_millis(600))
+            .expect("independent deadline observer must fire while blocking driver stalls")
+    })
+    .await
+    .unwrap();
+    assert!(
+        t_start.elapsed() < Duration::from_millis(800),
+        "panic deadline observer took {:?}",
+        t_start.elapsed()
+    );
+    assert_ne!(observer_tid, exec_tid, "deadline observer must be an independent thread");
+    assert!(handle.is_exited(), "deadline observer must mark executor exited on timeout");
+    {
+        let tids = driver_tids.lock().unwrap();
+        assert!(!tids.is_empty());
+        assert!(
+            tids.iter().all(|&tid| tid == exec_tid),
+            "only the RT owner thread may touch the driver (single-bus-writer): {tids:?} vs {exec_tid:?}"
+        );
+    }
+
+    // Release the blocked driver call so the thread finishes cleanly before Drop joins it.
+    let _ = release_tx.send(());
+    handle.stop_and_join();
+
+    // (b) `emergency_disable_and_join()` against a blocking driver also returns `TimedOut`
+    // in bounded time while the driver call is still blocked.
+    let driver_tids2 = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (entered_tx2, entered_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx2, release_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+    let drv2 = BlockingDisableDriver {
+        enabled: false,
+        driver_tids: driver_tids2.clone(),
+        entered_disable: Arc::new(std::sync::Mutex::new(Some(entered_tx2))),
+        release_disable: Arc::new(std::sync::Mutex::new(Some(release_rx2))),
+    };
+    let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
+    sup2.set_lease_enabled(false).await;
+    sup2.set_torque(true).await.unwrap();
+    driver_tids2.lock().unwrap().clear();
+    let hooks2 = PersistTestHooks {
+        panic_disable_timeout: Some(Duration::from_millis(60)),
+        ..Default::default()
+    };
+    let handle2 = sup2
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks2)
+        .await
+        .unwrap();
+    let exec_tid2 = handle2.executor_thread_id();
+    let h2 = handle2.clone();
+    let t_em = Instant::now();
+    let outcome2 = tokio::task::spawn_blocking(move || h2.emergency_disable_and_join())
+        .await
+        .unwrap();
+    let _ = entered_rx2.recv_timeout(Duration::from_millis(200));
+    assert_eq!(
+        outcome2,
+        PanicDisableOutcome::TimedOut,
+        "emergency_disable_and_join must return TimedOut when driver blocks past bound"
+    );
+    assert!(t_em.elapsed() < Duration::from_millis(600), "emergency disable took {:?}", t_em.elapsed());
+    assert!(
+        driver_tids2.lock().unwrap().iter().all(|&tid| tid == exec_tid2),
+        "single-bus-writer must hold during emergency teardown"
+    );
+    let _ = release_tx2.send(());
+    handle2.stop_and_join();
+
+    // (c) Legacy `attempt_legacy_panic_disable` against a blocking driver also bounds to TimedOut.
+    let (entered_tx3, entered_rx3) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx3, release_rx3) = std::sync::mpsc::sync_channel::<()>(1);
+    let drv3 = BlockingDisableDriver {
+        enabled: false,
+        driver_tids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        entered_disable: Arc::new(std::sync::Mutex::new(Some(entered_tx3))),
+        release_disable: Arc::new(std::sync::Mutex::new(Some(release_rx3))),
+    };
+    let sup3 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv3)));
+    sup3.set_lease_enabled(false).await;
+    sup3.set_torque(true).await.unwrap();
+    let sup3_c = sup3.clone();
+    let t_leg = Instant::now();
+    let outcome3 = tokio::task::spawn_blocking(move || {
+        sup3_c.attempt_legacy_panic_disable(Duration::from_millis(60))
+    })
+    .await
+    .unwrap();
+    let _ = entered_rx3.recv_timeout(Duration::from_millis(200));
+    assert_eq!(outcome3, PanicDisableOutcome::TimedOut);
+    assert!(t_leg.elapsed() < Duration::from_millis(500), "legacy panic disable took {:?}", t_leg.elapsed());
+    let _ = release_tx3.send(());
+}

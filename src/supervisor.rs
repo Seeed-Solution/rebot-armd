@@ -29,7 +29,7 @@ mod actions;
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
-pub use driver_transitions::{PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
+pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -4559,7 +4559,18 @@ impl ArmSupervisor {
                         PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
                     }
                 },
-                Err(_) => run_inline(Arc::clone(&self.inner), deadline),
+                Err(e) => {
+                    // Never fall back to an unbounded inline driver call when the bounded
+                    // helper thread cannot be spawned; only confirm NoDriver via non-blocking try_write.
+                    if let Ok(guard) = self.inner.try_write() {
+                        if guard.detached || guard.driver.is_none() {
+                            return PanicDisableOutcome::NoDriver;
+                        }
+                    }
+                    PanicDisableOutcome::Failed(format!(
+                        "failed to spawn bounded panic-disable helper thread: {e}"
+                    ))
+                }
             }
         }
         #[cfg(target_arch = "wasm32")]
