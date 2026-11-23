@@ -433,6 +433,167 @@ impl From<PolicyError> for ArmError {
     }
 }
 
+/// Preallocated circular buffer of future action-chunk slots.
+///
+/// Allocates `chunk_size` slots × up to `chunk_size` overlapping predictions × `action_dim`
+/// floats once in [`ChunkRing::new`] (`PreparedPolicy::from_backend`). No heap allocations
+/// occur while pushing chunks, discarding skipped periods, or popping the current action.
+struct ChunkRing {
+    chunk_size: usize,
+    max_preds: usize,
+    action_dim: usize,
+    head: usize,
+    len: usize,
+    /// Number of valid predictions stored in each physical slot (`len == chunk_size`, or 0 when `chunk_size <= 1`).
+    counts: Vec<usize>,
+    /// Flat storage laid out as `[physical_slot][pred_idx][dim]`.
+    data: Vec<f32>,
+}
+
+impl ChunkRing {
+    fn new(chunk_size: usize, action_dim: usize, temporal_ensemble: bool) -> Self {
+        if chunk_size <= 1 {
+            return Self {
+                chunk_size,
+                max_preds: 0,
+                action_dim,
+                head: 0,
+                len: 0,
+                counts: Vec::new(),
+                data: Vec::new(),
+            };
+        }
+        let max_preds = if temporal_ensemble { chunk_size } else { 1 };
+        Self {
+            chunk_size,
+            max_preds,
+            action_dim,
+            head: 0,
+            len: 0,
+            counts: vec![0; chunk_size],
+            data: vec![0.0; chunk_size * max_preds * action_dim],
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn phys_slot(&self, logical_offset: usize) -> usize {
+        debug_assert!(logical_offset < self.chunk_size);
+        (self.head + logical_offset) % self.chunk_size
+    }
+
+    #[inline]
+    fn pred_offset(&self, phys: usize, pred_idx: usize) -> usize {
+        (phys * self.max_preds + pred_idx) * self.action_dim
+    }
+
+    fn clear(&mut self) {
+        for offset in 0..self.len {
+            let phys = self.phys_slot(offset);
+            self.counts[phys] = 0;
+        }
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn discard_front(&mut self, count: usize) {
+        let drop_n = count.min(self.len);
+        for _ in 0..drop_n {
+            self.counts[self.head] = 0;
+            self.head = (self.head + 1) % self.chunk_size;
+            self.len -= 1;
+        }
+    }
+
+    fn push_chunk(&mut self, flat_chunk: &[f32], clear_existing: bool) {
+        debug_assert_eq!(flat_chunk.len(), self.chunk_size * self.action_dim);
+        if clear_existing {
+            self.clear();
+        }
+        for offset in 0..self.chunk_size {
+            let phys = self.phys_slot(offset);
+            if offset >= self.len {
+                self.counts[phys] = 0;
+            }
+            let pred_idx = self.counts[phys];
+            debug_assert!(pred_idx < self.max_preds);
+            if pred_idx < self.max_preds {
+                let dst_off = self.pred_offset(phys, pred_idx);
+                let src_off = offset * self.action_dim;
+                self.data[dst_off..dst_off + self.action_dim]
+                    .copy_from_slice(&flat_chunk[src_off..src_off + self.action_dim]);
+                self.counts[phys] = pred_idx + 1;
+            }
+        }
+        self.len = self.chunk_size;
+    }
+
+    fn pop_front_into(
+        &mut self,
+        temporal_ensemble_k: Option<f32>,
+        out: &mut [f32],
+    ) -> Result<(), PolicyError> {
+        if self.len == 0 {
+            return Err(PolicyError::InferenceFailed(
+                "action chunk buffer unexpectedly empty".into(),
+            ));
+        }
+        let phys = self.head;
+        let count = self.counts[phys];
+        if count == 0 {
+            return Err(PolicyError::InferenceFailed(
+                "action chunk slot unexpectedly empty".into(),
+            ));
+        }
+        let dim = self.action_dim;
+        debug_assert_eq!(out.len(), dim);
+        if let Some(k) = temporal_ensemble_k.filter(|_| count > 1) {
+            out.fill(0.0);
+            let mut w_sum = 0.0f32;
+            for age_idx in 0..count {
+                let w = (-k * (age_idx as f32)).exp();
+                w_sum += w;
+                let off = self.pred_offset(phys, age_idx);
+                let pred = &self.data[off..off + dim];
+                for (dst, &src) in out.iter_mut().zip(pred.iter()) {
+                    *dst += w * src;
+                }
+            }
+            if w_sum > 0.0 {
+                for v in out.iter_mut() {
+                    *v /= w_sum;
+                }
+            }
+        } else {
+            let off = self.pred_offset(phys, count - 1);
+            out.copy_from_slice(&self.data[off..off + dim]);
+        }
+        self.counts[phys] = 0;
+        self.head = (self.head + 1) % self.chunk_size;
+        self.len -= 1;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn storage_snapshot(&self) -> (usize, usize, usize, usize) {
+        (
+            self.counts.capacity(),
+            self.counts.as_ptr() as usize,
+            self.data.capacity(),
+            self.data.as_ptr() as usize,
+        )
+    }
+}
+
 /// Fully validated, preallocated policy inference pipeline ready to step against an arm config.
 pub struct PreparedPolicy {
     snapshot: PolicySnapshot,
@@ -449,8 +610,7 @@ pub struct PreparedPolicy {
     policy_act_units: Vec<f32>,
     arm_target_rad: Vec<f32>,
     periods_since_replan: usize,
-    /// Per-future-step queue of overlapping normalized action predictions (`len <= chunk_size`).
-    chunk_ring: std::collections::VecDeque<Vec<Vec<f32>>>,
+    chunk_ring: ChunkRing,
 }
 
 impl PreparedPolicy {
@@ -499,7 +659,11 @@ impl PreparedPolicy {
             .map(|p| (p.closed_rad, p.open_rad));
 
         let dim = contract.action_dim;
-        let chunk_cap = contract.chunking.chunk_size;
+        let chunk_ring = ChunkRing::new(
+            contract.chunking.chunk_size,
+            dim,
+            contract.chunking.temporal_ensemble_k.is_some(),
+        );
         Ok(Self {
             snapshot,
             contract,
@@ -515,7 +679,7 @@ impl PreparedPolicy {
             policy_act_units: vec![0.0; dim],
             arm_target_rad: vec![0.0; dim],
             periods_since_replan: 0,
-            chunk_ring: std::collections::VecDeque::with_capacity(chunk_cap),
+            chunk_ring,
         })
     }
 
@@ -715,48 +879,18 @@ impl PreparedPolicy {
             }
 
             // Discard entries for skipped control periods before taking or ensembling the current step.
-            for _ in 0..skipped.min(self.chunk_ring.len()) {
-                self.chunk_ring.pop_front();
-            }
+            self.chunk_ring.discard_front(skipped);
 
             if need_replan {
-                if chunking.temporal_ensemble_k.is_none() {
-                    self.chunk_ring.clear();
-                }
-                while self.chunk_ring.len() < chunking.chunk_size {
-                    self.chunk_ring.push_back(Vec::new());
-                }
-                for offset in 0..chunking.chunk_size {
-                    let slice = &self.infer_out[offset * dim..(offset + 1) * dim];
-                    self.chunk_ring[offset].push(slice.to_vec());
-                }
+                self.chunk_ring
+                    .push_chunk(&self.infer_out, chunking.temporal_ensemble_k.is_none());
                 self.periods_since_replan = 0;
             } else {
                 self.periods_since_replan = next_periods_since_replan;
             }
 
-            let preds = self
-                .chunk_ring
-                .pop_front()
-                .ok_or_else(|| PolicyError::InferenceFailed("action chunk buffer unexpectedly empty".into()))?;
-            if let Some(k) = chunking.temporal_ensemble_k.filter(|_| preds.len() > 1) {
-                self.step_out_norm.fill(0.0);
-                let mut w_sum = 0.0f32;
-                for (age_idx, p) in preds.iter().enumerate() {
-                    let w = (-k * (age_idx as f32)).exp();
-                    w_sum += w;
-                    for (dst, &src) in self.step_out_norm.iter_mut().zip(p.iter()) {
-                        *dst += w * src;
-                    }
-                }
-                if w_sum > 0.0 {
-                    for v in &mut self.step_out_norm {
-                        *v /= w_sum;
-                    }
-                }
-            } else if let Some(latest) = preds.last() {
-                self.step_out_norm.copy_from_slice(latest);
-            }
+            self.chunk_ring
+                .pop_front_into(chunking.temporal_ensemble_k, &mut self.step_out_norm)?;
         }
 
         if let (Some(mean), Some(std)) = (
@@ -1764,6 +1898,67 @@ mod chunking_tests {
         }
         assert_eq!(calls_a.load(Ordering::Relaxed), 4);
         assert_eq!(calls_b.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn chunking_ring_capacity_does_not_grow_over_50_steps() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let chunk_size = 8usize;
+        let chunks: Vec<Vec<f32>> = (0..60)
+            .map(|c| {
+                let vals: Vec<f32> = (0..chunk_size)
+                    .map(|k| ((c * chunk_size + k) % 20) as f32 * 0.02 - 0.2)
+                    .collect();
+                make_constant_chunk(state_dim, &vals)
+            })
+            .collect();
+
+        // Case 1: Open-loop chunking (replan_every=2) over 50 steps including occasional skips.
+        let (snap_ol, contract_ol, cfg_ol) = make_chunk_snapshot_and_contract(chunk_size, 2, None);
+        let (backend_ol, _) =
+            CountingChunkBackend::new(state_dim, chunk_size * state_dim, chunks.clone());
+        let mut prep_ol =
+            PreparedPolicy::from_backend(snap_ol, contract_ol, Box::new(backend_ol), &cfg_ol)
+                .unwrap();
+        let initial_ol = prep_ol.chunk_ring.storage_snapshot();
+        assert_eq!(initial_ol.0, chunk_size);
+        assert_eq!(initial_ol.2, chunk_size * state_dim);
+        for step in 0..50usize {
+            let elapsed = if step > 0 && step.is_multiple_of(11) { 3 } else { 1 };
+            let act = prep_ol.step_infer_periods(&state, elapsed).unwrap();
+            assert_eq!(act.len(), state_dim);
+            assert!(act.iter().all(|v| v.is_finite()));
+            assert_eq!(
+                prep_ol.chunk_ring.storage_snapshot(),
+                initial_ol,
+                "open-loop ChunkRing reallocated on step {step}"
+            );
+        }
+
+        // Case 2: Worst-case temporal ensembling (replan_every=1, full chunk_size overlap) over 50 steps.
+        let (snap_te, contract_te, cfg_te) =
+            make_chunk_snapshot_and_contract(chunk_size, 1, Some(0.05));
+        let (backend_te, calls_te) =
+            CountingChunkBackend::new(state_dim, chunk_size * state_dim, chunks);
+        let mut prep_te =
+            PreparedPolicy::from_backend(snap_te, contract_te, Box::new(backend_te), &cfg_te)
+                .unwrap();
+        let initial_te = prep_te.chunk_ring.storage_snapshot();
+        assert_eq!(initial_te.0, chunk_size);
+        assert_eq!(initial_te.2, chunk_size * chunk_size * state_dim);
+        for step in 0..50usize {
+            let elapsed = if step > 0 && step.is_multiple_of(13) { 2 } else { 1 };
+            let act = prep_te.step_infer_periods(&state, elapsed).unwrap();
+            assert_eq!(act.len(), state_dim);
+            assert!(act.iter().all(|v| v.is_finite()));
+            assert_eq!(
+                prep_te.chunk_ring.storage_snapshot(),
+                initial_te,
+                "temporal-ensemble ChunkRing reallocated on step {step}"
+            );
+        }
+        assert_eq!(calls_te.load(Ordering::Relaxed), 50);
     }
 
     #[test]
