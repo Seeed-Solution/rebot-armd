@@ -179,7 +179,7 @@ pub const TERMINAL_CODES: &[&str] = &[
     "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
-    "FEEDBACK_UNCONFIRMED", "INVALID_FEEDBACK", "UNLOAD_FAILED",
+    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
@@ -341,7 +341,7 @@ fn static_code(e: ArmError) -> &'static str {
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY",
     ];
     if let ArmError::Motion(m) = &e { return m.code(); }
     let code = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
@@ -808,6 +808,14 @@ mod tests {
     }
 
     #[test]
+    fn delegated_feedback_and_config_codes_keep_their_name() {
+        for code in ["FEEDBACK_STALE", "CONFIG_BUSY"] {
+            assert_eq!(static_code(ArmError::detailed(409, code, "x", serde_json::json!({}))), code);
+        }
+        assert_eq!(static_code(ArmError::detailed(409, "SOMETHING_NEW", "x", serde_json::json!({}))), "REJECTED");
+    }
+
+    #[test]
     fn terminal_outcomes_keep_their_cause() {
         assert_eq!(outcome_of("running", None), None);
         assert_eq!(outcome_of("done", None), Some(Outcome::Completed));
@@ -820,6 +828,7 @@ mod tests {
         assert_eq!(outcome_of("failed", Some("FOLLOWING_ERROR")), Some(Outcome::Failed("FOLLOWING_ERROR")));
         assert_eq!(outcome_of("failed", Some("SOMETHING_NEW")), Some(Outcome::Failed("FAILED")));
         assert_eq!(outcome_of("failed", None), Some(Outcome::Failed("FAILED")));
+        assert_eq!(outcome_of("failed", Some("FEEDBACK_STALE")), Some(Outcome::Failed("FEEDBACK_STALE")));
         // every fault code is listed
         for c in crate::safety::FaultCode::ALL {
             let name = serde_json::to_value(c).unwrap();
