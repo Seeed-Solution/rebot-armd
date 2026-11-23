@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use armd::rt_core::broker::{
     AdmitError, Authority, BootId, Broker, Capacities, ClientId, ImmediateOp, Outcome, Reply, RequestId, Submit,
 };
-use armd::rt_core::mailbox::{StreamId, Submitted, TargetFrame, TargetWriter, MAX_DOF};
+use armd::rt_core::ids::ArmId;
+use armd::rt_core::mailbox::{StreamId, Submitted, TargetAuthority, TargetFrame, TargetWriter, MAX_DOF};
 use armd::rt_core::ops::{Checkpoint, CoreOps, Primitive, ReleaseFixture, StubCore};
 use armd::rt_core::urgent::StopRequests;
 use armd::{ArmConfig, SupervisorInner};
@@ -179,19 +180,38 @@ fn targets_are_rechecked_at_consumption() {
     let (mut fx, _b, mut tw, _stop) = fixture(Capacities::default());
     let a = auth(&fx);
     let q = fx.core.commanded_positions.clone();
+    let now = fx.now();
     let frame = |seq: u64, authority: Authority, dq: f32| {
         let mut arr = [0.0; MAX_DOF];
         arr[..q.len()].copy_from_slice(&q);
         arr[0] += dq;
-        TargetFrame { stream: StreamId(1), seq, authority, policy_generation: 0, input_at: Instant::now(), vision_at: None, dof: q.len() as u8, q: arr, replaceable: true }
+        TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq, authority, policy_generation: 0, input_at: now, vision_at: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true }
     };
+    // no stream authorized yet: refused
     assert_eq!(tw.submit(frame(1, a, 0.001)), Submitted::Accepted);
-    assert_eq!(tw.submit(frame(2, a, 0.002)), Submitted::Coalesced { replaced: 1 });
+    assert_eq!(fx.step().target, Some((1, Err("STREAM_NOT_AUTHORIZED"))));
+    fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), max_input_age: Some(Duration::from_millis(100)), ..TargetAuthority::default() });
+    let (f1, f2) = (TargetFrame { seq: 10, ..frame(1, a, 0.001) }, TargetFrame { seq: 11, ..frame(2, a, 0.002) });
+    assert_eq!(tw.submit(f1), Submitted::Accepted);
+    assert_eq!(tw.submit(f2), Submitted::Coalesced { replaced: 10 });
     let rep = fx.step();
-    assert_eq!(rep.target, Some((2, Ok(()))));
+    assert_eq!(rep.target, Some((11, Ok(()))));
+    // a frame whose input aged past the bound while buffered
+    tw.submit(TargetFrame { seq: 12, ..frame(2, a, 0.002) });
+    fx.clock().advance(Duration::from_millis(200));
+    assert_eq!(fx.step().target, Some((12, Err("INPUT_STALE"))));
+    fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), ..TargetAuthority::default() });
+    // the stream was replaced: frames of the old one are refused
+    tw.submit(TargetFrame { stream: StreamId(7), ..frame(1, a, 0.001) });
+    assert_eq!(fx.step().target, Some((1, Err("STREAM_NOT_AUTHORIZED"))));
+    let frame = |seq: u64, authority: Authority, dq: f32| TargetFrame { seq: seq + 100, ..frame(seq, authority, dq) };
+    assert_eq!(tw.submit(frame(1, a, 0.001)), Submitted::Accepted);
+    assert_eq!(tw.submit(frame(2, a, 0.002)), Submitted::Coalesced { replaced: 101 });
+    let rep = fx.step();
+    assert_eq!(rep.target, Some((102, Ok(()))));
     assert!(fx.step().target.is_none(), "consumed once");
     tw.submit(frame(3, Authority { epoch: a.epoch + 1, ..a }, 0.003));
-    assert_eq!(fx.step().target, Some((3, Err("EPOCH_MISMATCH"))));
+    assert_eq!(fx.step().target, Some((103, Err("EPOCH_MISMATCH"))));
 }
 
 #[test]
@@ -200,7 +220,7 @@ fn a_stub_core_never_acknowledges_success() {
     let a = Authority::default();
     let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap())).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
-    tw.submit(TargetFrame { stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, dof: 1, q: [0.0; MAX_DOF], replaceable: true });
+    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
     assert_eq!(replies(&mut b), vec![Reply::Refused { request: r1, code: "NOT_WIRED" }, Reply::Refused { request: r2, code: "NOT_WIRED" }]);
     assert_eq!((fx.core.commits_seen, fx.core.targets_seen, fx.core.releases), (2, 1, 3));
@@ -384,7 +404,8 @@ fn a_stop_arriving_mid_release_precedes_the_commit_the_target_and_the_output() {
     let q = fx.core.commanded_positions.clone();
     let mut arr = [0.0; MAX_DOF];
     arr[..q.len()].copy_from_slice(&q);
-    tw.submit(TargetFrame { stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(), vision_at: None, dof: q.len() as u8, q: arr, replaceable: true });
+    fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), ..TargetAuthority::default() });
+    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(), vision_at: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true });
     let s = stop.clone();
     fx.on_checkpoint(move |c| if c == Checkpoint::BeforeTarget { s.request(); });
     let rep = fx.step();

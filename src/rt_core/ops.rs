@@ -211,7 +211,8 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
-    /// Applies one target after rechecking its authority.
+    /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
+    /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str>;
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
@@ -318,8 +319,8 @@ impl CoreOps for SupervisorInner {
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
-        if usize::from(frame.dof) > MAX_DOF { return Err("INVALID_COMMAND"); }
-        if let Some(code) = frame.authority.admits(&self.authority(ctx)) { return Err(code); }
+        if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) { return Err(code); }
+        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
         self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| static_code(ArmError::Safety(e)))
     }
 

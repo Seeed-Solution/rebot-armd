@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::config_iface::{ConfigDomain, Reservation};
+use super::mailbox::TargetAuthority;
 use super::ids::{ArmId, BusId};
 use super::publish::{state_channel, RtInputs, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
@@ -55,6 +56,8 @@ pub struct ArmCore {
     /// Recording samples of the running teach session.
     record: RecordProducer,
     config: ConfigHold,
+    /// The target stream the core consumes from (`mailbox::TargetFrame::check`).
+    targets: TargetAuthority,
 }
 
 impl ArmCore {
@@ -68,6 +71,7 @@ impl ArmCore {
             publisher,
             record: RecordProducer::new(dof),
             config: ConfigHold::default(),
+            targets: TargetAuthority::default(),
         }
     }
 
@@ -194,4 +198,16 @@ impl ArmCore {
 
     /// A held reservation inhibits incompatible motion.
     pub fn motion_inhibited_by_config(&self) -> bool { self.config.held.as_ref().is_some_and(|r| r.inhibits_motion) }
+
+    // -- target streams -------------------------------------------------------------------
+
+    /// What target frames must match to be consumed.
+    pub fn target_authority(&self) -> TargetAuthority { self.targets }
+
+    /// Consume frames of `a.stream` only, under `a`'s policy generation and age bounds
+    /// (replaces the previous stream: its buffered frames are refused).
+    pub fn authorize_stream(&mut self, a: TargetAuthority) { self.targets = a; }
+
+    /// No stream is consumed any more (stream ended, policy revoked).
+    pub fn revoke_stream(&mut self) { self.targets = TargetAuthority::default(); }
 }

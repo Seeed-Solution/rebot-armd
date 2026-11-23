@@ -57,10 +57,16 @@ impl<T> Producer<T> {
 
     /// Hands the back slot to the consumer and takes the middle slot as the new back slot
     /// (an older, unconsumed sample or the slot the consumer released). Never blocks.
-    pub fn publish(&mut self) {
+    /// True when the previous publication was still unconsumed and is now overwritten: the
+    /// same atomic swap decides it, so the answer is exact even while the consumer runs.
+    pub fn publish(&mut self) -> bool {
         let prev = self.shared.middle.swap(self.back | FRESH, Ordering::AcqRel);
         self.back = prev & INDEX;
+        prev & FRESH != 0
     }
+
+    /// A publication is waiting for the consumer (it may take it right after this returns).
+    pub fn unconsumed(&self) -> bool { self.shared.middle.load(Ordering::Acquire) & FRESH != 0 }
 }
 
 impl<T> Consumer<T> {

@@ -183,7 +183,7 @@ impl StatePublisher {
         copy_into(&mut slot.rt.velocities, rt.velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
         copy_into(&mut slot.rt.feedback_seqs, rt.feedback_seqs);
-        self.producer.publish();
+        let _ = self.producer.publish();
         self.hub.published.store(seq, Ordering::Release);
         self.hub.wake();
         displaced

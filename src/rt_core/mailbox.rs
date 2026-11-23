@@ -1,25 +1,35 @@
 //! Latest-target mailbox: servo / teleop / policy targets from the broker to the RT
 //! (armd 1.6 RT core, step 2 foundation; design section 3, "Urgent control and servo").
 //!
-//! One writer (the broker, normal priority) and one reader (the RT). The reader takes the
-//! newest unconsumed frame; a newer frame replaces an unconsumed one only when that one is
-//! replaceable ([`TargetFrame::replaceable`]), otherwise the submit is refused (`Busy`). The
-//! writer refuses a frame whose stream sequence does not advance (duplicate or wrapped).
-//! Frames are `Copy` with fixed-size joint arrays: neither side allocates.
+//! One writer (the broker, normal priority) and one reader (the RT): [`TargetWriter`] and
+//! [`TargetReader`] are neither `Clone` nor shareable (`TargetReader` is not `Sync`), so a
+//! frame is consumed by one consumer. The reader takes the newest unconsumed frame; a newer
+//! frame replaces an unconsumed one only when that one is replaceable
+//! ([`TargetFrame::replaceable`]), otherwise the submit is refused (`Busy`). Whether a frame
+//! was replaced unconsumed (`Coalesced`) is decided by the publishing swap itself, so a frame
+//! the reader took concurrently is never reported as coalesced.
 //!
-//! The RT rechecks a frame's stream, lease, stop/epoch and policy generation at consumption
-//! ([`TargetFrame::authority`], track D); the mailbox carries the original input and vision
-//! times unchanged.
+//! The writer keeps the last sequence of each stream ([`MAX_STREAMS`] at a time; a further
+//! stream is refused with `StreamsFull` until one is closed) and refuses a frame whose
+//! sequence does not advance on its stream (duplicate or wrapped), whatever other streams
+//! sent in between. Frames are `Copy` with fixed-size joint arrays: neither side allocates.
+//!
+//! At consumption the RT rechecks a frame ([`TargetFrame::check`], track D): arm and boot
+//! identity, its original deadline, the authority (stop, epoch, lease, config revision), the
+//! stream the core authorized, the policy generation, the input and vision ages
+//! ([`TargetAuthority`]); the core adds its configuration hold (`CONFIG_BUSY`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::broker::Authority;
+use super::broker::{Authority, BootId};
+use super::ids::ArmId;
 use super::triple::{triple_buffer, Consumer, Producer};
 
 /// Joints a frame carries at most.
 pub const MAX_DOF: usize = 8;
+
+/// Streams whose sequence state a writer keeps.
+pub const MAX_STREAMS: usize = 8;
 
 /// A target stream (one WS servo stream, one policy run).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,6 +38,9 @@ pub struct StreamId(pub u64);
 /// One target.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetFrame {
+    /// The arm and boot the frame was produced for.
+    pub arm: ArmId,
+    pub boot: BootId,
     pub stream: StreamId,
     /// Stream sequence; must increase within a stream.
     pub seq: u64,
@@ -38,76 +51,119 @@ pub struct TargetFrame {
     pub input_at: Instant,
     /// Camera sample time behind the frame (vision policies).
     pub vision_at: Option<Instant>,
+    /// Original monotonic deadline: not consumed after it (`DEADLINE_EXPIRED`).
+    pub deadline: Instant,
     pub dof: u8,
     pub q: [f32; MAX_DOF],
     /// The protocol lets a newer frame replace this one before it is consumed.
     pub replaceable: bool,
 }
 
+/// What the core currently authorizes for targets (core state, `ArmCore::target_authority`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TargetAuthority {
+    /// The one stream whose frames are consumed (None: none).
+    pub stream: Option<StreamId>,
+    /// Current policy authorization generation (0: the stream is not a policy).
+    pub policy_generation: u64,
+    /// Oldest input a consumed frame may carry (None: not bounded).
+    pub max_input_age: Option<Duration>,
+    /// Oldest camera sample behind a consumed frame (None: not bounded).
+    pub max_vision_age: Option<Duration>,
+}
+
 impl TargetFrame {
     pub fn positions(&self) -> &[f32] { &self.q[..usize::from(self.dof).min(MAX_DOF)] }
+
+    /// The refusal code at consumption, None to apply it. Order: `INVALID_COMMAND` (dof),
+    /// `WRONG_TARGET`, `DEADLINE_EXPIRED`, authority codes ([`Authority::admits`]),
+    /// `STREAM_NOT_AUTHORIZED`, `POLICY_REVOKED`, `INPUT_STALE`, `VISION_STALE`.
+    pub fn check(&self, arm: ArmId, boot: BootId, now: Instant, current: &Authority, targets: &TargetAuthority) -> Option<&'static str> {
+        if self.dof == 0 || usize::from(self.dof) > MAX_DOF { return Some("INVALID_COMMAND"); }
+        if self.arm != arm || self.boot != boot { return Some("WRONG_TARGET"); }
+        if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
+        if let Some(code) = self.authority.admits(current) { return Some(code); }
+        if targets.stream != Some(self.stream) { return Some("STREAM_NOT_AUTHORIZED"); }
+        if self.policy_generation != targets.policy_generation { return Some("POLICY_REVOKED"); }
+        if targets.max_input_age.is_some_and(|m| now.saturating_duration_since(self.input_at) > m) { return Some("INPUT_STALE"); }
+        if let (Some(m), Some(at)) = (targets.max_vision_age, self.vision_at) {
+            if now.saturating_duration_since(at) > m { return Some("VISION_STALE"); }
+        }
+        None
+    }
 }
 
 /// Result of [`TargetWriter::submit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submitted {
     Accepted,
-    /// Accepted and replaced the unconsumed frame with this sequence.
+    /// Accepted and replaced the unconsumed frame with this stream and sequence.
     Coalesced { replaced: u64 },
     /// Refused: the unconsumed frame is not replaceable.
     Busy,
     /// Refused: the sequence does not advance on this stream (duplicate or wrapped).
     OutOfOrder,
+    /// Refused: [`MAX_STREAMS`] streams are open ([`TargetWriter::close_stream`]).
+    StreamsFull,
 }
 
 #[derive(Clone, Copy)]
 struct Slot {
-    /// Publication number of the frame (0: none).
-    n: u64,
     frame: Option<TargetFrame>,
 }
 
 /// The broker's side.
 pub struct TargetWriter {
     producer: Producer<Slot>,
-    published: u64,
+    /// Last sequence of each open stream.
+    streams: [Option<(StreamId, u64)>; MAX_STREAMS],
     last: Option<TargetFrame>,
-    consumed: Arc<AtomicU64>,
     coalesced: u64,
 }
 
-/// The RT's side.
+/// The RT's side. Not `Clone`, not `Sync`: one consumer.
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<armd::rt_core::mailbox::TargetReader>();
+/// ```
 pub struct TargetReader {
     consumer: Consumer<Slot>,
-    consumed: Arc<AtomicU64>,
 }
 
 pub fn target_mailbox() -> (TargetWriter, TargetReader) {
-    let empty = Slot { n: 0, frame: None };
+    let empty = Slot { frame: None };
     let (producer, consumer) = triple_buffer(empty, empty, empty);
-    let consumed = Arc::new(AtomicU64::new(0));
-    (TargetWriter { producer, published: 0, last: None, consumed: consumed.clone(), coalesced: 0 }, TargetReader { consumer, consumed })
+    (TargetWriter { producer, streams: [None; MAX_STREAMS], last: None, coalesced: 0 }, TargetReader { consumer })
 }
 
 impl TargetWriter {
     pub fn submit(&mut self, frame: TargetFrame) -> Submitted {
-        let unconsumed = self.consumed.load(Ordering::Acquire) < self.published;
-        if let Some(last) = self.last.filter(|l| l.stream == frame.stream) {
-            if frame.seq <= last.seq { return Submitted::OutOfOrder; }
-        }
-        let replaced = match self.last {
-            Some(last) if unconsumed && !last.replaceable => return Submitted::Busy,
-            Some(last) if unconsumed => Some(last.seq),
-            _ => None,
+        let entry = match self.streams.iter().position(|e| e.is_some_and(|(s, _)| s == frame.stream)) {
+            Some(i) => {
+                if self.streams[i].is_some_and(|(_, last)| frame.seq <= last) { return Submitted::OutOfOrder; }
+                i
+            }
+            None => match self.streams.iter().position(Option::is_none) {
+                Some(i) => i,
+                None => return Submitted::StreamsFull,
+            },
         };
-        self.published += 1;
-        *self.producer.back_mut() = Slot { n: self.published, frame: Some(frame) };
-        self.producer.publish();
-        self.last = Some(frame);
+        // conservative: the reader may take the unconsumed frame right after this check
+        if self.producer.unconsumed() && self.last.is_some_and(|l| !l.replaceable) { return Submitted::Busy; }
+        self.producer.back_mut().frame = Some(frame);
+        let overwrote = self.producer.publish();
+        self.streams[entry] = Some((frame.stream, frame.seq));
+        let replaced = self.last.replace(frame).filter(|_| overwrote);
         match replaced {
-            Some(seq) => { self.coalesced += 1; Submitted::Coalesced { replaced: seq } }
+            Some(old) => { self.coalesced += 1; Submitted::Coalesced { replaced: old.seq } }
             None => Submitted::Accepted,
         }
+    }
+
+    /// Forgets `stream`'s sequence state (the stream ended); its later frames start anew.
+    pub fn close_stream(&mut self, stream: StreamId) {
+        for e in self.streams.iter_mut() { if e.is_some_and(|(s, _)| s == stream) { *e = None; } }
     }
 
     /// Frames replaced before consumption.
@@ -118,10 +174,7 @@ impl TargetReader {
     /// The newest unconsumed frame (None when nothing new).
     pub fn take(&mut self) -> Option<TargetFrame> {
         if !self.consumer.refresh() { return None; }
-        let slot = *self.consumer.front();
-        if slot.n == 0 { return None; }
-        self.consumed.store(slot.n, Ordering::Release);
-        slot.frame
+        self.consumer.front().frame
     }
 }
 
@@ -130,8 +183,9 @@ mod tests {
     use super::*;
 
     fn frame(stream: u64, seq: u64, replaceable: bool) -> TargetFrame {
-        TargetFrame { stream: StreamId(stream), seq, authority: Authority::default(), policy_generation: 0, input_at: Instant::now(),
-            vision_at: None, dof: 2, q: [seq as f32; MAX_DOF], replaceable }
+        let now = Instant::now();
+        TargetFrame { arm: ArmId::LOCAL, boot: BootId(1), stream: StreamId(stream), seq, authority: Authority::default(), policy_generation: 0,
+            input_at: now, vision_at: None, deadline: now + Duration::from_secs(5), dof: 2, q: [seq as f32; MAX_DOF], replaceable }
     }
 
     #[test]
@@ -178,5 +232,63 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let got = r.take().unwrap();
         assert_eq!((got.input_at, got.vision_at), (t, Some(t)));
+    }
+
+    #[test]
+    fn each_stream_keeps_its_own_sequence() {
+        let (mut w, mut r) = target_mailbox();
+        assert_eq!(w.submit(frame(1, 10, true)), Submitted::Accepted);
+        r.take();
+        assert_eq!(w.submit(frame(2, 1, true)), Submitted::Accepted);
+        r.take();
+        assert_eq!(w.submit(frame(1, 9, true)), Submitted::OutOfOrder, "stale A:9 after A:10, B:1");
+        assert_eq!(w.submit(frame(1, 11, true)), Submitted::Accepted);
+        // bounded: a ninth stream waits until one closes
+        for k in 3..=8 { r.take(); assert_eq!(w.submit(frame(k, 1, true)), Submitted::Accepted); }
+        r.take();
+        assert_eq!(w.submit(frame(9, 1, true)), Submitted::StreamsFull);
+        w.close_stream(StreamId(2));
+        assert_eq!(w.submit(frame(9, 1, true)), Submitted::Accepted);
+    }
+
+    #[test]
+    fn a_frame_taken_concurrently_is_never_reported_coalesced() {
+        let (mut w, mut r) = target_mailbox();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(2) {
+                if let Some(f) = r.take() { got.push(f.seq); if f.seq == 20_000 { break; } }
+            }
+            got
+        });
+        let mut coalesced = Vec::new();
+        for seq in 1..=20_000u64 {
+            if let Submitted::Coalesced { replaced } = w.submit(frame(1, seq, true)) { coalesced.push(replaced); }
+        }
+        let got = reader.join().unwrap();
+        assert!(got.windows(2).all(|p| p[0] < p[1]), "delivered in order, once");
+        for c in &coalesced { assert!(got.binary_search(c).is_err(), "frame {c} reported coalesced but delivered"); }
+        assert_eq!(coalesced.len() + got.len(), 20_000, "every frame either delivered or coalesced");
+    }
+
+    #[test]
+    fn consumption_checks_identity_deadline_stream_policy_and_ages() {
+        let now = Instant::now();
+        let a = Authority::default();
+        let ta = TargetAuthority { stream: Some(StreamId(1)), policy_generation: 3, max_input_age: Some(Duration::from_millis(50)), max_vision_age: Some(Duration::from_millis(100)) };
+        let ok = TargetFrame { policy_generation: 3, vision_at: Some(now), ..frame(1, 1, true) };
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &a, &ta), None);
+        assert_eq!(ok.check(ArmId(1), BootId(1), now, &a, &ta), Some("WRONG_TARGET"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(2), now, &a, &ta), Some("WRONG_TARGET"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), ok.deadline + Duration::from_millis(1), &a, &ta), Some("DEADLINE_EXPIRED"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &Authority { epoch: 1, ..a }, &ta), Some("EPOCH_MISMATCH"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &a, &TargetAuthority { stream: Some(StreamId(2)), ..ta }), Some("STREAM_NOT_AUTHORIZED"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now, &a, &TargetAuthority { policy_generation: 4, ..ta }), Some("POLICY_REVOKED"));
+        assert_eq!(ok.check(ArmId::LOCAL, BootId(1), now + Duration::from_millis(60), &a, &ta), Some("INPUT_STALE"));
+        let old_vision = TargetFrame { vision_at: Some(now - Duration::from_millis(150)), ..ok };
+        assert_eq!(old_vision.check(ArmId::LOCAL, BootId(1), now, &a, &ta), Some("VISION_STALE"));
+        let big = TargetFrame { dof: MAX_DOF as u8 + 1, ..ok };
+        assert_eq!(big.check(ArmId::LOCAL, BootId(1), now, &a, &ta), Some("INVALID_COMMAND"));
     }
 }
