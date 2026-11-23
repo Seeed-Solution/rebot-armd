@@ -8320,9 +8320,13 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
     #[cfg(target_os = "linux")]
     {
         // a normal-priority thread even when started from a real-time one
-        let param = libc::sched_param { sched_priority: 0 };
-        // SAFETY: plain call on the calling thread with a valid parameter.
-        unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param) };
+        // SAFETY: sched_param is plain old data (musl has extra fields); the call only
+        // touches the calling thread.
+        unsafe {
+            let mut param: libc::sched_param = std::mem::zeroed();
+            param.sched_priority = 0;
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
+        }
     }
     let mut last = 0;
     while !hub.is_closed() {
