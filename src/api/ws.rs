@@ -459,6 +459,12 @@ impl WsWriterHandle {
         })
     }
 
+    /// Fallback delivery for an E-stop reply whose initial non-blocking urgent reservation hit
+    /// capacity: waits for the next freed urgent slot so an E-stop reply is never dropped.
+    async fn send_estop_blocking(&self, reply: Value) -> bool {
+        self.estop_tx.send(reply).await.is_ok()
+    }
+
     fn try_reserve_stop(&self) -> Result<mpsc::OwnedPermit<Value>, mpsc::error::TrySendError<()>> {
         self.stop_tx.clone().try_reserve_owned().map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => mpsc::error::TrySendError::Full(()),
@@ -608,18 +614,30 @@ impl OrdinaryQueue {
 
     /// Drains cancellable motion/RPC items (`command`, `preset`, `servo`) while preserving
     /// non-cancellable session/lease frames (`acquire_lease`, `release_lease`, `auth`, `heartbeat`).
+    /// Builds JSON cancellation payloads outside the sync lock so the reader critical section stays O(1).
     fn drain_cancellable(&self, code: &'static str, epoch: Option<u64>) -> Vec<Value> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut replies = Vec::new();
-        let mut kept = VecDeque::with_capacity(g.items.len());
-        while let Some(item) = g.items.pop_front() {
-            match cancelled_reply(&item.value, code, epoch) {
-                Some(reply) => replies.push(reply),
-                None => kept.push_back(item),
+        let mut to_cancel = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let n = g.items.len();
+            for _ in 0..n {
+                if let Some(item) = g.items.pop_front() {
+                    let kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
+                    let cancellable = matches!(kind, "command" | "preset" | "servo")
+                        || item.value.get("positions").is_some()
+                        || item.value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream");
+                    if cancellable {
+                        to_cancel.push(item.value);
+                    } else {
+                        g.items.push_back(item);
+                    }
+                }
             }
         }
-        g.items = kept;
-        replies
+        to_cancel
+            .into_iter()
+            .filter_map(|v| cancelled_reply(&v, code, epoch))
+            .collect()
     }
 
     fn close(&self) {
@@ -1275,22 +1293,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
 
-            // Urgent E-stop (both aliases): latch synchronously in the reader through the atomic
-            // checked path, reserve urgent writer capacity at admission, and finish off-reader.
+            // Urgent E-stop (both aliases): reserve urgent reply capacity BEFORE latching, ALWAYS
+            // latch immediately in O(1) via the atomic checked path, and never drop the reply even
+            // when the urgent reply queue is momentarily full (deliver as soon as a slot frees).
             if kind == "estop" || kind == "e_stop" {
+                let reserved = reader_writer.try_reserve_estop();
+                let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
                 let ticket = reader_supervisor.begin_e_stop_checked();
-                let (permit, fatal_or_closed) = match reader_writer.try_reserve_estop() {
-                    Ok(p) => (Some(p), false),
-                    Err(mpsc::error::TrySendError::Full(())) => {
-                        reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
-                        (None, true)
-                    }
-                    Err(mpsc::error::TrySendError::Closed(())) => (None, true),
-                };
                 let req_id = value.get("request_id").cloned();
                 let sup = reader_supervisor.clone();
                 let stop_gen = reader_stop_gen.clone();
                 let cancel_tx = reader_cancel_tx.clone();
+                let writer_c = reader_writer.clone();
                 tokio::spawn(async move {
                     let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
                         Ok((state, epoch)) => (
@@ -1304,13 +1318,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             (r, sup.hub().latest().map(|s| s.obs.epoch_id))
                         }
                     };
-                    if let Some(permit) = permit {
-                        permit.send(reply);
+                    match reserved {
+                        Ok(permit) => { permit.send(reply); }
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            let _ = writer_c.send_estop_blocking(reply).await;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {}
                     }
                     let next_gen = stop_gen.fetch_add(1, Ordering::SeqCst) + 1;
                     let _ = cancel_tx.send(Some(CancelSignal { gen: next_gen, code: "ESTOP_ACTIVE", epoch: cancel_epoch }));
                 });
-                if fatal_or_closed { break; }
+                if closed { break; }
                 continue;
             }
 

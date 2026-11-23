@@ -4857,8 +4857,8 @@ impl ArmSupervisor {
     }
 
     /// Synchronously latches the physical E-stop flag, increments the requested generation,
-    /// and registers a per-request waiter without awaiting any async lock. Call
-    /// [`Self::finish_e_stop_checked`] to obtain the applied `(SafetyState, epoch_id)`.
+    /// and registers a per-request waiter in O(1) without awaiting any async lock or draining rings.
+    /// Call [`Self::finish_e_stop_checked`] to obtain the applied `(SafetyState, epoch_id)`.
     pub(crate) fn begin_e_stop_checked(&self) -> CheckedEstopTicket {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::begin_e_stop_checked");
         // Set the physical E-stop latch FIRST before touching any lock.
@@ -4868,9 +4868,6 @@ impl ArmSupervisor {
             let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
             let rx = reg.register(req);
             let mode = self.owner_mode.load(Ordering::Acquire);
-            if mode == OWNER_EXECUTOR {
-                reg.drain();
-            }
             (req, rx, mode)
         };
         CheckedEstopTicket { req, rx, mode }
@@ -4882,7 +4879,10 @@ impl ArmSupervisor {
     ) -> Result<(SafetyState, u64), ArmError> {
         let CheckedEstopTicket { req, mut rx, mode } = ticket;
         match mode {
-            OWNER_EXECUTOR => self.await_estop_waiter(rx).await,
+            OWNER_EXECUTOR => {
+                self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+                self.await_estop_waiter(rx).await
+            }
             OWNER_LEGACY | OWNER_TRANSFERRING => {
                 if let Ok(res) = rx.try_recv() {
                     return res;

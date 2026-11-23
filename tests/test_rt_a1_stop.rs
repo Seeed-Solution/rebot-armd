@@ -1176,3 +1176,45 @@ async fn urgent_stop_does_not_reject_earlier_or_later_ordinary_request_ids() {
     let m7 = next_of(&mut ws2, &["command_ack", "command_reject"]).await;
     assert_eq!((m7["type"].as_str(), m7["request_id"].as_u64()), (Some("command_ack"), Some(7)), "{m7}");
 }
+
+// 13. Round 3 Item 3 (Major): E-stop burst exceeding urgent reply capacity (64) still latches
+//     immediately and delivers every single E-stop reply once writer slots free (zero dropped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn estop_burst_beyond_urgent_capacity_still_latches_and_delivers_all_replies() {
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep0 = sup.get_observation().await.epoch_id;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _hook_guard = WriteHookGuard(conn_id.clone());
+
+    // Pause writer so urgent E-stop reply slots (cap 64) saturate.
+    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep0, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+    // Send 68 E-stops (> 64 urgent capacity) while writer stays blocked: latch must succeed immediately.
+    const N: usize = 68;
+    for i in 0..N {
+        let kind = if i % 2 == 0 { "estop" } else { "e_stop" };
+        send(&mut ws, json!({"type": kind})).await;
+    }
+    wait_until(Duration::from_millis(100), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+    wait_until(Duration::from_secs(1), || sup.requested_estop_count.load(Ordering::SeqCst) >= N as u64).await;
+
+    // Unpause writer: ALL 68 E-stop replies must arrive (zero dropped, no spurious fatal close).
+    armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+    let mut syncs = 0usize;
+    let mut last_ep = ep0;
+    while syncs < N {
+        let msg = next_of(&mut ws, &["epoch_sync", "estop_reject", "error"]).await;
+        assert_eq!((msg["type"].as_str(), msg["safety_state"].as_str()), (Some("epoch_sync"), Some("EStop")), "unexpected reply at {syncs}: {msg}");
+        let ep = msg["epoch_id"].as_u64().unwrap();
+        assert!(ep >= last_ep, "epoch regressed: {ep} < {last_ep}");
+        last_ep = ep;
+        syncs += 1;
+    }
+    assert_eq!(syncs, N);
+    // Connection remains alive after burst drains.
+    let extra = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync", "estop_reject"]).await;
+    assert_eq!((extra["type"].as_str(), extra["safety_state"].as_str()), (Some("epoch_sync"), Some("EStop")), "{extra}");
+}
