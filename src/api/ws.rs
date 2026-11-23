@@ -13,6 +13,20 @@ use crate::safety::SafetyError;
 use crate::api::rest::ApiError;
 use axum::http::StatusCode;
 
+// ws leaf modules (armd 1.6 RT-core foundation)
+mod motion_cmds;
+#[allow(unused_imports)]
+use motion_cmds::*;
+mod policy;
+#[allow(unused_imports)]
+use policy::*;
+mod calibration;
+#[allow(unused_imports)]
+use calibration::*;
+mod config;
+#[allow(unused_imports)]
+use config::*;
+
 pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>;
 
 static CONNECTION_REGISTRY: LazyLock<ConnectionRegistry> =
@@ -102,169 +116,6 @@ fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
 /// Action started by a command: (action id, expected duration in s).
 type Started = Option<(u64, f64)>;
 
-// The caller holds the same write lock used to verify lease and epoch.
-fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
-    if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
-    if let Some(duration) = body.get("duration_secs").filter(|v| !v.is_null()) {
-        if duration.as_f64().is_none() { return Err(invalid_command("duration_secs must be numeric")); }
-    }
-    match path {
-        "/api/v1/torque" | "/api/v1/arm" => {
-            let enabled = body.get("enable").and_then(Value::as_bool)
-                .ok_or_else(|| invalid_command("enable must be boolean"))?;
-            inner.set_torque(enabled).map_err(ArmError::from)?;
-        }
-        "/api/v1/safety/clear_fault" => {
-            // {"mit_recovery": "torque_off_all"}: the operator accepts the MIT expiry recovery
-            // (torque off on every joint); any other value is refused
-            let mit_recovery = match body.get("mit_recovery") {
-                None | Some(Value::Null) => false,
-                Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => true,
-                Some(_) => return Err(invalid_command(&format!("mit_recovery must be \"{}\"", crate::mit::RECOVERY_CONFIRM_VALUE))),
-            };
-            inner.clear_fault_confirmed(mit_recovery)?;
-        }
-        "/api/v1/motion/servo" => { inner.servo(positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
-        "/api/v1/motion/jog" => {
-            let speed_scale = motion::num(body, "speed_scale").map_err(ArmError::from)?;
-            let (_, id, duration) = inner.jog_action_with_speed_scale(
-                positions(body.get("target_positions"))?,
-                body.get("duration_secs").and_then(Value::as_f64),
-                Some(epoch),
-                "joint_move",
-                speed_scale,
-            )?;
-            return Ok(Some((id, duration)));
-        }
-        "/api/v1/motion/home" => {
-            inner.check_commissioning_for_ordinary_motion("home")?;
-            let (_, id, duration) = inner.jog_action(inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
-            return Ok(Some((id, duration)));
-        }
-        "/api/v1/motion/unload" => {
-            inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
-            inner.collision_hold_check().map_err(ArmError::from)?;
-            if inner.handover_settling_since.is_some() {
-                return Err(ArmError::Safety(SafetyError::HandoverSettling).into());
-            }
-            if !inner.supports_automatic_unload() {
-                return Err(ArmError::Unsupported("Automatic unload requires a resting-pose profile and velocity, torque and enable-state feedback; no motion was started".into()).into());
-            }
-            if !inner.safety.state().is_operational() && !inner.holding_after_clear() {
-                return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
-            }
-            let id = inner.unload_action()?;
-            let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
-            return Ok(id.map(|id| (id, duration)));
-        }
-        "/api/v1/motion/stop" => {
-            inner.exit_gravity_comp("STOPPED", "Stop command");
-            inner.stop_motion();
-            inner.request_macro_stop();
-        }
-        "/api/v1/mode/gravity_comp" => {
-            let enable = body.get("enable").and_then(Value::as_bool)
-                .ok_or_else(|| invalid_command("enable must be boolean"))?;
-            if enable {
-                inner.enter_gravity_comp(gravity_comp_request(body)?)?;
-            } else {
-                inner.exit_gravity_comp("REQUESTED", "Exit requested");
-            }
-        }
-        _ => return Err(invalid_command("Unknown actuator command")),
-    }
-    Ok(None)
-}
-
-/// `scale` (number) and `damping_kd` (number for all six arm joints, or six numbers).
-fn gravity_comp_request(body: &Value) -> Result<crate::gravity_comp::GravityCompRequest, ApiError> {
-    let scale = match body.get("scale") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| invalid_command("scale must be a number"))? as f32),
-    };
-    let damping_kd = match body.get("damping_kd") {
-        None | Some(Value::Null) => None,
-        Some(Value::Number(n)) => Some(vec![n.as_f64().unwrap_or(f64::NAN) as f32; 6]),
-        Some(Value::Array(a)) => Some(a.iter().map(|v| v.as_f64().map_or(f32::NAN, |x| x as f32)).collect()),
-        Some(_) => return Err(invalid_command("damping_kd must be a number or an array of 6 numbers")),
-    };
-    Ok(crate::gravity_comp::GravityCompRequest { scale, damping_kd })
-}
-
-/// A Cartesian action waiting for its plan (computed outside the lock).
-struct PendingPlan {
-    request_id: Value,
-    kind: &'static str,
-    input: PlanInput,
-    goal: crate::kinematics::Pose,
-    speed: crate::motion::Speed,
-    tag: Option<String>,
-    opts: crate::motion::PathOpts,
-    /// Same-side approach (`precise: true` / `approach`, src/backlash.rs): settings or the
-    /// reason for a direct motion (None = off).
-    approach: Result<crate::backlash::Plan, Option<&'static str>>,
-    /// `path: "joint"`: the IK seeds ([`motion::goal_seeds`]), the `speed_scale` of the joint
-    /// quintic and the same-side approach request (None = off). None: the straight line.
-    joint: Option<JointGoal>,
-    /// IK seeds of the goal ([`motion::goal_seeds`]): the joint-space solve of `path: "joint"`,
-    /// and for a straight line the check behind the `path: "joint"` hint of `IK_BRANCH_FLIP`.
-    seeds: Vec<[f64; 6]>,
-}
-
-/// `path: "joint"` part of a [`PendingPlan`].
-struct JointGoal {
-    speed_scale: f64,
-    same_side: Option<crate::backlash::Request>,
-    /// Supervisor state the joint quintic is planned from without the lock.
-    snapshot: crate::supervisor::JointGoalSnapshot,
-}
-
-#[cfg(feature = "policy-runtime")]
-struct PendingPolicyStart {
-    request: crate::policy_runtime::PolicyStartRequest,
-    config: crate::model::ArmConfig,
-    epoch: u64,
-    policy_live_allowed: bool,
-}
-
-#[cfg(feature = "policy-runtime")]
-struct PolicyLoadingGuard(Option<Arc<ArmSupervisor>>);
-
-#[cfg(feature = "policy-runtime")]
-impl PolicyLoadingGuard {
-    fn new(sup: Arc<ArmSupervisor>) -> Self {
-        Self(Some(sup))
-    }
-
-    fn clear(&mut self, inner: &mut SupervisorInner) {
-        if self.0.take().is_some() {
-            inner.policy_loading = false;
-        }
-    }
-}
-
-#[cfg(feature = "policy-runtime")]
-impl Drop for PolicyLoadingGuard {
-    fn drop(&mut self) {
-        let Some(sup) = self.0.take() else {
-            return;
-        };
-        if let Ok(mut inner) = sup.inner().try_write() {
-            inner.policy_loading = false;
-            return;
-        }
-        match tokio::runtime::Handle::try_current() {
-            Ok(h) => {
-                h.spawn(async move {
-                    sup.inner().write().await.policy_loading = false;
-                });
-            }
-            Err(_) => sup.inner().blocking_write().policy_loading = false,
-        }
-        tracing::warn!("policy loading ended without explicit clear; cleared policy_loading");
-    }
-}
-
 enum ActionStart {
     Started(u64, f64),
     Plan(PendingPlan),
@@ -278,49 +129,6 @@ enum ActionStart {
     Policy(Box<PendingPolicyStart>),
     #[cfg(feature = "policy-runtime")]
     PolicyStopped(bool),
-}
-
-/// A macro action (crate::macro_action) checked under the lock, planned without it.
-enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
-
-#[allow(clippy::large_enum_variant)]
-enum PlannedMacro { Grasp(crate::grasp::PlannedGrasp), Place(crate::place::PlannedPlace) }
-
-impl PendingMacro {
-    fn plan(self) -> Result<PlannedMacro, ArmError> {
-        match self {
-            Self::Grasp(g) => crate::grasp::plan(g).map(PlannedMacro::Grasp),
-            Self::Place(p) => crate::place::plan(p).map(PlannedMacro::Place),
-        }
-    }
-}
-
-impl PlannedMacro {
-    /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
-    fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
-        match self {
-            Self::Grasp(planned) => crate::grasp::begin(inner, supervisor, deps.source.clone(), planned),
-            Self::Place(planned) => {
-                let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
-                if planned.orientation_levelled {
-                    inner.update_action(id, |a| {
-                        a.orientation = Some("levelled".into());
-                    });
-                }
-                let duration = crate::place::expected_duration(&planned) + inner.approach_estimate_s("place_final", planned.request.approach);
-                crate::place::spawn(supervisor.clone(), id, planned);
-                Ok((id, duration))
-            }
-        }
-    }
-}
-
-/// A macro action being planned and checked (grasp preflight: model switch, up to ~7 s) in a
-/// task of its own, so the receive loop still reads stop / e-stop on the connection meanwhile.
-struct MacroCheck {
-    request_id: Value,
-    generation: u64,
-    task: tokio::task::JoinHandle<Result<PlannedMacro, ArmError>>,
 }
 
 /// Messages queued while a [`MacroCheck`] runs, at most; then the socket is not read until
@@ -538,194 +346,6 @@ fn pose_ack_fields(inner: &SupervisorInner, pose: &crate::poses::NamedPose, revi
     ]
 }
 
-/// Atomic persist-before-commit config write (Step 1 prepared under lock, Step 2 staged to
-/// disk without lock under `config_write_lock`, Step 3 prechecked + published + committed under lock).
-enum PreparedConfigWrite {
-    Keepout(crate::keepout::PreparedKeepout),
-    Collision(crate::collision::PreparedCollision),
-    GripperCalib(Box<crate::gripper_calib::PreparedGripperCalib>),
-    PosesSave(crate::poses::PreparedPosesSave),
-    PosesDelete(crate::poses::PreparedPosesDelete),
-    PosesRename(crate::poses::PreparedPosesSave),
-    Sequences(crate::sequences::PreparedSequences),
-    GraspSetup(Box<crate::grasp::PreparedGraspSetup>),
-    ToolCommissioning(crate::tool::PreparedToolCommissioning),
-}
-
-impl PreparedConfigWrite {
-    fn prepare(
-        inner: &mut SupervisorInner,
-        path: &str,
-        body: &Value,
-        setup_path: Option<&std::path::PathBuf>,
-        require_expected_revision: bool,
-    ) -> Option<Result<Self, ArmError>> {
-        Some(match path {
-            "/api/v1/workspace/keepout" => crate::keepout::prepare_update_with(inner, body, require_expected_revision).map(Self::Keepout),
-            "/api/v1/safety/collision" => crate::collision::prepare_update_with(inner, body, require_expected_revision).map(Self::Collision),
-            "/api/v1/gripper/calibration" => crate::gripper_calib::prepare_update_with(inner, body, require_expected_revision).map(|p| Self::GripperCalib(Box::new(p))),
-            "/api/v1/poses/save" => crate::poses::prepare_save_with(inner, body, require_expected_revision).map(Self::PosesSave),
-            "/api/v1/poses/delete" => crate::poses::prepare_delete_with(inner, body, require_expected_revision).map(Self::PosesDelete),
-            "/api/v1/poses/rename" => crate::poses::prepare_rename_with(inner, body, require_expected_revision).map(Self::PosesRename),
-            "/api/v1/sequences/save" => crate::sequences::prepare_save(inner, body).map(Self::Sequences),
-            "/api/v1/sequences/delete" => crate::sequences::prepare_delete(inner, body).map(Self::Sequences),
-            "/api/v1/grasp/setup" => crate::grasp::prepare_setup_update(inner, body, setup_path, require_expected_revision).map(|p| Self::GraspSetup(Box::new(p))),
-            "/api/v1/tool/commissioning/confirm" => crate::tool::prepare_commissioning_confirm(inner, body, require_expected_revision).map(Self::ToolCommissioning),
-            _ => return None,
-        })
-    }
-
-    fn path(&self) -> &'static str {
-        match self {
-            Self::Keepout(_) => "/api/v1/workspace/keepout",
-            Self::Collision(_) => "/api/v1/safety/collision",
-            Self::GripperCalib(_) => "/api/v1/gripper/calibration",
-            Self::PosesSave(_) => "/api/v1/poses/save",
-            Self::PosesDelete(_) => "/api/v1/poses/delete",
-            Self::PosesRename(_) => "/api/v1/poses/rename",
-            Self::Sequences(p) => if p.sequence.is_some() { "/api/v1/sequences/save" } else { "/api/v1/sequences/delete" },
-            Self::GraspSetup(_) => "/api/v1/grasp/setup",
-            Self::ToolCommissioning(_) => "/api/v1/tool/commissioning/confirm",
-        }
-    }
-
-    fn has_write(&self) -> bool {
-        match self {
-            Self::Keepout(p) => p.write.is_some(),
-            Self::Collision(p) => p.write.is_some(),
-            Self::GripperCalib(p) => p.write.is_some(),
-            Self::PosesSave(p) => p.write.is_some(),
-            Self::PosesDelete(p) => p.write.is_some(),
-            Self::PosesRename(p) => p.write.is_some(),
-            Self::Sequences(p) => p.write.is_some(),
-            Self::GraspSetup(p) => p.write.is_some(),
-            Self::ToolCommissioning(p) => p.write.is_some(),
-        }
-    }
-
-    fn take_write(&mut self) -> Option<crate::persist::PendingWrite> {
-        match self {
-            Self::Keepout(p) => p.write.take(),
-            Self::Collision(p) => p.write.take(),
-            Self::GripperCalib(p) => p.write.take(),
-            Self::PosesSave(p) => p.write.take(),
-            Self::PosesDelete(p) => p.write.take(),
-            Self::PosesRename(p) => p.write.take(),
-            Self::Sequences(p) => p.write.take(),
-            Self::GraspSetup(p) => p.write.take(),
-            Self::ToolCommissioning(p) => p.write.take(),
-        }
-    }
-
-    fn precheck(&mut self, inner: &mut SupervisorInner) -> Option<ArmError> {
-        match self {
-            Self::Keepout(p) => {
-                if inner.keepout.revision != p.base_revision {
-                    return Some(ArmError::PolicyRevisionMismatch { expected: p.base_revision, current: inner.keepout.revision });
-                }
-                if inner.calibration_busy {
-                    return Some(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
-                }
-                if inner.workspace_policy().is_none() {
-                    return Some(crate::motion::MotionError::Unsupported(
-                        "Keep-out boxes need a profile with kinematics and a workspace".into(),
-                    ).into());
-                }
-                if let Some(reason) = inner.workspace_change_blocker() {
-                    return Some(crate::motion::MotionError::MotionBusy(format!("keep-out boxes cannot change while {reason}")).into());
-                }
-                None
-            }
-            Self::Collision(p) => {
-                if inner.collision.revision != p.base_revision {
-                    return Some(ArmError::PolicyRevisionMismatch { expected: p.base_revision, current: inner.collision.revision });
-                }
-                if inner.calibration_busy {
-                    return Some(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
-                }
-                if p.enabled == Some(true) && !inner.collision_available() {
-                    return Some(crate::motion::MotionError::Unsupported(
-                        "The collision guard needs a profile gravity model and a driver that reports torque".into(),
-                    ).into());
-                }
-                None
-            }
-            Self::GripperCalib(ref mut p) => crate::gripper_calib::precheck_update(inner, p).err(),
-            Self::PosesSave(p) => crate::poses::precheck_save(inner, p).err(),
-            Self::PosesDelete(p) => crate::poses::precheck_delete(inner, p).err(),
-            Self::PosesRename(p) => crate::poses::precheck_save(inner, p).err(),
-            Self::Sequences(p) => crate::sequences::precheck(inner, p).err(),
-            Self::GraspSetup(p) => crate::grasp::precheck_setup_update(inner, p).err(),
-            Self::ToolCommissioning(p) => crate::tool::precheck_commissioning_confirm(inner, p).err(),
-        }
-    }
-
-    fn commit(self, inner: &mut SupervisorInner) -> Result<Vec<(&'static str, Value)>, ArmError> {
-        match self {
-            Self::Keepout(p) => {
-                let state = crate::keepout::commit_update(inner, p)?;
-                Ok(vec![
-                    ("boxes", json!(state.boxes)),
-                    ("source", json!(state.source)),
-                    ("revision", json!(state.revision)),
-                ])
-            }
-            Self::Collision(p) => {
-                let cfg = crate::collision::commit_update(inner, p)?;
-                Ok(vec![
-                    ("collision", json!(cfg)),
-                    ("revision", json!(cfg.revision)),
-                ])
-            }
-            Self::GripperCalib(p) => {
-                let (policy, revision) = crate::gripper_calib::commit_update(inner, *p)?;
-                Ok(vec![
-                    ("policy", json!(policy)),
-                    ("closed_rad", json!(policy.closed_rad)),
-                    ("open_rad", json!(policy.open_rad)),
-                    ("jaw_opening", json!(policy.jaw_opening)),
-                    ("revision", json!(revision)),
-                ])
-            }
-            Self::PosesSave(p) => {
-                let (pose, revision) = crate::poses::commit_save(inner, p)?;
-                Ok(pose_ack_fields(inner, &pose, revision))
-            }
-            Self::PosesDelete(p) => {
-                let revision = crate::poses::commit_delete(inner, p)?;
-                Ok(vec![
-                    ("revision", json!(revision)),
-                ])
-            }
-            Self::PosesRename(p) => {
-                let (pose, revision) = crate::poses::commit_save(inner, p)?;
-                Ok(pose_ack_fields(inner, &pose, revision))
-            }
-            Self::Sequences(p) => {
-                let (seq, revision) = crate::sequences::commit(inner, p)?;
-                let mut fields = vec![("revision", json!(revision))];
-                if let Some(seq) = seq { fields.push(("sequence", json!(seq))); }
-                Ok(fields)
-            }
-            Self::GraspSetup(p) => {
-                let (setup, revision) = crate::grasp::commit_setup_update(inner, *p)?;
-                Ok(vec![
-                    ("setup", json!(setup)),
-                    ("revision", json!(revision)),
-                ])
-            }
-            Self::ToolCommissioning(p) => {
-                let (active_tool, revision) = crate::tool::commit_commissioning_confirm(inner, p)?;
-                Ok(vec![
-                    ("active_tool", json!(active_tool)),
-                    ("commissioning_required", json!(active_tool.commissioning_required)),
-                    ("revision", json!(revision)),
-                ])
-            }
-        }
-    }
-}
-
 struct WsAuthState {
     auth: crate::auth::OperatorAuth,
     token: Option<String>,
@@ -855,65 +475,6 @@ fn lease_free_operator_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Opti
     Some(ApiError::operator_required(path))
 }
 
-/// A calibration command checked under the lock.
-enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest), JointZeroRestore(String),
-    MitQualification(Box<crate::calibration::CalibrationFile>) }
-
-/// What a checked calibration command does: a task (job, busy flag set) or a reply under the
-/// lock (motor zero dry run).
-enum CalibStart { Job(CalibJob, bool), Reply(Value) }
-
-/// Paths refused while a calibration transaction runs: motion (MOTION_BUSY) and configuration
-/// writes (CONFIG_BUSY). Stop, torque, clear_fault and everything else go through.
-fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static str> {
-    if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
-    if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
-    if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
-    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/rename" | "/api/v1/poses/delete"
-        | "/api/v1/sequences/save" | "/api/v1/sequences/delete"
-        | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
-    None
-}
-
-/// Under the lock: parse and check a calibration command; a real apply / restore marks the
-/// transaction running (`calibration_busy`, cleared by its task). Returns (job, busy set).
-fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Result<CalibStart, crate::calibration::CalibError> {
-    if path == crate::motor_zero::PATH {
-        let (req, dry) = crate::motor_zero::check(inner, body)?;
-        if let Some(reply) = dry { return Ok(CalibStart::Reply(reply)); }
-        inner.calibration_busy = true;
-        inner.motor_zero_busy = true;
-        return Ok(CalibStart::Job(CalibJob::MotorZero(req), true));
-    }
-    if path == crate::mit::TIMEOUT_PATH {
-        // register reads / RAM write of a few motors with torque off, under the lock
-        return inner.mit_timeout_command(body).map(CalibStart::Reply);
-    }
-    if path == crate::mit::QUALIFICATION_PATH {
-        let file = inner.mit_qualification_check(body)?;
-        inner.calibration_busy = true;
-        return Ok(CalibStart::Job(CalibJob::MitQualification(Box::new(file)), true));
-    }
-    if path == crate::motor_zero::RESTORE_PATH {
-        let name = crate::motor_zero::check_restore(inner, body)?;
-        inner.calibration_busy = true;
-        inner.motor_zero_busy = true;
-        return Ok(CalibStart::Job(CalibJob::JointZeroRestore(name), true));
-    }
-    crate::calibration::begin_checks(inner)?;
-    let job = if path == "/api/v1/calibration/apply" {
-        let req = crate::calibration::parse_apply(body)?;
-        if !req.dry_run && req.kinematics.is_some() { crate::calibration::kinematics_armed(inner)?; }
-        CalibJob::Apply(Box::new(req))
-    } else {
-        if !body.is_object() { return Err(crate::calibration::CalibError::new(400, "INVALID_COMMAND", "Command body must be an object")); }
-        CalibJob::Restore(body.clone())
-    };
-    let busy = !matches!(&job, CalibJob::Apply(r) if r.dry_run);
-    if busy { inner.calibration_busy = true; }
-    Ok(CalibStart::Job(job, busy))
-}
-
 /// `command_ack` carrying the fields of `reply`.
 fn fields_ack(request_id: &Value, reply: Value) -> Value {
     let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted"});
@@ -922,12 +483,6 @@ fn fields_ack(request_id: &Value, reply: Value) -> Value {
         other => ack["result"] = other,
     }
     ack
-}
-
-fn calibration_reject(request_id: &Value, e: &crate::calibration::CalibError) -> Value {
-    let mut reply = json!({"type":"command_reject", "request_id":request_id});
-    for (k, v) in e.reply_fields() { reply[k] = v; }
-    reply
 }
 
 fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
