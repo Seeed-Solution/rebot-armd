@@ -87,8 +87,10 @@ pub struct ActiveRecording {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stopper {
     Owner(RecorderOwner),
-    /// The monitor (length cap, low space: `reason`; owner lost: discard).
-    Monitor { reason: &'static str },
+    /// The monitor of recording `recording` (length cap, low space: `reason`; owner lost:
+    /// discard). It stops only that recording: checked under the write guard, so a
+    /// replacement recording started meanwhile is never touched.
+    Monitor { reason: &'static str, recording: String },
 }
 
 /// Result of ending a recording.
@@ -319,6 +321,9 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                     return Err(ArmError::detailed(409, "RECORDER_NOT_OWNER", format!("the recording is owned by '{}'", r.owner.label()), json!({"owner": r.owner.label()})));
                 }
             }
+            if let Stopper::Monitor { recording, .. } = &by {
+                if recording != &r.id { return Err(rejected(409, "RECORDING_REPLACED", "the monitored recording ended; another one runs")); }
+            }
             inner.episodes.clone()
         };
         if save && !monitor {
@@ -334,6 +339,11 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 return Err(crate::recording::RecordingError::InvalidState { action: "save".into(), state: inner.recorder.state().clone() }.into());
             };
             if let Stopper::Owner(o) = &by { if o != &r.owner { return Err(rejected(409, "RECORDER_NOT_OWNER", "the recording changed owner")); } }
+            // under the mutation guard: the recording the monitor watched may have been
+            // replaced since its check
+            if let Stopper::Monitor { recording, .. } = &by {
+                if recording != &r.id { return Err(rejected(409, "RECORDING_REPLACED", "the monitored recording ended; another one runs")); }
+            }
             if !save {
                 inner.recorder.discard()?;
                 inner.recording = None;
@@ -379,7 +389,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
         let (joint_names, profile_id, arm_dof, gripper_joint, fps, tool_id, tool_config_digest) = sidecar_base;
         let has_gripper_motion = store::episode_has_gripper_motion(&frames, gripper_joint);
         let duration = match (frames.first(), frames.last()) { (Some(a), Some(b)) => (b.timestamp - a.timestamp).max(0.0), _ => 0.0 };
-        let (truncated, stopped_by) = match by { Stopper::Monitor { reason } => (reason == "max_duration", Some(reason.to_string())), _ => (false, None) };
+        let (truncated, stopped_by) = match by { Stopper::Monitor { reason, .. } => (reason == "max_duration", Some(reason.to_string())), _ => (false, None) };
         let sidecar = EpisodeSidecar {
             id: rec.id.clone(), dataset: rec.options.dataset.clone(), task: rec.options.task.clone(), source: rec.options.source.clone(),
             sequence_id: rec.options.sequence_id.clone(), repeat_index: rec.options.repeat_index, outcome: outcome.into(),
@@ -428,9 +438,10 @@ async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInne
             free.filter(|f| *f < store::STOP_MIN_FREE_BYTES).map(|_| (true, "low_space"))
         } else { None };
         let Some((save, reason)) = action else { continue; };
-        // only this recording: a newer one is not touched
+        // only this recording: a newer one is not touched (stop_recording checks it again
+        // under the write guard)
         if !lock.read().await.recording.as_ref().is_some_and(|r| r.id == id) { return; }
-        match stop_recording(&lock, Stopper::Monitor { reason }, save, None, None).await {
+        match stop_recording(&lock, Stopper::Monitor { reason, recording: id.clone() }, save, None, None).await {
             Ok(_) => tracing::warn!("Recording {id} {} by armd ({reason})", if save { "saved" } else { "discarded" }),
             Err(e) => tracing::warn!("Recording {id}: stop ({reason}) failed: {e}"),
         }

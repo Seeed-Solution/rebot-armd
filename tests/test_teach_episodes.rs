@@ -416,3 +416,22 @@ async fn import_validates_units_joint_order_limits_and_zero() {
     let (_, one) = get(addr, &format!("/api/v1/episodes/{}", r["id"].as_str().unwrap())).await;
     assert_eq!(one["stale"], true);
 }
+
+/// The monitor stops only the recording it watched: a stop for a recording that was
+/// replaced meanwhile is refused under the write guard and the new recording keeps running.
+#[tokio::test]
+async fn a_monitor_stop_never_touches_a_replacement_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sup = ArmSupervisor::new(profile());
+    sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+    sup.start_recording(None, None).await.unwrap();
+    for _ in 0..3 { sup.tick(0.02).await; }
+    let current = sup.inner().read().await.recording.as_ref().map(|r| r.id.clone()).unwrap();
+    let stale = armd::teach::Stopper::Monitor { reason: "max_duration", recording: format!("{current}-replaced") };
+    let e = sup.stop_recording_as(stale, true, None, None).await.expect_err("a stale monitor stop");
+    assert!(format!("{e:?}").contains("RECORDING_REPLACED"), "{e:?}");
+    assert_eq!(sup.inner().read().await.recording.as_ref().map(|r| r.id.clone()), Some(current.clone()), "the running recording was touched");
+    let own = armd::teach::Stopper::Monitor { reason: "max_duration", recording: current };
+    assert!(sup.stop_recording_as(own, true, None, None).await.is_ok());
+    assert!(sup.inner().read().await.recording.is_none());
+}
