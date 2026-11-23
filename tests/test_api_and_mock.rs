@@ -61,6 +61,19 @@ async fn rpc(ws: &mut TestSocket, generation: u64, epoch: u64, path: &str, body:
     ws_reply(ws, serde_json::json!({"type":"command", "request_id":REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed), "generation":generation, "epoch_id":epoch, "path":path, "body":body}), &["command_ack", "command_reject"]).await
 }
 
+/// A stalled writer (no published sample, the lock held past `OBS_LOCK_WAIT`): the HTTP
+/// body carries `code: OBSERVATION_UNAVAILABLE` with status 503 (SDK clients map the code).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observation_unavailable_503_body_carries_the_code() {
+    let (addr, sup) = spawn_test_server().await;
+    let writer = sup.inner().write().await;
+    let res = reqwest::Client::new().get(format!("http://{}/api/v1/observation", addr)).send().await.unwrap();
+    drop(writer);
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["code"], "OBSERVATION_UNAVAILABLE", "{body}");
+}
+
 #[tokio::test]
 async fn test_rest_api_observation_and_schema() {
     let (addr, _) = spawn_test_server().await;
