@@ -14,7 +14,10 @@
 //  4. expired session (cookie dropped, page still shows unlocked): a vision switch is refused, the badge goes back
 //     to locked, the dialog opens, the PIN runs the switch;
 //  5. the badge shows the minutes left in the last 5 minutes of a session;
-//  6. a failed fine calibration (stubbed result): no "can be applied" accuracy note, one line per failed cause.
+//  6. a failed fine calibration (stubbed result): no "can be applied" accuracy note, one line per failed cause;
+//  7. the enable switch label in the E-stop state fits the switch.
+// The PIN dialog, the calibration drawer and the failure box are checked after their animations ended: the element
+// at their centre and four inner points belongs to them.
 // PNGs to OUT. Exits non-zero if a check fails.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -39,6 +42,17 @@ const toasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toa
 const modal = (page) => page.evaluate(() => ({ open: !$('op-modal').hidden, why: $('op-why').textContent, retry: $('op-retry').textContent, cancel: $('op-cancel').textContent }));
 const clearToasts = (page) => page.evaluate(() => document.querySelectorAll('#toasts .toast').forEach((x) => x.remove()));
 const lockGlyph = (page, sel) => page.evaluate((s) => { const e = document.querySelector(s); return e ? getComputedStyle(e, '::after').content : null; }, sel);
+// wait until fade-in / slide-in animations have ended (screenshots taken earlier show the dialog half transparent)
+const settle = (page) => page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running' || a.effect?.getComputedTiming().iterations === Infinity), null, { timeout: 5000 }).catch(() => {});
+// the element on top at the centre and four inner points of `sel` belongs to it (nothing of the page drawn over it)
+const onTop = (page, sel) => page.evaluate((s) => {
+  const d = document.querySelector(s); if (!d) return ['missing'];
+  const r = d.getBoundingClientRect();
+  return [[0.5, 0.5], [0.5, 0.2], [0.5, 0.8], [0.2, 0.5], [0.8, 0.5]].map(([x, y]) => {
+    const h = document.elementFromPoint(r.left + r.width * x, r.top + r.height * y);
+    return h && d.contains(h) ? 'in' : h ? (h.id || String(h.className) || h.tagName) : 'none';
+  }).filter((v) => v !== 'in');
+}, sel);
 async function enterPin(page) { await page.fill('#op-pin', PIN); await page.press('#op-pin', 'Enter'); return waitFor(page, () => $('op-modal').hidden && S.auth.role === 'operator'); }
 
 const VIEWS = [['phone', { width: 390, height: 844 }], ['tablet', { width: 1024, height: 768 }]];
@@ -83,9 +97,15 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   ok(m.open && m.why.length > 20 && !m.retry, `${name} calibration entry explains before opening ${JSON.stringify(m)}`);
   ok(m.cancel === (lang === 'zh' ? '先不解锁' : 'Not now'), `${name} cancel reads Not now (${m.cancel})`);
   ok(await page.evaluate(() => $('cwiz').hidden), name + ' wizard not open while the dialog is up');
+  await settle(page);
+  let cover = await onTop(page, '.op-dialog');
+  ok(!cover.length, `${name} PIN dialog on top of the page ${JSON.stringify(cover)}`);
   await page.screenshot({ path: path.join(out, `${name}_2_calib_entry.png`) });
   await page.click('#op-cancel');
   ok(await waitFor(page, () => !$('cwiz').hidden), name + ' Not now opens the wizard');
+  await settle(page);
+  cover = await onTop(page, '#cwiz-panel');
+  ok(!cover.length, `${name} calibration drawer on top of the page ${JSON.stringify(cover)}`);
   ok(await waitFor(page, () => [...document.querySelectorAll('#toasts .toast')].some((x) => x.querySelector('.toast-act'))), name + ' refused vision switch: toast with Unlock');
   await page.waitForTimeout(500);
   ok(await page.evaluate(() => { const b = document.querySelector('#toasts .toast-act'), r = b.getBoundingClientRect(), h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
@@ -167,12 +187,28 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
       { key: 'kin_heldout_ab', ok: true, value: 3.1, limit: 5, unit: 'mm' }, { key: 'kin_heldout_ba', ok: false, value: 5.2, limit: 5, unit: 'mm' }],
       kin: { warnings: [{ key: 'accuracy', mm: 5.2, limit: 3 }] } };
     cwOpen(true);
+    document.querySelector('#cwiz-body .cwiz-fail').scrollIntoView({ block: 'center' });
     const msgs = [...$('cwiz-body').querySelectorAll('.cwiz-msg')].map((x) => x.innerText);
     return { msgs, items: $('cwiz-body').querySelectorAll('.cwiz-fail li').length, acc: t('cw.f.acc', { mm: '5.2', lim: '3' }).slice(0, 12), same: t('cw.f.fail') };
   });
   ok(!fine.msgs.some((x) => x.startsWith(fine.acc)), `${name} failed fine calibration: no "can be applied" note ${JSON.stringify(fine.msgs)}`);
+  await settle(page);
+  cover = await onTop(page, '#cwiz-body .cwiz-fail');
+  ok(!cover.length, `${name} fine calibration failure box on top of the page ${JSON.stringify(cover)}`);
+  await page.screenshot({ path: path.join(out, `${name}_7_fine_fail.png`) });
   ok(fine.items === 2 && fine.msgs.some((x) => x.includes(fine.same) && x.includes('RMS') && x.includes('B → A')), `${name} failed fine calibration: one line per failed cause ${JSON.stringify(fine)}`);
   await page.evaluate(() => { cwOpen(false); CWZ.solve = null; CWZ.step = 'board'; });
+  // 7. E-stop latched: the enable switch label is not cut off
+  await page.click('#btn-estop');
+  ok(await waitFor(page, () => S.state === 'EStop' && /⚠/.test($('enable-txt').textContent)), name + ' E-stop latched');
+  await settle(page);
+  const lbl = await page.evaluate(() => { const b = $('enable-txt'), sw = $('btn-enable'); const r = b.getBoundingClientRect(), q = sw.getBoundingClientRect();
+    return { text: b.textContent, sw: b.scrollWidth, cw: b.clientWidth, inside: r.right <= q.right + 0.5 && r.bottom <= q.bottom + 0.5 }; });
+  ok(lbl.text.length > 3 && lbl.sw <= lbl.cw + 1 && lbl.inside, `${name} E-stop reset label fits the switch ${JSON.stringify(lbl)}`);
+  await page.screenshot({ path: path.join(out, `${name}_8_estop_label.png`), clip: { x: 0, y: 0, width: view.width, height: Math.min(view.height, 520) } });
+  // reset (the session is unlocked here) so the next viewport starts without a latched E-stop
+  await page.evaluate(() => clearFault());
+  ok(await waitFor(page, () => S.state !== 'EStop'), name + ' E-stop reset');
   console.log(`${name}: done`);
   await ctx.close();
 }
