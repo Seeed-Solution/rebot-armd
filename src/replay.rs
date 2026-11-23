@@ -451,14 +451,16 @@ impl ReplayMotion {
     /// Approach + playback at `speed` + settle allowance (s).
     pub fn expected_duration(&self) -> f64 { self.approach_duration + self.duration / self.speed + 0.5 }
 
-    fn sample_at(&self, t: f64) -> Vec<f32> {
+    /// The recording at `t` into `out` (reused).
+    fn sample_at_into(&self, t: f64, out: &mut Vec<f32>) {
         let x = (t / self.sample_dt).max(0.0);
         let k = (x.floor() as usize).min(self.samples.len() - 1);
         let b = (k + 1).min(self.samples.len() - 1);
         // the last segment may be shorter than sample_dt
         let seg = if b + 1 == self.samples.len() { (self.duration - k as f64 * self.sample_dt).max(1e-9) } else { self.sample_dt };
         let f = ((t - k as f64 * self.sample_dt) / seg).clamp(0.0, 1.0) as f32;
-        self.samples[k].iter().zip(&self.samples[b]).map(|(x, y)| x + (y - x) * f).collect()
+        out.clear();
+        out.extend(self.samples[k].iter().zip(&self.samples[b]).map(|(x, y)| x + (y - x) * f));
     }
 
     /// Gripper joint of `q`: held when not replayed; while the stall latch holds it, a
@@ -475,15 +477,18 @@ impl ReplayMotion {
         false
     }
 
-    pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
+    crate::motion::step_into_via_with!();
+
+    /// One step, written into `positions` / `velocities` (their memory is reused).
+    fn step_with(&mut self, ctx: &StepCtx, mut positions: Vec<f32>, mut velocities: Vec<f32>) -> StepOut {
         let n = ctx.commanded.len();
         let progress = (self.t_s() / self.duration).clamp(0.0, 1.0) as f32;
         match &mut self.phase {
             Phase::Approach(traj) => {
-                let point = traj.step(ctx.dt * ctx.time_scale);
+                let (mut q, mut v) = (positions, velocities);
+                traj.step_pv_into(ctx.dt * ctx.time_scale, &mut q, &mut v);
                 let finished = traj.is_finished();
-                let mut q = point.positions;
-                let mut v: Vec<f32> = point.velocities.iter().map(|x| x * ctx.time_scale as f32).collect();
+                for x in v.iter_mut() { *x *= ctx.time_scale as f32; }
                 let clear = self.apply_gripper(&mut q, ctx);
                 if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
                 if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
@@ -500,8 +505,12 @@ impl ReplayMotion {
                 if rate <= STALL_RATE {
                     *stalled_for += ctx.dt;
                     if *stalled_for >= STALL_TIMEOUT_S - 1e-9 {
+                        positions.clear();
+                        positions.extend_from_slice(ctx.commanded);
+                        velocities.clear();
+                        velocities.resize(n, 0.0);
                         return StepOut {
-                            positions: ctx.commanded.to_vec(), velocities: vec![0.0; n], progress, clear_gripper_stall: false,
+                            positions, velocities, progress, clear_gripper_stall: false,
                             status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
                                 "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
                         };
@@ -511,9 +520,11 @@ impl ReplayMotion {
                 }
                 *t = (*t + ctx.dt * self.speed * rate * ctx.time_scale).min(self.duration);
                 let t_now = *t;
-                let mut q = self.sample_at(t_now);
+                let mut q = positions;
+                self.sample_at_into(t_now, &mut q);
                 let clear = self.apply_gripper(&mut q, ctx);
-                let velocities: Vec<f32> = (0..n).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32).collect();
+                velocities.clear();
+                velocities.extend((0..n).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32));
                 if t_now >= self.duration { self.phase = Phase::Settle(Settle::default()); }
                 StepOut { positions: q, velocities, status: StepStatus::Running, progress: (t_now / self.duration).min(1.0) as f32, clear_gripper_stall: clear }
             }
@@ -522,7 +533,11 @@ impl ReplayMotion {
                     Some(settled) => StepStatus::Done { settled: Some(settled), holding: None, gripper_gap_rad: None },
                     None => StepStatus::Running,
                 };
-                StepOut { positions: ctx.commanded.to_vec(), velocities: vec![0.0; n], status, progress: 1.0, clear_gripper_stall: false }
+                positions.clear();
+                positions.extend_from_slice(ctx.commanded);
+                velocities.clear();
+                velocities.resize(n, 0.0);
+                StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: false }
             }
         }
     }

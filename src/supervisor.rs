@@ -7,6 +7,7 @@ use crate::supervisor_lock::SupervisorLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::rt_core::scratch::{copy_into, fill_n};
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{EpisodeRecorder, RecordFrame, RecordingError};
@@ -238,6 +239,17 @@ struct DeferredActionDone {
 }
 
 /// Internal mutable state of the robotic arm supervisor
+/// What [`SupervisorInner::tick_publish`] hands back.
+pub struct TickPublished {
+    /// A copy of the published observation (asked for with `keep`).
+    pub kept: Option<ArmObservation>,
+    /// An observation the publication slot held and the caller frees after the lock (None
+    /// when the tick filled the slot's own observation, the steady state).
+    pub displaced: Option<ArmObservation>,
+    /// End of the tick body (the tick phase mark), None without phase timing.
+    pub body_end: Option<Instant>,
+}
+
 pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
@@ -422,6 +434,10 @@ pub struct SupervisorInner {
     /// Per joint, the receive-queue bound of its last sample ([`ArmDriver::feedback_queue_bounds`]);
     /// empty when the driver has no receive queue (the receive instant bounds the sample then).
     pub joint_feedback_queue_bounds: Vec<Option<Instant>>,
+    /// Preallocated buffers of the tick (no allocation in a steady-state tick).
+    pub(crate) scratch: crate::rt_core::scratch::TickScratch,
+    /// Vectors of the tick's workspace evaluators (`servo_step_workspace`).
+    pub(crate) ws_eval_bufs: crate::chain::EvalBufs,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
@@ -702,6 +718,8 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             core: crate::rt_core::ArmCore::new(dof),
             joint_feedback_queue_bounds: Vec::new(),
+            scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
+            ws_eval_bufs: Default::default(),
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             requested_estop_count: Arc::new(AtomicU64::new(0)),
@@ -989,7 +1007,7 @@ impl SupervisorInner {
         }
         if let Some(loads) = loads {
             if loads.len() == dof && loads.iter().all(|x| x.is_finite()) {
-                *loads_vec = loads.to_vec();
+                copy_into(loads_vec, loads);
             }
         }
     }
@@ -1144,24 +1162,24 @@ impl SupervisorInner {
     /// When a live policy run has a `verified_release_gate`, each joint's `max_velocity`
     /// is further scaled by `gate.max_speed_scale().clamp(0.1, 1.0)`.
     pub fn servo_limits(&self) -> Vec<crate::model::JointLimit> {
+        let mut limits = Vec::with_capacity(self.config.limits.len());
+        self.servo_limits_into(&mut limits);
+        limits
+    }
+
+    /// [`Self::servo_limits`] into `limits`, reusing its memory (the tick's form).
+    pub fn servo_limits_into(&self, limits: &mut Vec<crate::model::JointLimit>) {
+        self.config.servo_limits_into(limits);
         #[cfg(feature = "policy-runtime")]
-        {
-            let mut limits = self.config.servo_limits();
-            if let Some(ref run) = self.policy_run {
-                if run.mode == crate::policy_runtime::PolicyMode::Live {
-                    if let Some(ref gate) = run.verified_release_gate {
-                        let scale = (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
-                        for limit in &mut limits {
-                            limit.max_velocity *= scale;
-                        }
+        if let Some(ref run) = self.policy_run {
+            if run.mode == crate::policy_runtime::PolicyMode::Live {
+                if let Some(ref gate) = run.verified_release_gate {
+                    let scale = (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
+                    for limit in limits.iter_mut() {
+                        limit.max_velocity *= scale;
                     }
                 }
             }
-            limits
-        }
-        #[cfg(not(feature = "policy-runtime"))]
-        {
-            self.config.servo_limits()
         }
     }
 
@@ -1297,34 +1315,50 @@ impl SupervisorInner {
 
     /// Full workspace sweep check for a servo streaming or braking tick.
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
-        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp(
+        // the evaluator's vectors are reused from tick to tick (no allocation in the tick)
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let result = self.servo_step_workspace_in(next, phase, &mut bufs);
+        self.ws_eval_bufs = bufs;
+        let cand_min_d = result?;
+        if let Some(min_d) = cand_min_d { self.servo_ws_min_depths = Some((self.workspace_revision, min_d)); }
+        Ok(())
+    }
+
+    /// [`Self::servo_step_workspace`]'s check; the new minimum depths (None: no workspace).
+    fn servo_step_workspace_in(&self, next: &[f32], phase: &str, bufs: &mut crate::chain::EvalBufs)
+        -> Result<Option<crate::kinematics::SlotBuf>, SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(None); };
+        let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
             &self.config.arm_model,
             ws,
             cam,
             self.config.tcp_offset,
+            bufs,
         );
-        let mut c0 = eval.alloc_buf();
-        eval.eval_into(&self.commanded_positions, &mut c0, phase)
-            .map_err(SafetyError::from_workspace)?;
-        let mut cand_min_d = match &self.servo_ws_min_depths {
-            Some((rev, min_d)) if *rev == self.workspace_revision => min_d.clone(),
-            _ => eval.init_min_depths(&c0),
-        };
-        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
-        eval.sweep_linear_step(
-            &self.commanded_positions,
-            next,
-            &c0,
-            &mut cand_min_d,
-            &mut budget,
-            MAX_KEEPOUT_EVALS_PER_TICK,
-            phase,
-            phase,
-        )
-        .map_err(|(_, f)| SafetyError::from_workspace(f))?;
-        self.servo_ws_min_depths = Some((self.workspace_revision, cand_min_d));
-        Ok(())
+        let checked = (|| {
+            let mut c0 = eval.alloc_buf();
+            eval.eval_into(&self.commanded_positions, &mut c0, phase)
+                .map_err(SafetyError::from_workspace)?;
+            let mut cand_min_d = match &self.servo_ws_min_depths {
+                Some((rev, min_d)) if *rev == self.workspace_revision => min_d.clone(),
+                _ => eval.init_min_depths(&c0),
+            };
+            let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+            eval.sweep_linear_step(
+                &self.commanded_positions,
+                next,
+                &c0,
+                &mut cand_min_d,
+                &mut budget,
+                MAX_KEEPOUT_EVALS_PER_TICK,
+                phase,
+                phase,
+            )
+            .map_err(|(_, f)| SafetyError::from_workspace(f))?;
+            Ok(Some(cand_min_d))
+        })();
+        eval.recycle(bufs);
+        checked
     }
 
     /// Conservative keep-out check of the joint path `at(t)` over `knots` (ascending).
@@ -1533,40 +1567,38 @@ impl SupervisorInner {
 
     pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {
         if !self.feedback_numeric_valid { return false; }
-        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| {
-            // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
-            // which would silently cap callers asking for a longer bound.
-            let ages = drv.feedback_ages();
-            ages.len() == self.config.dof
-                && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
-        }))
+        // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
+        // which would silently cap callers asking for a longer bound.
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
     }
 
-    /// Update per-joint feedback instants and monotonic sequence counters from a hardware driver.
+    /// Update per-joint feedback instants and monotonic sequence counters from a hardware driver
+    /// (read into `sc`, no allocation).
     fn record_driver_feedback_timing(
         joint_feedback_instants: &mut Vec<Option<Instant>>,
         joint_feedback_seqs: &mut Vec<u64>,
         joint_feedback_queue_bounds: &mut Vec<Option<Instant>>,
         dof: usize,
         driver: &dyn ArmDriver,
+        sc: &mut crate::rt_core::scratch::FeedbackScratch,
     ) {
-        let instants = driver.feedback_instants();
-        let seqs = driver.feedback_seqs();
-        let bounds = driver.feedback_queue_bounds();
-        if bounds.len() == dof {
-            *joint_feedback_queue_bounds = bounds;
+        driver.feedback_instants_into(&mut sc.instants);
+        driver.feedback_seqs_into(&mut sc.seqs);
+        driver.feedback_queue_bounds_into(&mut sc.bounds);
+        if sc.bounds.len() == dof {
+            copy_into(joint_feedback_queue_bounds, &sc.bounds);
         } else {
             joint_feedback_queue_bounds.clear();
         }
         if joint_feedback_seqs.len() != dof {
             joint_feedback_seqs.resize(dof, 0);
         }
-        if seqs.len() == dof {
-            *joint_feedback_seqs = seqs;
+        if sc.seqs.len() == dof {
+            copy_into(joint_feedback_seqs, &sc.seqs);
         } else {
             for i in 0..dof {
                 let prev = joint_feedback_instants.get(i).copied().flatten();
-                let cur = instants.get(i).copied().flatten();
+                let cur = sc.instants.get(i).copied().flatten();
                 if let Some(t) = cur {
                     if prev.is_none_or(|p| t > p) {
                         joint_feedback_seqs[i] = joint_feedback_seqs[i].wrapping_add(1);
@@ -1574,7 +1606,7 @@ impl SupervisorInner {
                 }
             }
         }
-        *joint_feedback_instants = instants;
+        copy_into(joint_feedback_instants, &sc.instants);
     }
 
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
@@ -1755,8 +1787,38 @@ impl SupervisorInner {
         valid
     }
 
+    /// The control loop's tick under the write guard of lock generation `generation`:
+    /// [`Self::tick_control`], the observation filled in place into the publication's back
+    /// slot ([`Self::fill_observation`]), and its publication (before the guard drops: no
+    /// other write can come in between). No allocation in a steady-state tick; `keep` copies
+    /// the observation for the caller (tests).
+    pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
+        let timestamp = self.tick_control(dt);
+        let mut obs = self.core.take_observation_buffer().unwrap_or_else(ArmObservation::blank);
+        self.fill_observation(timestamp, &mut obs);
+        self.tick_phase(4);
+        let body_end = self.tick_phase_mark.take();
+        let control_hz = self.config.control_frequency_hz;
+        let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
+            .min(self.observation_valid_for(&obs));
+        let kept = keep.then(|| obs.clone());
+        let at = Instant::now();
+        let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
+        let displaced = core.publish(generation, at, at + max_age, obs, measured_positions, measured_velocities);
+        TickPublished { kept, displaced, body_end }
+    }
+
     pub fn current_observation(&self) -> ArmObservation {
-        let timestamp = self.start_time.elapsed().as_secs_f64();
+        let mut obs = ArmObservation::blank();
+        self.fill_observation(self.start_time.elapsed().as_secs_f64(), &mut obs);
+        obs
+    }
+
+    /// [`Self::current_observation`] at `timestamp` written into `out`, reusing its memory: the
+    /// control tick fills its published sample this way, without allocating while no value
+    /// changes its shape (armd 1.6 RT core). Every field is overwritten.
+    pub fn fill_observation(&self, timestamp: f64, out: &mut ArmObservation) {
+        use crate::rt_core::scratch::{fill_n, set_opt, set_opt_eq, set_opt_str};
         let tcp = if self.config.kinematics.is_some() {
             self.config.tcp_pose_f32(&self.measured_positions).map(|pose| {
                 let rpy = crate::kinematics::r_to_rpy(&pose.r);
@@ -1791,45 +1853,58 @@ impl SupervisorInner {
             None
         };
         let driver_capabilities = self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.capabilities())).unwrap_or_default();
-        ArmObservation {
-            timestamp,
-            positions: self.measured_positions.clone(),
-            velocities: self.measured_velocities.clone(),
-            torques: self.torques.clone(),
-            temperatures: self.temperatures.clone(),
-            is_torqued: self.is_torqued,
-            safety_state: self.safety.state().clone(),
-            epoch_id: self.safety.epoch_id(),
-            gravity_compensated: self.gravity_output_enabled(),
-            gravity_torques: self.gravity_torques.clone(),
-            driver_capabilities,
-            enable_state: self.driver.as_ref().map_or(if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }, |d| d.lock().map_or(EnableState::Unknown, |drv| drv.enable_state())),
-            feedback_age_ms: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.feedback_ages().iter().map(|a| a.map(|v| v.as_millis().min(u64::MAX as u128) as u64)).collect())).unwrap_or_else(|| vec![Some(0); self.config.dof]),
-            disable_pending: self.disable_pending,
-            feedback_valid: self.hardware_feedback_fresh(Duration::from_millis(250)),
-            commanded_positions: self.commanded_positions.clone(),
-            action: self.last_action.clone(),
-            previous_action: self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a.clone()),
-            control_mode: if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position },
-            gravity_comp: self.gravity_comp_observation(),
-            driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
-            lease_holder: self.lease_holder(),
-            motion_limit: self.motion_limit.clone(),
-            workspace_violation: self.workspace_violation.clone(),
-            motor_errors: self.motor_errors.clone(),
-            fault: self.safety.fault(),
-            residual_torques: self.residual_torques,
-            collision: self.collision_observation(),
-            power: self.power_observation(),
-            gripper_zero: self.gripper_zero_observation(),
-            tcp,
-            gripper,
-            loads: (driver_capabilities.load_feedback && self.loads.len() == self.config.dof).then(|| self.loads.clone()),
-            #[cfg(feature = "policy-runtime")]
-            policy: self.policy_observation(),
-            #[cfg(not(feature = "policy-runtime"))]
-            policy: None,
+        out.timestamp = timestamp;
+        out.positions.clone_from(&self.measured_positions);
+        out.velocities.clone_from(&self.measured_velocities);
+        out.torques.clone_from(&self.torques);
+        out.temperatures.clone_from(&self.temperatures);
+        out.is_torqued = self.is_torqued;
+        // `fault` is a function of the safety state and its code: rebuilt (a String) only
+        // when either changed
+        let state = self.safety.state();
+        if out.safety_state != *state || out.fault.as_ref().map(|f| f.code) != self.safety.fault_code() {
+            out.fault = self.safety.fault();
         }
+        if out.safety_state != *state { out.safety_state = state.clone(); }
+        out.epoch_id = self.safety.epoch_id();
+        out.gravity_compensated = self.gravity_output_enabled();
+        out.gravity_torques.clone_from(&self.gravity_torques);
+        out.driver_capabilities = driver_capabilities;
+        out.enable_state = self.driver.as_ref().map_or(if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }, |d| d.lock().map_or(EnableState::Unknown, |drv| drv.enable_state()));
+        match self.driver.as_ref().map(|d| d.lock()) {
+            Some(Ok(drv)) => drv.feedback_age_ms_into(&mut out.feedback_age_ms),
+            _ => fill_n(&mut out.feedback_age_ms, Some(0), self.config.dof),
+        }
+        out.disable_pending = self.disable_pending;
+        out.feedback_valid = self.hardware_feedback_fresh(Duration::from_millis(250));
+        out.commanded_positions.clone_from(&self.commanded_positions);
+        out.action.clone_from(&self.last_action);
+        set_opt(&mut out.previous_action, self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a));
+        out.control_mode = if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position };
+        self.gravity_comp_observation_into(&mut out.gravity_comp);
+        match self.driver.as_ref().map(|d| d.lock()) {
+            Some(Ok(drv)) => drv.with_range_check(&mut |rc| set_opt_eq(&mut out.driver_range_check, rc)),
+            _ => out.driver_range_check = None,
+        }
+        set_opt_str(&mut out.lease_holder, self.lease_holder_str());
+        out.motion_limit.clone_from(&self.motion_limit);
+        set_opt_eq(&mut out.workspace_violation, self.workspace_violation.as_ref());
+        if out.motor_errors != self.motor_errors { out.motor_errors.clone_from(&self.motor_errors); }
+        out.residual_torques = self.residual_torques;
+        out.collision = self.collision_observation();
+        self.power_observation_into(&mut out.power);
+        self.gripper_zero_observation_into(&mut out.gripper_zero);
+        out.tcp = tcp;
+        out.gripper = gripper;
+        if driver_capabilities.load_feedback && self.loads.len() == self.config.dof {
+            set_opt(&mut out.loads, Some(&self.loads));
+        } else {
+            out.loads = None;
+        }
+        #[cfg(feature = "policy-runtime")]
+        self.policy_observation_into(&mut out.policy);
+        #[cfg(not(feature = "policy-runtime"))]
+        { out.policy = None; }
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
@@ -2222,6 +2297,7 @@ impl SupervisorInner {
                     &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     driver.as_ref(),
+                    &mut self.scratch.fb,
                 );
                 Self::apply_feedback(
                     &mut self.measured_positions,
@@ -2733,6 +2809,7 @@ impl SupervisorInner {
                     &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     drv.as_ref(),
+                    &mut self.scratch.fb,
                 );
                 Self::apply_feedback(
                     &mut self.measured_positions,
@@ -2789,6 +2866,7 @@ impl SupervisorInner {
                 &mut self.joint_feedback_queue_bounds,
                 self.config.dof,
                 drv.as_ref(),
+                &mut self.scratch.fb,
             );
             Self::apply_feedback(
                 &mut self.measured_positions,
@@ -3132,7 +3210,12 @@ impl SupervisorInner {
 
     /// Label of the valid lease holder (empty string when it sent none); None when no lease is held.
     pub fn lease_holder(&self) -> Option<String> {
-        self.active_lease.as_ref().filter(|a| a.acquired_at.elapsed() < self.lease_timeout).map(|a| a.label.clone())
+        self.lease_holder_str().map(str::to_owned)
+    }
+
+    /// [`Self::lease_holder`] without the copy.
+    pub fn lease_holder_str(&self) -> Option<&str> {
+        self.active_lease.as_ref().filter(|a| a.acquired_at.elapsed() < self.lease_timeout).map(|a| a.label.as_str())
     }
 
     /// Why `client_id` no longer holds `generation`: "preempted" when a forced acquire
@@ -4467,29 +4550,36 @@ impl SupervisorInner {
     }
 
     pub fn gripper_zero_observation(&self) -> Option<crate::model::GripperZeroObservation> {
-        let idx = self.config.gripper_index()?;
-        self.config.gripper_policy.as_ref()?;
+        let mut out = None;
+        self.gripper_zero_observation_into(&mut out);
+        out
+    }
+
+    /// [`Self::gripper_zero_observation`] into `out`, reusing its memory.
+    pub fn gripper_zero_observation_into(&self, out: &mut Option<crate::model::GripperZeroObservation>) {
+        let (Some(idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) else {
+            *out = None;
+            return;
+        };
         let j7 = self.measured_positions.get(idx).copied().unwrap_or(0.0);
         let offset_rad = self.gripper_calib_offset.or(self.last_zero_check_offset);
         let state = if self.gripper_calib_invalid {
-            "calib_invalid".to_string()
+            "calib_invalid"
         } else if self.gripper_zero_checked {
-            "checked".to_string()
+            "checked"
         } else {
-            let policy = self.config.gripper_policy.as_ref().unwrap();
             let min_j7 = policy.closed_rad.min(policy.open_rad) - 0.3;
             let max_j7 = policy.closed_rad.max(policy.open_rad) + 0.3;
-            if j7 < min_j7 || j7 > max_j7 {
-                "out_of_range".to_string()
-            } else {
-                "ok".to_string()
-            }
+            if j7 < min_j7 || j7 > max_j7 { "out_of_range" } else { "ok" }
         };
-        Some(crate::model::GripperZeroObservation {
-            state,
-            j7,
-            offset_rad,
-        })
+        match out {
+            Some(o) => {
+                crate::rt_core::scratch::set_str(&mut o.state, state);
+                o.j7 = j7;
+                o.offset_rad = offset_rad;
+            }
+            None => *out = Some(crate::model::GripperZeroObservation { state: state.to_string(), j7, offset_rad }),
+        }
     }
 
     /// Validate a candidate gripper calibration (including hardware driver limits) without
@@ -4582,7 +4672,7 @@ impl SupervisorInner {
     /// Single place that ends a running action whose reference went away (spec 2.3).
     fn reconcile_action(&mut self, dt: f64, tick_output_accepted: bool) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
-        let (id, kind) = (action.id, action.kind.clone());
+        let (id, is_park, is_replay) = (action.id, action.kind == "park", action.kind == "replay");
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
         #[cfg(feature = "policy-runtime")]
         let is_policy = self.policy_run.as_ref().is_some_and(|p| p.action_id == id);
@@ -4594,13 +4684,13 @@ impl SupervisorInner {
             SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
             SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
             SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
-            _ if kind != "park" && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
+            _ if !is_park && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
             _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
             _ => None,
         };
         if let Some((state, code, message)) = cause {
             // a macro sub-motion or a replay must not outlive its action
-            if (is_macro || kind == "replay") && carried { self.stop_motion(); }
+            if (is_macro || is_replay) && carried { self.stop_motion(); }
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
             #[cfg(feature = "policy-runtime")]
             if is_policy {
@@ -4645,7 +4735,7 @@ impl SupervisorInner {
             return;
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
-        if kind == "park" {
+        if is_park {
             if self.mit.deferred_park_action == Some(id) { return; }
             if self.pending_normal_unload {
                 let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
@@ -4684,19 +4774,23 @@ impl SupervisorInner {
     /// With tracking enabled, returns a deferred completion payload on `StepStatus::Done` so
     /// `"done"` is only published after that tick's output has been validated and written
     /// to the driver; with tracking off it publishes at once (e4f72b6) and returns None.
-    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) -> Option<DeferredActionDone> {
-        self.commanded_positions = out.positions;
-        self.commanded_velocities = out.velocities;
-        if out.clear_gripper_stall {
+    fn apply_action_step(&mut self, action_id: Option<u64>, mut out: StepOut) -> Option<DeferredActionDone> {
+        // swap: the previous command's vectors go back to the scratch for the next step
+        std::mem::swap(&mut self.commanded_positions, &mut out.positions);
+        std::mem::swap(&mut self.commanded_velocities, &mut out.velocities);
+        let status = std::mem::replace(&mut out.status, StepStatus::Running);
+        let (progress, clear_gripper_stall) = (out.progress, out.clear_gripper_stall);
+        self.scratch.step_out = out;
+        if clear_gripper_stall {
             self.gripper_stalled = false;
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
         }
         let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-            if a.id == id && a.is_running() && !macro_sub { a.progress = out.progress; }
+            if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
         }
-        match out.status {
+        match status {
             StepStatus::Running => None,
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
                 if !self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
@@ -5151,7 +5245,19 @@ impl SupervisorInner {
             .or_else(|| self.unload_settle.as_ref().and_then(|s| self.unload_still_violation(s)))
     }
 
+    /// One control tick and its observation ([`Self::tick_control`], then
+    /// [`Self::current_observation`] at the tick's timestamp).
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
+        let timestamp = self.tick_control(dt);
+        let mut obs = ArmObservation::blank();
+        self.fill_observation(timestamp, &mut obs);
+        obs
+    }
+
+    /// One control tick without building the observation; returns the tick's observation
+    /// timestamp (the recording sample's). The control loop fills its published sample with
+    /// [`Self::fill_observation`] at this timestamp.
+    pub fn tick_control(&mut self, dt: f64) -> f64 {
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing
         if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
@@ -5159,33 +5265,37 @@ impl SupervisorInner {
         }
 
         // Polling a cached sample never refreshes its hardware receive timestamp.
+        // The driver is read into the tick's preallocated buffers (`self.scratch`).
         let mut invalid_feedback = false;
-        let mut motor_errors = None;
+        let mut new_motor_errors = None;
         let mut driver_torque_lost = false;
-        let mut recovered_joints = Vec::new();
-        let mut recovery_ages: Option<Vec<Option<Duration>>> = None;
-        let mut hw_rx: Option<Vec<Instant>> = None;
+        let mut recovery_ages = false;
+        let mut hw_rx = false;
         let mut reset_stillness_on_read_err = false;
+        let mut sc = std::mem::take(&mut self.scratch);
+        sc.recovered.clear();
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             match d.lock() {
                 Ok(mut driver) => {
-                    match driver.read_joint_states() {
-                        Ok(states) => {
-                            recovered_joints = driver.take_recovery_writes();
-                            let loads = driver.joint_loads();
-                            self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref());
+                    match driver.read_joint_states_into(&mut sc.states) {
+                        Ok(()) => {
+                            driver.take_recovery_writes_into(&mut sc.recovered);
+                            let has_loads = driver.joint_loads_into(&mut sc.loads);
+                            self.feedback_numeric_valid = Self::states_valid(&sc.states, driver.capabilities(), self.config.dof, has_loads.then_some(sc.loads.as_slice()));
                             invalid_feedback = !self.feedback_numeric_valid;
-                            let ages = driver.feedback_ages();
-                            if !recovered_joints.is_empty() || self.tracking.recovery_suspended {
-                                recovery_ages = Some(ages.clone());
+                            driver.feedback_ages_into(&mut sc.ages);
+                            if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
+                                recovery_ages = true;
                             }
                             let driver_valid = driver.is_feedback_valid();
-                            let all_fresh_age = ages.len() == self.config.dof
-                                && ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
-                            if self.feedback_numeric_valid && ages.len() == self.config.dof && driver_valid {
-                                self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
-                                    .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+                            let all_fresh_age = sc.ages.len() == self.config.dof
+                                && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
+                            if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
+                                // the oldest joint's sample; None when a joint has none
+                                let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+                                self.last_can_feedback_instant = oldest.filter(|_| !sc.ages.is_empty())
+                                    .and_then(|age| Instant::now().checked_sub(age));
                             } else {
                                 self.last_can_feedback_instant = None;
                             }
@@ -5196,6 +5306,7 @@ impl SupervisorInner {
                                     &mut self.joint_feedback_queue_bounds,
                                     self.config.dof,
                                     driver.as_ref(),
+                                    &mut sc.fb,
                                 );
                                 Self::apply_feedback(
                                     &mut self.measured_positions,
@@ -5204,14 +5315,16 @@ impl SupervisorInner {
                                     &mut self.temperatures,
                                     &mut self.loads,
                                     self.config.dof,
-                                    &states,
-                                    loads.as_deref(),
+                                    &sc.states,
+                                    has_loads.then_some(sc.loads.as_slice()),
                                 );
                             }
                             if self.feedback_numeric_valid && all_fresh_age && driver_valid {
-                                let rx = driver.feedback_receive_instants();
-                                if rx.len() == self.config.dof && rx.iter().all(Option::is_some) {
-                                    hw_rx = Some(rx.into_iter().map(Option::unwrap).collect());
+                                driver.feedback_receive_instants_into(&mut sc.rx);
+                                if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
+                                    sc.rx_vals.clear();
+                                    sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
+                                    hw_rx = true;
                                 }
                             }
                         }
@@ -5220,10 +5333,18 @@ impl SupervisorInner {
                             reset_stillness_on_read_err = true;
                         }
                     }
-                    if let Some(status) = driver.motor_status() {
-                        motor_errors = Some(status.into_iter().map(|code| {
-                            driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
-                        }).collect());
+                    if driver.motor_status_into(&mut sc.status) {
+                        // decoded (a String per code) only when a code changed
+                        let changed = sc.status.len() != self.motor_errors.len()
+                            || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
+                                let decoded = e.as_ref().map(|e| e.code);
+                                decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
+                            });
+                        if changed {
+                            new_motor_errors = Some(sc.status.iter().map(|&code| {
+                                driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
+                            }).collect());
+                        }
                     }
                     if self.is_torqued && !self.disable_pending && self.gravity_comp.is_none() && self.safety.state().is_operational()
                         && driver.capabilities().enable_feedback && driver.is_feedback_valid() && driver.enable_state() != EnableState::Enabled
@@ -5247,28 +5368,28 @@ impl SupervisorInner {
                 *seq = seq.wrapping_add(1);
             }
         }
+        if let Some(errors) = new_motor_errors {
+            self.update_motor_errors(errors);
+        }
         if reset_stillness_on_read_err {
             self.reset_table_stillness();
-        }
-        if let Some(errors) = motor_errors {
-            self.update_motor_errors(errors);
         }
         self.tick_phase(0);
         // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
         // tracking output history and suspend compensated writes until fresh post-recovery
         // feedback confirms a clean baseline across every joint.
         if self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled) {
-            if !recovered_joints.is_empty() {
+            if !sc.recovered.is_empty() {
                 tracing::warn!(
                     "Driver emitted autonomous recovery writes for joints {:?}; suspending tracking compensation until fresh baseline",
-                    recovered_joints.iter().map(|i| i + 1).collect::<Vec<_>>()
+                    sc.recovered.iter().map(|i| i + 1).collect::<Vec<_>>()
                 );
-                self.tracking.suspend_for_recovery(&recovered_joints, Instant::now());
+                self.tracking.suspend_for_recovery(&sc.recovered, Instant::now());
                 self.stop_motion();
                 self.servo_stream_active = false;
             } else if self.tracking.recovery_suspended && self.feedback_numeric_valid {
                 const RECOVERY_FRESH_BOUND: Duration = Duration::from_millis(45);
-                let all_fresh_post_recovery = recovery_ages.as_ref().is_some_and(|ages| {
+                let all_fresh_post_recovery = recovery_ages && Some(&sc.ages).is_some_and(|ages| {
                     ages.len() == self.config.dof
                         && ages.iter().all(|a| a.is_some_and(|age| age < RECOVERY_FRESH_BOUND))
                         && self.tracking.recovery_joints.iter().all(|&(j, since)| {
@@ -5346,7 +5467,7 @@ impl SupervisorInner {
             self.reset_table_stillness();
         }
         let is_still_sample = self.feedback_numeric_valid
-            && (self.driver.is_none() || (self.hardware_feedback_fresh(Duration::from_millis(250)) && hw_rx.is_some()))
+            && (self.driver.is_none() || (self.hardware_feedback_fresh(Duration::from_millis(250)) && hw_rx))
             && self.active_trajectory.is_none()
             && self.servo_target.is_none()
             && self.commanded_velocities.iter().all(|v| v.abs() <= 1e-3)
@@ -5365,21 +5486,22 @@ impl SupervisorInner {
                 if !self.still_anchor_positions.is_empty() {
                     self.still_window_ever_moved = true;
                 }
-                self.still_anchor_positions = self.measured_positions.clone();
+                copy_into(&mut self.still_anchor_positions, &self.measured_positions);
                 self.last_still_since_s = Some(self.sim_time_s);
             }
-            if let Some(rx_vals) = hw_rx {
+            if hw_rx {
+                let rx_vals = &sc.rx_vals;
                 let drifted = self.table_still_anchor_positions.len() != self.measured_positions.len()
                     || self.table_still_first_rx_instants.len() != self.config.dof
                     || self.table_still_last_rx_instants.len() != self.config.dof
                     || self.measured_positions.iter().zip(&self.table_still_anchor_positions)
                         .any(|(m, a)| !m.is_finite() || (m - a).abs() > UNLOAD_STILL_POSITION_SPAN_RAD);
                 if drifted {
-                    self.table_still_anchor_positions = self.measured_positions.clone();
-                    self.table_still_first_rx_instants = rx_vals.clone();
-                    self.table_still_last_rx_instants = rx_vals;
+                    copy_into(&mut self.table_still_anchor_positions, &self.measured_positions);
+                    copy_into(&mut self.table_still_first_rx_instants, rx_vals);
+                    copy_into(&mut self.table_still_last_rx_instants, rx_vals);
                 } else {
-                    for (last, rx) in self.table_still_last_rx_instants.iter_mut().zip(rx_vals) {
+                    for (last, rx) in self.table_still_last_rx_instants.iter_mut().zip(rx_vals.iter().copied()) {
                         if rx > *last {
                             *last = rx;
                         }
@@ -5387,7 +5509,9 @@ impl SupervisorInner {
                 }
             }
         }
-        let before_velocities = self.commanded_velocities.clone();
+        copy_into(&mut sc.before_velocities, &self.commanded_velocities);
+        // the scratch goes back for the helpers below; `before_velocities` stays in it
+        self.scratch = sc;
 
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
@@ -5851,7 +5975,11 @@ impl SupervisorInner {
         }
         // Action: the gripper reference (its own stall handling); Arm / Replay / Quintic move
         // J7 as part of a whole-arm reference and pass the J7 stall freeze.
-        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut), Arm(StepOut), Replay(StepOut, &'static str, f64) }
+        // Quintic: the sample is in `point_buf` (the scratch's, no allocation)
+        enum Stepped { Quintic(bool, f32), Action(StepOut), Arm(StepOut), Replay(StepOut, &'static str, f64) }
+        let mut point_buf = std::mem::take(&mut self.scratch.point);
+        // the scratch's step output: Path / Gripper / Replay steps write into its vectors
+        let mut step_buf = std::mem::take(&mut self.scratch.step_out);
         let time_scale = self.motion_time_scale();
         let (torque_feedback, load_feedback) = if let Some(ref d) = self.driver {
             if let Ok(driver) = d.lock() {
@@ -5897,21 +6025,21 @@ impl SupervisorInner {
             let out = match &mut active.reference {
                 Reference::Quintic(traj) => {
                     // power governor: the reference advances at dt x scale (velocities scaled with it)
-                    let mut point = traj.step(dt * time_scale);
-                    if time_scale < 1.0 { for v in point.velocities.iter_mut() { *v *= time_scale as f32; } }
-                    Stepped::Quintic(point, traj.is_finished(), (traj.elapsed / traj.duration).min(1.0) as f32)
+                    traj.step_into(dt * time_scale, &mut point_buf);
+                    if time_scale < 1.0 { for v in point_buf.velocities.iter_mut() { *v *= time_scale as f32; } }
+                    Stepped::Quintic(traj.is_finished(), (traj.elapsed / traj.duration).min(1.0) as f32)
                 }
-                Reference::Path(path) => Stepped::Arm(path.step(&ctx)),
-                Reference::Gripper(grip) => Stepped::Action(grip.step(&ctx)),
+                Reference::Path(path) => { path.step_into(&ctx, &mut step_buf); Stepped::Arm(std::mem::take(&mut step_buf)) }
+                Reference::Gripper(grip) => { grip.step_into(&ctx, &mut step_buf); Stepped::Action(std::mem::take(&mut step_buf)) }
                 Reference::Replay(replay) => {
-                    let out = replay.step(&ctx);
-                    Stepped::Replay(out, replay.phase_name(), replay.t_s())
+                    replay.step_into(&ctx, &mut step_buf);
+                    Stepped::Replay(std::mem::take(&mut step_buf), replay.phase_name(), replay.t_s())
                 }
             };
             // same-side approach: progress over both legs; the first leg's end starts the short
             // segment (src/backlash.rs)
             let out = match (active.span.is_some(), out) {
-                (true, Stepped::Quintic(p, f, g)) => Stepped::Quintic(p, f, active.overall_progress(g)),
+                (true, Stepped::Quintic(f, g)) => Stepped::Quintic(f, active.overall_progress(g)),
                 (true, Stepped::Arm(mut o)) => { o.progress = active.overall_progress(o.progress); Stepped::Arm(o) }
                 (_, o) => o,
             };
@@ -5953,12 +6081,13 @@ impl SupervisorInner {
                 }
                 deferred_done = self.apply_action_step(action_id, out);
             }
-            Some((action_id, Stepped::Quintic(mut point, finished, progress))) => {
+            Some((action_id, Stepped::Quintic(finished, progress))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
-                self.gripper_hold_filter(&mut point.positions, &mut point.velocities);
-                self.commanded_positions = point.positions;
-                self.commanded_velocities = point.velocities;
+                self.gripper_hold_filter(&mut point_buf.positions, &mut point_buf.velocities);
+                // swap: the previous command's memory goes back to the scratch
+                std::mem::swap(&mut self.commanded_positions, &mut point_buf.positions);
+                std::mem::swap(&mut self.commanded_velocities, &mut point_buf.velocities);
                 let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
                     if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
@@ -5974,6 +6103,9 @@ impl SupervisorInner {
             }
         }
 
+        self.scratch.point = point_buf;
+        // not stepped (no Path / Gripper / Replay reference): the buffer goes back unused
+        if self.scratch.step_out.positions.capacity() < step_buf.positions.capacity() { self.scratch.step_out = step_buf; }
         if let Some(caps) = caps_before_step {
             if self.active_trajectory.is_none() {
                 self.tracking.retained_motion_limits = Some(caps);
@@ -5983,7 +6115,11 @@ impl SupervisorInner {
         // 3.1 Handle pending normal unload settling phase
         if self.pending_normal_unload && self.active_trajectory.is_none() {
             if !self.step_park_release() { self.step_unload_settle(servo_dt); }
-        } else if let Some(ref target) = self.servo_target.clone() {
+        } else if self.servo_target.is_some() {
+            // the target, copied into the scratch (the stream may replace it meanwhile)
+            let mut target_buf = std::mem::take(&mut self.scratch.servo_target);
+            copy_into(&mut target_buf, self.servo_target.as_deref().unwrap_or(&[]));
+            let target = &target_buf;
             // Check continuous motion frame timeout:
             // If > 200ms without a new pose frame, clear servo_target to begin controlled smooth deceleration
             if self.last_motion_frame.elapsed() > self.motion_frame_timeout {
@@ -6018,15 +6154,19 @@ impl SupervisorInner {
                         "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
                 } else {
                     reference_stepped = true;
-                    let mut reached_flags = vec![false; self.config.dof];
-                    let mut next_positions = self.commanded_positions.clone();
-                    let mut next_velocities = self.commanded_velocities.clone();
+                    let mut reached_flags = std::mem::take(&mut self.scratch.reached);
+                    fill_n(&mut reached_flags, false, self.config.dof);
+                    let mut next_positions = std::mem::take(&mut self.scratch.next_positions);
+                    let mut next_velocities = std::mem::take(&mut self.scratch.next_velocities);
+                    copy_into(&mut next_positions, &self.commanded_positions);
+                    copy_into(&mut next_velocities, &self.commanded_velocities);
                     let mut infeasible = None;
                     // Speed cap: joint limits capped by servo_max_velocity. Lead cap: in the direction
                     // of travel the stepper target stays within servo_max_lead_rad of the measured
                     // position (torque on, fresh feedback), so the tracking error stays below the bound
                     // whatever the client sends.
-                    let mut step_limits = self.servo_limits();
+                    let mut step_limits = std::mem::take(&mut self.scratch.step_limits);
+                    self.servo_limits_into(&mut step_limits);
                     // power governor: scale the velocity cap, never below what the joint can brake
                     // to in this tick (the stepper stays feasible); acceleration unchanged
                     if time_scale < 1.0 {
@@ -6039,7 +6179,8 @@ impl SupervisorInner {
                     let lead = self.config.servo_max_lead_rad;
                     let lead_gate = self.driver.is_some() && self.is_torqued
                         && self.hardware_feedback_fresh(Duration::from_millis(100));
-                    let mut lead_capped = vec![false; self.config.dof];
+                    let mut lead_capped = std::mem::take(&mut self.scratch.lead_capped);
+                    fill_n(&mut lead_capped, false, self.config.dof);
                     let (mut lead_hit, mut speed_hit, mut limit_hit) = (None::<(usize, f32)>, None, None);
                     for (i, &tgt) in target.iter().enumerate() {
                         if i < self.config.dof {
@@ -6124,9 +6265,10 @@ impl SupervisorInner {
                     } else if let Err(e) = self.servo_step_workspace(&next_positions, "servo_step") {
                         self.enter_servo_keepout_hold(&e);
                     } else {
-                        self.commanded_positions = next_positions;
-                        self.commanded_velocities = next_velocities;
-                        self.target_positions = self.commanded_positions.clone();
+                        // swap: the previous command's memory goes back to the scratch
+                        std::mem::swap(&mut self.commanded_positions, &mut next_positions);
+                        std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
+                        copy_into(&mut self.target_positions, &self.commanded_positions);
 
                         // Update hysteresis counter for each axis: if reached, increment; if not reached, reset to 0
                         for i in 0..self.config.dof {
@@ -6146,7 +6288,7 @@ impl SupervisorInner {
                                 let keep_stream = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled)
                                     && self.tracking.has_residual_lead(
                                         &self.commanded_positions,
-                                        &self.config.arm_joint_indices(),
+                                        &self.config.arm_joints(),
                                     );
                                 if !keep_stream {
                                     self.servo_stream_active = false;
@@ -6154,8 +6296,14 @@ impl SupervisorInner {
                             }
                         }
                     }
+                    self.scratch.reached = reached_flags;
+                    self.scratch.next_positions = next_positions;
+                    self.scratch.next_velocities = next_velocities;
+                    self.scratch.step_limits = step_limits;
+                    self.scratch.lead_capped = lead_capped;
                 }
             }
+            self.scratch.servo_target = target_buf;
         }
 
         if !reference_stepped
@@ -6169,17 +6317,19 @@ impl SupervisorInner {
         {
             // A stale/dropped target requests zero velocity. The same feasible
             // interval governs braking, with no small-velocity truncation.
-            let mut next_positions = self.commanded_positions.clone();
-            let mut next_velocities = self.commanded_velocities.clone();
+            let mut next_positions = std::mem::take(&mut self.scratch.next_positions);
+            let mut next_velocities = std::mem::take(&mut self.scratch.next_velocities);
+            copy_into(&mut next_positions, &self.commanded_positions);
+            copy_into(&mut next_velocities, &self.commanded_velocities);
             let mut infeasible = None;
-            let step_limits = self.config.limits.clone(); // braking a stream: same limits as streaming
+            // braking a stream: same limits as streaming (`config.limits`)
             for i in 0..self.config.dof {
                 let step = Self::bounded_servo_step_with_jerk(
                     self.commanded_positions[i],
                     self.commanded_positions[i],
                     self.commanded_velocities[i],
                     servo_dt,
-                    &step_limits[i],
+                    &self.config.limits[i],
                     self.commanded_accelerations[i],
                     self.config.max_jerk,
                 );
@@ -6196,9 +6346,10 @@ impl SupervisorInner {
             } else if let Some(e) = braking.then(|| self.servo_step_workspace(&next_positions, "braking").err()).flatten() {
                 self.enter_servo_keepout_hold(&e);
             } else {
-                self.commanded_positions = next_positions;
-                self.commanded_velocities = next_velocities;
-                self.target_positions = self.commanded_positions.clone();
+                // swap: the previous command's memory goes back to the scratch
+                std::mem::swap(&mut self.commanded_positions, &mut next_positions);
+                std::mem::swap(&mut self.commanded_velocities, &mut next_velocities);
+                copy_into(&mut self.target_positions, &self.commanded_positions);
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
                     self.servo_ws_min_depths = None;
@@ -6206,21 +6357,23 @@ impl SupervisorInner {
                         && (braking
                             || self.tracking.has_residual_lead(
                                 &self.commanded_positions,
-                                &self.config.arm_joint_indices(),
+                                &self.config.arm_joints(),
                             ));
                     if !keep_stream {
                         self.servo_stream_active = false;
                     }
                 }
             }
+            self.scratch.next_positions = next_positions;
+            self.scratch.next_velocities = next_velocities;
         }
 
         self.gripper_lead_cap();
         for i in 0..self.config.dof {
             self.commanded_accelerations[i] = if self.safety.state().is_stopped() { 0.0 }
-                else { (self.commanded_velocities[i] - before_velocities[i]) / servo_dt as f32 };
+                else { (self.commanded_velocities[i] - self.scratch.before_velocities[i]) / servo_dt as f32 };
         }
-        self.last_commanded_velocities = self.commanded_velocities.clone();
+        copy_into(&mut self.last_commanded_velocities, &self.commanded_velocities);
 
         let feedback_fresh = self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
         if self.driver.is_some() && self.is_torqued {
@@ -6303,7 +6456,7 @@ impl SupervisorInner {
 
             if send_to_bus {
                 let tracking_active = self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled);
-                let arm_indices = self.config.arm_joint_indices();
+                let arm_indices = self.config.arm_joints();
                 let has_residual = tracking_active
                     && self.tracking.has_residual_lead(&self.commanded_positions, &arm_indices);
                 let holding_residual = !reference_stepped
@@ -6473,7 +6626,10 @@ impl SupervisorInner {
                         self.tracking.invalidate();
                     }
                     if self.driver.is_some() {
-                        let targets: Vec<JointTarget> = self
+                        // built in the tick's scratch (no allocation)
+                        let mut targets = std::mem::take(&mut self.scratch.targets);
+                        targets.clear();
+                        targets.extend(self
                             .commanded_positions
                             .iter()
                             .zip(self.commanded_velocities.iter())
@@ -6488,9 +6644,9 @@ impl SupervisorInner {
                                 },
                                 kp: None,
                                 kd: None,
-                            })
-                            .collect();
-                        match self.write_output(targets, servo_dt) {
+                            }));
+                        self.scratch.targets = targets;
+                        match self.write_output_scratch(servo_dt) {
                             Some(Ok(())) => tick_output_accepted = true,
                             Some(Err(e)) => output_error = Some(e),
                             None => {}
@@ -6511,7 +6667,7 @@ impl SupervisorInner {
             let settled = self.active_trajectory.is_none()
                 && self.quintic_settle.is_none()
                 && self.tracking.fallback_ramp.is_none()
-                && !self.tracking.has_residual_lead(&self.commanded_positions, &self.config.arm_joint_indices());
+                && !self.tracking.has_residual_lead(&self.commanded_positions, &self.config.arm_joints());
             if settled {
                 self.tracking.retained_motion_limits = None;
             }
@@ -6539,7 +6695,7 @@ impl SupervisorInner {
                 || (self.commanded_velocities.iter().all(|&v| v == 0.0)
                     && !self.tracking.has_residual_lead(
                         &self.commanded_positions,
-                        &self.config.arm_joint_indices(),
+                        &self.config.arm_joints(),
                     )))
         {
             self.servo_stream_active = false;
@@ -6580,8 +6736,8 @@ impl SupervisorInner {
 
         // If in simulation (no hardware driver attached), mirror commanded into measured
         if self.driver.is_none() {
-            self.measured_positions = self.commanded_positions.clone();
-            self.measured_velocities = self.commanded_velocities.clone();
+            copy_into(&mut self.measured_positions, &self.commanded_positions);
+            copy_into(&mut self.measured_velocities, &self.commanded_velocities);
             if let Some(g_idx) = self.config.gripper_index() {
                 let gripper_moving = matches!(&self.active_trajectory, Some(ActiveTrajectory { reference: Reference::Gripper(_), .. }));
                 // the stall torque lasts only while the jaw pushes on the stop; a stale value would
@@ -6645,7 +6801,7 @@ impl SupervisorInner {
         self.reconcile_action(servo_dt, tick_output_accepted || !tracking_enabled);
         self.expire_motion_limit();
         self.tick_phase(3);
-        let obs = self.current_observation();
+        let timestamp = self.start_time.elapsed().as_secs_f64();
 
         // 5. Record frame if episode recording is active: a teach session appends to the
         // preallocated ring (no allocation, `crate::rt_core::record_ring`); a recorder started
@@ -6653,17 +6809,17 @@ impl SupervisorInner {
         if self.recording_frame_room() {
             if self.core.record.active() {
                 let seq = self.core.published_seq() + 1;
-                self.core.record.push(seq, obs.timestamp, &self.measured_positions, &self.commanded_positions);
+                self.core.record.push(seq, timestamp, &self.measured_positions, &self.commanded_positions);
             } else {
                 self.recorder.append_frame(RecordFrame {
-                    timestamp: obs.timestamp,
+                    timestamp,
                     observation_state: self.measured_positions.clone(),
                     action: self.commanded_positions.clone(),
                 });
             }
         }
 
-        obs
+        timestamp
     }
 }
 
@@ -6716,6 +6872,14 @@ impl SupervisorInner {
                 r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live
             })
             .and_then(|r| r.verified_release_gate.as_ref())
+    }
+
+    /// [`Self::policy_observation`] into `out`, reusing its memory.
+    pub fn policy_observation_into(&self, out: &mut Option<crate::model::PolicyObservation>) {
+        match &self.policy_run {
+            Some(run) => run.to_observation_into(true, out.get_or_insert_with(Default::default)),
+            None => crate::rt_core::scratch::set_opt(out, self.last_policy_obs.as_ref()),
+        }
     }
 
     pub fn policy_observation(&self) -> Option<crate::model::PolicyObservation> {
@@ -7998,20 +8162,12 @@ impl ArmSupervisor {
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
-            let obs = inner.tick(dt);
-            inner.tick_phase(4);
-            let body_end = inner.tick_phase_mark.take().unwrap_or(body_start);
+            let TickPublished { kept, displaced, body_end } = inner.tick_publish(dt, generation, keep);
+            let body_end = body_end.unwrap_or(body_start);
             let phases = inner.tick_phases_us;
             inner.defer_zero_check_persist = false;
             let pending_zc = inner.pending_zero_check_persist.take();
             let control_hz = inner.config.control_frequency_hz;
-            // Published before the guard drops: no other write can come in between.
-            let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
-                .min(inner.observation_valid_for(&obs));
-            let kept = keep.then(|| obs.clone());
-            let at = Instant::now();
-            let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *inner;
-            let displaced = core.publish(generation, at, at + max_age, obs, measured_positions, measured_velocities);
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
             (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, displaced,

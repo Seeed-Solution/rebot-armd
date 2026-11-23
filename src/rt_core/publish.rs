@@ -135,6 +135,10 @@ impl StatePublisher {
     }
 
     pub fn hub(&self) -> &Arc<StateHub> { &self.hub }
+
+    /// Moves the observation out of the slot the next [`Self::publish`] writes (see
+    /// `ArmCore::take_observation_buffer`).
+    pub fn take_back_observation(&mut self) -> Option<ArmObservation> { self.producer.back_mut().obs.take() }
 }
 
 struct HubState {
@@ -171,14 +175,16 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
 impl StateHub {
     /// The newest published sample (None before the first tick). Takes the hub mutex,
     /// which only readers and the dispatcher share; the first reader after a publication
-    /// moves the observation out of the slot (its deallocation then happens on the reader
-    /// side when the last `Arc` drops, not in the tick).
+    /// copies the observation out of the slot (the copy is allocated and freed on the reader
+    /// side; the slot keeps its memory, which the tick fills again).
     pub fn latest(&self) -> Option<Arc<Snapshot>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.consumer.refresh() {
             let slot = st.consumer.front_mut();
-            if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.take()) {
-                let snap = Snapshot { meta, obs, rt: slot.rt.clone() };
+            // copied, not moved: the slot keeps its memory for the tick to fill again (the
+            // tick neither allocates nor frees observations)
+            if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.as_ref()) {
+                let snap = Snapshot { meta, obs: obs.clone(), rt: slot.rt.clone() };
                 st.latest = Some(Arc::new(snap));
             }
         }

@@ -101,6 +101,23 @@ pub struct PolicyRun {
 }
 
 impl PolicyRun {
+    /// [`Self::to_observation`] into `out`, reusing its memory.
+    pub fn to_observation_into(&self, active: bool, out: &mut PolicyObservation) {
+        use crate::rt_core::scratch::{set_opt, set_opt_str, set_str};
+        out.active = active;
+        out.action_id = self.action_id;
+        set_str(&mut out.policy_id, &self.policy_id);
+        set_str(&mut out.artifact_digest, &self.artifact_digest);
+        set_str(&mut out.backend, &self.backend);
+        set_str(&mut out.mode, self.mode.as_str());
+        out.steps = self.steps;
+        out.last_input_age_ms = self.last_input_age_ms;
+        out.last_vision_age_ms = self.last_vision_age_ms;
+        out.vision_frame_id = self.vision_frame_id;
+        set_opt(&mut out.last_shadow_target, self.last_shadow_target.as_ref());
+        set_opt_str(&mut out.stop_reason, self.stop_reason.as_deref());
+    }
+
     pub fn to_observation(&self, active: bool) -> PolicyObservation {
         PolicyObservation {
             active,

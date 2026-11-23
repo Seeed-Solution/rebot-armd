@@ -1039,6 +1039,34 @@ pub struct StepOut {
     pub clear_gripper_stall: bool,
 }
 
+impl Default for StepOut {
+    fn default() -> Self {
+        Self { positions: Vec::new(), velocities: Vec::new(), status: StepStatus::Running, progress: 0.0, clear_gripper_stall: false }
+    }
+}
+
+/// `dst` = `src` (copied), reusing `dst`'s memory.
+fn refill(dst: &mut Vec<f32>, src: &[f32]) { dst.clear(); dst.extend_from_slice(src); }
+/// `dst` = `n` zeros, reusing `dst`'s memory.
+fn zeros(dst: &mut Vec<f32>, n: usize) { dst.clear(); dst.resize(n, 0.0); }
+
+/// Steps a reference into `out`, reusing `out`'s vectors (the control tick's form of
+/// `step`: no allocation once they have the capacity).
+macro_rules! step_into_via_with {
+    () => {
+        /// [`Self::step`] into `out`, reusing its vectors.
+        pub fn step_into(&mut self, ctx: &StepCtx, out: &mut StepOut) {
+            let positions = std::mem::take(&mut out.positions);
+            let velocities = std::mem::take(&mut out.velocities);
+            *out = self.step_with(ctx, positions, velocities);
+        }
+
+        pub fn step(&mut self, ctx: &StepCtx) -> StepOut { self.step_with(ctx, Vec::new(), Vec::new()) }
+    };
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use step_into_via_with;
+
 /// Lag-aware time scaling band (rad): full speed below LAG_FULL, stop above LAG_STOP.
 pub const LAG_FULL: f64 = 0.38;
 pub const LAG_STOP: f64 = 0.45;
@@ -1105,15 +1133,19 @@ impl PathTrajectory {
         std::array::from_fn(|i| self.path.q[a][i] + (self.path.q[b][i] - self.path.q[a][i]) * f)
     }
 
-    pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
+    step_into_via_with!();
+
+    /// One step, written into `positions` / `velocities` (their memory is reused).
+    fn step_with(&mut self, ctx: &StepCtx, mut positions: Vec<f32>, mut velocities: Vec<f32>) -> StepOut {
         let dof = ctx.commanded.len();
-        let last = self.path.last()[..dof].to_vec();
         if let Some(settle) = self.settle.as_mut() {
             let status = match settle.step(ctx.dt, ctx.commanded, ctx.measured, ctx.measured_velocities) {
                 Some(settled) => StepStatus::Done { settled: Some(settled), holding: None, gripper_gap_rad: None },
                 None => StepStatus::Running,
             };
-            return StepOut { positions: last, velocities: vec![0.0; dof], status, progress: 1.0, clear_gripper_stall: false };
+            refill(&mut positions, &self.path.last()[..dof]);
+            zeros(&mut velocities, dof);
+            return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: false };
         }
         let arm_joints = self.path.arm_dof.min(dof);
         let lag = (0..arm_joints).map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
@@ -1122,8 +1154,10 @@ impl PathTrajectory {
         if rate == 0.0 {
             self.stalled_for += ctx.dt;
             if self.stalled_for >= STALL_TIMEOUT_S - 1e-9 {
+                refill(&mut positions, ctx.commanded);
+                zeros(&mut velocities, dof);
                 return StepOut {
-                    positions: ctx.commanded.to_vec(), velocities: vec![0.0; dof],
+                    positions, velocities,
                     status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
                         "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
                     progress: (self.elapsed / self.path.duration) as f32, clear_gripper_stall: false,
@@ -1136,12 +1170,16 @@ impl PathTrajectory {
         let u = self.elapsed / self.path.duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
         let q = self.position_at(s);
-        let velocities: Vec<f32> = (0..dof).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32).collect();
         if self.elapsed >= self.path.duration {
             self.settle = Some(Settle::default());
-            return StepOut { positions: last, velocities: vec![0.0; dof], status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
+            refill(&mut positions, &self.path.last()[..dof]);
+            zeros(&mut velocities, dof);
+            return StepOut { positions, velocities, status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
         }
-        StepOut { positions: q[..dof].to_vec(), velocities, status: StepStatus::Running, progress: u as f32, clear_gripper_stall: false }
+        velocities.clear();
+        velocities.extend((0..dof).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32));
+        refill(&mut positions, &q[..dof]);
+        StepOut { positions, velocities, status: StepStatus::Running, progress: u as f32, clear_gripper_stall: false }
     }
 }
 
@@ -1225,10 +1263,13 @@ impl GripperMotion {
             && low_torque
     }
 
-    pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
+    step_into_via_with!();
+
+    /// One step, written into `positions` / `velocities` (their memory is reused).
+    fn step_with(&mut self, ctx: &StepCtx, mut positions: Vec<f32>, mut velocities: Vec<f32>) -> StepOut {
         self.elapsed += ctx.dt;
-        let mut positions: Vec<f32> = ctx.commanded.to_vec();
-        let mut velocities = vec![0.0f32; positions.len()];
+        refill(&mut positions, ctx.commanded);
+        zeros(&mut velocities, positions.len());
         let idx = self.gripper_index;
         let (q_g, v_gc) = (ctx.commanded.get(idx).copied().unwrap_or(0.0), ctx.commanded_velocities.get(idx).copied().unwrap_or(0.0));
         let (m_g, mv_g) = (ctx.measured.get(idx).copied().unwrap_or(0.0), ctx.measured_velocities.get(idx).copied().unwrap_or(0.0));
@@ -1488,7 +1529,7 @@ impl ActiveTrajectory {
 }
 
 /// Status of the most recent action, published in every observation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
     /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose | replay | sequence
@@ -1707,6 +1748,8 @@ pub struct ActionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurement: Option<serde_json::Value>,
 }
+
+crate::fieldwise_clone!(ActionStatus { id, kind, tag, state, code, message, progress, started_at, finished_at, holding, gripper_gap_rad, settled, task, phase, iteration, error_px, final_offset_px, acquire_height_m, power_scale, episode, t_s, sequence_id, step_index, step_type, repeat_index, repeats, failed_step, episodes, align, align_turn_rad, angle_spread_deg, orientation, grasp_width_m, height_source, height_reason, object_height_m, height_estimates, yaw_estimates, width_estimates, close_height_m, probe_dz_m, depth_anchor, object_depth_m, object_length_m, jaw_clear, border, border_shift_px, probe_mode, lateral_baseline_m, lateral_baseline_err_mm, recentre, recentre_iterations, descend_peak_residual_nm, descend_peak_tracking_rad, descend_contact, descend_contact_height_m, post_lift, pre_open, pre_open_m, held_width_m, stop_rad, offset_rad, pass, approach, approach_reason, approach_signs, approach_flipped, phase_ms, motions, constraint_id, geometry_id, violation_phase, reason, durability_confirmed, durability_warning, policy_stats, measurement });
 
 /// `ActionStatus::policy_stats`: inferences done (`steps`), steps whose inference + commit
 /// took longer than the period (`overruns`), periods without a committed target because the
