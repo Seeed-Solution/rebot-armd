@@ -1006,6 +1006,19 @@ impl SupervisorInner {
         None
     }
 
+    /// An authorized stop (the RT's urgent-stop generation advanced): ends client motion
+    /// like [`Self::stop_motion`], except a running watchdog park. The park belongs to the
+    /// lease watchdog, not to the client that stopped: only a new lease ([`Self::acquire_lease`],
+    /// [`Self::preempt_lease`]) takes it over. Returns false when the park was kept.
+    pub fn authorized_stop(&mut self) -> bool {
+        if self.watchdog_park.is_some() && self.pending_normal_unload {
+            tracing::info!("Stop during a watchdog park: the park continues (only a new lease takes it over)");
+            return false;
+        }
+        self.stop_motion();
+        true
+    }
+
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
         let last = path.last_slice().to_vec();
         self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
