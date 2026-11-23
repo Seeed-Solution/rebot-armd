@@ -2794,7 +2794,7 @@ const I18N = {
     'op.why.calib': '标定需要操作员权限', 'op.why.poses': '保存或修改点位、动作需要操作员权限', 'op.why.rec': '录制和管理录制片段需要操作员权限', 'op.why.safety': '修改安全设置（禁入区、碰撞保护）需要操作员权限',
     'op.why.sandbox': '仿真沙盒需要操作员权限', 'op.why.vision': '切换视觉模式（YOLO / ArUco / 深度）需要操作员权限',
     'op.why.calib_open': '标定向导会把视觉切到 ArUco、保存标定数据并写入标定结果，这些步骤需要操作员权限。不解锁也能打开向导，但这些步骤会被拒绝。',
-    'op.skip': '先不解锁', 'op.again.take': '已解锁。再按一次「接管控制权」确认接管。', 'op.again': '已解锁。会让机械臂运动的操作不会自动执行，请再按一次。',
+    'op.skip': '先不解锁', 'op.why.renew': '操作员会话快到期了：输入 PIN 开始新的会话，当前流程和已采集的数据保持不变。', 'op.renew_warn': '操作员会话 {m} 分钟后到期：标定等流程需要它保存结果。', 'op.renew_btn': '续期（输入 PIN）', 'op.again.take': '已解锁。再按一次「接管控制权」确认接管。', 'op.again': '已解锁。会让机械臂运动的操作不会自动执行，请再按一次。',
     'ec.lease_busy': '另一个客户端持有控制权：请对方释放，或在本页接管', 'ec.lease_lost': '控制权已被其他客户端取走：确认现场后重新操作',
     'ec.not_armed': '力矩已关闭：先按「使能」', 'ec.rate': 'PIN 错误次数过多：稍等再试', 'ec.insecure': '凭据不能经未加密的 http 发往其他主机：在设备本机操作，或按文档开启不安全认证',
     'ec.vision_down': '视觉服务无响应：检查 rebot-vision 是否在运行，再试一次', 'ec.vision_timeout': '视觉服务未在时限内应答：稍后再试', 'op.why.take': '强制接管控制权需要操作员权限', 'op.why.default': '这个操作需要操作员权限', 'op.retry': '解锁后自动继续这个操作。',
@@ -3037,7 +3037,7 @@ const I18N = {
     'op.why.calib': 'Calibration needs operator access', 'op.why.poses': 'Saving or changing poses and motions needs operator access', 'op.why.rec': 'Recording and managing episodes needs operator access', 'op.why.safety': 'Changing safety settings (keep-out boxes, collision guard) needs operator access',
     'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.vision': 'Switching the vision mode (YOLO / ArUco / depth) needs operator access',
     'op.why.calib_open': 'The calibration wizard switches the vision to ArUco, stores calibration data and writes the calibration; these steps need operator access. Without an unlock the wizard opens, but those steps are refused.',
-    'op.skip': 'Not now', 'op.again.take': 'Unlocked. Tap "Take over control" again to confirm.', 'op.again': 'Unlocked. Actions that move the arm do not run by themselves; tap again.',
+    'op.skip': 'Not now', 'op.why.renew': 'The operator session ends soon: enter the PIN for a new session; the running flow and its captured data stay as they are.', 'op.renew_warn': 'The operator session ends in {m} min; calibration and similar flows need it to store their results.', 'op.renew_btn': 'Renew (enter PIN)', 'op.again.take': 'Unlocked. Tap "Take over control" again to confirm.', 'op.again': 'Unlocked. Actions that move the arm do not run by themselves; tap again.',
     'ec.lease_busy': 'Another client holds control: ask it to release, or take over on this page', 'ec.lease_lost': 'Another client took control: check the arm, then try again',
     'ec.not_armed': 'Torque is off: tap Enable first', 'ec.rate': 'Too many wrong PINs: wait, then try again', 'ec.insecure': 'Credentials are not sent over plain http to another host: work on the device, or enable insecure auth as documented',
     'ec.vision_down': 'The vision service does not answer: check that rebot-vision runs, then try again', 'ec.vision_timeout': 'The vision service did not answer in time: try again shortly', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
@@ -3261,7 +3261,7 @@ Object.assign(I18N.zh, {
   'cw.f.lv.l0': '没有哪个修正级别比不修正更好：只应用相机标定（内参、安装、桌面高度），设备上已有的几何修正会被删除。',
   'cw.sess.load': '从设备加载', 'cw.sess.title': '设备上的标定数据', 'cw.sess.loading': '正在读取…', 'cw.sess.none': '设备上还没有标定数据。', 'cw.sess.unsupported': '这个 armd 版本不保存标定数据，请更新 rebot-armd。',
   'cw.sess.item': '{k} · {at} · {n} 个视图', 'cw.sess.kind.camera': '相机标定', 'cw.sess.kind.fine': '精校', 'cw.sess.close': '关闭', 'cw.sess.err': '读取失败：{m}',
-  'cw.sess.upfail': '标定数据没有保存到设备（{m}），向导继续。', 'cw.sess.loaded': '已加载 {at} 的标定数据（{n} 个视图），重新求解，不重新采集。',
+  'cw.sess.upfail': '标定数据没有保存到设备（{m}），向导继续。', 'cw.sess.queued': '标定数据没有保存到设备：操作员会话已结束。解锁后自动重新保存，向导继续。', 'cw.sess.loaded': '已加载 {at} 的标定数据（{n} 个视图），重新求解，不重新采集。',
   'cw.sess.verify': '验证视图', 'cw.sess.verify.hint': '数据是从设备加载的：标定板可能已经移动。让相机看到标定板（摇杆或手动），机械臂静止后点「验证视图」：在当前位置采一张图，用求解结果重投影，误差在 {g} mm 内才能应用。',
   'cw.sess.verify.ok': '验证通过：{mm} mm（{px} px，{m} 个标记）', 'cw.sess.verify.bad': '验证未通过：{mm} mm（限值 {g} mm）。标定板可能移动过，请重新采集。', 'cw.sess.verify.few': '验证未通过：只看到 {m} 个标定板标记。',
   'cw.f.par.title': '几何修正参数（J1、J6 固定为 0）', 'cw.f.par.joint': '关节', 'cw.f.par.off': '零位 °', 'cw.f.par.scale': '比例 %', 'cw.f.par.tilt': '轴倾斜 x / y °', 'cw.f.par.origin': '原点 dx / dy / dz mm', 'cw.f.par.fixed': '（固定）',
@@ -3332,7 +3332,7 @@ Object.assign(I18N.en, {
   'cw.f.lv.l0': 'No correction level beats the uncorrected model: only the camera calibration (intrinsics, mount, table height) is applied, and a geometry correction stored on the device is removed.',
   'cw.sess.load': 'Load from device', 'cw.sess.title': 'Calibration data on the device', 'cw.sess.loading': 'Reading…', 'cw.sess.none': 'No calibration data on the device yet.', 'cw.sess.unsupported': 'This armd does not store calibration data; update rebot-armd.',
   'cw.sess.item': '{k} · {at} · {n} views', 'cw.sess.kind.camera': 'Camera calibration', 'cw.sess.kind.fine': 'Fine calibration', 'cw.sess.close': 'Close', 'cw.sess.err': 'Read failed: {m}',
-  'cw.sess.upfail': 'Calibration data not saved to the device ({m}); the wizard carries on.', 'cw.sess.loaded': 'Loaded the calibration data of {at} ({n} views); solved again without capturing.',
+  'cw.sess.upfail': 'Calibration data not saved to the device ({m}); the wizard carries on.', 'cw.sess.queued': 'Calibration data not saved to the device: the operator session ended. It is saved again by itself after the unlock; the wizard carries on.', 'cw.sess.loaded': 'Loaded the calibration data of {at} ({n} views); solved again without capturing.',
   'cw.sess.verify': 'Verify view', 'cw.sess.verify.hint': 'This data was loaded from the device: the board may have moved. Bring the board into the camera view (jog or by hand), and with the arm still tap "Verify view": one capture at this pose is reprojected with the solved values and must be within {g} mm before Apply.',
   'cw.sess.verify.ok': 'Verified: {mm} mm ({px} px, {m} markers)', 'cw.sess.verify.bad': 'Verify failed: {mm} mm (limit {g} mm). The board may have moved; capture again.', 'cw.sess.verify.few': 'Verify failed: only {m} board markers seen.',
   'cw.f.par.title': 'Geometric correction (J1, J6 fixed at 0)', 'cw.f.par.joint': 'Joint', 'cw.f.par.off': 'Zero °', 'cw.f.par.scale': 'Scale %', 'cw.f.par.tilt': 'Axis tilt x / y °', 'cw.f.par.origin': 'Origin dx / dy / dz mm', 'cw.f.par.fixed': '(fixed)',
@@ -3783,7 +3783,7 @@ function toast(msg, kind = '', code = '', opts = null) {
     el.classList.add('has-act'); el.appendChild(btn);
   }
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
+  setTimeout(() => el.remove(), opts && opts.ms ? opts.ms : op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
   return el;
 }
@@ -6809,7 +6809,8 @@ async function cwSessionUpload() {
     CWZ.sessionId = d.id; CWZ.sessionWarn = '';
   } catch (e) {
     CWZ.sessionWarn = t('cw.sess.upfail', { m: e.code === 'OPERATOR_REQUIRED' ? t('err.operator_required') : e.message });
-    if (e.code === 'OPERATOR_REQUIRED') toast(CWZ.sessionWarn, 'warn', e.code, { path: '/api/v1/calibration/sessions', retry: cwSessionUpload });
+    // not a motion: stored again by itself after the next unlock (also one started from the badge)
+    if (e.code === 'OPERATOR_REQUIRED') { CWZ.sessionWarn = t('cw.sess.queued'); opQueue('calib.session', cwSessionUpload); toast(CWZ.sessionWarn, 'warn', e.code, { path: '/api/v1/calibration/sessions' }); }
   }
   cwRender();
 }
@@ -14973,7 +14974,7 @@ function reconnectWS() {
 /* Operator access. The badge in the header opens the dialog; a privileged request refused with OPERATOR_REQUIRED
    opens it with the reason (opRequire). After an unlock the token goes to the open telemetry socket ({type:"auth"}),
    so the lease (and a torqued arm) stays; an armd without that message gets a reconnect, as before. */
-const OP = { waiters: [], why: null, retry: false, skip: false, ack: null, seq: 0, lastFocus: null, pass: null, warned: false };
+const OP = { waiters: [], why: null, retry: false, skip: false, renew: false, ack: null, seq: 0, lastFocus: null, pass: null, warned: false, queue: new Map(), warnedFor: null };
 const opLocked = () => S.auth.enforced && S.auth.role !== 'operator';
 const opIsOpen = () => !!$('op-modal') && !$('op-modal').hidden;
 // Resetting needs the operator: a latched E-stop, a non-recoverable fault, an escalated collision (armd ws.rs)
@@ -14986,6 +14987,7 @@ function opReasonKey(path, body) {
   const p = String(path || '');
   if (p === 'lease.force') return 'op.why.take';
   if (p === 'calib.open') return 'op.why.calib_open';
+  if (p === 'op.renew') return 'op.why.renew';
   if (p === '/api/v1/vision/mode' || p === '/api/v1/vision/subscribe') return 'op.why.vision';
   if (p === '/api/v1/mode/gravity_comp') return 'op.why.gc';
   if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : 'op.why.fault';
@@ -15008,12 +15010,14 @@ function opCanRetry(path, body) {
    opCanRetry); opt.skip: the action goes on either way, Cancel reads "Not now". */
 function opRequire(path, body, opt = {}) {
   // refused while the page showed the session unlocked: it expired or was locked elsewhere
-  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); opToastExpired(); }
+  if (S.auth.role === 'operator' && !OP.renew) { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); opToastExpired(); }
   S.auth.enforced = true;
   renderOpBadge();
   return new Promise((resolve) => {
     OP.waiters.push(resolve);
+    const renew = OP.renew;
     openOperatorModal(opReasonKey(path, body), 'retry' in opt ? !!opt.retry : opCanRetry(path, body), !!opt.skip);
+    OP.renew = renew; renderOperatorModal();
   });
 }
 /* "Session expired" and Unlock toasts describe a locked session: they go when it is unlocked again. */
@@ -15027,6 +15031,31 @@ function opRefused() {
   S.auth.enforced = true; S.auth.role = 'program'; S.auth.expiresIn = null; S.auth.expiresAt = null;
   scheduleAuthExpiryRefresh(); renderOpBadge();
   if (was) opToastExpired();
+}
+/* Long operator flows (camera / fine calibration, motor zero, gripper calibration, a recording, a size measurement)
+   outlast the fixed operator session (armd auth.rs DEFAULT_TTL_S, 30 min, no renewal by design: a stolen or forgotten
+   session ends). Before it ends the page asks for the PIN again (a fresh session; the flow keeps its progress), and an
+   operator-only write that is not a motion and was refused meanwhile waits in OP.queue until the next unlock. */
+const opFlowActive = () => !!((typeof CWZ !== 'undefined' && (CWZ.open || CWZ.running || CWZ.solving)) || (typeof MZ !== 'undefined' && MZ.open)
+  || !$('gtool').hidden || (typeof TCH !== 'undefined' && TCH.rec) || (typeof MS !== 'undefined' && MS.state === 'running'));
+const OP_WARN_MS = 3 * 60000;
+function opRenew() {
+  OP.renew = true;
+  return opRequire('op.renew', undefined, { retry: false });
+}
+function opCheckExpiry() {
+  if (!S.auth.enforced || S.auth.role !== 'operator' || !S.auth.expiresAt || !opFlowActive()) return;
+  const left = S.auth.expiresAt - Date.now();
+  if (left > OP_WARN_MS || OP.warnedFor === S.auth.expiresAt || opIsOpen()) return;
+  OP.warnedFor = S.auth.expiresAt;
+  const el = toast(t('op.renew_warn', { m: Math.max(1, Math.ceil(left / 60000)) }), 'warn', '', { act: { label: t('op.renew_btn'), fn: opRenew }, ms: 60000 });
+  if (el) el.classList.add('op-stale');
+}
+// an operator-only write refused during a flow: run it again after the next unlock (key: one entry per kind of write)
+function opQueue(key, fn) { OP.queue.set(key, fn); }
+function opFlushQueue() {
+  const q = [...OP.queue.values()]; OP.queue.clear();
+  for (const fn of q) { try { Promise.resolve(fn()).catch(() => {}); } catch (_) {} }
 }
 // every same-origin API answer: a 403 OPERATOR_REQUIRED updates the badge, whichever code path made the request
 {
@@ -15146,7 +15175,8 @@ function opFit() {
   m.classList.toggle('op-short', h < 520);
 }
 function renderOperatorModal() {
-  const unlocked = S.auth.role === 'operator';
+  // renew: a new unlock while the session still runs (the PIN starts a fresh session; nothing else changes)
+  const unlocked = S.auth.role === 'operator' && !OP.renew;
   setText($('op-why'), OP.why ? t(OP.why) : '');
   setText($('op-retry'), OP.why && OP.retry && !unlocked ? t('op.retry') : '');
   $('op-pin-field').hidden = unlocked;
@@ -15181,14 +15211,14 @@ function closeOperatorModal(ok = false) {
   m.style.top = ''; m.style.height = '';
   document.body.classList.remove('op-open');
   $('op-pin').value = '';
-  OP.why = null; OP.retry = false; OP.skip = false;
+  OP.why = null; OP.retry = false; OP.skip = false; OP.renew = false;
   const f = OP.lastFocus; OP.lastFocus = null;
   if (f && typeof f.focus === 'function' && document.contains(f)) { try { f.focus({ preventScroll: true }); } catch (_) {} }
   opSettle(ok);
 }
 async function submitOperatorPin(ev) {
   if (ev) ev.preventDefault();
-  if (S.auth.role === 'operator') { closeOperatorModal(true); return; }
+  if (S.auth.role === 'operator' && !OP.renew) { closeOperatorModal(true); return; }
   const pin = ($('op-pin').value || '').trim();
   if (!pin) { setText($('op-status'), t('op.need_pin')); $('op-pin').focus({ preventScroll: true }); return; }
   $('op-unlock').disabled = true;
@@ -15213,6 +15243,7 @@ async function submitOperatorPin(ev) {
     closeOperatorModal(true);
     opDropStaleToasts();
     toast(t('op.unlocked_msg'), 'ok');
+    opFlushQueue();
   } catch (e) {
     setText($('op-status'), e.message || t('err.reqfail'));
   } finally {
@@ -15272,7 +15303,7 @@ i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
 }
 schemaReady = loadSchema();
 loadAuthStatus();
-setInterval(() => { if (S.auth.role === 'operator') renderOpBadge(); }, 30000); // minutes left on the badge
+setInterval(() => { if (S.auth.role === 'operator') { renderOpBadge(); opCheckExpiry(); } }, 10000); // minutes left on the badge, renewal before the end of a flow
 initSandbox();
 connectWS();
 connectDetectionWS();
