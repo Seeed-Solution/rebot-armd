@@ -979,9 +979,9 @@ impl SupervisorInner {
         }
         let arm_dof = input.arm.arm_dof();
         let gripper_idx = self.config.gripper_index().unwrap_or(arm_dof);
-        let moved = (0..arm_dof).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
-            || (self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0) - input.j7).abs() >= 1e-4;
-        if moved { return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into()); }
+        if crate::motion::plan_start_moved(&self.commanded_positions, &input.q0[..arm_dof.min(6)], gripper_idx, input.j7) {
+            return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into());
+        }
         Ok(())
     }
 
