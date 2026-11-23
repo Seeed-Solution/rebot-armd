@@ -1162,10 +1162,24 @@ fn wrapper_default_bounded_write_fails_closed_and_flush_estop_drops_pending() {
     assert_eq!(m_rx.deferred, 0);
 
     reset_tx_metrics();
-    d.clear_fault().unwrap();
+    bus.clear();
+    // clear_fault() obeys the per-tick TX budget (max_frames = 4 on 7 motors -> 4 sent, 3 deferred)
+    // while still dropping all pending motion frames immediately.
+    let cf_err = d.clear_fault().unwrap_err();
+    assert!(
+        matches!(cf_err, ArmDriverError::TxDeferred { pending: 3 }),
+        "clear_fault under max_frames=4 must defer remaining 3 motors: {cf_err:?}"
+    );
+    assert_eq!(bus.with(|s| s.tx_log.len()), 4, "clear_fault must respect max_frames=4");
     assert_eq!(d.pending_tx_len(), 0);
     let m_cf = take_tx_metrics();
     assert_eq!((m_cf.dropped_stopped, m_cf.pending), (3, 0));
+
+    // With sufficient TX budget, clear_fault transmits all 7 clear-fault frames and succeeds.
+    d.set_tx_budget(TxBudget::default());
+    bus.clear();
+    d.clear_fault().unwrap();
+    assert_eq!(bus.with(|s| s.tx_log.len()), 7);
 }
 
 #[test]
@@ -2066,12 +2080,28 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
     inner.attach_stop_requests(stops.clone());
     d.set_estop_gate(inner.estop_gate());
     d.set_abort_flag(Arc::new(AtomicBool::new(true)));
-    let _ = stops.request();
+    let pending_gen = stops.request();
 
-    // C1: Age J4 feedback past 100 ms -> base-mode rollback MUST send 0 frames and fail closed.
-    clock.advance(ms(120));
+    // C0: While a stop is PENDING (not yet applied), even base-mode rollback is refused (0 frames).
     bus.clear();
     let pos_modes = [JointMode::Position; 7];
+    let err_pending = d.set_joint_modes(&pos_modes, &targets_const(1.75)).unwrap_err();
+    assert!(
+        is_estop_inhibited(&err_pending),
+        "pending stop must refuse base-mode rollback: {err_pending:?}"
+    );
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "pending stop rollback refusal must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Apply the stop so the gate is no longer pending while E-stop remains LATCHED.
+    stops.mark_applied(pending_gen);
+
+    // C1: Age J4 feedback past 100 ms -> base-mode rollback while latched MUST send 0 frames and fail closed.
+    clock.advance(ms(120));
+    bus.clear();
     let err_stale = d.set_joint_modes(&pos_modes, &targets_const(1.75)).unwrap_err();
     assert!(
         err_stale.to_string().contains("fresh feedback"),
@@ -2083,9 +2113,9 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
         bus.with(|s| s.tx_log.clone())
     );
 
-    // C2: Deliver fresh feedback at measured q = 0.42 -> base-mode rollback succeeds and overrides
-    // caller's stale/arbitrary 1.75 hold with the fresh measured 0.42 position.
-    d.read_joint_states().unwrap(); // refresh empty-queue boundary (no 0xCC sent while stop pending)
+    // C2: Deliver fresh feedback at measured q = 0.42 -> base-mode rollback while latched succeeds
+    // and overrides caller's stale/arbitrary 1.75 hold with the fresh measured 0.42 position.
+    d.read_joint_states().unwrap(); // refresh empty-queue boundary (read-only 0xCC allowed while latched)
     bus.with(|s| {
         s.motors[3].2 = 0.42;
         s.push_all_feedback();
@@ -2093,7 +2123,7 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
     d.read_joint_states().unwrap();
     bus.clear();
     d.set_joint_modes(&pos_modes, &targets_const(1.75))
-        .expect("base-mode rollback with fresh feedback must succeed");
+        .expect("base-mode rollback with fresh feedback while latched must succeed");
     let tx = bus.with(|s| s.tx_accepted.clone());
     let hold_frames: Vec<_> = tx.iter().filter(|f| f.id == 0x104).copied().collect();
     assert_eq!(hold_frames.len(), 1, "expected 1 POS_VEL hold frame for J4: {tx:?}");

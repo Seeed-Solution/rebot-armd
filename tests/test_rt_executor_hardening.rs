@@ -241,16 +241,20 @@ fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() 
     drv_gc.read_joint_states().unwrap();
     drv_gc.set_joint_modes(&mit_modes, &hold).unwrap();
     let gc_req = Arc::new(AtomicU64::new(1));
-    let gc_app = Arc::new(AtomicU64::new(0));
+    let gc_app = Arc::new(AtomicU64::new(1));
     drv_gc.set_estop_gate(EstopGate::new(gc_req, gc_app));
     drv_gc.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    // Refresh fresh feedback (empty-queue boundary + state) so latched rollback has <= 100 ms feedback.
+    drv_gc.read_joint_states().unwrap();
+    raw_gc.with(|s| s.push_all_feedback());
+    drv_gc.read_joint_states().unwrap();
     bus_gc.tx_calls.store(0, Ordering::SeqCst);
     gc_clock.sleeps.store(0, Ordering::SeqCst);
     bus_gc.would_block_first_n.store(1, Ordering::SeqCst);
     let pos_modes = vec![JointMode::Position; 7];
     drv_gc
         .set_joint_modes(&pos_modes, &hold)
-        .expect("legacy gravity-comp exit set_joint_modes must still retry and succeed after E-stop");
+        .expect("legacy gravity-comp exit set_joint_modes must still retry and succeed while latched");
     assert!(gc_clock.sleeps.load(Ordering::SeqCst) >= 1, "legacy gravity-comp exit should retry WouldBlock");
 
     // (b1) Normal PosVel target batch: E-stop arrives during the 7th (final) target transmit ->
