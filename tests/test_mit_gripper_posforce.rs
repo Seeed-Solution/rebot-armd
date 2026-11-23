@@ -1898,6 +1898,11 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
         inner: FakeBus,
         clock: MockClock,
         inject_on_wouldblock: Arc<Mutex<Option<CanFrame>>>,
+        /// `(skip_empty_reads, frame, pre_tx_gap)`: on the `(skip_empty_reads + 1)`-th empty RX
+        /// read, queue `(frame, Some(clock.now()))` into `timed_rx` and advance the clock by
+        /// `pre_tx_gap` so the frame arrives after the final empty read and strictly before `tx_at`.
+        inject_between_empty_and_tx: Arc<Mutex<Option<(usize, CanFrame, Duration)>>>,
+        timed_rx: Arc<Mutex<VecDeque<(CanFrame, Option<std::time::Instant>)>>>,
         advance_schedule: Arc<Mutex<VecDeque<Duration>>>,
     }
 
@@ -1907,6 +1912,8 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
                 inner: FakeBus::with_clock(&b601_limits(), clock.clone()),
                 clock,
                 inject_on_wouldblock: Arc::new(Mutex::new(None)),
+                inject_between_empty_and_tx: Arc::new(Mutex::new(None)),
+                timed_rx: Arc::new(Mutex::new(VecDeque::new())),
                 advance_schedule: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
@@ -1916,6 +1923,17 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
         fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
         fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> { self.inner.transmit(frame) }
         fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.receive_timestamped().map(|(f, _)| f)
+        }
+        fn receive_timestamped(&mut self) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {
+            if let Some(item) = self.timed_rx.lock().unwrap().pop_front() {
+                if let Some(d) = self.advance_schedule.lock().unwrap().pop_front() {
+                    if !d.is_zero() {
+                        self.clock.advance(d);
+                    }
+                }
+                return Ok(item);
+            }
             match self.inner.receive() {
                 Ok(frame) => {
                     if let Some(d) = self.advance_schedule.lock().unwrap().pop_front() {
@@ -1923,11 +1941,23 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
                             self.clock.advance(d);
                         }
                     }
-                    Ok(frame)
+                    Ok((frame, None))
                 }
                 Err(e @ (TransportError::Timeout | TransportError::WouldBlock)) => {
                     if let Some(injected) = self.inject_on_wouldblock.lock().unwrap().take() {
                         self.inner.with(|s| s.rx.push_back(injected));
+                    }
+                    let mut armed = self.inject_between_empty_and_tx.lock().unwrap();
+                    if let Some((skip, frame, gap)) = armed.take() {
+                        if skip == 0 {
+                            let arrived_at = self.clock.now();
+                            self.timed_rx.lock().unwrap().push_back((frame, Some(arrived_at)));
+                            if !gap.is_zero() {
+                                self.clock.advance(gap);
+                            }
+                        } else {
+                            *armed = Some((skip - 1, frame, gap));
+                        }
                     }
                     Err(e)
                 }
@@ -2021,6 +2051,68 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
         let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
         assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
         let log = bus.inner.tx_log();
+        assert!(j7_commands(&log).is_empty());
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+    }
+
+    // (a3) Reply arriving AFTER the final pre-transmit empty read (`drain_rx_for_boundary`'s
+    //      `WouldBlock`) and BEFORE `transmit(0xCC)`: it is dequeued post-transmit with a
+    //      post-transmit sequence number (`seq > boundary`), yet MUST be rejected because its
+    //      receive time precedes `tx_at`, in both RefreshBeforeRestore and PreEnableRefresh.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock) = make_probe_stale(already_mode_4);
+        let pre_tx_j7 = bus.inner.with(|s| {
+            s.motors[J7].mute_feedback = true;
+            s.motors[J7].q = -1.35;
+            s.motors[J7].feedback_frame()
+        });
+        let seq_before_poll = if already_mode_4 {
+            let _ = d.begin_torque(true).unwrap();
+            while !bus.inner.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+                clock.advance(Duration::from_micros(500));
+                let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            }
+            let b = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+            let rb = CanFrame::new_standard(0x17, &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap();
+            bus.inner.with(|s| s.rx.push_back(rb));
+            // Empty read #0 = poll_readback's receive_feedback; empty read #1 = drain_rx_for_boundary
+            // right before 0xCC transmit.
+            *bus.inject_between_empty_and_tx.lock().unwrap() = Some((1, pre_tx_j7, Duration::from_micros(100)));
+            clock.advance(Duration::from_millis(1));
+            assert!(matches!(d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap(), armd::driver::TorqueProgress::Pending { .. }));
+            assert!(bus.inner.tx_log().iter().any(is_j7_refresh), "expected 0xCC transmit");
+            d.feedback_seqs()[J7]
+        } else {
+            // Empty read #0 = drain_rx_before_command; empty read #1 = drain_rx_for_boundary
+            // right before 0xCC transmit.
+            *bus.inject_between_empty_and_tx.lock().unwrap() = Some((1, pre_tx_j7, Duration::from_micros(100)));
+            let p = d.begin_torque(true).unwrap();
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+            assert!(bus.inner.tx_log().iter().any(is_j7_refresh), "expected 0xCC transmit");
+            d.feedback_seqs()[J7]
+        };
+        assert_eq!(bus.timed_rx.lock().unwrap().len(), 1,
+            "already_mode_4={already_mode_4}: pre-tx reply must still sit unread after 0xCC transmit");
+        let wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+            armd::driver::TorqueProgress::Pending { wake } => wake,
+            other => panic!("already_mode_4={already_mode_4}: pre-tx reply was accepted! got {other:?}"),
+        };
+        assert_eq!(d.feedback_seqs()[J7], seq_before_poll.wrapping_add(1),
+            "already_mode_4={already_mode_4}: pre-tx reply must have been dequeued post-transmit");
+        assert!(wake > clock.now());
+        clock.advance(wake.saturating_duration_since(clock.now()));
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        if already_mode_4 {
+            assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+        } else {
+            assert!(err.contains("no timely post-refresh feedback"), "{err}");
+        }
+        let log = bus.inner.tx_log();
+        if !already_mode_4 {
+            assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+        }
         assert!(j7_commands(&log).is_empty());
         assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
         assert!(!d.is_enabled());
@@ -2195,6 +2287,52 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
         let log = bus.tx_log();
         assert!(j7_commands(&log).is_empty(), "{label} emitted 0x307 hold: {log:?}");
         assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE), "{label} emitted CMD_ENABLE");
+        assert!(!d.is_enabled());
+    }
+
+    // (d) Healthy reply first dequeued at the exact expiry wake (no prior poll / read_joint_states):
+    //     - When its receive time is strictly before the deadline (`wake - 1 ms`), one bounded RX
+    //       drain at the expiry wake accepts it and enables cleanly in both phases.
+    //     - Negative control: a late reply first dequeued at the expiry wake with receive time
+    //       at the deadline (`wake`) is rejected fail-closed.
+    for already_mode_4 in [false, true] {
+        // d1. Timely reply (rx_at = wake - 1 ms) first dequeued at expiry wake -> accepted.
+        let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
+        let to_pre = wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+        clock.advance(to_pre);
+        let timely_rx_at = clock.now();
+        let timely_frame = bus.inner.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.motors[J7].q = -1.45;
+            s.motors[J7].feedback_frame()
+        });
+        bus.timed_rx.lock().unwrap().push_back((timely_frame, Some(timely_rx_at)));
+        // Advance directly to expiry wake WITHOUT calling read_joint_states() beforehand.
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(clock.now(), wake);
+        let mut p = d.poll_torque(clock.now() + Duration::from_millis(5))
+            .unwrap_or_else(|e| panic!("already_mode_4={already_mode_4}: timely reply first dequeued at expiry wake timed out: {e}"));
+        while let armd::driver::TorqueProgress::Pending { .. } = p {
+            clock.advance(Duration::from_micros(500));
+            p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        }
+        assert!(d.is_enabled() && d.motor_current_cap().unwrap().active, "already_mode_4={already_mode_4}");
+
+        // d2. Late reply (rx_at == wake == deadline) first dequeued at expiry wake -> rejected.
+        let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
+        clock.advance(wake.saturating_duration_since(clock.now()));
+        assert_eq!(clock.now(), wake);
+        let late_frame = bus.inner.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.motors[J7].feedback_frame()
+        });
+        bus.timed_rx.lock().unwrap().push_back((late_frame, Some(wake)));
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        if already_mode_4 {
+            assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+        } else {
+            assert!(err.contains("no timely post-refresh feedback"), "{err}");
+        }
         assert!(!d.is_enabled());
     }
 }

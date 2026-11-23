@@ -2458,6 +2458,7 @@ struct RefreshSample {
 struct RefreshCapture {
     joint: usize,
     boundary: u64,
+    tx_at: Instant,
     deadline: Deadline,
     first: Option<RefreshSample>,
 }
@@ -3561,8 +3562,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return false;
             }
             let attempt = self.now();
-            match self.can.receive() {
-                Ok(frame) => self.process_rx_frame(&frame, true),
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => self.process_rx_frame(&frame, true, rx_ts),
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     self.mark_rx_empty(attempt);
                     return true;
@@ -3579,17 +3580,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !self.drain_rx_for_boundary(deadline) || deadline.passed(self.now()) {
             return Ok(None);
         }
-        // Advance RX sequence immediately before transmitting so the refresh request has its own
-        // transmit boundary strictly after every pre-transmit dequeued frame (and distinct from
-        // `rx_empty_seq`). Without transport RX/TX timestamps or a protocol sequence byte in
-        // `0xCC`, this tight pre-transmit drain + transmit boundary matches `poll_readback`/
-        // `begin_disable`/`rx_boundary` and cannot distinguish an asynchronous wire arrival
-        // between the immediate pre-transmit `WouldBlock` and `transmit()`.
-        self.rx_seq += 1;
+        // Snapshot the receive sequence and transmit instant right before transmitting `0xCC`:
+        // only replies with `seq > boundary` AND receive time `rx_at >= tx_at` are accepted.
         let boundary = self.rx_seq;
+        let tx_at = self.now();
         let id = self.motor_ids[joint];
         self.can.transmit(&damiao::build_refresh_frame(id)).and_then(|()| self.can.flush())?;
-        self.refresh_capture = Some(RefreshCapture { joint, boundary, deadline, first: None });
+        self.refresh_capture = Some(RefreshCapture { joint, boundary, tx_at, deadline, first: None });
         Ok(Some(boundary))
     }
 
@@ -3610,9 +3607,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Serve a bounded 0xCC feedback refresh: accepts only the first feedback frame for `r.joint`
-    /// received strictly after `r.boundary`, recorded strictly before `r.deadline`, and still within
-    /// `POS_FORCE_FEEDBACK_MAX_AGE`. Live telemetry remains updated by any newer frames so callers
-    /// retain live safety-veto authority.
+    /// received strictly after `r.boundary`, with receive time not before the transmit instant and
+    /// strictly before `r.deadline`, and still within `POS_FORCE_FEEDBACK_MAX_AGE`. Even at the
+    /// expiry wake, runs one bounded RX drain before deciding. Live telemetry remains updated by
+    /// any newer frames so callers retain live safety-veto authority.
     fn poll_feedback_refresh(&mut self, mut r: FeedbackRefresh) -> Result<RefreshStep, ArmDriverError> {
         let expired_before_read = r.deadline.passed(self.now());
         match r.boundary {
@@ -3622,16 +3620,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
             Some(b) => {
-                if !expired_before_read {
-                    let _ = self.read_joint_states();
-                }
-                if let Some(sample) = self.refresh_capture.as_ref()
+                let _ = self.read_joint_states();
+                if let Some((tx_at, sample)) = self.refresh_capture.as_ref()
                     .filter(|c| c.joint == r.joint && c.boundary == b)
-                    .and_then(|c| c.first)
+                    .and_then(|c| c.first.map(|s| (c.tx_at, s)))
                 {
                     let fresh_rx = self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE;
                     let fresh_bound = sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
-                    if sample.seq > b && !r.deadline.passed(sample.rx_at) && fresh_rx && fresh_bound && sample.position.is_finite() {
+                    if sample.seq > b
+                        && sample.rx_at >= tx_at
+                        && !r.deadline.passed(sample.rx_at)
+                        && fresh_rx
+                        && fresh_bound
+                        && sample.position.is_finite()
+                    {
                         self.refresh_capture = None;
                         // Do NOT roll back live cached_states/motor_status: return Ready(sample) and let
                         // callers enforce safety checks on BOTH `sample` and live telemetry so neither
@@ -4115,8 +4117,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         for _ in 0..128 {
             if self.since(start) >= Duration::from_millis(5) { return false; }
             let attempt = self.now();
-            match self.can.receive() {
-                Ok(frame) => self.process_rx_frame(&frame, false),
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => self.process_rx_frame(&frame, false, rx_ts),
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     self.mark_rx_empty(attempt);
                     return true;
@@ -4716,7 +4718,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Decode one received CAN frame into the driver's feedback cache and, when
     /// `record_register_replies` is true, into the register reply buffers.
-    fn process_rx_frame(&mut self, frame: &CanFrame, record_register_replies: bool) {
+    fn process_rx_frame(&mut self, frame: &CanFrame, record_register_replies: bool, rx_timestamp: Option<Instant>) {
         self.rx_seq += 1;
         if self.awaiting_rx_boundary {
             return;
@@ -4745,8 +4747,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         {
             // A register reply is not feedback: byte 0 would decode as state 0.
             if record_register_replies {
+                let decode_now = self.now();
+                let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
                 if self.register_replies.len() < 64 { self.register_replies.push(reply); }
-                if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, self.now(), self.rx_seq, self.rx_empty_seq)); }
+                if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, rx_at, self.rx_seq, self.rx_empty_seq)); }
             }
             return;
         }
@@ -4770,7 +4774,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             }
             if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
-                let rx_at = self.now();
+                let decode_now = self.now();
+                let rx_at = rx_timestamp.map_or(decode_now, |ts| ts.min(decode_now));
                 let queue_bound = self.rx_empty_instant;
                 let seq = self.rx_seq;
                 self.cached_states[idx] = JointState {
@@ -4788,6 +4793,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     if cap.joint == idx
                         && cap.first.is_none()
                         && seq > cap.boundary
+                        && rx_at >= cap.tx_at
                         && !cap.deadline.passed(rx_at)
                         && feedback.position.is_finite()
                         && queue_bound.is_some()
@@ -4826,10 +4832,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         while frames_processed < 64 && !self.rx_over(t0) {
             // Taken before the receive: an empty result means the queue was empty after it.
             let attempt = self.now();
-            match self.can.receive() {
-                Ok(frame) => {
+            match self.can.receive_timestamped() {
+                Ok((frame, rx_ts)) => {
                     frames_processed += 1;
-                    self.process_rx_frame(&frame, true);
+                    self.process_rx_frame(&frame, true, rx_ts);
                     if frames_processed >= 64 || self.rx_over(t0) {
                         break;
                     }
