@@ -511,9 +511,9 @@ fn macro_children_name_their_parent_and_a_macro_terminal_carries_its_child_count
     // a ticket for another parent than the stamp's
     submit_install(&mut b, 2, a, later(), grip(parent.0 + 1)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
-    // well-formed, not wired in the foundation adapter
+    // well-formed, but the parent is a plain joint move, not a macro
     submit_install(&mut b, 3, a, later(), grip(parent.0)).unwrap();
-    assert_eq!(fx.step().command.unwrap().1, Err("UNSUPPORTED"));
+    assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
     assert_eq!(fx.active(), Some(parent));
     // the macro's terminal record (outcome and children) outlives its action record
     fx.core.core.record_macro_terminal(MacroTerminal { action: parent, children: 3, outcome: Outcome::Failed("NOT_HOLDING") });
@@ -771,4 +771,45 @@ fn the_target_port_is_reachable_from_the_supervisor_module() {
     assert_ne!(servo_stream(7), policy_stream(7));
     assert_eq!(servo_stream(7).0 & SERVO_STREAM_BIT, SERVO_STREAM_BIT);
     assert_eq!(policy_stream(7).0 & SERVO_STREAM_BIT, 0);
+}
+
+#[test]
+fn child_primitives_of_a_running_macro_commit_through_the_release() {
+    use armd::rt_core::ops::{ChildSpec, ChildTicket};
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let epoch = fx.core.safety.epoch_id();
+    let id = fx.core.begin_orchestrated_action("sequence", None, epoch).unwrap();
+    let parent = armd::rt_core::broker::ActionId(id);
+    let a = auth(&fx);
+    assert_eq!(a.parent_generation, id);
+    let start = |fx: &ReleaseFixture<SupervisorInner>| { let mut s = [0.0; MAX_DOF]; let c = &fx.core.commanded_positions; s[..c.len()].copy_from_slice(c); s };
+    let spec = |seq| Some(ChildSpec { ticket: ChildTicket { parent, child_seq: seq }, timeout_s: 10.0, timeout_code: "SEQUENCE_TIMEOUT", contact: None });
+    let dof = fx.core.commanded_positions.len() as u8;
+    let mut q = start(&fx);
+    q[0] += 0.05;
+    let joint = Primitive::JointQuinticLimited { child: spec(1), dof, start: start(&fx), q, duration_s: 0.5, max_velocity: [0.0; MAX_DOF], settle_s: 0.0 };
+    let r1 = submit_install(&mut b, 1, a, later(), joint).unwrap();
+    let rep = fx.step();
+    assert!(matches!(rep.command, Some((r, Ok(_))) if r == r1), "{rep:?}");
+    assert_eq!((fx.active(), fx.core.macro_children(id)), (Some(parent), Some(1)));
+    assert!(fx.core.active_trajectory.is_some());
+    // the same ticket again (not the next child) is stale; nothing replaces the running child
+    submit_install(&mut b, 2, a, later(), joint).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
+    let child_done = |fx: &ReleaseFixture<SupervisorInner>| matches!(fx.core.macro_run.as_ref().map(|m| &m.sub), Some(armd::macro_action::SubState::Done(_)));
+    for _ in 0..300 { fx.step(); if child_done(&fx) { break; } }
+    assert!(child_done(&fx));
+    assert!((fx.core.commanded_positions[0] - q[0]).abs() < 1e-3);
+    // a gripper child, then the macro ends: one terminal with both children
+    let grip = Primitive::Gripper { child: spec(2), dof, start: start(&fx), fraction: 0.5, speed: 1.0, grasp: false };
+    submit_install(&mut b, 3, auth(&fx), later(), grip).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert_eq!(fx.core.macro_children(id), Some(2));
+    for _ in 0..300 { fx.step(); if child_done(&fx) { break; } }
+    assert!(child_done(&fx));
+    fx.core.finish_macro(id, "done", None, None, None, None);
+    assert_eq!(fx.step().ended, Some((parent, Outcome::Completed)));
+    let got = replies(&mut b);
+    assert!(got.iter().any(|r| matches!(r, Reply::Terminal { action, children: 2, outcome: Outcome::Completed, .. } if *action == parent)), "{got:?}");
+    assert_eq!((b.reserved(), b.outstanding()), (0, 0));
 }

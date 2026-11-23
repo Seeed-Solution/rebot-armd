@@ -403,7 +403,12 @@ impl CoreOps for SupervisorInner {
         }
         match primitive {
             Primitive::None => Err("INVALID_COMMAND"),
-            Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => Err("UNSUPPORTED"),
+            // macro children (track E): installed for the running macro named by the ticket;
+            // the committed action is the parent (its terminal carries the child count)
+            Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
+                if primitive.child().is_none() { return Err("UNSUPPORTED"); }
+                self.commit_macro_child(primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
+            }
             Primitive::JointQuintic { dof, start, q, duration_s } => {
                 // the fields are public: a hand-built primitive may name more joints than it holds
                 let n = usize::from(*dof);
