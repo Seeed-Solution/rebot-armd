@@ -508,10 +508,12 @@ pub struct StopDiagRecord {
 /// Preallocated, lock-free diagnostic slot for `authorized_stop` on the RT thread.
 ///
 /// The RT path only performs plain atomic stores (zero allocations, zero formatting, zero
-/// tracing); a normal-priority caller drains and formats via [`Self::drain_and_log`].
+/// tracing); normal-priority periodic paths ([`super::publish::StateHub::latest`], driven by
+/// the dispatcher loop) drain and format via [`Self::drain_and_log_once`].
 #[derive(Debug)]
 pub struct StopDiagSlot {
     count: AtomicU64,
+    drained: AtomicU64,
     arm: AtomicU32,
     park_elapsed_us: AtomicU64,
     park_budget_us: AtomicU64,
@@ -521,6 +523,7 @@ impl StopDiagSlot {
     pub const fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
             arm: AtomicU32::new(0),
             park_elapsed_us: AtomicU64::new(0),
             park_budget_us: AtomicU64::new(0),
@@ -554,9 +557,7 @@ impl StopDiagSlot {
         })
     }
 
-    /// Off-thread drain: formats and emits `tracing::info!` for newly recorded events.
-    pub fn drain_and_log(&self, seen: &mut u64) -> Option<StopDiagRecord> {
-        let rec = self.poll(seen)?;
+    fn emit_log(rec: &StopDiagRecord) {
         tracing::info!(
             "Stop during a watchdog park (arm {}, elapsed {:.2} s / budget {:.2} s, {} event(s)): the park continues (only a new lease takes it over)",
             rec.arm.0,
@@ -564,7 +565,35 @@ impl StopDiagSlot {
             rec.park_budget_us as f64 / 1_000_000.0,
             rec.count,
         );
+    }
+
+    /// Off-thread drain with caller-managed cursor: formats and emits `tracing::info!` for
+    /// newly recorded events since `*seen`.
+    pub fn drain_and_log(&self, seen: &mut u64) -> Option<StopDiagRecord> {
+        let rec = self.poll(seen)?;
+        Self::emit_log(&rec);
         Some(rec)
+    }
+
+    /// Off-thread shared drain called by normal-priority periodic paths (e.g.
+    /// `StateHub::refresh` driven by the supervisor dispatcher loop): claims unlogged events
+    /// via CAS on `self.drained` so each recorded stop event is emitted once.
+    pub fn drain_and_log_once(&self) -> Option<StopDiagRecord> {
+        loop {
+            let prev = self.drained.load(Ordering::Acquire);
+            let now = self.count.load(Ordering::Acquire);
+            if now == prev { return None; }
+            if self.drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let rec = StopDiagRecord {
+                    count: now.wrapping_sub(prev),
+                    arm: ArmId(self.arm.load(Ordering::Relaxed) as u16),
+                    park_elapsed_us: self.park_elapsed_us.load(Ordering::Relaxed),
+                    park_budget_us: self.park_budget_us.load(Ordering::Relaxed),
+                };
+                Self::emit_log(&rec);
+                return Some(rec);
+            }
+        }
     }
 }
 

@@ -568,12 +568,8 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
     assert_eq!((allocs, frees), (0, 0), "staging/pinning/retiring 8 full plan slots touched the allocator");
 }
 
-/// `authorized_stop` during a watchdog park records fields into the preallocated diagnostic
-/// slot without tracing, allocating or freeing; an off-thread caller drains and logs it.
-#[test]
-fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
+fn watchdog_park_supervisor() -> SupervisorInner {
     use armd::model::{JointLimit, RestingPosePolicy};
-    use armd::rt_core::ops::stop_diag;
 
     let mut cfg = ArmConfig::default();
     cfg.dof = 2;
@@ -610,6 +606,19 @@ fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
     inner.last_heartbeat = Instant::now() - past;
     inner.tick(0.02);
     assert!(inner.watchdog_park.is_some() && inner.pending_normal_unload);
+    inner
+}
+
+static STOP_DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `authorized_stop` during a watchdog park records fields into the preallocated diagnostic
+/// slot without tracing, allocating or freeing; an off-thread caller drains and logs it.
+#[test]
+fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
+    use armd::rt_core::ops::stop_diag;
+    let _guard = STOP_DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut inner = watchdog_park_supervisor();
 
     let mut seen = stop_diag().count();
     let (stopped, allocs, frees) = counted(|| inner.authorized_stop());
@@ -630,6 +639,73 @@ fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
     let (stopped_idle, a2, f2) = counted(|| idle.authorized_stop());
     assert!(stopped_idle);
     assert_eq!((a2, f2), (0, 0), "idle/servo authorized_stop touched allocator");
+}
+
+/// Normal-priority periodic publication refresh (`StateHub::latest` / `try_latest`, called by
+/// the supervisor dispatcher loop at 50 Hz) drains deferred RT stop diagnostics off the RT
+/// thread and logs each recorded watchdog-park stop event exactly once.
+#[test]
+fn watchdog_park_stop_diagnostic_is_drained_and_logged_once_off_rt_thread() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    let _guard = STOP_DIAG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufGuard;
+        fn make_writer(&'a self) -> Self::Writer { BufGuard(self.0.clone()) }
+    }
+    struct BufGuard(Arc<Mutex<Vec<u8>>>);
+    impl Write for BufGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    let mut inner = watchdog_park_supervisor();
+
+    // Clear any prior un-drained count before capturing logs for this test.
+    let _ = inner.core.hub().latest();
+
+    let buf = BufWriter::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let captured = || String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+
+    tracing::subscriber::with_default(sub, || {
+        // 1. RT authorized_stop records into the lock-free slot without logging or allocating.
+        let (stopped, a, f) = counted(|| inner.authorized_stop());
+        assert!(!stopped);
+        assert_eq!((a, f), (0, 0), "authorized_stop during watchdog park must not touch allocator");
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 0, "must not log on RT call");
+
+        // 2. RT tick publication does NOT drain/log the stop diagnostic.
+        let _ = inner.tick_publish(0.02, 1, false);
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 0, "must not log on RT tick");
+
+        // 3. Normal-priority StateHub::latest() (dispatcher loop path) drains and logs once.
+        let _ = inner.core.hub().latest();
+        let text = captured();
+        assert_eq!(text.matches("Stop during a watchdog park").count(), 1, "expected 1 log line: {text}");
+        assert!(text.contains("the park continues"), "missing park-continues message: {text}");
+
+        // 4. Subsequent normal-priority polls do not re-log the same event.
+        let _ = inner.core.hub().latest();
+        let _ = inner.core.hub().try_latest();
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 1, "must log record only once");
+
+        // 5. A second watchdog-park stop event is drained once more.
+        assert!(!inner.authorized_stop());
+        let _ = inner.core.hub().latest();
+        let _ = inner.core.hub().latest();
+        assert_eq!(captured().matches("Stop during a watchdog park").count(), 2, "second event logged once");
+    });
 }
 
 /// Commit-time RT boundaries for path, replay, jog, and config reservation:
