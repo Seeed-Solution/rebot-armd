@@ -888,6 +888,9 @@ impl SupervisorInner {
         self.check_workspace_quintic_inline(&traj)?;
 
         self.last_heartbeat = Instant::now();
+        if self.config.gripper_index().is_some_and(|g| target.len() > g && (target[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.gripper_hold_vel_ceiling = None;
+        }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
