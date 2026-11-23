@@ -14,6 +14,7 @@ pub mod dynamics;
 #[cfg(not(target_arch = "wasm32"))] pub mod grasp;
 pub mod gravity;
 #[cfg(not(target_arch = "wasm32"))] pub mod gravity_comp;
+pub mod gripper_baseline;
 #[cfg(not(target_arch = "wasm32"))] pub mod gripper_calib;
 #[cfg(not(target_arch = "wasm32"))] pub mod keepout;
 #[cfg(not(target_arch = "wasm32"))] pub mod joint_zero;
