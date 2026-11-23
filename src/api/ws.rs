@@ -387,12 +387,16 @@ fn prepare_action(
                     request.speed = (2.0 * scale).clamp(0.01, 2.0);
                 }
             }
-            match body.get("baseline") {
-                None | Some(Value::Null) => {}
-                Some(v) if v.as_str() == Some("reset") => inner.reset_gripper_baseline(),
-                Some(_) => return Err(invalid_command("baseline must be \"reset\"")),
+            let baseline_cmd = match body.get("baseline").map(|v| (v.is_null(), v.as_str())) {
+                None | Some((true, _)) => crate::supervisor::GripperBaselineCmd::None,
+                Some((_, Some("calibrate"))) => crate::supervisor::GripperBaselineCmd::Calibrate,
+                Some((_, Some("reset"))) => crate::supervisor::GripperBaselineCmd::Reset,
+                Some(_) => return Err(invalid_command("baseline must be \"calibrate\" or \"reset\"")),
+            };
+            if baseline_cmd != crate::supervisor::GripperBaselineCmd::None && request.grasp {
+                return Err(invalid_command("baseline calibration strokes need grasp false (nothing in the jaws)"));
             }
-            let (id, duration) = inner.start_gripper(request, epoch)?;
+            let (id, duration) = inner.start_gripper_with_baseline(request, epoch, baseline_cmd)?;
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/gripper_zero_check" => {
@@ -817,9 +821,9 @@ fn check_operator_privilege(
         {
             Some(ApiError::operator_required("run_sequence (record)"))
         }
-        // forgets the learned free-motion torque of the jaw (stored on the device)
+        // calibrates or forgets the learned free-motion torque of the jaw (stored on the device)
         "/api/v1/action/gripper" if body.get("baseline").is_some_and(|v| !v.is_null()) => {
-            Some(ApiError::operator_required("gripper (baseline reset)"))
+            Some(ApiError::operator_required("gripper (baseline calibrate / reset)"))
         }
         "/api/v1/action/gripper_zero_check"
             if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>

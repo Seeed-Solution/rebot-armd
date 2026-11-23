@@ -89,6 +89,9 @@ pub struct FreeTorqueBaseline {
     pub tool_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_config_digest: Option<String>,
+    /// `--follower` armd ran with (a sim or mock baseline never applies to the real arm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follower: Option<String>,
     /// Stroke the bins cover (rad).
     pub lo_rad: f32,
     pub hi_rad: f32,
@@ -195,11 +198,12 @@ impl FreeTorqueBaseline {
     pub const VERSION: u32 = 1;
 
     /// Empty baseline over the stroke between `closed_rad` and `open_rad`.
-    pub fn new(closed_rad: f32, open_rad: f32, tool_id: Option<String>, tool_config_digest: Option<String>) -> Self {
+    pub fn new(closed_rad: f32, open_rad: f32, tool_id: Option<String>, tool_config_digest: Option<String>, follower: Option<String>) -> Self {
         Self {
             version: Self::VERSION,
             tool_id,
             tool_config_digest,
+            follower,
             lo_rad: closed_rad.min(open_rad),
             hi_rad: closed_rad.max(open_rad),
             close_fast: Table::default(),
@@ -211,6 +215,14 @@ impl FreeTorqueBaseline {
             rejected_moves: 0,
             ts: None,
         }
+    }
+
+    /// The baseline was learned with this tool (id and config digest) on this follower; every
+    /// identity field must be present and equal.
+    pub fn belongs_to(&self, tool_id: &str, tool_config_digest: &str, follower: Option<&str>) -> bool {
+        self.tool_id.as_deref() == Some(tool_id)
+            && self.tool_config_digest.as_deref() == Some(tool_config_digest)
+            && follower.is_some() && self.follower.as_deref() == follower
     }
 
     /// Structural checks of a loaded file.
@@ -306,7 +318,10 @@ impl FreeTorqueBaseline {
     /// Learn from one unloaded move. Samples near the start and the end of the move and samples
     /// slower than LEARN_MIN_SPEED_RAD_S are dropped; each bin with at least
     /// LEARN_MIN_BIN_SAMPLES samples gets the move's robust median, bounded and outlier-checked.
-    pub fn learn(&mut self, rec: &MoveRecord) -> LearnOutcome {
+    /// A bin's first value is at most `initial_max_nm` (the free-motion torque the absolute
+    /// contact rule allows for: `contact_torque_nm` − MARGIN_FLOOR_NM); it then rises by at most
+    /// MAX_RISE_PER_MOVE_NM per move.
+    pub fn learn(&mut self, rec: &MoveRecord, initial_max_nm: f32) -> LearnOutcome {
         let mut out = LearnOutcome::default();
         let travel = rec.end_rad - rec.start_rad;
         let sign = if travel >= 0.0 { 1.0 } else { -1.0 };
@@ -324,7 +339,7 @@ impl FreeTorqueBaseline {
             let (m, s) = robust_stats(g);
             let t = self.table_mut(rec.direction, slow);
             if t.moves[b] == 0 {
-                t.median_nm[b] = m;
+                t.median_nm[b] = m.min(initial_max_nm.max(0.0));
                 t.spread_nm[b] = s.clamp(MIN_SPREAD_NM, MAX_SPREAD_NM);
                 t.moves[b] = 1;
                 t.outlier_streak[b] = 0;
@@ -392,11 +407,9 @@ pub enum ContactSource {
 pub enum ThresholdSource {
     /// The learned baseline + margin.
     Baseline,
-    /// No baseline yet: this move's first part (after LEARN_START_GUARD_RAD of travel).
-    MoveStart,
-    /// No baseline and no usable move start: `gripper_policy.contact_torque_nm`.
+    /// No baseline near this position: `gripper_policy.contact_torque_nm` (the absolute rule).
     ContactTorqueNm,
-    /// Torque contact suspended (move start window, no baseline).
+    /// Torque contact off (no `contact_torque_nm`).
     None,
 }
 
@@ -416,33 +429,33 @@ mod tests {
 
     #[test]
     fn learns_position_dependent_torque_and_bounds_changes() {
-        let mut b = FreeTorqueBaseline::new(0.0, -5.7, None, None);
+        let mut b = FreeTorqueBaseline::new(0.0, -5.7, None, None, None);
         assert_eq!(b.state(), "unlearned");
         assert!(b.estimate(-3.0, Direction::Close, 1.0).is_none());
         let shape = |q: f32| 0.12 + 0.08 * (-q);
-        b.learn(&record(Direction::Open, 0.0, -5.7, shape, 1.0));
+        b.learn(&record(Direction::Open, 0.0, -5.7, shape, 1.0), 2.0);
         // closing falls back on the opening tables with extra margin
         let e = b.estimate(-3.0, Direction::Close, 1.0).unwrap();
         assert!(e.other_direction && (e.baseline_nm - shape(-3.0)).abs() < 0.03, "{e:?}");
-        b.learn(&record(Direction::Close, -5.7, 0.0, shape, 1.0));
-        b.learn(&record(Direction::Close, -5.7, 0.0, shape, 1.0));
+        b.learn(&record(Direction::Close, -5.7, 0.0, shape, 1.0), 2.0);
+        b.learn(&record(Direction::Close, -5.7, 0.0, shape, 1.0), 2.0);
         assert_eq!(b.state(), "learned");
         let e = b.estimate(-3.0, Direction::Close, 1.0).unwrap();
         assert!(!e.other_direction && (e.baseline_nm - shape(-3.0)).abs() < 0.03, "{e:?}");
         // a move with an object pressing (+0.5 N·m) is rejected twice, then taken in bounded steps
         let before = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
         for _ in 0..2 {
-            let o = b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0));
+            let o = b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0), 2.0);
             assert!(o.bins_rejected > 0);
         }
         assert_eq!(b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm, before);
-        b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0));
+        b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0), 2.0);
         let after = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
         assert!(after > before && after - before <= MAX_RISE_PER_MOVE_NM + 1e-4, "{before} -> {after}");
         // a lower baseline (lubrication) is followed, at most MAX_FALL_PER_MOVE_NM per move
         let mut prev = after;
         for _ in 0..12 {
-            b.learn(&record(Direction::Close, -5.7, 0.0, |q| 0.5 * shape(q), 1.0));
+            b.learn(&record(Direction::Close, -5.7, 0.0, |q| 0.5 * shape(q), 1.0), 2.0);
             let now = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
             assert!(prev - now <= MAX_FALL_PER_MOVE_NM + 1e-4);
             prev = now;
@@ -451,10 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn first_value_is_bounded_then_rises_slowly() {
+        let mut b = FreeTorqueBaseline::new(0.0, -5.7, None, None, None);
+        // a compressed object on the first move cannot set a high baseline at once
+        b.learn(&record(Direction::Open, 0.0, -5.7, |_| 0.9, 1.0), 0.45);
+        assert!((b.estimate(-3.0, Direction::Open, 1.0).unwrap().baseline_nm - 0.45).abs() < 1e-4);
+        b.learn(&record(Direction::Open, 0.0, -5.7, |_| 0.6, 1.0), 0.45);
+        let e = b.estimate(-3.0, Direction::Open, 1.0).unwrap().baseline_nm;
+        assert!(e <= 0.45 + MAX_RISE_PER_MOVE_NM + 1e-4, "{e}");
+    }
+
+    #[test]
+    fn identity_needs_every_field() {
+        let b = FreeTorqueBaseline::new(0.0, -5.7, Some("stock".into()), Some("d".into()), Some("damiao".into()));
+        assert!(b.belongs_to("stock", "d", Some("damiao")));
+        assert!(!b.belongs_to("stock", "d", Some("sim")));
+        assert!(!b.belongs_to("stock", "d", None));
+        assert!(!b.belongs_to("stock", "e", Some("damiao")));
+        let legacy = FreeTorqueBaseline::new(0.0, -5.7, None, None, None);
+        assert!(!legacy.belongs_to("stock", "d", Some("damiao")));
+    }
+
+    #[test]
     fn guards_drop_the_ends_of_a_move() {
-        let mut b = FreeTorqueBaseline::new(0.0, -5.7, None, None);
+        let mut b = FreeTorqueBaseline::new(0.0, -5.7, None, None, None);
         // torque spike at the end (fingers meet at closed): not learned
-        b.learn(&record(Direction::Close, -5.7, 0.0, |q| if q > -0.25 { 3.0 } else { 0.3 }, 1.0));
+        b.learn(&record(Direction::Close, -5.7, 0.0, |q| if q > -0.25 { 3.0 } else { 0.3 }, 1.0), 2.0);
         let e = b.estimate(-0.1, Direction::Close, 1.0).unwrap();
         assert!(e.baseline_nm < 0.35, "{e:?}");
     }
@@ -471,8 +506,8 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let mut b = FreeTorqueBaseline::new(0.0, -5.7, Some("stock".into()), Some("abc".into()));
-        b.learn(&record(Direction::Open, 0.0, -5.7, |_| 0.4, 1.0));
+        let mut b = FreeTorqueBaseline::new(0.0, -5.7, Some("stock".into()), Some("abc".into()), Some("sim".into()));
+        b.learn(&record(Direction::Open, 0.0, -5.7, |_| 0.4, 1.0), 2.0);
         let text = serde_json::to_string(&b).unwrap();
         let back: FreeTorqueBaseline = serde_json::from_str(&text).unwrap();
         assert_eq!(back, b);

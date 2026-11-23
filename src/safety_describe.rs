@@ -167,7 +167,7 @@ impl SupervisorInner {
         if let Some((joint, g)) = gripper.filter(|(_, g)| g.max_close_torque_nm.is_some()) {
             stops.push(json!({
                 "id": "gripper_force_limit",
-                "trigger": "|gripper torque| above max_close_torque_nm for persist_ticks consecutive ticks on fresh feedback while the jaw is driven closed, whatever its speed",
+                "trigger": "|gripper torque| above max_close_torque_nm for persist_ticks consecutive ticks on fresh feedback while the jaw is driven closed, or the torque pushing open above it while the jaw is driven open, whatever its speed",
                 "joint": joint,
                 "max_close_torque_nm": g.max_close_torque_nm,
                 "persist_ticks": GRIPPER_FORCE_CAP_TICKS,
@@ -405,13 +405,14 @@ impl SupervisorInner {
                     "stream_contact_speed_rad_s": g.stream_contact_speed_rad_s,
                     // grasp contact relative to the learned free-motion torque (crate::gripper_baseline)
                     "contact_baseline": {
-                        "rule": "contact when |torque| >= baseline(position, direction, speed band) + max(margin_floor_nm, margin_spreads x spread), at least min_contact_nm, below cap_fraction x max_close_torque_nm, for 3 ticks; contact_torque_nm until a baseline is learned (after the first move_start_window_rad of travel); the torque cap does not depend on it",
+                        "rule": "contact when |torque| >= baseline(position, direction, speed band) + max(margin_floor_nm, margin_spreads x spread), at least min_contact_nm, below cap_fraction x max_close_torque_nm, for 3 ticks; where no baseline is learned, contact_torque_nm for 2 ticks; the torque cap does not depend on it",
                         "margin_floor_nm": crate::gripper_baseline::MARGIN_FLOOR_NM,
                         "margin_spreads": crate::gripper_baseline::MARGIN_SPREADS,
                         "min_contact_nm": crate::gripper_baseline::MIN_CONTACT_NM,
                         "cap_fraction": crate::gripper_baseline::CONTACT_CAP_FRACTION,
-                        "move_start_window_rad": [crate::motion::GRIPPER_MOVE_START_WINDOW_RAD.0, crate::motion::GRIPPER_MOVE_START_WINDOW_RAD.1],
-                        "learned_from": "unloaded moves: opens and closes that end at the target without a contact, stall or torque cap trip and without an object held",
+                        "learned_from": "opening moves, and calibration strokes (gripper action with baseline calibrate/reset, nothing in the jaws, grasp false), that end at the target without a contact, stall or torque cap trip",
+                        "stall_raise_max_nm": crate::supervisor::GRIPPER_STALL_BASELINE_RAISE_MAX_NM,
+                        "stream_target_raise_max_nm": crate::supervisor::GRIPPER_STREAM_TARGET_RAISE_MAX_NM,
                         "observation": "gripper.baseline",
                         "calibrated": false,
                     },

@@ -963,10 +963,10 @@ pub struct GripperRequest {
 pub const GRIPPER_DEFAULT_TIMEOUT_S: f64 = 6.0;
 /// Added to the expected duration for the default gripper deadline (s).
 pub const GRIPPER_TIMEOUT_MARGIN_S: f64 = 2.0;
-/// Upper bound of a default (derived) gripper deadline (s). While the jaw keeps closing at the
-/// contact speed the deadline follows the remaining stroke at that speed, up to this bound
-/// (fully open -> closed at GRIPPER_CONTACT_SPEED takes about 19 s).
-pub const GRIPPER_MAX_DEFAULT_TIMEOUT_S: f64 = 20.0;
+/// A default (derived) gripper deadline may be extended by at most this (s), and only while the
+/// jaw moves unloaded: progressing toward the target with |τ| within the learned free-motion
+/// threshold over the whole window. Against an obstacle it is never extended.
+pub const GRIPPER_MAX_EXTENSION_S: f64 = 2.0;
 /// Deadline extension: the jaw counts as progressing when it moved at least
 /// GRIPPER_PROGRESS_RAD toward the target over the last GRIPPER_PROGRESS_WINDOW_S.
 pub const GRIPPER_PROGRESS_WINDOW_S: f64 = 0.5;
@@ -1060,20 +1060,10 @@ pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
 pub const SETTLE_HOLD_S: f64 = 0.2;
 /// Grasp contact: consecutive ticks of torque rise or following error.
 pub const GRIPPER_CONTACT_TICKS: u32 = 2;
-/// Grasp contact from the torque above a learned baseline (or the move-start estimate):
+/// Grasp contact from the torque above a learned baseline:
 /// consecutive ticks (one more than GRIPPER_CONTACT_TICKS: the margin is closer to free motion).
 pub const GRIPPER_BASELINE_CONTACT_TICKS: u32 = 3;
-/// No baseline yet: the closing torque over this stretch of the move's travel (rad from the
-/// start) estimates the free-motion torque of this move; torque contact waits for it (the
-/// following error and the torque cap stay active).
-pub const GRIPPER_MOVE_START_WINDOW_RAD: (f32, f32) = (0.1, 0.4);
-/// ... at least this many samples; without them by GRIPPER_MOVE_START_GIVE_UP_RAD of travel
-/// the threshold falls back on `contact_torque_nm`.
-pub const GRIPPER_MOVE_START_MIN_SAMPLES: usize = 5;
-pub const GRIPPER_MOVE_START_GIVE_UP_RAD: f32 = 0.8;
-/// A contact gave way when the hold torque is below min(contact_torque_nm, this fraction of the
-/// contact torque) (sim block 2026-11-22: 0.90 N·m while it turned, 0.28 N·m once the jaw stopped).
-pub const GRIPPER_YIELD_FRACTION: f32 = 0.6;
+
 /// Grasp contact from the following error: command at least this far ahead of the jaw (rad) ...
 pub const GRIPPER_CONTACT_LAG_RAD: f32 = 0.30;
 /// ... while the jaw closes slower than this fraction of the requested speed.
@@ -1199,15 +1189,9 @@ pub struct GripperMotion {
     contact_ticks: u32,
     /// Free-motion torque baseline of the active tool (snapshot at the start of the move).
     baseline: Option<FreeTorqueBaseline>,
-    /// Record this move for learning ([`Self::take_learning`]).
-    learn: bool,
+    /// Which moves are recorded for learning ([`Self::take_learning`]).
+    learn: LearnMode,
     samples: Option<MoveSamples>,
-    /// No baseline: (median, spread) of the closing torque at the move start; `move_start_done`
-    /// once decided (None then means: use contact_torque_nm).
-    move_start: Option<(f32, f32)>,
-    move_start_done: bool,
-    /// Hold torque below which the current contact counts as given way (`contact_yielded`).
-    contact_yield_nm: Option<f32>,
     /// Last contact verdict of this move.
     pub last_contact: Option<ContactInfo>,
     /// A contact verdict, a stall or a torque cap trip farther than holding_gap_rad from the
@@ -1218,6 +1202,20 @@ pub struct GripperMotion {
     extendable: bool,
     hard_timeout_s: f64,
     progress_ref: (f64, f32),
+    /// Every tick of the current progress window moved within the learned free-motion threshold.
+    window_unloaded: bool,
+}
+
+/// Which finished gripper moves are offered to the free-motion baseline.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnMode {
+    Off,
+    /// Opening moves only (every ordinary gripper action): nothing is compressed while opening.
+    Opening,
+    /// A calibration stroke the operator started with nothing in the jaws
+    /// (`"baseline": "calibrate"` / `"reset"`): opening and non-grasp closing moves.
+    Calibration,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1236,22 +1234,30 @@ impl GripperMotion {
         let mut m = Self {
             request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false,
             phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0,
-            baseline: None, learn: false, samples: None, move_start: None, move_start_done: false, 
-            contact_yield_nm: None, last_contact: None, loaded: false, learned: None, extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
+            baseline: None, learn: LearnMode::Off, samples: None,
+            last_contact: None, loaded: false, learned: None, extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
+            window_unloaded: true,
         };
         m.extendable = m.request.timeout_s.is_none();
         m.timeout_s = m.request.timeout_s
             .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
-        m.hard_timeout_s = if m.extendable { m.timeout_s.max(GRIPPER_MAX_DEFAULT_TIMEOUT_S) } else { m.timeout_s };
+        m.hard_timeout_s = if m.extendable { m.timeout_s + GRIPPER_MAX_EXTENSION_S } else { m.timeout_s };
         m
     }
 
-    /// Use `baseline` (the active tool's free-motion torque) for the contact threshold and, when
-    /// `learn`, record the move for [`Self::take_learning`] (Seek moves are never recorded).
-    pub fn with_baseline(mut self, baseline: Option<FreeTorqueBaseline>, learn: bool) -> Self {
+    /// Use `baseline` (the active tool's free-motion torque) for the contact threshold and record
+    /// the move for [`Self::take_learning`] as `learn` allows (Seek moves and grasp closes are
+    /// never recorded).
+    pub fn with_baseline(mut self, baseline: Option<FreeTorqueBaseline>, learn: LearnMode) -> Self {
         self.baseline = baseline;
-        self.learn = learn && self.request.command != GripperCommand::Seek;
-        if self.learn { self.samples = Some(MoveSamples::default()); }
+        let closing = (self.target - self.start) * self.close_dir() > 0.0;
+        let recorded = match learn {
+            LearnMode::Off => false,
+            LearnMode::Opening => !closing,
+            LearnMode::Calibration => !(closing && self.request.grasp),
+        };
+        self.learn = if recorded && self.request.command != GripperCommand::Seek { learn } else { LearnMode::Off };
+        if self.learn != LearnMode::Off { self.samples = Some(MoveSamples::default()); }
         self
     }
 
@@ -1263,47 +1269,14 @@ impl GripperMotion {
     pub fn hard_timeout_s(&self) -> f64 { self.hard_timeout_s }
 
     /// Contact torque threshold at jaw `m_g` moving at `mv` (rad/s): (threshold, source,
-    /// baseline). Off without `contact_torque_nm`.
+    /// baseline). Off without `contact_torque_nm`; without a learned baseline near `m_g` it is
+    /// `contact_torque_nm` (the absolute rule).
     fn contact_threshold(&self, m_g: f32, mv: f32) -> (Option<f32>, ThresholdSource, Option<f32>) {
         let Some(floor) = self.policy.contact_torque_nm else { return (None, ThresholdSource::None, None) };
         let cap = self.policy.max_close_torque_nm;
-        if let Some(e) = self.baseline.as_ref().and_then(|b| b.estimate(m_g, Direction::Close, mv.abs())) {
-            return (Some(e.threshold_nm(cap)), ThresholdSource::Baseline, Some(e.baseline_nm));
-        }
-        match (self.move_start, self.move_start_done) {
-            (Some((med, spread)), _) => {
-                let est = crate::gripper_baseline::Estimate { baseline_nm: med, spread_nm: spread, other_direction: false };
-                (Some(est.threshold_nm(cap).max(floor.min(cap.map_or(floor, |c| crate::gripper_baseline::CONTACT_CAP_FRACTION * c)))),
-                    ThresholdSource::MoveStart, Some(med))
-            }
-            (None, true) => (Some(floor), ThresholdSource::ContactTorqueNm, None),
-            (None, false) => (None, ThresholdSource::None, None),
-        }
-    }
-
-    /// No baseline: estimate this move's free-motion closing torque from its first part.
-    fn update_move_start(&mut self) {
-        if self.move_start_done || self.baseline.as_ref().is_some_and(|b| b.moves(Direction::Close) + b.moves(Direction::Open) > 0) {
-            self.move_start_done = true;
-            return;
-        }
-        let Some(samples) = self.samples.as_ref() else { self.move_start_done = true; return };
-        let Some(&(q_last, _, _)) = samples.iter().last() else { return };
-        let dir = self.close_dir();
-        let travel = (q_last - self.start) * dir;
-        let (w0, w1) = GRIPPER_MOVE_START_WINDOW_RAD;
-        if travel < w1 { return; }
-        let mut buf = [0.0f32; 64];
-        let mut n = 0;
-        for &(q, tau, v) in samples.iter() {
-            let t = (q - self.start) * dir;
-            if t >= w0 && v >= crate::gripper_baseline::LEARN_MIN_SPEED_RAD_S && n < buf.len() { buf[n] = tau; n += 1; }
-        }
-        if n >= GRIPPER_MOVE_START_MIN_SAMPLES {
-            self.move_start = Some(crate::gripper_baseline::robust_stats(&mut buf[..n]));
-            self.move_start_done = true;
-        } else if travel >= GRIPPER_MOVE_START_GIVE_UP_RAD {
-            self.move_start_done = true;
+        match self.baseline.as_ref().and_then(|b| b.estimate(m_g, Direction::Close, mv.abs())) {
+            Some(e) => (Some(e.threshold_nm(cap)), ThresholdSource::Baseline, Some(e.baseline_nm)),
+            None => (Some(floor), ThresholdSource::ContactTorqueNm, None),
         }
     }
 
@@ -1314,7 +1287,7 @@ impl GripperMotion {
 
     /// A Done move: keep it for learning when unloaded.
     fn finish_learning(&mut self, m_g: f32, holding: Option<bool>) {
-        if !self.learn || self.loaded || holding == Some(true) || !m_g.is_finite() { return; }
+        if self.learn == LearnMode::Off || self.loaded || holding == Some(true) || !m_g.is_finite() { return; }
         if (self.target - m_g).abs() > self.policy.holding_gap_rad.max(GRIPPER_STOP_SHORT_RAD) { return; }
         let Some(samples) = self.samples.take() else { return };
         let direction = if (self.target - self.start) * self.close_dir() > 0.0 { Direction::Close } else { Direction::Open };
@@ -1344,7 +1317,7 @@ impl GripperMotion {
         let (Some(contact), Some(stop)) = (self.contact_rad, self.contact_stop()) else { return false };
         let dir = self.close_dir();
         let low_torque = !torque_feedback
-            || tau_g.abs() < self.contact_yield_nm.or(self.policy.contact_torque_nm).unwrap_or(self.policy.holding_torque_nm);
+            || tau_g.abs() < self.policy.contact_torque_nm.unwrap_or(self.policy.holding_torque_nm);
         (self.policy.closed_rad - stop) * dir > 1e-4
             && (m_g - contact) * dir >= 0.5 * self.policy.squeeze_rad
             && low_torque
@@ -1425,7 +1398,6 @@ impl GripperMotion {
             self.phase = GripPhase::Moving;
             self.contact_rad = None;
             self.contact_ticks = 0;
-            self.contact_yield_nm = None;
             self.still_for = 0.0;
             if idx < positions.len() { positions[idx] = m_g; }
             return StepOut { positions, velocities, status: StepStatus::Running, progress: progress_of(m_g), clear_gripper_stall: true };
@@ -1463,15 +1435,25 @@ impl GripperMotion {
 
         // Default deadline: while the jaw progresses toward the target, it covers the remaining
         // stroke at the current speed limit (the contact speed after a contact), up to the bound.
+        if self.extendable {
+            let toward = (self.target - self.start).signum();
+            let travel_dir = if toward * dir > 0.0 { Direction::Close } else { Direction::Open };
+            let cap = self.policy.max_close_torque_nm;
+            let unloaded = ctx.feedback_fresh && ctx.torque_feedback && !stalled && self.contact_rad.is_none()
+                && self.baseline.as_ref().and_then(|b| b.estimate(m_g, travel_dir, mv_g.abs()))
+                    .is_some_and(|e| tau_g.abs() <= e.threshold_nm(cap));
+            self.window_unloaded &= unloaded;
+        }
         if self.extendable && self.elapsed - self.progress_ref.0 >= GRIPPER_PROGRESS_WINDOW_S - 1e-9 && m_g.is_finite() {
             let toward = (self.target - self.start).signum();
-            if (m_g - self.progress_ref.1) * toward >= GRIPPER_PROGRESS_RAD {
+            if self.window_unloaded && (m_g - self.progress_ref.1) * toward >= GRIPPER_PROGRESS_RAD {
                 let remaining = f64::from((active_target - m_g).abs());
                 let need = self.elapsed + remaining / f64::from(self.limit.max_velocity.max(0.05))
                     + 0.5 + self.policy.settle_ms as f64 / 1000.0 + GRIPPER_TIMEOUT_MARGIN_S;
                 self.timeout_s = self.timeout_s.max(need).min(self.hard_timeout_s);
             }
             self.progress_ref = (self.elapsed, m_g);
+            self.window_unloaded = true;
         }
         if self.elapsed > self.timeout_s {
             if idx < positions.len() { positions[idx] = m_g; }
@@ -1490,7 +1472,6 @@ impl GripperMotion {
         // a baseline the move-start estimate or contact_torque_nm; once the jaw has moved) or
         // following error (command ahead while the jaw slows down), sustained.
         if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !stalled {
-            if self.baseline.is_none() || !self.move_start_done { self.update_move_start(); }
             let (threshold, threshold_source, baseline_nm) = self.contact_threshold(m_g, mv_g);
             let torque_hit = ctx.torque_feedback && self.moved && threshold.is_some_and(|c| tau_g.abs() >= c);
             let lag_hit = (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD
@@ -1502,11 +1483,6 @@ impl GripperMotion {
                 self.limit.max_velocity = self.limit.max_velocity.min(GRIPPER_CONTACT_SPEED);
                 self.note_load(m_g);
                 let tau = tau_g.abs();
-                // the contact gave way when the hold torque falls well below the contact torque
-                // (a contact found closer to free motion would otherwise count a soft object's
-                // hold as giving way)
-                let reference = tau.max(threshold.or(self.policy.contact_torque_nm).unwrap_or(0.0));
-                self.contact_yield_nm = self.policy.contact_torque_nm.map(|c| c.min(GRIPPER_YIELD_FRACTION * reference));
                 self.last_contact = Some(ContactInfo {
                     at_rad: m_g,
                     torque_nm: tau,
