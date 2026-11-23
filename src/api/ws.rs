@@ -1564,6 +1564,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
                             let effective_fps = crate::policy_runtime::validate_policy_fps(request_mode, effective_fps)
                                 .map_err(ArmError::from)?;
+                            crate::policy_runtime::validate_chunking_horizon(
+                                prepared_policy.contract().chunking,
+                                effective_fps,
+                            )
+                            .map_err(ArmError::from)?;
                             let verified_release_gate = if let Some(ref deployment_ctx) = deployment {
                                 let raw_gate = match inline_release_gate {
                                     Some(v) => Some(v),
