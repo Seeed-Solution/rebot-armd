@@ -182,7 +182,23 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 
 /// Load the persisted runtime list at startup (fail-closed: returns `Err` and leaves the file
 /// untouched on any read/parse/validation, missing-workspace non-empty boxes, or combined-install error).
+///
+/// Restart reconciliation (track B): the keep-out domain is `Reconciling` (motion inhibited)
+/// from the start of the load until the file is installed, so active and durable versions
+/// agree; a load that fails leaves it `Reconciling` (the file stays on disk, the profile
+/// boxes stay active).
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) -> Result<(), String> {
+    use crate::rt_core::config_iface::{ConfigAuthority, ConfigDomain};
+    persist::remove_staged_leftovers(path);
+    let reconciling = supervisor.inner().write().await.begin_reconcile(ConfigDomain::Keepout);
+    let loaded = load_file_into(supervisor, path).await;
+    if loaded.is_ok() && reconciling {
+        supervisor.inner().write().await.finish_reconcile(ConfigDomain::Keepout);
+    }
+    loaded
+}
+
+async fn load_file_into(supervisor: &ArmSupervisor, path: &Path) -> Result<(), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

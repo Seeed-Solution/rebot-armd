@@ -532,6 +532,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 /// left untouched and the profile setting stays in force.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+    persist::remove_staged_leftovers(path);
     let mut inner = supervisor.inner().write().await;
     inner.collision.path = Some(path.to_path_buf());
     match persist::load::<CollisionSetting>(path, |_| Ok(())) {

@@ -218,6 +218,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 /// Load the persisted gripper calibration at startup (logs outcome).
 /// Invalid/corrupt file -> log a warning, ignore it, report observation.gripper_zero.state "calib_invalid".
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+    persist::remove_staged_leftovers(path);
     let mut inner = supervisor.inner().write().await;
     inner.gripper_calib_path = Some(path.to_path_buf());
     let j7_lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx)).cloned();

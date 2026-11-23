@@ -1351,103 +1351,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let _ = tx.send(reply).await;
                     });
                 }
-                // Atomic two-phase persist-before-commit config writes (keepout, collision, gripper_calibration, poses, grasp_setup).
-                // Phase 1 (stage) runs outside sup.inner() lock; Phase 2 (auth + lease + epoch + precheck + publish + commit) runs under sup.inner() write lock.
-                if let Some((request_id, mut prepared, generation, epoch)) = pending_config_write.take() {
+                // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
+                if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
                     let sup = recv_supervisor.clone();
                     let tx = ack_tx.clone();
-                    let ws_auth_c = ws_auth.clone();
-                    let conn_c = recv_connection.clone();
-                    let gen_now = recv_generation.clone();
-                    let op_path = prepared.path();
+                    let (ws_auth_c, conn_c, gen_now) = (ws_auth.clone(), recv_connection.clone(), recv_generation.clone());
                     tokio::spawn(async move {
-                        let cw_lock = sup.config_write_lock();
-                        let _cw = cw_lock.lock().await;
-                        let write = prepared.take_write().expect("checked has_write");
-                        let staged_res = tokio::task::spawn_blocking(move || {
-                            crate::persist::StagedWrite::stage(write.path, write.text)
-                        }).await;
-                        let reply = match staged_res {
-                            Err(e) => {
-                                tracing::warn!("State file stage task failed: {e}");
-                                let inner = sup.inner().read().await;
-                                command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")))
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!("State file not staged: {e}");
-                                let inner = sup.inner().read().await;
-                                command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")))
-                            }
-                            Ok(Ok(staged)) => {
-                                let (reply_or_ack, dir_sync_opt) = {
-                                    let mut inner = sup.inner().write().await;
-                                    if !ws_auth_c.is_operator() {
-                                        staged.abort();
-                                        (command_reject(&inner, &request_id, ApiError::operator_required(op_path)), None)
-                                    } else if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn_c, generation) {
-                                        staged.abort();
-                                        (json!({
-                                            "type": "command_reject",
-                                            "request_id": request_id,
-                                            "status": 409,
-                                            "code": "LEASE_LOST",
-                                            "message": "This connection lost the lease while persisting configuration",
-                                            "error": "LEASE_LOST",
-                                            "epoch_id": inner.safety.epoch_id()
-                                        }), None)
-                                    } else if inner.safety.epoch_id() != epoch {
-                                        staged.abort();
-                                        (json!({
-                                            "type": "command_reject",
-                                            "request_id": request_id,
-                                            "status": 409,
-                                            "code": "EPOCH_MISMATCH",
-                                            "message": "Command epoch is no longer current",
-                                            "error": "EPOCH_MISMATCH",
-                                            "epoch_id": inner.safety.epoch_id()
-                                        }), None)
-                                    } else if let Some(err) = prepared.precheck(&mut inner) {
-                                        staged.abort();
-                                        (command_reject(&inner, &request_id, err.into()), None)
-                                    } else {
-                                        match staged.rename_only() {
-                                            Err(e) => {
-                                                tracing::warn!("State file not published: {e}");
-                                                (command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}"))), None)
-                                            }
-                                            Ok(dir_sync) => match prepared.commit(&mut inner) {
-                                                Ok(fields) => {
-                                                    let mut ack = command_ack(&inner, &request_id, None);
-                                                    for (key, field) in fields { ack[key] = field; }
-                                                    ack["persisted"] = json!(true);
-                                                    (ack, Some(dir_sync))
-                                                }
-                                                Err(err) => (command_reject(&inner, &request_id, err.into()), None),
-                                            }
-                                        }
-                                    }
-                                };
-                                match dir_sync_opt {
-                                    Some(dir_sync) => {
-                                        let mut ack = reply_or_ack;
-                                        let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
-                                            .await
-                                            .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
-                                        match outcome {
-                                            crate::persist::PublishOutcome::Published => {
-                                                ack["durability_confirmed"] = json!(true);
-                                            }
-                                            crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(warn_msg) => {
-                                                ack["durability_confirmed"] = json!(false);
-                                                ack["durability_warning"] = json!(warn_msg);
-                                            }
-                                        }
-                                        ack
-                                    }
-                                    None => reply_or_ack,
-                                }
-                            }
-                        };
+                        let reply = persist_and_activate(sup, request_id, prepared, generation, epoch, ws_auth_c, conn_c, gen_now).await;
                         let _ = tx.send(reply).await;
                     });
                 }
