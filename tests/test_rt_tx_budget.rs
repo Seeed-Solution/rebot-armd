@@ -2108,3 +2108,141 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
         "rollback hold must use fresh measured position ~0.42, not caller 1.75 (got {wire_pos})"
     );
 }
+
+#[test]
+fn confirmed_handover_and_mit_fresh_status_obey_per_send_stop_gate_and_tx_budget() {
+    // Part A: Stop raised during the FIRST confirmation refresh send in `write_modes_confirmed`
+    // (`set_joint_modes_confirmed`) -> NO further refresh frames sent, fails closed with EstopInhibited.
+    // Wrap `VirtualBus` to drop immediate feedback frames produced by the MIT hold frames for J1 & J2
+    // so `write_modes_confirmed` enters its confirmation 0xCC refresh loop with `missing = [0, 1]`.
+    struct DropHoldFeedbackBus {
+        inner: VirtualBus,
+        drop_mit_feedback_for: Vec<u32>,
+    }
+    impl CanTransport for DropHoldFeedbackBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let rx_before = self.inner.with(|s| s.rx.len());
+            let r = self.inner.transmit(frame);
+            if self.drop_mit_feedback_for.contains(&frame.id)
+                && frame.data != damiao::CMD_ENABLE
+                && frame.data != damiao::CMD_DISABLE
+                && frame.data != damiao::CMD_CLEAR_FAULTS
+            {
+                self.inner.with(|s| s.rx.truncate(rx_before));
+            }
+            r
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+    }
+
+    let limits = b601_limits();
+    let (vbus, _clock) = VirtualBus::new(&limits);
+    let wrapper = DropHoldFeedbackBus { inner: vbus.clone(), drop_mit_feedback_for: vec![1, 2] };
+    let mut d = DamiaoArmDriver::new(wrapper, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    vbus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("enable");
+    d.check_mapping_ranges();
+    vbus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+
+    let stops_hook = stops.clone();
+    vbus.clear();
+    vbus.with(|s| {
+        s.on_tx = Some(Arc::new(move |_, frame| {
+            if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                let _ = stops_hook.request();
+            }
+        }));
+    });
+    let mut mit_two = [JointMode::Position; 7];
+    mit_two[0] = JointMode::Mit;
+    mit_two[1] = JointMode::Mit;
+    let err = d.set_joint_modes_confirmed(&mit_two, &targets_const(0.0)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "stop during first confirmation refresh must fail closed with EstopInhibited: {err:?}");
+    let refreshes: Vec<_> = vbus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+            .copied()
+            .collect()
+    });
+    assert_eq!(
+        refreshes.len(),
+        1,
+        "stop raised during first confirmation refresh must send 0 further refresh frames: {refreshes:?}"
+    );
+    assert!(d.joint_modes_uncertain(), "aborted confirmed handover must leave modes uncertain");
+
+    // Part B: Stop raised during FIRST refresh send in `mit_fresh_status` -> NO further refresh frames.
+    let (mut d, bus, _) = enabled_driver();
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+    let stops_hook = stops.clone();
+    bus.clear();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move |_, frame| {
+            if frame.id == 0x7FF && frame.data[2] == 0xCC {
+                let _ = stops_hook.request();
+            }
+        }));
+    });
+    let err = d.mit_fresh_status().unwrap_err();
+    assert!(
+        err.contains(armd::driver::ESTOP_INHIBITED),
+        "mit_fresh_status must stop on mid-loop stop: {err}"
+    );
+    let refreshes: Vec<_> = bus.with(|s| {
+        s.tx_log
+            .iter()
+            .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+            .copied()
+            .collect()
+    });
+    assert_eq!(
+        refreshes.len(),
+        1,
+        "stop raised during first mit_fresh_status refresh must send 0 further refresh frames: {refreshes:?}"
+    );
+
+    // Part C: TX budget bounds BOTH non-pos-force holds in confirmed handover AND `mit_fresh_status`.
+    let (mut d, bus, _) = enabled_driver();
+    d.check_mapping_ranges();
+    d.set_tx_budget(TxBudget { max_frames: 2, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let err = d.mit_fresh_status().unwrap_err();
+    assert!(err.contains("TX budget exhausted"), "mit_fresh_status must respect TX budget: {err}");
+    assert_eq!(
+        bus.with(|s| s.tx_log.len()),
+        2,
+        "mit_fresh_status must stop after max_frames = 2"
+    );
+
+    // Non-pos-force confirmed handover with max_frames = 1 (room for CTRL_MODE but not its hold)
+    // must send 0 frames and fail closed.
+    let (mut d, bus, _) = enabled_driver();
+    d.check_mapping_ranges();
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let mut mit_j4 = [JointMode::Position; 7];
+    mit_j4[3] = JointMode::Mit;
+    assert!(d.set_joint_modes_confirmed(&mit_j4, &targets_const(0.0)).is_err());
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "confirmed handover for non-PF joint must respect TX budget (0 frames under max_frames=1): {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+}

@@ -691,6 +691,7 @@ fn budgeted_clear_fault_and_pre_enable_hold_errors_do_not_allocate_or_free() {
     assert_eq!((a, f), (0, 0), "clear_fault_budgeted WouldBlock touched allocator");
 
     // 2. clear_fault_budgeted flush ENOBUFS -> 0 allocs, 0 frees.
+    d.begin_tx_tick();
     d.can_mut().mode = Mode::Ok;
     d.can_mut().flush_err = Some(Mode::EnobufsAfter(0));
     let dl = clock.now() + Duration::from_millis(50);
@@ -704,6 +705,7 @@ fn budgeted_clear_fault_and_pre_enable_hold_errors_do_not_allocate_or_free() {
     // 3. clear_fault_budgeted SocketCAN ENETDOWN -> 0 allocs, 0 frees.
     #[cfg(target_os = "linux")]
     {
+        d.begin_tx_tick();
         d.can_mut().flush_err = None;
         d.can_mut().mode = Mode::SocketCanOsAfter(0, libc::ENETDOWN);
         d.can_mut().tx_count = 0;

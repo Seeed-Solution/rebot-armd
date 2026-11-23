@@ -511,7 +511,13 @@ fn mit_staggered_switch_holds_do_not_extend_the_deadline() {
     let clock = MockClock::new();
     let lim = b601_limits();
     let bus = FakeBus::with_clock(&lim[3..5], clock.clone());
-    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2]).with_joint_limits(lim[3..5].to_vec()).unwrap();
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2])
+        .with_joint_limits(lim[3..5].to_vec())
+        .unwrap()
+        .with_tx_budget(armd::driver::TxBudget {
+            max_duration: FENCE,
+            ..armd::driver::TxBudget::default()
+        });
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
     d.check_mapping_ranges(); // ranges verified: the switch sends only mode writes and holds
