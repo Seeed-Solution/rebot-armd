@@ -345,28 +345,26 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
     let ep1 = sup.get_observation().await.epoch_id;
     assert_eq!(rpc(&mut ws, gen, ep1, "/api/v1/motion/jog", json!({"target_positions": [0.5, 0.3, -0.2, 0.25, -0.2, 0.15, 0.0], "duration_secs": 0.8})).await["type"], "command_ack");
 
-    let handle = sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await.unwrap();
-    // Capture the exact `tx_log` index and 7-joint motor state at the owner's `stops.applied() >= 1` boundary.
-    let applied_boundary: Arc<Mutex<Option<(usize, [f32; 7])>>> = Arc::new(Mutex::new(None));
+    let delay = Arc::new(Mutex::new(None));
+    let handle = sup.start_executor_with_hooks(
+        ExecutorConfig::for_tests(Duration::from_millis(5)),
+        PersistTestHooks { release_delay_once: Some(delay.clone()), ..Default::default() },
+    ).await.unwrap();
+    // Count every CAN transmit observed once the owner advances `stops.applied() >= 1`.
     let stops_obs = handle.stop_requests().clone();
-    let bus_obs = bus.clone();
-    let b_ref = applied_boundary.clone();
     let seen_tx_after_apply = Arc::new(AtomicUsize::new(0));
     let tx_cnt = seen_tx_after_apply.clone();
     bus.with(|s| {
         s.on_tx = Some(Arc::new(move || {
             if stops_obs.applied() >= 1 {
                 tx_cnt.fetch_add(1, Ordering::Relaxed);
-                let mut g = b_ref.lock().unwrap();
-                if g.is_none() {
-                    // Snapshot right when the first post-apply frame is logged (before checking later frames).
-                    let _ = &bus_obs;
-                    *g = Some((usize::MAX, [0.0; 7]));
-                }
             }
         }));
     });
     wait_until(Duration::from_secs(2), || bus.with(|s| s.motors[0].q > 0.02)).await;
+    // Pause one release so queued broker command, target frame, and urgent Stop meet on the same release.
+    *delay.lock().unwrap() = Some(Duration::from_millis(80));
+    wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
     let obs = sup.observation().await.unwrap();
     fill_ordinary_queues(&handle, gen, obs.epoch_id, 0, &obs.positions, [-0.5, -0.4, 0.4, -0.4, 0.4, -0.4, 0.0, 0.0]);
     let tx_before_stop_send = bus.with(|s| s.tx_log.len());
