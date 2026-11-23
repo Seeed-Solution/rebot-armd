@@ -134,6 +134,8 @@ enum ActionStart {
 /// Messages queued while a [`MacroCheck`] runs, at most; then the socket is not read until
 /// the check ends.
 const MACRO_CHECK_BACKLOG: usize = 64;
+const ORDINARY_OUT_CAPACITY: usize = 64;
+const URGENT_OUT_RESERVE: usize = 64;
 
 /// Handled while a [`MacroCheck`] runs; every other message waits for its reply, in order.
 /// None of these can start motion; lease changes are caught by the re-check after the check.
@@ -259,6 +261,13 @@ fn format_urgent_stop_outcome(
     }
 }
 
+async fn send_ordinary(tx: &mpsc::Sender<Message>, msg: Message) -> bool {
+    if tx.capacity() <= URGENT_OUT_RESERVE {
+        return !tx.is_closed();
+    }
+    !matches!(tx.try_send(msg), Err(tokio::sync::mpsc::error::TrySendError::Closed(_)))
+}
+
 async fn send_urgent(tx: &mpsc::Sender<Message>, msg: Message) -> bool {
     match tx.try_send(msg) {
         Ok(()) => true,
@@ -273,7 +282,6 @@ async fn cancel_macro_and_backlog(
     out_tx: &mpsc::Sender<Message>,
     code: &str,
     epoch: Option<u64>,
-    non_blocking: bool,
 ) -> bool {
     let mut cancelled = Vec::new();
     if let Some(check) = macro_check.take() {
@@ -287,12 +295,7 @@ async fn cancel_macro_and_backlog(
         _ => None,
     }));
     for reply in cancelled {
-        let msg = Message::Text(reply.to_string().into());
-        if non_blocking {
-            if matches!(out_tx.try_send(msg), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
-                return false;
-            }
-        } else if out_tx.send(msg).await.is_err() {
+        if !send_ordinary(out_tx, Message::Text(reply.to_string().into())).await {
             return false;
         }
     }
@@ -309,7 +312,6 @@ async fn deliver_urgent_stop(
     macro_check: &mut Option<MacroCheck>,
     backlog: &mut std::collections::VecDeque<Message>,
     out_tx: &mpsc::Sender<Message>,
-    urgent_out_tx: &mpsc::Sender<Message>,
     #[cfg(feature = "policy-runtime")] policy_stop_gen: Option<&AtomicU64>,
 ) -> bool {
     let (reply, accepted) = format_urgent_stop_outcome(raw_request_id, parsed_request_id, last_request, max_synced_estop, stop_res);
@@ -319,12 +321,12 @@ async fn deliver_urgent_stop(
             gen.fetch_add(1, Ordering::SeqCst);
         }
         if macro_check.is_some()
-            && !cancel_macro_and_backlog(macro_check, backlog, out_tx, "STOPPED", reply.get("epoch_id").and_then(Value::as_u64), true).await
+            && !cancel_macro_and_backlog(macro_check, backlog, out_tx, "STOPPED", reply.get("epoch_id").and_then(Value::as_u64)).await
         {
             return false;
         }
     }
-    send_urgent(urgent_out_tx, Message::Text(reply.to_string().into())).await
+    send_urgent(out_tx, Message::Text(reply.to_string().into())).await
 }
 
 // Under the write lock, after lease / epoch / request_id checks.
@@ -668,8 +670,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             return;
         }
     };
-    let (urgent_out_tx, mut urgent_out_rx) = tokio::sync::mpsc::channel::<Message>(64);
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
+    // Single FIFO outbound control channel preserving wire epoch order, with `URGENT_OUT_RESERVE`
+    // permits reserved strictly for emergency (`estop`/`e_stop`) and urgent Stop replies.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(ORDINARY_OUT_CAPACITY + URGENT_OUT_RESERVE);
     // This identity never comes from a client payload and is never disclosed.
     let connection = format!("connection:{}", NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed));
     let connection_generation = Arc::new(AtomicU64::new(0));
@@ -693,10 +696,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         loop {
             tokio::select! {
                 biased;
-                message = urgent_out_rx.recv() => match message {
-                    Some(message) => if sender.send(message).await.is_err() { break; },
-                    None => break,
-                },
                 message = out_rx.recv() => match message {
                     Some(message) => if sender.send(message).await.is_err() { break; },
                     None => break,
@@ -782,8 +781,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     reply["is_torqued"] = json!(s.obs.is_torqued);
                                 }
                             }
+                            if let Some((se, st)) = max_synced_estop.as_ref() {
+                                if reply.get("epoch_id").and_then(Value::as_u64).is_some_and(|e| e < *se) {
+                                    reply["epoch_id"] = json!(se);
+                                    reply["safety_state"] = json!(st);
+                                }
+                            }
                             test_ack_stamp_delay().await;
-                            if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                            if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                             continue;
                         }
                         stop_res = async {
@@ -794,7 +799,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if !deliver_urgent_stop(
                                 &pending.raw_request_id, pending.parsed_request_id, &mut last_request,
                                 max_synced_estop.as_ref(), stop_res,
-                                &mut macro_check, &mut backlog, &out_tx, &urgent_out_tx,
+                                &mut macro_check, &mut backlog, &out_tx,
                                 #[cfg(feature = "policy-runtime")] Some(&policy_stop_gen),
                             ).await { break; }
                             continue;
@@ -830,7 +835,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     }
                                 }
                             };
-                            if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                            if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                             continue;
                         }
                         // Emergency intake stays unconditionally live even when ordinary backlog is full.
@@ -853,7 +858,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 if backlog.len() < MACRO_CHECK_BACKLOG {
                     backlog.push_back(Message::Text(text));
                 } else if let Some(reply) = backlog_full_reject(kind, &value) {
-                    if matches!(out_tx.try_send(Message::Text(reply.to_string().into())), Err(tokio::sync::mpsc::error::TrySendError::Closed(_))) {
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await {
                         break;
                     }
                 }
@@ -867,7 +872,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let status = ws_auth.update_token(next_token);
                 let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
                     "role":status.role, "expires_in_s":status.expires_in_s});
-                if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                 continue;
             }
             // Urgent E-stop: routed through shared `trigger_e_stop_checked`; never synthesizes epoch-0 success.
@@ -886,9 +891,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         (r, recv_supervisor.hub().latest().map(|s| s.obs.epoch_id))
                     }
                 };
-                if !send_urgent(&urgent_out_tx, Message::Text(reply.to_string().into())).await { break; }
+                if !send_urgent(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                 if (macro_check.is_some() || !backlog.is_empty())
-                    && !cancel_macro_and_backlog(&mut macro_check, &mut backlog, &out_tx, "ESTOP_ACTIVE", cancel_epoch, true).await
+                    && !cancel_macro_and_backlog(&mut macro_check, &mut backlog, &out_tx, "ESTOP_ACTIVE", cancel_epoch).await
                 {
                     break;
                 }
@@ -924,7 +929,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if !deliver_urgent_stop(
                             &raw_request_id, parsed_request_id, &mut last_request,
                             max_synced_estop.as_ref(), stop_res,
-                            &mut macro_check, &mut backlog, &out_tx, &urgent_out_tx,
+                            &mut macro_check, &mut backlog, &out_tx,
                             #[cfg(feature = "policy-runtime")] None,
                         ).await { break; }
                         continue;
@@ -933,7 +938,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         if !deliver_urgent_stop(
                             &raw_request_id, parsed_request_id, &mut last_request,
                             max_synced_estop.as_ref(), Err(err),
-                            &mut macro_check, &mut backlog, &out_tx, &urgent_out_tx,
+                            &mut macro_check, &mut backlog, &out_tx,
                             #[cfg(feature = "policy-runtime")] None,
                         ).await { break; }
                         continue;
@@ -945,7 +950,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let owner_mode = recv_supervisor.owner_mode();
             if owner_mode != crate::supervisor::OWNER_LEGACY {
                 if let Some(reply) = executor_routing_reject(kind, &value, owner_mode) {
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                 }
                 continue;
             }
@@ -954,14 +959,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let request_id = value.get("request_id").and_then(Value::as_u64);
                 if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
                     let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                     continue;
                 }
                 last_request = request_id;
                 if let Some(e) = lease_free_operator_check(&ws_auth, crate::depth_measure::PATH, &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                     continue;
                 }
                 let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
@@ -976,14 +981,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let request_id = value.get("request_id").and_then(Value::as_u64);
                 if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
                     let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                     continue;
                 }
                 last_request = request_id;
                 if let Some(e) = lease_free_operator_check(&ws_auth, value["path"].as_str().unwrap_or(""), &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                     continue;
                 }
                 let caller = crate::teach::Caller {
@@ -1013,7 +1018,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 if inner.detached {
                     drop(inner);
                     if let Some(reply) = executor_routing_reject(kind, &value, recv_supervisor.owner_mode()) {
-                        if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                        if !send_ordinary(&out_tx, Message::Text(reply.to_string().into())).await { break; }
                     }
                     continue;
                 }
@@ -1696,7 +1701,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             // Do not silently lose control acknowledgements behind telemetry.
             if let Some(response) = response {
-                if out_tx.send(Message::Text(response.to_string().into())).await.is_err() { break; }
+                if !send_ordinary(&out_tx, Message::Text(response.to_string().into())).await { break; }
             }
         }
     });
