@@ -51,6 +51,77 @@ static TEST_WS_WRITE_TIMEOUT_CONNS: LazyLock<Mutex<HashMap<String, Duration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static TEST_WS_WRITE_UNPAUSE: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
 
+static TEST_WS_WORKER_BEFORE_LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TEST_WS_WORKER_BEFORE_LOCK_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TEST_WS_WORKER_BEFORE_LOCK_UNPAUSE: LazyLock<tokio::sync::Notify> =
+    LazyLock::new(tokio::sync::Notify::new);
+
+/// Test hook: pause or unpause the ordinary worker right after popping a frame and before
+/// acquiring `supervisor.inner().write()` for a specific connection ID.
+pub fn set_test_ws_worker_before_lock_paused(connection_id: &str, paused: bool) {
+    {
+        let mut map = TEST_WS_WORKER_BEFORE_LOCK_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        if paused {
+            map.entry(connection_id.to_owned()).or_insert(0);
+        } else {
+            map.remove(connection_id);
+        }
+        TEST_WS_WORKER_BEFORE_LOCK_ACTIVE.store(!map.is_empty(), Ordering::Release);
+    }
+    if !paused {
+        TEST_WS_WORKER_BEFORE_LOCK_UNPAUSE.notify_waiters();
+    }
+}
+
+/// Test hook: number of ordinary workers currently paused before acquiring `inner.write()` for `connection_id`.
+pub fn test_ws_worker_before_lock_blocked_count(connection_id: &str) -> usize {
+    TEST_WS_WORKER_BEFORE_LOCK_CONNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(connection_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+async fn maybe_pause_worker_before_lock(connection_id: &str) {
+    if !TEST_WS_WORKER_BEFORE_LOCK_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let is_paused = || {
+        TEST_WS_WORKER_BEFORE_LOCK_CONNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(connection_id)
+    };
+    if !is_paused() {
+        return;
+    }
+    struct WorkerBlockedGuard(String);
+    impl Drop for WorkerBlockedGuard {
+        fn drop(&mut self) {
+            let mut map = TEST_WS_WORKER_BEFORE_LOCK_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = map.get_mut(&self.0) {
+                *c = c.saturating_sub(1);
+            }
+        }
+    }
+    {
+        let mut map = TEST_WS_WORKER_BEFORE_LOCK_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get_mut(connection_id) {
+            *c += 1;
+        }
+    }
+    let _guard = WorkerBlockedGuard(connection_id.to_owned());
+    while is_paused() {
+        let notified = TEST_WS_WORKER_BEFORE_LOCK_UNPAUSE.notified();
+        if !is_paused() {
+            break;
+        }
+        notified.await;
+    }
+}
+
 fn refresh_write_hooks_active() {
     let paused = !TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
     let timed = !TEST_WS_WRITE_TIMEOUT_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
@@ -646,6 +717,7 @@ fn format_urgent_stop_outcome(
 async fn deliver_urgent_stop_batch(
     waiters: Vec<CoalescedStopWaiter>,
     stop_res: Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError>,
+    pre_drained: Option<Vec<Value>>,
     last_request: &Mutex<Option<u64>>,
     conn_stop_gen: &AtomicU64,
     cancel_tx: &tokio::sync::watch::Sender<Option<CancelSignal>>,
@@ -659,7 +731,11 @@ async fn deliver_urgent_stop_batch(
         Ok(UrgentStopOutcome::Applied { epoch, .. }) => Some(*epoch),
         _ => None,
     };
-    let cancelled = if let Some(epoch) = applied_epoch {
+    let cancelled = if let Some(drained) = pre_drained {
+        // Legacy path already advanced `conn_stop_gen`, signalled `cancel_tx`, and drained
+        // `ordinary_queue` atomically under `inner.write()`.
+        drained
+    } else if let Some(epoch) = applied_epoch {
         let next_gen = conn_stop_gen.fetch_add(1, Ordering::SeqCst) + 1;
         #[cfg(feature = "policy-runtime")]
         if let Some(gen) = policy_stop_gen {
@@ -1349,7 +1425,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
                                 let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
                                 deliver_urgent_stop_batch(
-                                    waiters, stop_res, &last_req_c, &stop_gen_c, &cancel_tx_c, &ord_q_c, &writer_c,
+                                    waiters, stop_res, None, &last_req_c, &stop_gen_c, &cancel_tx_c, &ord_q_c, &writer_c,
                                     #[cfg(feature = "policy-runtime")] Some(&policy_gen_c),
                                 ).await;
                             });
@@ -1365,13 +1441,23 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             #[cfg(feature = "policy-runtime")]
                             let policy_gen_c = reader_policy_stop_gen.clone();
                             tokio::spawn(async move {
-                                let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, || {
+                                let mut pre_drained: Option<Vec<Value>> = None;
+                                let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, |applied_epoch| {
+                                    // Advance connection stop generation, notify macro cancellation,
+                                    // and drain the ordinary queue atomically under `inner.write()`.
+                                    let next_gen = stop_gen_c.fetch_add(1, Ordering::SeqCst) + 1;
                                     #[cfg(feature = "policy-runtime")]
                                     policy_gen_c.fetch_add(1, Ordering::SeqCst);
+                                    let _ = cancel_tx_c.send(Some(CancelSignal {
+                                        gen: next_gen,
+                                        code: "STOPPED",
+                                        epoch: Some(applied_epoch),
+                                    }));
+                                    pre_drained = Some(ord_q_c.drain_cancellable("STOPPED", Some(applied_epoch)));
                                 }).await;
                                 let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
                                 deliver_urgent_stop_batch(
-                                    waiters, stop_res, &last_req_c, &stop_gen_c, &cancel_tx_c, &ord_q_c, &writer_c,
+                                    waiters, stop_res, pre_drained, &last_req_c, &stop_gen_c, &cancel_tx_c, &ord_q_c, &writer_c,
                                     #[cfg(feature = "policy-runtime")] None,
                                 ).await;
                             });
@@ -1604,6 +1690,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
+            maybe_pause_worker_before_lock(&recv_connection).await;
             {
                 let mut inner = recv_supervisor.inner().write().await;
                 if inner.detached {
@@ -1755,6 +1842,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             } else if kind == "heartbeat" {
                                 let _ = inner.heartbeat(&recv_connection, epoch);
                                 response = None;
+                            } else if !is_dry_run && recv_stop_gen.load(Ordering::SeqCst) != enqueued_stop_gen {
+                                response = cancelled_reply(&value, "STOPPED", Some(epoch));
                             } else if kind == "command" {
                                 let request_id = value.get("request_id").and_then(Value::as_u64);
                                 if request_id.is_none() || last_request_get(&recv_last_request).is_some_and(|last| request_id.unwrap() <= last) {

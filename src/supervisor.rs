@@ -4990,16 +4990,16 @@ impl ArmSupervisor {
         &self,
         stop: crate::rt_core::urgent::UrgentStop,
     ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
-        self.urgent_stop_with_legacy_hook(stop, || {}).await
+        self.urgent_stop_with_legacy_hook(stop, |_| {}).await
     }
 
-    /// Like [`Self::urgent_stop`], running `on_legacy_applied` strictly inside the legacy
-    /// `inner.write()` critical section alongside the stop mutation (so `policy_stop_gen`
-    /// advances atomically with respect to concurrent policy-load installation).
+    /// Like [`Self::urgent_stop`], running `on_legacy_applied(epoch)` strictly inside the legacy
+    /// `inner.write()` critical section alongside the stop mutation (so `conn_stop_gen`,
+    /// `policy_stop_gen`, and ordinary queue drain happen atomically before releasing the lock).
     pub(crate) async fn urgent_stop_with_legacy_hook(
         &self,
         stop: crate::rt_core::urgent::UrgentStop,
-        on_legacy_applied: impl FnOnce(),
+        on_legacy_applied: impl FnOnce(u64),
     ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
         use crate::rt_core::urgent::UrgentStopOutcome;
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::urgent_stop");
@@ -5031,11 +5031,12 @@ impl ArmSupervisor {
                     guard.exit_gravity_comp("STOPPED", "Stop command");
                     guard.stop_motion();
                     guard.request_macro_stop();
-                    on_legacy_applied();
+                    let applied_epoch = guard.safety.epoch_id();
+                    on_legacy_applied(applied_epoch);
                     return Ok(UrgentStopOutcome::Applied {
                         stop_generation: 0,
                         applied_to_motion: true,
-                        epoch: guard.safety.epoch_id(),
+                        epoch: applied_epoch,
                         safety_state: guard.safety.state_arc(),
                         is_torqued: guard.is_torqued,
                         control_mode_gravity_comp: guard.gravity_comp_active(),
@@ -5829,7 +5830,7 @@ mod observation_snapshot_tests {
             body_error: None,
         };
         // Refused stop (wrong epoch / wrong lease) must NOT advance policy_stop_gen.
-        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), || { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
+        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), |_| { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
         assert!(matches!(r_refused, crate::rt_core::urgent::UrgentStopOutcome::EpochMismatch { .. }));
         assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 0);
 
@@ -5839,7 +5840,7 @@ mod observation_snapshot_tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let (s1, p1, e1, r1) = (sup.clone(), policy_stop_gen.clone(), entered.clone(), release.clone());
         let stop_task = tokio::spawn(async move {
-            s1.urgent_stop_with_legacy_hook(mk(gen, ep), || {
+            s1.urgent_stop_with_legacy_hook(mk(gen, ep), |_| {
                 p1.fetch_add(1, Ordering::SeqCst);
                 e1.notify_one();
                 // Yield briefly while still holding `inner.write()` so the installer task queues on the lock.

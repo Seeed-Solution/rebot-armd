@@ -1070,3 +1070,46 @@ async fn ordinary_outbound_queue_saturation_closes_connection_with_error_and_dro
     wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn_id)).await;
     assert!(sup.inner().read().await.active_lease.is_none(), "closed connection's lease must be released");
 }
+
+struct WorkerLockHookGuard(String);
+impl Drop for WorkerLockHookGuard {
+    fn drop(&mut self) {
+        armd::api::ws::set_test_ws_worker_before_lock_paused(&self.0, false);
+    }
+}
+
+// 11. Round 3 Item 1 (Blocker): popped ordinary motion command held right before owner lock is
+//     refused as STOPPED after a Stop applies under the lock, and zero motion starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn popped_motion_command_held_at_lock_is_refused_after_legacy_stop() {
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _worker_guard = WorkerLockHookGuard(conn_id.clone());
+    assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep = sup.get_observation().await.epoch_id;
+
+    // Hold the ordinary worker right after it pops the jog frame and before `inner.write()`.
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+    send(&mut ws, json!({"type": "command", "request_id": 10, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {"target_positions": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 1.0}})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1).await;
+
+    // Apply a Stop while the popped jog is held at the lock boundary.
+    send(&mut ws, json!({"type": "command", "request_id": 11, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+    let stop_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((stop_ack["type"].as_str(), stop_ack["request_id"].as_u64()), (Some("command_ack"), Some(11)), "{stop_ack}");
+
+    // Release the held jog -> acquires `inner.write()`, sees stale admission stop generation, refuses STOPPED.
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+    let jog_rej = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((jog_rej["type"].as_str(), jog_rej["request_id"].as_u64(), jog_rej["status"].as_u64(), jog_rej["code"].as_str()),
+        (Some("command_reject"), Some(10), Some(409), Some("STOPPED")), "{jog_rej}");
+    assert!(sup.inner().read().await.active_trajectory.is_none(), "popped jog must NOT start motion after Stop applied");
+
+    // Subsequent motion command admitted AFTER Stop succeeds cleanly.
+    send(&mut ws, json!({"type": "command", "request_id": 12, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/jog", "body": {"target_positions": [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 0.5}})).await;
+    let ok_jog = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((ok_jog["type"].as_str(), ok_jog["request_id"].as_u64()), (Some("command_ack"), Some(12)), "{ok_jog}");
+    assert!(sup.inner().read().await.active_trajectory.is_some());
+}
