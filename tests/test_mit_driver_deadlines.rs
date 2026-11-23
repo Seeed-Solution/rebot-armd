@@ -18,6 +18,7 @@ use mit_support::FakeBus;
 const J4: usize = 3;
 const FENCE: Duration = Duration::from_millis(45);
 const RELEASE: Duration = Duration::from_millis(20);
+const RX_PASS: Duration = Duration::from_millis(5);
 
 fn ms(n: u64) -> Duration { Duration::from_millis(n) }
 
@@ -115,7 +116,7 @@ fn partial_disable_confirmation_is_unconfirmed_not_success() {
         // serve exactly at the requested wake (or 0.5 ms later when it is now)
         let now = clock.now();
         clock.advance(if wake > now { wake - now } else { Duration::from_micros(500) });
-        p = d.poll_torque().unwrap();
+        p = d.poll_torque(clock.now() + RX_PASS).unwrap();
         served += 1;
         assert!(served < 1000);
     }
@@ -140,13 +141,13 @@ fn success_is_withheld_until_confirmation() {
     assert!(d.write_joint_targets(&hold).is_err(), "a target before the confirmation");
     assert!(bus.tx_log().is_empty());
     assert!(d.begin_torque(true).is_err(), "a second enable while one is pending");
-    assert!(matches!(d.poll_torque().unwrap(), TorqueProgress::Pending { .. }));
+    assert!(matches!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Pending { .. }));
     assert!(!d.is_enabled());
     clock.advance(ms(10));
-    assert_eq!(d.poll_torque().unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert_eq!(d.poll_torque(clock.now() + RX_PASS).unwrap(), TorqueProgress::Done(TorqueOutcome::Confirmed));
     assert!(d.is_enabled());
     d.write_joint_targets(&hold).expect("targets after the confirmation");
-    assert!(d.poll_torque().is_err(), "nothing pending");
+    assert!(d.poll_torque(clock.now() + RX_PASS).is_err(), "nothing pending");
 }
 
 #[test]
@@ -154,14 +155,14 @@ fn disable_replaces_a_pending_enable() {
     let (mut d, bus, clock) = rig();
     bus.with(|s| s.motors[J4].silent = true);
     d.begin_torque(true).unwrap();
-    let _ = d.poll_torque().unwrap();
+    let _ = d.poll_torque(clock.now() + RX_PASS).unwrap();
     bus.with(|s| s.motors[J4].silent = false);
     bus.clear_log();
     let t0 = clock.now();
     let mut p = d.begin_torque(false).unwrap();
     while let TorqueProgress::Pending { .. } = p {
         clock.advance(Duration::from_micros(500));
-        p = d.poll_torque().unwrap();
+        p = d.poll_torque(clock.now() + RX_PASS).unwrap();
     }
     assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
     let f = torque_frames(&bus, t0);
@@ -192,7 +193,7 @@ fn release_cadence_delays_retries_and_expiry() {
             let wake = if wake > now { wake } else { now + Duration::from_micros(500) };
             let at = if serve_at_wake { wake.min(next_release) } else { next_release };
             clock.advance(at - now);
-            match d.poll_torque() { Ok(np) => p = np, Err(e) => break Err(e) }
+            match d.poll_torque(clock.now() + RX_PASS) { Ok(np) => p = np, Err(e) => break Err(e) }
         };
         let end = clock.now().saturating_duration_since(t0);
         let retries: Vec<Duration> = torque_frames(&bus, t0).iter().skip(7).map(|f| f.2).collect();
@@ -305,4 +306,29 @@ fn disable_is_not_inhibited_by_a_pending_estop() {
     d.set_torque(false).expect("disable");
     assert_eq!(ids(&torque_frames(&bus, t0)), vec![1, 2, 3, 4, 5, 6, 7]);
     assert!(!d.is_enabled());
+}
+
+/// The service deadline caps the receive pass: past it nothing is read, so nothing confirms; the
+/// next service within its budget does. With the MIT fence off the cut pass trips nothing.
+#[test]
+fn service_deadline_caps_the_receive_pass() {
+    let (mut d, bus, clock) = rig();
+    bus.with(|s| s.rx_step = Duration::from_micros(100));
+    let p = d.begin_torque(true).unwrap();
+    assert!(matches!(p, TorqueProgress::Pending { .. }));
+    // replies are queued; a service whose deadline already passed reads none of them
+    let _ = d.poll_torque(clock.now()).unwrap(); // moves pending replies into the queue
+    let before = clock.now();
+    assert!(matches!(d.poll_torque(before).unwrap(), TorqueProgress::Pending { .. }), "confirmed without a receive pass");
+    assert_eq!(clock.now(), before, "frames read past the service deadline");
+    assert!(!d.is_enabled());
+    // within budget: the replies confirm the enable
+    let mut p = d.poll_torque(clock.now() + RX_PASS).unwrap();
+    for _ in 0..4 {
+        if p == TorqueProgress::Done(TorqueOutcome::Confirmed) { break; }
+        clock.advance(Duration::from_micros(500));
+        p = d.poll_torque(clock.now() + RX_PASS).unwrap();
+    }
+    assert_eq!(p, TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert!(d.is_enabled());
 }

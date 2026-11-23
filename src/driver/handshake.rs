@@ -116,6 +116,26 @@ pub enum TorqueProgress {
     Done(TorqueOutcome),
 }
 
+/// Translate one service of a driver transition to the RT contract (`HardwarePoll::torque`):
+/// `Pending` keeps its wake, a confirmed transition is `Done`, and everything else is a
+/// terminal code from `rt_core::ops::TERMINAL_CODES`. An unconfirmed disable is never success:
+/// `FEEDBACK_UNCONFIRMED` (the caller keeps checking the enable state).
+pub fn rt_progress(enabled: bool, r: Result<TorqueProgress, super::ArmDriverError>)
+    -> Result<crate::rt_core::ops::TorqueProgress, &'static str> {
+    use crate::rt_core::ops::TorqueProgress as Rt;
+    use super::ArmDriverError as E;
+    match r {
+        Ok(TorqueProgress::Pending { wake }) => Ok(Rt::Pending { wake }),
+        Ok(TorqueProgress::Done(TorqueOutcome::Confirmed)) => Ok(Rt::Done),
+        Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed)) => Err("FEEDBACK_UNCONFIRMED"),
+        Err(e) if super::is_estop_inhibited(&e) => Err("ESTOP_ACTIVE"),
+        Err(E::Transport(_)) => Err("DRIVER_WRITE_FAILED"),
+        Err(_) if enabled => Err("ENABLE_FAILED"),
+        Err(E::HardwareFault(_)) => Err("FEEDBACK_UNCONFIRMED"),
+        Err(_) => Err("HARDWARE_FAULT"),
+    }
+}
+
 /// Bound of one service of a torque transition: the driver's receive pass (Damiao: 64 frames or
 /// 5 ms), then at most one frame per joint and one flush.
 pub const SERVICE_TX_FRAMES_PER_JOINT: usize = 1;
@@ -161,6 +181,26 @@ mod tests {
         let mut d = ConfirmWindow::new(TorqueDirection::Disable, 2, t0, t0, ms(150), &RETRY);
         assert!(matches!(d.service(t0, 0b01, true, Some(1)), Service::Wait { .. }));
         assert_eq!(d.service(t0, 0b11, true, None), Service::Confirmed);
+    }
+
+    #[test]
+    fn rt_progress_never_reports_an_unconfirmed_transition_as_done() {
+        use crate::rt_core::ops::{TorqueProgress as Rt, TERMINAL_CODES};
+        use super::super::{ArmDriverError as E, ESTOP_INHIBITED};
+        use crate::transport::TransportError;
+        let t = Instant::now();
+        assert_eq!(rt_progress(true, Ok(TorqueProgress::Pending { wake: t })), Ok(Rt::Pending { wake: t }));
+        assert_eq!(rt_progress(false, Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))), Ok(Rt::Done));
+        let codes = [
+            rt_progress(false, Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed))),
+            rt_progress(true, Err(E::HardwareFault("x".into()))),
+            rt_progress(false, Err(E::HardwareFault("x".into()))),
+            rt_progress(false, Err(E::Protocol(ESTOP_INHIBITED.into()))),
+            rt_progress(false, Err(E::Transport(TransportError::WouldBlock))),
+            rt_progress(false, Err(E::Timeout(1))),
+        ];
+        assert_eq!(codes.map(|c| c.unwrap_err()), ["FEEDBACK_UNCONFIRMED", "ENABLE_FAILED", "FEEDBACK_UNCONFIRMED", "ESTOP_ACTIVE", "DRIVER_WRITE_FAILED", "HARDWARE_FAULT"]);
+        for c in codes { assert!(TERMINAL_CODES.contains(&c.unwrap_err()), "{c:?} not a terminal code"); }
     }
 
     #[test]

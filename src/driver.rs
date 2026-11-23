@@ -108,6 +108,8 @@ pub const DAMIAO_ENABLE_CONFIRM: Duration = Duration::from_millis(150);
 const DAMIAO_ENABLE_RETRY_AT: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(75)];
 /// Damiao disable handshake: how long to wait for every motor to report state 0.
 pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
+/// Time bound of one Damiao receive pass (with at most 64 frames).
+pub const DAMIAO_RX_PASS: Duration = Duration::from_millis(5);
 
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
@@ -212,9 +214,10 @@ pub trait ArmDriver: Send {
         self.set_torque(enabled).map(|()| TorqueProgress::Done(TorqueOutcome::Confirmed))
     }
 
-    /// Serve the pending torque transition once: one bounded receive pass, at most one retransmit
-    /// per joint, no sleep. Err when the transition failed (or none is pending).
-    fn poll_torque(&mut self) -> Result<TorqueProgress, ArmDriverError> {
+    /// Serve the pending torque transition once: one receive pass ending by `deadline` (and the
+    /// driver's own frame / time bound), at most one retransmit per joint, no sleep. Err when the
+    /// transition failed (or none is pending).
+    fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         Err(ArmDriverError::Protocol("no torque transition pending".into()))
     }
 
@@ -2329,6 +2332,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_tracking_used: bool,
     /// Pending torque transition (`begin_torque` / `poll_torque`); None = idle.
     torque_hs: Option<DamiaoTorque>,
+    /// Service deadline capping the receive pass of the current `poll_torque` (None: 5 ms only).
+    rx_deadline: Option<Instant>,
 }
 
 /// Phase of a pending Damiao torque transition.
@@ -2409,6 +2414,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_acked: false,
             mit_tracking_used: false,
             torque_hs: None,
+            rx_deadline: None,
         }
     }
 
@@ -3700,7 +3706,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if let TorqueProgress::Done(_) = progress { return Ok(()); }
             if !first { self.pause(Duration::from_micros(500)); }
             first = false;
-            progress = self.poll_torque()?;
+            let deadline = self.now() + DAMIAO_RX_PASS;
+            progress = self.poll_torque(deadline)?;
         }
     }
 
@@ -3708,13 +3715,16 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if enabled { self.begin_enable() } else { self.begin_disable() }
     }
 
-    fn poll_torque(&mut self) -> Result<TorqueProgress, ArmDriverError> {
-        match self.torque_hs.take() {
+    fn poll_torque(&mut self, deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        self.rx_deadline = Some(deadline);
+        let r = match self.torque_hs.take() {
             None => Err(ArmDriverError::Protocol("no torque transition pending".into())),
             Some(DamiaoTorque::Restore(w)) => self.poll_restore(w),
             Some(DamiaoTorque::Enable(window)) => self.poll_enable(window),
             Some(DamiaoTorque::Disable { window, mit_fenced }) => self.poll_disable(window, mit_fenced),
-        }
+        };
+        self.rx_deadline = None;
+        r
     }
 
     fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
@@ -3852,13 +3862,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 impl<C: CanTransport> DamiaoArmDriver<C> {
     /// The bounded receive of `read_joint_states` (at most 64 frames or 5 ms) with its
     /// recovery holds and stale-motor refresh; updates `cached_states`.
+    /// The receive pass started at `t0` is over: 5 ms, or the caller's service deadline
+    /// (`poll_torque`), whichever comes first.
+    fn rx_over(&self, t0: Instant) -> bool {
+        let now = self.now();
+        now.saturating_duration_since(t0) >= DAMIAO_RX_PASS || self.rx_deadline.is_some_and(|d| now >= d)
+    }
+
     fn receive_feedback(&mut self) -> Result<(), ArmDriverError> {
-        const MAX_RX_DURATION: Duration = Duration::from_millis(5);
         let t0 = self.now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
         self.last_read_drained = false;
-        while frames_processed < 64 && self.since(t0) < MAX_RX_DURATION {
+        while frames_processed < 64 && !self.rx_over(t0) {
             // Taken before the receive: an empty result means the queue was empty after it.
             let attempt = self.now();
             match self.can.receive() {
@@ -3866,7 +3882,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     frames_processed += 1;
                     self.rx_seq += 1;
                     if self.awaiting_rx_boundary {
-                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
+                        if frames_processed >= 64 || self.rx_over(t0) { break; }
                         continue;
                     }
                     // Ignore transmit commands: on SocketCAN with local echo enabled,
@@ -3882,14 +3898,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         || frame.data == damiao::CMD_CLEAR_FAULTS
                         || frame.data == damiao::CMD_SET_ZERO
                     {
-                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
+                        if frames_processed >= 64 || self.rx_over(t0) {
                             break;
                         }
                         continue;
                     }
                     // Local echo of an MIT command (same ID as some feedback paths).
                     if self.last_target_frames.iter().flatten().any(|f| f.id == frame.id && f.data == frame.data) {
-                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
+                        if frames_processed >= 64 || self.rx_over(t0) { break; }
                         continue;
                     }
                     if let Some(reply) = damiao::parse_register_reply(&frame)
@@ -3898,7 +3914,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         // A register reply is not feedback: byte 0 would decode as state 0.
                         if self.register_replies.len() < 64 { self.register_replies.push(reply); }
                         if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, self.now(), self.rx_seq, self.rx_empty_seq)); }
-                        if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION { break; }
+                        if frames_processed >= 64 || self.rx_over(t0) { break; }
                         continue;
                     }
                     if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
@@ -3911,7 +3927,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                                 .iter()
                                 .any(|&m| frame.id == m as u32 || frame.id == (0x10 + m as u32));
                         if !is_valid_feedback_id {
-                            if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
+                            if frames_processed >= 64 || self.rx_over(t0) {
                                 break;
                             }
                             continue;
@@ -3934,7 +3950,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
-                    if frames_processed >= 64 || self.since(t0) >= MAX_RX_DURATION {
+                    if frames_processed >= 64 || self.rx_over(t0) {
                         break;
                     }
                 }

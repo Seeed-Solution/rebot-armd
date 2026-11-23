@@ -371,7 +371,7 @@ impl ArmDriver for SimArmDriver {
                 TorqueProgress::Done(_) => return Ok(()),
                 TorqueProgress::Pending { .. } => {}
             }
-            progress = self.poll_torque()?;
+            progress = self.poll_torque(Instant::now())?;
             if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
         }
     }
@@ -391,7 +391,8 @@ impl ArmDriver for SimArmDriver {
         Ok(TorqueProgress::Pending { wake: now })
     }
 
-    fn poll_torque(&mut self) -> Result<TorqueProgress, ArmDriverError> {
+    /// No receive pass (the receiver thread fills the cache): `_deadline` bounds nothing.
+    fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
         let Some((enabled, deadline)) = self.torque_hs else {
             return Err(ArmDriverError::Protocol("no torque transition pending".into()));
         };
