@@ -316,6 +316,7 @@ fn queue_full_would_block_and_enobufs_defer_and_count_without_sleeping() {
 
     // Tick 2 (20 ms later): J4 hits WouldBlock, stops immediately with no sleep, does not double-count deferred.
     clock.advance(ms(20));
+    d.begin_tx_tick();
     let t1 = clock.now();
     let out2 = d.drain_pending_tx().unwrap();
     assert_eq!(out2, TxBatchOutcome::Deferred { pending: 4 });
@@ -325,6 +326,7 @@ fn queue_full_would_block_and_enobufs_defer_and_count_without_sleeping() {
 
     // Tick 3 (10 ms later, total age 30 ms < 45 ms): queue clears, J4..J7 delivered.
     clock.advance(ms(10));
+    d.begin_tx_tick();
     let out3 = d.drain_pending_tx().unwrap();
     assert_eq!(out3, TxBatchOutcome::Complete);
     let m3 = take_tx_metrics();
@@ -335,6 +337,7 @@ fn queue_full_would_block_and_enobufs_defer_and_count_without_sleeping() {
     );
 
     // Hard transport error still returns Err (never treated as backpressure) and clears pending queue.
+    d.begin_tx_tick();
     bus.with(|s| {
         s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
         s.tx_script.push_back((TxRule::HardError, Duration::ZERO));
@@ -373,6 +376,7 @@ fn mid_batch_stop_and_estop_drop_pending_motion_frames() {
         }));
     });
     clock.advance(ms(10));
+    d.begin_tx_tick();
     let err = d.drain_pending_tx().unwrap_err();
     assert!(is_estop_inhibited(&err), "{err:?}");
     assert_eq!(d.pending_tx_len(), 0, "stop must drop remaining pending motion frames");
@@ -383,6 +387,7 @@ fn mid_batch_stop_and_estop_drop_pending_motion_frames() {
     stops.mark_applied(stops.current());
     bus.with(|s| s.on_tx = None);
     bus.clear();
+    d.begin_tx_tick();
     assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
     assert!(bus.with(|s| s.tx_log.is_empty()));
 
@@ -421,6 +426,7 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     bus.clear();
     reset_tx_metrics();
     clock.advance(ms(45) - Duration::from_nanos(1));
+    d.begin_tx_tick();
     assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.pending), (3, 0, 0));
@@ -436,6 +442,7 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     bus.clear();
     reset_tx_metrics();
     clock.advance(ms(45));
+    d.begin_tx_tick();
     assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.dropped_stopped, m.pending), (0, 3, 0, 0));
@@ -472,6 +479,7 @@ fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_coun
     // Tick 2 (20 ms later): opposite command -0.5 rad.
     // J5..J7 stay at the front of the FIFO (no starvation), updated IN PLACE to -0.5 rad (never replaying +0.5!).
     clock.advance(ms(20));
+    d.begin_tx_tick();
     assert_eq!(
         d.write_joint_targets_bounded(&targets_const(-0.5)).unwrap(),
         TxBatchOutcome::Deferred { pending: 3 }
@@ -503,12 +511,14 @@ fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_coun
 
     // Same untouched pending frames on tick 2 (drain_pending_tx): deferred == 0, pending == 7.
     clock.advance(ms(10));
+    d.begin_tx_tick();
     assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Deferred { pending: 7 });
     let r2 = take_tx_metrics();
     assert_eq!((r2.deferred, r2.pending), (0, 7));
 
     // New opposite targets replace the 7 slots: each new command instance is deferred once -> deferred == 7, pending == 7.
     clock.advance(ms(10));
+    d.begin_tx_tick();
     assert_eq!(
         d.write_joint_targets_bounded(&targets_const(-0.25)).unwrap(),
         TxBatchOutcome::Deferred { pending: 7 }
@@ -521,6 +531,7 @@ fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_coun
     let app = Arc::new(AtomicU64::new(0));
     d.set_estop_gate(EstopGate::new(req, app));
     clock.advance(ms(10)); // 10 ms < 45 ms
+    d.begin_tx_tick();
     assert!(is_estop_inhibited(&d.drain_pending_tx().unwrap_err()));
     let r4 = take_tx_metrics();
     assert_eq!((r4.dropped_stale, r4.dropped_stopped, r4.pending), (0, 7, 0));
@@ -540,6 +551,7 @@ fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_coun
     // Next tick (10 ms later, fresh): remaining 4 frames complete when deadline allows.
     bus.with(|s| s.default_step = us(100));
     clock.advance(ms(10));
+    d.begin_tx_tick();
     assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
     assert_eq!(bus.with(|s| s.tx_accepted.len()), 7);
 }
@@ -665,6 +677,7 @@ fn flush_backpressure_and_failure_are_fail_closed_without_replay() {
         assert!(res.is_err(), "flush {flush_rule:?} must fail closed, got {res:?}");
         assert_eq!(d.pending_tx_len(), 0, "submitted frames must not be re-queued after flush failure");
         bus.clear();
+        d.begin_tx_tick();
         assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
         assert!(bus.with(|s| s.tx_log.is_empty()), "no replay of already-submitted frames");
     }
@@ -873,4 +886,282 @@ fn wrapper_default_bounded_write_fails_closed_and_flush_estop_drops_pending() {
     assert_eq!(d.pending_tx_len(), 0);
     let m_cf = take_tx_metrics();
     assert_eq!((m_cf.dropped_stopped, m_cf.pending), (3, 0));
+}
+
+#[test]
+fn same_tick_budget_persists_across_multiple_calls_and_enobufs_retry() {
+    // Part A: within a single receive tick, write_joint_targets_bounded + drain_pending_tx +
+    // another write share the exact same max_frames and backpressure closure.
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    bus.clear();
+    reset_tx_metrics();
+
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    assert_eq!(bus.with(|s| s.tx_log.len()), 4);
+
+    // Same tick (no read_joint_states / begin_tx_tick): drain_pending_tx and a second write must
+    // make ZERO additional transmit attempts because max_frames (4) is already exhausted.
+    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Deferred { pending: 3 });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(-0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 7 }
+    );
+    assert_eq!(bus.with(|s| s.tx_log.len()), 4, "no extra attempts in the same tick");
+
+    // Part B: immediate retry after ENOBUFS in the same tick stays closed (0 extra attempts),
+    // even when max_frames and max_duration still have spare headroom.
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.with(|s| {
+        s.push_all_feedback();
+        s.tx_script.push_back((TxRule::Ok, us(10)));
+        s.tx_script.push_back((TxRule::Enobufs, us(10)));
+    });
+    d.read_joint_states().unwrap();
+    bus.clear();
+    reset_tx_metrics();
+
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 6 }
+    );
+    assert_eq!(bus.with(|s| s.tx_log.len()), 2);
+
+    // Immediate drain in the same tick must NOT probe the bus again.
+    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Deferred { pending: 6 });
+    assert_eq!(bus.with(|s| s.tx_log.len()), 2, "ENOBUFS closure must persist within the tick");
+
+    // Next receive tick opens a fresh pass and delivers the remaining 6 frames.
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
+    assert_eq!(bus.with(|s| s.tx_accepted.len()), 7);
+}
+
+#[test]
+fn stop_during_final_send_or_flush_fails_closed_for_unfenced_and_fenced_mit() {
+    // Part A: unfenced batch fully transmitted, stop raised during flush() -> Err(EstopInhibited), never Complete.
+    let (mut d, bus, _) = enabled_driver();
+    let stops = StopRequests::new();
+    d.set_estop_gate(
+        EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_stops(stops.clone()),
+    );
+    let stops_hook = stops.clone();
+    bus.with(|s| {
+        s.on_flush = Some(Arc::new(move || {
+            let _ = stops_hook.request();
+        }));
+    });
+    let err = d.write_joint_targets_bounded(&targets_const(0.25)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "stop during final flush must not return Complete: {err:?}");
+    assert_eq!(bus.with(|s| s.tx_accepted.len()), 7);
+    assert_eq!(d.pending_tx_len(), 0);
+
+    // Part B: fenced MIT batch fully transmitted, stop raised during final transmit -> trips fence,
+    // invalidates cached frames, and returns Err(EstopInhibited), never Complete.
+    let (mut d, bus, clock) = enabled_driver();
+    let hold = targets_const(0.0);
+    let modes = [
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Mit,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+    ];
+    d.set_joint_modes(&modes, &hold).unwrap();
+    d.set_mit_deadline_fence(Some(ms(45)), ms(300));
+    let stops = StopRequests::new();
+    d.set_estop_gate(
+        EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_stops(stops.clone()),
+    );
+    bus.clear();
+    let stops_hook = stops.clone();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move |idx, _| {
+            if idx == 6 {
+                let _ = stops_hook.request();
+            }
+        }));
+    });
+    let err = d.write_joint_targets_bounded(&targets_const(0.1)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "fenced stop during final frame must fail closed: {err:?}");
+    assert!(
+        d.mit_fence_trip().is_some_and(|r| r.contains("E-stop")),
+        "fenced MIT stop during final frame must trip fence: {:?}",
+        d.mit_fence_trip()
+    );
+    // Cached output invalidated: later ticks send nothing even after stop applied.
+    stops.mark_applied(stops.current());
+    bus.with(|s| s.on_tx = None);
+    bus.clear();
+    clock.advance(ms(50));
+    let _ = d.read_joint_states();
+    assert!(d.write_joint_targets_bounded(&targets_const(0.1)).is_err());
+    assert!(bus.with(|s| s.tx_log.is_empty()));
+}
+
+#[test]
+fn receive_recovery_obeys_stop_gate_and_refresh_flush_failure_propagates() {
+    // Part A: receive-side recovery with cached MIT output obeys stop raised during first recovery send.
+    let (mut d, bus, clock) = enabled_driver();
+    let hold = targets_const(0.0);
+    let modes = [
+        JointMode::Mit,
+        JointMode::Mit,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+    ];
+    d.set_joint_modes(&modes, &hold).unwrap();
+    // Stage a pending frame on a partial write so we can also confirm recovery stop drops pending motion.
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.15)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    let stops = StopRequests::new();
+    d.set_estop_gate(
+        EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_stops(stops.clone()),
+    );
+    // Advance 50 ms (>= 45 ms recovery threshold, < 100 ms refresh threshold) with all feedback stale.
+    clock.advance(ms(50));
+    bus.clear();
+    let stops_hook = stops.clone();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move |idx, _| {
+            if idx == 0 {
+                let _ = stops_hook.request();
+            }
+        }));
+    });
+    d.read_joint_states().unwrap();
+    assert_eq!(
+        bus.with(|s| s.tx_log.len()),
+        1,
+        "stop raised during first MIT recovery send must inhibit remaining recovery frames"
+    );
+    assert_eq!(d.pending_tx_len(), 0, "stop during recovery must clear pending motion queue");
+
+    // Already-pending stop inhibits ALL recovery frames (0 sent).
+    bus.with(|s| s.on_tx = None);
+    bus.clear();
+    clock.advance(ms(50));
+    d.read_joint_states().unwrap();
+    assert!(
+        bus.with(|s| s.tx_log.iter().all(|f| f.id == 0x7FF)),
+        "already-pending stop must inhibit every recovery command: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Part B: 0xCC refresh flush failure propagates Err, closes the shared pass, and drops pending motion.
+    for flush_rule in [TxRule::WouldBlock, TxRule::Enobufs, TxRule::HardError] {
+        let (mut d, bus, clock) = enabled_driver();
+        d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+        assert_eq!(
+            d.write_joint_targets_bounded(&targets_const(0.1)).unwrap(),
+            TxBatchOutcome::Deferred { pending: 3 }
+        );
+        d.set_torque(false).unwrap(); // disabled -> stale >= 100 ms sends 0xCC refreshes only
+        // Re-queue pending motion frames isn't needed while disabled, verify pass closure + Err propagation.
+        clock.advance(ms(120));
+        bus.clear();
+        bus.with(|s| s.flush_error = Some(flush_rule));
+        let err = d.read_joint_states().unwrap_err();
+        match flush_rule {
+            TxRule::WouldBlock => assert!(matches!(err, ArmDriverError::Transport(TransportError::WouldBlock)), "{err:?}"),
+            TxRule::Enobufs => assert!(matches!(err, ArmDriverError::Transport(TransportError::NoBufferSpace)), "{err:?}"),
+            TxRule::HardError => assert!(matches!(err, ArmDriverError::Transport(TransportError::Can(_))), "{err:?}"),
+            TxRule::Ok => unreachable!(),
+        }
+        // Pass must be closed in the same tick: a subsequent target write makes 0 new TX attempts.
+        let attempts_after_rx = bus.with(|s| s.tx_log.len());
+        let out = d.write_joint_targets_bounded(&targets_const(0.2)).unwrap();
+        assert_eq!(out, TxBatchOutcome::Deferred { pending: 7 });
+        assert_eq!(
+            bus.with(|s| s.tx_log.len()),
+            attempts_after_rx,
+            "refresh flush failure must close the tick pass against subsequent target writes"
+        );
+    }
+}
+
+#[test]
+fn preflight_rejection_trips_mit_fence_and_clears_pending_queue() {
+    // Part A: with MIT fence armed, wrong joint count trips fence & clears cached output while
+    // preserving JointCountMismatch.
+    let (mut d, bus, _) = enabled_driver();
+    let hold = targets_const(0.0);
+    let modes = [
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Mit,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+    ];
+    d.set_joint_modes(&modes, &hold).unwrap();
+    d.set_mit_deadline_fence(Some(ms(45)), ms(300));
+    bus.clear();
+    let err = d.write_joint_targets_bounded(&targets_const(0.1)[..3]).unwrap_err();
+    assert!(matches!(err, ArmDriverError::JointCountMismatch { expected: 7, actual: 3 }), "{err:?}");
+    assert!(d.mit_fence_trip().is_some(), "preflight rejection under MIT fence must trip the group");
+    assert!(bus.with(|s| s.tx_log.is_empty()));
+
+    // Part B: deferred bounded batch followed by legacy write_joint_targets with wrong count
+    // discards the previously queued pending frames while returning JointCountMismatch.
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.2)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    assert_eq!(d.pending_tx_len(), 3);
+    d.begin_tx_tick();
+    reset_tx_metrics();
+    let err = d.write_joint_targets(&targets_const(0.2)[..2]).unwrap_err();
+    assert!(matches!(err, ArmDriverError::JointCountMismatch { expected: 7, actual: 2 }), "{err:?}");
+    assert_eq!(d.pending_tx_len(), 0, "preflight rejection must invalidate carried pending frames");
+    let m = take_tx_metrics();
+    assert_eq!((m.dropped_stopped, m.pending), (3, 0));
+    bus.clear();
+    d.begin_tx_tick();
+    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
+    assert!(bus.with(|s| s.tx_log.is_empty()));
+}
+
+#[test]
+fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
+    // Frame 0 succeeds, frame 1 hits WouldBlock, then successful flush() advances clock to 45 ms:
+    // remaining 6 current-batch frames expire during flush -> dropped as stale, queue empty,
+    // and write_joint_targets_bounded fails closed with Timeout (never returning Deferred).
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    let clock_hook = clock.clone();
+    bus.with(|s| {
+        s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
+        s.tx_script.push_back((TxRule::WouldBlock, Duration::ZERO));
+        s.on_flush = Some(Arc::new(move || {
+            clock_hook.advance(ms(45));
+        }));
+    });
+    reset_tx_metrics();
+    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    assert_eq!(d.pending_tx_len(), 0, "expired frames must not remain queued after flush");
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.would_block, m.dropped_stale, m.pending), (1, 1, 6, 0));
 }

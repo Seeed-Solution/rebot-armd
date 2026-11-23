@@ -203,10 +203,12 @@ fn test_damiao_write_targets_defers_on_would_block_without_sleeping() {
     );
     assert_eq!(driver.can_mut().tx_frames.len(), 0);
     assert_eq!(driver.pending_tx_len(), 1);
+    driver.begin_tx_tick();
     assert_eq!(
         driver.drain_pending_tx().unwrap(),
         TxBatchOutcome::Deferred { pending: 1 }
     );
+    driver.begin_tx_tick();
     assert_eq!(
         driver.drain_pending_tx().unwrap(),
         TxBatchOutcome::Complete

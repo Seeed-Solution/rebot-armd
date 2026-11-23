@@ -11,9 +11,11 @@ use armd::diagnostics::tick::{
     reset_tx_metrics, thread_usage, TickSample, TickStats, TxAttemptKind, UsageMark,
 };
 use armd::driver::{
-    ArmDriver, ArmDriverError, DamiaoArmDriver, JointTarget, TxBatchOutcome, TxBudget,
+    is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, JointMode, JointTarget,
+    TxBatchOutcome, TxBudget,
 };
 use armd::protocol::damiao::{self, DamiaoLimits};
+use armd::rt_core::urgent::{EstopGate, StopRequests};
 use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
 use armd::{ArmConfig, SupervisorInner};
 
@@ -64,26 +66,38 @@ enum Mode {
 
 /// Pre-allocated Damiao CAN bus fake (zero allocations during `transmit` and `receive`).
 struct NoAllocDamiaoBus {
-    motors: Vec<(u16, DamiaoLimits, f32, bool)>,
+    motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>,
     rx: VecDeque<CanFrame>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
     tx_count: usize,
+    tx_step: Duration,
+    flush_err: Option<Mode>,
+    on_tx_stop: Option<(usize, StopRequests)>,
+    on_flush_stop: Option<StopRequests>,
 }
 
 impl NoAllocDamiaoBus {
     fn new(limits: &[DamiaoLimits]) -> Self {
         Self {
-            motors: limits.iter().enumerate().map(|(i, l)| (i as u16 + 1, *l, 0.0, false)).collect(),
+            motors: limits
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (i as u16 + 1, *l, 0.0, false, damiao::CTRL_MODE_POS_VEL))
+                .collect(),
             rx: VecDeque::with_capacity(1024),
             clock: std::sync::Arc::new(MockClock::new()),
             mode: Mode::Ok,
             tx_count: 0,
+            tx_step: Duration::ZERO,
+            flush_err: None,
+            on_tx_stop: None,
+            on_flush_stop: None,
         }
     }
 
     fn reply(&mut self, k: usize) {
-        let (id, l, q, enabled) = self.motors[k];
+        let (id, l, q, enabled, _) = self.motors[k];
         let p = damiao::float_to_uint(q, l.p_min, l.p_max, 16);
         let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
         let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
@@ -101,6 +115,12 @@ impl NoAllocDamiaoBus {
             self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
         }
     }
+
+    fn push_all_feedback(&mut self) {
+        for k in 0..self.motors.len() {
+            self.reply(k);
+        }
+    }
 }
 
 impl CanTransport for NoAllocDamiaoBus {
@@ -109,6 +129,14 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+        if !self.tx_step.is_zero() {
+            self.clock.advance(self.tx_step);
+        }
+        if let Some((at, ref stops)) = self.on_tx_stop {
+            if self.tx_count == at {
+                let _ = stops.request();
+            }
+        }
         match self.mode {
             Mode::Ok => {}
             Mode::WouldBlockAfter(n) if self.tx_count >= n => return Err(TransportError::WouldBlock),
@@ -117,12 +145,49 @@ impl CanTransport for NoAllocDamiaoBus {
         }
         self.tx_count += 1;
         let id = frame.id as u16;
-        let find = |m: &[(u16, DamiaoLimits, f32, bool)], id: u16| m.iter().position(|x| x.0 == id);
+        let find = |m: &[(u16, DamiaoLimits, f32, bool, u32)], id: u16| m.iter().position(|x| x.0 == id);
         if id == 0x7FF {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             if let Some(k) = find(&self.motors, mid) {
-                if frame.data[2] == 0xCC {
-                    self.reply(k);
+                match frame.data[2] {
+                    0xCC => self.reply(k),
+                    damiao::REG_READ => {
+                        let (_, l, _, _, mode) = self.motors[k];
+                        let val = match frame.data[3] {
+                            damiao::RID_CTRL_MODE => mode.to_le_bytes(),
+                            damiao::RID_PMAX => l.p_max.to_le_bytes(),
+                            damiao::RID_VMAX => l.v_max.to_le_bytes(),
+                            damiao::RID_TMAX => l.t_max.to_le_bytes(),
+                            _ => 0u32.to_le_bytes(),
+                        };
+                        let [lo, hi] = mid.to_le_bytes();
+                        if self.rx.len() < self.rx.capacity() {
+                            self.rx.push_back(
+                                CanFrame::new_standard(
+                                    0x10 + mid,
+                                    &[lo, hi, damiao::REG_READ, frame.data[3], val[0], val[1], val[2], val[3]],
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    }
+                    damiao::REG_WRITE => {
+                        let val = [frame.data[4], frame.data[5], frame.data[6], frame.data[7]];
+                        if frame.data[3] == damiao::RID_CTRL_MODE {
+                            self.motors[k].4 = u32::from_le_bytes(val);
+                        }
+                        let [lo, hi] = mid.to_le_bytes();
+                        if self.rx.len() < self.rx.capacity() {
+                            self.rx.push_back(
+                                CanFrame::new_standard(
+                                    0x10 + mid,
+                                    &[lo, hi, damiao::REG_WRITE, frame.data[3], val[0], val[1], val[2], val[3]],
+                                )
+                                .unwrap(),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         } else if let Some(k) = find(&self.motors, id) {
@@ -147,7 +212,14 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {
-        Ok(())
+        if let Some(ref stops) = self.on_flush_stop {
+            let _ = stops.request();
+        }
+        match self.flush_err {
+            None | Some(Mode::Ok) => Ok(()),
+            Some(Mode::WouldBlockAfter(_)) => Err(TransportError::WouldBlock),
+            Some(Mode::EnobufsAfter(_)) => Err(TransportError::NoBufferSpace),
+        }
     }
 }
 
@@ -176,11 +248,13 @@ fn bounded_send_path_does_not_allocate_on_healthy_backpressure_carry_and_expiry(
     reset_tx_metrics();
 
     // 1. Healthy 7-joint bounded send: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     let (res, a, f) = counted(|| driver.write_joint_targets_bounded(&targets_a));
     assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
     assert_eq!((a, f), (0, 0), "healthy bounded send touched allocator");
 
     // 2. WouldBlock mid-batch deferral: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     driver.can_mut().mode = Mode::WouldBlockAfter(3);
     driver.can_mut().tx_count = 0;
     let (res, a, f) = counted(|| driver.write_joint_targets_bounded(&targets_a));
@@ -188,6 +262,7 @@ fn bounded_send_path_does_not_allocate_on_healthy_backpressure_carry_and_expiry(
     assert_eq!((a, f), (0, 0), "WouldBlock deferral touched allocator");
 
     // 3. ENOBUFS mid-batch deferral with opposite-target coalescing: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     driver.can_mut().mode = Mode::EnobufsAfter(1);
     driver.can_mut().tx_count = 0;
     let (res, a, f) = counted(|| driver.write_joint_targets_bounded(&targets_b));
@@ -195,6 +270,7 @@ fn bounded_send_path_does_not_allocate_on_healthy_backpressure_carry_and_expiry(
     assert_eq!((a, f), (0, 0), "ENOBUFS deferral + coalescing touched allocator");
 
     // 4. Carry-over drain when queue opens: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     driver.can_mut().mode = Mode::Ok;
     let (res, a, f) = counted(|| driver.drain_pending_tx());
     assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
@@ -210,20 +286,150 @@ fn bounded_send_path_does_not_allocate_on_healthy_backpressure_carry_and_expiry(
     assert_eq!(res.unwrap(), TxBatchOutcome::Deferred { pending: 3 });
     assert_eq!((a, f), (0, 0), "budget exhaustion deferral touched allocator");
     clock.advance(Duration::from_millis(45));
+    driver.begin_tx_tick();
     let (res, a, f) = counted(|| driver.drain_pending_tx());
     assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
     assert_eq!((a, f), (0, 0), "45 ms stale expiry drop touched allocator");
 
     // 6. Legacy write_joint_targets returning Err(TxDeferred) + discarding queue: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     let (res, a, f) = counted(|| driver.write_joint_targets(&targets_b));
     assert!(matches!(res, Err(ArmDriverError::TxDeferred { pending: 3 })), "{res:?}");
     assert_eq!((a, f), (0, 0), "legacy TxDeferred error path touched allocator");
 
     // 7. Explicit discard_pending_tx: 0 allocs, 0 frees.
+    driver.begin_tx_tick();
     let _ = driver.write_joint_targets_bounded(&targets_a).unwrap();
     let (dropped, a, f) = counted(|| driver.discard_pending_tx());
     assert_eq!(dropped, 3);
     assert_eq!((a, f), (0, 0), "discard_pending_tx touched allocator");
+}
+
+#[test]
+fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    let limits = b601_limits();
+    let targets: Vec<JointTarget> = (0..7).map(|i| JointTarget::position(0.05 * i as f32)).collect();
+    let modes = [
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Mit,
+        JointMode::Position,
+        JointMode::Position,
+        JointMode::Position,
+    ];
+    let mk_fenced = || {
+        let bus = NoAllocDamiaoBus::new(&limits);
+        let clock = bus.clock.clone();
+        let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits.clone())
+            .unwrap();
+        d.can_mut().push_all_feedback();
+        d.read_joint_states().unwrap();
+        d.set_torque(true).expect("enable");
+        d.set_joint_modes(&modes, &targets).expect("switch J4 to MIT");
+        d.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(300));
+        d.can_mut().tx_count = 0;
+        let stops = StopRequests::new();
+        d.set_estop_gate(
+            EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+                .with_stops(stops.clone()),
+        );
+        reset_tx_metrics();
+        (d, clock, stops)
+    };
+
+    // 1. Stop / E-stop before batch (fenced MIT) — 0 allocs, 0 frees.
+    let (mut d, _, stops) = mk_fenced();
+    let _ = stops.request();
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(is_estop_inhibited(&res.unwrap_err()));
+    assert_eq!((a, f), (0, 0), "fenced pre-batch stop touched allocator");
+
+    // 2. Stop / E-stop during final flush (fenced MIT) — 0 allocs, 0 frees.
+    let (mut d, _, stops) = mk_fenced();
+    d.can_mut().on_flush_stop = Some(stops);
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(is_estop_inhibited(&res.unwrap_err()));
+    assert_eq!((a, f), (0, 0), "fenced post-flush stop touched allocator");
+
+    // 3. Fenced MIT preflight budget exceeded — 0 allocs, 0 frees.
+    let (mut d, _, _) = mk_fenced();
+    d.set_tx_budget(TxBudget {
+        max_frames: 5,
+        max_duration: Duration::from_millis(5),
+        frame_max_age: Duration::from_millis(45),
+    });
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::MitFenceTripped(_))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "fenced preflight budget trip touched allocator");
+
+    // 4. Fenced MIT mid-batch ENOBUFS backpressure — 0 allocs, 0 frees.
+    let (mut d, _, _) = mk_fenced();
+    d.can_mut().mode = Mode::EnobufsAfter(3);
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "fenced ENOBUFS trip touched allocator");
+
+    // 5. Fenced MIT deadline expiry at 45 ms inclusive — 0 allocs, 0 frees.
+    let (mut d, clock, _) = mk_fenced();
+    clock.advance(Duration::from_millis(45));
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::MitFenceTripped(_))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "fenced 45 ms deadline trip touched allocator");
+
+    // 6. Fenced MIT flush WouldBlock — 0 allocs, 0 frees.
+    let (mut d, _, _) = mk_fenced();
+    d.can_mut().flush_err = Some(Mode::WouldBlockAfter(0));
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::WouldBlock))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "fenced flush WouldBlock trip touched allocator");
+
+    // 7. Fenced MIT preflight wrong joint count — 0 allocs, 0 frees.
+    let (mut d, _, _) = mk_fenced();
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets[..3]));
+    assert!(matches!(res, Err(ArmDriverError::JointCountMismatch { expected: 7, actual: 3 })), "{res:?}");
+    assert_eq!((a, f), (0, 0), "fenced preflight count mismatch touched allocator");
+
+    // 8. Unfenced mid-batch stop + mid-pass stale Timeout + flush ENOBUFS — 0 allocs, 0 frees.
+    let bus = NoAllocDamiaoBus::new(&limits);
+    let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    d.set_torque(true).expect("enable");
+    let stops = StopRequests::new();
+    d.set_estop_gate(
+        EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+            .with_stops(stops.clone()),
+    );
+    d.can_mut().tx_count = 0;
+    d.can_mut().on_tx_stop = Some((2, stops.clone()));
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(is_estop_inhibited(&res.unwrap_err()));
+    assert_eq!((a, f), (0, 0), "unfenced mid-batch stop touched allocator");
+
+    stops.mark_applied(stops.current());
+    d.can_mut().on_tx_stop = None;
+    d.begin_tx_tick();
+    d.set_tx_budget(TxBudget {
+        max_frames: 16,
+        max_duration: Duration::from_millis(100),
+        frame_max_age: Duration::from_millis(45),
+    });
+    d.can_mut().tx_step = Duration::from_millis(45);
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::Timeout))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "unfenced mid-pass stale drop Timeout touched allocator");
+
+    d.can_mut().tx_step = Duration::ZERO;
+    d.can_mut().flush_err = Some(Mode::EnobufsAfter(0));
+    d.begin_tx_tick();
+    let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
+    assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace))), "{res:?}");
+    assert_eq!((a, f), (0, 0), "unfenced flush ENOBUFS touched allocator");
 }
 
 #[test]
