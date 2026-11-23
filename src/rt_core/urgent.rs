@@ -247,8 +247,9 @@ impl UrgentStopIntake {
     /// - `flush_existing == true` (clean exit after publication): flushes already-computed
     ///   pending replies as-is.
     /// - `flush_existing == false` (panic exit): converts unpublished pending replies into
-    ///   `ExecutorStopped` while moving any `Arc<SafetyState>` into `returned_state` and
-    ///   keeping `retired` payloads intact so nothing drops on `armd-control`.
+    ///   `ExecutorStopped`, moving any `Arc<SafetyState>` into `returned_state` and keeping
+    ///   `retired` payloads intact so nothing drops on `armd-control`.
+    ///
     /// Then converts any remaining unconsumed requests on `req_rx` into `ExecutorStopped`.
     pub fn drain_stopped(&mut self, flush_existing: bool) -> bool {
         let mut pushed = false;
@@ -346,9 +347,25 @@ impl UrgentStopClientInner {
 
     fn fail_remaining(&mut self, err: UrgentStopError) {
         let remaining = std::mem::take(&mut self.waiters);
-        for (_, w) in remaining {
-            w.deliver(Err(err.clone()));
+        for (_, w) in remaining { w.deliver(Err(err.clone())); }
+    }
+
+    fn enqueue(&mut self, stop: UrgentStop, waiter: UrgentStopWaiter) -> Result<(), UrgentStopError> {
+        self.drain_replies();
+        if self.closed || self.exited.load(Ordering::Acquire) || self.req_tx.is_abandoned() {
+            return Err(UrgentStopError::Stopped);
         }
+        if self.in_flight >= self.capacity || self.req_tx.is_full() {
+            return Err(UrgentStopError::QueueFull);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.req_tx.push(UrgentStopRequest { id, stop }).is_err() {
+            return Err(UrgentStopError::QueueFull);
+        }
+        self.in_flight += 1;
+        self.waiters.insert(id, waiter);
+        Ok(())
     }
 }
 
@@ -361,13 +378,8 @@ pub struct UrgentStopClient {
 }
 
 impl UrgentStopClient {
-    pub fn drain_replies(&self) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).drain_replies();
-    }
-
-    pub fn in_flight(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).in_flight
-    }
+    pub fn drain_replies(&self) { self.inner.lock().unwrap_or_else(|e| e.into_inner()).drain_replies(); }
+    pub fn in_flight(&self) -> usize { self.inner.lock().unwrap_or_else(|e| e.into_inner()).in_flight }
 
     pub fn close(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,21 +401,7 @@ impl UrgentStopClient {
         stop: UrgentStop,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<UrgentStopOutcome, UrgentStopError>>, UrgentStopError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.drain_replies();
-        if g.closed || g.exited.load(Ordering::Acquire) || g.req_tx.is_abandoned() {
-            return Err(UrgentStopError::Stopped);
-        }
-        if g.in_flight >= g.capacity || g.req_tx.is_full() {
-            return Err(UrgentStopError::QueueFull);
-        }
-        let id = g.next_id;
-        g.next_id += 1;
-        if g.req_tx.push(UrgentStopRequest { id, stop }).is_err() {
-            return Err(UrgentStopError::QueueFull);
-        }
-        g.in_flight += 1;
-        g.waiters.insert(id, UrgentStopWaiter::Async(tx));
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).enqueue(stop, UrgentStopWaiter::Async(tx))?;
         Ok(rx)
     }
 
@@ -428,23 +426,7 @@ impl UrgentStopClient {
 
     pub fn submit_sync(&self, stop: UrgentStop) -> Result<UrgentStopOutcome, UrgentStopError> {
         let (tx, rx) = mpsc::sync_channel(1);
-        {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            g.drain_replies();
-            if g.closed || g.exited.load(Ordering::Acquire) || g.req_tx.is_abandoned() {
-                return Err(UrgentStopError::Stopped);
-            }
-            if g.in_flight >= g.capacity || g.req_tx.is_full() {
-                return Err(UrgentStopError::QueueFull);
-            }
-            let id = g.next_id;
-            g.next_id += 1;
-            if g.req_tx.push(UrgentStopRequest { id, stop }).is_err() {
-                return Err(UrgentStopError::QueueFull);
-            }
-            g.in_flight += 1;
-            g.waiters.insert(id, UrgentStopWaiter::Sync(tx));
-        }
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).enqueue(stop, UrgentStopWaiter::Sync(tx))?;
         loop {
             match rx.recv_timeout(Duration::from_millis(2)) {
                 Ok(res) => return res,
@@ -462,22 +444,10 @@ pub fn urgent_stop_channel(capacity: usize, exited: Arc<AtomicBool>) -> (UrgentS
     let (rep_tx, rep_rx) = RingBuffer::<UrgentStopReply>::new(cap);
     let client = UrgentStopClient {
         inner: Mutex::new(UrgentStopClientInner {
-            req_tx,
-            rep_rx,
-            capacity: cap,
-            in_flight: 0,
-            next_id: 1,
-            closed: false,
-            waiters: HashMap::new(),
-            exited,
+            req_tx, rep_rx, capacity: cap, in_flight: 0, next_id: 1, closed: false, waiters: HashMap::new(), exited,
         }),
     };
-    let intake = UrgentStopIntake {
-        req_rx,
-        rep_tx,
-        pending: VecDeque::with_capacity(cap),
-        capacity: cap,
-    };
+    let intake = UrgentStopIntake { req_rx, rep_tx, pending: VecDeque::with_capacity(cap), capacity: cap };
     (client, intake)
 }
 
@@ -522,39 +492,33 @@ mod tests {
         assert!(!gate.pending());
     }
 
-    #[test]
-    fn urgent_stop_credit_reservation_survives_disconnected_waiter_and_saturates_explicitly() {
-        let exited = Arc::new(AtomicBool::new(false));
-        let (client, mut intake) = urgent_stop_channel(2, exited);
-        let stop = UrgentStop {
+    fn sample_stop(request_id: u64, epoch: u64) -> UrgentStop {
+        UrgentStop {
             connection: crate::model::HolderLabel::new("connection:1"),
             lease_generation: 1,
-            epoch: Some(1),
-            request_id: 1,
+            epoch: Some(epoch),
+            request_id,
             request_id_valid: true,
             body_error: None,
-        };
-        let rx1 = client.enqueue_async(stop).unwrap();
-        let rx2 = client.enqueue_async(UrgentStop { request_id: 2, ..stop }).unwrap();
+        }
+    }
+
+    #[test]
+    fn urgent_stop_credit_reservation_survives_disconnected_waiter_and_saturates_explicitly() {
+        let (client, mut intake) = urgent_stop_channel(2, Arc::new(AtomicBool::new(false)));
+        let rx1 = client.enqueue_async(sample_stop(1, 1)).unwrap();
+        let rx2 = client.enqueue_async(sample_stop(2, 1)).unwrap();
         assert_eq!(client.in_flight(), 2);
-        // Dropping rx1 before drain must NOT release its reply credit!
         drop(rx1);
-        assert_eq!(
-            client.enqueue_async(UrgentStop { request_id: 3, ..stop }).unwrap_err(),
-            UrgentStopError::QueueFull
-        );
+        assert_eq!(client.enqueue_async(sample_stop(3, 1)).unwrap_err(), UrgentStopError::QueueFull);
         assert_eq!(client.in_flight(), 2);
 
-        let applied = intake.drain_requests(|_| {
-            (UrgentStopOutcome::LeaseLost { epoch: 1 }, RetiredStopPayloads::default())
-        });
-        assert!(!applied);
+        assert!(!intake.drain_requests(|_| (UrgentStopOutcome::LeaseLost { epoch: 1 }, RetiredStopPayloads::default())));
         assert!(intake.flush_replies());
         client.drain_replies();
         assert_eq!(client.in_flight(), 0);
         assert_eq!(rx2.blocking_recv().unwrap().unwrap(), UrgentStopOutcome::LeaseLost { epoch: 1 });
-        // Capacity is fully reclaimed after off-thread drain.
-        let _rx3 = client.enqueue_async(UrgentStop { request_id: 3, ..stop }).unwrap();
+        let _rx3 = client.enqueue_async(sample_stop(3, 1)).unwrap();
         assert_eq!(client.in_flight(), 1);
     }
 
@@ -562,44 +526,23 @@ mod tests {
     fn urgent_stop_client_drains_final_ack_after_observing_exited() {
         let exited = Arc::new(AtomicBool::new(false));
         let (client, mut intake) = urgent_stop_channel(4, exited.clone());
-        let stop = UrgentStop {
-            connection: crate::model::HolderLabel::new("connection:1"),
-            lease_generation: 1,
-            epoch: Some(5),
-            request_id: 1,
-            request_id_valid: true,
-            body_error: None,
-        };
-        let mut rx = client.enqueue_async(stop).unwrap();
+        let mut rx = client.enqueue_async(sample_stop(1, 5)).unwrap();
         assert!(intake.drain_requests(|_| (
             UrgentStopOutcome::Applied {
-                stop_generation: 1,
-                applied_to_motion: true,
-                epoch: 5,
+                stop_generation: 1, applied_to_motion: true, epoch: 5,
                 safety_state: Arc::new(crate::safety::SafetyState::Armed),
-                is_torqued: true,
-                control_mode_gravity_comp: false,
+                is_torqued: true, control_mode_gravity_comp: false,
             },
             RetiredStopPayloads::default(),
         )));
-
-        // Simulate the exact race: client observes empty reply queue, then RT flushes final
-        // Applied reply and stores `exited = true` before client checks `exited`.
         let mut g = client.inner.lock().unwrap();
         g.drain_replies_with_hook(|| {
             assert!(intake.flush_replies());
             exited.store(true, Ordering::Release);
         });
         drop(g);
-
-        let delivered = rx
-            .try_recv()
-            .expect("final urgent stop ACK must be delivered, not lost to exited")
-            .expect("must not be converted to Stopped");
-        assert!(matches!(
-            delivered,
-            UrgentStopOutcome::Applied { stop_generation: 1, epoch: 5, .. }
-        ));
+        let delivered = rx.try_recv().expect("final ACK lost to exited").expect("converted to Stopped");
+        assert!(matches!(delivered, UrgentStopOutcome::Applied { stop_generation: 1, epoch: 5, .. }));
         assert_eq!(client.in_flight(), 0);
     }
 
@@ -607,42 +550,25 @@ mod tests {
     fn urgent_stop_panic_drain_preserves_state_arc_off_rt_and_reports_stopped() {
         let exited = Arc::new(AtomicBool::new(false));
         let (client, mut intake) = urgent_stop_channel(4, exited.clone());
-        let stop = UrgentStop {
-            connection: crate::model::HolderLabel::new("connection:1"),
-            lease_generation: 1,
-            epoch: Some(5),
-            request_id: 1,
-            request_id_valid: true,
-            body_error: None,
-        };
-        let mut rx1 = client.enqueue_async(stop).unwrap();
-        let mut rx2 = client.enqueue_async(UrgentStop { request_id: 2, ..stop }).unwrap();
-        let state_arc = Arc::new(crate::safety::SafetyState::Fault(
-            crate::safety::FaultReason::Other("heap fault payload".into()),
-        ));
+        let mut rx1 = client.enqueue_async(sample_stop(1, 5)).unwrap();
+        let mut rx2 = client.enqueue_async(sample_stop(2, 5)).unwrap();
+        let state_arc = Arc::new(crate::safety::SafetyState::Fault(crate::safety::FaultReason::Other("heap".into())));
         let weak = Arc::downgrade(&state_arc);
-        // Drain only req 1 into pending (simulate panic between apply and publish, with req 2 still queued).
         let req1 = intake.req_rx.pop().unwrap();
         intake.pending.push_back(UrgentStopReply {
             id: req1.id,
             outcome: UrgentStopOutcome::Applied {
-                stop_generation: 1,
-                applied_to_motion: true,
-                epoch: 5,
-                safety_state: state_arc,
-                is_torqued: true,
-                control_mode_gravity_comp: false,
+                stop_generation: 1, applied_to_motion: true, epoch: 5,
+                safety_state: state_arc, is_torqued: true, control_mode_gravity_comp: false,
             },
             returned_state: None,
             retired: RetiredStopPayloads::default(),
         });
         assert!(intake.drain_stopped(false));
-        // Arc must STILL be alive (moved into reply ring, NOT dropped on RT)!
         assert!(weak.upgrade().is_some(), "Arc<SafetyState> must survive panic drain for off-thread drop");
-
         exited.store(true, Ordering::Release);
         client.drain_replies();
-        assert!(weak.upgrade().is_none(), "Arc<SafetyState> must be dropped off-thread by drain_replies");
+        assert!(weak.upgrade().is_none(), "Arc<SafetyState> must drop off-thread in drain_replies");
         assert_eq!(rx1.try_recv().unwrap(), Err(UrgentStopError::Stopped));
         assert_eq!(rx2.try_recv().unwrap(), Err(UrgentStopError::Stopped));
         assert_eq!(client.in_flight(), 0);
