@@ -5,7 +5,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth, SupervisorInner};
+use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth};
+#[cfg(test)]
+use armd::SupervisorInner;
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -154,6 +156,7 @@ fn resolve_operator_auth(follower: &str, cli: &CliArgs) -> Result<OperatorAuth, 
 }
 
 /// Called while holding the supervisor write lock so stop authority cannot race motion.
+#[cfg(test)]
 fn request_shutdown(inner: &mut SupervisorInner) -> bool {
     inner.request_shutdown()
 }
@@ -346,6 +349,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
+    let rt_owner = armd::rt_core::executor::RtOwner::from_env()?;
+    armd::rt_core::executor::validate_startup_owner(rt_owner, follower)?;
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
     let config = apply_cli_tool(config, cli.tool.as_deref())?;
     if follower == "mock" && cli.follower_port.is_some() {
@@ -467,49 +472,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!(),
     }
     armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
-
-    // The control loop runs on its own OS thread at real-time priority (the RT executor,
-    // `armd::rt_core::executor`). On the single-core SG2002 a tokio task shares one worker with
-    // HTTP/WS/video proxies and with yolo-detector, so a tick could slip past the stall deadline.
-    // SCHED_FIFO 45 by default, below the SPI/CAN interrupt threads at 50 (`armd::rt_core::sched`).
-    let control_supervisor = supervisor.clone();
-    let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let control_stop_flag = control_stop.clone();
-    let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
-    let loop_stats = executor_stats.clone();
-    let runtime = tokio::runtime::Handle::current();
-    std::thread::Builder::new().name("armd-control".into()).spawn(move || {
-        let sched = armd::rt_core::sched::apply_to_current_thread(&rt_sched, &memory_lock);
-        if sched.realtime {
-            info!("Control loop running at SCHED_FIFO priority {}{}", sched.priority,
-                sched.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default());
-        } else {
-            warn!("Control loop real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused", sched.errors.join("; "));
-        }
-        armd::rt_core::sched::set_readiness(armd::rt_core::sched::RtReadiness::from_sched(&sched));
-        control_supervisor.set_control_thread_sched(sched);
-        if std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1") {
-            armd::diagnostics::alloc::time_this_thread();
-            info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
-        }
-        // Absolute releases; missed releases are skipped and dt keeps the real elapsed time so
-        // the supervisor can detect stalled control ticks.
-        armd::rt_core::executor::run_periodic(period, &control_stop_flag, &loop_stats, |dt| {
-            let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.block_on(control_supervisor.control_tick(dt));
-            }));
-            if let Err(e) = tick_res {
-                control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
-                error!("Control thread panicked during tick: {:?}", e);
-                armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
-                std::process::exit(1);
-            }
-        });
-    })?;
-    executor_stats.spawn_monitor(control_stop.clone())?;
-
+    // Complete all startup configuration BEFORE transferring ownership or starting the control loop.
     let operator_auth = resolve_operator_auth(follower, &cli)?;
     supervisor.set_operator_auth_enforced(operator_auth.is_enforced()).await;
+
+    // One owner selected at startup: legacy supervisor-lock loop (default) or the synchronous
+    // RT executor OS thread owning `ArmCore` and the bus with zero Tokio entry.
+    let alloc_timing = std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1");
+    let mut legacy_control_stop: Option<Arc<std::sync::atomic::AtomicBool>> = None;
+    let mut executor_handle: Option<armd::rt_core::executor::RtExecutorHandle> = None;
+    match rt_owner {
+        armd::rt_core::executor::RtOwner::Legacy => {
+            let control_supervisor = supervisor.clone();
+            let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let control_stop_flag = control_stop.clone();
+            let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+            let loop_stats = executor_stats.clone();
+            let runtime = tokio::runtime::Handle::current();
+            std::thread::Builder::new().name("armd-control".into()).spawn(move || {
+                let sched = armd::rt_core::sched::apply_to_current_thread(&rt_sched, &memory_lock);
+                if sched.realtime {
+                    info!(
+                        "Control loop running at SCHED_FIFO priority {}{}",
+                        sched.priority,
+                        sched.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default()
+                    );
+                } else {
+                    warn!(
+                        "Control loop real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused",
+                        sched.errors.join("; ")
+                    );
+                }
+                armd::rt_core::sched::set_readiness(armd::rt_core::sched::RtReadiness::from_sched(&sched));
+                control_supervisor.set_control_thread_sched(sched);
+                if alloc_timing {
+                    armd::diagnostics::alloc::time_this_thread();
+                    info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
+                }
+                armd::rt_core::executor::run_periodic(period, &control_stop_flag, &loop_stats, |dt| {
+                    let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.block_on(control_supervisor.control_tick(dt));
+                    }));
+                    if let Err(e) = tick_res {
+                        control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                        error!("Control thread panicked during tick: {:?}", e);
+                        armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
+                        std::process::exit(1);
+                    }
+                });
+            })?;
+            executor_stats.spawn_monitor(control_stop.clone())?;
+            legacy_control_stop = Some(control_stop);
+        }
+        armd::rt_core::executor::RtOwner::Executor => {
+            let cfg = armd::rt_core::executor::ExecutorConfig {
+                period,
+                boot: armd::rt_core::broker::BootId(1),
+                capacities: armd::rt_core::broker::Capacities::default(),
+                rt_sched,
+                memory_lock,
+                alloc_timing,
+                panic_policy: armd::rt_core::executor::PanicPolicy::AbortProcess,
+                apply_rt_sched: true,
+            };
+            let handle = supervisor
+                .start_executor(cfg)
+                .await
+                .map_err(|e| format!("Failed to start RT executor: {e}"))?;
+            info!("RT executor owns ArmCore and bus (ARMD_RT_OWNER=executor)");
+            executor_handle = Some(handle);
+        }
+    }
+
     info!(
         "armd API server listening on http://{}",
         listener.local_addr()?
@@ -543,16 +577,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {}
         }
 
-        let mut inner = supervisor.inner().write().await;
-        if request_shutdown(&mut inner) {
-            break;
+        match supervisor.request_shutdown().await {
+            Ok(true) => break,
+            Ok(false) => {
+                warn!("Shutdown refused: hardware disable is not confirmed. Stop is latched; control loop and API remain available. Explicit fault recovery and rearming are required before further motion.");
+            }
+            Err(e) => {
+                warn!("Shutdown request failed ({e}); keeping daemon active");
+            }
         }
-        warn!("Shutdown refused: hardware disable is not confirmed. Stop is latched; control loop and API remain available. Explicit fault recovery and rearming are required before further motion.");
     }
 
     // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
     server_handle.abort();
-    control_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = executor_handle {
+        if let Err(e) = handle.shutdown_and_join() {
+            warn!("RT executor shutdown join returned error: {e}");
+        }
+    }
+    if let Some(control_stop) = legacy_control_stop {
+        control_stop.store(true, Ordering::SeqCst);
+    }
     info!("armd stopped after shutdown readiness confirmation");
     Ok(())
 }

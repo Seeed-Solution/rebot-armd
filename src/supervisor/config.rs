@@ -385,6 +385,138 @@ impl SupervisorInner {
         res
     }
 
+    /// Lightweight pure-math validation of a gripper calibration candidate without cloning
+    /// `ArmConfig` or mutating `self` (used by the RT executor's two-phase persistence path).
+    pub(crate) fn validate_gripper_calibration_light(
+        &self,
+        offset_rad: Option<f32>,
+        jaw_opening: Option<&crate::model::JawOpening>,
+    ) -> Result<(crate::model::GripperPolicy, Option<crate::model::JawOpening>), String> {
+        let base = self
+            .base_gripper_policy
+            .as_ref()
+            .or(self.config.gripper_policy.as_ref())
+            .ok_or_else(|| "No base gripper policy available".to_string())?;
+        let mut policy = base.clone();
+        let offset = offset_rad.unwrap_or(0.0);
+        if !offset.is_finite() {
+            return Err("offset_rad must be finite".into());
+        }
+        let closed_rad = base.closed_rad + offset;
+        let mut open_rad = base.open_rad + offset;
+        if !closed_rad.is_finite() || !open_rad.is_finite() {
+            return Err("Computed closed_rad or open_rad is not finite".into());
+        }
+        let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
+        if let Some(lim) = lim {
+            if closed_rad < lim.min_position || closed_rad > lim.max_position {
+                return Err(format!(
+                    "Calibrated closed_rad {closed_rad:.4} exceeds joint limits [{}, {}]",
+                    lim.min_position, lim.max_position
+                ));
+            }
+            open_rad = open_rad.clamp(lim.min_position, lim.max_position);
+        }
+        if (closed_rad - open_rad).abs() < 0.1 {
+            return Err(format!(
+                "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
+            ));
+        }
+        policy.closed_rad = closed_rad;
+        policy.open_rad = open_rad;
+        let candidate_jo = jaw_opening
+            .cloned()
+            .or_else(|| self.gripper_calib_jaw_opening.clone())
+            .or_else(|| base.jaw_opening.clone());
+        let mut jo = match candidate_jo {
+            Some(jo) => jo,
+            None if self.config.active_tool.is_stock => crate::model::JawOpening::sim_default(),
+            None => return Err("Non-stock tool requires an explicit jaw_opening calibration curve".into()),
+        };
+        jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
+        for pt in &mut jo.points {
+            pt[0] += offset;
+        }
+        jo.validate(None).map_err(|e| format!("Invalid jaw_opening calibration: {e}"))?;
+        policy.jaw_opening = Some(jo);
+        crate::model::validate_effective_gripper_policy_ex(&policy, lim, None, false)?;
+        if let Some(ref err) = self.driver_config_error {
+            return Err(err.clone());
+        }
+        Ok((policy, jaw_opening.cloned()))
+    }
+
+    /// In-place swap of validated gripper calibration fields on the RT executor thread,
+    /// returning replaced heap values so the caller drops them off the RT thread.
+    pub(crate) fn swap_gripper_calibration_in_place(
+        &mut self,
+        offset_rad: f32,
+        new_policy: crate::model::GripperPolicy,
+        new_jaw: Option<crate::model::JawOpening>,
+    ) -> (Option<crate::model::GripperPolicy>, Option<crate::model::JawOpening>) {
+        if self.base_gripper_policy.is_none() {
+            self.base_gripper_policy = self.config.gripper_policy.clone();
+        }
+        let old_policy = self.config.gripper_policy.replace(new_policy);
+        let old_jaw = match new_jaw {
+            Some(j) => self.gripper_calib_jaw_opening.replace(j),
+            None => None,
+        };
+        self.gripper_calib_offset = Some(offset_rad);
+        self.gripper_calib_invalid = false;
+        self.gripper_calib_revision += 1;
+        (old_policy, old_jaw)
+    }
+
+    pub(crate) fn fail_zero_check_action(&mut self, action_id: u64, code: &str, message: &str) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
+            a.state = "failed".into();
+            a.code = Some(code.into());
+            a.message = Some(message.into());
+            a.finished_at = Some(now);
+        }
+    }
+
+    pub(crate) fn cancel_zero_check_action(&mut self, action_id: u64, code: &str, message: &str) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
+            a.state = "cancelled".into();
+            a.code = Some(code.into());
+            a.message = Some(message.into());
+            a.finished_at = Some(now);
+        }
+    }
+
+    pub(crate) fn complete_zero_check_action(
+        &mut self,
+        action_id: u64,
+        durability: crate::rt_core::config_iface::Durability,
+        warning: Option<String>,
+    ) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+            if a.is_running() {
+                a.state = "done".into();
+                a.progress = 1.0;
+                a.finished_at = Some(now);
+            }
+            match durability {
+                crate::rt_core::config_iface::Durability::Durable => {
+                    a.durability_confirmed = Some(true);
+                    a.durability_warning = None;
+                }
+                crate::rt_core::config_iface::Durability::DurableUnconfirmed => {
+                    a.durability_confirmed = Some(false);
+                    a.durability_warning = warning;
+                }
+                crate::rt_core::config_iface::Durability::Volatile => {
+                    a.durability_confirmed = Some(false);
+                }
+            }
+        }
+    }
+
     /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
     pub fn commit_gripper_calibration_candidate(&mut self, cand: GripperCalibrationCandidate) {
         self.config = cand.config;

@@ -892,7 +892,7 @@ pub struct ReleaseEngine {
     /// The driver transition in flight.
     transition: Option<Installed>,
     releases: u64,
-    hook: Option<Box<dyn FnMut(Checkpoint)>>,
+    hook: Option<Box<dyn FnMut(Checkpoint) + Send>>,
 }
 
 impl ReleaseEngine {
@@ -927,7 +927,7 @@ impl ReleaseEngine {
         CommitCtx { arm: self.intake.arm(), boot: self.intake.boot(), now, stop_generation: self.stop.current() }
     }
 
-    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + 'static) { self.hook = Some(Box::new(hook)); }
+    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + Send + 'static) { self.hook = Some(Box::new(hook)); }
 
     /// Applies any pending urgent E-stop and/or authorized-stop requests; true when either applied.
     pub fn apply_pending_urgent<O: CoreOps>(&mut self, core: &mut O) -> bool {
@@ -1111,7 +1111,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// Runs `hook` at every [`Checkpoint`] just before the fixture samples the stop
     /// generation and the time there (tests: a stop or a clock step arriving mid-release).
-    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + 'static) { self.engine.on_checkpoint(hook); }
+    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + Send + 'static) { self.engine.on_checkpoint(hook); }
 
     /// One release.
     pub fn step(&mut self) -> ReleaseReport {

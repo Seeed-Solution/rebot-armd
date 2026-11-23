@@ -533,12 +533,12 @@ pub async fn action_requires_lease(
 /// POST /api/v1/safety/e_stop
 pub async fn safety_e_stop(
     State(supervisor): State<Arc<ArmSupervisor>>,
-) -> Json<SafetyResponse> {
-    let (safety_state, epoch_id) = supervisor.trigger_e_stop().await;
-    Json(SafetyResponse {
+) -> Result<Json<SafetyResponse>, ApiError> {
+    let (safety_state, epoch_id) = supervisor.trigger_e_stop_checked().await?;
+    Ok(Json(SafetyResponse {
         safety_state,
         epoch_id,
-    })
+    }))
 }
 
 /// POST /api/v1/safety/clear_fault

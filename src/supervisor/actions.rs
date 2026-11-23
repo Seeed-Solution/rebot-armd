@@ -195,21 +195,30 @@ impl SupervisorInner {
                     };
                     let text = serde_json::to_string_pretty(&file).unwrap_or_default();
                     if self.defer_zero_check_persist {
-                        // Hold action as running until atomic persist-before-commit completes outside the lock.
-                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                            a.state = "running".into();
-                            a.finished_at = None;
+                        if !self.persist_capacity_available {
+                            tracing::warn!("Persistence worker unavailable or saturated; failing zero_check(store_offset=true) cleanly");
+                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                a.state = "failed".into();
+                                a.code = Some("PERSIST_FAILED".into());
+                                a.message = Some("Persistence channel unavailable or saturated".into());
+                            }
+                        } else {
+                            // Hold action as running until atomic persist-before-commit completes outside the lock.
+                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                a.state = "running".into();
+                                a.finished_at = None;
+                            }
+                            self.zero_check_persisting = Some(id);
+                            self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
+                                action_id: id,
+                                offset_rad,
+                                jaw_opening: candidate_jaw,
+                                base_revision: self.gripper_calib_revision,
+                                lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
+                                operator_auth,
+                                write: crate::persist::PendingWrite::new(path, text),
+                            });
                         }
-                        self.zero_check_persisting = Some(id);
-                        self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
-                            action_id: id,
-                            offset_rad,
-                            jaw_opening: candidate_jaw,
-                            base_revision: self.gripper_calib_revision,
-                            lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
-                            operator_auth,
-                            write: crate::persist::PendingWrite::new(path, text),
-                        });
                     } else {
                         let auth_ok = operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
                         if !auth_ok {

@@ -166,10 +166,14 @@ impl<T> SupervisorLock<T> {
 
     /// The control tick's write guard: counted in the generation (returned) but not logged,
     /// the tick times itself.
-    pub async fn write_tick(&self) -> (RwLockWriteGuard<'_, T>, u64) {
-        let guard = self.lock.write().await;
-        let generation = self.bump();
-        (guard, generation)
+    pub fn write_tick(&self) -> impl Future<Output = (RwLockWriteGuard<'_, T>, u64)> + '_ {
+        crate::rt_core::executor::assert_not_in_rt_release("SupervisorLock::write_tick");
+        async move {
+            crate::rt_core::executor::assert_not_in_rt_release("SupervisorLock::write_tick");
+            let guard = self.lock.write().await;
+            let generation = self.bump();
+            (guard, generation)
+        }
     }
 
     /// The log since the previous call, reset. Never blocks: None when the log's mutex is

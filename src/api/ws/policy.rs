@@ -24,7 +24,7 @@ impl PolicyLoadingGuard {
     }
 
     pub(super) fn clear(&mut self, inner: &mut SupervisorInner) {
-        if self.0.take().is_some() {
+        if self.0.take().is_some() && !inner.detached {
             inner.policy_loading = false;
         }
     }
@@ -37,16 +37,26 @@ impl Drop for PolicyLoadingGuard {
             return;
         };
         if let Ok(mut inner) = sup.inner().try_write() {
-            inner.policy_loading = false;
+            if !inner.detached {
+                inner.policy_loading = false;
+            }
             return;
         }
         match tokio::runtime::Handle::try_current() {
             Ok(h) => {
                 h.spawn(async move {
-                    sup.inner().write().await.policy_loading = false;
+                    let mut inner = sup.inner().write().await;
+                    if !inner.detached {
+                        inner.policy_loading = false;
+                    }
                 });
             }
-            Err(_) => sup.inner().blocking_write().policy_loading = false,
+            Err(_) => {
+                let mut inner = sup.inner().blocking_write();
+                if !inner.detached {
+                    inner.policy_loading = false;
+                }
+            }
         }
         tracing::warn!("policy loading ended without explicit clear; cleared policy_loading");
     }

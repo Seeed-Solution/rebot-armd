@@ -1362,6 +1362,9 @@ impl Drop for BusyGuard {
 }
 
 fn clear_busy(inner: &mut SupervisorInner) {
+    if inner.detached {
+        return;
+    }
     inner.calibration_busy = false;
     inner.motor_zero_busy = false;
 }

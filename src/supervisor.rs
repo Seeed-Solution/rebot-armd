@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -545,6 +545,11 @@ pub struct SupervisorInner {
     pub(crate) pending_rx_poll: PendingRxPoll,
     /// Authorized-stop generations wired into `estop_gate()` when owned by an RT executor.
     pub(crate) stop_requests: Option<crate::rt_core::urgent::StopRequests>,
+    /// True on the empty shell left inside `ArmSupervisor::inner` after executor ownership transfer.
+    pub(crate) detached: bool,
+    /// True when deferred zero-check persistence can accept a job (false if the dedicated
+    /// persistence worker channel is saturated or disconnected).
+    pub(crate) persist_capacity_available: bool,
 }
 
 /// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
@@ -807,7 +812,23 @@ impl SupervisorInner {
             tool_commissioning_revision: 1,
             pending_rx_poll: PendingRxPoll::default(),
             stop_requests: None,
+            detached: false,
+            persist_capacity_available: true,
         }
+    }
+
+    /// Minimal empty shell left inside `ArmSupervisor::inner` once ownership transfers to
+    /// the synchronous RT executor; all legacy lock paths reject it when `detached == true`.
+    pub(crate) fn detached_shell(
+        config: &ArmConfig,
+        e_stop_latched: Arc<AtomicBool>,
+        requested_estop_count: Arc<AtomicU64>,
+    ) -> Self {
+        let mut shell = Self::new(config.clone());
+        shell.e_stop_latched = e_stop_latched;
+        shell.requested_estop_count = requested_estop_count;
+        shell.detached = true;
+        shell
     }
 
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
@@ -1120,6 +1141,15 @@ impl SupervisorInner {
             if age <= FEEDBACK_FRESH { until = until.min(sampled + (FEEDBACK_FRESH - age)); }
         }
         (sampled, until.max(sampled))
+    }
+
+    pub(crate) fn begin_tick_phases(&mut self, start: Instant) {
+        self.tick_phases_us = [0; 5];
+        self.tick_phase_mark = Some(start);
+    }
+
+    pub(crate) fn take_tick_phases(&mut self) -> ([u32; 5], Option<Instant>) {
+        (self.tick_phases_us, self.tick_phase_mark.take())
     }
 
     /// Publishes an observation filled in place at `timestamp` with lock/release generation
@@ -3582,27 +3612,48 @@ pub fn check_path_with_tcp_tol<'a>(
     Ok(())
 }
 
+/// Ownership mode of [`ArmSupervisor`], mirrored atomically for lock-free routing checks.
+pub const OWNER_LEGACY: u8 = 0;
+pub const OWNER_TRANSFERRING: u8 = 1;
+pub const OWNER_EXECUTOR: u8 = 2;
+pub const OWNER_FAILED: u8 = 3;
+
+enum OwnerSlot {
+    Legacy,
+    Transferring,
+    Executor(crate::rt_core::executor::RtExecutorHandle),
+    Failed,
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
-    tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
     /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
     tick_stats_wait_us: AtomicU64,
-    control_sched: std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>,
+    control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
     hub: Arc<crate::rt_core::publish::StateHub>,
     /// Serializes the start of the dispatcher thread.
     dispatcher_start: std::sync::Mutex<()>,
     /// Control period of the last tick (µs): bounds how long a reader waits for a sample.
-    control_period_us: AtomicU64,
+    control_period_us: Arc<AtomicU64>,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
     obs_waits: AtomicU64,
     obs_unavailable: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Single-owner slot (`Legacy` -> `Transferring` -> `Executor` | `Failed`).
+    /// Lock order: always `self.inner` before `self.owner`.
+    owner: std::sync::Mutex<OwnerSlot>,
+    owner_mode: AtomicU8,
+    /// Always-present lock-serialized E-stop waiter registry (never touched by `armd-control`).
+    estop_reg: Arc<std::sync::Mutex<crate::rt_core::executor::EstopRegistry>>,
+    /// Off-thread consumer sinks installed when ownership transfers to the RT executor.
+    sinks: Arc<std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -3615,6 +3666,40 @@ pub const OBS_LOCK_WAIT: Duration = Duration::from_millis(500);
 fn observation_unavailable() -> ArmError {
     ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
         message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() }
+}
+
+fn executor_routing_pending() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_ROUTING_PENDING".into(),
+        message: "ArmCore is owned by the synchronous RT executor; legacy lock path is disabled".into(),
+    }
+}
+
+fn executor_unavailable() -> ArmError {
+    ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor ownership is transitioning or unavailable".into(),
+    }
+}
+
+/// RAII rollback guard for the single `.await` inside [`ArmSupervisor::start_executor_with_hooks`].
+struct TransferGuard<'a> {
+    sup: &'a ArmSupervisor,
+    armed: bool,
+}
+
+impl Drop for TransferGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut slot = self.sup.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(*slot, OwnerSlot::Transferring) {
+                *slot = OwnerSlot::Legacy;
+                self.sup.owner_mode.store(OWNER_LEGACY, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// A published sample, or the read guard when no sample answers (no control loop running).
@@ -3642,17 +3727,151 @@ impl ArmSupervisor {
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
-            tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
+            tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
             tick_stats_wait_us: AtomicU64::new(0),
-            control_sched: std::sync::Mutex::new(None),
+            control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
-            control_period_us: AtomicU64::new(control_period_us),
+            control_period_us: Arc::new(AtomicU64::new(control_period_us)),
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
             obs_waits: AtomicU64::new(0),
             obs_unavailable: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            owner: std::sync::Mutex::new(OwnerSlot::Legacy),
+            owner_mode: AtomicU8::new(OWNER_LEGACY),
+            estop_reg: Arc::new(std::sync::Mutex::new(crate::rt_core::executor::EstopRegistry::default())),
+            sinks: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Current ownership mode (`OWNER_LEGACY`, `OWNER_TRANSFERRING`, `OWNER_EXECUTOR`, `OWNER_FAILED`).
+    pub fn owner_mode(&self) -> u8 {
+        self.owner_mode.load(Ordering::Acquire)
+    }
+
+    /// Handle to the synchronous RT executor when ownership has transferred.
+    pub fn executor_handle(&self) -> Option<crate::rt_core::executor::RtExecutorHandle> {
+        let slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            OwnerSlot::Executor(h) => Some(h.clone()),
+            _ => None,
+        }
+    }
+
+    fn check_legacy_under_guard(&self, inner: &SupervisorInner) -> Result<(), ArmError> {
+        if !inner.detached && self.owner_mode.load(Ordering::Acquire) == OWNER_LEGACY {
+            Ok(())
+        } else if self.owner_mode.load(Ordering::Acquire) == OWNER_EXECUTOR {
+            Err(executor_routing_pending())
+        } else {
+            Err(executor_unavailable())
+        }
+    }
+
+    fn drain_diag(&self) {
+        let sink = self.sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = sink {
+            s.drain_diag(&self.tick_stats);
+        }
+    }
+
+    /// Transfers ownership of `SupervisorInner` (`ArmCore` + bus driver) once at startup
+    /// into the synchronous RT executor OS thread.
+    pub async fn start_executor(
+        &self,
+        cfg: crate::rt_core::executor::ExecutorConfig,
+    ) -> Result<crate::rt_core::executor::RtExecutorHandle, ArmError> {
+        self.start_executor_with_hooks(cfg, crate::rt_core::executor::PersistTestHooks::default()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn start_executor_with_hooks(
+        &self,
+        cfg: crate::rt_core::executor::ExecutorConfig,
+        hooks: crate::rt_core::executor::PersistTestHooks,
+    ) -> Result<crate::rt_core::executor::RtExecutorHandle, ArmError> {
+        self.ensure_dispatcher()?;
+        {
+            let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if !matches!(*slot, OwnerSlot::Legacy) {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "OWNER_ALREADY_TRANSFERRED".into(),
+                    message: "RT executor ownership can only be transferred once from Legacy mode".into(),
+                });
+            }
+            *slot = OwnerSlot::Transferring;
+            self.owner_mode.store(OWNER_TRANSFERRING, Ordering::Release);
+        }
+        let mut rollback = TransferGuard { sup: self, armed: true };
+
+        // The single `.await` point in handoff: if cancelled here, `TransferGuard` rolls back to `Legacy`.
+        let mut guard = self.inner.write().await;
+
+        // Zero `.await` points below this line: swap + synchronous spawn + commit/rollback.
+        if guard.detached || guard.calibration_busy || guard.motor_zero_busy {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "TRANSFER_BLOCKED".into(),
+                message: "Cannot transfer ownership while calibration or motor_zero is busy".into(),
+            });
+        }
+        #[cfg(feature = "policy-runtime")]
+        if guard.policy_loading || guard.policy_run.is_some() {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "TRANSFER_BLOCKED".into(),
+                message: "Cannot transfer ownership while policy runtime is active or loading".into(),
+            });
+        }
+
+        let initial_gen = self.inner.generation();
+        let shell = SupervisorInner::detached_shell(
+            &guard.config,
+            self.e_stop_latched.clone(),
+            self.requested_estop_count.clone(),
+        );
+        let real = std::mem::replace(&mut *guard, shell);
+
+        match crate::rt_core::executor::spawn_executor(
+            real,
+            cfg,
+            initial_gen,
+            Arc::clone(&self.config_write_mutex),
+            Arc::clone(&self.estop_reg),
+            Arc::clone(&self.tick_stats),
+            Arc::clone(&self.control_sched),
+            Arc::clone(&self.control_period_us),
+            hooks,
+        ) {
+            Ok((handle, sinks)) => {
+                *self.sinks.lock().unwrap_or_else(|e| e.into_inner()) = Some(sinks);
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Executor(handle.clone());
+                    self.owner_mode.store(OWNER_EXECUTOR, Ordering::Release);
+                }
+                rollback.armed = false;
+                drop(guard);
+                self.hub.wake();
+                Ok(handle)
+            }
+            Err((Some(real), msg)) => {
+                *guard = *real;
+                drop(guard);
+                Err(ArmError::Internal(msg))
+            }
+            Err((None, msg)) => {
+                {
+                    let mut slot = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+                    *slot = OwnerSlot::Failed;
+                    self.owner_mode.store(OWNER_FAILED, Ordering::Release);
+                }
+                rollback.armed = false;
+                drop(guard);
+                Err(ArmError::Internal(msg))
+            }
         }
     }
 
@@ -3661,7 +3880,10 @@ impl ArmSupervisor {
     }
 
     pub async fn set_operator_auth_enforced(&self, enforced: bool) {
-        self.inner.write().await.operator_auth_enforced = enforced;
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.operator_auth_enforced = enforced;
+        }
     }
 
     /// Every tick's observation, forwarded by the dispatcher thread (started here when it
@@ -3678,14 +3900,21 @@ impl ArmSupervisor {
     pub fn start_dispatcher(&self) -> Result<(), ArmError> { self.ensure_dispatcher() }
 
     /// Starts the dispatcher thread once: a normal-priority thread woken by every
-    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers and
-    /// drains the recording ring.
+    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers,
+    /// drains the recording ring, and drains executor diagnostics/reclamation sinks.
     pub(crate) fn ensure_dispatcher(&self) -> Result<(), ArmError> {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx) = (Arc::clone(&self.hub), self.telemetry_tx.clone());
-        let handle = std::thread::Builder::new().name("armd-dispatch".into()).spawn(move || dispatch_loop(&hub, &tx))
+        let (hub, tx, sinks, tick_stats) = (
+            Arc::clone(&self.hub),
+            self.telemetry_tx.clone(),
+            Arc::clone(&self.sinks),
+            Arc::clone(&self.tick_stats),
+        );
+        let handle = std::thread::Builder::new()
+            .name("armd-dispatch".into())
+            .spawn(move || dispatch_loop(&hub, &tx, &sinks, &tick_stats))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
@@ -3696,19 +3925,13 @@ impl ArmSupervisor {
         &self.inner
     }
 
+    #[doc(hidden)]
+    pub fn hub(&self) -> &Arc<crate::rt_core::publish::StateHub> {
+        &self.hub
+    }
+
     /// The current observation, without the supervisor lock while the control loop runs
     /// (`GET /api/v1/observation`).
-    ///
-    /// Served from the tick's publication (`crate::rt_core::publish`): a sample answers when
-    /// it was taken after every write that completed before this call (its lock generation is
-    /// at least the one seen here) and its validity deadline has not passed (lease expiry,
-    /// previous-action window, feedback freshness, two control periods). Otherwise, while a
-    /// sample younger than two control periods shows the control loop running, the call waits
-    /// for the next tick's sample (at most two periods). Without a running loop the
-    /// observation is computed under the read lock, waiting for it at most
-    /// [`OBS_LOCK_WAIT`]; when neither gives fresh state in time the call fails with 503
-    /// `OBSERVATION_UNAVAILABLE` instead of waiting further. The hub is only polled
-    /// (never waited for), and not at all while the read guard is held.
     pub async fn observation(&self) -> Result<ArmObservation, ArmError> {
         match self.fresh(true).await? {
             Fresh::Sample(s) => Ok(s.obs.clone()),
@@ -3716,12 +3939,36 @@ impl ArmSupervisor {
         }
     }
 
-    /// [`Self::observation`] for in-process callers and tests: when it is unavailable, waits
-    /// for the read lock without a bound (the 1.5 behaviour).
+    /// [`Self::observation`] for in-process callers and tests: when it is unavailable in Legacy
+    /// mode, waits for the read lock without a bound; in Executor mode, routes through the RT owner
+    /// (never reading the detached shell).
     pub async fn get_observation(&self) -> ArmObservation {
         match self.observation().await {
             Ok(obs) => obs,
-            Err(_) => self.inner.read().await.current_observation(),
+            Err(_) => {
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    if let Some(h) = self.executor_handle() {
+                        if let Ok(obs) = h.observation_async().await {
+                            return obs;
+                        }
+                    }
+                    if let Some(s) = self.hub.latest() {
+                        return s.obs.clone();
+                    }
+                    return ArmObservation::blank();
+                }
+                let inner = self.inner.read().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return inner.current_observation();
+                }
+                drop(inner);
+                if let Some(h) = self.executor_handle() {
+                    if let Ok(obs) = h.observation_async().await {
+                        return obs;
+                    }
+                }
+                self.hub.latest().map_or_else(ArmObservation::blank, |s| s.obs.clone())
+            }
         }
     }
 
@@ -3733,17 +3980,21 @@ impl ArmSupervisor {
 
     async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
         use crate::rt_core::publish::Poll;
+        let mode = self.owner_mode();
+        if mode == OWNER_TRANSFERRING || mode == OWNER_FAILED {
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(observation_unavailable());
+        }
         let want = self.inner.generation();
         let started = Instant::now();
         let bound = self.wait_bound();
         let mut waited = false;
         loop {
             let poll = self.hub.try_latest();
-            // read after the refresh: reclamation or preemption inside it must not let an
-            // expired sample through
             let now = Instant::now();
             match poll {
-                Poll::Ready(None) => break,
+                Poll::Ready(None) if mode != OWNER_EXECUTOR => break,
+                Poll::Ready(None) => {}
                 Poll::Ready(Some(s)) => {
                     if Self::answers(&s, want, now) {
                         if count {
@@ -3752,19 +4003,29 @@ impl ArmSupervisor {
                         }
                         return Ok(Fresh::Sample(s));
                     }
-                    if now.saturating_duration_since(s.meta.sampled_at) > bound { break; }
+                    if mode != OWNER_EXECUTOR && now.saturating_duration_since(s.meta.sampled_at) > bound {
+                        break;
+                    }
                 }
-                // another reader holds the hub: look again
                 Poll::Busy => {}
             }
             if now.duration_since(started) >= bound { break; }
             waited = true;
             tokio::time::sleep(OBS_POLL).await;
         }
+        // Executor mode NEVER falls back to reading the detached shell under `self.inner`.
+        if self.owner_mode() != OWNER_LEGACY {
+            if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+                if Self::answers(&s, want, Instant::now()) {
+                    if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                    return Ok(Fresh::Sample(s));
+                }
+            }
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(observation_unavailable());
+        }
         let seen_seq = self.hub.published_seq();
-        // one deadline for every wait for the read lock below (not one per attempt)
         let lock_deadline = tokio::time::Instant::now() + OBS_LOCK_WAIT;
-        // a stalled tick (or writer) holds the lock: one last non-blocking look, then 503
         let unavailable = || {
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
                 if Self::answers(&s, want, Instant::now()) {
@@ -3776,9 +4037,10 @@ impl ArmSupervisor {
             Err(observation_unavailable())
         };
         let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
-        // a tick may have published while this call waited for the lock. Only the atomic
-        // sequence is read under the guard: refreshing the hub (reclamation, the snapshot's
-        // allocation) happens after the guard is dropped
+        if self.check_legacy_under_guard(&inner).is_err() {
+            drop(inner);
+            return unavailable();
+        }
         if self.hub.published_seq() != seen_seq {
             drop(inner);
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
@@ -3788,6 +4050,10 @@ impl ArmSupervisor {
                 }
             }
             let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
+            if self.check_legacy_under_guard(&inner).is_err() {
+                drop(inner);
+                return unavailable();
+            }
             if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
             return Ok(Fresh::Locked(inner));
         }
@@ -3795,30 +4061,43 @@ impl ArmSupervisor {
         Ok(Fresh::Locked(inner))
     }
 
-    /// The newest sample while the control loop runs (one younger than two control
-    /// periods), for feedback reads: the per-joint feedback fields are written by the tick
-    /// (and by torque and fault handshakes, whose feedback the next sample carries).
     fn running_sample(&self) -> Option<Arc<crate::rt_core::publish::Snapshot>> {
         self.hub.latest().filter(|s| s.meta.sampled_at.elapsed() <= self.wait_bound())
     }
 
-    /// [`SupervisorInner::arm_feedback_snapshot`] from the newest sample while the control
-    /// loop runs, else under the read lock. `arm`: the profile's arm joint indices
-    /// (`config.arm_joint_indices()`).
     pub async fn arm_feedback_snapshot(&self, arm: &[usize]) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
-        match self.running_sample() {
-            Some(s) => s.rt.arm_feedback(arm),
-            None => self.inner.read().await.arm_feedback_snapshot(),
+        if let Some(s) = self.running_sample() {
+            return s.rt.arm_feedback(arm);
         }
+        if self.owner_mode() != OWNER_LEGACY {
+            return self
+                .hub
+                .latest()
+                .map_or_else(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()), |s| s.rt.arm_feedback(arm));
+        }
+        let inner = self.inner.read().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.arm_feedback_snapshot();
+        }
+        drop(inner);
+        self.hub
+            .latest()
+            .map_or_else(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()), |s| s.rt.arm_feedback(arm))
     }
 
-    /// The measured joint positions from the newest sample while the control loop runs,
-    /// else under the read lock.
     pub async fn measured_positions(&self) -> Vec<f32> {
-        match self.running_sample() {
-            Some(s) => s.rt.positions.clone(),
-            None => self.inner.read().await.measured_positions.clone(),
+        if let Some(s) = self.running_sample() {
+            return s.rt.positions.clone();
         }
+        if self.owner_mode() != OWNER_LEGACY {
+            return self.hub.latest().map_or_else(Vec::new, |s| s.rt.positions.clone());
+        }
+        let inner = self.inner.read().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.measured_positions.clone();
+        }
+        drop(inner);
+        self.hub.latest().map_or_else(Vec::new, |s| s.rt.positions.clone())
     }
 
     /// Scheduling of the control thread, reported by it after its real-time request.
@@ -3832,7 +4111,10 @@ impl ArmSupervisor {
 
     /// Records the `--follower` model name for `GET /api/v1/safety/describe`.
     pub async fn set_follower(&self, name: &str) {
-        self.inner.write().await.follower = Some(name.to_string());
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.follower = Some(name.to_string());
+        }
     }
 
     pub async fn get_config(&self) -> ArmConfig {
@@ -3840,9 +4122,10 @@ impl ArmSupervisor {
         inner.config.clone()
     }
 
-    pub async fn set_driver(&self, mut driver: Box<dyn ArmDriver>) {
+    pub async fn try_set_driver(&self, mut driver: Box<dyn ArmDriver>) -> Result<(), ArmError> {
         driver.set_abort_flag(self.e_stop_latched.clone());
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         driver.set_estop_gate(inner.estop_gate());
         driver.set_gripper_index(inner.config.gripper_index());
         let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
@@ -3864,20 +4147,27 @@ impl ArmSupervisor {
         }
         inner.apply_driver_limits(drv.as_ref());
         inner.driver = Some(std::sync::Mutex::new(drv));
+        Ok(())
+    }
+
+    pub async fn set_driver(&self, driver: Box<dyn ArmDriver>) {
+        let _ = self.try_set_driver(driver).await;
     }
 
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
-            driver.set_estop_gate(inner.estop_gate());
-            driver.set_gripper_index(inner.config.gripper_index());
-            driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
-            if driver.capabilities().load_feedback {
-                inner.loads = vec![f32::NAN; inner.config.dof];
+            if self.check_legacy_under_guard(&inner).is_ok() {
+                driver.set_estop_gate(inner.estop_gate());
+                driver.set_gripper_index(inner.config.gripper_index());
+                driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
+                if driver.capabilities().load_feedback {
+                    inner.loads = vec![f32::NAN; inner.config.dof];
+                }
+                let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
+                inner.apply_driver_limits(driver.as_ref());
+                inner.driver = Some(std::sync::Mutex::new(driver));
             }
-            let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
-            inner.apply_driver_limits(driver.as_ref());
-            inner.driver = Some(std::sync::Mutex::new(driver));
         }
         self
     }
@@ -3887,6 +4177,7 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.clone().write_owned().await;
+        self.check_legacy_under_guard(&inner)?;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
         if enable && inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
@@ -3977,6 +4268,7 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
@@ -3986,17 +4278,23 @@ impl ArmSupervisor {
 
     pub async fn execute_stop(&self, policy: StopPolicy) {
         let mut inner = self.inner.write().await;
-        inner.execute_stop(policy);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.execute_stop(policy);
+        }
     }
 
     pub async fn set_lease_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().await;
-        inner.lease_enabled = enabled;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.lease_enabled = enabled;
+        }
     }
 
     pub async fn set_temperatures(&self, temps: Vec<f32>) {
         let mut inner = self.inner.write().await;
-        inner.temperatures = temps;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.temperatures = temps;
+        }
     }
 
     pub async fn jog(
@@ -4006,6 +4304,7 @@ impl ArmSupervisor {
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         inner.jog(target_positions, duration_secs, epoch_id)
     }
 
@@ -4015,54 +4314,196 @@ impl ArmSupervisor {
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
+        self.check_legacy_under_guard(&inner)?;
         let home_pos = inner.config.home_positions.clone();
         inner.jog_action(home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
-    pub async fn stop_motion(&self) { self.inner.write().await.stop_motion(); }
+    pub async fn stop_motion(&self) {
+        let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.stop_motion();
+        }
+    }
 
-    pub async fn shutdown_ready(&self) -> bool { self.inner.read().await.shutdown_ready() }
+    pub async fn shutdown_ready(&self) -> bool {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => match self.executor_handle() {
+                Some(h) => h.shutdown_ready_async().await.unwrap_or(false),
+                None => false,
+            },
+            OWNER_LEGACY => {
+                let inner = self.inner.read().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return inner.shutdown_ready();
+                }
+                drop(inner);
+                match self.executor_handle() {
+                    Some(h) => h.shutdown_ready_async().await.unwrap_or(false),
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Authoritative shutdown gate routed through whichever single owner holds `ArmCore`.
+    pub async fn request_shutdown(&self) -> Result<bool, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => match self.executor_handle() {
+                Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                None => Err(executor_unavailable()),
+            },
+            OWNER_LEGACY => {
+                let mut inner = self.inner.write().await;
+                if self.check_legacy_under_guard(&inner).is_ok() {
+                    return Ok(inner.request_shutdown());
+                }
+                drop(inner);
+                match self.executor_handle() {
+                    Some(h) => h.request_shutdown_async().await.map_err(Into::into),
+                    None => Err(executor_unavailable()),
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
 
     pub async fn is_at_safe_resting_pose(&self) -> bool {
         let inner = self.inner.read().await;
         inner.is_at_safe_resting_pose()
     }
 
-    pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
-        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
-        self.e_stop_latched.store(true, Ordering::SeqCst);
-        let inner = Arc::clone(&self.inner);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let jh = handle.spawn(async move {
-                let mut guard = inner.write().await;
-                guard.consume_pending_estop();
-                (guard.safety.state().clone(), guard.safety.epoch_id())
-            });
-            match jh.await {
-                Ok(res) => res,
+    async fn await_estop_waiter(
+        &self,
+        mut rx: tokio::sync::oneshot::Receiver<Result<(SafetyState, u64), ArmError>>,
+    ) -> Result<(SafetyState, u64), ArmError> {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
+                Ok(Ok(res)) => return res,
+                Ok(Err(_)) => {
+                    return Err(ArmError::Rejected {
+                        status: 503,
+                        code: "EXECUTOR_STOPPED".into(),
+                        message: "RT executor stopped before acknowledging E-stop".into(),
+                    });
+                }
                 Err(_) => {
-                    let guard = self.inner.read().await;
-                    (guard.safety.state().clone(), guard.safety.epoch_id())
+                    self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
                 }
             }
-        } else {
-            let mut guard = inner.write().await;
-            guard.consume_pending_estop();
-            (guard.safety.state().clone(), guard.safety.epoch_id())
         }
     }
 
-    pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
-        let mut inner = self.inner.clone().write_owned().await;
-        let res = tokio::task::spawn_blocking(move || inner.clear_fault())
+    /// Lock-free physical stop latch + exact per-request pinned acknowledgement across both
+    /// Legacy and Executor ownership (including concurrent Legacy -> Executor handoff).
+    pub async fn trigger_e_stop_checked(&self) -> Result<(SafetyState, u64), ArmError> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop_checked");
+        // Set the physical E-stop latch FIRST before touching any lock.
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        let (req, mut rx, mode) = {
+            let mut reg = self.estop_reg.lock().unwrap_or_else(|e| e.into_inner());
+            let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let rx = reg.register(req);
+            let mode = self.owner_mode.load(Ordering::Acquire);
+            if mode == OWNER_EXECUTOR {
+                reg.drain();
+            }
+            (req, rx, mode)
+        };
+        match mode {
+            OWNER_EXECUTOR => self.await_estop_waiter(rx).await,
+            OWNER_LEGACY => {
+                let inner = Arc::clone(&self.inner);
+                let owner_mode_ref = &self.owner_mode;
+                let mut guard = inner.write().await;
+                if !guard.detached && owner_mode_ref.load(Ordering::Acquire) == OWNER_LEGACY {
+                    guard.consume_pending_estop();
+                    let applied = guard.applied_estop_count;
+                    let res = (guard.safety.state().clone(), guard.safety.epoch_id());
+                    drop(guard);
+                    self.estop_reg
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .resolve_up_to(applied, res.0.clone(), res.1);
+                    return Ok(res);
+                }
+                drop(guard);
+                // Ownership changed while waiting on `inner.write()`: if a concurrent legacy
+                // call already applied `req`, return that pinned result immediately.
+                if let Ok(res) = rx.try_recv() {
+                    return res;
+                }
+                match self.owner_mode() {
+                    OWNER_EXECUTOR => {
+                        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+                        self.await_estop_waiter(rx).await
+                    }
+                    _ => {
+                        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).cancel_waiter(
+                            req,
+                            503,
+                            "EXECUTOR_UNAVAILABLE",
+                            "RT executor ownership unavailable while applying E-stop",
+                        );
+                        if let Ok(res) = rx.try_recv() {
+                            return res;
+                        }
+                        Err(executor_unavailable())
+                    }
+                }
+            }
+            _ => {
+                self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).cancel_waiter(
+                    req,
+                    503,
+                    "EXECUTOR_UNAVAILABLE",
+                    "RT executor ownership is transitioning or unavailable",
+                );
+                Err(executor_unavailable())
+            }
+        }
+    }
+
+    pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::trigger_e_stop");
+        self.trigger_e_stop_checked()
             .await
-            .map_err(|e| ArmError::Internal(format!("clear_fault blocking task failed: {e}")))?;
-        res.map_err(ArmError::Safety)
+            .unwrap_or((SafetyState::EStop, 0))
+    }
+
+    pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                res.map_err(ArmError::Safety)
+            }
+            OWNER_LEGACY => {
+                let mut inner = self.inner.clone().write_owned().await;
+                if self.check_legacy_under_guard(&inner).is_err() {
+                    drop(inner);
+                    if self.owner_mode() == OWNER_EXECUTOR {
+                        let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                        let res = h.clear_fault_async().await.map_err(ArmError::from)?;
+                        return res.map_err(ArmError::Safety);
+                    }
+                    return Err(executor_unavailable());
+                }
+                let res = tokio::task::spawn_blocking(move || inner.clear_fault())
+                    .await
+                    .map_err(|e| ArmError::Internal(format!("clear_fault blocking task failed: {e}")))?;
+                res.map_err(ArmError::Safety)
+            }
+            _ => Err(executor_unavailable()),
+        }
     }
 
     pub async fn apply_stop_policy(&self, policy: StopPolicy) {
         let mut inner = self.inner.write().await;
-        inner.apply_stop_policy(policy);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.apply_stop_policy(policy);
+        }
     }
 
     pub async fn is_unloading(&self) -> bool {
@@ -4077,22 +4518,31 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick");
         self.tick_shared(dt, true).await.expect("tick keeps a copy when asked")
     }
 
     /// [`Self::tick`] for the control loop, which does not use the observation: saves a copy.
     pub async fn control_tick(&self, dt: f64) {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::control_tick");
         self.tick_shared(dt, false).await;
     }
 
     /// One tick; publishes its observation (`crate::rt_core::publish`) and returns a copy
     /// when `keep`.
     async fn tick_shared(&self, dt: f64, keep: bool) -> Option<ArmObservation> {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::tick_shared");
+        if self.owner_mode() != OWNER_LEGACY {
+            return None;
+        }
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
         let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
+            if inner.detached || self.owner_mode() != OWNER_LEGACY {
+                return None;
+            }
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
             let _ = crate::diagnostics::alloc::take();
@@ -4380,12 +4830,14 @@ impl ArmSupervisor {
 
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
+        self.drain_diag();
         self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
     }
 
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
     /// the stats mutex and sorted after it is released, so this route does not delay a tick.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
+        self.drain_diag();
         let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
         let mut snap = window.snapshot();
         snap.control_thread = self.control_sched.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -4411,8 +4863,15 @@ impl ArmSupervisor {
 }
 
 /// The dispatcher thread: forwards each new sample to the telemetry receivers (one clone
-/// per sample, off the control thread) until the supervisor is dropped.
-fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender<ArmObservation>) {
+/// per sample, off the control thread), drains the recording ring, and drains RT executor
+/// diagnostics / E-stop acks / maintenance replies / orphaned persistence replies until
+/// the supervisor is dropped.
+fn dispatch_loop(
+    hub: &crate::rt_core::publish::StateHub,
+    tx: &broadcast::Sender<ArmObservation>,
+    sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
+    tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+) {
     #[cfg(target_os = "linux")]
     {
         // a normal-priority thread even when started from a real-time one
@@ -4424,8 +4883,15 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
             libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param);
         }
     }
+    let drain_sinks = || {
+        let s = sinks.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(s) = s {
+            s.drain_all(tick_stats);
+        }
+    };
     let mut last = 0;
     while !hub.is_closed() {
+        drain_sinks();
         if let Some(ring) = hub.record_ring() { ring.drain(); }
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
@@ -4435,6 +4901,10 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
         }
         std::thread::park_timeout(Duration::from_millis(50));
     }
+    // Final drain on supervisor close so no retired/diagnostic/reply items are stranded.
+    drain_sinks();
+    if let Some(ring) = hub.record_ring() { ring.drain(); }
+    let _ = hub.latest();
 }
 
 #[cfg(test)]
