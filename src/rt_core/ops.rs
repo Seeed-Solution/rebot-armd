@@ -675,6 +675,7 @@ impl CoreOps for SupervisorInner {
         // One budgeted bus service per release: first serve any torque transition in flight,
         // then apply feedback from the transition's RX cache (when this call polled the bus)
         // or run a single budgeted receive pass.
+        let was_torqued_or_disabling = self.is_torqued || self.disable_pending;
         let trans = self.service_torque_transition(budget);
         let transition_rx = if let Some(tp) = trans {
             self.core.begin_transition(tp.progress);
@@ -686,20 +687,12 @@ impl CoreOps for SupervisorInner {
         let rx_frames = rx.rx_frames;
         let rx_exhausted = rx.budget_exhausted;
         self.pending_rx_poll = rx;
-        // If a background disable (non-broker, e.g. failed enable or thermal trip) was pending
-        // and Step 2's fresh feedback just confirmed every motor disabled, clear `disable_pending`
-        // immediately so Step 2b maintenance (`ClearFault`/`RequestShutdown`) and Step 3 commits
-        // observe the confirmed torque-off on this release rather than waiting until Step 5.
-        if self.disable_pending && self.torque_transition.is_none() {
-            let confirmed = self.driver.as_ref().is_none_or(|d| {
-                d.lock().is_ok_and(|drv| drv.is_feedback_valid() && drv.enable_state() == crate::driver::EnableState::Disabled)
-            });
-            if confirmed {
-                self.is_torqued = false;
-                self.pending_rearm = false;
-                self.disable_pending = false;
-            }
-        }
+        // Run thermal protection BEFORE consuming background disable confirmation and before
+        // Step 2b maintenance (`ClearFault`/`RequestShutdown`) or Step 3 command admission so an
+        // over-temperature sample arriving on the same poll as confirmed disable cannot suppress
+        // `ThermalTrip`.
+        self.check_thermal_protection(was_torqued_or_disabling);
+        let _ = self.confirm_background_disable_if_ready();
         let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
         let Some(driver) = self.driver.as_ref() else {
             return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };

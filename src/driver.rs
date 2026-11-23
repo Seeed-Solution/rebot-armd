@@ -3652,13 +3652,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
-    /// Joints (mask) whose feedback is newer than `after` and reports `state`; and whether every
-    /// joint answered after `after`.
-    fn fresh_state_mask(&self, after: Instant, state: u8) -> (u32, bool) {
+    /// Single per-motor post-command feedback boundary shared by [`Self::enable_state`],
+    /// [`Self::fresh_state_mask`] (`poll_enable`/`poll_disable`), MIT recovery, TIMEOUT
+    /// commissioning, and `set_zero_position`.
+    fn motor_feedback_after(
+        &self,
+        i: usize,
+        after_instant: Option<Instant>,
+        after_rx_seq: Option<u64>,
+    ) -> bool {
+        !self.awaiting_rx_boundary
+            && self.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| {
+                after_instant.is_none_or(|cmd| t >= cmd)
+                    && after_rx_seq.is_none_or(|seq| self.last_feedback_seq[i] > seq)
+            })
+    }
+
+    /// Joints (mask) whose feedback arrived strictly after `(after, after_rx_seq)` and reports
+    /// `state`; and whether every joint answered after that boundary.
+    fn fresh_state_mask(&self, after: Instant, after_rx_seq: Option<u64>, state: u8) -> (u32, bool) {
         let mut mask = 0u32;
-        let mut all_fresh = !self.last_feedback_instant.is_empty();
+        let mut all_fresh = !self.last_feedback_instant.is_empty() && !self.awaiting_rx_boundary;
         for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
-            let fresh = self.last_feedback_instant[i].is_some_and(|t| t >= after);
+            let fresh = self.motor_feedback_after(i, Some(after), after_rx_seq);
             all_fresh &= fresh;
             if fresh && self.motor_status[i] == state { mask |= 1 << i; }
         }
@@ -3711,7 +3727,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         let _ = self.receive_feedback();
         self.enable_estop_inhibited()?;
-        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, 1);
+        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, self.last_enable_command_rx_seq, 1);
         let fault = if all_fresh { self.motor_status.iter().position(|&st| damiao_fault_name(st).is_some()) } else { None };
         match window.service(self.now(), mask, all_fresh, fault) {
             Service::Confirmed => {
@@ -3816,7 +3832,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed));
         }
         let _ = self.receive_feedback();
-        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, 0);
+        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, self.last_enable_command_rx_seq, 0);
         match window.service(self.now(), mask, all_fresh, None) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
@@ -3940,36 +3956,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn enable_state(&self) -> EnableState {
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
+        if self.awaiting_rx_boundary || self.motor_status.is_empty() || !self.is_feedback_valid() {
             return EnableState::Unknown;
         }
-        // Every motor must have reported feedback since startup, and (once an enable or
-        // disable request has been issued) strictly after that request. Initial zeroed
-        // `motor_status` without observed feedback never proves `Disabled`.
-        if self.last_feedback_instant.iter().enumerate().any(|(i, t)| {
-            t.is_none_or(|sample| {
-                self.last_enable_command.is_some_and(|command| sample < command)
-                    || self.last_enable_command_rx_seq.is_some_and(|seq| self.last_feedback_seq[i] <= seq)
-            })
+        // Every motor must have reported current feedback since startup, and (once an enable or
+        // disable request has been issued) strictly after that request using the exact same
+        // per-motor boundary as `fresh_state_mask`. Initial zeroed `motor_status`, pre-command
+        // samples, or stale feedback after CAN silence never prove `Disabled`.
+        if (0..self.motor_ids.len()).any(|i| {
+            !self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
         }) {
             return EnableState::Unknown;
         }
-        if self.is_enabled {
-            if !self.is_feedback_valid() {
-                return EnableState::Unknown;
-            }
-            // Fresh feedback from every motor reporting state 0 is physical proof of
-            // torque-off (e.g. motor power dip), whatever the cached enable flag says.
-            if self.motor_status.iter().all(|&state| state == 0) {
-                return EnableState::Disabled;
-            }
-            if self.motor_status.iter().all(|&state| state == 1) {
-                EnableState::Enabled
-            } else {
-                EnableState::Unknown
-            }
-        } else if self.motor_status.iter().all(|&state| state == 0) {
+        if self.motor_status.iter().all(|&state| state == 0) {
             EnableState::Disabled
+        } else if self.is_enabled && self.motor_status.iter().all(|&state| state == 1) {
+            EnableState::Enabled
         } else {
             EnableState::Unknown
         }
@@ -4121,9 +4123,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // 2. no cached frame may ever be replayed; then the disable of every motor
         self.last_target_frames.fill(None);
         let res = self.set_torque(false);
-        let cmd = self.last_enable_command;
         let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
-            !(self.last_feedback_instant[i].is_some_and(|t| cmd.is_some_and(|c| t >= c)) && self.motor_status[i] == 0)
+            !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                && self.motor_status[i] == 0)
         }).map(|i| format!("J{}", i + 1)).collect();
         if res.is_err() || !unconfirmed.is_empty() {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
@@ -4168,9 +4170,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         for &i in joints {
             // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
-            let fresh = self.last_feedback_instant[i].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE
-                && self.last_enable_command.is_none_or(|c| t >= c));
-            if self.awaiting_rx_boundary || !fresh || self.motor_status[i] != 0 {
+            let fresh = self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                && self.last_feedback_instant[i].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
+            if !fresh || self.motor_status[i] != 0 {
                 return Err(none_attempted(ArmDriverError::HardwareFault(format!("joint {} (CAN ID 0x{:X}) is not confirmed disabled (state {})",
                     i + 1, self.motor_ids[i], self.motor_status[i]))));
             }
@@ -4207,9 +4209,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(ArmDriverError::Protocol(format!("joint {} (CAN ID 0x{id:X}): set-zero needs torque off", joint + 1)));
         }
         // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
-        let fresh = self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE
-            && self.last_enable_command.is_none_or(|c| t >= c));
-        if self.awaiting_rx_boundary || !fresh || self.motor_status[joint] != 0 {
+        let fresh = self.motor_feedback_after(joint, self.last_enable_command, self.last_enable_command_rx_seq)
+            && self.last_feedback_instant[joint].is_some_and(|t| self.since(t) <= ZERO_FEEDBACK_MAX_AGE);
+        if !fresh || self.motor_status[joint] != 0 {
             return Err(ArmDriverError::HardwareFault(format!(
                 "joint {} (CAN ID 0x{id:X}) is not confirmed disabled (state {}, feedback age {:?})",
                 joint + 1, self.motor_status[joint], self.last_feedback_instant[joint].map(|t| self.since(t)))));

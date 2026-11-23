@@ -609,7 +609,7 @@ impl SupervisorInner {
     }
 
     /// State once fresh feedback confirmed the disable.
-    fn disable_confirmed(&mut self) {
+    pub(super) fn disable_confirmed(&mut self) {
         self.is_torqued = false;
         self.pending_rearm = false;
         self.disable_pending = false;

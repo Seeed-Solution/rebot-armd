@@ -1610,6 +1610,43 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Thermal protection remains active while torqued or while torque disable is unconfirmed.
+    /// `was_active` preserves thermal protection when a torque transition confirmed disable on
+    /// the exact same Step 2 poll that delivered an over-temperature sample.
+    pub(crate) fn check_thermal_protection(&mut self, was_active: bool) {
+        let temperature_available = self
+            .driver
+            .as_ref()
+            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+        if (self.is_torqued || self.disable_pending || was_active)
+            && temperature_available
+            && self
+                .temperatures
+                .iter()
+                .any(|t| t.is_finite() && *t > self.config.max_temperature)
+            && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }))
+        {
+            self.apply_stop_policy(StopPolicy::ThermalTrip);
+        }
+    }
+
+    /// Consumes confirmation of a non-broker background disable once fresh valid hardware
+    /// feedback reports every motor disabled. Returns `true` when no background disable
+    /// remains pending.
+    pub(crate) fn confirm_background_disable_if_ready(&mut self) -> bool {
+        if !self.disable_pending || self.torque_transition.is_some() {
+            return true;
+        }
+        let confirmed = self.driver.as_ref().is_none_or(|d| {
+            d.lock()
+                .is_ok_and(|drv| drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled)
+        });
+        if confirmed {
+            self.disable_confirmed();
+        }
+        confirmed
+    }
+
     pub fn shutdown_ready(&self) -> bool {
         if self.disable_pending || self.gravity_comp.is_some() || self.torque_transition_pending() {
             return false;
@@ -2617,22 +2654,13 @@ impl SupervisorInner {
         self.supervise_watchdog_park(dt);
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
-        let temperature_available = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
-        if (self.is_torqued || self.disable_pending) && temperature_available
-            && self.temperatures.iter().any(|t| t.is_finite() && *t > self.config.max_temperature)
-                && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
-                self.apply_stop_policy(StopPolicy::ThermalTrip);
-            }
+        self.check_thermal_protection(false);
         // (a torque transition in flight confirms its own disable: `service_torque_transition`)
-        if self.disable_pending && self.torque_transition.is_none() {
-            let confirmed = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv|
-                drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
-            if confirmed {
-                self.is_torqued = false;
-                self.pending_rearm = false;
-                self.disable_pending = false;
-            } else if self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
-                if let Err(e) = self.request_disable() { tracing::warn!("Torque shutdown remains unconfirmed: {e}"); }
+        if !self.confirm_background_disable_if_ready()
+            && self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250))
+        {
+            if let Err(e) = self.request_disable() {
+                tracing::warn!("Torque shutdown remains unconfirmed: {e}");
             }
         }
         // Detect sustained physical tracking error, never compare against stale samples.

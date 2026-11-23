@@ -1502,3 +1502,229 @@ async fn panic_disable_deadline_observer_fires_on_blocking_driver_and_preserves_
     assert!(t_leg.elapsed() < Duration::from_millis(500), "legacy panic disable took {:?}", t_leg.elapsed());
     let _ = release_tx3.send(());
 }
+
+// ============================================================================
+// 10. Unified Damiao fresh feedback boundary (virtual clock) & Step 2 thermal protection
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damiao_unified_fresh_boundary_and_stale_shutdown_gate_virtual_clock() {
+    // (a) Frozen virtual clock + MIT fence: pre-command state-0 feedback must NOT confirm
+    // `poll_disable` or release the MIT fence when `enable_state()` is `Unknown`.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.set_torque(true).unwrap();
+    assert_eq!(drv.enable_state(), EnableState::Enabled);
+    drv.set_mit_deadline_fence(Some(Duration::from_millis(500)), Duration::from_millis(200));
+
+    // Inject pre-disable state-0 feedback at the current frozen virtual timestamp, then stop
+    // immediate replies so `begin_torque(false)` gets zero post-command replies at the same `t`.
+    bus.with(|s| {
+        s.immediate_replies = false;
+        for m in &mut s.motors {
+            m.enabled = false;
+        }
+        s.push_all_feedback();
+    });
+    drv.read_joint_states().unwrap();
+    assert_eq!(drv.enable_state(), EnableState::Disabled);
+
+    let p0 = drv.begin_torque(false).unwrap();
+    assert!(matches!(p0, TorqueProgress::Pending { .. }));
+    assert_eq!(drv.enable_state(), EnableState::Unknown);
+
+    // Polling at the SAME frozen timestamp with NO post-command feedback MUST stay Pending
+    // and MUST keep the MIT fence armed!
+    let p1 = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
+    assert!(
+        matches!(p1, TorqueProgress::Pending { .. }),
+        "frozen-clock pre-command state-0 feedback must not confirm disable handshake: {p1:?}"
+    );
+    assert_eq!(drv.enable_state(), EnableState::Unknown);
+    assert!(drv.mit_fence_trip().is_none(), "fence must stay armed, not tripped yet");
+    let hold = vec![JointTarget::position(0.0); 7];
+    let mode_err = drv
+        .set_joint_modes(&[JointMode::Position; 7], &hold)
+        .unwrap_err();
+    assert!(
+        mode_err.to_string().contains("MIT tracking holds the deadline fence"),
+        "MIT fence must stay armed while disable is unconfirmed: {mode_err}"
+    );
+
+    // Advance virtual clock past DAMIAO_DISABLE_CONFIRM (still below the 500 ms fence deadline)
+    // with no post-command replies: disable fails and MIT fence STILL stays armed.
+    clock.advance(Duration::from_millis(350));
+    let expire_err = drv
+        .poll_torque(clock.now() + Duration::from_millis(50))
+        .expect_err("unconfirmed fenced disable must error on expiry");
+    assert!(expire_err.to_string().contains("MIT fence stays"), "{expire_err}");
+    assert!(drv.mit_fence_trip().is_none(), "fence stayed armed via unconfirmed disable, not age trip");
+    assert!(drv
+        .set_joint_modes(&[JointMode::Position; 7], &hold)
+        .is_err());
+
+    // Now start disable again and provide genuine post-command state-0 feedback on the same
+    // frozen timestamp: `rx_seq` advances past the command boundary, confirming disable and
+    // releasing the MIT fence!
+    let _ = drv.begin_torque(false).unwrap();
+    bus.with(|s| s.push_all_feedback());
+    let p_ok = drv.poll_torque(clock.now() + Duration::from_millis(50)).unwrap();
+    assert_eq!(p_ok, TorqueProgress::Done(TorqueOutcome::Confirmed));
+    assert_eq!(drv.enable_state(), EnableState::Disabled);
+    drv.set_joint_modes(&[JointMode::Position; 7], &hold)
+        .expect("confirmed post-command disable must release MIT fence");
+
+    // (b) Stale disabled feedback (virtual clock advances past 250 ms with silent CAN bus):
+    // `enable_state()` MUST become `Unknown` even with `!is_enabled`, and `shutdown_ready()`
+    // / `request_shutdown()` MUST refuse until current state-0 feedback returns!
+    let clock2 = MockClock::new();
+    let bus2 = FakeBus::with_clock(&dm_limits(), clock2.clone());
+    bus2.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let mut drv2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv2.read_joint_states().unwrap();
+    assert_eq!(drv2.enable_state(), EnableState::Disabled);
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
+    sup.set_lease_enabled(false).await;
+    assert!(sup.shutdown_ready().await, "current state-0 feedback confirms shutdown_ready");
+
+    // Advance virtual clock past 250 ms without any new CAN frames -> stale feedback -> Unknown!
+    clock2.advance(Duration::from_millis(300));
+    assert!(
+        !sup.shutdown_ready().await,
+        "stale disabled Damiao feedback (>250 ms) must make enable_state Unknown and refuse shutdown_ready"
+    );
+    assert!(
+        !sup.request_shutdown().await.unwrap(),
+        "request_shutdown must refuse stale disabled Damiao feedback"
+    );
+
+    // Fresh state-0 feedback restores Disabled and shutdown_ready!
+    bus2.with(|s| s.push_all_feedback());
+    {
+        let inner = sup.inner().read().await;
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        drv.read_joint_states().unwrap();
+        assert_eq!(drv.enable_state(), EnableState::Disabled);
+    }
+    assert!(sup.shutdown_ready().await);
+    assert!(sup.request_shutdown().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step2_simultaneous_disable_confirm_and_overtemp_latches_thermal_trip() {
+    // Driver that reports disabled (`EnableState::Disabled`) AND over-temperature on the very
+    // same Step 2 poll while `disable_pending == true` (simulating a hot motor whose disable
+    // confirmation arrives together with the over-temperature feedback sample).
+    struct HotDisableConfirmDriver {
+        temp_c: Arc<std::sync::Mutex<f32>>,
+        state: Arc<std::sync::Mutex<EnableState>>,
+        disables_sent: Arc<AtomicUsize>,
+    }
+
+    impl ArmDriver for HotDisableConfirmDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            *self.state.lock().unwrap()
+        }
+        fn is_enabled(&self) -> bool {
+            *self.state.lock().unwrap() == EnableState::Enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::ZERO); 7]
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            let t = *self.temp_c.lock().unwrap();
+            Ok((0..7)
+                .map(|i| JointState {
+                    position: 0.0,
+                    velocity: 0.0,
+                    torque: 0.0,
+                    temperature: if i == 2 { t } else { 30.0 },
+                })
+                .collect())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            if !enable {
+                self.disables_sent.fetch_add(1, Ordering::SeqCst);
+                *self.state.lock().unwrap() = EnableState::Disabled;
+            } else {
+                *self.state.lock().unwrap() = EnableState::Enabled;
+            }
+            Ok(())
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    let temp_c = Arc::new(std::sync::Mutex::new(35.0f32));
+    let state = Arc::new(std::sync::Mutex::new(EnableState::Unknown));
+    let disables_sent = Arc::new(AtomicUsize::new(0));
+    let drv = HotDisableConfirmDriver {
+        temp_c: temp_c.clone(),
+        state: state.clone(),
+        disables_sent: disables_sent.clone(),
+    };
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.max_temperature = 70.0;
+    let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(drv)));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        // Background disable in flight (`disable_pending == true`, `is_torqued == false`),
+        // not yet faulted with ThermalTrip.
+        inner.is_torqued = false;
+        inner.disable_pending = true;
+    }
+
+    // Before Step 2 polls: deliver BOTH confirmed disable (`Disabled`) AND over-temperature (92°C)
+    // in the exact same feedback poll.
+    *state.lock().unwrap() = EnableState::Disabled;
+    *temp_c.lock().unwrap() = 92.0;
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+
+    let obs = sup.observation().await.unwrap();
+    assert!(
+        matches!(obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { joint_idx: 2, .. })),
+        "simultaneous disable confirmation and over-temp in Step 2 must latch ThermalTrip, got {:?}",
+        obs.safety_state
+    );
+    assert!(disables_sent.load(Ordering::SeqCst) >= 1);
+    // And Step 2b `clear_fault()` must refuse while temperature stays above reset threshold.
+    assert!(sup.clear_fault().await.is_err());
+
+    handle.stop_and_join();
+}
