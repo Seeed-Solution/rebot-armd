@@ -963,6 +963,11 @@ pub struct GripperRequest {
 pub const GRIPPER_DEFAULT_TIMEOUT_S: f64 = 6.0;
 /// Added to the expected duration for the default gripper deadline (s).
 pub const GRIPPER_TIMEOUT_MARGIN_S: f64 = 2.0;
+/// Default deadline: the commanded travel time x this ...
+pub const GRIPPER_TRAVEL_TIME_FACTOR: f64 = 1.2;
+/// ... bounded by this (s), the largest explicit `timeout_s` (a full 5.7 rad stroke at 0.3 rad/s
+/// gives 1.2 x 19 + 0.5 + 0.3 + 2 = 25.6 s).
+pub const GRIPPER_MAX_DEFAULT_TIMEOUT_S: f64 = 30.0;
 /// A default (derived) gripper deadline may be extended by at most this (s), and only while the
 /// jaw moves unloaded: progressing toward the target with |τ| within the learned free-motion
 /// threshold over the whole window. Against an obstacle it is never extended.
@@ -1309,9 +1314,8 @@ impl GripperMotion {
             window_unloaded: true, cap_k: None,
         };
         m.extendable = m.request.timeout_s.is_none();
-        m.timeout_s = m.request.timeout_s
-            .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
-        m.hard_timeout_s = if m.extendable { m.timeout_s + GRIPPER_MAX_EXTENSION_S } else { m.timeout_s };
+        m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
+        m.hard_timeout_s = if m.extendable { (m.timeout_s + GRIPPER_MAX_EXTENSION_S).min(GRIPPER_MAX_DEFAULT_TIMEOUT_S).max(m.timeout_s) } else { m.timeout_s };
         m
     }
 
@@ -1367,6 +1371,17 @@ impl GripperMotion {
         let Some(samples) = self.samples.take() else { return };
         let direction = if (self.target - self.start) * self.close_dir() > 0.0 { Direction::Close } else { Direction::Open };
         self.learned = Some(MoveRecord { direction, start_rad: self.start, end_rad: m_g, samples, calibration: self.learn == LearnMode::Calibration });
+    }
+
+    /// Default deadline (s): the travel at the requested speed with GRIPPER_TRAVEL_TIME_FACTOR
+    /// margin (the real jaw lags its command: B601-DM full closes at 0.3 rad/s took 20.0-21.1 s
+    /// for 19 s of commanded travel), plus 0.5 s, the squeeze window and
+    /// GRIPPER_TIMEOUT_MARGIN_S; at least GRIPPER_DEFAULT_TIMEOUT_S, at most
+    /// GRIPPER_MAX_DEFAULT_TIMEOUT_S.
+    pub fn default_timeout_s(&self) -> f64 {
+        let travel = f64::from((self.target - self.start).abs()) / self.request.speed;
+        (GRIPPER_TRAVEL_TIME_FACTOR * travel + 0.5 + self.policy.settle_ms as f64 / 1000.0 + GRIPPER_TIMEOUT_MARGIN_S)
+            .clamp(GRIPPER_DEFAULT_TIMEOUT_S, GRIPPER_MAX_DEFAULT_TIMEOUT_S)
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.

@@ -823,3 +823,18 @@ fn real_profile_slow_closes_before_calibration() {
     assert!(!calibrated && (t - 0.85).abs() < 1e-4, "{t}");
 }
 
+/// The default deadline covers a full stroke at the 0.3 rad/s close speed with margin, bounded.
+#[test]
+fn default_deadline_covers_a_slow_full_stroke() {
+    let p = GripperPolicy::rebot_dm();
+    let lim = ArmConfig::rebot_dm().limits[6].clone();
+    let m = armd::motion::GripperMotion::new(GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.3, timeout_s: None, tag: None },
+        p.clone(), lim.clone(), p.open_rad, 6);
+    let travel = f64::from((p.open_rad - p.closed_rad).abs()) / 0.3;
+    eprintln!("full stroke at 0.3 rad/s: travel {travel:.1} s, deadline {:.1} s, bound {:.1} s", m.timeout_s, m.hard_timeout_s());
+    assert!(m.timeout_s >= 1.2 * travel && m.timeout_s <= armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S);
+    assert!(m.hard_timeout_s() <= armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S);
+    let slowest = armd::motion::GripperMotion::new(GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 0.05, timeout_s: None, tag: None },
+        p.clone(), lim, p.open_rad, 6);
+    assert_eq!(slowest.timeout_s, armd::motion::GRIPPER_MAX_DEFAULT_TIMEOUT_S);
+}

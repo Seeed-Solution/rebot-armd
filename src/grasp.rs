@@ -416,7 +416,8 @@ impl Default for GraspSetup {
             align_max_angle_spread_deg: 15.0,
             approach_speed_mps: 0.05,
             descend_speed_mps: 0.03,
-            phase_timeout_s: 25.0,
+            // covers a gripper close at close_speed_rad_s over the whole stroke (25.6 s deadline)
+            phase_timeout_s: 30.0,
             timeout_s: 120.0,
             acquire_camera_down: AcquireCameraDown::Auto,
             recheck_tol_px: 40.0,
