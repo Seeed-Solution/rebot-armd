@@ -169,6 +169,11 @@ impl ArmDriver for ZeroOffsetDriver {
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.inner.joint_loads_into(out) }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.inner.motor_status_into(out) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
+    fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
+    fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+    fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
+    fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.inner.clear_fault() }
