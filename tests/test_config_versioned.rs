@@ -1,7 +1,9 @@
-//! Versioned configuration (armd 1.6 RT core, track B): reserve at the candidate's
-//! revision, persist, apply + activate, release on failure. Each outcome asserts the file on
-//! disk, the active revision and motion eligibility (no reservation left that inhibits
-//! motion; a joint motion is admitted afterwards).
+//! Versioned configuration (armd 1.6 RT core, track B, contracts v2): reserve at the
+//! candidate's revision, persist, apply + activate, release on failure, `Reconciling` after a
+//! failure past the rename and at start. Each outcome asserts the file on disk, the active
+//! revision and motion eligibility (no hold left that inhibits motion; a joint motion is
+//! admitted afterwards). RT-side tests use one monotonic base instant or the fixture's
+//! virtual clock, never sleeps.
 
 mod common;
 
@@ -13,9 +15,10 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 use armd::model::KeepoutBox;
-use armd::rt_core::broker::{BootId, Capacities, ClientId, Reply, Submit};
-use armd::rt_core::config_iface::{Activated, ConfigAuthority, ConfigDomain, Durability, Reserved};
+use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit};
+use armd::rt_core::config_iface::{Activated, ConfigAuthority, ConfigDomain, Durability, HoldState, Released, Reserved};
 use armd::rt_core::ops::{CoreOps, Primitive, ReleaseFixture};
+use armd::supervisor::ArmError;
 use armd::{ArmConfig, ArmSupervisor, SupervisorInner};
 use common::INSPECT;
 
@@ -40,72 +43,111 @@ fn disk_boxes(path: &Path) -> Option<Vec<String>> {
 
 fn runtime_boxes(inner: &SupervisorInner) -> Vec<String> { inner.keepout.runtime_boxes.iter().map(|b| b.name.clone()).collect() }
 
+fn state_of(inner: &SupervisorInner) -> Option<HoldState> { inner.core.config_hold().map(|h| h.state) }
+
 // -- the RT side of the contract (production adapter) ------------------------------------
 
 #[test]
-fn reserve_refuses_stale_expired_foreign_and_competing_proposals() {
+fn reserve_refuses_stale_expired_stopped_foreign_and_competing_proposals() {
     let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let t0 = Instant::now();
+    let ctx = inner.config_ctx(t0);
     assert_eq!(inner.revision(ConfigDomain::Keepout), 1);
 
-    let mut p = inner.config_proposal(ConfigDomain::Keepout, 1, 0);
-    p.stamp.deadline = Instant::now() - Duration::from_millis(1);
-    assert_eq!(inner.reserve(&p, Instant::now()), Reserved::Refused { code: "DEADLINE_EXPIRED", current: 1 });
-    let mut p = inner.config_proposal(ConfigDomain::Keepout, 1, 0);
-    p.stamp.authority.epoch += 1;
-    assert_eq!(inner.reserve(&p, Instant::now()), Reserved::Refused { code: "EPOCH_MISMATCH", current: 1 });
-    let p = inner.config_proposal(ConfigDomain::Keepout, 1, 77);
-    assert_eq!(inner.reserve(&p, Instant::now()), Reserved::Refused { code: "LEASE_LOST", current: 1 });
-    let p = inner.config_proposal(ConfigDomain::Keepout, 0, 0);
-    assert_eq!(inner.reserve(&p, Instant::now()), Reserved::Refused { code: "REVISION_MISMATCH", current: 1 });
-    assert!(!inner.core.motion_inhibited_by_config(), "refusals hold nothing");
+    let p = inner.config_proposal(ConfigDomain::Keepout, 1, 0, &ctx);
+    let late = inner.config_ctx(p.stamp.deadline + Duration::from_millis(1));
+    assert_eq!(inner.reserve(&p, &late), Reserved::Refused { code: "DEADLINE_EXPIRED", current: 1 });
+    let stopped = armd::rt_core::ops::CommitCtx { stop_generation: 1, ..ctx };
+    assert_eq!(inner.reserve(&p, &stopped), Reserved::Refused { code: "STOPPED", current: 1 });
+    let mut q = p;
+    q.stamp.authority.epoch += 1;
+    assert_eq!(inner.reserve(&q, &ctx), Reserved::Refused { code: "EPOCH_MISMATCH", current: 1 });
+    let q = inner.config_proposal(ConfigDomain::Keepout, 1, 77, &ctx);
+    assert_eq!(inner.reserve(&q, &ctx), Reserved::Refused { code: "LEASE_LOST", current: 1 });
+    let q = inner.config_proposal(ConfigDomain::Keepout, 0, 0, &ctx);
+    assert_eq!(inner.reserve(&q, &ctx), Reserved::Refused { code: "REVISION_MISMATCH", current: 1 });
+    assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config(), "refusals hold nothing");
 
     // a granted reservation inhibits motion; a competing one (any domain) is busy
-    let p = inner.config_proposal(ConfigDomain::Keepout, 1, 0);
-    let Reserved::Granted(r) = inner.reserve(&p, Instant::now()) else { panic!("reserve") };
-    assert_eq!((r.from, r.inhibits_motion), (1, true));
+    let Reserved::Granted(r) = inner.reserve(&p, &ctx) else { panic!("reserve") };
+    assert_eq!((r.from(), r.inhibits_motion()), (1, true));
     assert!(inner.core.motion_inhibited_by_config());
-    let q = inner.config_proposal(ConfigDomain::Collision, 1, 0);
-    assert_eq!(inner.reserve(&q, Instant::now()), Reserved::Refused { code: "CONFIG_BUSY", current: 1 });
+    let c = inner.config_proposal(ConfigDomain::Collision, 1, 0, &ctx);
+    assert_eq!(inner.reserve(&c, &ctx), Reserved::Refused { code: "CONFIG_BUSY", current: 1 });
 
-    // nothing applied yet: activation is refused and the hold stays
-    assert_eq!(inner.activate(r, Durability::Volatile), Activated::Refused { code: "NOT_APPLIED" });
-    assert!(inner.core.motion_inhibited_by_config());
-    inner.release(r);
+    // nothing applied yet: activation hands the token back and the hold stays
+    let Activated::Refused { code: "NOT_APPLIED", reservation: r } = inner.activate(r) else { panic!("not applied") };
+    assert_eq!(state_of(&inner), Some(HoldState::Reserved));
+    assert_eq!(inner.release(r), Released::Cleared);
     assert!(!inner.core.motion_inhibited_by_config());
-    assert_eq!(inner.activate(r, Durability::Volatile), Activated::Refused { code: "NOT_RESERVED" });
     assert_eq!(inner.revision(ConfigDomain::Keepout), 1);
 
     // poses do not affect motion
-    let p = inner.config_proposal(ConfigDomain::Poses, inner.revision(ConfigDomain::Poses), 0);
-    let Reserved::Granted(r) = inner.reserve(&p, Instant::now()) else { panic!("reserve poses") };
-    assert!(!r.inhibits_motion && !inner.core.motion_inhibited_by_config());
-    inner.release(r);
+    let p = inner.config_proposal(ConfigDomain::Poses, inner.revision(ConfigDomain::Poses), 0, &ctx);
+    let Reserved::Granted(r) = inner.reserve(&p, &ctx) else { panic!("reserve poses") };
+    assert!(!r.inhibits_motion() && !inner.core.motion_inhibited_by_config());
+    assert_eq!(inner.release(r), Released::Cleared);
+}
+
+#[test]
+fn persisted_then_activated_reports_the_durability_and_frees_motion() {
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let r = inner.reserve_config(ConfigDomain::Keepout, 1, 0).unwrap();
+    let r = inner.config_persisted(r, Durability::DurableUnconfirmed).unwrap();
+    assert_eq!(state_of(&inner), Some(HoldState::PersistedAwaitingActivation { durability: Durability::DurableUnconfirmed }));
+    inner.set_keepout_boxes(vec![boxed("a", 0.3)]).unwrap();
+    assert_eq!(inner.activate(r), Activated::Active { revision: 2, durability: Durability::DurableUnconfirmed });
+    assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config());
+    // volatile: no persisted report
+    let ((), rev) = inner.commit_config(ConfigDomain::Keepout, 2, 0, |i| i.set_keepout_boxes(vec![boxed("b", 0.3)])).unwrap();
+    assert_eq!(rev, 3);
 }
 
 #[test]
 fn activation_moves_the_revision_by_one_and_a_failed_apply_changes_nothing() {
     let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
-    let ((), rev) = inner
-        .commit_config(ConfigDomain::Keepout, 1, 0, Durability::Volatile, |i| i.set_keepout_boxes(vec![boxed("a", 0.3)]))
-        .unwrap();
+    let ((), rev) = inner.commit_config(ConfigDomain::Keepout, 1, 0, |i| i.set_keepout_boxes(vec![boxed("a", 0.3)])).unwrap();
     assert_eq!((rev, inner.keepout.revision), (2, 2));
     assert_eq!(runtime_boxes(&inner), ["a"]);
     assert!(!inner.core.motion_inhibited_by_config());
 
     // a competing candidate built from revision 1 is refused; the active state is kept
-    let err = inner
-        .commit_config(ConfigDomain::Keepout, 1, 0, Durability::Volatile, |i| i.set_keepout_boxes(vec![boxed("b", 0.3)]))
-        .unwrap_err();
-    assert!(matches!(err, armd::supervisor::ArmError::PolicyRevisionMismatch { expected: 1, current: 2 }), "{err:?}");
+    let err = inner.commit_config(ConfigDomain::Keepout, 1, 0, |i| i.set_keepout_boxes(vec![boxed("b", 0.3)])).unwrap_err();
+    assert!(matches!(err, ArmError::PolicyRevisionMismatch { expected: 1, current: 2 }), "{err:?}");
     assert_eq!(runtime_boxes(&inner), ["a"]);
 
-    // an invalid candidate fails to apply: revision, boxes and motion eligibility unchanged
+    // an invalid candidate fails to apply before any rename: revision, boxes and motion eligibility unchanged
     let bad = KeepoutBox { name: "bad".into(), min_m: [0.4; 3], max_m: [0.3; 3] };
-    inner.commit_config(ConfigDomain::Keepout, 2, 0, Durability::Volatile, |i| i.set_keepout_boxes(vec![bad])).unwrap_err();
+    inner.commit_config(ConfigDomain::Keepout, 2, 0, |i| i.set_keepout_boxes(vec![bad])).unwrap_err();
     assert_eq!(inner.keepout.revision, 2);
     assert_eq!(runtime_boxes(&inner), ["a"]);
-    assert!(!inner.core.motion_inhibited_by_config());
+    assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config());
     inner.jog_action({ let mut q = INSPECT.to_vec(); q[0] += 0.05; q }, Some(0.3), None, "joint_move").expect("motion admitted");
+}
+
+/// The candidate was renamed into place, then failed to apply: active (revision 1, no
+/// boxes) and durable differ, so the hold is `Reconciling`: motion inhibited, further
+/// changes busy, until reconciliation finishes.
+#[test]
+fn apply_failure_after_the_rename_reconciles() {
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let r = inner.reserve_config(ConfigDomain::Keepout, 1, 0).unwrap();
+    let r = inner.config_persisted(r, Durability::Durable).unwrap();
+    let bad = KeepoutBox { name: "bad".into(), min_m: [0.4; 3], max_m: [0.3; 3] };
+    inner.activate_config_candidate(r, |i| i.set_keepout_boxes(vec![bad])).unwrap_err();
+    assert_eq!(state_of(&inner), Some(HoldState::Reconciling));
+    assert!(inner.core.motion_inhibited_by_config());
+    assert_eq!(inner.keepout.revision, 1);
+    let err = inner.reserve_config(ConfigDomain::Poses, inner.poses.revision, 0).unwrap_err();
+    assert!(matches!(&err, ArmError::Rejected { code, .. } if code == "CONFIG_BUSY"), "{err:?}");
+    assert!(inner.finish_reconcile(ConfigDomain::Keepout));
+    assert!(!inner.core.motion_inhibited_by_config());
+
+    // activation of a persisted candidate that was never applied reconciles as well
+    let r = inner.reserve_config(ConfigDomain::Keepout, 1, 0).unwrap();
+    let r = inner.config_persisted(r, Durability::Durable).unwrap();
+    assert_eq!(inner.activate(r), Activated::Reconciling { code: "NOT_APPLIED" });
+    assert!(inner.core.motion_inhibited_by_config());
 }
 
 #[test]
@@ -115,35 +157,38 @@ fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     inner.tick(0.02);
     inner.set_torque(true).unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(inner, BootId(7), Capacities { commands: 4, plans: 2, replies: 6 });
-    let p = fx.core.config_proposal(ConfigDomain::Keepout, 1, 0);
-    let Reserved::Granted(r) = fx.core.reserve(&p, Instant::now()) else { panic!("reserve") };
+    let ctx = fx.ctx(fx.now());
+    let p = fx.core.config_proposal(ConfigDomain::Keepout, 1, 0, &ctx);
+    let Reserved::Granted(r) = fx.core.reserve(&p, &ctx) else { panic!("reserve") };
 
-    let mut q = fx.core.commanded_positions.clone();
+    let start = fx.core.commanded_positions.clone();
+    let mut q = start.clone();
     q[0] += 0.05;
-    let prim = Primitive::joint_quintic(&q, 0.2);
-    let later = Instant::now() + Duration::from_secs(10);
-    let a = fx.core.authority(fx.ctx(Instant::now()).stop_generation);
+    let prim = Primitive::joint_quintic(&start, &q, 0.2).unwrap();
+    let later = fx.now() + Duration::from_secs(10);
+    let a = fx.core.authority(&fx.ctx(fx.now()));
     let req = b.submit(ClientId(1), 1, a, later, Submit::Install(&move |s: &mut Primitive| *s = prim)).unwrap();
     let rep = fx.step();
     assert_eq!(rep.command, Some((req, Err("CONFIG_BUSY"))));
     assert!(fx.core.active_trajectory.is_none(), "no motion installed while the reservation is held");
 
-    fx.core.release(r);
+    assert_eq!(fx.core.release(r), Released::Cleared);
+    let a = fx.core.authority(&fx.ctx(fx.now()));
     let req2 = b.submit(ClientId(1), 2, a, later, Submit::Install(&move |s: &mut Primitive| *s = prim)).unwrap();
     let rep = fx.step();
     assert!(matches!(rep.command, Some((r2, Ok(_))) if r2 == req2), "{rep:?}");
     assert!(fx.core.active_trajectory.is_some());
     let mut got = Vec::new();
     b.poll(|_, r| { got.push(r); true });
-    assert!(matches!(got[0], Reply::Refused { code: "CONFIG_BUSY", .. }), "{got:?}");
+    assert!(format!("{:?}", got[0]).contains("CONFIG_BUSY"), "{got:?}");
 }
 
 // -- restart ------------------------------------------------------------------------------
 
 /// The process ended after the candidate was renamed into place but before it was applied
-/// and activated, with another candidate's temp file still next to it. On the next start
-/// the loader activates the file (active == durable), removes the never-published temp file
-/// and nothing stays reserved.
+/// and activated (its hold `PersistedAwaitingActivation`), with another candidate's temp
+/// file still next to it. On the next start the loader reconciles: it activates the file
+/// (active == durable), removes the never-published temp file and ends the reconciliation.
 #[tokio::test]
 async fn restart_after_rename_before_activation_activates_the_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -155,12 +200,14 @@ async fn restart_after_rename_before_activation_activates_the_file() {
         let mut prepared = armd::keepout::prepare_update(&inner, &json!({"boxes": [cube("new", 0.3)]})).unwrap();
         let w = prepared.write.take().unwrap();
         let staged = armd::persist::StagedWrite::stage(w.path, w.text).unwrap();
-        let _r = inner.reserve_config(ConfigDomain::Keepout, prepared.base_revision, 0).unwrap();
+        let r = inner.reserve_config(ConfigDomain::Keepout, prepared.base_revision, 0).unwrap();
         drop(staged.rename_only().unwrap());
+        let _r = inner.config_persisted(r, Durability::DurableUnconfirmed).unwrap();
         // crash here: never applied, never activated
         assert_eq!(inner.keepout.revision, 1);
         assert!(runtime_boxes(&inner).is_empty());
-        assert!(inner.core.motion_inhibited_by_config(), "the old process kept the change reserved");
+        assert!(matches!(state_of(&inner), Some(HoldState::PersistedAwaitingActivation { .. })));
+        assert!(inner.core.motion_inhibited_by_config());
     }
     drop(sup);
     std::fs::write(dir.path().join(".keepout.json.tmp-1-9"), "{\"boxes\": [").unwrap();
@@ -171,8 +218,25 @@ async fn restart_after_rename_before_activation_activates_the_file() {
     let inner = fresh.inner().read().await;
     assert_eq!(runtime_boxes(&inner), ["new"]);
     assert_eq!(inner.keepout.revision, 1);
-    assert!(!inner.core.motion_inhibited_by_config());
+    assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config());
     assert_eq!(files(dir.path()), ["keepout.json"]);
+}
+
+/// A start whose keep-out file cannot be installed stays `Reconciling`: the file stays on
+/// disk, the profile boxes stay active and motion is inhibited.
+#[tokio::test]
+async fn restart_with_an_unloadable_file_stays_reconciling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keepout.json");
+    std::fs::write(&path, "{\"boxes\": [ broken").unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    armd::keepout::load_into(&sup, &path).await.unwrap_err();
+    let mut inner = sup.inner().write().await;
+    assert_eq!(state_of(&inner), Some(HoldState::Reconciling));
+    assert!(inner.core.motion_inhibited_by_config());
+    let err = inner.reserve_config(ConfigDomain::Keepout, 1, 0).unwrap_err();
+    assert!(matches!(&err, ArmError::Rejected { code, .. } if code == "CONFIG_BUSY"), "{err:?}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"boxes\": [ broken");
 }
 
 // -- the WS commit boundary --------------------------------------------------------------
