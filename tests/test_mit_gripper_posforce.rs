@@ -3728,3 +3728,204 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
         assert!((sup.measured_positions[J7] - (-2.0)).abs() < 0.05, "ended at {}", sup.measured_positions[J7]);
     }
 }
+
+/// Post-merge Item 2: J7 refresh must never declare Ready on a stationary reply while newer
+/// J7 motion or fault replies are still queued beyond the single-pass RX budget.
+///
+/// Covers both `RefreshBeforeRestore` (`already_mode_4 = false`) and `PreEnableRefresh`
+/// (`already_mode_4 = true`):
+/// 1. Stationary J7 reply followed by 63 filler frames (exhausting the 64-frame RX pass) and a
+///    queued J7 fault (`0x08`) or moving (`v = 0.5`) reply -> first poll stays `Pending` (NOT
+///    Ready, zero mode-write / 0x307 hold / CMD_ENABLE); second poll drains the queued reply
+///    and fails closed reporting the fault / motion.
+/// 2. Budgeted poll (`max_rx_frames = 4`): stationary J7 reply + 2 filler + J7 fault `0x08`
+///    followed by a trailing stationary J7 reply -> vetoes immediately with fault `status 8`
+///    (trailing benign reply cannot mask the intervening fault).
+/// 3. Stationary J7 reply followed by an un-drained backlog past the 50 ms deadline -> stays
+///    `Pending` before the deadline and fails closed at the deadline.
+#[test]
+fn enable_refresh_waits_for_empty_queue_and_reports_queued_fault_or_motion_beyond_rx_budget() {
+    let is_j7_refresh = |f: &CanFrame| f.id == 0x7FF && f.data[0] == 7 && f.data[1] == 0 && f.data[2] == 0xCC;
+
+    let drive_to_active_refresh = |already_mode_4: bool| {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = 0.1 * i as f32;
+            }
+            s.motors[J7].q = -1.0;
+            if already_mode_4 {
+                s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            }
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits())
+            .unwrap()
+            .with_gripper_pos_force(pf())
+            .unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        // Age J7 feedback past 100 ms without polling so enable enters `RefreshBeforeRestore`
+        // (when !already_mode_4) or `PreEnableRefresh` (after readback, when already_mode_4).
+        clock.advance(Duration::from_millis(120));
+        bus.with(|s| s.motors[J7].mute_feedback = true);
+        bus.clear_log();
+        let mut p = d.begin_torque(true).unwrap();
+        let wake = loop {
+            match p {
+                armd::driver::TorqueProgress::Pending { wake }
+                    if bus.tx_log().iter().any(is_j7_refresh) && wake > clock.now() => break wake,
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    clock.advance(Duration::from_micros(500));
+                    p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                }
+                armd::driver::TorqueProgress::Done(_) => panic!("finished before refresh"),
+            }
+        };
+        bus.clear_log();
+        (d, bus, clock, wake)
+    };
+
+    // 1. Stationary reply followed by 63 filler frames + queued fault (0x08) or moving (v=0.5)
+    //    reply beyond the 64-frame RX budget -> poll 1 stays Pending, poll 2 reports fault/motion.
+    for already_mode_4 in [false, true] {
+        for (label, v, st_ovr, expect_substr) in [
+            ("fault_0x08", 0.0_f32, Some(0x08u8), "status 8"),
+            ("moving", 0.5_f32, None, "still false"),
+        ] {
+            let (mut d, bus, clock, _wake) = drive_to_active_refresh(already_mode_4);
+            clock.advance(Duration::from_millis(2));
+            bus.with(|s| {
+                s.motors[J7].mute_feedback = false;
+                s.motors[J7].v = 0.0;
+                s.motors[J7].state_override = None;
+                let safe_j7 = s.motors[J7].feedback_frame();
+                let filler = s.motors[0].feedback_frame();
+                s.motors[J7].v = v;
+                s.motors[J7].state_override = st_ovr;
+                let bad_j7 = s.motors[J7].feedback_frame();
+                s.rx.push_back(safe_j7);
+                for _ in 0..63 {
+                    s.rx.push_back(filler);
+                }
+                // Frame 65 (beyond the 64-frame RX pass budget): newer J7 fault / motion!
+                s.rx.push_back(bad_j7);
+            });
+
+            // Poll 1: reads frames 1..=64 (including safe_j7), does NOT observe empty queue ->
+            // MUST remain Pending and emit NO mode-write, NO 0x307 hold, NO CMD_ENABLE!
+            let p1 = d
+                .poll_torque(clock.now() + Duration::from_millis(5))
+                .unwrap_or_else(|e| panic!("already_mode_4={already_mode_4} {label}: unexpected error on poll 1: {e}"));
+            assert!(
+                matches!(p1, armd::driver::TorqueProgress::Pending { .. }),
+                "already_mode_4={already_mode_4} {label}: must stay Pending while queue is not drained, got {p1:?}"
+            );
+            let log1 = bus.tx_log();
+            assert!(
+                !log1.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+                "already_mode_4={already_mode_4} {label}: wrote CTRL_MODE before queue drained: {log1:?}"
+            );
+            assert!(
+                j7_commands(&log1).is_empty(),
+                "already_mode_4={already_mode_4} {label}: sent 0x307 hold before queue drained: {log1:?}"
+            );
+            assert!(
+                !log1.iter().any(|f| f.data == damiao::CMD_ENABLE),
+                "already_mode_4={already_mode_4} {label}: sent CMD_ENABLE before queue drained: {log1:?}"
+            );
+
+            // Poll 2: dequeues frame 65 (fault / motion) and hits empty queue -> MUST fail closed
+            // and report the fault / motion!
+            clock.advance(Duration::from_millis(1));
+            let err = d
+                .poll_torque(clock.now() + Duration::from_millis(5))
+                .expect_err(&format!("already_mode_4={already_mode_4} {label}: queued unsafe J7 reply must veto"))
+                .to_string();
+            assert!(
+                err.contains(expect_substr),
+                "already_mode_4={already_mode_4} {label}: expected '{expect_substr}' in error, got: {err}"
+            );
+            let log2 = bus.tx_log();
+            assert!(!log2.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+            assert!(j7_commands(&log2).is_empty());
+            assert!(!log2.iter().any(|f| f.data == damiao::CMD_ENABLE));
+            assert!(!d.is_enabled());
+        }
+    }
+
+    // 2. Intervening fault across a small budgeted poll (max_rx_frames = 4) cannot be masked by
+    //    a trailing benign stationary J7 frame queued behind it.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock, _wake) = drive_to_active_refresh(already_mode_4);
+        clock.advance(Duration::from_millis(2));
+        bus.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.motors[J7].v = 0.0;
+            s.motors[J7].state_override = None;
+            let safe_j7 = s.motors[J7].feedback_frame();
+            let filler = s.motors[0].feedback_frame();
+            s.motors[J7].state_override = Some(0x08);
+            let fault_j7 = s.motors[J7].feedback_frame();
+            s.motors[J7].state_override = None;
+            let trailing_safe_j7 = s.motors[J7].feedback_frame();
+            // Poll 1 (budget 4) reads: safe_j7, filler, filler, fault_j7; trailing_safe_j7 stays queued.
+            s.rx.push_back(safe_j7);
+            s.rx.push_back(filler);
+            s.rx.push_back(filler);
+            s.rx.push_back(fault_j7);
+            s.rx.push_back(trailing_safe_j7);
+        });
+        let err = d
+            .poll_torque_budgeted(clock.now() + Duration::from_millis(5), 4)
+            .expect_err(&format!("already_mode_4={already_mode_4}: intervening fault must veto immediately"))
+            .to_string();
+        assert!(err.contains("status 8"), "already_mode_4={already_mode_4}: expected fault status 8, got: {err}");
+        let log = bus.tx_log();
+        assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+        assert!(j7_commands(&log).is_empty());
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+    }
+
+    // 3. Stationary reply followed by an un-drained backlog that never reaches empty before the
+    //    50 ms deadline -> stays Pending before deadline, then fails closed at the deadline.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock, wake) = drive_to_active_refresh(already_mode_4);
+        clock.advance(Duration::from_millis(2));
+        let filler = bus.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            let safe_j7 = s.motors[J7].feedback_frame();
+            let filler = s.motors[0].feedback_frame();
+            s.rx.push_back(safe_j7);
+            for _ in 0..150 {
+                s.rx.push_back(filler);
+            }
+            filler
+        });
+        let p1 = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        assert!(matches!(p1, armd::driver::TorqueProgress::Pending { .. }));
+        // Advance to deadline while keeping the RX queue flooded beyond 64 frames.
+        bus.with(|s| {
+            for _ in 0..100 {
+                s.rx.push_back(filler);
+            }
+        });
+        clock.advance(wake.saturating_duration_since(clock.now()));
+        let err = d
+            .poll_torque(clock.now() + Duration::from_millis(5))
+            .expect_err(&format!("already_mode_4={already_mode_4}: undrained refresh at deadline must fail closed"))
+            .to_string();
+        assert!(!err.is_empty());
+        let log = bus.tx_log();
+        assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+        assert!(j7_commands(&log).is_empty());
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+    }
+}

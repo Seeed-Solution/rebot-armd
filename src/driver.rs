@@ -2611,6 +2611,10 @@ struct RefreshCapture {
     tx_at: Instant,
     deadline: Deadline,
     first: Option<RefreshSample>,
+    /// First post-boundary J7 reply observed during this refresh that violated stationary
+    /// torque-off (`|v| > 0.05`, non-finite velocity, or `motor_status != 0`). Sticky across
+    /// polls so a later benign reply cannot mask an intervening motion or fault event.
+    unsafe_sample: Option<RefreshSample>,
 }
 
 enum RefreshStep {
@@ -3968,7 +3972,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.can.transmit(&damiao::build_refresh_frame(id))?;
         self.enable_estop_inhibited()?;
         self.can.flush()?;
-        self.refresh_capture = Some(RefreshCapture { joint, boundary, tx_at, deadline, first: None });
+        self.refresh_capture = Some(RefreshCapture {
+            joint,
+            boundary,
+            tx_at,
+            deadline,
+            first: None,
+            unsafe_sample: None,
+        });
         Ok(Some(boundary))
     }
 
@@ -3989,11 +4000,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(FeedbackRefresh { joint, boundary, deadline })
     }
 
-    /// Serve a bounded 0xCC feedback refresh: accepts only the first feedback frame for `r.joint`
-    /// received strictly after `r.boundary`, with receive time not before the transmit instant and
-    /// strictly before `r.deadline`, and still within `POS_FORCE_FEEDBACK_MAX_AGE`. Even at the
-    /// expiry wake, runs one bounded RX drain before deciding. Live telemetry remains updated by
-    /// any newer frames so callers retain live safety-veto authority.
+    /// Serve a bounded 0xCC feedback refresh: accepts only when a post-boundary J7 reply
+    /// arrived strictly before `r.deadline` (with `rx_at >= tx_at`, within
+    /// `POS_FORCE_FEEDBACK_MAX_AGE`) AND the RX queue reached an observed empty-queue boundary
+    /// (`last_read_drained`), so newer queued motion or fault replies beyond the RX budget can
+    /// never be skipped. Any post-boundary unsafe J7 sample (motion or non-zero status/fault)
+    /// vetoes immediately. Even at the expiry wake, runs one bounded RX drain before deciding;
+    /// if the queue still has not drained at the deadline, fails closed (`TimedOut`).
     fn poll_feedback_refresh(&mut self, mut r: FeedbackRefresh) -> Result<RefreshStep, ArmDriverError> {
         self.enable_estop_inhibited()?;
         let expired_before_read = r.deadline.passed(self.now());
@@ -4006,24 +4019,36 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(b) => {
                 let _ = self.receive_feedback();
                 self.enable_estop_inhibited()?;
-                if let Some((tx_at, sample)) = self.refresh_capture.as_ref()
+                let cap_state = self
+                    .refresh_capture
+                    .as_ref()
                     .filter(|c| c.joint == r.joint && c.boundary == b)
-                    .and_then(|c| c.first.map(|s| (c.tx_at, s)))
-                {
-                    let fresh_rx = self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE;
-                    let fresh_bound = sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
-                    if sample.seq > b
-                        && sample.rx_at >= tx_at
-                        && !r.deadline.passed(sample.rx_at)
-                        && fresh_rx
-                        && fresh_bound
-                        && sample.position.is_finite()
-                    {
+                    .map(|c| (c.tx_at, c.first, c.unsafe_sample));
+                if let Some((tx_at, first, unsafe_sample)) = cap_state {
+                    if let Some(bad) = unsafe_sample {
                         self.refresh_capture = None;
-                        // Do NOT roll back live cached_states/motor_status: return Ready(sample) and let
-                        // callers enforce safety checks on BOTH `sample` and live telemetry so neither
-                        // unsafe-timely/safe-late nor safe-timely/unsafe-late can enable.
-                        return Ok(RefreshStep::Ready(sample));
+                        return Ok(RefreshStep::Ready(bad));
+                    }
+                    if self.last_read_drained {
+                        if let Some(sample) = first {
+                            let fresh_rx = self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE;
+                            let fresh_bound = sample
+                                .queue_bound
+                                .is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+                            if sample.seq > b
+                                && sample.rx_at >= tx_at
+                                && !r.deadline.passed(sample.rx_at)
+                                && fresh_rx
+                                && fresh_bound
+                                && sample.position.is_finite()
+                            {
+                                self.refresh_capture = None;
+                                // Do NOT roll back live cached_states/motor_status: return Ready(sample)
+                                // and let callers enforce safety checks on BOTH `sample` and live
+                                // telemetry (now up to date through the empty-queue boundary).
+                                return Ok(RefreshStep::Ready(sample));
+                            }
+                        }
                     }
                 }
             }
@@ -4232,7 +4257,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     .map(|(rep, ..)| rep.as_u32());
                 match reply {
                     Some(v) if v == damiao::CTRL_MODE_POS_FORCE => {
-                        if self.fresh_measured_position(r.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_some() {
+                        if self.last_read_drained
+                            && self.fresh_measured_position(r.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_some()
+                        {
                             return self.finish_pos_force_readback(r.joint, None);
                         }
                         let drained_now = !expired_before_read && self.last_read_drained;
@@ -4279,12 +4306,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn finish_pos_force_readback(&mut self, joint: usize, refresh_sample: Option<RefreshSample>) -> Result<TorqueProgress, ArmDriverError> {
         self.enable_estop_inhibited()?;
         if let Some(sample) = refresh_sample {
-            let sample_fresh = sample.position.is_finite()
-                && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
-                && sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
-            if !sample_fresh {
-                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
-            }
             let sample_still = sample.velocity.is_finite() && sample.velocity.abs() <= 0.05;
             let sample_off = !self.is_enabled && sample.motor_status == 0;
             if !(sample_still && sample_off) {
@@ -4296,6 +4317,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         sample.motor_status
                     ),
                 );
+            }
+            let sample_fresh = sample.position.is_finite()
+                && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+                && sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+            if !sample_fresh {
+                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
             }
         }
         // Hold at the position of the newest fresh sample that passes the live freshness,
@@ -5530,22 +5557,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     self.disable_confirmed_sticky = false;
                 }
                 if let Some(cap) = self.refresh_capture.as_mut() {
-                    if cap.joint == idx
-                        && cap.first.is_none()
-                        && seq > cap.boundary
-                        && rx_at >= cap.tx_at
-                        && !cap.deadline.passed(rx_at)
-                        && feedback.position.is_finite()
-                        && queue_bound.is_some()
-                    {
-                        cap.first = Some(RefreshSample {
+                    if cap.joint == idx && seq > cap.boundary && rx_at >= cap.tx_at {
+                        let sample = RefreshSample {
                             position: feedback.position,
                             velocity: feedback.velocity,
                             motor_status: feedback.state_or_error,
                             rx_at,
                             queue_bound,
                             seq,
-                        });
+                        };
+                        let unsafe_motion_or_state =
+                            !(feedback.velocity.is_finite() && feedback.velocity.abs() <= 0.05)
+                                || feedback.state_or_error != 0;
+                        if unsafe_motion_or_state && cap.unsafe_sample.is_none() {
+                            cap.unsafe_sample = Some(sample);
+                        }
+                        if cap.first.is_none()
+                            && !cap.deadline.passed(rx_at)
+                            && feedback.position.is_finite()
+                            && queue_bound.is_some()
+                        {
+                            cap.first = Some(sample);
+                        }
                     }
                 }
             }
