@@ -858,6 +858,14 @@ async fn grasp_setup_persists_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub").join("grasp_setup.json");
     let mut w = ws_rig(Some(path.clone())).await;
+    // table_z_from_tcp needs the jaws closed on nothing: release the simulated object and wait for
+    // the measured gripper to follow the closed command (the hold could have stopped it at OBJECT_J7)
+    w.rig.hold.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while w.rig.sup.inner().read().await.measured_positions[6].abs() > 0.05 {
+        assert!(Instant::now() < deadline, "gripper did not close");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let tcp_z = start_pose(&w.rig).await.p[2];
     let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup",
         json!({"table_z_from_tcp": true, "grip_pixel_norm": [0.42, 0.71], "approach_height_m": 0.17, "camera_tilt_deg": 25.0})).await;

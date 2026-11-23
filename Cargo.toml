@@ -75,6 +75,13 @@ jpeg-encoder = "0.6"
 members = ["crates/mview-stereo"]
 default-members = [".", "crates/mview-stereo"]
 
+# dev and test builds (`cargo test` inherits dev): line tables only, so panics and backtraces keep
+# file:line but debuggers see no variables. Full debug info made one integration test binary
+# 658 MB and a test build's target/ 60 GB (spark, 2026-11-23). For a debugger session:
+# CARGO_PROFILE_DEV_DEBUG=full cargo test ...
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -118,3 +125,10 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.zune-core]
 opt-level = 3
+
+# dev and test builds: the image matching and third-party crates at opt-level 2. The multi-view
+# measurement and grasp tests spend most of their time in this code.
+[profile.dev.package.mview-stereo]
+opt-level = 2
+[profile.dev.package."*"]
+opt-level = 2
