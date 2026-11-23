@@ -62,6 +62,18 @@ fn opt_bool(v: &Value, key: &str) -> Result<Option<bool>, ImportInvalid> {
     }
 }
 
+/// A positive whole number, or absent (`frames_dropped`: 0 is stored as absent).
+fn opt_count(v: &Value, key: &str) -> Result<Option<u64>, ImportInvalid> {
+    match v.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => match n.as_u64() {
+            Some(0) => Ok(None),
+            Some(c) => Ok(Some(c)),
+            None => Err(bad("sidecar", format!("{key} must be a non-negative integer"))),
+        },
+    }
+}
+
 /// Embedded tool provenance read from a Parquet file's schema key-value metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddedProvenance {
@@ -227,6 +239,8 @@ pub fn check_with_provenance(
         return Err(bad("tool_provenance", "sidecar tool_config_digest cannot be empty"));
     }
     let sidecar_has_gripper = opt_bool(sidecar, "has_gripper_motion")?;
+    // an incomplete recording stays marked incomplete
+    let frames_dropped = opt_count(sidecar, "frames_dropped")?;
     let emb = match parquet_kv {
         Some(kv) => extract_embedded_provenance(kv).map_err(|e| bad("tool_provenance", e))?,
         None => EmbeddedProvenance::default(),
@@ -288,7 +302,7 @@ pub fn check_with_provenance(
         fps_nominal: sidecar.get("fps_nominal").and_then(Value::as_f64).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(ctx.fps),
         truncated: false, stopped_by: None, arm_dof: Some(ctx.arm_dof), gripper_joint: ctx.gripper_joint, recovered: None,
         first_state: Some(frames[0].observation_state.clone()), last_state: Some(frames[frames.len() - 1].observation_state.clone()),
-        tool_id, tool_config_digest, has_gripper_motion: Some(has_gripper_motion), frames_dropped: None,
+        tool_id, tool_config_digest, has_gripper_motion: Some(has_gripper_motion), frames_dropped,
     };
     Ok(CheckedImport { sidecar: sc, stale })
 }
@@ -318,6 +332,13 @@ mod tests {
         let side = json!({"units": "rad", "joint_names": c.joint_names, "joint_zero": {"offsets_rad": vec![0.0; 7], "rev": "x"}, "task": "t"});
         let ok = check(&c, &side, &frames(&q, 10)).unwrap();
         assert!(!ok.stale && ok.sidecar.source == "import" && ok.sidecar.frames == 10);
+        assert_eq!(ok.sidecar.frames_dropped, None);
+        // the dropped-sample counter of an incomplete recording is kept, and validated
+        let mut dropped = side.clone();
+        dropped["frames_dropped"] = json!(12);
+        assert_eq!(check(&c, &dropped, &frames(&q, 10)).unwrap().sidecar.frames_dropped, Some(12));
+        dropped["frames_dropped"] = json!(-1);
+        assert_eq!(check(&c, &dropped, &frames(&q, 10)).unwrap_err().reason, "sidecar");
         let reason = |s: &Value, f: &[RecordFrame]| check(&c, s, f).unwrap_err().reason;
         // degrees refused
         let mut deg = side.clone();
