@@ -543,7 +543,9 @@ fn tracking_off_wire_equivalence() {
             assert_eq!(go.is_torqued, eo.is_torqued, "{label}: tick {k} is_torqued vs e4f72b6");
             assert_eq!(format!("{:?}", go.safety_state), eo.safety_state, "{label}: tick {k} safety_state vs e4f72b6");
             assert_eq!(go.fault.as_ref().map(|f| format!("{f:?}")), eo.fault, "{label}: tick {k} fault vs e4f72b6");
-            assert_eq!(go.gripper.as_ref().map(|g| format!("{g:?}")), eo.gripper, "{label}: tick {k} gripper vs e4f72b6");
+            // `baseline` (learned free-motion torque) was added after e4f72b6
+            let gripper = go.gripper.clone().map(|g| format!("{:?}", armd::model::GripperObs { baseline: None, ..g }).replace(", baseline: None", ""));
+            assert_eq!(gripper, eo.gripper, "{label}: tick {k} gripper vs e4f72b6");
             assert_eq!(
                 go.motion_limit.as_ref().map(|m| format!("{:?}:{:?}", m.reason, m.joint)),
                 eo.motion_limit,

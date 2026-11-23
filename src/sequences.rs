@@ -644,7 +644,7 @@ pub fn expected_duration(inner: &SupervisorInner, steps: &[(usize, PinnedStep)],
 fn gripper_request(action: GripperAction, fraction: Option<f64>) -> crate::motion::GripperRequest {
     use crate::motion::GripperCommand as C;
     let command = match action { GripperAction::Open => C::Open, GripperAction::Close => C::Close, GripperAction::Move => C::Move };
-    crate::motion::GripperRequest { command, fraction, grasp: command == C::Close, speed: 1.0, timeout_s: Some(8.0), tag: None }
+    crate::motion::GripperRequest { command, fraction, grasp: command == C::Close, speed: 1.0, timeout_s: None, tag: None }
 }
 
 /// Begin the parent action and spawn its orchestrator. Returns (action id, expected duration).

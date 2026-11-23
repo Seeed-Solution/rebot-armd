@@ -215,11 +215,70 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
     Ok((effective, write))
 }
 
+/// Learned free-motion torque baseline (`crate::gripper_baseline`): `ARMD_GRIPPER_BASELINE`, else
+/// `gripper_baseline.json` next to the gripper calibration file. A separate file: it changes
+/// after unloaded gripper moves, the calibration only on a calibration write.
+pub fn baseline_path_for(calib_path: &Path) -> PathBuf {
+    std::env::var_os("ARMD_GRIPPER_BASELINE").map(PathBuf::from)
+        .unwrap_or_else(|| calib_path.with_file_name("gripper_baseline.json"))
+}
+
+/// How often [`spawn_baseline_persister`] writes a changed baseline.
+pub const BASELINE_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The baseline file write when it changed since the last one (clears the flag).
+pub fn take_baseline_write(inner: &mut SupervisorInner) -> Option<PendingWrite> {
+    if !inner.gripper_baseline_dirty { return None; }
+    let path = inner.gripper_baseline_path.clone()?;
+    let b = inner.gripper_baseline.as_ref()?;
+    let text = serde_json::to_string_pretty(b).ok()?;
+    inner.gripper_baseline_dirty = false;
+    Some(PendingWrite::new(path, text))
+}
+
+/// Write the baseline every [`BASELINE_PERSIST_INTERVAL`] when it changed.
+pub fn spawn_baseline_persister(supervisor: std::sync::Arc<ArmSupervisor>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BASELINE_PERSIST_INTERVAL);
+        loop {
+            tick.tick().await;
+            let write = take_baseline_write(&mut *supervisor.inner().write().await);
+            if let Some(w) = write {
+                let path = w.path.clone();
+                if let Err(e) = w.run().await {
+                    tracing::warn!("Failed to write gripper baseline {}: {e}", path.display());
+                    supervisor.inner().write().await.gripper_baseline_dirty = true;
+                }
+            }
+        }
+    });
+}
+
+/// Load the persisted baseline (another tool's or an invalid file is ignored; the baseline then
+/// starts unlearned and the next write replaces the file).
+fn load_baseline(inner: &mut SupervisorInner, path: &Path) {
+    inner.gripper_baseline_path = Some(path.to_path_buf());
+    match persist::load::<crate::gripper_baseline::FreeTorqueBaseline>(path, |b| b.validate()) {
+        Loaded::Loaded(b) => {
+            if !inner.config.active_tool.matches_record(b.tool_id.as_deref(), b.tool_config_digest.as_deref()) {
+                tracing::warn!("Ignoring gripper baseline from {} (tool {:?}/{:?} is not the active tool {})",
+                    path.display(), b.tool_id, b.tool_config_digest, inner.config.active_tool.id);
+                return;
+            }
+            tracing::info!("Gripper baseline loaded from {} ({}, {} close / {} open moves)", path.display(), b.state(), b.close_moves, b.open_moves);
+            inner.gripper_baseline = Some(b);
+        }
+        Loaded::Missing => {}
+        Loaded::Invalid(e) => tracing::warn!("Ignoring gripper baseline file: {e}; starting unlearned"),
+    }
+}
+
 /// Load the persisted gripper calibration at startup (logs outcome).
 /// Invalid/corrupt file -> log a warning, ignore it, report observation.gripper_zero.state "calib_invalid".
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
     inner.gripper_calib_path = Some(path.to_path_buf());
+    load_baseline(&mut inner, &baseline_path_for(path));
     let j7_lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx)).cloned();
     match persist::load::<GripperCalibFile>(path, |f| f.validate(j7_lim.as_ref())) {
         Loaded::Loaded(calib) => {

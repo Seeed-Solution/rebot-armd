@@ -2211,6 +2211,24 @@ pub struct GripperObs {
     /// Torque cap trips since start.
     #[serde(default)]
     pub force_limit_trips: u64,
+    /// Learned free-motion torque of the jaw (`crate::gripper_baseline`); absent from older armd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<GripperBaselineObs>,
+}
+
+/// `observation.gripper.baseline`: state of the learned free-motion torque baseline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GripperBaselineObs {
+    /// `"unlearned"`, `"learning"` or `"learned"`.
+    pub state: String,
+    /// Unloaded moves learned per direction.
+    pub close_moves: u64,
+    pub open_moves: u64,
+    /// Moves with a position bin rejected as an outlier (not learned).
+    pub rejected_moves: u64,
+    /// Last grasp contact verdict: torque, threshold, baseline and margin (|τ| − baseline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_contact: Option<crate::gripper_baseline::ContactInfo>,
 }
 
 /// Full arm telemetry / observation
