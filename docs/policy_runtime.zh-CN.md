@@ -133,12 +133,13 @@
 
     其中预测序列 $a_0, \dots, a_{m-1}$ 按**最旧优先**排列（$i = 0$ 为该周期最早且仍有效的预测）。
 - **预分配环形缓冲与 runner 线程分配**：`PreparedPolicy::from_backend` 一次性分配 `ChunkRing` 及其固定容量的来源元数据表（`chunk_size` 槽 × `1` 或 `chunk_size` 条重叠预测 × `action_dim` 浮点；`chunk_size <= 1` 时分配 0 字节），写入块、剪枝与槽位选择均不扩容环形缓冲。单位转换与目标构造（`rad_to_policy_units`、`policy_units_to_rad` 以及克隆传给 `policy_step_with_vision` 的 `Vec<f32>`）仍在 runner 线程上分配长度为 `action_dim` 的短向量。
-- **两阶段执行与提交前唯一门禁 `commit_gate(now)`**：
-  - 锁外规划阶段（`plan_chunk_step`）：清理过期/失效条目，将环形缓冲推进到当前采样周期；当缓冲为空或 `sample_period - last_replan_period >= replan_every` 时运行后端推理并写入新块，同时预转换当前采样周期的候选目标（不弹出槽位）。
-  - 监督器写锁内（视频嵌入模式下同时持有 `HubCommitGuard`），在发布门禁/部署检查及当前拍 `InferenceTicket` 校验之后，将 `commit_gate_now` 作为**调用 `policy_step_with_vision` 前的最后一步**执行，读取一次单调时钟（`now`）：
-    1. 按该次读数计算 `commit_period` 并选择对应槽位（丢弃已过槽位）；若该周期已提交/已过期或缓冲未能覆盖该周期，则本拍不提交目标（未覆盖时清空缓冲）。
-    2. 按该次 `now` 校验所选槽位每一条贡献预测的来源年龄：本拍新推理的预测使用常规上限（`max_policy_input_age_ms(fps)`、`vision.max_staleness_ms`、嵌入票据原始截止时间 `horizon_ms = 0`）；早期缓存预测使用 `max_policy_input_age_ms(fps) + replan_every * period`（视觉为 `vision.max_staleness_ms + replan_every * period`，嵌入票据截止时间 `+ replan_every * period`）。若超期，则清空整个块环形缓冲并在本拍跳过提交（不终止运行），下一周期强制重新规划。
-    3. 校验每条贡献预测的来源身份：检测器 `model_generation`、检测器目标身份 `DetectorTargetIdentity`（提交前重新读取最新帧：检测器提供 track id 时为 `TrackId`，否则为标签 128 位 SHA-256 摘要 + 量化到 `0..=1000` 的归一化框 + `frame_id`，无目标为 `Absent`）以及视频嵌入 `InferenceTicket` 的身份/失效代次/截止时间；任一项不匹配（包括目标保持存在但顶层目标被替换为另一目标）即清空整个块环形缓冲并跳过本拍提交。
-  - `commit_gate_now` 决定之后到 `policy_step_with_vision` 之间不再做任何额外读时钟或新鲜度/周期检查（`input_age_ms` 与检测器 `post_vision_age_ms` 直接由门禁的 `now` 计算）。
+- **两阶段执行与 runner 侧最终放行门禁 `commit_gate(now)`**：
+  - 单步策略（`chunk_size == 1`，每拍新鲜推理）与分块策略（`chunk_size > 1`）共用同一条两阶段路径（`plan_chunk_step` → `commit_gate_now` → `policy_step_with_vision`）。
+  - 锁外规划阶段（`plan_chunk_step`）：清理过期/失效条目，将环形缓冲推进到当前采样周期；当 `chunk_size == 1`、缓冲为空或 `sample_period - last_replan_period >= replan_every` 时运行后端推理并写入新块，同时预转换当前采样周期的候选目标（不弹出槽位）。
+  - 监督器写锁内（视频嵌入模式下同时持有 `HubCommitGuard`），先执行门禁前检查：若视觉配置了 `on_stale=stop`（或触发 `model_generation` / 发布门禁失败），或当前拍 `InferenceTicket` 校验失败，均按配置直接终止运行。随后 `commit_gate_now` 作为 **runner 侧最后一个 PERMIT 放行决策点**执行，读取一次单调时钟（`now`）：
+    1. 按该次读数计算 `commit_period` 并选择对应槽位（`chunk_size == 1` 时选择本拍暂存目标），同时丢弃已过槽位；若该周期已提交/已过期或缓冲未能覆盖该周期，则本拍不提交目标（未覆盖时清空缓冲）。
+    2. 按该次 `now` 校验所选槽位每一条贡献预测的来源年龄（嵌入票据截止时间同样按门禁的 `now` 计算）：本拍新推理的预测使用常规上限（`max_policy_input_age_ms(fps)`、`vision.max_staleness_ms`、嵌入票据原始截止时间 `horizon_ms = 0`）；早期缓存预测使用 `max_policy_input_age_ms(fps) + replan_every * period`（视觉为 `vision.max_staleness_ms + replan_every * period`，嵌入票据截止时间 `+ replan_every * period`）。除前述已按配置终止运行的 `on_stale=stop` 或票据失败外，来源超期会丢弃整个块缓冲、跳过本拍提交（不终止运行）并在下一周期强制重新规划。
+    3. 校验每条贡献预测的来源身份：检测器 `model_generation`、检测器目标身份 `DetectorTargetIdentity`（提交前重新读取最新帧：检测器提供 track id 时按 `TrackId` 匹配；否则仅在标签一致且块来源框与当前顶层框的 IoU `>= 0.5` 时视为同一目标，`frame_id` 不属于目标身份；`Absent` 仅与 `Absent` 匹配）以及按 `now` 核验的视频嵌入 `InferenceTicket` 身份/失效代次/截止时间；任一项不匹配（包括顶层目标替换、标签变化或目标移动至 IoU `< 0.5`）即丢弃整个块缓冲并跳过本拍提交。
+  - `commit_gate_now` 之后到 `policy_step_with_vision` 之间，runner 不再读取时钟或做额外放行判断（`input_age_ms` 与 `post_vision_age_ms` 直接由门禁的 `now` 计算）。在 `policy_step_with_vision` 内部，监督器仍会施加当前拍围栏——标定来源一致性（calibration provenance）、关节新鲜度 / `STALE_INPUT` 以及停机/租约/shadow 规则（及 live 步长与伺服保护）；这些监督器检查只能拒绝提交，不会覆盖放行。
 - **整环清空触发条件**：除 `commit_gate` 失配/超期外，发生停止或急停（E-stop）、故障（fault）、租约变更或失效、epoch 变化、shadow ↔ live 模式切换（`sync_run_context`）、视觉 `Hold`/`Stop` 决策以及 `policy_step_with_vision` 返回错误时，均立即清空整个块环形缓冲。
 - **1000 ms 开环时域上限**：`chunk_size > 1` 时要求 `replan_every * (1000 / fps) <= 1000 ms`（`MAX_OPEN_LOOP_HORIZON_MS`）。若 `policy.json` 声明了 `fps`，在 `StrictPolicyContract::parse` 时校验；在 `/api/v1/action/policy/start` 及 `spawn_policy_runner` 启动时按生效 `fps` 再次校验并拒绝超限配置。单步策略（`chunk_size == 1`）不受此上限限制。
