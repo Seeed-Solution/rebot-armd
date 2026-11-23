@@ -133,6 +133,11 @@ impl ThreadAuditDriver {
         (drv, enforce, threads, tokio_entered, missing_guard, writes, reads)
     }
 
+    fn with_confirm_delay(mut self, delay: Duration) -> Self {
+        self.confirm_delay = delay;
+        self
+    }
+
     fn record_access(&self) {
         if self.enforce_rt_context.load(Ordering::Acquire) {
             self.threads.lock().unwrap().push(thread::current().id());
@@ -1229,7 +1234,12 @@ fn single_budgeted_rx_pass_and_zero_rx_torque_begin_and_unsupported_serial() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wakes() {
+    // Use a 50ms period with widened host-jitter margins so parallel CI scheduling cannot
+    // swallow the sub-release wake or drop a healthy release dt below the floor, while keeping
+    // the exact skipped-release, real-dt overrun, sub-release wake, and non-collapsed-dt
+    // semantics unchanged.
     let (drv, ..) = ThreadAuditDriver::new(7);
+    let drv = drv.with_confirm_delay(Duration::from_millis(85));
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
     let delay = Arc::new(Mutex::new(None));
@@ -1238,31 +1248,32 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
         ..Default::default()
     };
     let handle = sup
-        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(10)), hooks)
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(50)), hooks)
         .await
         .unwrap();
 
-    // Let 2 clean releases run, then inject a 45ms overrun (> 4 periods).
-    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
-    *delay.lock().unwrap() = Some(Duration::from_millis(45));
+    // Let 2 clean releases run, then inject a 200ms overrun (4 periods).
+    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+    *delay.lock().unwrap() = Some(Duration::from_millis(200));
     let steps_before = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(2), || {
+    wait_until_async(Duration::from_secs(3), || {
         handle.stats().steps.load(Ordering::Relaxed) >= steps_before + 3
     })
     .await;
 
     let skipped = handle.stats().skipped_releases.load(Ordering::Relaxed);
-    assert!(skipped >= 2, "expected skipped_releases >= 2 after 45ms overrun on 10ms period, got {skipped}");
+    assert!(skipped >= 2, "expected skipped_releases >= 2 after 200ms overrun on 50ms period, got {skipped}");
     let samples = sup.tick_samples();
     assert!(
-        samples.iter().any(|s| s.period_us >= 40_000),
-        "expected real elapsed dt >= 40ms after overrun; samples={:?}",
+        samples.iter().any(|s| s.period_us >= 170_000),
+        "expected real elapsed dt >= 170ms after overrun; samples={:?}",
         samples.iter().map(|s| s.period_us).collect::<Vec<_>>()
     );
 
-    // Sub-release torque confirmation wake (confirm_delay = 14ms on a 10ms period -> fires ~4ms
-    // into Release N+1 as a genuine sub-release wake!) must execute at least 1 measured wake
-    // and NOT collapse the release `dt` spanning that wake!
+    // Sub-release torque confirmation wake (confirm_delay = 85ms on a 50ms period -> fires ~35ms
+    // into Release N+1, ~15ms before Release N+2, as a genuine sub-release wake!) must execute
+    // at least 1 measured wake and NOT collapse the release `dt` spanning that wake (~50ms vs
+    // ~15ms if the wake wrongly reset `last_release`, leaving 28ms of host-jitter headroom).
     let wakes_before = handle.stats().wakes.load(Ordering::Relaxed);
     let steps_before_wake = handle.stats().steps.load(Ordering::Relaxed);
     let samples_before_wake = sup.tick_samples().len();
@@ -1276,7 +1287,7 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
     let steps_at_terminal = handle.stats().steps.load(Ordering::Relaxed);
     let target_steps = steps_at_terminal + 2;
     let min_wake_samples = (target_steps.saturating_sub(steps_before_wake) as usize).max(2);
-    wait_until_async(Duration::from_secs(1), || {
+    wait_until_async(Duration::from_secs(2), || {
         handle.stats().steps.load(Ordering::Relaxed) >= target_steps
             && sup.tick_samples().len() >= samples_before_wake + min_wake_samples
     })
@@ -1294,8 +1305,8 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
         min_wake_samples
     );
     assert!(
-        recent.iter().all(|&p| p >= 7_000),
-        "sub-release wake reset release dt below ~10ms period: {recent:?}"
+        recent.iter().all(|&p| p >= 22_000),
+        "sub-release wake reset release dt below ~50ms period: {recent:?}"
     );
     handle.stop_and_join();
 }
