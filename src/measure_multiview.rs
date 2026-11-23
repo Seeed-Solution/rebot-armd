@@ -1563,6 +1563,8 @@ pub fn footprint_value(sils: &[ViewSilhouette], fp: &Option<Result<mview_stereo:
             "view_spans_mm": f.view_spans_m.iter().map(|s| [r1(s[0] * 1000.0), r1(s[1] * 1000.0)]).collect::<Vec<_>>(),
             "height_sensitivity_mm": f.height_sensitivity_m.map(|x| if x.is_finite() { json!(r1(x * 1000.0)) } else { Value::Null }),
             "max_ray_angle_deg": r1(f.max_ray_angle_deg),
+            "view_shifts_mm": f.view_shifts_m.iter().map(|s| [r1(s[0] * 1000.0), r1(s[1] * 1000.0)]).collect::<Vec<_>>(),
+            "chord_length_mm": r1(f.chord_length_m * 1000.0), "chord_width_mm": r1(f.chord_width_m * 1000.0),
             "rejected": f.rejected.iter().map(|(v, r)| json!({"view": v, "reason": r})).collect::<Vec<_>>(),
         }), Value::Null),
         Some(Err(e)) => (Value::Null, json!(e)),
