@@ -1799,11 +1799,18 @@ mod chunking_tests {
     }
 
     #[test]
+    #[ignore = "requires local exported bundle path via REBOT_TEST_RECAMERA_BUNDLE"]
     fn loads_and_steps_exported_microduck_recamera_bundle_when_present() {
-        let bundle = PathBuf::from(
-            "/home/harvest/project/rebot-companion/examples/scenes/microduck_assembly/recamera_bundle",
-        );
+        let Some(bundle_env) = std::env::var_os("REBOT_TEST_RECAMERA_BUNDLE") else {
+            eprintln!("skipped: REBOT_TEST_RECAMERA_BUNDLE is not set");
+            return;
+        };
+        let bundle = PathBuf::from(bundle_env);
         if !bundle.join("policy.json").is_file() {
+            eprintln!(
+                "skipped: policy.json not found in REBOT_TEST_RECAMERA_BUNDLE ({})",
+                bundle.display()
+            );
             return;
         }
         let snap = PolicySnapshot::load_from_dir(&bundle).expect("load_from_dir");
