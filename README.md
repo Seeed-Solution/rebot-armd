@@ -922,6 +922,8 @@ not certified safety functions.
 
 ```bash
 cargo test                                 # 316 tests (2 ignored), mock arm, no hardware
+cargo nextest run --workspace --profile fast   # day-to-day lane (cargo-nextest; see CONTRIBUTING.md, "Faster test runs")
+cargo nextest run --workspace --profile ci     # every test, before a merge
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
