@@ -4077,10 +4077,91 @@ pub(crate) struct CheckedEstopTicket {
     mode: u8,
 }
 
+type TerminalSinkFn = Box<dyn Fn(&ArmObservation) -> bool + Send + Sync>;
+
+struct TerminalBroadcasterInner {
+    seen: std::collections::VecDeque<u64>,
+    next_id: u64,
+    sinks: Vec<(u64, TerminalSinkFn)>,
+}
+
+/// Lossless off-RT action-terminal fan-out: routes observations carrying an unseen terminal
+/// action (`!is_running()`) directly into each WS connection's ordinary control queue rather
+/// than the lossy telemetry broadcast channel. Never touched by `armd-control`.
+pub(crate) struct TerminalBroadcaster {
+    inner: std::sync::Mutex<TerminalBroadcasterInner>,
+}
+
+impl Default for TerminalBroadcaster {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(TerminalBroadcasterInner {
+                seen: std::collections::VecDeque::with_capacity(128),
+                next_id: 1,
+                sinks: Vec::new(),
+            }),
+        }
+    }
+}
+
+impl TerminalBroadcaster {
+    fn has_terminal(obs: &ArmObservation) -> bool {
+        obs.previous_action.as_ref().is_some_and(|a| !a.is_running())
+            || obs.action.as_ref().is_some_and(|a| !a.is_running())
+    }
+
+    pub(crate) fn subscribe(&self, sink: TerminalSinkFn) -> u64 {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = g.next_id;
+        g.next_id += 1;
+        g.sinks.push((id, sink));
+        id
+    }
+
+    pub(crate) fn unsubscribe(&self, id: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.sinks.retain(|(sid, _)| *sid != id);
+    }
+
+    pub(crate) fn publish_if_terminal(&self, obs: &ArmObservation) {
+        if !Self::has_terminal(obs) {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found_new = false;
+        for act in [obs.previous_action.as_ref(), obs.action.as_ref()].into_iter().flatten() {
+            if !act.is_running() && !g.seen.contains(&act.id) {
+                if g.seen.len() >= 128 {
+                    g.seen.pop_front();
+                }
+                g.seen.push_back(act.id);
+                found_new = true;
+            }
+        }
+        if !found_new || g.sinks.is_empty() {
+            return;
+        }
+        g.sinks.retain(|(_, sink)| sink(obs));
+    }
+}
+
+/// RAII subscription unregistering a WS connection from [`TerminalBroadcaster`] on teardown.
+pub(crate) struct TerminalSubscription {
+    broadcaster: Arc<TerminalBroadcaster>,
+    id: u64,
+}
+
+impl Drop for TerminalSubscription {
+    fn drop(&mut self) {
+        self.broadcaster.unsubscribe(self.id);
+    }
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
+    terminals: Arc<TerminalBroadcaster>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
     stop_gen: Arc<AtomicU64>,
@@ -4192,6 +4273,7 @@ impl ArmSupervisor {
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
+            terminals: Arc::new(TerminalBroadcaster::default()),
             e_stop_latched,
             requested_estop_count,
             stop_gen,
@@ -4446,6 +4528,19 @@ impl ArmSupervisor {
         Ok(self.telemetry_tx.subscribe())
     }
 
+    /// Subscribes a WS connection's lossless ordinary control queue to unseen action-terminal
+    /// observations so terminals are never lost to telemetry broadcast lag.
+    pub(crate) fn subscribe_action_terminals(
+        &self,
+        sink: impl Fn(&ArmObservation) -> bool + Send + Sync + 'static,
+    ) -> TerminalSubscription {
+        let id = self.terminals.subscribe(Box::new(sink));
+        TerminalSubscription {
+            broadcaster: Arc::clone(&self.terminals),
+            id,
+        }
+    }
+
     /// Starts the dispatcher thread (armd does at startup, before the control loop): it
     /// frees the observations the tick retired, forwards telemetry and drains the
     /// recording ring. Idempotent.
@@ -4458,15 +4553,16 @@ impl ArmSupervisor {
         if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return Ok(()); }
-        let (hub, tx, sinks, tick_stats) = (
+        let (hub, tx, terminals, sinks, tick_stats) = (
             Arc::clone(&self.hub),
             self.telemetry_tx.clone(),
+            Arc::clone(&self.terminals),
             Arc::clone(&self.sinks),
             Arc::clone(&self.tick_stats),
         );
         let handle = std::thread::Builder::new()
             .name("armd-dispatch".into())
-            .spawn(move || dispatch_loop(&hub, &tx, &sinks, &tick_stats))
+            .spawn(move || dispatch_loop(&hub, &tx, &terminals, &sinks, &tick_stats))
             .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
         self.hub.set_dispatcher(handle.thread().clone());
         Ok(())
@@ -5356,7 +5452,7 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
+        let (obs, terminal_obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             if inner.detached || self.owner_mode() != OWNER_LEGACY {
                 return None;
@@ -5379,11 +5475,23 @@ impl ArmSupervisor {
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
             Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut inner);
-            (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
+            // Capture any terminal action observation WITHOUT touching `self.hub.latest()` so a
+            // preempted reader holding `StateHub`'s reader lock can never delay `tick_shared`.
+            let terminal_obs = if inner.last_action.as_ref().is_some_and(|a| !a.is_running())
+                || inner.previous_action.as_ref().is_some_and(|(a, _)| !a.is_running())
+            {
+                kept.clone().or_else(|| Some(inner.current_observation()))
+            } else {
+                None
+            };
+            (kept, terminal_obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked,
                 body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
+        if let Some(ref tobs) = terminal_obs {
+            self.terminals.publish_if_terminal(tobs);
+        }
         self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
@@ -5691,6 +5799,7 @@ impl ArmSupervisor {
 fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
+    terminals: &TerminalBroadcaster,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
     tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
 ) {
@@ -5718,6 +5827,7 @@ fn dispatch_loop(
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
+                terminals.publish_if_terminal(&s.obs);
                 if tx.receiver_count() > 0 { let _ = tx.send(s.obs.clone()); }
             }
         }
@@ -5726,7 +5836,9 @@ fn dispatch_loop(
     // Final drain on supervisor close so no retired/diagnostic/reply items are stranded.
     drain_sinks();
     if let Some(ring) = hub.record_ring() { ring.drain(); }
-    let _ = hub.latest();
+    if let Some(s) = hub.latest() {
+        terminals.publish_if_terminal(&s.obs);
+    }
 }
 
 #[cfg(test)]

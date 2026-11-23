@@ -46,6 +46,10 @@ static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 /// enqueueing it. 0 (no pause) outside tests.
 pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
+/// Test hook: pause (ms) after `acquire_lease` releases the owner lock and before enqueueing
+/// `lease_granted` onto `ordinary_out_tx`, allowing heartbeat-triggered `lease_lost` to race ahead.
+pub static TEST_LEASE_GRANTED_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -582,9 +586,7 @@ fn enforce_monotonic_epoch(last_wire_epoch: &mut Option<(u64, Option<Value>)>, r
     }
 }
 
-fn extract_lease_loss_gen(msg: &Message) -> Option<u64> {
-    let Message::Text(t) = msg else { return None; };
-    let v: Value = serde_json::from_str(t).ok()?;
+fn extract_lease_loss_gen_value(v: &Value) -> Option<u64> {
     if v.get("type").and_then(Value::as_str) == Some("lease_lost") {
         v.get("generation").and_then(Value::as_u64)
     } else {
@@ -592,30 +594,10 @@ fn extract_lease_loss_gen(msg: &Message) -> Option<u64> {
     }
 }
 
-struct ActionTerminalTracker {
-    seen: VecDeque<u64>,
-}
-
-impl ActionTerminalTracker {
-    fn new() -> Self {
-        Self { seen: VecDeque::with_capacity(64) }
-    }
-
-    /// Returns `true` when `obs` carries a terminal (`!is_running()`) action in `action` or
-    /// `previous_action` whose ID has not yet been emitted on this connection.
-    fn record_unseen_terminals(&mut self, obs: &crate::model::ArmObservation) -> bool {
-        let mut found = false;
-        for act in [obs.previous_action.as_ref(), obs.action.as_ref()].into_iter().flatten() {
-            if !act.is_running() && !self.seen.contains(&act.id) {
-                if self.seen.len() >= 64 {
-                    self.seen.pop_front();
-                }
-                self.seen.push_back(act.id);
-                found = true;
-            }
-        }
-        found
-    }
+fn extract_lease_loss_gen(msg: &Message) -> Option<u64> {
+    let Message::Text(t) = msg else { return None; };
+    let v: Value = serde_json::from_str(t).ok()?;
+    extract_lease_loss_gen_value(&v)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1668,11 +1650,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     let _conn_guard = ConnectionGuard(connection.clone());
 
-    // Task 3: Writer task with urgent-first priority, causal grant-before-loss ordering, monotonic
-    // wire epoch guard, action-terminal preservation (never skipped by latest-wins telemetry),
+    // Route unseen action terminals into this connection's lossless ordinary control queue
+    // (never dropped by telemetry broadcast lag; overflow closes the connection with an error).
+    let term_writer = writer.clone();
+    let _terminal_sub = supervisor.subscribe_action_terminals(move |obs| {
+        let Ok(val) = serde_json::to_value(obs) else { return true; };
+        term_writer.try_send_ordinary_control(val)
+    });
+
+    // Task 3: Writer task with urgent-first priority, unified grant-before-loss deferral across
+    // ALL lease_lost sources (revocation + heartbeat + worker), monotonic wire epoch guard,
+    // lossless action-terminal delivery via `ordinary_out_rx`, telemetry resync on broadcast lag,
     // explicit error close on control queue saturation (<= 1 s grace, flushing queued urgent
     // replies BEFORE fatal error + Close), and bounded write timeout.
     let writer_connection = connection.clone();
+    let writer_supervisor = supervisor.clone();
     let writer_fatal_triggered = fatal_triggered.clone();
     let writer_fatal_notify = fatal_notify.clone();
     let writer_estop_admitted = estop_admitted_count.clone();
@@ -1685,8 +1677,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let mut max_granted_gen: u64 = 0;
         let mut estop_replies_delivered: u64 = 0;
         let mut deferred_losses: VecDeque<(u64, Message)> = VecDeque::new();
-        let mut terminal_tracker = ActionTerminalTracker::new();
-        let mut pending_terminals: VecDeque<crate::model::ArmObservation> = VecDeque::new();
         let mut pending_latest_telemetry: Option<crate::model::ArmObservation> = None;
         let (mut rev_closed, mut estop_closed, mut stop_closed, mut auth_closed, mut ord_closed) =
             (false, false, false, false, false);
@@ -1699,7 +1689,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 msg = revocation_rx.recv(), if !rev_closed => match msg {
                     Some(msg) => {
                         if let Some(loss_gen) = extract_lease_loss_gen(&msg).filter(|&g| g > max_granted_gen) {
-                            // Causal order: hold a preemption loss until its lease_granted is written.
+                            // Causal order: hold any lease_lost until its lease_granted is written.
+                            if deferred_losses.len() >= ORDINARY_OUT_CAPACITY {
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection,
+                                    &mut sender,
+                                    &FatalClose::outbound_queue_full(),
+                                    &mut last_wire_epoch,
+                                    &mut estop_out_rx,
+                                    &mut stop_out_rx,
+                                    &writer_estop_admitted,
+                                    &mut estop_replies_delivered,
+                                    &writer_in_flight_estops,
+                                    &writer_in_flight_stops,
+                                    &writer_urgent_notify,
+                                )
+                                .await;
+                                break;
+                            }
                             deferred_losses.push_back((loss_gen, msg));
                         } else if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
@@ -1770,12 +1777,38 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 reply = ordinary_out_rx.recv(), if !ord_closed => match reply {
                     Some(mut val) => {
+                        // Unified grant-before-loss deferral: losses from heartbeat_task or
+                        // worker_task follow the exact same causal rule as revocation_rx.
+                        if let Some(loss_gen) = extract_lease_loss_gen_value(&val).filter(|&g| g > max_granted_gen) {
+                            if deferred_losses.len() >= ORDINARY_OUT_CAPACITY {
+                                flush_urgent_then_fatal_and_close(
+                                    &writer_connection,
+                                    &mut sender,
+                                    &FatalClose::outbound_queue_full(),
+                                    &mut last_wire_epoch,
+                                    &mut estop_out_rx,
+                                    &mut stop_out_rx,
+                                    &writer_estop_admitted,
+                                    &mut estop_replies_delivered,
+                                    &writer_in_flight_estops,
+                                    &writer_in_flight_stops,
+                                    &writer_urgent_notify,
+                                )
+                                .await;
+                                break;
+                            }
+                            deferred_losses.push_back((loss_gen, Message::Text(val.to_string().into())));
+                            continue;
+                        }
+                        let is_control_msg = val.get("type").is_some();
                         let granted_gen = if val.get("type").and_then(Value::as_str) == Some("lease_granted") {
                             val.get("generation").and_then(Value::as_u64)
                         } else {
                             None
                         };
-                        enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
+                        if is_control_msg {
+                            enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
+                        }
                         if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
                             if e == WriteErr::Timeout {
                                 send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
@@ -1808,18 +1841,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                     None => { ord_closed = true; }
                 },
-                _ = std::future::ready(()), if !pending_terminals.is_empty() => {
-                    if let Some(obs) = pending_terminals.pop_front() {
-                        if let Ok(text) = serde_json::to_string(&obs) {
-                            if let Err(e) = write_ws_frame_bounded(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection), &writer_fatal_triggered, &writer_fatal_notify).await {
-                                if e == WriteErr::Timeout {
-                                    send_timeout_close(&mut sender, writer_estop_admitted.load(Ordering::SeqCst) > estop_replies_delivered).await;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                },
                 _ = std::future::ready(()), if pending_latest_telemetry.is_some() => {
                     if let Some(obs) = pending_latest_telemetry.take() {
                         if let Some(rate) = obs_rate {
@@ -1838,45 +1859,26 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 observation = telemetry.recv() => match observation {
                     Ok(first) => {
-                        let mut classify = |obs: crate::model::ArmObservation| -> bool {
-                            if terminal_tracker.record_unseen_terminals(&obs) {
-                                if pending_terminals.len() >= ORDINARY_OUT_CAPACITY {
-                                    return true;
-                                }
-                                pending_terminals.push_back(obs);
-                                pending_latest_telemetry = None;
-                            } else {
-                                pending_latest_telemetry = Some(obs);
-                            }
-                            false
-                        };
-                        let mut overflowed = classify(first);
-                        while !overflowed {
+                        pending_latest_telemetry = Some(first);
+                        loop {
                             match telemetry.try_recv() {
-                                Ok(newer) => overflowed = classify(newer),
-                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                                Ok(newer) => pending_latest_telemetry = Some(newer),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                                    if let Some(s) = writer_supervisor.hub().latest() {
+                                        pending_latest_telemetry = Some(s.obs.clone());
+                                    }
+                                }
                                 Err(_) => break,
                             }
                         }
-                        if overflowed {
-                            flush_urgent_then_fatal_and_close(
-                                &writer_connection,
-                                &mut sender,
-                                &FatalClose::outbound_queue_full(),
-                                &mut last_wire_epoch,
-                                &mut estop_out_rx,
-                                &mut stop_out_rx,
-                                &writer_estop_admitted,
-                                &mut estop_replies_delivered,
-                                &writer_in_flight_estops,
-                                &writer_in_flight_stops,
-                                &writer_urgent_notify,
-                            )
-                            .await;
-                            break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Action terminals already went through `ordinary_out_rx`; resync
+                        // latest telemetry snapshot from the supervisor hub.
+                        if let Some(s) = writer_supervisor.hub().latest() {
+                            pending_latest_telemetry = Some(s.obs.clone());
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                     Err(_) => break,
                 }
             }
@@ -3190,6 +3192,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             // Control replies are never silently dropped: saturation closes the connection with an error.
             if let Some(response) = response {
+                if response.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                    let delay_ms = TEST_LEASE_GRANTED_DELAY_MS.load(Ordering::Relaxed);
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                }
                 if !worker_writer.send_ordinary_control(response).await { break; }
             }
         }

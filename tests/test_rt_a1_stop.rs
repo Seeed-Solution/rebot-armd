@@ -2378,3 +2378,154 @@ async fn estop_intake_blocked_writer_recovers_vs_never_recovers_and_off_reader_a
         assert_eq!(ack["role"], "operator", "{ack}");
     }
 }
+
+// 18. Item 3 (Writer ordering):
+//     (a) Heartbeat-triggered `lease_lost(G)` arriving on `ordinary_out_rx` before `lease_granted(G)`
+//         goes through the same causal deferral so `lease_granted(G)` ALWAYS precedes `lease_lost(G)`.
+//     (b) Action terminals go through the lossless ordinary control queue (never lost on broadcast lag),
+//         and `RecvError::Lagged` resyncs telemetry from the supervisor hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_ordering_heartbeat_loss_deferred_and_broadcast_lag_never_loses_terminals() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // (a) Heartbeat-triggered `lease_lost(G)` races ahead of `lease_granted(G)` into `ordinary_out_tx`:
+    //     writer MUST defer `lease_lost(G)` until `lease_granted(G)` is written on the wire.
+    {
+        struct DelayReset;
+        impl Drop for DelayReset {
+            fn drop(&mut self) {
+                armd::api::ws::TEST_LEASE_GRANTED_DELAY_MS.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = DelayReset;
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        let ep = sup.get_observation().await.epoch_id;
+
+        // Delay enqueueing `lease_granted` AFTER `acquire_lease` releases the owner lock.
+        armd::api::ws::TEST_LEASE_GRANTED_DELAY_MS.store(120, Ordering::Relaxed);
+        send(&mut ws, json!({"type": "acquire_lease", "client_id": "hb_defer", "seq": 1})).await;
+        // Wait until the owner lock recorded the lease (while `lease_granted` is still delayed).
+        wait_until(Duration::from_secs(1), || {
+            sup.inner().try_read().is_ok_and(|g| g.active_lease.as_ref().is_some_and(|l| l.label == "hb_defer"))
+        }).await;
+        let gen = {
+            let mut inner = sup.inner().write().await;
+            let lease = inner.active_lease.as_mut().unwrap();
+            let g = lease.generation;
+            // Expire the lease directly (no second connection / no revocation_rx!) so ONLY
+            // `heartbeat_task` produces `lease_lost(g)` via `ordinary_out_tx`.
+            lease.acquired_at = Instant::now() - Duration::from_secs(60);
+            g
+        };
+        send(&mut ws, json!({"type": "heartbeat", "generation": gen, "epoch_id": ep})).await;
+
+        let m1 = next_of(&mut ws, &["lease_granted", "lease_lost"]).await;
+        let m2 = next_of(&mut ws, &["lease_granted", "lease_lost"]).await;
+        assert_eq!(
+            (m1["type"].as_str(), m1["generation"].as_u64()),
+            (Some("lease_granted"), Some(gen)),
+            "lease_granted MUST precede heartbeat lease_lost: m1={m1}, m2={m2}"
+        );
+        assert_eq!(
+            (m2["type"].as_str(), m2["generation"].as_u64()),
+            (Some("lease_lost"), Some(gen)),
+            "deferred heartbeat lease_lost MUST follow lease_granted: m1={m1}, m2={m2}"
+        );
+    }
+
+    // (b) Broadcast lag (>128 telemetry frames dropped while writer paused): ALL action terminals
+    //     arrive intact via `ordinary_out_rx`, AND telemetry resyncs to latest hub state after lag.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn.clone());
+        let ep = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+
+        // Independent broadcast probe subscribed before the flood so we prove broadcast truly lagged.
+        let mut lag_probe = sup.subscribe_telemetry().unwrap();
+
+        armd::api::ws::set_test_ws_write_paused(&conn, true);
+        send(&mut ws, json!({"type": "auth", "seq": 42, "token": null})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn) >= 1).await;
+
+        // Finish two distinct actions, then overwrite both slots with a running third action.
+        let (id1, id2, id3) = {
+            let mut inner = sup.inner().write().await;
+            let id1 = inner.begin_action("lag_move_1", None);
+            inner.finish_action(id1, "done", None, None, None, None, None);
+            drop(inner);
+            sup.tick(0.02).await;
+
+            let mut inner = sup.inner().write().await;
+            let id2 = inner.begin_action("lag_move_2", None);
+            inner.finish_action(id2, "failed", Some("TEST_FAIL"), Some("boom".into()), None, None, None);
+            drop(inner);
+            sup.tick(0.02).await;
+
+            let mut inner = sup.inner().write().await;
+            let id3 = inner.begin_action("lag_move_3", None);
+            drop(inner);
+            sup.tick(0.02).await;
+            (id1, id2, id3)
+        };
+
+        // Flood > 180 ticks so `telemetry_tx` (broadcast cap 128) overflows and drops earlier frames!
+        let mut latest_ts = 0.0f64;
+        for _ in 0..180 {
+            let obs = sup.tick(0.02).await;
+            latest_ts = obs.timestamp;
+            // Yield periodically so the dispatcher forwards into the broadcast channel to overflow it.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Confirm broadcast truly lagged for a receiver paused as long as `ws`.
+        let mut saw_lag = false;
+        while let Ok(res) = tokio::time::timeout(Duration::from_millis(50), lag_probe.recv()).await {
+            if matches!(res, Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) {
+                saw_lag = true;
+                break;
+            }
+        }
+        assert!(saw_lag, "test setup must overflow broadcast channel to verify lag resilience");
+
+        // Unpause writer: client MUST receive BOTH id1 (done) and id2 (failed) terminals via the
+        // ordinary control queue AND a resynced latest telemetry observation (>= latest_ts).
+        armd::api::ws::set_test_ws_write_paused(&conn, false);
+        let mut saw_id1 = false;
+        let mut saw_id2 = false;
+        let mut saw_resynced = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !(saw_id1 && saw_id2 && saw_resynced) {
+            if let Ok(Some(Ok(Message::Text(txt)))) =
+                tokio::time::timeout(Duration::from_millis(250), ws.next()).await
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    for a in [v.get("action"), v.get("previous_action")].into_iter().flatten() {
+                        if a["id"].as_u64() == Some(id1) && a["state"].as_str() == Some("done") {
+                            saw_id1 = true;
+                        }
+                        if a["id"].as_u64() == Some(id2)
+                            && a["state"].as_str() == Some("failed")
+                            && a["code"].as_str() == Some("TEST_FAIL")
+                        {
+                            saw_id2 = true;
+                        }
+                    }
+                    if v.get("type").is_none()
+                        && v["timestamp"].as_f64().is_some_and(|ts| ts >= latest_ts - 1e-6)
+                        && v["action"]["id"].as_u64() == Some(id3)
+                    {
+                        saw_resynced = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_id1 && saw_id2 && saw_resynced,
+            "broadcast lag dropped terminal or missed resync: id1={saw_id1}, id2={saw_id2}, resync={saw_resynced} (latest_ts={latest_ts})"
+        );
+    }
+}
