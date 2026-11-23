@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::broker::{
-    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, RequestId, RtIntake,
+    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, PlanSlotRef, RequestId, RtIntake,
     TransitionOp,
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
@@ -120,12 +120,27 @@ pub fn tool_digest_hash(digest: &str) -> u64 {
     digest.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Joint samples one plan slot's [`PreparedPath`] holds (allocated when the slot is built;
-/// a longer path or episode is refused `PLAN_TOO_LARGE` when it is prepared).
+/// Joint samples one plan slot's [`PreparedPath`] holds (allocated and write-touched when
+/// the slot is built; a longer path or episode is refused `PLAN_TOO_LARGE` when prepared).
 pub const MAX_PATH_SAMPLES: usize = 2048;
 
-/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated once (plan slot
-/// construction) and refilled in place: preparing never reallocates it.
+/// Payload bytes reserved by one default [`PlanSlot`]'s [`PreparedPath`] (`2048 * (8 * 4 + 8) = 81,920`).
+pub const PLAN_SLOT_PAYLOAD_BYTES: usize = MAX_PATH_SAMPLES * (std::mem::size_of::<[f32; MAX_DOF]>() + std::mem::size_of::<f64>());
+
+/// Total payload bytes reserved across [`super::broker::PLAN_SLOTS`] default plan slots (`8 * 81,920 = 655,360`).
+pub const ALL_PLAN_SLOTS_PAYLOAD_BYTES: usize = super::broker::PLAN_SLOTS * PLAN_SLOT_PAYLOAD_BYTES;
+
+/// Write-touches every element of `v`'s allocated spare capacity via volatile stores so the
+/// OS faults physical pages at construction rather than leaving lazy COW zero pages.
+fn pre_fault_spare<T: Copy>(v: &mut Vec<T>, val: T) {
+    for slot in v.spare_capacity_mut() {
+        // SAFETY: `slot` points to valid, aligned, exclusively-owned allocated memory in `v`.
+        unsafe { std::ptr::write_volatile(slot.as_mut_ptr(), val) };
+    }
+}
+
+/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated and pre-faulted
+/// once (plan slot construction) and refilled in place: preparing never reallocates it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedPath {
     samples: Vec<[f32; MAX_DOF]>,
@@ -133,8 +148,18 @@ pub struct PreparedPath {
 }
 
 impl PreparedPath {
-    pub fn with_capacity(n: usize) -> Self { Self { samples: Vec::with_capacity(n), params: Vec::with_capacity(n) } }
+    pub fn with_capacity(n: usize) -> Self {
+        let mut samples = Vec::with_capacity(n);
+        pre_fault_spare(&mut samples, [0.0; MAX_DOF]);
+        let mut params = Vec::with_capacity(n);
+        pre_fault_spare(&mut params, 0.0);
+        Self { samples, params }
+    }
     pub fn capacity(&self) -> usize { self.samples.capacity().min(self.params.capacity()) }
+    /// Payload bytes reserved by `samples` and `params` backing buffers.
+    pub fn payload_bytes(&self) -> usize {
+        self.samples.capacity() * std::mem::size_of::<[f32; MAX_DOF]>() + self.params.capacity() * std::mem::size_of::<f64>()
+    }
     pub fn clear(&mut self) { self.samples.clear(); self.params.clear(); }
     pub fn len(&self) -> usize { self.samples.len() }
     pub fn is_empty(&self) -> bool { self.samples.is_empty() }
@@ -179,6 +204,9 @@ impl Default for PlanSlot {
 
 impl PlanSlot {
     pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+
+    /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
+    pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
     /// Stages a primitive that reads no path (the path is cleared).
     pub fn set(&mut self, p: Primitive) {
@@ -435,6 +463,12 @@ pub trait CoreOps {
     /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
     fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
         Err("UNSUPPORTED")
+    }
+    /// Installs a [`Primitive::Prepared`] using a pinned [`PlanSlotRef`] so implementations
+    /// can borrow the immutable slot samples until terminal retirement without vector copies.
+    /// Default delegates to [`Self::commit_prepared`].
+    fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.commit_prepared(d, &slot.primitive, &slot.path, ctx)
     }
     /// Starts a driver transition after rechecking the stamp; its progress and outcome come
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
@@ -905,7 +939,10 @@ impl<O: CoreOps> ReleaseFixture<O> {
             let result = match d.kind {
                 CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => self.core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
+                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                        Some(slot_ref) => self.core.commit_prepared_slot(&d, slot_ref, &ctx),
+                        None => Err("PLAN_RETIRED"),
+                    },
                     Some(slot) => self.core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => self.core.commit_immediate(&d, op, &ctx),
@@ -1036,5 +1073,25 @@ mod tests {
             let name = name.as_str().unwrap();
             if name != "OTHER" { assert!(TERMINAL_CODES.contains(&name), "{name}"); }
         }
+    }
+
+    #[test]
+    fn eight_plan_slots_reserve_655360_payload_bytes() {
+        assert_eq!(PLAN_SLOT_PAYLOAD_BYTES, 81_920);
+        assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
+        let (mut w, mut r) = super::super::broker::plan_slots(super::super::broker::PLAN_SLOTS, PlanSlot::default);
+        let mut handles = Vec::new();
+        let mut total_bytes = 0usize;
+        for _ in 0..super::super::broker::PLAN_SLOTS {
+            let h = w.stage(|s| { s.path.clear(); }).expect("slot");
+            let slot = r.get(h).expect("live");
+            assert_eq!(slot.path.capacity(), MAX_PATH_SAMPLES);
+            assert_eq!(slot.payload_bytes(), PLAN_SLOT_PAYLOAD_BYTES);
+            total_bytes += slot.payload_bytes();
+            handles.push(h);
+        }
+        assert_eq!(total_bytes, 655_360);
+        assert!(w.stage(|_| {}).is_none());
+        for h in handles { assert!(r.retire(h)); }
     }
 }
