@@ -343,3 +343,37 @@ fn steady_state_ticks_do_not_touch_the_allocator_damiao_driver() {
     DAMIAO.with(|d| d.set(true));
     scenarios(true);
 }
+
+/// Stalled readers and dispatcher: no reader refreshes the hub and the recording ring's
+/// consumer is held (a preempted dispatcher) for longer than the retire ring and the
+/// recording ring hold. The tick still neither allocates nor frees: it fills the slot's own
+/// observation in place (readers copy it, never take it), so nothing is displaced, and a
+/// full recording ring drops and counts samples. Holding both mutexes on this thread also
+/// shows the tick never takes them.
+#[test]
+fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
+    DEVICE.with(|d| d.set(true));
+    DAMIAO.with(|d| d.set(true));
+    let mut inner = supervisor(true);
+    let dir = tempfile::tempdir().unwrap();
+    inner.recorder.start(Some("ep".into()), Some(dir.path().join("ep.parquet"))).unwrap();
+    inner.core.begin_recording();
+    let mut q = inner.commanded_positions.clone();
+    q[1] += 0.3;
+    let epoch = inner.safety.epoch_id();
+    inner.jog(q, Some(8.0), Some(epoch)).expect("jog");
+    warm(&mut inner, 10);
+    let hub = inner.core.hub().clone();
+    let ring = inner.core.record.ring().unwrap().clone();
+    let (_reader, _dispatcher) = (hub.reader_guard(), ring.consumer_guard());
+    let n = armd::rt_core::record_ring::RECORD_RING_CAPACITY + 2 * armd::rt_core::publish::RETIRE_CAPACITY + 20;
+    let counts: Vec<(u64, u64)> = (0..n).map(|_| {
+        let (published, a, f) = counted(|| inner.tick_publish(0.02, 1, false));
+        assert!(published.displaced.is_none(), "the tick displaced an observation");
+        (a, f)
+    }).collect();
+    assert_zero("stalled readers and dispatcher", &counts);
+    assert!(inner.active_trajectory.is_some(), "still moving");
+    assert_eq!(hub.tick_frees(), 0);
+    assert!(inner.core.record.dropped() > 0, "the recording ring overflowed");
+}
