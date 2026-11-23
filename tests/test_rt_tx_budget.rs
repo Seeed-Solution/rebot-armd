@@ -654,6 +654,93 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
 }
 
 #[test]
+fn expired_carryover_on_fresh_write_returns_expired_never_complete() {
+    // Part A: defer 3 frames, advance 45 ms, raise budget, submit a fresh full 7-joint batch ->
+    // write_joint_targets_bounded MUST return Expired { dropped: 3, pending: 0 }, never Complete.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.25)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(45));
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    d.begin_tx_tick();
+    let out = d.write_joint_targets_bounded(&targets_const(-0.25)).unwrap();
+    assert_eq!(
+        out,
+        TxBatchOutcome::Expired { dropped: 3, pending: 0 },
+        "fresh write after carried-over expiry must not report Complete"
+    );
+    assert_eq!(d.pending_tx_len(), 0);
+    let sent_ids: Vec<(u32, f32)> = bus.with(|s| {
+        s.tx_accepted
+            .iter()
+            .map(|f| (f.id, pos_vel_target_rad(f)))
+            .collect()
+    });
+    assert_eq!(
+        sent_ids,
+        vec![
+            (0x101, -0.25),
+            (0x102, -0.25),
+            (0x103, -0.25),
+            (0x104, -0.25),
+            (0x105, -0.25),
+            (0x106, -0.25),
+            (0x107, -0.25),
+        ],
+        "fresh batch transmits all 7 current targets after dropping expired carry-over"
+    );
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (7, 3, 0, 0));
+
+    // Part B: same expired carry-over followed by a fresh batch under constrained budget (max_frames = 4) ->
+    // reports Expired { dropped: 3, pending: 3 } so both stale loss and remaining pending count are visible.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.25)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(45));
+    d.begin_tx_tick();
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(-0.25)).unwrap(),
+        TxBatchOutcome::Expired { dropped: 3, pending: 3 }
+    );
+    assert_eq!(d.pending_tx_len(), 3);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stale, m.deferred, m.pending), (4, 3, 3, 3));
+
+    // Part C: under legacy write_joint_targets, expired carry-over followed by a fresh full batch
+    // maps Expired -> Err(TransportError::Timeout) (never Ok(())).
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.25)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(45));
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(5), frame_max_age: ms(45) });
+    d.begin_tx_tick();
+    let err = d.write_joint_targets(&targets_const(-0.25)).unwrap_err();
+    assert!(
+        matches!(err, ArmDriverError::Transport(TransportError::Timeout)),
+        "legacy write_joint_targets must map Expired carry-over to Timeout: {err:?}"
+    );
+    assert_eq!(d.pending_tx_len(), 0);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stale, m.pending), (7, 3, 0));
+}
+
+#[test]
 fn budget_exhaustion_carries_fresh_coalesces_opposite_targets_and_separates_counters() {
     // Part A: opposite consecutive targets under max_frames = 4.
     let (mut d, bus, clock) = enabled_driver();

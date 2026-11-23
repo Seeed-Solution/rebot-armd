@@ -4762,8 +4762,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
-        // 5. Drain FIFO within the shared per-tick TX pass.
-        self.drain_pending_pass(batch_stamp, 0, true)
+        // 5. Drain FIFO within the shared per-tick TX pass, carrying `stale` so losing carried-over
+        //    frames to expiry reports `TxBatchOutcome::Expired` (never `Complete`).
+        self.drain_pending_pass(batch_stamp, stale, true)
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
