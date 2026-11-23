@@ -431,6 +431,8 @@ impl crate::supervisor::SupervisorInner {
     pub fn mit_gate(&self) -> Result<(), String> {
         let joints = mit_joints(&self.config);
         if joints.is_empty() { return Ok(()); }
+        // fail-closed: no MIT unless the RT executor runs at SCHED_FIFO with locked memory
+        if let Some(why) = crate::rt_core::sched::mit_refusal() { return Err(why); }
         let Some(d) = self.driver.as_ref() else { return Err("MIT needs a motor driver".into()) };
         let mut driver = d.lock().map_err(|_| "driver lock poisoned".to_string())?;
         let supports = driver.supports_mit_mode_switch();

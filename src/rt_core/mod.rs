@@ -16,7 +16,11 @@ pub mod ids;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod publish;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod executor;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod record_ring;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sched;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod triple;
 

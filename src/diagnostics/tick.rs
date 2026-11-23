@@ -150,6 +150,21 @@ pub struct ControlThreadSched {
     pub priority: i32,
     /// Whether the SCHED_FIFO request succeeded.
     pub realtime: bool,
+    /// Priority asked for (`ARMD_RT_PRIORITY`, default 45; `crate::rt_core::sched`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_priority: Option<i32>,
+    /// CPU the executor is pinned to (`ARMD_RT_CPU`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<usize>,
+    /// Whether `mlockall(MCL_CURRENT | MCL_FUTURE)` succeeded at startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_locked: Option<bool>,
+    /// `"locked"`, `"skipped: ..."` or `"failed: ..."`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_lock: Option<String>,
+    /// Scheduling requests that failed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 /// Observations served by `GET /api/v1/observation` from the tick's published sample
