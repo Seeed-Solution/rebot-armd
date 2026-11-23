@@ -447,6 +447,8 @@ pub trait CoreOps {
     /// `frame.positions()` (a slice of the frame) into the core's preallocated target state.
     /// (The foundation adapter still delegates to `servo(Vec)`, which allocates: track D.)
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
+    /// Applies any pending urgent E-stop request; returns true when an E-stop was applied.
+    fn apply_estop(&mut self) -> bool { false }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// How `action` ended, None while it runs.
@@ -457,8 +459,21 @@ pub trait CoreOps {
     /// The bus owner's progress and confirmations within `budget` (exclusive: the bus
     /// owner's state machine advances here).
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll;
+    /// Sub-release wake for a pending driver transition only (without running a full release
+    /// feedback pass). Default delegates to [`Self::poll_hardware`].
+    fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        self.poll_hardware(budget)
+    }
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
+    /// Advances control output for `dt` seconds and returns the observation timestamp for
+    /// [`Self::publish`]. Default delegates to [`Self::advance`].
+    fn advance_output(&mut self, dt: f64, generation: u64) -> f64 {
+        self.advance(dt, generation);
+        0.0
+    }
+    /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
+    fn publish(&mut self, _timestamp: f64, _generation: u64) {}
 }
 
 /// The protocol code of a delegated error, as a static string (unknown codes: `REJECTED`).
@@ -629,6 +644,8 @@ impl CoreOps for SupervisorInner {
         self.consume_target_frame(frame, ctx)
     }
 
+    fn apply_estop(&mut self) -> bool { self.consume_pending_estop() }
+
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
 
@@ -642,20 +659,59 @@ impl CoreOps for SupervisorInner {
     fn action_children(&self, action: ActionId) -> u32 { self.core.last_macro().filter(|m| m.action == action).map_or(0, |m| m.children) }
 
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
-        // the torque transition in flight: one service of the driver's handshake (or the
-        // supervisor's disable confirmation) within the budget; its progress replaces the
-        // core's. Feedback is otherwise still read by the tick.
-        if let Some(progress) = self.service_torque_transition(budget) { self.core.begin_transition(progress); }
-        let budget_exhausted = budget.now > budget.deadline;
-        let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() }; };
+        // One budgeted bus service per release: first serve any torque transition in flight,
+        // then apply feedback from the transition's RX cache (when this call polled the bus)
+        // or run a single budgeted receive pass.
+        let trans = self.service_torque_transition(budget);
+        let mut transition_rx = None;
+        if let Some(tp) = trans {
+            self.core.begin_transition(tp.progress);
+            transition_rx = tp.rx;
+        }
+        let rx = self.poll_hardware_rx(Some(budget), transition_rx);
+        let rx_frames = rx.rx_frames;
+        let rx_exhausted = rx.budget_exhausted;
+        self.pending_rx_poll = rx;
+        let budget_exhausted = budget.now > budget.deadline || rx_exhausted;
+        let Some(driver) = self.driver.as_ref() else {
+            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
+        };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
-        let ages = d.feedback_ages();
+        d.feedback_ages_into(&mut self.scratch.ages);
+        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
         HardwarePoll {
             driverless: false,
             feedback_valid: d.is_feedback_valid(),
             enable_state: Some(d.enable_state()),
-            oldest_feedback_age: ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a))),
-            rx_frames: 0,
+            oldest_feedback_age: oldest,
+            rx_frames,
+            budget_exhausted,
+            torque: self.core.poll_transition(),
+        }
+    }
+
+    fn poll_transition_wake(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        let trans = self.service_torque_transition(budget);
+        let (rx_frames, trans_exhausted) = match trans {
+            Some(tp) => {
+                self.core.begin_transition(tp.progress);
+                tp.rx.unwrap_or((0, false))
+            }
+            None => (0, false),
+        };
+        let budget_exhausted = budget.now > budget.deadline || trans_exhausted;
+        let Some(driver) = self.driver.as_ref() else {
+            return HardwarePoll { driverless: true, rx_frames, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() };
+        };
+        let d = driver.lock().unwrap_or_else(|e| e.into_inner());
+        d.feedback_ages_into(&mut self.scratch.ages);
+        let oldest = self.scratch.ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
+        HardwarePoll {
+            driverless: false,
+            feedback_valid: d.is_feedback_valid(),
+            enable_state: Some(d.enable_state()),
+            oldest_feedback_age: oldest,
+            rx_frames,
             budget_exhausted,
             torque: self.core.poll_transition(),
         }
@@ -663,6 +719,14 @@ impl CoreOps for SupervisorInner {
 
     fn advance(&mut self, dt: f64, generation: u64) {
         drop(self.tick_publish(dt, generation, false));
+    }
+
+    fn advance_output(&mut self, dt: f64, _generation: u64) -> f64 {
+        self.tick_control(dt)
+    }
+
+    fn publish(&mut self, timestamp: f64, generation: u64) {
+        drop(self.publish_at(timestamp, generation, false));
     }
 }
 
@@ -809,14 +873,18 @@ impl VirtualClock {
     pub fn advance(&self, d: Duration) { self.offset_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst); }
 }
 
-/// Advances one core one release at a time, in the executor's order: urgent stop, hardware
-/// poll, at most one ordinary command, the latest target, the control tick, terminal
-/// detection, then extra hardware services at a pending transition's wake before the next
-/// release (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]). Tests and tracks drive it deterministically: no thread, and virtual time
-/// ([`VirtualClock`]): release `k` (from 1) starts at `clock.base() + (k - 1) * dt` plus what
-/// a test advanced.
-pub struct ReleaseFixture<O: CoreOps> {
-    pub core: O,
+/// Synchronous single-arm release engine shared by [`ReleaseFixture`] (virtual time)
+/// and the production RT executor (real monotonic time).
+///
+/// Exact per-release order:
+/// 1. Urgent requests (E-stop, then authorized stop).
+/// 2. Single budgeted hardware poll (emitting any completed transition terminal at the poll boundary).
+/// 3. Urgent recheck (`BeforeCommit`), then commit at most one ordinary descriptor.
+/// 4. Urgent recheck (`BeforeTarget`), then consume at most one latest target.
+/// 5. Urgent recheck (`BeforeOutput`), then advance control output (`dt`).
+/// 6. Publish observation and RT inputs.
+/// 7. Deliver active-action terminal.
+pub struct ReleaseEngine {
     intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
@@ -824,92 +892,114 @@ pub struct ReleaseFixture<O: CoreOps> {
     /// The driver transition in flight.
     transition: Option<Installed>,
     releases: u64,
-    clock: VirtualClock,
     hook: Option<Box<dyn FnMut(Checkpoint)>>,
-    pub dt: f64,
 }
 
-/// The points of a release where the fixture re-reads the stop generation and the time
-/// (and applies a stop that arrived since): a stop or a deadline can never be overtaken by
-/// the command, target or output that follows it in the same release.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Checkpoint {
-    /// Before the ordinary command commits.
-    BeforeCommit,
-    /// Before the latest target is consumed.
-    BeforeTarget,
-    /// Before the control tick computes and sends its output.
-    BeforeOutput,
-}
-
-impl<O: CoreOps> ReleaseFixture<O> {
-    /// The fixture, the broker feeding it, the target writer and the stop handle.
-    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+impl ReleaseEngine {
+    /// Creates an engine with its broker, target writer, and authorized-stop handle.
+    pub fn new(boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
         let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, PlanSlot::default);
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
-        let clock = VirtualClock::starting_at(Instant::now());
-        (Self { core, intake, targets: tr, stop: stop.clone(), active: None, transition: None, releases: 0, clock, hook: None, dt: 0.02 }, broker, tw, stop)
+        (
+            Self {
+                intake,
+                targets: tr,
+                stop: stop.clone(),
+                active: None,
+                transition: None,
+                releases: 0,
+                hook: None,
+            },
+            broker,
+            tw,
+            stop,
+        )
     }
-
-    /// The fixture's virtual clock (clone it to advance time from a test).
-    pub fn clock(&self) -> &VirtualClock { &self.clock }
-    /// Virtual now.
-    pub fn now(&self) -> Instant { self.clock.now() }
 
     pub fn releases(&self) -> u64 { self.releases }
     pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
-    /// The driver transition in flight.
     pub fn transition(&self) -> Option<ActionId> { self.transition.as_ref().map(Installed::action) }
     pub fn reply_overflow(&self) -> u64 { self.intake.reply_overflow() }
+    pub fn stop_requests(&self) -> &StopRequests { &self.stop }
 
     pub fn ctx(&self, now: Instant) -> CommitCtx {
         CommitCtx { arm: self.intake.arm(), boot: self.intake.boot(), now, stop_generation: self.stop.current() }
     }
 
-    /// Runs `hook` at every [`Checkpoint`] just before the fixture samples the stop
-    /// generation and the time there (tests: a stop or a clock step arriving mid-release).
     pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + 'static) { self.hook = Some(Box::new(hook)); }
 
-    /// Applies a stop requested since the last one applied; true when it did.
-    fn apply_pending_stop(&mut self) -> bool {
+    /// Applies any pending urgent E-stop and/or authorized-stop requests; true when either applied.
+    pub fn apply_pending_urgent<O: CoreOps>(&mut self, core: &mut O) -> bool {
+        let mut applied = false;
+        if core.apply_estop() {
+            applied = true;
+        }
         let generation = self.stop.current();
-        if generation == self.stop.applied() { return false; }
-        self.core.apply_stop();
-        self.stop.mark_applied(generation);
-        true
+        if generation != self.stop.applied() {
+            core.apply_stop();
+            self.stop.mark_applied(generation);
+            applied = true;
+        }
+        applied
     }
 
-    /// `at`: re-reads the stop generation (applying a new stop first) and the time.
-    fn checkpoint(&mut self, at: Checkpoint, report: &mut ReleaseReport) -> CommitCtx {
+    fn checkpoint<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        at: Checkpoint,
+        now_fn: &mut impl FnMut() -> Instant,
+        report: &mut ReleaseReport,
+    ) -> CommitCtx {
         if let Some(hook) = self.hook.as_mut() { hook(at); }
-        if self.apply_pending_stop() { report.stopped = true; }
-        self.ctx(self.clock.now())
+        if self.apply_pending_urgent(core) { report.stopped = true; }
+        self.ctx(now_fn())
     }
 
-    /// One release.
-    pub fn step(&mut self) -> ReleaseReport {
+    fn deliver_transition_terminal(&mut self, report: &mut ReleaseReport) {
+        let ended = match report.poll.torque {
+            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
+            Some(Err(code)) => Some(Outcome::Failed(code)),
+            _ => None,
+        };
+        if let Some(outcome) = ended {
+            if let Some(t) = self.transition.take() {
+                report.transition_ended = Some((t.action(), outcome));
+                self.intake.terminal(t, outcome);
+            }
+        }
+    }
+
+    /// Runs one full release on `core`.
+    pub fn step<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        mut now_fn: impl FnMut() -> Instant,
+        dt: f64,
+        release_deadline: Instant,
+        publish_generation: u64,
+    ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
-        let started = self.clock.now();
-        let release_deadline = started + Duration::from_secs_f64(self.dt);
-        // 1. urgent stop, independent of the command ring's capacity
-        if self.apply_pending_stop() { report.stopped = true; }
-        // 2. the bus owner, within the release's service budget
-        self.service_hardware(release_deadline, &mut report);
-        // 3. one ordinary command (the intake enforces one per release)
+        // 1. Urgent requests (E-stop + authorized stop), independent of command ring capacity
+        if self.apply_pending_urgent(core) { report.stopped = true; }
+        // 2. Single budgeted hardware poll (emitting completed transition terminal at poll boundary)
+        let budget = ServiceBudget::for_release(now_fn(), release_deadline);
+        report.poll = core.poll_hardware(&budget);
+        self.deliver_transition_terminal(&mut report);
+        // 3. Urgent recheck + at most one ordinary command
         self.intake.begin_release(self.releases);
-        let ctx = self.checkpoint(Checkpoint::BeforeCommit, &mut report);
+        let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
         if let Some(mut t) = self.intake.take() {
             let d = *t.descriptor();
             let result = match d.kind {
                 CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => self.core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
-                    Some(slot) => self.core.commit_primitive(&d, &slot.primitive, &ctx),
+                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
+                    Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
-                CommandKind::Immediate(op) => self.core.commit_immediate(&d, op, &ctx),
-                CommandKind::Transition(op) => self.core.commit_transition(&d, op, &ctx),
+                CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
+                CommandKind::Transition(op) => core.commit_transition(&d, op, &ctx),
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
@@ -932,57 +1022,117 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 }
             }));
         }
-        // 4. the latest target
+        // 4. Unconditional urgent recheck + consume at most one latest target
+        let ctx = self.checkpoint(core, Checkpoint::BeforeTarget, &mut now_fn, &mut report);
         if let Some(f) = self.targets.take() {
-            let ctx = self.checkpoint(Checkpoint::BeforeTarget, &mut report);
-            let result = self.core.consume_target(&f, &ctx);
+            let result = core.consume_target(&f, &ctx);
             self.targets.report(TargetOutcome { stream: f.stream, seq: f.seq, result });
             report.target_refusal = result.err();
             report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
-        // 5. the control tick (its output gate also holds for a stop arriving during it:
-        // `EstopGate::with_stops`)
-        self.checkpoint(Checkpoint::BeforeOutput, &mut report);
-        self.core.advance(self.dt, self.releases);
-        // 6. terminal of the active action
+        // 5. Urgent recheck + advance control output
+        let _ = self.checkpoint(core, Checkpoint::BeforeOutput, &mut now_fn, &mut report);
+        let timestamp = core.advance_output(dt, publish_generation);
+        // 6. Publish
+        core.publish(timestamp, publish_generation);
+        // 7. Deliver active-action terminal
         if let Some(action) = self.active() {
-            if let Some(outcome) = self.core.action_outcome(action) {
+            if let Some(outcome) = core.action_outcome(action) {
                 let installed = self.active.take().expect("active above");
-                let children = self.core.action_children(action);
+                let children = core.action_children(action);
                 self.intake.terminal_with_children(installed, outcome, children);
                 report.ended = Some((action, outcome));
             }
         }
-        // 7. the executor wakes again at a pending transition's wake before the next release
-        // (a transition committed in this release is first served at the next one)
+        report
+    }
+
+    /// Runs one sub-release transition wake on `core` (no full feedback poll, no output step).
+    pub fn service_wake<O: CoreOps>(
+        &mut self,
+        core: &mut O,
+        now: Instant,
+        release_deadline: Instant,
+        report: &mut ReleaseReport,
+    ) {
+        if self.apply_pending_urgent(core) { report.stopped = true; }
+        let budget = ServiceBudget::for_release(now, release_deadline);
+        report.poll = core.poll_transition_wake(&budget);
+        self.deliver_transition_terminal(report);
+    }
+}
+
+/// Advances one core one release at a time, in the executor's order: urgent stop, hardware
+/// poll, at most one ordinary command, the latest target, the control tick, terminal
+/// detection, then extra hardware services at a pending transition's wake before the next
+/// release (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]). Tests and tracks drive it deterministically: no thread, and virtual time
+/// ([`VirtualClock`]): release `k` (from 1) starts at `clock.base() + (k - 1) * dt` plus what
+/// a test advanced.
+pub struct ReleaseFixture<O: CoreOps> {
+    pub core: O,
+    engine: ReleaseEngine,
+    clock: VirtualClock,
+    pub dt: f64,
+}
+
+/// The points of a release where the fixture re-reads the stop generation and the time
+/// (and applies a stop that arrived since): a stop or a deadline can never be overtaken by
+/// the command, target or output that follows it in the same release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// Before the ordinary command commits.
+    BeforeCommit,
+    /// Before the latest target is consumed.
+    BeforeTarget,
+    /// Before the control tick computes and sends its output.
+    BeforeOutput,
+}
+
+impl<O: CoreOps> ReleaseFixture<O> {
+    /// The fixture, the broker feeding it, the target writer and the stop handle.
+    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        let (engine, broker, tw, stop) = ReleaseEngine::new(boot, caps);
+        let clock = VirtualClock::starting_at(Instant::now());
+        (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
+    }
+
+    /// The fixture's virtual clock (clone it to advance time from a test).
+    pub fn clock(&self) -> &VirtualClock { &self.clock }
+    /// Virtual now.
+    pub fn now(&self) -> Instant { self.clock.now() }
+
+    pub fn releases(&self) -> u64 { self.engine.releases() }
+    pub fn active(&self) -> Option<ActionId> { self.engine.active() }
+    /// The driver transition in flight.
+    pub fn transition(&self) -> Option<ActionId> { self.engine.transition() }
+    pub fn reply_overflow(&self) -> u64 { self.engine.reply_overflow() }
+
+    pub fn ctx(&self, now: Instant) -> CommitCtx { self.engine.ctx(now) }
+
+    /// Runs `hook` at every [`Checkpoint`] just before the fixture samples the stop
+    /// generation and the time there (tests: a stop or a clock step arriving mid-release).
+    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + 'static) { self.engine.on_checkpoint(hook); }
+
+    /// One release.
+    pub fn step(&mut self) -> ReleaseReport {
+        let started = self.clock.now();
+        let release_deadline = started + Duration::from_secs_f64(self.dt);
+        let next_gen = self.engine.releases() + 1;
+        let clock = &self.clock;
+        let mut report = self.engine.step(&mut self.core, || clock.now(), self.dt, release_deadline, next_gen);
+        // Extra sub-release hardware services at a pending transition's wake before the next release
+        // (a transition committed in this release is first served at the next one).
         let mut next = report.poll.wake_before(release_deadline);
         while let Some(wake) = next {
             if report.wakes == MAX_SERVICE_WAKES { break; }
             report.wakes += 1;
             self.clock.advance(wake.saturating_duration_since(self.clock.now()));
-            self.service_hardware(release_deadline, &mut report);
+            self.engine.service_wake(&mut self.core, self.clock.now(), release_deadline, &mut report);
             next = report.poll.wake_before(release_deadline);
         }
-        // the next release starts one period later
+        // The next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
-    }
-
-    /// One `poll_hardware` within the release's budget; a transition it ends gets its terminal.
-    fn service_hardware(&mut self, release_deadline: Instant, report: &mut ReleaseReport) {
-        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
-        let ended = match report.poll.torque {
-            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
-            Some(Err(code)) => Some(Outcome::Failed(code)),
-            _ => None,
-        };
-        // (the transition is taken only when it ended: a pending one stays in flight)
-        if let Some(outcome) = ended {
-            if let Some(t) = self.transition.take() {
-                report.transition_ended = Some((t.action(), outcome));
-                self.intake.terminal(t, outcome);
-            }
-        }
     }
 }
 

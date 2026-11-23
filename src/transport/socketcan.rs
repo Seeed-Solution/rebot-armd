@@ -171,6 +171,10 @@ impl CanTransport for SocketCanTransport {
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
     }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -189,5 +193,9 @@ impl CanTransport for SocketCanTransport {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
     }
 }

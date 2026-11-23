@@ -14,6 +14,23 @@ pub const DISABLE_CONFIRM_WINDOW: Duration = Duration::from_millis(25);
 /// Interval between services of [`DisableConfirm`] in the blocking `request_disable`.
 pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
 
+/// Result of one budgeted [`DisableConfirm::serve_budgeted`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisableServe {
+    pub outcome: Option<bool>,
+    pub did_rx: bool,
+    pub rx_frames: u16,
+    pub budget_exhausted: bool,
+}
+
+/// Outcome of one [`SupervisorInner::service_torque_transition`] call, with the exact
+/// RX work performed by this call (None when no bus receive pass ran).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TransitionPoll {
+    pub progress: Result<crate::rt_core::ops::TorqueProgress, &'static str>,
+    pub rx: Option<(u16, bool)>,
+}
+
 /// The supervisor's disable confirmation as an absolute-deadline wait (no sleep inside): served
 /// once per call, it reads feedback once and reports `Some(confirmed)` when finished.
 #[derive(Clone, Copy, Debug)]
@@ -34,6 +51,34 @@ impl DisableConfirm {
         if self.deadline.passed(drv.clock_now()) { return Some(Self::confirmed(drv)); }
         let _ = drv.read_joint_states();
         Self::confirmed(drv).then_some(true)
+    }
+
+    /// Budgeted service for the RT executor: skips bus RX once the deadline has passed,
+    /// otherwise performs a single budgeted receive pass into `buf`.
+    pub fn serve_budgeted(
+        &mut self,
+        drv: &mut dyn ArmDriver,
+        deadline: Instant,
+        max_rx_frames: u16,
+        buf: &mut Vec<crate::model::JointState>,
+    ) -> DisableServe {
+        if self.deadline.passed(drv.clock_now()) {
+            return DisableServe {
+                outcome: Some(Self::confirmed(drv)),
+                did_rx: false,
+                rx_frames: 0,
+                budget_exhausted: false,
+            };
+        }
+        let (rx_frames, budget_exhausted) = drv
+            .read_joint_states_budgeted(buf, deadline, max_rx_frames)
+            .unwrap_or_default();
+        DisableServe {
+            outcome: Self::confirmed(drv).then_some(true),
+            did_rx: true,
+            rx_frames,
+            budget_exhausted,
+        }
     }
 }
 
@@ -366,6 +411,10 @@ impl SupervisorInner {
     /// limits, handover, pending disable, E-stop, fault, MIT gate), then the feedback read
     /// that seeds the commanded state. Returns (torque was on, gripper command to keep).
     fn enable_prepare(&mut self) -> Result<(bool, Option<f32>), SafetyError> {
+        self.enable_prepare_inner(true)
+    }
+
+    fn enable_prepare_inner(&mut self, allow_bus_read: bool) -> Result<(bool, Option<f32>), SafetyError> {
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::MotionForbiddenInFaultState(format!("Driver limit configuration error: {err}")));
         }
@@ -433,7 +482,7 @@ impl SupervisorInner {
             if self.estop_pending() {
                 return Err(SafetyError::EStopActive);
             }
-            if !driver.is_feedback_valid() {
+            if allow_bus_read && !driver.is_feedback_valid() {
                 if let Ok(states) = driver.read_joint_states() {
                     let loads = driver.joint_loads();
                     if !states.is_empty() && driver.is_feedback_valid() && SupervisorInner::states_valid(&states, driver.capabilities(), self.config.dof, loads.as_deref()) {
@@ -484,9 +533,23 @@ impl SupervisorInner {
     /// an arm that was not torqued again), seeds commanded / target / tracking state from it,
     /// and records torque on.
     fn enable_finish(&mut self, was_torqued: bool, prev_gripper_cmd: Option<f32>) -> Result<SafetyState, SafetyError> {
+        self.enable_finish_inner(was_torqued, prev_gripper_cmd, false)
+    }
+
+    fn enable_finish_inner(&mut self, was_torqued: bool, prev_gripper_cmd: Option<f32>, use_cached: bool) -> Result<SafetyState, SafetyError> {
         if let Some(ref d) = self.driver {
             let mut driver = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-            let states = match driver.read_joint_states() {
+            let states = if use_cached {
+                let mut buf = Vec::with_capacity(self.config.dof);
+                if driver.read_cached_joint_states_into(&mut buf).is_some() {
+                    Ok(buf)
+                } else {
+                    driver.read_joint_states()
+                }
+            } else {
+                driver.read_joint_states()
+            };
+            let states = match states {
                 Ok(s) => s,
                 Err(_) => {
                     if !was_torqued {
@@ -650,18 +713,18 @@ impl SupervisorInner {
         if self.torque_transition.is_some() { return Err(SafetyError::ClearFaultRejected("A torque transition is pending".into())); }
         self.gravity_comp_servo_busy()?;
         if enable {
-            let (was_torqued, prev_gripper_cmd) = self.enable_prepare()?;
+            let (was_torqued, prev_gripper_cmd) = self.enable_prepare_inner(false)?;
             let started = match self.driver.as_ref() {
                 None => None,
                 Some(d) => {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                     let drv_now = drv.clock_now();
-                    Some((drv.begin_torque(true), drv_now))
+                    Some((drv.begin_torque_budgeted(true, 0), drv_now))
                 }
             };
             Ok(match started {
                 None | Some((Ok(crate::driver::TorqueProgress::Done(crate::driver::TorqueOutcome::Confirmed)), _)) =>
-                    self.enable_finish(was_torqued, prev_gripper_cmd).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
+                    self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
                 Some((Ok(crate::driver::TorqueProgress::Pending { .. }), now)) => {
                     self.torque_transition = Some(TorqueTransition::Enable { was_torqued, prev_gripper_cmd });
                     Ok(Rt::Pending { wake: now })
@@ -678,7 +741,7 @@ impl SupervisorInner {
                 Some(d) => {
                     let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
                     let drv_now = drv.clock_now();
-                    Some((drv.begin_torque(false), drv_now))
+                    Some((drv.begin_torque_budgeted(false, 0), drv_now))
                 }
             };
             Ok(match started {
@@ -723,51 +786,65 @@ impl SupervisorInner {
     /// driver's receive pass gets the same span on the driver's clock). None: none in flight.
     /// `Pending { wake }` is on the executor's clock.
     pub(crate) fn service_torque_transition(&mut self, budget: &crate::rt_core::ops::ServiceBudget)
-        -> Option<Result<crate::rt_core::ops::TorqueProgress, &'static str>> {
+        -> Option<TransitionPoll> {
         use crate::driver::{TorqueOutcome, TorqueProgress as Drv};
         use crate::rt_core::ops::TorqueProgress as Rt;
         let t = self.torque_transition.take()?;
-        let Some(d) = self.driver.as_ref() else { return Some(Err("INTERNAL")); };
-        let Ok(mut drv) = d.lock() else { return Some(Err("FEEDBACK_UNAVAILABLE")); };
+        let Some(d) = self.driver.as_ref() else {
+            return Some(TransitionPoll { progress: Err("INTERNAL"), rx: None });
+        };
+        let Ok(mut drv) = d.lock() else {
+            return Some(TransitionPoll { progress: Err("FEEDBACK_UNAVAILABLE"), rx: None });
+        };
         let drv_now = drv.clock_now();
         let span = budget.deadline.saturating_duration_since(budget.now);
         let to_exec = |wake: Instant| budget.now + wake.saturating_duration_since(drv_now);
         match t {
             TorqueTransition::Enable { was_torqued, prev_gripper_cmd } => {
-                let r = drv.poll_torque(drv_now + span);
+                let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                let rx = drv.take_last_poll_rx();
                 drop(drv);
-                Some(match r {
+                let progress = match r {
                     Ok(Drv::Pending { wake }) => {
                         self.torque_transition = Some(t);
                         Ok(Rt::Pending { wake: to_exec(wake) })
                     }
                     Ok(Drv::Done(TorqueOutcome::Confirmed)) =>
-                        self.enable_finish(was_torqued, prev_gripper_cmd).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
+                        self.enable_finish_inner(was_torqued, prev_gripper_cmd, true).map(|_| Rt::Done).map_err(|e| torque_error_code(&e)),
                     r => self.enable_step_failed(was_torqued, r),
-                })
+                };
+                Some(TransitionPoll { progress, rx })
             }
-            TorqueTransition::Disable { confirm: None } => match drv.poll_torque(drv_now + span) {
-                Ok(Drv::Pending { wake }) => {
-                    self.torque_transition = Some(t);
-                    Some(Ok(Rt::Pending { wake: to_exec(wake) }))
+            TorqueTransition::Disable { confirm: None } => {
+                let r = drv.poll_torque_budgeted(drv_now + span, budget.max_rx_frames);
+                let rx = drv.take_last_poll_rx();
+                match r {
+                    Ok(Drv::Pending { wake }) => {
+                        drop(drv);
+                        self.torque_transition = Some(t);
+                        Some(TransitionPoll { progress: Ok(Rt::Pending { wake: to_exec(wake) }), rx })
+                    }
+                    // confirmed or not by the driver's window: the supervisor's confirmation decides
+                    // (an unconfirmed disable is never success; `request_disable` does the same)
+                    Ok(Drv::Done(_)) => {
+                        let now = drv.clock_now();
+                        drop(drv);
+                        self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(DisableConfirm::start(now)) });
+                        Some(TransitionPoll { progress: Ok(Rt::Pending { wake: budget.now }), rx })
+                    }
+                    Err(e) => {
+                        drop(drv);
+                        Some(TransitionPoll { progress: Err(self.disable_step_failed(e)), rx })
+                    }
                 }
-                // confirmed or not by the driver's window: the supervisor's confirmation decides
-                // (an unconfirmed disable is never success; `request_disable` does the same)
-                Ok(Drv::Done(_)) => {
-                    let now = drv.clock_now();
-                    drop(drv);
-                    self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(DisableConfirm::start(now)) });
-                    Some(Ok(Rt::Pending { wake: budget.now }))
-                }
-                Err(e) => {
-                    drop(drv);
-                    Some(Err(self.disable_step_failed(e)))
-                }
-            },
+            }
             TorqueTransition::Disable { confirm: Some(mut c) } => {
-                let served = c.serve(&mut **drv);
+                let mut states = std::mem::take(&mut self.scratch.states);
+                let served = c.serve_budgeted(&mut **drv, drv_now + span, budget.max_rx_frames, &mut states);
+                self.scratch.states = states;
                 drop(drv);
-                Some(match served {
+                let rx = served.did_rx.then_some((served.rx_frames, served.budget_exhausted));
+                let progress = match served.outcome {
                     None => {
                         self.torque_transition = Some(TorqueTransition::Disable { confirm: Some(c) });
                         let wake = (drv_now + DISABLE_CONFIRM_SERVICE).min(c.deadline());
@@ -782,7 +859,8 @@ impl SupervisorInner {
                             "Torque disable has not been confirmed by fresh hardware feedback".into()));
                         Err("FEEDBACK_UNCONFIRMED")
                     }
-                })
+                };
+                Some(TransitionPoll { progress, rx })
             }
         }
     }
@@ -946,6 +1024,10 @@ impl SupervisorInner {
         } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
             return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
         }
+        self.clear_fault_finish()
+    }
+
+    fn clear_fault_finish(&mut self) -> Result<SafetyState, SafetyError> {
         self.pending_rearm = true;
         if self.mit.owner == crate::mit::MitOwner::Lost {
             // cleared: a rearm (fresh readback, base modes restored) and a fresh handover follow
@@ -981,6 +1063,85 @@ impl SupervisorInner {
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)
+    }
+
+    /// Bounded fault clearing for the RT executor: uses Step 2's already-polled feedback
+    /// (zero extra `read_joint_states()` calls), refuses `MitOwner::Lost`, and sends hardware
+    /// resets only via [`ArmDriver::clear_fault_budgeted`] while preserving the reset latch
+    /// rule (a reset write never clears the fault on the same call).
+    pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
+        Self::check_concurrent_estop(self)?;
+        if self.driver_config_error.is_some() {
+            self.reapply_driver_limits();
+        }
+        if let Some(ref err) = self.driver_config_error {
+            return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
+        }
+        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
+        if self.gravity_comp_blocks_clear() {
+            return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
+        }
+        if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+        if self.mit.owner == crate::mit::MitOwner::Lost {
+            return Err(SafetyError::ClearFaultRejected("UNSUPPORTED: MIT lost recovery requires legacy path".into()));
+        }
+        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+        if let Some(ref d) = self.driver {
+            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            let disabling = drv.clear_fault_disables_joints();
+            if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
+                && disabling.iter().any(|&j| j < self.config.arm_dof())
+            {
+                let ages = drv.feedback_ages();
+                let max_age = self.resting_policy().map(|p| Duration::from_millis(p.feedback_max_age_ms)).unwrap_or(Duration::from_millis(250));
+                if !self.feedback_numeric_valid
+                    || !drv.is_feedback_valid()
+                    || ages.len() != self.config.dof
+                    || !ages.iter().all(|a| a.is_some_and(|t| t <= max_age))
+                {
+                    return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before checking resting pose support".into()));
+                }
+                if let Some(reason) = self.resting_pose_support_violation_with_driver(Some(drv.as_ref())) {
+                    return Err(SafetyError::ClearFaultRejected(format!(
+                        "Cannot disable faulted supporting arm joint away from resting pose ({reason}); support the arm at rest first"
+                    )));
+                }
+            }
+            // Clearing a latched motor error requires a later fresh feedback observation.
+            if drv.check_hardware_status().is_err() {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(SafetyError::ClearFaultRejected("Clear fault budget expired".into()));
+                }
+                let drv_deadline = drv.clock_now() + deadline.saturating_duration_since(now);
+                drv.clear_fault_budgeted(drv_deadline).map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
+                return Err(SafetyError::ClearFaultRejected("Hardware reset sent; wait for fresh fault-free feedback before retrying".into()));
+            }
+            let ages = drv.feedback_ages();
+            if !self.feedback_numeric_valid
+                || !drv.is_feedback_valid()
+                || ages.len() != self.config.dof
+                || ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
+            {
+                return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before resetting a fault".into()));
+            }
+            drv.check_hardware_status().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
+            if thermal && (!drv.capabilities().temperature_feedback || self.temperatures.iter().any(|t|
+                !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C))
+            {
+                return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
+            }
+            let state = drv.enable_state();
+            let partial = drv.has_known_partial_enable();
+            let any_enabled = drv.has_any_joint_enabled();
+            if state == EnableState::Unknown && !partial {
+                return Err(SafetyError::ClearFaultRejected("Hardware enable state is unknown; reset remains latched".into()));
+            }
+            self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
+        } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
+            return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+        }
+        self.clear_fault_finish()
     }
 
     pub fn driver_feedback_confirmed(&self) -> bool {

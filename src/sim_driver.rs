@@ -306,6 +306,12 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let mut out = Vec::with_capacity(self.dof);
+        self.read_joint_states_into(&mut out)?;
+        Ok(out)
+    }
+
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         if let (Some(state), _) = self.snapshot() {
             self.cached_torques = state.tau.clone();
             if self.load_only_feedback {
@@ -329,7 +335,24 @@ impl ArmDriver for SimArmDriver {
                 };
             }
         }
-        Ok(self.cached.clone())
+        out.clear();
+        out.extend_from_slice(&self.cached);
+        Ok(())
+    }
+
+    fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _deadline: Instant, _max_rx_frames: u16) -> Result<(u16, bool), ArmDriverError> {
+        self.read_joint_states_into(out)?;
+        Ok((0, false))
+    }
+
+    fn read_cached_joint_states_into(&self, out: &mut Vec<JointState>) -> Option<()> {
+        out.clear();
+        out.extend_from_slice(&self.cached);
+        Some(())
+    }
+
+    fn clear_fault_budgeted(&mut self, _deadline: Instant) -> Result<(), ArmDriverError> {
+        Ok(())
     }
 
     fn joint_loads(&self) -> Option<Vec<f32>> {

@@ -690,9 +690,9 @@ impl crate::supervisor::SupervisorInner {
     }
 
     fn write_output_slice(&mut self, targets: &mut [JointTarget], dt: f64) -> Option<Result<(), String>> {
-        // an E-stop requested since the tick applied the last one: no dynamic output reaches
-        // the bus (the tick applies the stop policy right after, see `tick_control`)
-        if self.estop_request_unapplied() { return None; }
+        // an E-stop or authorized stop requested since the tick applied the last one: no dynamic
+        // output reaches the bus (the tick applies the stop policy right after, see `tick_control`)
+        if self.urgent_stop_unapplied() { return None; }
         let ff = match self.mit.owner {
             MitOwner::Off => None,
             MitOwner::Lost => return None,

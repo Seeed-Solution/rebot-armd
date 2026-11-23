@@ -46,10 +46,11 @@ impl FeedbackState {
 
 /// The RT-owned state of one arm.
 ///
-/// One `ArmCore` per arm, owned by exactly one local owner (during the migration
-/// `SupervisorInner`, under the supervisor write lock; after the cutover the RT executor);
-/// its bus endpoint names one physical bus. Its state lives in private aggregates reached
-/// only through the narrow operations below; there is no general mutable accessor.
+/// One `ArmCore` per arm, owned by exactly one local owner (either `SupervisorInner`
+/// under the legacy supervisor write lock, or exclusively by the synchronous RT executor
+/// OS thread once ownership transfers at startup); its bus endpoint names one physical bus.
+/// Its state lives in private aggregates reached only through the narrow operations below;
+/// there is no general mutable accessor.
 ///
 /// Aggregates today: feedback bookkeeping ([`FeedbackState`]), the state publication, the
 /// recording producer and configuration reservations. Tracks A-E move the remaining

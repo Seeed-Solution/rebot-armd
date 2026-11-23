@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth, StopPolicy, SupervisorInner};
+use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth, SupervisorInner};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -155,15 +155,7 @@ fn resolve_operator_auth(follower: &str, cli: &CliArgs) -> Result<OperatorAuth, 
 
 /// Called while holding the supervisor write lock so stop authority cannot race motion.
 fn request_shutdown(inner: &mut SupervisorInner) -> bool {
-    if inner.driver.is_none() || inner.shutdown_ready() {
-        info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
-        inner.e_stop_latched.store(true, Ordering::SeqCst);
-        return true;
-    }
-    if !inner.safety.state().is_stopped() {
-        inner.execute_stop(StopPolicy::EStopLatch);
-    }
-    false
+    inner.request_shutdown()
 }
 
 /// Requests SCHED_FIFO 50 for the calling thread and reads the policy back

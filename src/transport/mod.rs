@@ -272,4 +272,11 @@ pub trait CanTransport: Send {
 
     /// Flush pending CAN frames
     fn flush(&mut self) -> Result<(), TransportError>;
+
+    /// True when [`Self::flush`] is non-blocking / time-bounded (e.g. SocketCAN or in-memory
+    /// test transports). Serial transports (`SlcanTransport`) default to `false` so bounded
+    /// RT maintenance fails closed rather than stalling the executor thread.
+    fn supports_bounded_flush(&self) -> bool {
+        false
+    }
 }

@@ -541,6 +541,24 @@ pub struct SupervisorInner {
     pub tool_commissioning_confirmed_at: Option<String>,
     /// Monotonic revision for tool commissioning state.
     pub tool_commissioning_revision: u64,
+    /// Single-pass Step-2 hardware poll state consumed once by `tick_control` in the same release.
+    pub(crate) pending_rx_poll: PendingRxPoll,
+    /// Authorized-stop generations wired into `estop_gate()` when owned by an RT executor.
+    pub(crate) stop_requests: Option<crate::rt_core::urgent::StopRequests>,
+}
+
+/// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
+/// without allocating or re-reading the bus.
+#[derive(Debug, Default)]
+pub(crate) struct PendingRxPoll {
+    pub active: bool,
+    pub invalid_feedback: bool,
+    pub driver_torque_lost: bool,
+    pub recovery_ages: bool,
+    pub hw_rx: bool,
+    pub reset_stillness_on_read_err: bool,
+    pub rx_frames: u16,
+    pub budget_exhausted: bool,
 }
 
 /// Complete validated gripper calibration snapshot ready for infallible commit after disk rename.
@@ -787,6 +805,8 @@ impl SupervisorInner {
             tool_commissioning_path: None,
             tool_commissioning_confirmed_at: None,
             tool_commissioning_revision: 1,
+            pending_rx_poll: PendingRxPoll::default(),
+            stop_requests: None,
         }
     }
 
@@ -817,15 +837,39 @@ impl SupervisorInner {
         schema
     }
 
-    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick.
+    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick
+    /// (plus authorized-stop generations when attached to an RT executor).
     pub fn estop_gate(&self) -> crate::rt_core::urgent::EstopGate {
-        crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone())
+        let gate = crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone());
+        match self.stop_requests.as_ref() {
+            Some(stops) => gate.with_stops(stops.clone()),
+            None => gate,
+        }
+    }
+
+    /// Attaches the executor's authorized-stop generation tracker and updates the bus
+    /// driver's `EstopGate` so mid-batch writes also stop on authorized stop requests.
+    pub fn attach_stop_requests(&mut self, stops: crate::rt_core::urgent::StopRequests) {
+        self.stop_requests = Some(stops);
+        let gate = self.estop_gate();
+        if let Some(ref d) = self.driver {
+            if let Ok(mut drv) = d.lock() {
+                drv.set_estop_gate(gate);
+            }
+        }
     }
 
     /// An E-stop request the tick has not applied yet (not the latch: hold output while
     /// latched still reaches the motors).
     pub(crate) fn estop_request_unapplied(&self) -> bool {
         self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+    }
+
+    /// True when either an E-stop request or an attached authorized-stop request has not
+    /// yet been applied by the control tick / release engine.
+    pub(crate) fn urgent_stop_unapplied(&self) -> bool {
+        self.estop_request_unapplied()
+            || self.stop_requests.as_ref().is_some_and(crate::rt_core::urgent::StopRequests::pending)
     }
 
     pub(crate) fn estop_pending(&self) -> bool {
@@ -1078,13 +1122,9 @@ impl SupervisorInner {
         (sampled, until.max(sampled))
     }
 
-    /// The control loop's tick under the write guard of lock generation `generation`:
-    /// [`Self::tick_control`], the observation filled in place into the publication's back
-    /// slot ([`Self::fill_observation`]), and its publication (before the guard drops: no
-    /// other write can come in between). No allocation in a steady-state tick; `keep` copies
-    /// the observation for the caller (tests).
-    pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
-        let timestamp = self.tick_control(dt);
+    /// Publishes an observation filled in place at `timestamp` with lock/release generation
+    /// `generation` without re-running `tick_control`.
+    pub fn publish_at(&mut self, timestamp: f64, generation: u64, keep: bool) -> TickPublished {
         let mut obs = self.core.take_observation_buffer();
         self.fill_observation(timestamp, &mut obs);
         self.tick_phase(4);
@@ -1095,6 +1135,16 @@ impl SupervisorInner {
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
         core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
         TickPublished { kept, body_end }
+    }
+
+    /// The control loop's tick under the write guard of lock generation `generation`:
+    /// [`Self::tick_control`], the observation filled in place into the publication's back
+    /// slot ([`Self::fill_observation`]), and its publication (before the guard drops: no
+    /// other write can come in between). No allocation in a steady-state tick; `keep` copies
+    /// the observation for the caller (tests).
+    pub fn tick_publish(&mut self, dt: f64, generation: u64, keep: bool) -> TickPublished {
+        let timestamp = self.tick_control(dt);
+        self.publish_at(timestamp, generation, keep)
     }
 
     pub fn current_observation(&self) -> ArmObservation {
@@ -1465,12 +1515,12 @@ impl SupervisorInner {
     pub(crate) fn consume_pending_estop(&mut self) -> bool {
         let req = self.requested_estop_count.load(Ordering::SeqCst);
         if req > self.applied_estop_count {
-            self.applied_estop_count = req;
-            self.estop_applied.store(req, Ordering::SeqCst);
             self.e_stop_latched.store(true, Ordering::SeqCst);
             if !matches!(self.safety.state(), SafetyState::Fault(_)) {
                 self.apply_stop_policy(StopPolicy::EStopLatch);
             }
+            self.applied_estop_count = req;
+            self.estop_applied.store(req, Ordering::SeqCst);
             true
         } else {
             false
@@ -1485,7 +1535,7 @@ impl SupervisorInner {
     }
 
     pub fn shutdown_ready(&self) -> bool {
-        if self.disable_pending { return false; }
+        if self.disable_pending || self.gravity_comp.is_some() { return false; }
         match &self.driver {
             None => !self.is_torqued,
             Some(driver) => !self.is_torqued
@@ -1497,6 +1547,21 @@ impl SupervisorInner {
                     }
                 }),
         }
+    }
+
+    /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
+    /// Returns `true` when safe to stop the control loop and exit; returns `false` after
+    /// latching stop when hardware disable is not yet confirmed.
+    pub fn request_shutdown(&mut self) -> bool {
+        if self.driver.is_none() || self.shutdown_ready() {
+            tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
+            self.e_stop_latched.store(true, Ordering::SeqCst);
+            return true;
+        }
+        if !self.safety.state().is_stopped() {
+            self.execute_stop(StopPolicy::EStopLatch);
+        }
+        false
     }
 
     pub fn is_fully_settled_hold(&self) -> bool {
@@ -1741,53 +1806,79 @@ impl SupervisorInner {
         obs
     }
 
-    /// One control tick without building the observation; returns the tick's observation
-    /// timestamp (the recording sample's). The control loop fills its published sample with
-    /// [`Self::fill_observation`] at this timestamp.
-    pub fn tick_control(&mut self, dt: f64) -> f64 {
-        self.consume_pending_estop();
-        // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
-            self.apply_stop_policy(StopPolicy::EStopLatch);
-        }
-
-        // Polling a cached sample never refreshes its hardware receive timestamp.
-        // The driver is read into the tick's preallocated buffers (`self.scratch`).
-        let mut invalid_feedback = false;
+    /// Single-pass hardware receive + feedback intake.
+    ///
+    /// Called at Step 2 (`CoreOps::poll_hardware`) with `budget: Some(...)` so Step 3 commits
+    /// and Step 4 targets see fresh feedback and Step 5 `tick_control` does not re-read the bus.
+    /// Legacy callers invoking `tick_control` directly without a prior `poll_hardware` call this
+    /// with `budget: None`.
+    pub(crate) fn poll_hardware_rx(
+        &mut self,
+        budget: Option<&crate::rt_core::ops::ServiceBudget>,
+        transition_rx: Option<(u16, bool)>,
+    ) -> PendingRxPoll {
+        let mut out = PendingRxPoll { active: true, ..PendingRxPoll::default() };
         let mut new_motor_errors = None;
-        let mut driver_torque_lost = false;
-        let mut recovery_ages = false;
-        let mut hw_rx = false;
-        let mut reset_stillness_on_read_err = false;
         let mut sc = std::mem::take(&mut self.scratch);
         sc.recovered.clear();
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             match d.lock() {
                 Ok(mut driver) => {
-                    match driver.read_joint_states_into(&mut sc.states) {
-                        Ok(()) => {
+                    let read_res = match (budget, transition_rx) {
+                        (Some(b), Some((frames, exhausted))) => {
+                            if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
+                                Ok((frames, exhausted))
+                            } else {
+                                let drv_now = driver.clock_now();
+                                let span = b.deadline.saturating_duration_since(b.now);
+                                driver
+                                    .read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
+                                    .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
+                            }
+                        }
+                        (Some(b), None) => {
+                            let drv_now = driver.clock_now();
+                            let span = b.deadline.saturating_duration_since(b.now);
+                            driver.read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
+                        }
+                        (None, _) => driver.read_joint_states_into(&mut sc.states).map(|()| (0, false)),
+                    };
+                    match read_res {
+                        Ok((frames, exhausted)) => {
+                            out.rx_frames = frames;
+                            out.budget_exhausted = exhausted;
                             driver.take_recovery_writes_into(&mut sc.recovered);
                             let has_loads = driver.joint_loads_into(&mut sc.loads);
-                            self.feedback_numeric_valid = Self::states_valid(&sc.states, driver.capabilities(), self.config.dof, has_loads.then_some(sc.loads.as_slice()));
-                            invalid_feedback = !self.feedback_numeric_valid;
+                            self.feedback_numeric_valid = Self::states_valid(
+                                &sc.states,
+                                driver.capabilities(),
+                                self.config.dof,
+                                has_loads.then_some(sc.loads.as_slice()),
+                            );
+                            out.invalid_feedback = !self.feedback_numeric_valid;
                             driver.feedback_ages_into(&mut sc.ages);
                             if !sc.recovered.is_empty() || self.tracking.recovery_suspended {
-                                recovery_ages = true;
+                                out.recovery_ages = true;
                             }
                             let driver_valid = driver.is_feedback_valid();
                             let all_fresh_age = sc.ages.len() == self.config.dof
                                 && sc.ages.iter().all(|a| a.is_some_and(|age| age <= Duration::from_millis(250)));
                             if self.feedback_numeric_valid && sc.ages.len() == self.config.dof && driver_valid {
-                                // the oldest joint's sample; None when a joint has none
                                 let oldest = sc.ages.iter().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a)));
-                                self.last_can_feedback_instant = oldest.filter(|_| !sc.ages.is_empty())
+                                self.last_can_feedback_instant = oldest
+                                    .filter(|_| !sc.ages.is_empty())
                                     .and_then(|age| Instant::now().checked_sub(age));
                             } else {
                                 self.last_can_feedback_instant = None;
                             }
                             if self.feedback_numeric_valid {
-                                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut sc.fb);
+                                self.core.poll_feedback(
+                                    &mut self.joint_feedback_queue_bounds,
+                                    self.config.dof,
+                                    driver.as_ref(),
+                                    &mut sc.fb,
+                                );
                                 Self::apply_feedback(
                                     &mut self.measured_positions,
                                     &mut self.measured_velocities,
@@ -1804,37 +1895,49 @@ impl SupervisorInner {
                                 if sc.rx.len() == self.config.dof && sc.rx.iter().all(Option::is_some) {
                                     sc.rx_vals.clear();
                                     sc.rx_vals.extend(sc.rx.iter().map(|t| t.unwrap()));
-                                    hw_rx = true;
+                                    out.hw_rx = true;
                                 }
                             }
                         }
                         Err(_) => {
                             self.last_can_feedback_instant = None;
-                            reset_stillness_on_read_err = true;
+                            out.reset_stillness_on_read_err = true;
                         }
                     }
                     if driver.motor_status_into(&mut sc.status) {
-                        // decoded (a String per code) only when a code changed
                         let changed = sc.status.len() != self.motor_errors.len()
                             || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
                                 let decoded = e.as_ref().map(|e| e.code);
                                 decoded != Some(*code) && !(decoded.is_none() && driver.decode_motor_error(*code).is_none())
                             });
                         if changed {
-                            new_motor_errors = Some(sc.status.iter().map(|&code| {
-                                driver.decode_motor_error(code).map(|name| crate::model::MotorError { code, name })
-                            }).collect());
+                            new_motor_errors = Some(
+                                sc.status
+                                    .iter()
+                                    .map(|&code| {
+                                        driver
+                                            .decode_motor_error(code)
+                                            .map(|name| crate::model::MotorError { code, name })
+                                    })
+                                    .collect(),
+                            );
                         }
                     }
-                    if self.is_torqued && !self.disable_pending && self.gravity_comp.is_none() && self.safety.state().is_operational()
-                        && driver.capabilities().enable_feedback && driver.is_feedback_valid() && driver.enable_state() != EnableState::Enabled
-                        && !(self.pending_rearm && driver.has_known_partial_enable()) {
-                        driver_torque_lost = true;
+                    if self.is_torqued
+                        && !self.disable_pending
+                        && self.gravity_comp.is_none()
+                        && self.safety.state().is_operational()
+                        && driver.capabilities().enable_feedback
+                        && driver.is_feedback_valid()
+                        && driver.enable_state() != EnableState::Enabled
+                        && !(self.pending_rearm && driver.has_known_partial_enable())
+                    {
+                        out.driver_torque_lost = true;
                     }
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;
-                    reset_stillness_on_read_err = true;
+                    out.reset_stillness_on_read_err = true;
                 }
             }
         } else {
@@ -1842,13 +1945,39 @@ impl SupervisorInner {
             self.core.simulate_feedback(self.config.dof, Instant::now());
             self.joint_feedback_queue_bounds.clear();
         }
+        self.scratch = sc;
         if let Some(errors) = new_motor_errors {
             self.update_motor_errors(errors);
         }
-        if reset_stillness_on_read_err {
+        if out.reset_stillness_on_read_err {
             self.reset_table_stillness();
         }
         self.tick_phase(0);
+        out
+    }
+
+    /// One control tick without building the observation; returns the tick's observation
+    /// timestamp (the recording sample's). The control loop fills its published sample with
+    /// [`Self::fill_observation`] at this timestamp.
+    pub fn tick_control(&mut self, dt: f64) -> f64 {
+        self.consume_pending_estop();
+        // Immediate atomic e-stop latch check before any processing
+        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
+            self.apply_stop_policy(StopPolicy::EStopLatch);
+        }
+
+        // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
+        // a preceding `poll_hardware` perform the receive pass here.
+        let rx = if self.pending_rx_poll.active {
+            std::mem::take(&mut self.pending_rx_poll)
+        } else {
+            self.poll_hardware_rx(None, None)
+        };
+        let invalid_feedback = rx.invalid_feedback;
+        let driver_torque_lost = rx.driver_torque_lost;
+        let recovery_ages = rx.recovery_ages;
+        let hw_rx = rx.hw_rx;
+        let mut sc = std::mem::take(&mut self.scratch);
         // B1: autonomous driver recovery writes (e.g. Damiao 45 ms POS_VEL hold) invalidate
         // tracking output history and suspend compensated writes until fresh post-recovery
         // feedback confirms a clean baseline across every joint.
@@ -3155,12 +3284,21 @@ impl SupervisorInner {
         }
 
         self.tick_phase(2);
-        // An E-stop requested during this tick: its output did not reach the bus (or the batch
-        // stopped at the next frame, `ArmDriver::set_estop_gate`); apply it now instead of one
-        // period later. A batch the gate stopped is not a driver failure.
-        if self.estop_request_unapplied() {
+        // An E-stop or authorized stop requested during this tick: its output did not reach
+        // the bus (or the batch stopped at the next frame, `ArmDriver::set_estop_gate`); apply
+        // it now instead of one period later. A batch the gate stopped is not a driver failure.
+        if self.urgent_stop_unapplied() {
             tick_output_accepted = false;
-            self.consume_pending_estop();
+            if self.estop_request_unapplied() {
+                self.consume_pending_estop();
+            }
+            if let Some(stops) = self.stop_requests.clone() {
+                let generation = stops.current();
+                if generation != stops.applied() {
+                    self.authorized_stop();
+                    stops.mark_applied(generation);
+                }
+            }
             if output_error.as_deref().is_some_and(|e| e.contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
         }
         if let Some(error) = output_error {
