@@ -273,6 +273,8 @@ pub struct SupervisorInner {
     pub commanded_accelerations: Vec<f32>,
     pub following_error_since: Option<Instant>,
     pub disable_pending: bool,
+    /// The torque transition the RT started and serves from `poll_hardware` (None: none).
+    pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
     pub last_disable_attempt: Option<Instant>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
@@ -637,6 +639,7 @@ impl SupervisorInner {
             commanded_accelerations: vec![0.0; dof],
             following_error_since: None,
             disable_pending: false,
+            torque_transition: None,
             last_disable_attempt: None,
             output_suspended: false,
             feedback_numeric_valid: true,
@@ -2389,7 +2392,8 @@ impl SupervisorInner {
                 && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
                 self.apply_stop_policy(StopPolicy::ThermalTrip);
             }
-        if self.disable_pending {
+        // (a torque transition in flight confirms its own disable: `service_torque_transition`)
+        if self.disable_pending && self.torque_transition.is_none() {
             let confirmed = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv|
                 drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
             if confirmed {
@@ -2909,7 +2913,9 @@ impl SupervisorInner {
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
         let mut tick_output_accepted = false;
-        if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
+        // a torque transition in flight owns the bus until it ends (the driver refuses targets)
+        let transition_owns_bus = self.torque_transition.is_some();
+        if self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
@@ -2925,7 +2931,7 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if self.is_torqued && !self.disable_pending {
+        } else if self.is_torqued && !self.disable_pending && !transition_owns_bus {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 

@@ -299,6 +299,17 @@ impl HardwarePoll {
     pub fn wake(&self) -> Option<Instant> {
         match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
     }
+
+    /// The executor's extra service within the release ending at `release`: the pending
+    /// transition's wake when it comes before the release (None: serve it at the release).
+    pub fn wake_before(&self, release: Instant) -> Option<Instant> { self.wake().filter(|w| *w < release) }
+}
+
+/// Extra hardware services the executor runs within one release at most (a transition's
+/// retry cadence is 25 ms and its confirmation service 2 ms: a 20 ms release needs a few).
+pub const MAX_SERVICE_WAKES: u32 = 8;
+
+impl HardwarePoll {
 }
 
 /// The narrow operations of one arm's core.
@@ -341,7 +352,8 @@ fn static_code(e: ArmError) -> &'static str {
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE",
     ];
     if let ArmError::Motion(m) = &e { return m.code(); }
     let code = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
@@ -446,11 +458,12 @@ impl CoreOps for SupervisorInner {
 
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.check_commit(d, ctx)?;
-        if self.core.transition_pending() { return Err("TRANSITION_BUSY"); }
-        // delegated: the existing set_torque confirms synchronously; the result is reported
-        // by the next poll, as the bus owner's state machine will (track A)
-        let result = self.set_torque(matches!(op, TransitionOp::TorqueOn)).map(drop).map_err(|e| static_code(ArmError::Safety(e)));
-        self.core.begin_transition(result.map(|()| TorqueProgress::Done));
+        if self.core.transition_pending() || self.torque_transition_pending() { return Err("TRANSITION_BUSY"); }
+        // starts the bus owner's handshake (ArmDriver::begin_torque); a refusal before any
+        // frame refuses the commit, a later failure is the transition's terminal
+        let progress = self.begin_torque_transition(matches!(op, TransitionOp::TorqueOn)).map_err(|e| static_code(ArmError::Safety(e)))?;
+        // the next service is the next poll (the begin's wake is on the driver's clock)
+        self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
     }
 
@@ -473,7 +486,10 @@ impl CoreOps for SupervisorInner {
     fn action_children(&self, action: ActionId) -> u32 { self.core.last_macro().filter(|m| m.action == action).map_or(0, |m| m.children) }
 
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
-        // no bus servicing is delegated yet (the tick reads feedback): only the budget is reported
+        // the torque transition in flight: one service of the driver's handshake (or the
+        // supervisor's disable confirmation) within the budget; its progress replaces the
+        // core's. Feedback is otherwise still read by the tick.
+        if let Some(progress) = self.service_torque_transition(budget) { self.core.begin_transition(progress); }
         let budget_exhausted = budget.now > budget.deadline;
         let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() }; };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
@@ -615,6 +631,9 @@ pub struct ReleaseReport {
     pub poll: HardwarePoll,
     /// The driver transition that ended in this release.
     pub transition_ended: Option<(ActionId, Outcome)>,
+    /// Extra hardware services at a pending transition's wake within this release
+    /// (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]); `poll` is the last one.
+    pub wakes: u32,
 }
 
 /// The fixture's clock: virtual monotonic time, advanced by the fixture (one `dt` per
@@ -636,7 +655,8 @@ impl VirtualClock {
 
 /// Advances one core one release at a time, in the executor's order: urgent stop, hardware
 /// poll, at most one ordinary command, the latest target, the control tick, terminal
-/// detection. Tests and tracks drive it deterministically: no thread, and virtual time
+/// detection, then extra hardware services at a pending transition's wake before the next
+/// release (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]). Tests and tracks drive it deterministically: no thread, and virtual time
 /// ([`VirtualClock`]): release `k` (from 1) starts at `clock.base() + (k - 1) * dt` plus what
 /// a test advanced.
 pub struct ReleaseFixture<O: CoreOps> {
@@ -720,16 +740,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // 1. urgent stop, independent of the command ring's capacity
         if self.apply_pending_stop() { report.stopped = true; }
         // 2. the bus owner, within the release's service budget
-        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
-        let ended = match report.poll.torque {
-            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
-            Some(Err(code)) => Some(Outcome::Failed(code)),
-            _ => None,
-        };
-        if let (Some(outcome), Some(t)) = (ended, self.transition.take()) {
-            report.transition_ended = Some((t.action(), outcome));
-            self.intake.terminal(t, outcome);
-        }
+        self.service_hardware(release_deadline, &mut report);
         // 3. one ordinary command (the intake enforces one per release)
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(Checkpoint::BeforeCommit, &mut report);
@@ -785,9 +796,36 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 report.ended = Some((action, outcome));
             }
         }
+        // 7. the executor wakes again at a pending transition's wake before the next release
+        // (a transition committed in this release is first served at the next one)
+        let mut next = report.poll.wake_before(release_deadline);
+        while let Some(wake) = next {
+            if report.wakes == MAX_SERVICE_WAKES { break; }
+            report.wakes += 1;
+            self.clock.advance(wake.saturating_duration_since(self.clock.now()));
+            self.service_hardware(release_deadline, &mut report);
+            next = report.poll.wake_before(release_deadline);
+        }
         // the next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
+    }
+
+    /// One `poll_hardware` within the release's budget; a transition it ends gets its terminal.
+    fn service_hardware(&mut self, release_deadline: Instant, report: &mut ReleaseReport) {
+        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
+        let ended = match report.poll.torque {
+            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
+            Some(Err(code)) => Some(Outcome::Failed(code)),
+            _ => None,
+        };
+        // (the transition is taken only when it ended: a pending one stays in flight)
+        if let Some(outcome) = ended {
+            if let Some(t) = self.transition.take() {
+                report.transition_ended = Some((t.action(), outcome));
+                self.intake.terminal(t, outcome);
+            }
+        }
     }
 }
 
