@@ -296,3 +296,55 @@ async fn capability_is_advertised_with_cartesian() {
     assert_eq!(schema["capabilities"]["move_path_joint"], true);
     assert_eq!(schema["capabilities"]["cartesian"], true);
 }
+
+/// Longest supervisor write hold by `ws.rs` at `line` in the recorded ticks (µs).
+fn ws_hold_us(sup: &ArmSupervisor, line: u32) -> u32 {
+    sup.tick_samples().iter()
+        .flat_map(|s| [s.longest_hold, s.waited_for])
+        .flatten()
+        .filter(|h| h.location.file().ends_with("api/ws.rs") && h.location.line() == line)
+        .map(|h| h.hold_us)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The quintic of a `path: "joint"` move is planned and checked with the IK, without the
+/// supervisor lock: the install reuses it, and the control tick never waits for the sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joint_move_installs_the_quintic_planned_without_the_lock() {
+    let home: [f32; 7] = std::array::from_fn(|i| profile().home_positions.get(i).copied().unwrap_or(0.0));
+    let mut r = Rig::new(&home, true).await;
+    // a keep-out box away from the path: the swept check evaluates it on every sample
+    r.set_keepout(vec![KeepoutBox { name: "bin".into(), min_m: [0.30, -0.40, 0.0], max_m: [0.40, -0.30, 0.10] }]).await;
+    let goals = [[0.12, 0.18, 0.30, 15.0], [0.20, -0.10, 0.30, 30.0], [0.22, 0.0, 0.25, 45.0]];
+    for (i, g) in goals.iter().enumerate() {
+        let (_, a) = r.move_to(body(*g, json!({"path": "joint", "speed_scale": 0.5}))).await.unwrap_or_else(|e| panic!("{g:?}: {e}"));
+        assert_eq!(a.state, "done", "{a:?}");
+        assert_eq!(r.sup.inner().read().await.prepared_quintics_used, i as u64 + 1);
+    }
+    println!("install hold max {} us", ws_hold_us(&r.sup, install_line()));
+}
+
+/// When the arm state the quintic was planned from changed, the install plans under the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joint_move_replans_under_the_lock_when_the_start_changed() {
+    let home: [f32; 7] = std::array::from_fn(|i| profile().home_positions.get(i).copied().unwrap_or(0.0));
+    let mut r = Rig::new(&home, true).await;
+    r.sup.inner().write().await.before_install_hook = Some(Box::new(|inner: &mut armd::SupervisorInner| {
+        inner.commanded_velocities[0] = 1e-4;
+    }));
+    let (_, a) = r.move_to(body([0.12, 0.18, 0.30, 15.0], json!({"path": "joint", "speed_scale": 0.5}))).await.unwrap();
+    assert_eq!(a.state, "done", "{a:?}");
+    assert_eq!(r.sup.inner().read().await.prepared_quintics_used, 0);
+    println!("install hold (planned under the lock) {} us", ws_hold_us(&r.sup, install_line()));
+}
+
+/// Line of the `path: "joint"` install's write guard in src/api/ws.rs.
+fn install_line() -> u32 {
+    let src = include_str!("../src/api/ws.rs");
+    let at = src.find("inner.install_joint_goal_prepared(").unwrap();
+    let before = &src[..at];
+    let guard = before.rfind("let mut inner = recv_supervisor.inner().write().await;").unwrap();
+    // the partial last line is the guard's line
+    before[..guard].lines().count() as u32
+}

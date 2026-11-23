@@ -215,6 +215,8 @@ struct PendingPlan {
 struct JointGoal {
     speed_scale: f64,
     same_side: Option<crate::backlash::Request>,
+    /// Supervisor state the joint quintic is planned from without the lock.
+    snapshot: crate::supervisor::JointGoalSnapshot,
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -496,6 +498,7 @@ fn prepare_action(
             Some(JointGoal {
                 speed_scale,
                 same_side: same_side.then_some(request),
+                snapshot: inner.joint_goal_snapshot(speed_scale),
             })
         }
     };
@@ -1424,20 +1427,27 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     if let Some(joint) = joint {
                         // path "joint": IK of the goal only (several seeds) without the lock,
                         // then the move_to_pose quintic, checked under the lock
+                        // ... and the quintic's plan, power fit and swept-workspace check, which
+                        // the install reuses when the arm and the workspace did not change
+                        let JointGoal { speed_scale, same_side, snapshot } = joint;
                         let solved = tokio::task::spawn_blocking(move || {
                             let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
-                            (input, q)
+                            let prepared = match (&q, same_side) {
+                                (Ok(q), None) => crate::supervisor::prepare_quintic(&input, &snapshot, q),
+                                _ => None,
+                            };
+                            (input, q.map(|q| (q, prepared)))
                         }).await;
                         let mut inner = recv_supervisor.inner().write().await;
                         if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
                         response = Some(match solved {
                             Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
                             Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
-                            Ok((input, Ok(q))) => {
+                            Ok((input, Ok((q, prepared)))) => {
                                 if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                                 } else {
-                                    match inner.install_joint_goal(&input, &q, joint.speed_scale, kind, tag, joint.same_side) {
+                                    match inner.install_joint_goal_prepared(&input, &q, speed_scale, kind, tag, same_side, prepared) {
                                         Ok(started) => command_ack(&inner, &request_id, Some(started)),
                                         Err(error) => command_reject(&inner, &request_id, error.into()),
                                     }

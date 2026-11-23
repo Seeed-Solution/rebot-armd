@@ -697,10 +697,18 @@ impl SupervisorInner {
     /// `min_scale` does not fit; otherwise run at `min_scale` (park).
     pub(crate) fn power_fit_quintic(&self, traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
         limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
+        power_fit_quintic_with(self.power_budget(), &self.config.arm_model, self.config.arm_dof(), traj, start, v0, target, limits, refuse)
+    }
+}
+
+/// [`SupervisorInner::power_fit_quintic`] with the budget and arm model given (no lock).
+pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::chain::ArmModel, dof: usize,
+    traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
+    limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
         use crate::power_plan::{plan_scale, quintic_samples};
-        let Some(b) = self.power_budget().filter(|b| b.planning.enabled) else { return Ok((traj, None)); };
+        let Some(b) = budget.filter(|b| b.planning.enabled) else { return Ok((traj, None)); };
         let t0 = std::time::Instant::now();
-        let (p, arm, dof) = (b.planning, &self.config.arm_model, self.config.arm_dof());
+        let p = b.planning;
         let fit = |t: &crate::trajectory::MultiJointQuinticTrajectory| plan_scale(b, arm, &quintic_samples(&p, t, dof));
         let mut s = match fit(&traj) {
             Ok(f) if f.scale >= 1.0 => return Ok((traj, Some(1.0))),
@@ -730,7 +738,9 @@ impl SupervisorInner {
         let scale = full / t2.duration;
         tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
         Ok((t2, Some(scale)))
-    }
+}
+
+impl SupervisorInner {
 
     /// `observation.power`.
     pub fn power_observation(&self) -> Option<PowerObservation> {
