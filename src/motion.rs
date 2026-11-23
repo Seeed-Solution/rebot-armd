@@ -167,6 +167,20 @@ pub fn plan_start_moved(commanded: &[f32], arm_q0: &[f64], gripper_idx: usize, g
     arm || (commanded.get(gripper_idx).copied().unwrap_or(0.0) - gripper_q0).abs() >= PLAN_START_TOL_RAD as f32
 }
 
+/// Worker-side preparation of a joint move for the RT broker (armd 1.6 RT core, track C):
+/// the joint quintic from the snapshot's commanded joints to `q` in `duration_s`, to submit
+/// under `snap.authority`. Refused before admission (nothing is queued) when a configuration
+/// hold inhibits motion (`CONFIG_BUSY`) or `q` does not fit (`INVALID_COMMAND`); the commit
+/// rechecks everything (stamp, lease, start, configuration, feedback).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_joint_move(snap: &crate::rt_core::ops::PlanningSnapshot, q: &[f32], duration_s: f64) -> Result<crate::rt_core::ops::Primitive, &'static str> {
+    if snap.config_inhibited { return Err("CONFIG_BUSY"); }
+    if q.len() != snap.commanded.len() || !q.iter().all(|v| v.is_finite()) || !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("INVALID_COMMAND");
+    }
+    crate::rt_core::ops::Primitive::joint_quintic(&snap.commanded, q, duration_s)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed {
     pub linear: f64,

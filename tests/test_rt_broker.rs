@@ -710,3 +710,31 @@ fn invalid_feedback_refuses_the_commit_and_leaves_the_motion() {
     submit_install(&mut b, 3, a, later(), quintic(&fx, -0.1, 1.0)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
+
+#[test]
+fn a_worker_refuses_a_joint_move_at_admission_while_a_config_hold_inhibits_motion() {
+    use armd::rt_core::broker::{RequestId, Stamp};
+    use armd::rt_core::config_iface::{CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Reserved};
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let ctx = fx.ctx(fx.now());
+    let snap = fx.core.planning_snapshot(&ctx);
+    let mut q = snap.commanded.clone();
+    q[0] += 0.05;
+    // free: prepared from the snapshot's commanded joints, admitted and committed
+    let p = armd::motion::prepare_joint_move(&snap, &q, 0.5).unwrap();
+    submit_install(&mut b, 1, snap.authority, later(), p).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert_eq!(armd::motion::prepare_joint_move(&snap, &q[..2], 0.5), Err("INVALID_COMMAND"));
+    // a configuration worker holds a motion domain: the next move is refused before admission
+    let a = auth(&fx);
+    let stamp = Stamp { arm: ArmId::LOCAL, boot: BOOT, request: RequestId(900), client: ClientId(5), client_seq: 1, authority: a, deadline: later() };
+    let proposal = ConfigProposal { domain: ConfigDomain::Keepout, expected_revision: fx.core.revision(ConfigDomain::Keepout), candidate: CandidateId(1), stamp };
+    let ctx = fx.ctx(fx.now());
+    let Reserved::Granted(r) = fx.core.reserve(&proposal, &ctx) else { panic!("not granted") };
+    let snap = fx.core.planning_snapshot(&ctx);
+    assert_eq!(armd::motion::prepare_joint_move(&snap, &snap.commanded.clone(), 0.5), Err("CONFIG_BUSY"));
+    assert_eq!(b.stats().admitted, 1, "nothing queued");
+    fx.core.release(r);
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
+    assert!(armd::motion::prepare_joint_move(&snap, &snap.commanded.clone(), 0.5).is_ok());
+}
