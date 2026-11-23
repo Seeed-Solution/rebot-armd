@@ -985,6 +985,27 @@ impl SupervisorInner {
         Ok(())
     }
 
+    // -- RT commit (armd 1.6 RT core, track C) ------------------------------------------
+
+    /// Feedback a commit may plan from: numerically valid, and fresh per the driver (no driver: simulated).
+    pub fn commit_feedback_valid(&self) -> bool {
+        self.feedback_numeric_valid && self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.is_feedback_valid()))
+    }
+
+    /// The refusal code when a primitive admitted under `admitted` may not be installed,
+    /// beyond the stamp and authority checks of the commit (identity, deadline, stop, epoch,
+    /// a lease valid at the commit instant, configuration revision, parent, prepared start):
+    /// the configuration authority's active workspace revision (`PLAN_STALE`), no
+    /// configuration reservation inhibiting motion (`CONFIG_BUSY`) and valid feedback
+    /// (`FEEDBACK_STALE`). None: the install's own checks decide. Changes nothing.
+    pub fn motion_commit_blocker(&self, admitted: &crate::rt_core::broker::Authority) -> Option<&'static str> {
+        use crate::rt_core::config_iface::{ConfigAuthority, ConfigDomain};
+        if ConfigAuthority::revision(self, ConfigDomain::Workspace) != admitted.config_revision { return Some("PLAN_STALE"); }
+        if self.core.motion_inhibited_by_config() { return Some("CONFIG_BUSY"); }
+        if !self.commit_feedback_valid() { return Some("FEEDBACK_STALE"); }
+        None
+    }
+
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
         let last = path.last_slice().to_vec();
         self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
