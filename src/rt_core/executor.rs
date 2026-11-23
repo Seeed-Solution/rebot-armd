@@ -1318,7 +1318,9 @@ impl ControlState {
             let Ok(arc) = self.reclaim_return_rx.pop() else {
                 break;
             };
-            core.safety.return_fault_arc(arc);
+            if let Err(unusable) = core.safety.return_fault_arc(arc) {
+                let _ = self.reclaim_state_tx.push(unusable);
+            }
         }
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {

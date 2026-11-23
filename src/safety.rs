@@ -247,8 +247,6 @@ pub const SAFETY_LOG_TEXT_CAPACITY: usize = 320;
 pub const SAFETY_JOINT_NAME_CAPACITY: usize = 64;
 
 /// Fixed-capacity UTF-8 text buffer stored inline without heap allocation.
-///
-/// Truncates cleanly at a UTF-8 character boundary if input exceeds `N` bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BoundedText<const N: usize> {
     len: u16,
@@ -256,29 +254,20 @@ pub struct BoundedText<const N: usize> {
 }
 
 impl<const N: usize> BoundedText<N> {
-    /// Creates an empty buffer.
-    pub const fn empty() -> Self {
-        Self { len: 0, buf: [0u8; N] }
-    }
+    pub const fn empty() -> Self { Self { len: 0, buf: [0u8; N] } }
 
-    /// Copies `s` inline, truncating at a UTF-8 character boundary if longer than `N` bytes.
     pub fn new(s: &str) -> Self {
         let mut out = Self::empty();
         out.push_str(s);
         out
     }
 
-    /// Appends as much of `s` as fits within `N` bytes without splitting a UTF-8 codepoint.
     pub fn push_str(&mut self, s: &str) {
         let used = usize::from(self.len);
         let avail = N.saturating_sub(used);
-        if avail == 0 {
-            return;
-        }
+        if avail == 0 { return; }
         let mut take = s.len().min(avail);
-        while take > 0 && !s.is_char_boundary(take) {
-            take -= 1;
-        }
+        while take > 0 && !s.is_char_boundary(take) { take -= 1; }
         self.buf[used..used + take].copy_from_slice(&s.as_bytes()[..take]);
         self.len = (used + take) as u16;
     }
@@ -287,54 +276,25 @@ impl<const N: usize> BoundedText<N> {
         std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
 }
 
-impl<const N: usize> Default for BoundedText<N> {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
+impl<const N: usize> Default for BoundedText<N> { fn default() -> Self { Self::empty() } }
 impl<const N: usize> std::fmt::Debug for BoundedText<N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(self.as_str(), f)
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
 }
-
 impl<const N: usize> std::fmt::Display for BoundedText<N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.as_str()) }
 }
-
 impl<const N: usize> core::fmt::Write for BoundedText<N> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.push_str(s);
-        Ok(())
-    }
+    fn write_str(&mut self, s: &str) -> core::fmt::Result { self.push_str(s); Ok(()) }
 }
 
 /// Stack-allocated mirror of [`FaultReason`] for zero-alloc deferred safety logging.
-///
-/// Its [`std::fmt::Debug`] formatting matches [`FaultReason`] character-for-character
-/// (up to [`SAFETY_LOG_TEXT_CAPACITY`] / [`SAFETY_JOINT_NAME_CAPACITY`] bytes).
 #[derive(Clone, Copy, PartialEq)]
 pub enum BoundedFaultReason {
-    JointLimitExceeded {
-        joint_idx: usize,
-        joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>,
-        value: f32,
-        min: f32,
-        max: f32,
-    },
-    ThermalTrip {
-        joint_idx: usize,
-        temperature: f32,
-        limit: f32,
-    },
+    JointLimitExceeded { joint_idx: usize, joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>, value: f32, min: f32, max: f32 },
+    ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
     BusLoss,
     WatchdogTimeout,
     Other(BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
@@ -343,28 +303,11 @@ pub enum BoundedFaultReason {
 impl BoundedFaultReason {
     pub fn from_reason(reason: &FaultReason) -> Self {
         match reason {
-            FaultReason::JointLimitExceeded {
-                joint_idx,
-                joint_name,
-                value,
-                min,
-                max,
-            } => Self::JointLimitExceeded {
-                joint_idx: *joint_idx,
-                joint_name: BoundedText::new(joint_name),
-                value: *value,
-                min: *min,
-                max: *max,
+            FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max } => Self::JointLimitExceeded {
+                joint_idx: *joint_idx, joint_name: BoundedText::new(joint_name), value: *value, min: *min, max: *max,
             },
-            FaultReason::ThermalTrip {
-                joint_idx,
-                temperature,
-                limit,
-            } => Self::ThermalTrip {
-                joint_idx: *joint_idx,
-                temperature: *temperature,
-                limit: *limit,
-            },
+            FaultReason::ThermalTrip { joint_idx, temperature, limit } =>
+                Self::ThermalTrip { joint_idx: *joint_idx, temperature: *temperature, limit: *limit },
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
             FaultReason::Other(m) => Self::Other(BoundedText::new(m)),
@@ -375,30 +318,13 @@ impl BoundedFaultReason {
 impl std::fmt::Debug for BoundedFaultReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::JointLimitExceeded {
-                joint_idx,
-                joint_name,
-                value,
-                min,
-                max,
-            } => f
+            Self::JointLimitExceeded { joint_idx, joint_name, value, min, max } => f
                 .debug_struct("JointLimitExceeded")
-                .field("joint_idx", joint_idx)
-                .field("joint_name", &joint_name.as_str())
-                .field("value", value)
-                .field("min", min)
-                .field("max", max)
-                .finish(),
-            Self::ThermalTrip {
-                joint_idx,
-                temperature,
-                limit,
-            } => f
+                .field("joint_idx", joint_idx).field("joint_name", &joint_name.as_str())
+                .field("value", value).field("min", min).field("max", max).finish(),
+            Self::ThermalTrip { joint_idx, temperature, limit } => f
                 .debug_struct("ThermalTrip")
-                .field("joint_idx", joint_idx)
-                .field("temperature", temperature)
-                .field("limit", limit)
-                .finish(),
+                .field("joint_idx", joint_idx).field("temperature", temperature).field("limit", limit).finish(),
             Self::BusLoss => f.write_str("BusLoss"),
             Self::WatchdogTimeout => f.write_str("WatchdogTimeout"),
             Self::Other(m) => f.debug_tuple("Other").field(&m.as_str()).finish(),
@@ -409,12 +335,7 @@ impl std::fmt::Debug for BoundedFaultReason {
 /// Stack-allocated mirror of [`SafetyState`] for zero-alloc deferred safety logging.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BoundedSafetyState {
-    Booting,
-    Idle,
-    Armed,
-    Moving,
-    EStop,
-    Fault(BoundedFaultReason),
+    Booting, Idle, Armed, Moving, EStop, Fault(BoundedFaultReason),
 }
 
 impl BoundedSafetyState {
@@ -433,14 +354,8 @@ impl BoundedSafetyState {
 /// Bounded, heap-free safety log event deferred from the control thread to an off-thread consumer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SafetyLogEvent {
-    EStop {
-        from: BoundedSafetyState,
-    },
-    Fault {
-        from: BoundedSafetyState,
-        reason: BoundedFaultReason,
-        code: FaultCode,
-    },
+    EStop { from: BoundedSafetyState },
+    Fault { from: BoundedSafetyState, reason: BoundedFaultReason, code: FaultCode },
     Cleared,
 }
 
@@ -448,20 +363,10 @@ impl SafetyLogEvent {
     /// Emits the exact tracing event on an off-RT thread.
     pub fn emit(&self) {
         match self {
-            Self::EStop { from } => {
-                tracing::warn!(target: "armd::safety", "Safety: {:?} -> EStop", from);
-            }
-            Self::Fault { from, reason, code } => {
-                tracing::warn!(
-                    target: "armd::safety",
-                    "Safety: {:?} -> Fault({:?}) [{code:?}]",
-                    from,
-                    reason
-                );
-            }
-            Self::Cleared => {
-                tracing::info!(target: "armd::safety", "Safety: cleared -> Idle");
-            }
+            Self::EStop { from } => tracing::warn!(target: "armd::safety", "Safety: {:?} -> EStop", from),
+            Self::Fault { from, reason, code } =>
+                tracing::warn!(target: "armd::safety", "Safety: {:?} -> Fault({:?}) [{code:?}]", from, reason),
+            Self::Cleared => tracing::info!(target: "armd::safety", "Safety: cleared -> Idle"),
         }
     }
 }
@@ -870,9 +775,8 @@ impl SafetyManager {
     }
 
     /// Returns a clean, uniquely owned `SafetyState::Idle` `Arc` recycled off-thread back into
-    /// the bounded fault slot pool. Callers on the RT thread must check
-    /// `self.fault_arc_pool_len() < FAULT_ARC_POOL_CAPACITY` first so `arc` is never dropped on RT.
-    pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) {
+    /// the bounded fault slot pool; returns `Err(arc)` without dropping if rejected.
+    pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) -> Result<(), Arc<SafetyState>> {
         if self.fault_arc_pool_len < FAULT_ARC_POOL_CAPACITY
             && Arc::strong_count(&arc) == 1
             && Arc::weak_count(&arc) == 0
@@ -880,6 +784,9 @@ impl SafetyManager {
         {
             self.fault_arc_pool[self.fault_arc_pool_len] = Some(arc);
             self.fault_arc_pool_len += 1;
+            Ok(())
+        } else {
+            Err(arc)
         }
     }
 
