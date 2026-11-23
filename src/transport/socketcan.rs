@@ -94,12 +94,12 @@ impl CanTransport for SocketCanTransport {
         let sk_frame = if frame.is_extended {
             let id = ExtendedId::new(frame.id)
                 .ok_or_else(|| TransportError::Can(format!("Invalid extended CAN ID: {:#x}", frame.id)))?;
-            CanDataFrame::new(id, &frame.data[..frame.dlc as usize])
+            CanDataFrame::new(id, frame.data_slice())
                 .ok_or_else(|| TransportError::Can("Failed to create extended CanDataFrame".to_string()))?
         } else {
             let id = StandardId::new(frame.id as u16)
                 .ok_or_else(|| TransportError::Can(format!("Invalid standard CAN ID: {:#x}", frame.id)))?;
-            CanDataFrame::new(id, &frame.data[..frame.dlc as usize])
+            CanDataFrame::new(id, frame.data_slice())
                 .ok_or_else(|| TransportError::Can("Failed to create standard CanDataFrame".to_string()))?
         };
 
