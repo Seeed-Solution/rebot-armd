@@ -463,6 +463,8 @@ pub struct ChunkSource {
     pub vision_target_present: Option<bool>,
     /// Video-embedding inference ticket captured for this chunk, if any.
     pub embedding_ticket: Option<InferenceTicket>,
+    /// Monotonic sequence id assigned when this chunk was pushed into `ChunkRing`.
+    pub infer_seq: u64,
 }
 
 impl ChunkSource {
@@ -474,6 +476,7 @@ impl ChunkSource {
             vision_generation: None,
             vision_target_present: None,
             embedding_ticket: None,
+            infer_seq: 0,
         }
     }
 
@@ -517,6 +520,31 @@ pub struct ChunkFreshnessLimits {
     pub live_ticket_ctx: Option<TicketVerificationContext>,
 }
 
+/// Parameters for the single [`PreparedPolicy::commit_gate`] check immediately before servo submission.
+#[derive(Debug, Clone)]
+pub struct CommitGateParams {
+    pub max_fresh_joint_age_ms: u64,
+    pub max_cached_joint_age_ms: u64,
+    pub max_fresh_vision_age_ms: Option<u64>,
+    pub max_cached_vision_age_ms: Option<u64>,
+    pub horizon_ms: u64,
+    pub vision_generation: Option<u64>,
+    pub vision_target_present: Option<bool>,
+    pub live_ticket_ctx: Option<TicketVerificationContext>,
+}
+
+/// Decision returned by [`PreparedPolicy::commit_gate`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommitGateDecision {
+    Submit {
+        target: Vec<f32>,
+        commit_period: u64,
+    },
+    Skip {
+        commit_period: u64,
+    },
+}
+
 /// Preallocated circular buffer of future action-chunk slots and fixed-storage provenance.
 ///
 /// Allocates `chunk_size` slots × up to `chunk_size` overlapping predictions × `action_dim`
@@ -529,6 +557,10 @@ struct ChunkRing {
     action_dim: usize,
     head: usize,
     len: usize,
+    /// Control period index corresponding to logical offset 0 when `len > 0`.
+    front_period: Option<u64>,
+    /// Monotonic sequence number assigned to each pushed chunk.
+    next_infer_seq: u64,
     /// Number of valid predictions stored in each physical slot (`len == chunk_size`, or 0 when `chunk_size <= 1`).
     counts: Vec<usize>,
     /// Flat storage laid out as `[physical_slot][pred_idx][dim]`.
@@ -549,6 +581,8 @@ impl ChunkRing {
                 action_dim,
                 head: 0,
                 len: 0,
+                front_period: None,
+                next_infer_seq: 1,
                 counts: Vec::new(),
                 data: Vec::new(),
                 sources: Vec::new(),
@@ -563,6 +597,8 @@ impl ChunkRing {
             action_dim,
             head: 0,
             len: 0,
+            front_period: None,
+            next_infer_seq: 1,
             counts: vec![0; chunk_size],
             data: vec![0.0; chunk_size * max_preds * action_dim],
             sources: vec![None; max_preds],
@@ -579,6 +615,11 @@ impl ChunkRing {
     #[inline]
     fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline]
+    fn front_period(&self) -> Option<u64> {
+        (self.len > 0).then_some(self.front_period).flatten()
     }
 
     #[inline]
@@ -605,6 +646,7 @@ impl ChunkRing {
         self.sources.fill(None);
         self.head = 0;
         self.len = 0;
+        self.front_period = None;
         self.next_source_slot = 0;
     }
 
@@ -614,6 +656,20 @@ impl ChunkRing {
             self.counts[self.head] = 0;
             self.head = (self.head + 1) % self.chunk_size;
             self.len -= 1;
+        }
+        if self.len == 0 {
+            self.front_period = None;
+        } else if let Some(fp) = self.front_period {
+            self.front_period = Some(fp.saturating_add(drop_n as u64));
+        }
+    }
+
+    fn advance_to_period(&mut self, target_period: u64) {
+        if let Some(fp) = self.front_period() {
+            if target_period > fp {
+                let drop_n = (target_period - fp).min(usize::MAX as u64) as usize;
+                self.discard_front(drop_n);
+            }
         }
     }
 
@@ -725,10 +781,28 @@ impl ChunkRing {
         dropped_any
     }
 
-    fn push_chunk(&mut self, flat_chunk: &[f32], source: ChunkSource, clear_existing: bool) {
+    fn push_chunk(
+        &mut self,
+        flat_chunk: &[f32],
+        chunk_start_period: Option<u64>,
+        mut source: ChunkSource,
+        clear_existing: bool,
+    ) -> u64 {
         debug_assert_eq!(flat_chunk.len(), self.chunk_size * self.action_dim);
-        if clear_existing {
+        let seq = self.next_infer_seq;
+        self.next_infer_seq = self.next_infer_seq.wrapping_add(1).max(1);
+        source.infer_seq = seq;
+        if clear_existing || self.len == 0 {
             self.clear();
+            self.front_period = chunk_start_period;
+        } else if let Some(target_p) = chunk_start_period {
+            self.advance_to_period(target_p);
+            if self.len > 0 && self.front_period != Some(target_p) {
+                self.clear();
+            }
+            if self.len == 0 {
+                self.front_period = Some(target_p);
+            }
         }
         let src_slot = self.next_source_slot;
         self.sources[src_slot] = Some(source);
@@ -751,10 +825,36 @@ impl ChunkRing {
             }
         }
         self.len = self.chunk_size;
+        seq
     }
 
-    fn pop_front_into(
-        &mut self,
+    fn collect_front_sources(&self, temporal_ensemble_k: Option<f32>, out: &mut Vec<ChunkSource>) {
+        out.clear();
+        if self.len == 0 {
+            return;
+        }
+        let phys = self.head;
+        let count = self.counts[phys];
+        if count == 0 {
+            return;
+        }
+        if temporal_ensemble_k.is_some() && count > 1 {
+            for age_idx in 0..count {
+                let src_id = self.source_ids[self.pred_slot(phys, age_idx)];
+                if let Some(src) = self.sources[src_id] {
+                    out.push(src);
+                }
+            }
+        } else {
+            let src_id = self.source_ids[self.pred_slot(phys, count - 1)];
+            if let Some(src) = self.sources[src_id] {
+                out.push(src);
+            }
+        }
+    }
+
+    fn peek_front_into(
+        &self,
         temporal_ensemble_k: Option<f32>,
         out: &mut [f32],
         used_sources: &mut Vec<ChunkSource>,
@@ -804,9 +904,21 @@ impl ChunkRing {
                 used_sources.push(src);
             }
         }
-        self.counts[phys] = 0;
-        self.head = (self.head + 1) % self.chunk_size;
-        self.len -= 1;
+        Ok(())
+    }
+
+    fn consume_front(&mut self) {
+        self.discard_front(1);
+    }
+
+    fn pop_front_into(
+        &mut self,
+        temporal_ensemble_k: Option<f32>,
+        out: &mut [f32],
+        used_sources: &mut Vec<ChunkSource>,
+    ) -> Result<(), PolicyError> {
+        self.peek_front_into(temporal_ensemble_k, out, used_sources)?;
+        self.consume_front();
         Ok(())
     }
 
@@ -841,6 +953,10 @@ pub struct PreparedPolicy {
     policy_act_units: Vec<f32>,
     arm_target_rad: Vec<f32>,
     periods_since_replan: usize,
+    last_replan_period: Option<u64>,
+    staged_period: Option<u64>,
+    staged_infer_seq: Option<u64>,
+    staged_ready: bool,
     chunk_ring: ChunkRing,
     last_step_sources: Vec<ChunkSource>,
     last_run_ctx: Option<ChunkRunContext>,
@@ -913,6 +1029,10 @@ impl PreparedPolicy {
             policy_act_units: vec![0.0; dim],
             arm_target_rad: vec![0.0; dim],
             periods_since_replan: 0,
+            last_replan_period: None,
+            staged_period: None,
+            staged_infer_seq: None,
+            staged_ready: false,
             chunk_ring,
             last_step_sources,
             last_run_ctx: None,
@@ -936,6 +1056,10 @@ impl PreparedPolicy {
     pub fn clear_chunk_buffer(&mut self) {
         self.chunk_ring.clear();
         self.periods_since_replan = 0;
+        self.last_replan_period = None;
+        self.staged_period = None;
+        self.staged_infer_seq = None;
+        self.staged_ready = false;
         self.last_step_sources.clear();
     }
 
@@ -973,6 +1097,10 @@ impl PreparedPolicy {
         let dropped = self.chunk_ring.prune_invalid_or_stale(limits);
         if self.chunk_ring.is_empty() {
             self.periods_since_replan = 0;
+            self.last_replan_period = None;
+            self.staged_period = None;
+            self.staged_infer_seq = None;
+            self.staged_ready = false;
         }
         dropped
     }
@@ -1059,16 +1187,11 @@ impl PreparedPolicy {
         self.step_infer_with_source(measured_arm_rad, vision_features, periods_elapsed, source, None)
     }
 
-    /// Run one full inference step with explicit source provenance and optional cached-chunk
-    /// freshness/invalidation bounds.
-    pub fn step_infer_with_source(
+    fn prepare_infer_input(
         &mut self,
         measured_arm_rad: &[f32],
         vision_features: Option<&[f32]>,
-        periods_elapsed: u32,
-        source: ChunkSource,
-        freshness: Option<&ChunkFreshnessLimits>,
-    ) -> Result<Vec<f32>, PolicyError> {
+    ) -> Result<(), PolicyError> {
         let dim = self.contract.action_dim;
         let vision_dim = self.contract.vision_feature_dim();
         if measured_arm_rad.len() != dim {
@@ -1139,6 +1262,21 @@ impl PreparedPolicy {
         if let Some(vf) = vision_features.filter(|_| vision_dim > 0) {
             self.infer_in[dim..dim + vision_dim].copy_from_slice(vf);
         }
+        Ok(())
+    }
+
+    /// Run one full inference step with explicit source provenance and optional cached-chunk
+    /// freshness/invalidation bounds.
+    pub fn step_infer_with_source(
+        &mut self,
+        measured_arm_rad: &[f32],
+        vision_features: Option<&[f32]>,
+        periods_elapsed: u32,
+        source: ChunkSource,
+        freshness: Option<&ChunkFreshnessLimits>,
+    ) -> Result<Vec<f32>, PolicyError> {
+        let dim = self.contract.action_dim;
+        self.prepare_infer_input(measured_arm_rad, vision_features)?;
 
         let chunking = self.contract.chunking;
         if chunking.chunk_size <= 1 {
@@ -1184,6 +1322,7 @@ impl PreparedPolicy {
             if need_replan {
                 self.chunk_ring.push_chunk(
                     &self.infer_out,
+                    None,
                     source,
                     chunking.temporal_ensemble_k.is_none(),
                 );
@@ -1200,6 +1339,67 @@ impl PreparedPolicy {
         }
 
         self.finalize_step_target()
+    }
+
+    /// Off-lock planning stage for chunked policies (`chunk_size > 1`): prunes stale entries,
+    /// runs backend inference when due for `sample_period`, and stages the converted candidate
+    /// target for `sample_period` without consuming the ring slot. Final slot selection,
+    /// freshness, and provenance checks run in [`Self::commit_gate`].
+    pub fn plan_chunk_step(
+        &mut self,
+        measured_arm_rad: &[f32],
+        vision_features: Option<&[f32]>,
+        sample_period: u64,
+        source: ChunkSource,
+        freshness: Option<&ChunkFreshnessLimits>,
+    ) -> Result<Option<u64>, PolicyError> {
+        let chunking = self.contract.chunking;
+        debug_assert!(chunking.chunk_size > 1);
+        self.prepare_infer_input(measured_arm_rad, vision_features)?;
+
+        if let Some(limits) = freshness {
+            self.prune_chunk_buffer(limits);
+        }
+        self.chunk_ring.advance_to_period(sample_period);
+
+        let need_replan = self.chunk_ring.is_empty()
+            || self.chunk_ring.front_period() != Some(sample_period)
+            || self.last_replan_period.is_none_or(|rp| {
+                sample_period.saturating_sub(rp) >= chunking.replan_every as u64
+            });
+
+        let fresh_seq = if need_replan {
+            self.backend.infer(&self.infer_in, &mut self.infer_out)?;
+            for (idx, &v) in self.infer_out.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(PolicyError::NonFinite(format!(
+                        "model output[{idx}] is non-finite: {v}"
+                    )));
+                }
+            }
+            let seq = self.chunk_ring.push_chunk(
+                &self.infer_out,
+                Some(sample_period),
+                source,
+                chunking.temporal_ensemble_k.is_none(),
+            );
+            self.last_replan_period = Some(sample_period);
+            self.periods_since_replan = 0;
+            Some(seq)
+        } else {
+            None
+        };
+
+        self.chunk_ring.peek_front_into(
+            chunking.temporal_ensemble_k,
+            &mut self.step_out_norm,
+            &mut self.last_step_sources,
+        )?;
+        let _ = self.finalize_step_target()?;
+        self.staged_period = Some(sample_period);
+        self.staged_infer_seq = fresh_seq;
+        self.staged_ready = true;
+        Ok(fresh_seq)
     }
 
     fn finalize_step_target(&mut self) -> Result<Vec<f32>, PolicyError> {
@@ -1234,36 +1434,144 @@ impl PreparedPolicy {
         Ok(self.arm_target_rad.clone())
     }
 
-    /// Advance a chunked policy's buffer by `late_periods` control periods that passed between
-    /// sampling and commit, discarding passed slots and returning the target for the current
-    /// period. Returns `Ok(None)` if the buffer cannot cover `late_periods` (or if cached
-    /// sources expired/invalidated), signalling the runner to submit nothing on this tick.
-    pub fn advance_chunk_for_commit(
+    /// Single final commit gate right before servo submission: reads the monotonic clock itself
+    /// and runs [`Self::commit_gate`] with that single reading.
+    pub fn commit_gate_now(
         &mut self,
-        late_periods: u32,
-        freshness: Option<&ChunkFreshnessLimits>,
-    ) -> Result<Option<Vec<f32>>, PolicyError> {
-        if late_periods == 0 || self.contract.chunking.chunk_size <= 1 {
-            return Ok(None);
+        interval_origin: Instant,
+        period_ns: u128,
+        last_committed_period: Option<u64>,
+        params: &CommitGateParams,
+    ) -> Result<(CommitGateDecision, Instant), PolicyError> {
+        let now = Instant::now();
+        let decision = self.commit_gate(now, interval_origin, period_ns, last_committed_period, params)?;
+        Ok((decision, now))
+    }
+
+    /// Single final commit gate for chunked policies (`chunk_size > 1`), executed immediately
+    /// before submitting to `policy_step_with_vision`:
+    ///
+    /// (a) Computes `commit_period` from `now` and selects that period's slot (discarding any
+    ///     passed slots). If the slot has already been committed/passed or is missing, submits
+    ///     nothing.
+    /// (b) Checks every source age of the selected slot against `now` (`max_fresh_*` for a
+    ///     fresh inference from this tick, `max_cached_*` for cached entries). On expiry, drops
+    ///     the whole chunk to force a replan on the next period and submits nothing (without
+    ///     failing the run).
+    /// (c) Checks provenance (detector model generation, detector target identity, embedding
+    ///     ticket identity/invalidation/deadlines) and clears the ring on mismatch.
+    pub fn commit_gate(
+        &mut self,
+        now: Instant,
+        interval_origin: Instant,
+        period_ns: u128,
+        last_committed_period: Option<u64>,
+        params: &CommitGateParams,
+    ) -> Result<CommitGateDecision, PolicyError> {
+        let commit_period = (now
+            .saturating_duration_since(interval_origin)
+            .as_nanos()
+            / period_ns.max(1))
+        .min(u64::MAX as u128) as u64;
+
+        // (a) Select the slot for `commit_period`.
+        if last_committed_period.is_some_and(|p| commit_period <= p) {
+            self.staged_ready = false;
+            return Ok(CommitGateDecision::Skip { commit_period });
         }
-        if let Some(limits) = freshness {
-            self.prune_chunk_buffer(limits);
+        let Some(front_p) = self.chunk_ring.front_period() else {
+            self.staged_ready = false;
+            return Ok(CommitGateDecision::Skip { commit_period });
+        };
+        if commit_period < front_p {
+            self.staged_ready = false;
+            return Ok(CommitGateDecision::Skip { commit_period });
         }
-        let late = late_periods as usize;
-        if self.chunk_ring.len() < late {
-            self.chunk_ring.clear();
-            self.periods_since_replan = self.periods_since_replan.saturating_add(late);
-            self.last_step_sources.clear();
-            return Ok(None);
+        let offset = (commit_period - front_p) as usize;
+        if offset >= self.chunk_ring.len() {
+            self.clear_chunk_buffer();
+            return Ok(CommitGateDecision::Skip { commit_period });
         }
-        self.chunk_ring.discard_front(late - 1);
-        self.chunk_ring.pop_front_into(
-            self.contract.chunking.temporal_ensemble_k,
-            &mut self.step_out_norm,
-            &mut self.last_step_sources,
-        )?;
-        self.periods_since_replan = self.periods_since_replan.saturating_add(late);
-        self.finalize_step_target().map(Some)
+        if offset > 0 {
+            self.chunk_ring.discard_front(offset);
+            self.staged_ready = false;
+        }
+
+        // (b) & (c) Inspect every contributing source of the selected slot against `now`.
+        let te_k = self.contract.chunking.temporal_ensemble_k;
+        self.chunk_ring
+            .collect_front_sources(te_k, &mut self.last_step_sources);
+        if self.last_step_sources.is_empty() {
+            self.clear_chunk_buffer();
+            return Ok(CommitGateDecision::Skip { commit_period });
+        }
+        let fresh_seq = self.staged_infer_seq;
+        for &src in &self.last_step_sources {
+            if params.vision_generation.is_some()
+                && src.vision_generation != params.vision_generation
+            {
+                self.clear_chunk_buffer();
+                return Ok(CommitGateDecision::Skip { commit_period });
+            }
+            if params.vision_target_present.is_some()
+                && src.vision_target_present != params.vision_target_present
+            {
+                self.clear_chunk_buffer();
+                return Ok(CommitGateDecision::Skip { commit_period });
+            }
+            let is_fresh = fresh_seq.is_some_and(|seq| src.infer_seq == seq);
+            let joint_limit = if is_fresh {
+                params.max_fresh_joint_age_ms
+            } else {
+                params.max_cached_joint_age_ms
+            };
+            if src.joint_age_ms(now) > joint_limit {
+                self.clear_chunk_buffer();
+                return Ok(CommitGateDecision::Skip { commit_period });
+            }
+            let vision_limit = if is_fresh {
+                params.max_fresh_vision_age_ms
+            } else {
+                params.max_cached_vision_age_ms
+            };
+            if let Some(max_v) = vision_limit {
+                if src.vision_age_ms(now).is_some_and(|age| age > max_v) {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
+            }
+            if let (Some(ticket), Some(live_ctx)) =
+                (src.embedding_ticket, params.live_ticket_ctx.as_ref())
+            {
+                let ticket_horizon = if is_fresh { 0 } else { params.horizon_ms };
+                if ticket
+                    .verify_identity_and_horizon(live_ctx, ticket_horizon)
+                    .is_err()
+                {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
+            }
+        }
+
+        let target = if self.staged_ready && self.staged_period == Some(commit_period) {
+            self.chunk_ring.consume_front();
+            self.arm_target_rad.clone()
+        } else {
+            self.chunk_ring.pop_front_into(
+                te_k,
+                &mut self.step_out_norm,
+                &mut self.last_step_sources,
+            )?;
+            self.finalize_step_target()?
+        };
+        self.staged_ready = false;
+        self.staged_period = None;
+        self.staged_infer_seq = None;
+        Ok(CommitGateDecision::Submit {
+            target,
+            commit_period,
+        })
     }
 }
 
@@ -1593,11 +1901,14 @@ pub fn spawn_policy_runner(
         });
     }
     let period = Duration::from_secs_f64(1.0 / clamped_fps);
+    let is_chunked = prepared.contract().chunking.chunk_size > 1;
     let replan_every = prepared.contract().chunking.replan_every;
     let horizon_ms = ((replan_every as f64) * (1000.0 / clamped_fps))
         .round()
         .max(0.0) as u64;
+    let max_fresh_joint_age_ms = max_policy_input_age_ms(clamped_fps);
     let max_source_joint_age_ms = max_cached_chunk_source_age_ms(clamped_fps, replan_every);
+    let max_fresh_vision_age_ms = vision_spec.as_ref().map(|s| s.max_staleness_ms);
     let max_source_vision_age_ms = vision_spec
         .as_ref()
         .map(|s| s.max_staleness_ms.saturating_add(horizon_ms));
@@ -1662,6 +1973,7 @@ pub fn spawn_policy_runner(
         let mut locked_generation: Option<u64> = None;
 
         let interval_origin = tokio::time::Instant::now();
+        let interval_origin_std = interval_origin.into_std();
         let mut interval = tokio::time::interval_at(interval_origin, period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let period_ns = period.as_nanos().max(1);
@@ -1683,16 +1995,15 @@ pub fn spawn_policy_runner(
             } else {
                 interval.tick().await;
             }
-            let tick_now = tokio::time::Instant::now();
-            let cur_period = (tick_now.saturating_duration_since(interval_origin).as_nanos()
+            let step_started_at = Instant::now();
+            let cur_period = (step_started_at
+                .saturating_duration_since(interval_origin_std)
+                .as_nanos()
                 / period_ns)
                 .min(u64::MAX as u128) as u64;
-            if prepared.contract().chunking.chunk_size > 1
-                && last_committed_period.is_some_and(|p| cur_period <= p)
-            {
+            if is_chunked && last_committed_period.is_some_and(|p| cur_period <= p) {
                 continue;
             }
-            let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
                     prepared.clear_chunk_buffer();
@@ -1853,6 +2164,7 @@ pub fn spawn_policy_runner(
                 vision_generation: locked_generation,
                 vision_target_present,
                 embedding_ticket: emb_ticket,
+                infer_seq: 0,
             };
             let freshness_limits = ChunkFreshnessLimits {
                 now: Instant::now(),
@@ -1872,13 +2184,27 @@ pub fn spawn_policy_runner(
 
             let infer_handle = tokio::task::spawn_blocking(move || {
                 let t0 = Instant::now();
-                let res = prepared.step_infer_with_source(
-                    &measured,
-                    vision_features.as_deref(),
-                    periods_elapsed,
-                    chunk_source,
-                    Some(&freshness_limits),
-                );
+                let res: Result<Option<Vec<f32>>, PolicyError> = if is_chunked {
+                    prepared
+                        .plan_chunk_step(
+                            &measured,
+                            vision_features.as_deref(),
+                            cur_period,
+                            chunk_source,
+                            Some(&freshness_limits),
+                        )
+                        .map(|_| None)
+                } else {
+                    prepared
+                        .step_infer_with_source(
+                            &measured,
+                            vision_features.as_deref(),
+                            periods_elapsed,
+                            chunk_source,
+                            Some(&freshness_limits),
+                        )
+                        .map(Some)
+                };
                 let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 (prepared, res.map(|t| (t, infer_us)))
             });
@@ -1896,7 +2222,7 @@ pub fn spawn_policy_runner(
                 infer_handle.await
             };
 
-            let (mut target, infer_us) = match infer_result {
+            let (single_step_target, infer_us) = match infer_result {
                 Err(e) => {
                     tracing::warn!("Policy inference task failed for action {action_id}: {e}");
                     let mut inner = supervisor.inner().write().await;
@@ -2031,17 +2357,22 @@ pub fn spawn_policy_runner(
             }
 
             // Final critical-section check (A-R2-1): hold `HubCommitGuard` together with
-            // `inner`, re-verify ALL `InferenceTicket` fields + monotonic deadlines AFTER
-            // calibration hashing / release-gate / deployment checks, and immediately commit
-            // `policy_step_with_vision` with zero intervening work.
+            // `inner`, re-verify current-tick `InferenceTicket`, then run the single
+            // `commit_gate_now` immediately before `policy_step_with_vision`.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
-            let commit_period = (tokio::time::Instant::now()
-                .saturating_duration_since(interval_origin)
-                .as_nanos()
-                / period_ns)
-                .min(u64::MAX as u128) as u64;
-            if prepared.contract().chunking.chunk_size > 1 && commit_period > cur_period {
-                let late = (commit_period - cur_period).min(u32::MAX as u64) as u32;
+            let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
+                match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
+                    Ok(now_ms) => Some(now_ms),
+                    Err(violation) => {
+                        prepared.clear_chunk_buffer();
+                        inner.fail_policy_run(action_id, violation.code(), violation.message());
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let (target, committed_period, input_age_ms, post_vision_age_ms) = if is_chunked {
                 let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
                     let live_hub = guard.live_ticket_state();
                     TicketVerificationContext {
@@ -2054,23 +2385,46 @@ pub fn spawn_policy_runner(
                         now_armd_ms: live_hub.now_armd_ms,
                     }
                 });
-                let commit_freshness = ChunkFreshnessLimits {
-                    now: Instant::now(),
-                    max_source_joint_age_ms,
-                    max_source_vision_age_ms,
+                let gate_params = CommitGateParams {
+                    max_fresh_joint_age_ms,
+                    max_cached_joint_age_ms: max_source_joint_age_ms,
+                    max_fresh_vision_age_ms,
+                    max_cached_vision_age_ms: max_source_vision_age_ms,
                     horizon_ms,
                     vision_generation: locked_generation,
                     vision_target_present,
                     live_ticket_ctx: commit_ticket_ctx,
                 };
-                match prepared.advance_chunk_for_commit(late, Some(&commit_freshness)) {
-                    Ok(Some(updated_target)) => {
-                        target = updated_target;
-                        last_infer_period = Some(commit_period);
+                match prepared.commit_gate_now(
+                    interval_origin_std,
+                    period_ns,
+                    last_committed_period,
+                    &gate_params,
+                ) {
+                    Ok((CommitGateDecision::Submit { target, commit_period }, gate_now)) => {
+                        let input_age = base_input_age_ms.map(|base| {
+                            base.saturating_add(
+                                gate_now
+                                    .saturating_duration_since(captured_at)
+                                    .as_millis()
+                                    .min(u64::MAX as u128) as u64,
+                            )
+                        });
+                        let vis_age = if let (Some(now_ms), Some(mapped_ms)) =
+                            (emb_commit_now_ms, emb_mapped_ms)
+                        {
+                            Some(now_ms.saturating_sub(mapped_ms))
+                        } else {
+                            vision_captured_at.map(|cap| {
+                                gate_now
+                                    .saturating_duration_since(cap)
+                                    .as_millis()
+                                    .min(u64::MAX as u128) as u64
+                            })
+                        };
+                        (target, Some(commit_period), input_age, vis_age)
                     }
-                    Ok(None) => {
-                        // Buffer cannot cover the period that is now current: submit nothing this tick.
-                        last_infer_period = Some(commit_period);
+                    Ok((CommitGateDecision::Skip { .. }, _)) => {
                         continue;
                     }
                     Err(e) => {
@@ -2083,53 +2437,20 @@ pub fn spawn_policy_runner(
                         break;
                     }
                 }
-            }
-            let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
-                match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
-                    Ok(now_ms) => {
-                        let live_hub = guard.live_ticket_state();
-                        let live_ctx = TicketVerificationContext {
-                            policy_instance_id: live_hub.policy_instance_id,
-                            lease_generation: active_run_lease_generation(&inner, action_id),
-                            producer_epoch: live_hub.producer_epoch,
-                            model_generation: live_hub.model_generation,
-                            invalidation_generation: live_hub.invalidation_generation,
-                            clock_handshake_generation: live_hub.clock_handshake_generation,
-                            now_armd_ms: live_hub.now_armd_ms,
-                        };
-                        let mut cached_violation = None;
-                        for src in prepared.last_step_sources() {
-                            if let Some(src_ticket) = src.embedding_ticket {
-                                if let Err(v) = src_ticket.verify_identity_and_horizon(&live_ctx, horizon_ms) {
-                                    cached_violation = Some(v);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(violation) = cached_violation {
-                            prepared.clear_chunk_buffer();
-                            inner.fail_policy_run(action_id, violation.code(), violation.message());
-                            break;
-                        }
-                        Some(now_ms)
-                    }
-                    Err(violation) => {
-                        prepared.clear_chunk_buffer();
-                        inner.fail_policy_run(action_id, violation.code(), violation.message());
-                        break;
-                    }
-                }
             } else {
-                None
+                let target = single_step_target.expect("single-step target");
+                let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) =
+                    (emb_commit_now_ms, emb_mapped_ms)
+                {
+                    Some(now_ms.saturating_sub(mapped_ms))
+                } else {
+                    detector_post_vision_age_ms
+                };
+                let input_age_ms = base_input_age_ms.map(|base| {
+                    base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
+                });
+                (target, None, input_age_ms, post_vision_age_ms)
             };
-            let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) = (emb_commit_now_ms, emb_mapped_ms) {
-                Some(now_ms.saturating_sub(mapped_ms))
-            } else {
-                detector_post_vision_age_ms
-            };
-            let input_age_ms = base_input_age_ms.map(|base| {
-                base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
-            });
             if let Err(e) = inner.policy_step_with_vision(
                 action_id,
                 target,
@@ -2141,7 +2462,10 @@ pub fn spawn_policy_runner(
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
             }
-            last_committed_period = Some(commit_period);
+            if let Some(cp) = committed_period {
+                last_committed_period = Some(cp);
+                last_infer_period = Some(cp);
+            }
         }
     })
 }
@@ -2681,31 +3005,305 @@ mod chunking_tests {
     }
 
     #[test]
-    fn chunking_advance_for_commit_discards_passed_slots_or_returns_none() {
+    fn chunking_commit_gate_selects_current_period_or_skips_when_exhausted() {
         let state_dim = ArmConfig::default().dof;
         let state = vec![0.0f32; state_dim];
         let c0 = make_constant_chunk(state_dim, &[0.05, 0.15, 0.25, 0.35]);
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+        let gate_params = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 200,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
 
-        // Case 1: 1 period late (period 0 passed -> return period 1 = 0.15).
+        // Case 1: planned in period 0, commit_gate runs at 60 ms (period 1) -> submits chunk[1]=0.15.
         let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
-        let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone()]);
+        let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0]);
         let mut prep =
             PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
-        let sampled = prep.step_infer_periods(&state, 1).unwrap();
-        assert!((sampled[0] - 0.05).abs() < 1e-6);
-        let committed = prep.advance_chunk_for_commit(1, None).unwrap().unwrap();
-        assert!((committed[0] - 0.15).abs() < 1e-6);
+        prep.plan_chunk_step(&state, None, 0, ChunkSource::from_joint(origin, Some(5)), None)
+            .unwrap();
+        let decision = prep
+            .commit_gate(origin + Duration::from_millis(60), origin, period_ns, None, &gate_params)
+            .unwrap();
+        match decision {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 1);
+                assert!((target[0] - 0.15).abs() < 1e-6);
+            }
+            other => panic!("expected Submit for period 1, got {other:?}"),
+        }
         assert_eq!(prep.chunk_buffer_len(), 2);
 
-        // Case 2: overrun larger than remaining buffer -> returns None and clears buffer.
+        // Case 2: overrun larger than chunk buffer -> Skip and ring cleared.
         let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(2, 2, None);
         let c_short = make_constant_chunk(state_dim, &[0.05, 0.15]);
         let (backend2, _) = CountingChunkBackend::new(state_dim, 2 * state_dim, vec![c_short]);
         let mut prep2 =
             PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
-        let _ = prep2.step_infer_periods(&state, 1).unwrap();
-        assert!(prep2.advance_chunk_for_commit(2, None).unwrap().is_none());
+        prep2
+            .plan_chunk_step(&state, None, 0, ChunkSource::from_joint(origin, Some(5)), None)
+            .unwrap();
+        let decision2 = prep2
+            .commit_gate(origin + Duration::from_millis(115), origin, period_ns, None, &gate_params)
+            .unwrap();
+        assert_eq!(decision2, CommitGateDecision::Skip { commit_period: 2 });
         assert_eq!(prep2.chunk_buffer_len(), 0);
+    }
+
+    #[test]
+    fn chunking_commit_gate_drops_source_expiring_before_commit_in_same_period_and_replans() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos(); // 20 Hz
+
+        // 20 Hz, replan_every=4 -> fresh limit=100ms, cached limit=300ms.
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, calls) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0, c1]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let gate_params = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 300,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+
+        // Period 0: fresh inference with base age 90 ms; at t=5ms age=95ms <= 100ms -> submits c0[0].
+        let src0 = ChunkSource::from_joint(origin, Some(90));
+        prep.plan_chunk_step(&state, None, 0, src0, None).unwrap();
+        let d0 = prep
+            .commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_params)
+            .unwrap();
+        assert!(matches!(d0, CommitGateDecision::Submit { commit_period: 0, .. }));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Part 1: fresh inference inside the limit at plan_chunk_step (age 94 ms <= 100 ms)
+        // that expires before commit within the SAME period (period 0, age 107 ms > 100 ms)
+        // -> not submitted, chunk dropped, forced replan on period 1.
+        let (snap_b, contract_b, cfg_b) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend_b, calls_b) = CountingChunkBackend::new(
+            state_dim,
+            4 * state_dim,
+            vec![
+                make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]),
+                make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]),
+            ],
+        );
+        let mut prep_b =
+            PreparedPolicy::from_backend(snap_b, contract_b, Box::new(backend_b), &cfg_b).unwrap();
+        let src_fresh = ChunkSource::from_joint(origin, Some(92));
+        let fresh_plan_limits = ChunkFreshnessLimits {
+            now: origin + Duration::from_millis(2),
+            max_source_joint_age_ms: 300,
+            max_source_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+        prep_b
+            .plan_chunk_step(&state, None, 0, src_fresh, Some(&fresh_plan_limits))
+            .unwrap();
+        assert_eq!(calls_b.load(Ordering::Relaxed), 1);
+        let d_exp = prep_b
+            .commit_gate(origin + Duration::from_millis(15), origin, period_ns, None, &gate_params)
+            .unwrap();
+        assert_eq!(d_exp, CommitGateDecision::Skip { commit_period: 0 });
+        assert_eq!(prep_b.chunk_buffer_len(), 0, "expired chunk must be dropped");
+
+        // Next period (period 1, t=52ms): fresh source replans immediately -> calls_b == 2, submits c1[0]=0.5.
+        let src_next = ChunkSource::from_joint(origin + Duration::from_millis(50), Some(5));
+        prep_b
+            .plan_chunk_step(&state, None, 1, src_next, None)
+            .unwrap();
+        assert_eq!(calls_b.load(Ordering::Relaxed), 2);
+        let d_next = prep_b
+            .commit_gate(origin + Duration::from_millis(52), origin, period_ns, None, &gate_params)
+            .unwrap();
+        match d_next {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 1);
+                assert!((target[0] - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected replanned Submit on period 1, got {other:?}"),
+        }
+
+        // Part 2: cached entry inside cached limit (200 ms) during plan_chunk_step in period 2
+        // (t=105ms, age=195ms <= 200ms) that expires before commit within the SAME period 2
+        // (t=115ms, age=205ms > 200ms) -> not submitted, chunk dropped, forced replan on period 3.
+        let (snap_c, contract_c, cfg_c) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend_c, calls_c) = CountingChunkBackend::new(
+            state_dim,
+            4 * state_dim,
+            vec![
+                make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]),
+                make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]),
+            ],
+        );
+        let mut prep_c =
+            PreparedPolicy::from_backend(snap_c, contract_c, Box::new(backend_c), &cfg_c).unwrap();
+        let cached_gate = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 200,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+        prep_c
+            .plan_chunk_step(&state, None, 0, ChunkSource::from_joint(origin, Some(90)), None)
+            .unwrap();
+        assert!(matches!(
+            prep_c.commit_gate(origin + Duration::from_millis(2), origin, period_ns, None, &cached_gate).unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+        // Period 2 ([100ms, 150ms)): at t=105ms age=195ms <= 200ms (passes pruning),
+        // then at commit t=115ms (STILL period 2!) age=205ms > 200ms -> Skip & drop chunk.
+        let plan_limits_p2 = ChunkFreshnessLimits {
+            now: origin + Duration::from_millis(105),
+            max_source_joint_age_ms: 200,
+            max_source_vision_age_ms: None,
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+        prep_c
+            .plan_chunk_step(
+                &state,
+                None,
+                2,
+                ChunkSource::from_joint(origin + Duration::from_millis(105), Some(5)),
+                Some(&plan_limits_p2),
+            )
+            .unwrap();
+        assert_eq!(calls_c.load(Ordering::Relaxed), 1, "still inside limit during plan_chunk_step");
+        let d_cached_exp = prep_c
+            .commit_gate(
+                origin + Duration::from_millis(115),
+                origin,
+                period_ns,
+                Some(0),
+                &cached_gate,
+            )
+            .unwrap();
+        assert_eq!(d_cached_exp, CommitGateDecision::Skip { commit_period: 2 });
+        assert_eq!(prep_c.chunk_buffer_len(), 0);
+        // Period 3 (t=152ms): replans c1!
+        prep_c
+            .plan_chunk_step(
+                &state,
+                None,
+                3,
+                ChunkSource::from_joint(origin + Duration::from_millis(150), Some(5)),
+                None,
+            )
+            .unwrap();
+        assert_eq!(calls_c.load(Ordering::Relaxed), 2);
+        let d_replan = prep_c
+            .commit_gate(
+                origin + Duration::from_millis(152),
+                origin,
+                period_ns,
+                Some(0),
+                &cached_gate,
+            )
+            .unwrap();
+        match d_replan {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 3);
+                assert!((target[0] - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected replanned Submit on period 3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunking_commit_gate_rejects_old_target_when_period_boundary_passes_before_submit() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.05, 0.15, 0.25, 0.35]);
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+        let gate_params = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 300,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        // Planned and pruned at t=48ms (period 0 -> staged target is c0[0]=0.05),
+        // then 50ms boundary passes before submit (t=52ms -> period 1):
+        // old period-0 target (0.05) must NOT be submitted; period-1 slot (0.15) is selected.
+        prep.plan_chunk_step(
+            &state,
+            None,
+            0,
+            ChunkSource::from_joint(origin + Duration::from_millis(45), Some(2)),
+            None,
+        )
+        .unwrap();
+        let d1 = prep
+            .commit_gate(origin + Duration::from_millis(52), origin, period_ns, None, &gate_params)
+            .unwrap();
+        match d1 {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 1);
+                assert!(
+                    (target[0] - 0.15).abs() < 1e-6,
+                    "old period-0 target (0.05) must not be submitted after boundary; got {}",
+                    target[0]
+                );
+            }
+            other => panic!("expected Submit for period 1, got {other:?}"),
+        }
+
+        // Now plan at t=198ms (period 3, the LAST slot c0[3]=0.35), then 200ms boundary passes
+        // before commit (t=202ms -> period 4, missing from buffer) -> Skip, old 0.35 NOT submitted.
+        prep.plan_chunk_step(
+            &state,
+            None,
+            3,
+            ChunkSource::from_joint(origin + Duration::from_millis(195), Some(2)),
+            None,
+        )
+        .unwrap();
+        let d4 = prep
+            .commit_gate(
+                origin + Duration::from_millis(202),
+                origin,
+                period_ns,
+                Some(1),
+                &gate_params,
+            )
+            .unwrap();
+        assert_eq!(d4, CommitGateDecision::Skip { commit_period: 4 });
+        assert_eq!(prep.chunk_buffer_len(), 0);
     }
 
     #[tokio::test]

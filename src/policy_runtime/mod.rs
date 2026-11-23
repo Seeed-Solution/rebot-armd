@@ -33,10 +33,10 @@ pub use release_gate::{
 pub use runner::{
     compute_policy_deadline, max_cached_chunk_source_age_ms, max_policy_input_age_ms,
     parse_policy_start_request, prepare_policy, spawn_policy_runner, validate_policy_fps,
-    ChunkFreshnessLimits, ChunkRunContext, ChunkSource, PolicyMode, PolicyRun, PolicyRunStart,
-    PolicyStartRequest, PolicyStepStats, PreparedPolicy, SpeedGateReport, WarmupInferUs,
-    DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
-    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, POLICY_STATS_RING,
+    ChunkFreshnessLimits, ChunkRunContext, ChunkSource, CommitGateDecision, CommitGateParams,
+    PolicyMode, PolicyRun, PolicyRunStart, PolicyStartRequest, PolicyStepStats, PreparedPolicy,
+    SpeedGateReport, WarmupInferUs, DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS,
+    MAX_POLICY_SECONDS, MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, POLICY_STATS_RING,
     SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
 };
 #[cfg(feature = "policy-tract")]
