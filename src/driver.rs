@@ -71,6 +71,10 @@ pub enum ArmDriverError {
     Timeout(u8),
 }
 
+/// Message of the error `write_joint_targets` returns when the E-stop gate stopped the
+/// batch (an E-stop request arrived during the transmit; the tick applies it at once).
+pub const ESTOP_INHIBITED: &str = "E-stop requested during the target batch; remaining frames not sent";
+
 /// Universal robotic arm hardware driver trait
 /// Name of a Damiao feedback state code that reports a fault (8 and above); None for
 /// the normal states (0 disabled, 1 enabled).
@@ -229,6 +233,12 @@ pub trait ArmDriver: Send {
     /// Set an atomic abort flag that hardware loops should check to abort early on E-stop
     fn set_abort_flag(&mut self, _flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 
+    /// The arm's E-stop gate ([`crate::rt_core::urgent::EstopGate`]): a driver that sends a
+    /// target batch frame by frame checks it before each frame and stops the batch while an
+    /// E-stop request is not yet applied by the tick (`write_joint_targets` then fails with
+    /// [`ESTOP_INHIBITED`]). Default: the driver does not check (the tick checks before its
+    /// output).
+    fn set_estop_gate(&mut self, _gate: crate::rt_core::urgent::EstopGate) {}
 
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
@@ -2221,6 +2231,8 @@ pub enum DamiaoControlMode {
 
 pub struct DamiaoArmDriver<C: CanTransport> {
     can: C,
+    /// Checked before each frame of a target batch (`ArmDriver::set_estop_gate`).
+    estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     motor_ids: Vec<u16>,
     master_id: u32,
     /// MIT / feedback mapping range per joint (must equal each motor's PMAX / VMAX / TMAX).
@@ -2336,6 +2348,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_read_drained: false,
             mit_fence: None,
             mit_fence_last_cmd: vec![None; dof],
+            estop_gate: None,
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
             mit_fence_acked: false,
@@ -2941,6 +2954,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         false
+    }
+
+    /// Err([`ESTOP_INHIBITED`]) while an E-stop request is not yet applied by the tick.
+    fn estop_check(&self) -> Result<(), ArmDriverError> {
+        if self.estop_gate.as_ref().is_some_and(|g| g.pending()) {
+            return Err(ArmDriverError::Protocol(ESTOP_INHIBITED.into()));
+        }
+        Ok(())
     }
 
     pub fn transmit_with_retry(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
@@ -3550,6 +3571,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
+                        if let Err(e) = self.estop_check() {
+                            // a partial batch under MIT: the group trips (no cached output)
+                            self.trip_fence(format!("E-stop during the batch after {i} of {} joints", targets.len()));
+                            return Err(e);
+                        }
                         if started[i].is_none() { started[i] = Some(self.now()); }
                         if let Err(e) = self.transmit_fenced(&frame) {
                             self.trip_fence(format!("transmit to joint {} failed after {} of {} joints: {e}", i + 1, i, targets.len()));
@@ -3571,6 +3597,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // Per joint: POS_VEL, MIT for joints switched by set_joint_modes, both when unconfirmed.
                 for (i, target) in targets.iter().enumerate() {
                     for frame in self.target_frames(i, target) {
+                        self.estop_check()?;
                         self.transmit_with_retry(&frame)?;
                         self.last_target_frames[i] = Some(frame);
                     }
@@ -3595,6 +3622,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         torque,
                         &self.limits[i],
                     );
+                    self.estop_check()?;
                     self.transmit_with_retry(&frame)?;
                     self.last_target_frames[i] = Some(frame);
                 }
@@ -3638,6 +3666,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.recovery_written_joints.clear();
     }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {

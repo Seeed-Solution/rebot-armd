@@ -24,6 +24,8 @@ pub mod sched;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scratch;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod urgent;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod triple;
 
 #[cfg(not(target_arch = "wasm32"))]

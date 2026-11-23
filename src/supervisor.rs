@@ -442,6 +442,8 @@ pub struct SupervisorInner {
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
     pub applied_estop_count: u64,
+    /// `applied_estop_count` for the bus driver's E-stop gate (`crate::rt_core::urgent`).
+    pub estop_applied: Arc<AtomicU64>,
     pub last_preemption: Option<Instant>,
     /// Connection and generation most recently evicted by a forced acquire.
     pub last_evicted: Option<(String, u64)>,
@@ -724,6 +726,7 @@ impl SupervisorInner {
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             requested_estop_count: Arc::new(AtomicU64::new(0)),
             applied_estop_count: 0,
+            estop_applied: Arc::new(AtomicU64::new(0)),
             last_preemption: None,
             last_evicted: None,
             handover_settling_since: None,
@@ -944,6 +947,17 @@ impl SupervisorInner {
         }
     }
 
+    /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick.
+    pub fn estop_gate(&self) -> crate::rt_core::urgent::EstopGate {
+        crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone())
+    }
+
+    /// An E-stop request the tick has not applied yet (not the latch: hold output while
+    /// latched still reaches the motors).
+    pub(crate) fn estop_request_unapplied(&self) -> bool {
+        self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+    }
+
     pub(crate) fn estop_pending(&self) -> bool {
         self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
     }
@@ -961,6 +975,7 @@ impl SupervisorInner {
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
+        driver.set_estop_gate(self.estop_gate());
         driver.set_gripper_index(self.config.gripper_index());
         driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
         if driver.capabilities().load_feedback {
@@ -2727,6 +2742,7 @@ impl SupervisorInner {
         let req = self.requested_estop_count.load(Ordering::SeqCst);
         if req > self.applied_estop_count {
             self.applied_estop_count = req;
+            self.estop_applied.store(req, Ordering::SeqCst);
             self.e_stop_latched.store(true, Ordering::SeqCst);
             if !matches!(self.safety.state(), SafetyState::Fault(_)) {
                 self.apply_stop_policy(StopPolicy::EStopLatch);
@@ -6674,6 +6690,14 @@ impl SupervisorInner {
         }
 
         self.tick_phase(2);
+        // An E-stop requested during this tick: its output did not reach the bus (or the batch
+        // stopped at the next frame, `ArmDriver::set_estop_gate`); apply it now instead of one
+        // period later. A batch the gate stopped is not a driver failure.
+        if self.estop_request_unapplied() {
+            tick_output_accepted = false;
+            self.consume_pending_estop();
+            if output_error.as_deref().is_some_and(|e| e.contains(crate::driver::ESTOP_INHIBITED)) { output_error = None; }
+        }
         if let Some(error) = output_error {
             tick_output_accepted = false;
             self.stop_motion();
@@ -7905,6 +7929,7 @@ impl ArmSupervisor {
     pub async fn set_driver(&self, mut driver: Box<dyn ArmDriver>) {
         driver.set_abort_flag(self.e_stop_latched.clone());
         let mut inner = self.inner.write().await;
+        driver.set_estop_gate(inner.estop_gate());
         driver.set_gripper_index(inner.config.gripper_index());
         let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
         let caps = drv.capabilities();
@@ -7930,6 +7955,7 @@ impl ArmSupervisor {
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
+            driver.set_estop_gate(inner.estop_gate());
             driver.set_gripper_index(inner.config.gripper_index());
             driver.set_strict_mode_handover(inner.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
             if driver.capabilities().load_feedback {
