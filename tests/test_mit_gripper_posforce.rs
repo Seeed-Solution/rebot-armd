@@ -2704,6 +2704,76 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             ticker.await.unwrap();
             assert!(done.gripper_gap_rad.is_some());
             assert!(sup2.inner().read().await.measured_positions[J7].abs() < 0.05);
+
+            // 8c. pos_vel close AND pos_force open keep timeout_s == 8.0 and ARE clamped to phase_timeout_s.
+            for (label, speed_cfg, start_q, cmd) in [
+                ("pos_vel_close", None, -5.7_f32, GripperCommand::Close),
+                ("pos_force_open", Some(0.30_f32), 0.0_f32, GripperCommand::Open),
+            ] {
+                let (sup_inner3, _, _) = make_sup(speed_cfg, start_q);
+                let sup3 = Arc::new(armd::supervisor::ArmSupervisor::new(ArmConfig::rebot_dm()));
+                let id3 = {
+                    let mut inner = sup3.inner().write().await;
+                    *inner = sup_inner3;
+                    let ep = inner.safety.epoch_id();
+                    inner.begin_sequence_action(None, ep).unwrap()
+                };
+                let ctx3 = armd::macro_action::MacroCtx {
+                    sup: sup3.clone(),
+                    id: id3,
+                    deadline: std::time::Instant::now() + Duration::from_secs(60),
+                    phase_timeout_s: 0.05,
+                    timeout_code: "GRASP_TIMEOUT",
+                    timeout_message: "macro timeout".into(),
+                };
+                let sup_watch = sup3.clone();
+                let seen_timeout = Arc::new(std::sync::Mutex::new(None));
+                let seen_out = seen_timeout.clone();
+                let watcher = tokio::spawn(async move {
+                    for _ in 0..20 {
+                        if let Some(active) = &sup_watch.inner().read().await.active_trajectory {
+                            if let armd::motion::Reference::Gripper(gm) = &active.reference {
+                                *seen_out.lock().unwrap() = Some(gm.timeout_s);
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                });
+                let t0 = std::time::Instant::now();
+                let res = ctx3.gripper(label, cmd).await;
+                watcher.await.unwrap();
+                assert!(t0.elapsed() < Duration::from_secs(1), "{label} was not clamped to phase_timeout_s");
+                assert_eq!(*seen_timeout.lock().unwrap(), Some(8.0), "{label} did not keep timeout_s == 8.0");
+                match res {
+                    Err(armd::macro_action::Stop::Fail(code, _)) => assert_eq!(code, "GRASP_TIMEOUT", "{label}"),
+                    other => panic!("{label}: expected GRASP_TIMEOUT at phase_timeout_s, got {other:?}"),
+                }
+            }
+
+            // 8d. sequences::expected_duration with a pos-force close step returns slow-close duration (~19 s).
+            let (sup_seq, _, _) = make_sup(Some(0.30), -5.7);
+            let seq_dur = armd::sequences::expected_duration(
+                &sup_seq,
+                &[(0, armd::sequences::PinnedStep::Gripper { action: armd::sequences::GripperAction::Close, fraction: None })],
+                1,
+                false,
+            );
+            assert!(seq_dur >= 1.0 + 5.7 / 0.30, "expected slow pos-force sequence duration >= 20 s, got {seq_dur:.2} s");
+
+            // 8d-explicit. Public start_macro_gripper preserves an explicit caller-supplied timeout_s
+            //              even on a pos-force close.
+            {
+                let (mut sup_exp, _, _) = make_sup(Some(0.30), -5.7);
+                let ep_exp = sup_exp.safety.epoch_id();
+                let id_exp = sup_exp.begin_sequence_action(None, ep_exp).unwrap();
+                let exp_req = GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
+                sup_exp.start_macro_gripper(id_exp, exp_req).unwrap();
+                match &sup_exp.active_trajectory.as_ref().unwrap().reference {
+                    armd::motion::Reference::Gripper(gm) => assert_eq!(gm.timeout_s, 2.0),
+                    other => panic!("expected Gripper reference, got {other:?}"),
+                }
+            }
         });
     }
 

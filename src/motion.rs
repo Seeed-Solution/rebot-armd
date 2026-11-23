@@ -1287,9 +1287,18 @@ impl GripperMotion {
             elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving,
             contact_rad: None, contact_ticks: 0,
         };
-        m.timeout_s = m.request.timeout_s
-            .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
+        m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
         Ok(m)
+    }
+
+    /// True when this motion moves the jaw in the closing direction.
+    pub fn is_closing(&self) -> bool {
+        (self.target - self.start) * self.close_dir() > 1e-6
+    }
+
+    /// Default deadline (s) derived from planned travel speed and settle time.
+    pub fn default_timeout_s(&self) -> f64 {
+        GRIPPER_DEFAULT_TIMEOUT_S.max(self.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S)
     }
 
     /// Wire-safe velocity ceiling for CAN encoding (prevents double-flooring `step_speed_f32`).

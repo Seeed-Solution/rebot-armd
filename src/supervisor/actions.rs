@@ -507,17 +507,19 @@ impl SupervisorInner {
 
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        self.start_macro_gripper_within(id, request, None).map(|(dur, _)| dur)
+        self.start_macro_gripper_within(id, request, None, false).map(|(dur, _, _)| dur)
     }
 
     /// Start a gripper sub-motion of macro action `id`, optionally verifying before installation
-    /// that its planned duration fits within `max_budget_s`. Returns `(expected_duration, timeout_s)`.
+    /// that a pos-force close's planned duration fits within `max_budget_s`. Returns
+    /// `(expected_duration, timeout_s, is_pos_force_close)`.
     pub(crate) fn start_macro_gripper_within(
         &mut self,
         id: u64,
         request: GripperRequest,
         max_budget_s: Option<f64>,
-    ) -> Result<(f64, f64), ArmError> {
+        extend_pos_force_close_timeout: bool,
+    ) -> Result<(f64, f64, bool), ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -529,17 +531,24 @@ impl SupervisorInner {
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
-        let motion = GripperMotion::try_with_close_speed_limit(
+        let mut motion = GripperMotion::try_with_close_speed_limit(
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         )?;
+        let is_pos_force_close = close_cap.is_some() && motion.is_closing();
+        if is_pos_force_close && extend_pos_force_close_timeout {
+            motion.request.timeout_s = None;
+            motion.timeout_s = motion.default_timeout_s();
+        }
         let duration = motion.expected_duration();
         let timeout_s = motion.timeout_s;
-        if let Some(budget_s) = max_budget_s {
-            if duration > budget_s {
-                return Err(MotionError::InvalidCommand(format!(
-                    "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
-                )).into());
+        if is_pos_force_close {
+            if let Some(budget_s) = max_budget_s {
+                if duration > budget_s {
+                    return Err(MotionError::InvalidCommand(format!(
+                        "gripper motion needs {duration:.1} s (deadline {timeout_s:.1} s), exceeding remaining macro budget {budget_s:.1} s"
+                    )).into());
+                }
             }
         }
         self.releasing = matches!(motion.request.command, GripperCommand::Open);
@@ -554,7 +563,7 @@ impl SupervisorInner {
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
-        Ok((duration, timeout_s))
+        Ok((duration, timeout_s, is_pos_force_close))
     }
 
     /// Start a joint-space quintic sub-motion of macro action `id` (sequence pose step) to
