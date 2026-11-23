@@ -71,6 +71,14 @@ pub struct FakeMotor {
     /// The feedback answering an enable / disable frame reaches the receive queue this long
     /// after the frame (fake clock): a late confirmation.
     pub torque_reply_delay: Duration,
+    /// Position-force plant: a jaw stop the joint cannot pass in +q (None: free).
+    pub stop_at: Option<f32>,
+    /// Torque per raw current unit (N·m / (1/10000 of the maximum phase current)).
+    pub nm_per_raw: f32,
+    /// Contact stiffness at the stop (N·m/rad) before current saturation.
+    pub stop_stiffness: f32,
+    /// Last position-force frame: (position, speed raw, current raw).
+    pub last_pos_force: Option<(f32, u16, u16)>,
 }
 
 impl FakeMotor {
@@ -87,7 +95,8 @@ impl FakeMotor {
         Self { id, q: 0.0, v: 0.0, tau: 0.0, enabled: false, state_override: None, limits, regs, reply_id: 0x10 + id,
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
             mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
-            drop_torque_frames: 0, torque_reply_delay: Duration::ZERO }
+            drop_torque_frames: 0, torque_reply_delay: Duration::ZERO,
+            stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None }
     }
 
     pub fn reg_u32(&self, rid: u8) -> u32 { u32::from_le_bytes(self.regs[&rid]) }
@@ -220,6 +229,8 @@ impl FakeBusState {
                 if follow {
                     m.q = match c { MotorCmd::PosVel { p, .. } | MotorCmd::Mit { p, .. } => p };
                     m.v = 0.0;
+                    // POS_VEL / MIT against the stop: no current cap in the plant
+                    if let Some(stop) = m.stop_at.filter(|s| m.q > *s) { m.tau = m.stop_stiffness * (m.q - stop); m.q = stop; }
                 }
             }
             m.last_cmd_at = now;
@@ -290,6 +301,31 @@ impl FakeBusState {
                     if !m.silent && !m.mute_feedback && !m.no_feedback { self.delayed.push((now + delay, m.feedback_frame())); }
                     return;
                 }
+            }
+            self.push_feedback(k);
+            return;
+        }
+        if let Some(k) = self.motors.iter().position(|m| u32::from(m.id) + 0x300 == frame.id) {
+            let m = &mut self.motors[k];
+            if m.ctrl_mode() == damiao::CTRL_MODE_POS_FORCE {
+                let p = f32::from_le_bytes([cmd[0], cmd[1], cmd[2], cmd[3]]);
+                let v = u16::from_le_bytes([cmd[4], cmd[5]]);
+                let i_des = u16::from_le_bytes([cmd[6], cmd[7]]);
+                m.last_pos_force = Some((p, v, i_des));
+                if m.enabled {
+                    // the actuator saturates at the commanded current: against the stop the torque
+                    // is min(stiffness * penetration, i_des * nm_per_raw)
+                    let cap = f32::from(i_des) * m.nm_per_raw;
+                    match m.stop_at {
+                        Some(stop) if p > stop => { m.q = stop; m.tau = (m.stop_stiffness * (p - stop)).min(cap); }
+                        _ => { m.q = p; m.tau = 0.0; }
+                    }
+                    m.v = 0.0;
+                }
+                let now = self.now();
+                let m = &mut self.motors[k];
+                m.commands += 1;
+                if m.enabled { m.last_cmd_at = now; }
             }
             self.push_feedback(k);
             return;
