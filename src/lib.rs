@@ -35,6 +35,7 @@ pub mod power_plan;
 #[cfg(not(target_arch = "wasm32"))] pub mod protocol;
 #[cfg(not(target_arch = "wasm32"))] pub mod recording;
 #[cfg(not(target_arch = "wasm32"))] pub mod replay;
+pub mod rt_core;
 pub mod safety;
 #[cfg(not(target_arch = "wasm32"))] pub mod safety_describe;
 #[cfg(not(target_arch = "wasm32"))] pub mod sequences;

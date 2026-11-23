@@ -416,10 +416,9 @@ pub struct SupervisorInner {
     pub gravity_scale: f32,
     pub gravity_torques_ramped: Vec<f32>,
     pub last_can_feedback_instant: Option<Instant>,
-    /// Monotonic hardware receive instant for each joint (same length as `measured_positions`).
-    pub joint_feedback_instants: Vec<Option<Instant>>,
-    /// Monotonic per-joint hardware feedback sequence counter (same length as `measured_positions`).
-    pub joint_feedback_seqs: Vec<u64>,
+    /// RT-owned state of this arm (`crate::rt_core`): per-joint feedback receive instants and
+    /// sequence counters, the state publisher and the recording ring.
+    pub core: crate::rt_core::ArmCore,
     /// Per joint, the receive-queue bound of its last sample ([`ArmDriver::feedback_queue_bounds`]);
     /// empty when the driver has no receive queue (the receive instant bounds the sample then).
     pub joint_feedback_queue_bounds: Vec<Option<Instant>>,
@@ -701,8 +700,7 @@ impl SupervisorInner {
             gravity_scale: 0.5,
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
-            joint_feedback_instants: vec![None; dof],
-            joint_feedback_seqs: vec![0; dof],
+            core: crate::rt_core::ArmCore::new(dof),
             joint_feedback_queue_bounds: Vec::new(),
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
@@ -1584,7 +1582,7 @@ impl SupervisorInner {
     pub fn arm_feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
         self.config.arm_joint_indices().iter().map(|&i| match self.joint_feedback_queue_bounds.get(i) {
             Some(b) => *b,
-            None => self.joint_feedback_instants.get(i).copied().flatten(),
+            None => self.core.joint_feedback_instants.get(i).copied().flatten(),
         }).collect()
     }
 
@@ -1595,11 +1593,11 @@ impl SupervisorInner {
         let vels = arm.iter().map(|&i| self.measured_velocities.get(i).copied().unwrap_or(0.0)).collect();
         let instants = arm
             .iter()
-            .map(|&i| self.joint_feedback_instants.get(i).copied().flatten())
+            .map(|&i| self.core.joint_feedback_instants.get(i).copied().flatten())
             .collect();
         let seqs = arm
             .iter()
-            .map(|&i| self.joint_feedback_seqs.get(i).copied().unwrap_or(0))
+            .map(|&i| self.core.joint_feedback_seqs.get(i).copied().unwrap_or(0))
             .collect();
         (self.measured_positions.clone(), vels, instants, seqs)
     }
@@ -2219,8 +2217,8 @@ impl SupervisorInner {
                 self.last_can_feedback_instant = driver.feedback_ages().into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
                 Self::record_driver_feedback_timing(
-                    &mut self.joint_feedback_instants,
-                    &mut self.joint_feedback_seqs,
+                    &mut self.core.joint_feedback_instants,
+                    &mut self.core.joint_feedback_seqs,
                     &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     driver.as_ref(),
@@ -2730,8 +2728,8 @@ impl SupervisorInner {
                 self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
                 Self::record_driver_feedback_timing(
-                    &mut self.joint_feedback_instants,
-                    &mut self.joint_feedback_seqs,
+                    &mut self.core.joint_feedback_instants,
+                    &mut self.core.joint_feedback_seqs,
                     &mut self.joint_feedback_queue_bounds,
                     self.config.dof,
                     drv.as_ref(),
@@ -2786,8 +2784,8 @@ impl SupervisorInner {
             self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                 .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
             Self::record_driver_feedback_timing(
-                &mut self.joint_feedback_instants,
-                &mut self.joint_feedback_seqs,
+                &mut self.core.joint_feedback_instants,
+                &mut self.core.joint_feedback_seqs,
                 &mut self.joint_feedback_queue_bounds,
                 self.config.dof,
                 drv.as_ref(),
@@ -5193,8 +5191,8 @@ impl SupervisorInner {
                             }
                             if self.feedback_numeric_valid {
                                 Self::record_driver_feedback_timing(
-                                    &mut self.joint_feedback_instants,
-                                    &mut self.joint_feedback_seqs,
+                                    &mut self.core.joint_feedback_instants,
+                                    &mut self.core.joint_feedback_seqs,
                                     &mut self.joint_feedback_queue_bounds,
                                     self.config.dof,
                                     driver.as_ref(),
@@ -5241,11 +5239,11 @@ impl SupervisorInner {
         } else {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
             let now = Instant::now();
-            self.joint_feedback_instants.resize(self.config.dof, Some(now));
-            self.joint_feedback_instants.fill(Some(now));
-            self.joint_feedback_seqs.resize(self.config.dof, 0);
+            self.core.joint_feedback_instants.resize(self.config.dof, Some(now));
+            self.core.joint_feedback_instants.fill(Some(now));
+            self.core.joint_feedback_seqs.resize(self.config.dof, 0);
             self.joint_feedback_queue_bounds.clear();
-            for seq in &mut self.joint_feedback_seqs {
+            for seq in &mut self.core.joint_feedback_seqs {
                 *seq = seq.wrapping_add(1);
             }
         }
