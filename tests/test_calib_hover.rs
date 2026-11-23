@@ -170,7 +170,7 @@ async fn disconnect_during_descent_parks_keeps_observations_and_resumes() {
     let sup = r.sup.clone();
     let until = Instant::now() + Duration::from_secs(60);
     loop {
-        let phase = sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase.clone());
+        let phase = sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase);
         if phase.as_deref() == Some("descend:b") { break; }
         assert!(Instant::now() < until, "no descent of b (phase {phase:?})");
         r.heartbeat().await;
@@ -216,7 +216,7 @@ async fn stop_during_capture_ends_the_run() {
     let sup = r.sup.clone();
     let until = Instant::now() + Duration::from_secs(60);
     loop {
-        let phase = sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase.clone());
+        let phase = sup.inner().read().await.last_action.as_ref().and_then(|a| a.phase);
         if phase.as_deref() == Some("capture:a") { break; }
         assert!(Instant::now() < until, "no capture (phase {phase:?})");
         r.heartbeat().await;

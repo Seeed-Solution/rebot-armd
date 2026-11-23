@@ -2131,7 +2131,7 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: Plan, src: Arc<dyn Detectio
         Err(Stop::Fail(code, message)) => inner.finish_macro(id, "failed", Some(&code), Some(message), None, None),
         Err(Stop::Cancelled) => {}
     }
-    let a = inner.last_action.as_ref().filter(|a| a.id == id).map(|a| (a.state.clone(), a.code.clone()));
+    let a = inner.last_action.as_ref().filter(|a| a.id == id).map(|a| (a.state, a.code));
     drop(inner);
     tracing::info!("measure_multiview {id} ended: {a:?}");
 }

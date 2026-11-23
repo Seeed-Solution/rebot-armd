@@ -443,20 +443,12 @@ fn workspace_reject(e: SafetyError) -> ArmError {
     }
 }
 
-// `ReplayMotion` is already boxed in `Reference::Replay`; keeping approach polynomials inline
-// avoids deallocating a `Vec<QuinticPolynomial>` on the RT thread when transitioning to `Follow`.
+// `MultiJointQuinticTrajectory` stores up to 8 joint polynomials inline so transitioning
+// from `Approach` to `Follow` never frees heap memory on the RT thread.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum Phase {
     Approach(MultiJointQuinticTrajectory),
-    /// Fixed-storage approach polynomials for RT prepared replays: transitioning to `Follow`
-    /// never frees a `Vec<QuinticPolynomial>` on the RT thread.
-    ApproachInline {
-        polys: [crate::trajectory::QuinticPolynomial; crate::rt_core::mailbox::MAX_DOF],
-        dof: usize,
-        duration: f64,
-        elapsed: f64,
-    },
     Follow { t: f64, stalled_for: f64 },
     Settle(Settle),
 }
@@ -534,11 +526,11 @@ impl ReplayMotion {
 
     /// Recording time reached (s): 0 during the approach.
     pub fn t_s(&self) -> f64 {
-        match &self.phase { Phase::Approach(_) | Phase::ApproachInline { .. } => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
+        match &self.phase { Phase::Approach(_) => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
     }
 
     pub fn phase_name(&self) -> &'static str {
-        match self.phase { Phase::Approach(_) | Phase::ApproachInline { .. } => "approach", Phase::Follow { .. } => "replay", Phase::Settle(_) => "settle" }
+        match self.phase { Phase::Approach(_) => "approach", Phase::Follow { .. } => "replay", Phase::Settle(_) => "settle" }
     }
 
     /// Approach + playback at `speed` + settle allowance (s).
@@ -585,22 +577,6 @@ impl ReplayMotion {
                 traj.step_pv_into(ctx.dt * ctx.time_scale, &mut q, &mut v);
                 let finished = traj.is_finished();
                 for x in v.iter_mut() { *x *= ctx.time_scale as f32; }
-                let clear = self.apply_gripper(&mut q, ctx);
-                if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
-                if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
-                StepOut { positions: q, velocities: v, status: StepStatus::Running, progress: 0.0, clear_gripper_stall: clear }
-            }
-            Phase::ApproachInline { polys, dof, duration, elapsed } => {
-                let (mut q, mut v) = (positions, velocities);
-                *elapsed += ctx.dt * ctx.time_scale;
-                let t = *elapsed;
-                let finished = t >= *duration;
-                q.clear();
-                v.clear();
-                for poly in &polys[..*dof] {
-                    q.push(poly.position(t) as f32);
-                    v.push((poly.velocity(t) * ctx.time_scale) as f32);
-                }
                 let clear = self.apply_gripper(&mut q, ctx);
                 if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
                 if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
@@ -712,17 +688,17 @@ impl SupervisorInner {
         let expected = motion.expected_duration();
         let tag = motion.tag.clone();
         self.start_replay_motion(first)?;
-        let id = self.begin_action("replay", tag);
+        let id = if log_start { self.begin_action("replay", tag) } else { self.begin_action_rt("replay") };
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         if let Some(a) = self.last_action.as_mut() {
-            crate::rt_core::scratch::set_opt_str(&mut a.episode, Some(motion.episode_str()));
-            crate::rt_core::scratch::set_opt_str(&mut a.phase, Some("approach"));
+            a.episode = Some(motion.episode_str().into());
+            a.phase = Some("approach".into());
             a.t_s = Some(0.0);
         }
         if log_start {
             tracing::info!("Replay of '{}' started (action {id}, {}x, gripper {}, {:.1} s recorded)", motion.episode_str(), motion.speed, motion.gripper, motion.duration);
         }
-        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(Box::new(motion))));
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(motion)));
         Ok((id, expected))
     }
 
@@ -738,13 +714,13 @@ impl SupervisorInner {
         let expected = motion.expected_duration();
         self.start_replay_motion(first)?;
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
-        let ep = motion.episode_str();
+        let ep: crate::model::HolderLabel = motion.episode_str().into();
         self.update_action(id, |a| {
-            crate::rt_core::scratch::set_opt_str(&mut a.episode, Some(ep));
+            a.episode = Some(ep);
             a.t_s = Some(0.0);
         });
         self.quintic_settle = None;
-        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(Box::new(motion))));
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(motion)));
         self.set_macro_sub_running(id);
         Ok(expected)
     }
@@ -760,8 +736,8 @@ impl SupervisorInner {
     }
 
     /// The approach to the first frame: validated, planned from the commanded state, power
-    /// fitted and checked against the workspace (no IK). Returns it with its power scale.
-    fn replay_approach(&self, first: &[f32], epoch: u64) -> Result<(MultiJointQuinticTrajectory, Option<f64>), ArmError> {
+    /// fitted and checked against the workspace (no IK, inline polynomials and sweep).
+    fn replay_approach(&mut self, first: &[f32], epoch: u64) -> Result<(MultiJointQuinticTrajectory, Option<f64>), ArmError> {
         self.safety.validate_motion_command(Some(epoch), first, &self.config.limits)?;
         let zero_buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         let zero_vec;
@@ -783,8 +759,7 @@ impl SupervisorInner {
         let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, first,
             zeros, None, limits)?;
         let (traj, approach_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, first, limits, true)?;
-        let checks = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
+        self.check_workspace_quintic_inline(&traj)?;
         Ok((traj, approach_scale))
     }
 
@@ -849,17 +824,6 @@ impl SupervisorInner {
         if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
         let (traj, approach_scale) = self.replay_approach(&first[..dof], epoch)?;
         let approach_duration = traj.duration;
-        let phase = if traj.polynomials.len() <= crate::rt_core::mailbox::MAX_DOF {
-            let zero_poly = crate::trajectory::QuinticPolynomial {
-                a0: 0.0, a1: 0.0, a2: 0.0, a3: 0.0, a4: 0.0, a5: 0.0,
-                duration: approach_duration, p0: 0.0, p1: 0.0, v0: 0.0, v1: 0.0, a_start: 0.0, a_end: 0.0,
-            };
-            let mut polys = [zero_poly; crate::rt_core::mailbox::MAX_DOF];
-            polys[..traj.polynomials.len()].copy_from_slice(&traj.polynomials);
-            Phase::ApproachInline { polys, dof: traj.polynomials.len(), duration: approach_duration, elapsed: 0.0 }
-        } else {
-            Phase::Approach(traj)
-        };
         let motion = ReplayMotion {
             episode: ReplayEpisode::Inline(episode),
             speed: f64::from(speed) * power_scale.unwrap_or(1.0),
@@ -871,7 +835,7 @@ impl SupervisorInner {
             hold_gripper,
             tag: None,
             approach_duration,
-            phase,
+            phase: Phase::Approach(traj),
         };
         Ok((motion, first, dof, [power_scale, approach_scale]))
     }

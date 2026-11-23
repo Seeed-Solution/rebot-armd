@@ -198,3 +198,137 @@ pub fn quintic_samples(p: &PlanningPolicy, traj: &crate::trajectory::MultiJointQ
     }
     s
 }
+
+/// Zero-allocation equivalent of [`plan_scale`] on [`quintic_samples`] for a joint quintic
+/// trajectory: computes identical inverse-dynamics currents directly from the polynomial
+/// coefficients on the stack (no `Samples` or `Pre` `Vec` allocations).
+pub fn plan_scale_quintic(
+    b: &PowerBudget,
+    arm: &ArmModel,
+    dof: usize,
+    traj: &crate::trajectory::MultiJointQuinticTrajectory,
+) -> Result<PlanScale, MotionError> {
+    let p = b.planning;
+    let n = Samples::count(&p, traj.duration);
+    let arm_n = arm.arm_dof().min(MAX_JOINTS);
+    let sample_dof = dof.min(traj.polynomials.len()).min(MAX_CHAIN_JOINTS);
+    let zero = [0.0; MAX_CHAIN_JOINTS];
+
+    let sample_torques = |k: usize| -> ([f32; MAX_JOINTS], [f32; MAX_JOINTS], [f32; MAX_JOINTS]) {
+        let t = traj.duration * k as f64 / n as f64;
+        let mut q = [0.0f64; MAX_CHAIN_JOINTS];
+        let mut qd = [0.0f64; MAX_CHAIN_JOINTS];
+        let mut qdd = [0.0f64; MAX_CHAIN_JOINTS];
+        for (j, poly) in traj.polynomials.iter().enumerate().take(sample_dof) {
+            q[j] = f64::from(poly.position(t) as f32);
+            qd[j] = f64::from(poly.velocity(t) as f32);
+            qdd[j] = f64::from(poly.acceleration(t) as f32);
+        }
+        let to_f32 = |v: [f64; MAX_CHAIN_JOINTS]| -> [f32; MAX_JOINTS] {
+            std::array::from_fn(|j| if j < arm_n { v[j] as f32 } else { 0.0 })
+        };
+        let tau_d = to_f32(arm.inverse_dynamics(&q, &qd, &qdd, false));
+        let tau_g = to_f32(arm.inverse_dynamics(&q, &zero, &zero, true));
+        let qd32 = to_f32(qd);
+        (tau_d, tau_g, qd32)
+    };
+
+    let current_at = |tau_d: &[f32; MAX_JOINTS], tau_g: &[f32; MAX_JOINTS], qd: &[f32; MAX_JOINTS], s: f32| -> f32 {
+        let mut w = b.base_w;
+        for (j, jp) in b.joints.iter().enumerate().take(MAX_JOINTS) {
+            let (tau, omega) = if j < arm_n {
+                let qdj = qd[j];
+                let sign = if qdj.abs() > 1e-6 { qdj.signum() } else { 0.0 };
+                (s * s * tau_d[j] + tau_g[j] + jp.viscous_nm_s * s * qdj + jp.coulomb_nm * sign, s * qdj)
+            } else { (0.0, 0.0) };
+            w += b.joint_power_w(j, tau, omega).0;
+        }
+        w / b.v_bus
+    };
+
+    let mut static0 = 0.0f32;
+    let mut full = 0.0f32;
+    let mut at_min = 0.0f32;
+    let mut at_min_k = 0usize;
+    let mut at_min_stat = 0.0f32;
+    let min_s = p.min_scale as f32;
+    for k in 0..=n {
+        let (tau_d, tau_g, qd) = sample_torques(k);
+        if k == 0 { static0 = current_at(&tau_d, &tau_g, &qd, 0.0); }
+        let c_full = current_at(&tau_d, &tau_g, &qd, 1.0);
+        if c_full > full { full = c_full; }
+        let c_min = current_at(&tau_d, &tau_g, &qd, min_s);
+        if c_min > at_min {
+            at_min = c_min;
+            at_min_k = k;
+            at_min_stat = current_at(&tau_d, &tau_g, &qd, 0.0);
+        }
+    }
+    let limit = (p.fraction * b.supply_rated_a).max(static0 + START_MARGIN * b.supply_rated_a);
+    let total = n + 1;
+    if full <= limit {
+        return Ok(PlanScale { scale: 1.0, peak_a: full, peak_full_a: full, limit_a: limit, samples: total });
+    }
+    if at_min > limit {
+        let tk = traj.duration * at_min_k as f64 / n as f64;
+        return Err(MotionError::PowerBudget(format!(
+            "the motion needs an estimated {at_min:.2} A of supply current even slowed to {:.0}% speed (t = {:.2} s of {:.2} s at full speed; static holding load there {at_min_stat:.2} A), above the planning limit {limit:.2} A ({:.0}% of the {} A supply rating); estimate from the rigid-body model, not measured",
+            p.min_scale * 100.0, tk, traj.duration, p.fraction * 100.0, b.supply_rated_a)));
+    }
+    let peak_for = |s: f32| -> f32 {
+        let mut mx = 0.0f32;
+        for k in 0..=n {
+            let (tau_d, tau_g, qd) = sample_torques(k);
+            let c = current_at(&tau_d, &tau_g, &qd, s);
+            if c > mx { mx = c; }
+        }
+        mx
+    };
+    let (mut lo, mut hi) = (p.min_scale, 1.0f64);
+    for _ in 0..30 {
+        let mid = 0.5 * (lo + hi);
+        if peak_for(mid as f32) <= limit { lo = mid; } else { hi = mid; }
+        if hi - lo < 1e-3 { break; }
+    }
+    let peak = peak_for(lo as f32);
+    Ok(PlanScale { scale: lo, peak_a: peak, peak_full_a: full, limit_a: limit, samples: total })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::ArmConfig;
+    use crate::trajectory::TrajectoryPlanner;
+
+    #[test]
+    fn plan_scale_quintic_matches_reference_plan_scale() {
+        let cfg: ArmConfig = serde_json::from_reader(
+            std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json")).unwrap(),
+        )
+        .unwrap();
+        let mut budget = cfg.power_budget.clone().expect("device profile has power budget");
+        let dof = cfg.dof;
+        let arm_dof = cfg.arm_dof();
+        let start = cfg.home_positions.clone();
+        let mut target = start.clone();
+        target[1] += 0.5;
+        target[2] -= 0.4;
+        let zeros = vec![0.0; dof];
+        let traj = TrajectoryPlanner::plan(&start, &zeros, &target, &zeros, Some(0.5), &cfg.limits).unwrap();
+
+        // 1. Fits at full speed (scale == 1.0)
+        let r_ref = plan_scale(&budget, &cfg.arm_model, &quintic_samples(&budget.planning, &traj, arm_dof)).unwrap();
+        let r_inline = plan_scale_quintic(&budget, &cfg.arm_model, arm_dof, &traj).unwrap();
+        assert_eq!(r_inline, r_ref);
+
+        // 2. Needs bisection slowdown (tighter supply rating)
+        budget.supply_rated_a = 1.5;
+        let r_ref2 = plan_scale(&budget, &cfg.arm_model, &quintic_samples(&budget.planning, &traj, arm_dof));
+        let r_inline2 = plan_scale_quintic(&budget, &cfg.arm_model, arm_dof, &traj);
+        match (r_ref2, r_inline2) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b),
+            (Err(MotionError::PowerBudget(a)), Err(MotionError::PowerBudget(b))) => assert_eq!(a, b),
+            (a, b) => panic!("mismatch: ref={a:?} inline={b:?}"),
+        }
+    }
+}

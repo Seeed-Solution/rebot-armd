@@ -51,6 +51,7 @@ fn run_until_ended(fx: &mut Fx, max: usize) -> (ActionId, Outcome) {
 
 #[test]
 fn a_prepared_cartesian_path_commits_without_planning_and_runs_to_its_end() {
+    use armd::motion::Reference;
     let (mut fx, mut b) = fixture();
     let path = planned_path(&fx);
     let last = path.last();
@@ -60,11 +61,19 @@ fn a_prepared_cartesian_path_commits_without_planning_and_runs_to_its_end() {
     let r = submit(&mut b, 1, auth(&fx), &slot);
     let rep = fx.step();
     assert!(matches!(rep.command, Some((req, Ok(_))) if req == r), "{rep:?}");
+    let borrows = matches!(
+        fx.core.active_trajectory.as_ref().map(|a| &a.reference),
+        Some(Reference::Path(p)) if p.borrows_plan_slot()
+    );
+    assert!(borrows, "prepared Cartesian path must borrow directly from the pinned plan slot");
+    b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 0, "pinned plan slot must not be reclaimed while Cartesian path runs");
     let action = fx.active().unwrap();
     assert_eq!(fx.core.last_action.as_ref().map(|a| a.kind.as_str()), Some("move_to"));
     assert_eq!(run_until_ended(&mut fx, 400), (action, Outcome::Completed));
     for (c, q) in fx.core.commanded_positions.iter().zip(last) { assert!((c - q).abs() < 1e-3, "{:?} vs {last:?}", fx.core.commanded_positions); }
     let got = { let mut v = Vec::new(); b.poll(|_, r| { v.push(r); true }); v };
+    assert_eq!(b.stats().retired, 1, "pinned plan slot reclaimed after Cartesian path terminal");
     assert!(matches!(got.last(), Some(Reply::Terminal { outcome: Outcome::Completed, .. })), "{got:?}");
 }
 

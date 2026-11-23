@@ -36,7 +36,7 @@ fn run(inner: &mut SupervisorInner, id: u64, max_s: f64) -> (motion::ActionStatu
     for _ in 0..(max_s / DT) as usize {
         inner.tick(DT);
         let a = inner.last_action.clone().unwrap();
-        trace.push((a.phase.clone(), inner.commanded_positions.clone()));
+        trace.push((a.phase.as_deref().map(str::to_owned), inner.commanded_positions.clone()));
         if a.id == id && !a.is_running() { return (a, trace); }
     }
     panic!("action still running: {:?}", inner.last_action);
@@ -229,11 +229,11 @@ fn macro_descent_records_the_outcome_and_runs_the_final_approach_phase() {
     for _ in 0..600 {
         inner.tick(DT);
         let a = inner.last_action.clone().unwrap();
-        if let Some(ph) = a.phase.clone() { if phases.last() != Some(&ph) { phases.push(ph); } }
+        if let Some(ph) = a.phase { if phases.last() != Some(&ph) { phases.push(ph); } }
         if matches!(inner.macro_sub(id), Some(armd::macro_action::SubState::Done(_))) { break; }
     }
     assert!(matches!(inner.macro_sub(id), Some(armd::macro_action::SubState::Done(_))), "sub-motion finished");
-    assert_eq!(phases.last().map(String::as_str), Some("final_approach"), "{phases:?}");
+    assert_eq!(phases.last().map(|p| p.as_str()), Some("final_approach"), "{phases:?}");
     let q = &inner.commanded_positions;
     assert!(q[..6].iter().zip(&target[..6]).all(|(a, b)| (a - b).abs() < 1e-5));
     // a contact stop turns the record into direct / contact

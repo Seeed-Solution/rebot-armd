@@ -682,8 +682,43 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Zero-allocation workspace sweep check of a joint-space quintic trajectory using
+    /// reused evaluator buffers (`ws_eval_bufs`) and stack-only adaptive subdivision.
+    /// Falls back to [`Self::workspace_samples`] + [`Self::check_workspace_path`] only when
+    /// `dof > INLINE_POLYS` or `arm_dof > MAX_CHAIN_JOINTS`.
+    pub(crate) fn check_workspace_quintic_inline(&mut self, traj: &MultiJointQuinticTrajectory) -> Result<(), SafetyError> {
+        if self.workspace_policy().is_none() {
+            return Ok(());
+        }
+        if traj.polynomials.len() > crate::trajectory::INLINE_POLYS
+            || self.config.arm_model.arm_dof() > crate::chain::MAX_CHAIN_JOINTS
+        {
+            let samples = self.workspace_samples(traj)?;
+            return self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice));
+        }
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            )
+            .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+            let checked = eval
+                .check_quintic_inline(traj, MAX_KEEPOUT_EVALS_PER_PLAN, "sweep")
+                .map_err(SafetyError::from_workspace);
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        self.ws_eval_bufs = bufs;
+        result
+    }
+
     /// Jog from a fixed slice (RT commit path: no `to_vec()`, no `planning_limits()`
-    /// allocation, no `target_positions` replacement free).
+    /// allocation, no `workspace_samples` `Vec`, no `target_positions` replacement free).
     pub(crate) fn jog_action_slice(
         &mut self,
         target_positions: &[f32],
@@ -756,8 +791,7 @@ impl SupervisorInner {
             limits,
         )?;
         let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, target, limits, true)?;
-        let samples = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        self.check_workspace_quintic_inline(&traj)?;
 
         self.last_heartbeat = Instant::now();
         self.release_servo_target();
@@ -766,7 +800,7 @@ impl SupervisorInner {
         crate::rt_core::scratch::copy_into(&mut self.target_positions, target);
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
-        let id = self.begin_action(kind, None);
+        let id = self.begin_action_rt(kind);
         if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
         // No `speed_scale` here, so `active_tracking_limits` already uses `planning_limits()`
         // when `motion_limits` is None (avoids cloning `Vec<JointLimit>` and joint name strings).
@@ -1065,13 +1099,73 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Zero-allocation equivalent of [`Self::check_prepared_fresh`] preserving identical
+    /// refusal precedence and static codes.
+    pub(crate) fn check_prepared_fresh_static(&self, epoch: u64) -> Result<(), &'static str> {
+        if self.safety.epoch_id() != epoch {
+            return Err("PLAN_STALE");
+        }
+        if self.handover_settling_since.is_some() { return Err("REJECTED"); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Err("ESTOP_ACTIVE"); }
+        match self.safety.state() {
+            SafetyState::EStop => return Err("ESTOP_ACTIVE"),
+            SafetyState::Fault(_) => return Err("FAULT_ACTIVE"),
+            s if !s.is_operational() => return Err("NOT_ARMED"),
+            _ => {}
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err("NOT_ARMED");
+        }
+        if self.collision.hold.is_some() { return Err("COLLISION_HOLD"); }
+        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
+        if self.mit_motion_blocker().is_some() { return Err("PLAN_STALE"); }
+        if self.calibration_busy
+            || self.zero_check_persisting.is_some()
+            || self.active_trajectory.is_some()
+            || self.servo_target.is_some()
+            || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3)
+        {
+            return Err("PLAN_STALE");
+        }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading || self.policy_run.is_some() {
+            return Err("PLAN_STALE");
+        }
+        Ok(())
+    }
+
+    /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
+    /// [`crate::rt_core::broker::PlanSlotRef`] as a `move_to` action (zero allocations and
+    /// zero frees on both accepted and refused commits). Returns `(action id, expected duration)`.
+    pub(crate) fn install_prepared_path_slot(
+        &mut self,
+        epoch: u64,
+        dof: usize,
+        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        duration_s: f64,
+        power_scale: Option<f64>,
+    ) -> Result<(u64, f64), &'static str> {
+        self.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
+        self.check_prepared_fresh_static(epoch)?;
+        let last = &slot.path.samples()[slot.path.len() - 1][..dof];
+        let duration = self
+            .start_path_motion_slice(epoch, last, duration_s)
+            .map_err(crate::rt_core::ops::static_code)?;
+        let id = self.begin_action_rt("move_to");
+        let scale = power_scale.unwrap_or(1.0);
+        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
+        let arm_dof = self.config.arm_dof();
+        self.active_trajectory = Some(ActiveTrajectory::new(
+            Some(id),
+            Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
+        ));
+        Ok((id, duration + 0.5))
+    }
+
     /// The [`JointPath`] of a prepared Cartesian path (`dof` joints, samples at the slot's
     /// path parameters): `INVALID_COMMAND` for fewer than two samples, more joints than a
     /// path sample holds, or parameters that do not run from 0 to 1 without going back.
-    ///
-    /// Note: copying `q` and `s` into `JointPath` remains until step 1 updates `JointPath` /
-    /// `PathTrajectory` (`src/motion.rs`) and `SupervisorInner::tick` (`src/supervisor.rs:2511`)
-    /// to borrow directly from [`crate::rt_core::broker::PlanSlotRef`].
+    /// Fallback used by `CoreOps::commit_prepared(&PreparedPath)` when no pinned slot is passed.
     pub(crate) fn prepared_joint_path(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, duration_s: f64, power_scale: Option<f64>)
         -> Result<JointPath, &'static str> {
         self.validate_prepared_joint_path(dof, path, duration_s)?;

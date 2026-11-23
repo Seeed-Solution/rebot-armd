@@ -739,11 +739,12 @@ impl CoreOps for SupervisorInner {
         match kind {
             PathKind::Cartesian => {
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
-                let joint_path = self.prepared_joint_path(n, &slot.path, duration_s, power_scale)?;
                 match child {
-                    None => committed(self.install_prepared_path(epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
+                    None => self
+                        .install_prepared_path_slot(epoch, n, slot, duration_s, power_scale)
+                        .map(|(id, _)| Committed::authorized(d, Some(ActionId(id)))),
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        this.install_macro_prepared_path(id, joint_path, power_scale.is_some()).map(drop)
+                        this.install_macro_prepared_path_slot(id, n, slot, duration_s, power_scale).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }

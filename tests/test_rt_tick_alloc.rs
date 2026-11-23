@@ -294,9 +294,9 @@ fn scenarios(with_driver: bool) {
     // counted while the jaw moves (the tick that ends the action is a transition)
     let mut counts = Vec::new();
     while inner.active_trajectory.is_some() && counts.len() < 200 {
-        let before = inner.last_action.as_ref().map(|a| a.state.clone());
+        let before = inner.last_action.as_ref().map(|a| a.state);
         let c = tick_counted(&mut inner);
-        if inner.active_trajectory.is_some() && inner.last_action.as_ref().map(|a| a.state.clone()) == before { counts.push(c); }
+        if inner.active_trajectory.is_some() && inner.last_action.as_ref().map(|a| a.state) == before { counts.push(c); }
     }
     assert!(counts.len() >= 10, "gripper close: {} ticks counted", counts.len());
     assert_zero(&format!("{tag} gripper close"), &counts);
@@ -831,10 +831,13 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     assert!(cfg_ok);
     assert_eq!((a_cfg, f_cfg), (0, 0), "config reserve/release touched the allocator");
 
-    // 5. Accepted prepared replay borrows the immutable plan slot (no sample vector copy) and
-    //    `sample_at_into` + `step_into` across approach and follow perform (0, 0) allocs/frees.
-    //    (Note: `SupervisorInner::tick` at `src/supervisor.rs:2557` still does `a.phase = Some(phase.into())`
-    //    every tick — 1 alloc + 1 free — which is a step-1 file.)
+    // 5. Accepted prepared replay commit (via `fx.step()`) performs (0, 0) allocs/frees,
+    //    borrows the immutable plan slot (no sample vector copy, no `Box`, inline approach),
+    //    and runs approach + follow ticks with (0, 0) allocs/frees.
+    // Warm publication triple-buffer slots before counting full releases.
+    for _ in 0..4 { fx.step(); }
+    let _ = fx.core.core.hub().latest();
+
     let rep_copy = replay_slot.clone();
     b.submit(
         ClientId(1),
@@ -844,8 +847,14 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&rep_copy).unwrap()),
     )
     .unwrap();
-    let step_rep = fx.step();
+    let (step_rep, a_rep_commit, f_rep_commit) = counted(|| fx.step());
     assert!(step_rep.command.unwrap().1.is_ok(), "prepared replay committed");
+    assert_eq!(
+        (a_rep_commit, f_rep_commit),
+        (0, 0),
+        "accepted prepared replay commit + tick touched the allocator"
+    );
+
     let mut sample_buf = Vec::with_capacity(dof);
     let mut step_out = armd::motion::StepOut {
         positions: Vec::with_capacity(dof),
@@ -893,16 +902,26 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
     assert_eq!(sample_buf.len(), dof);
     assert_eq!(step_out.positions.len(), dof);
 
+    // Steady-state replay ticks through `fx.core.tick_publish` also perform (0, 0) allocs/frees.
+    assert_zero("prepared replay steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
+
     // Overtaken stop ends the replay cleanly and retires its pinned slot.
     stop.request();
-    let stopped_rep = fx.step();
+    let (stopped_rep, a_stop, f_stop) = counted(|| fx.step());
     assert!(stopped_rep.stopped);
+    assert_eq!((a_stop, f_stop), (0, 0), "urgent stop ending slot-borrowed replay touched the allocator");
     assert!(fx.core.active_trajectory.is_none());
     b.poll(|_, _| true);
     assert_eq!(b.stats().retired, 1, "slot reclaimed after replay terminal");
+    // Let post-stop deceleration reach rest before preparing the next Cartesian path.
+    for _ in 0..20 {
+        if fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+        fx.step();
+    }
+    let _ = fx.core.core.hub().latest();
 
-    // 6. Accepted prepared Cartesian path and accepted Jog committed through ReleaseFixture
-    //    both execute steady-state ticks with (0, 0) allocs/frees.
+    // 6. Accepted prepared Cartesian path commit (via `fx.step()`) performs (0, 0) allocs/frees,
+    //    borrows the immutable plan slot, and executes steady-state ticks with (0, 0) allocs/frees.
     let mut cart_now = cart_slot.clone();
     let mut cur_start = [0.0f32; MAX_DOF];
     cur_start[..dof].copy_from_slice(&fx.core.commanded_positions);
@@ -929,14 +948,33 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart_now).unwrap()),
     )
     .unwrap();
-    assert!(fx.step().command.unwrap().1.is_ok(), "prepared path committed");
-    warm(&mut fx.core, 3);
-    assert!(fx.core.active_trajectory.is_some());
+    let (step_cart, a_cart_commit, f_cart_commit) = counted(|| fx.step());
+    assert!(step_cart.command.unwrap().1.is_ok(), "prepared path committed");
+    assert_eq!(
+        (a_cart_commit, f_cart_commit),
+        (0, 0),
+        "accepted prepared Cartesian path commit + tick touched the allocator"
+    );
+    assert!(
+        matches!(fx.core.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Path(p)) if p.borrows_plan_slot()),
+        "prepared Cartesian path must borrow directly from the immutable plan slot"
+    );
     assert_zero("prepared Cartesian path steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
     stop.request();
-    fx.step();
+    let (stopped_cart, a_stop2, f_stop2) = counted(|| fx.step());
+    assert!(stopped_cart.stopped);
+    assert_eq!((a_stop2, f_stop2), (0, 0), "urgent stop ending slot-borrowed path touched the allocator");
     b.poll(|_, _| true);
+    assert_eq!(b.stats().retired, 2, "slot reclaimed after Cartesian path terminal");
+    for _ in 0..20 {
+        if fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+        fx.step();
+    }
+    let _ = fx.core.core.hub().latest();
 
+    // 7. Accepted Jog commit (`Primitive::JointQuintic` via `fx.step()`) performs (0, 0)
+    //    allocs/frees (including inline quintic planner + stack workspace sweep) and runs
+    //    steady-state ticks with (0, 0) allocs/frees.
     let mut jog_start = [0.0f32; MAX_DOF];
     jog_start[..dof].copy_from_slice(&fx.core.commanded_positions);
     let mut jog_goal = jog_start;
@@ -950,8 +988,128 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
         Submit::Install(&move |s: &mut PlanSlot| s.set(jog_after)),
     )
     .unwrap();
-    assert!(fx.step().command.unwrap().1.is_ok(), "jog committed via jog_action_slice");
-    warm(&mut fx.core, 3);
+    let (step_jog, a_jog_commit, f_jog_commit) = counted(|| fx.step());
+    assert!(step_jog.command.unwrap().1.is_ok(), "jog committed via jog_action_slice");
+    assert_eq!(
+        (a_jog_commit, f_jog_commit),
+        (0, 0),
+        "accepted jog commit + tick touched the allocator"
+    );
     assert!(fx.core.active_trajectory.is_some());
     assert_zero("RT-committed jog steady ticks", &count_ticks(&mut fx.core, 10, |_, _| {}));
+}
+
+/// Accepted commits for prepared Cartesian path, prepared replay, and jog also perform
+/// `(0, 0)` allocations/frees under the real device profile (`rebot-b601dm.json`:
+/// workspace policy + link capsules + self-collision pairs + power-budget planning enabled).
+#[test]
+fn accepted_commits_on_device_profile_with_workspace_and_power_budget_do_not_allocate_or_free() {
+    use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit};
+    use armd::rt_core::mailbox::MAX_DOF;
+    use armd::rt_core::ops::{
+        tool_digest_hash, CoreOps, EpisodeRef, PathKind, PlanSlot, Primitive, ReleaseFixture,
+    };
+
+    DEVICE.with(|d| d.set(true));
+    let mut inner = supervisor(false);
+    DEVICE.with(|d| d.set(false));
+    assert!(inner.workspace_policy().is_some(), "device profile must exercise workspace sweep");
+    assert!(inner.power_budget().is_some_and(|b| b.planning.enabled), "device profile must exercise power planning");
+    warm(&mut inner, 4);
+
+    let boot = BootId::fresh();
+    let (mut fx, mut b, _tw, stop) = ReleaseFixture::new(inner, boot, Capacities::default());
+    for _ in 0..4 { fx.step(); }
+    let _ = fx.core.core.hub().latest();
+    let deadline = fx.now() + Duration::from_secs(30);
+    let dof = fx.core.commanded_positions.len();
+    let tool = tool_digest_hash(&fx.core.config.active_tool.config_digest);
+
+    // 1. Accepted prepared Cartesian path commit on device profile.
+    let mut start = [0.0f32; MAX_DOF];
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut cart = PlanSlot::default();
+    for k in 0..=10 {
+        let f = k as f32 / 10.0;
+        let mut q = start;
+        q[0] += 0.04 * f;
+        cart.path.push(&q[..dof], f64::from(f)).unwrap();
+    }
+    cart.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Cartesian,
+        duration_s: 0.8,
+        power_scale: None,
+    };
+    b.submit(
+        ClientId(1),
+        1,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&cart).unwrap()),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile prepared path committed");
+    assert_eq!((a, f), (0, 0), "device profile prepared path commit touched allocator");
+    stop.request();
+    fx.step();
+    b.poll(|_, _| true);
+
+    // 2. Accepted prepared replay commit on device profile (exercises approach quintic + power planning + workspace sweep).
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut replay = PlanSlot::default();
+    for k in 0..=20 {
+        let f = k as f32 / 20.0;
+        let mut q = start;
+        q[0] += 0.04 * f;
+        replay.path.push(&q[..dof], k as f64).unwrap();
+    }
+    replay.primitive = Primitive::Prepared {
+        child: None,
+        dof: dof as u8,
+        start,
+        kind: PathKind::Replay {
+            episode: EpisodeRef::new("dev_ep").unwrap(),
+            speed: 1.0,
+            gripper: false,
+            sample_dt: 0.02,
+            tool_digest: tool,
+        },
+        duration_s: 0.4,
+        power_scale: None,
+    };
+    b.submit(
+        ClientId(1),
+        2,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.copy_from(&replay).unwrap()),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile prepared replay committed");
+    assert_eq!((a, f), (0, 0), "device profile prepared replay commit touched allocator");
+    stop.request();
+    fx.step();
+    b.poll(|_, _| true);
+
+    // 3. Accepted jog commit on device profile (exercises quintic planner + power planning + workspace sweep).
+    start[..dof].copy_from_slice(&fx.core.commanded_positions);
+    let mut goal = start;
+    goal[0] -= 0.04;
+    let jog = Primitive::JointQuintic { dof: dof as u8, start, q: goal, duration_s: 0.8 };
+    b.submit(
+        ClientId(1),
+        3,
+        fx.core.authority(&fx.ctx(fx.now())),
+        deadline,
+        Submit::Install(&move |s: &mut PlanSlot| s.set(jog)),
+    )
+    .unwrap();
+    let (rep, a, f) = counted(|| fx.step());
+    assert!(rep.command.unwrap().1.is_ok(), "device profile jog committed");
+    assert_eq!((a, f), (0, 0), "device profile jog commit touched allocator");
 }
