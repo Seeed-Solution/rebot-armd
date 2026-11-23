@@ -8538,6 +8538,60 @@ mod observation_snapshot_tests {
         assert_eq!(sup.inner().read().await.core.record.dropped(), 0);
     }
 
+    /// The stop path takes the stop fence under the writer and collects the frames after
+    /// releasing it: a dispatcher preempted inside the ring's consumer mutex delays the save,
+    /// not the tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_ring_consumer_does_not_block_the_tick_during_a_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+        sup.start_recording(None, None).await.unwrap();
+        for _ in 0..5 { sup.tick(0.02).await; }
+        let ring = sup.inner().read().await.core.record.ring().unwrap().clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let ring = ring.clone();
+            std::thread::spawn(move || {
+                let _g = ring.consumer_guard();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let saver = { let sup = sup.clone(); tokio::spawn(async move { sup.save_recording().await }) };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!saver.is_finished(), "the save waits for the consumer");
+        tokio::time::timeout(Duration::from_millis(500), sup.tick(0.02)).await.expect("the tick must not wait for the stop");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        saver.await.unwrap().unwrap();
+        let st = sup.episode_store().await;
+        assert_eq!(st.list_episodes(None, Some(1), None, &[])[0].sidecar.frames, 5);
+    }
+
+    /// A save before the first recorded tick is refused and the session keeps recording
+    /// into the ring (not into the recorder).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_before_the_first_tick_keeps_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+        sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+        sup.start_recording(None, None).await.unwrap();
+        assert!(sup.save_recording().await.is_err());
+        {
+            let inner = sup.inner().read().await;
+            assert!(inner.core.record.active() && inner.recording.is_some());
+        }
+        for _ in 0..3 { sup.tick(0.02).await; }
+        {
+            let inner = sup.inner().read().await;
+            assert_eq!((inner.recorder.frame_count(), inner.core.record.pushed()), (0, 3));
+        }
+        sup.save_recording().await.unwrap();
+    }
+
     /// A full ring drops samples without waiting and the session reports them.
     #[test]
     fn recording_ring_overflow_is_explicit() {

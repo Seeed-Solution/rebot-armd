@@ -113,13 +113,6 @@ impl EpisodeRecorder {
         }
     }
 
-    /// Append frames recorded elsewhere (the control tick's recording ring) during recording.
-    pub fn append_frames(&mut self, frames: Vec<RecordFrame>) {
-        if self.state == EpisodeState::Recording {
-            if self.frames.is_empty() { self.frames = frames; } else { self.frames.extend(frames); }
-        }
-    }
-
     /// Commit the recording and save to Parquet file
     pub fn save(&mut self) -> Result<PathBuf, RecordingError> {
         let (path, frames) = self.begin_save()?;
@@ -142,6 +135,16 @@ impl EpisodeRecorder {
             return Err(RecordingError::EmptyEpisode);
         }
 
+        self.state = EpisodeState::Finalizing;
+        Ok((self.output_path.clone(), std::mem::take(&mut self.frames)))
+    }
+
+    /// [`begin_save`](Self::begin_save) when the frames are kept elsewhere (the control
+    /// tick's recording ring): no empty check here, the caller checked the frame count.
+    pub fn begin_finalize(&mut self) -> Result<(PathBuf, Vec<RecordFrame>), RecordingError> {
+        if self.state != EpisodeState::Recording {
+            return Err(RecordingError::InvalidState { action: "save".to_string(), state: self.state.clone() });
+        }
         self.state = EpisodeState::Finalizing;
         Ok((self.output_path.clone(), std::mem::take(&mut self.frames)))
     }

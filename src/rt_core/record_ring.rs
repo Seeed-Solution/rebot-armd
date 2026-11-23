@@ -5,12 +5,14 @@
 //! - Capacity [`RECORD_RING_CAPACITY`] samples: 5.12 s at 50 Hz between drains.
 //! - Overflow: when the ring is full the tick drops the sample and counts it; the session
 //!   is then incomplete ([`Finished::dropped`] > 0). Nothing waits.
-//! - Fences: [`RecordProducer::begin`] and [`RecordProducer::finish`] run under the
-//!   supervisor write lock, so no tick runs between a fence and the state change it marks.
-//!   Every sample carries its session number and the tick's publication sequence; a session
-//!   contains exactly the samples its ticks pushed between the two fences.
+//! - Fences: [`RecordProducer::begin`] and [`RecordProducer::end`] run under the
+//!   supervisor write lock, so no tick runs between a fence and the state change it marks;
+//!   neither takes a mutex. Every sample carries its session number and the tick's
+//!   publication sequence; a session contains exactly the samples its ticks pushed between
+//!   the two fences. [`Fence::collect`] assembles them after the lock is released.
 
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -26,12 +28,19 @@ struct RecSlot {
     action: Vec<f32>,
 }
 
-struct Assembly {
-    /// Session whose samples are kept; others are skipped.
+/// Frames of one session, assembled by the consumer.
+struct SessionFrames {
     session: u64,
     frames: Vec<RecordFrame>,
     first_tick: Option<u64>,
     last_tick: Option<u64>,
+}
+
+/// Consumer state: sessions in start order (normally one; two when a new session starts
+/// before the previous one is collected).
+#[derive(Default)]
+struct Assembly {
+    sessions: VecDeque<SessionFrames>,
 }
 
 /// Ring storage shared by the producer (the tick) and the consumer side.
@@ -61,9 +70,13 @@ impl RecordRing {
             slots,
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
-            assembly: Mutex::new(Assembly { session: 0, frames: Vec::new(), first_tick: None, last_tick: None }),
+            assembly: Mutex::new(Assembly::default()),
         }
     }
+
+    /// Holds the consumer mutex (tests: a preempted dispatcher).
+    #[doc(hidden)]
+    pub fn consumer_guard(&self) -> impl Drop + '_ { self.assembly.lock().unwrap_or_else(|e| e.into_inner()) }
 
     /// Moves the pushed samples of the current session into its frames (allocates; never
     /// call it from the tick). Returns how many samples it consumed.
@@ -80,10 +93,14 @@ impl RecordRing {
             // SAFETY: tail < head: the producer finished this slot and does not reuse it
             // before `tail` passes it (see the Sync impl).
             let slot = unsafe { &*self.slots[(tail % RECORD_RING_CAPACITY as u64) as usize].get() };
-            if slot.session == asm.session && asm.session != 0 {
-                asm.frames.push(RecordFrame { timestamp: slot.timestamp, observation_state: slot.state.clone(), action: slot.action.clone() });
-                asm.first_tick.get_or_insert(slot.tick_seq);
-                asm.last_tick = Some(slot.tick_seq);
+            if slot.session != 0 {
+                if asm.sessions.back().is_none_or(|s| s.session != slot.session) {
+                    asm.sessions.push_back(SessionFrames { session: slot.session, frames: Vec::new(), first_tick: None, last_tick: None });
+                }
+                let s = asm.sessions.back_mut().expect("pushed above");
+                s.frames.push(RecordFrame { timestamp: slot.timestamp, observation_state: slot.state.clone(), action: slot.action.clone() });
+                s.first_tick.get_or_insert(slot.tick_seq);
+                s.last_tick = Some(slot.tick_seq);
             }
             tail += 1;
         }
@@ -124,15 +141,11 @@ impl RecordProducer {
     pub fn ring(&self) -> Option<&Arc<RecordRing>> { self.ring.as_ref() }
 
     /// Start fence: the next pushed sample is the session's first. Allocates the ring on the
-    /// first session (not in the tick). Discards what an unfinished session left.
+    /// first session (not in the tick); takes no mutex.
     pub fn begin(&mut self) -> u64 {
-        let ring = self.ring.get_or_insert_with(|| Arc::new(RecordRing::new(self.dof))).clone();
+        if self.ring.is_none() { self.ring = Some(Arc::new(RecordRing::new(self.dof))); }
         let session = self.next_session;
         self.next_session += 1;
-        let mut asm = ring.assembly.lock().unwrap_or_else(|e| e.into_inner());
-        ring.drain_locked(&mut asm);
-        *asm = Assembly { session, frames: Vec::new(), first_tick: None, last_tick: None };
-        drop(asm);
         self.session = session;
         self.pushed = 0;
         self.dropped = 0;
@@ -172,16 +185,46 @@ impl RecordProducer {
         true
     }
 
-    /// Stop fence: ends the session and returns its frames (drains the rest of the ring;
-    /// allocates, call it off the tick under the write lock). Empty when none runs.
-    pub fn finish(&mut self) -> Finished {
-        let Some(ring) = self.ring.clone().filter(|_| self.session != 0) else { return Finished::default(); };
-        let mut asm = ring.assembly.lock().unwrap_or_else(|e| e.into_inner());
-        ring.drain_locked(&mut asm);
-        let done = Finished { frames: std::mem::take(&mut asm.frames), dropped: self.dropped, first_tick: asm.first_tick, last_tick: asm.last_tick };
-        asm.session = 0;
-        drop(asm);
+    /// Stop fence: ends the session (no tick pushes into it afterwards) without a mutex
+    /// or an allocation; [`Fence::collect`] returns its frames. None when no session runs.
+    pub fn end(&mut self) -> Option<Fence> {
+        let ring = self.ring.clone().filter(|_| self.session != 0)?;
+        let fence = Fence { ring, session: self.session, head: self.head, dropped: self.dropped };
         self.session = 0;
+        Some(fence)
+    }
+
+    /// [`end`](Self::end) and [`Fence::collect`] at once (tests).
+    pub fn finish(&mut self) -> Finished {
+        self.end().map(Fence::collect).unwrap_or_default()
+    }
+}
+
+/// A session ended by [`RecordProducer::end`]: the samples its ticks pushed.
+pub struct Fence {
+    ring: Arc<RecordRing>,
+    session: u64,
+    /// Samples written to the ring when the session ended.
+    head: u64,
+    dropped: u64,
+}
+
+impl Fence {
+    /// The session's frames (drains the ring up to the fence and beyond; allocates; call it
+    /// without the supervisor lock). Frames of older uncollected sessions are discarded.
+    pub fn collect(self) -> Finished {
+        let mut asm = self.ring.assembly.lock().unwrap_or_else(|e| e.into_inner());
+        self.ring.drain_locked(&mut asm);
+        debug_assert!(self.ring.tail.load(Ordering::Relaxed) >= self.head);
+        let mut done = Finished { dropped: self.dropped, ..Finished::default() };
+        while asm.sessions.front().is_some_and(|s| s.session <= self.session) {
+            let s = asm.sessions.pop_front().expect("checked");
+            if s.session == self.session {
+                done.frames = s.frames;
+                done.first_tick = s.first_tick;
+                done.last_tick = s.last_tick;
+            }
+        }
         done
     }
 }
@@ -208,6 +251,22 @@ mod tests {
         p.begin();
         p.push(11, 11.0, &[0.0; 2], &[0.0; 2]);
         assert_eq!(p.finish().frames.len(), 1);
+    }
+
+    #[test]
+    fn a_session_is_collected_after_the_next_one_began() {
+        let mut p = RecordProducer::new(1);
+        p.begin();
+        p.push(1, 1.0, &[1.0], &[1.0]);
+        let fence = p.end().unwrap();
+        p.begin();
+        p.push(2, 2.0, &[2.0], &[2.0]);
+        p.ring().unwrap().drain();
+        let first = fence.collect();
+        assert_eq!((first.frames.len(), first.first_tick), (1, Some(1)));
+        let second = p.finish();
+        assert_eq!((second.frames.len(), second.first_tick), (1, Some(2)));
+        assert!(p.end().is_none());
     }
 
     #[test]

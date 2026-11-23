@@ -317,26 +317,27 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             tokio::task::spawn_blocking(move || s2.check_capacity()).await
                 .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
         }
-        let (rec, _path, frames, sidecar_base, dropped) = {
+        let (rec, _path, direct_frames, sidecar_base, fence) = {
             let mut inner = lock.write().await;
             let Some(r) = inner.recording.clone() else {
                 return Err(crate::recording::RecordingError::InvalidState { action: "save".into(), state: inner.recorder.state().clone() }.into());
             };
             if let Stopper::Owner(o) = &by { if o != &r.owner { return Err(rejected(409, "RECORDER_NOT_OWNER", "the recording changed owner")); } }
-            // stop fence: the ring's samples of this session, up to the last tick
-            let ring = inner.core.record.finish();
             if !save {
                 inner.recorder.discard()?;
                 inner.recording = None;
+                // stop fence; the ring's samples are dropped after the guard is released
+                let fence = inner.core.record.end();
+                drop(inner);
+                drop(fence.map(crate::rt_core::record_ring::Fence::collect));
                 tracing::info!("Recording {} discarded", r.id);
                 return Ok(Stopped::Discarded);
             }
-            if ring.dropped > 0 {
-                tracing::warn!("Recording {}: {} samples dropped on a full recording ring; the episode is incomplete", r.id, ring.dropped);
-            }
-            let dropped = ring.dropped;
-            inner.recorder.append_frames(ring.frames);
-            let (path, frames) = inner.recorder.begin_save()?;
+            // refused while the session still runs (no tick recorded yet): it keeps recording
+            if inner.recording_frames() == 0 { return Err(crate::recording::RecordingError::EmptyEpisode.into()); }
+            let (path, direct) = inner.recorder.begin_finalize()?;
+            // stop fence: the ticks up to here; the frames are collected without the guard
+            let fence = inner.core.record.end();
             inner.recording = None;
             let base = (
                 inner.joint_names(),
@@ -347,8 +348,16 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 inner.config.active_tool.id.clone(),
                 inner.config.active_tool.config_digest.clone(),
             );
-            (r, path, frames, base, dropped)
+            (r, path, direct, base, fence)
         };
+        // the ring's frames of this session (a recorder without a session kept them itself)
+        let (frames, dropped) = match fence {
+            Some(f) => { let done = f.collect(); (done.frames, done.dropped) }
+            None => (direct_frames, 0),
+        };
+        if dropped > 0 {
+            tracing::warn!("Recording {}: {} samples dropped on a full recording ring; the episode is incomplete", rec.id, dropped);
+        }
         let (joint_names, profile_id, arm_dof, gripper_joint, fps, tool_id, tool_config_digest) = sidecar_base;
         let has_gripper_motion = store::episode_has_gripper_motion(&frames, gripper_joint);
         let duration = match (frames.first(), frames.last()) { (Some(a), Some(b)) => (b.timestamp - a.timestamp).max(0.0), _ => 0.0 };
