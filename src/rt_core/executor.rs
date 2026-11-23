@@ -62,7 +62,10 @@ fn mono_now_ns() -> u64 {
 /// Sleeps until the absolute monotonic time `at_ns` (returns at once when it has passed).
 #[cfg(target_os = "linux")]
 fn sleep_until_ns(at_ns: u64) {
-    let ts = libc::timespec { tv_sec: (at_ns / 1_000_000_000) as libc::time_t, tv_nsec: (at_ns % 1_000_000_000) as libc::c_long };
+    // SAFETY: timespec is plain old data; all-zero is valid
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+    ts.tv_sec = (at_ns / 1_000_000_000) as _;
+    ts.tv_nsec = (at_ns % 1_000_000_000) as _;
     loop {
         // SAFETY: `ts` is valid; the remaining-time pointer is unused with TIMER_ABSTIME.
         let rc = unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
