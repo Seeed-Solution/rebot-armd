@@ -11204,7 +11204,7 @@ function gbRender(body, o) {
   if (!torqued) body.appendChild(cwEl('div', 'cwiz-msg', t('gb.torque')));
   const armed = Date.now() < GB.armedUntil;
   const acts = cwEl('div', 'cwiz-acts');
-  acts.append(cwBtn(t(armed ? 'gb.confirm' : 'gb.run'), gbRun, { cls: armed ? 'btn-primary' : '', disabled: GB.busy || GT.busy || !torqued, id: 'gb-run' }));
+  acts.append(cwBtn(t(armed ? 'gb.confirm' : 'gb.run'), gbRun, { cls: armed ? 'btn-primary' : '', disabled: GB.busy || GT.busy || !torqued, id: 'gb-run', op: '/api/v1/action/gripper_calibrate' }));
   body.appendChild(acts);
   if (GB.status) body.appendChild(cwEl('div', 'cwiz-msg' + (GB.ok ? ' ok' : ''), GB.status));
 }
