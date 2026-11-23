@@ -446,6 +446,9 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
+/* phones: the stock tool's name gives way to the header controls (the language switch went off screen) */
+@media (max-width: 600px) { #tool-badge.is-stock { display: none; } }
+.cwiz-fail ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .cwiz-grip { display: grid; gap: 8px; justify-items: start; }
 .cwiz-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -1251,6 +1254,13 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 .toast code { font: 11px var(--mono); color: var(--sc-color-text-tertiary); }
 .toast.warn { border-color: #ffd591; }
 .toast.warn::before { background: #faad14; }
+/* a toast with an action (Unlock): clickable, the cause on a second line */
+.toast.has-act { pointer-events: auto; flex-wrap: wrap; max-width: 100%; }
+.toast .toast-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.toast .toast-why { font-size: 12px; color: var(--sc-color-text-secondary); }
+.toast .toast-act { min-height: 36px; padding: 0 14px; font-size: 13px; font-weight: 600; flex: none; }
+/* operator-only controls while the session is locked (OP_GATES): a lock after the label; a tap starts the unlock */
+body.op-locked :is([data-op], [data-op-mark])::after { content: "\00a0🔒"; font-size: 0.85em; }
 
 /* ---------- lease preemption ---------- */
 .btn.btn-park-off { width: 100%; flex-direction: column; gap: 2px; justify-content: center; margin-top: 8px; min-height: 48px; font-weight: 600; }
@@ -1407,6 +1417,10 @@ body::before {
 .safety-row .sw.holding .sw-track .thumb { width: 22px; }
 .safety-row .sw-text b { font-size: 14px; white-space: nowrap; }
 .safety-row .sw-text small { font-size: 10px; line-height: 1.2; }
+/* "⚠️ 点击复位急停" / "Tap to reset E-Stop" is longer than "Enable": it wraps instead of being cut off, and the
+   hint under it gives way (the safety card's note says the same) */
+.safety-row #enable-txt { white-space: normal; overflow-wrap: break-word; line-height: 1.2; }
+.safety-row .sw.clear .sw-text small { display: none; }
 .safety-row .btn-estop { padding: 0 10px; gap: 6px; font-size: 15px; }
 .safety-row .btn-estop svg { width: 18px; height: 18px; flex: none; }
 .safety-row .btn-estop small { font-size: 10px; }
@@ -1821,7 +1835,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <!-- teach strip: shown while teaching (panel open or closed); in the flow above the video, on the phone simple layout docked in free space -->
       <div class="tch-bar" id="teach-bar" role="group" data-i18n-aria="tch.bar" aria-label="示教工具条" hidden>
         <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose" data-i18n-title="tch.b.pose.t" title="记下当前位置（各关节和夹爪开度），加到点位列表；打开了动作时也加一步">记点</button>
-        <button class="btn tb-rec" id="tb-rec" type="button" data-i18n="tch.b.rec">● 录轨迹</button>
+        <button class="btn tb-rec" id="tb-rec" type="button" data-op="/api/v1/record/start" data-i18n="tch.b.rec">● 录轨迹</button>
         <button class="btn tb-seq" id="tb-edit" type="button" data-i18n-title="tch.b.edit" title="打开点位与动作"><span id="tb-seq"></span></button>
         <button class="btn tb-x" id="tb-x" type="button" data-i18n-aria="tch.b.end" aria-label="结束示教">×</button>
       </div>
@@ -1845,7 +1859,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <div class="hud">
           <button class="btn det-btn vis-chip only-simple" id="btn-vis" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="det-ctl" hidden>识别</button>
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="group" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" aria-pressed="false" data-vm="off" data-i18n="vm.off">关</button><button type="button" aria-pressed="false" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" aria-pressed="false" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" aria-pressed="false" data-vm="depth" data-i18n="depth.btn" aria-controls="depth-panel">深度（估计）</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" data-op="/api/v1/detection/inference" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="group" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" aria-pressed="false" data-vm="off" data-i18n="vm.off">关</button><button type="button" aria-pressed="false" data-vm="yolo" data-op="/api/v1/vision/mode" data-i18n="vm.yolo">YOLO</button><button type="button" aria-pressed="false" data-vm="aruco" data-op="/api/v1/vision/mode" data-i18n="vm.aruco">ArUco</button><button type="button" aria-pressed="false" data-vm="depth" data-op="/api/v1/vision/depth" data-i18n="depth.btn" aria-controls="depth-panel">深度（估计）</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" data-op="/api/v1/detection/trigger" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-op="/api/v1/grasp/setup" data-op-mode="offer" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1897,7 +1911,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <div class="seg seg-sm" id="speed-seg" role="radiogroup" data-i18n-aria="speed.mult" aria-label="速度倍率"></div>
         </div>
         <span class="grow"></span>
-        <button class="btn" id="btn-calib" type="button">
+        <button class="btn" id="btn-calib" type="button" data-op="calib.open" data-op-mode="offer">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><path d="M14 4h6v6"/><path d="M20 4l-6 6"/><circle cx="17" cy="17" r="3.5"/><path d="M6.5 14v6M3.5 17h6"/></svg>
           <span data-i18n="calib.open">相机标定</span>
         </button>
@@ -2057,7 +2071,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <button class="sw gc-sw" id="btn-gc" role="switch" aria-checked="false" hidden>
           <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
-          <span class="sw-text"><b data-i18n="gc.title" class="gc-long">重力补偿 / 拖动示教</b><b data-i18n="gc.chip" class="gc-short">拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
+          <span class="sw-text"><b data-i18n="gc.title" class="gc-long" data-op-mark>重力补偿 / 拖动示教</b><b data-i18n="gc.chip" class="gc-short" data-op-mark>拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
         </button>
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
@@ -2209,7 +2223,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <label class="field">Episode ID<input id="rec-id" spellcheck="false" autocomplete="off"></label>
           <div class="rec-stat"><span><span data-i18n="rec.dur">时长</span> <b id="rec-time">00:00</b></span><span><span data-i18n="rec.frames">估计帧数</span> <b id="rec-frames">0</b></span></div>
           <div class="rec-row">
-            <button class="btn btn-primary" id="btn-rec" data-i18n="rec.start">开始录制</button>
+            <button class="btn btn-primary" id="btn-rec" data-op="/api/v1/dataset/record/start" data-i18n="rec.start">开始录制</button>
             <button class="btn" id="btn-discard" data-i18n="rec.discard" disabled>丢弃</button>
           </div>
           <div class="rec-last" id="rec-last"></div>
@@ -2268,7 +2282,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <p class="preempt-cooldown" id="preempt-cooldown" hidden></p>
     <div class="preempt-actions">
       <button class="btn" id="preempt-cancel" data-i18n="cancel">取消</button>
-      <button class="btn btn-primary" id="preempt-confirm" data-i18n="preempt.confirm">确认接管</button>
+      <button class="btn btn-primary" id="preempt-confirm" data-op="lease.force" data-op-mode="move" data-op-again="op.again.take" data-i18n="preempt.confirm">确认接管</button>
     </div>
   </div>
 </div>
@@ -2373,7 +2387,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
     <div class="calib-live mono" id="gset-status">--</div>
     <div class="calib-actions">
-      <button class="btn btn-primary" id="gset-save" type="button" data-i18n="gset.save">保存高度</button>
+      <button class="btn btn-primary" id="gset-save" type="button" data-op="/api/v1/grasp/setup" data-i18n="gset.save">保存高度</button>
       <button class="btn" id="gset-reload" type="button" data-i18n="gset.reload">重新读取</button>
     </div>
   </aside>
@@ -2387,7 +2401,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <p class="calib-hint" data-i18n="pose.hint">把机械臂移到想要的位置，起个名字记录下来；之后点「前往」机械臂会自己回到这个位置（需要先使能）。</p>
     <div class="gset-row pose-new">
       <label class="field"><span data-i18n="pose.name">名称</span><input id="pose-name" maxlength="64" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="bin_a"></label>
-      <button class="btn btn-primary" id="pose-save" type="button" data-i18n="pose.save">记录当前位置</button>
+      <button class="btn btn-primary" id="pose-save" type="button" data-op="/api/v1/poses/save" data-i18n="pose.save">记录当前位置</button>
       <small id="pose-rule" data-i18n="pose.rule">只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。</small>
     </div>
     <ol class="calib-list pose-list" id="pose-list"></ol>
@@ -2461,7 +2475,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="gset-row" id="tools-set" hidden>
       <div class="gset-k"><span data-i18n="tools.title">工具</span></div>
       <small data-i18n="tools.order">推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。</small>
-      <div class="tools-warn" id="tools-zero" role="status" hidden><span></span> <button class="btn" id="tools-zero-open" type="button" data-i18n="tools.zero.open">打开零位标定</button></div>
+      <div class="tools-warn" id="tools-zero" role="status" hidden><span></span> <button class="btn" id="tools-zero-open" type="button" data-op="/api/v1/calibration/motor_zero" data-op-mode="offer" data-i18n="tools.zero.open">打开零位标定</button></div>
       <div class="tools-warn" id="tools-stale" role="status" hidden></div>
       <div class="tools-warn" id="tools-stale2" role="status" hidden></div>
       <div class="tools-list" id="tools-list"></div>
@@ -2469,10 +2483,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <small id="tools-release-hint"></small>
     </div>
     <div class="gset-row" id="col-set">
-      <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
+      <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl" data-op="/api/v1/safety/collision"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
       <small data-i18n="col.set.desc">机械臂运动中受阻时自动停在原地，受力消除后自动恢复；短时间内多次碰撞会锁定为故障。</small>
       <div class="gset-k"><span data-i18n="col.sens">灵敏度</span>
-        <div class="seg seg-sm" id="col-sens" role="radiogroup" data-i18n-aria="col.sens" aria-label="灵敏度">
+        <div class="seg seg-sm" id="col-sens" data-op="/api/v1/safety/collision" role="radiogroup" data-i18n-aria="col.sens" aria-label="灵敏度">
           <button type="button" role="radio" data-v="low" data-i18n="col.sens.low">低</button><button type="button" role="radio" data-v="medium" data-i18n="col.sens.medium">中</button><button type="button" role="radio" data-v="high" data-i18n="col.sens.high">高</button>
         </div>
       </div>
@@ -2535,7 +2549,7 @@ const I18N = {
     'depth.st.op': '需要操作员解锁', 'depth.st.hidden': '页面隐藏，已暂停',
     'vm.label': '视觉模式', 'vm.label.show': '本页画面显示', 'vm.show': '显示', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco',
     'vm.tip': '本页画面显示：YOLO 识别物体，ArUco 识别标记，深度（估计）显示模型估计的深度图；可同时开启，叠加显示。开启 YOLO 或 ArUco 时本页开启持续识别；「关」全部关闭。不影响其他客户端',
-    'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
+    'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.fail.calib': '标定预览需要 ArUco，视觉模式未切换', 'vm.fail.restore': '视觉模式未能恢复为「{m}」', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
     'aru.sum': 'ArUco 标定板标记 {n} 个', 'aru.unk': '{n} 个不在标定板上（疑似误检）：{ids}', 'aru.tap': '点击标记查看位姿', 'aru.sum.s': '标定板 {n}', 'aru.unk.s': '误检 {ids}', 'aru.picked': '已选定，再点一次恢复自动',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
@@ -2718,14 +2732,19 @@ const I18N = {
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
     'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
     'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',
-    'op.title': '操作员权限', 'op.locked': '🔒 操作员', 'op.unlocked': '🔓 操作员', 'op.badge.locked': '操作员权限：未解锁，点按输入 PIN', 'op.badge.unlocked': '操作员权限：已解锁，点按查看或锁定',
+    'op.title': '操作员权限', 'op.locked': '🔒 操作员', 'op.unlocked': '🔓 操作员', 'op.badge.locked': '操作员权限：未解锁。带 🔒 的功能需要先解锁，点按输入 PIN', 'op.badge.unlocked': '操作员权限：已解锁，点按查看或锁定', 'op.badge.unlocked_m': '操作员权限：已解锁，{m} 分钟后自动锁定；点按查看或锁定', 'op.left': '{m} 分',
     'op.hint': 'PIN 在 reCamera 控制台本应用的设置里（「操作员权限」分组）设置。未设置时，armd 每次启动生成新的随机 PIN，存放在设备的 /userdata/rebot-teleop/operator.pin（root 登录后查看）。',
-    'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员解锁后才能执行此操作',
+    'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员权限：点「解锁」输入 PIN 后再试',
     'op.rate': '尝试次数过多，请 {s} 秒后再试', 'op.state_on': '已解锁，{m} 分钟后自动锁定', 'op.state_on0': '已解锁', 'op.expired': '操作员会话已过期，已自动锁定', 'op.close': '关闭',
     'op.inline': '🔒 复位需要操作员权限 · 解锁并复位', 'op.inline_fault': '🔒 清除故障需要操作员权限 · 解锁并清除',
     'op.why.gc': '重力补偿需要操作员权限', 'op.why.det': '识别需要操作员权限', 'op.why.estop': '复位急停需要操作员权限', 'op.why.fault': '清除这个故障需要操作员权限',
     'op.why.calib': '标定需要操作员权限', 'op.why.poses': '保存或修改点位、动作需要操作员权限', 'op.why.rec': '录制和管理录制片段需要操作员权限', 'op.why.safety': '修改安全设置（禁入区、碰撞保护）需要操作员权限',
-    'op.why.sandbox': '仿真沙盒需要操作员权限', 'op.why.take': '强制接管控制权需要操作员权限', 'op.why.default': '这个操作需要操作员权限', 'op.retry': '解锁后自动继续这个操作。',
+    'op.why.sandbox': '仿真沙盒需要操作员权限', 'op.why.vision': '切换视觉模式（YOLO / ArUco / 深度）需要操作员权限',
+    'op.why.calib_open': '标定向导会把视觉切到 ArUco、保存标定数据并写入标定结果，这些步骤需要操作员权限。不解锁也能打开向导，但这些步骤会被拒绝。',
+    'op.skip': '先不解锁', 'op.again.take': '已解锁。再按一次「接管控制权」确认接管。', 'op.again': '已解锁。会让机械臂运动的操作不会自动执行，请再按一次。',
+    'ec.lease_busy': '另一个客户端持有控制权：请对方释放，或在本页接管', 'ec.lease_lost': '控制权已被其他客户端取走：确认现场后重新操作',
+    'ec.not_armed': '力矩已关闭：先按「使能」', 'ec.rate': 'PIN 错误次数过多：稍等再试', 'ec.insecure': '凭据不能经未加密的 http 发往其他主机：在设备本机操作，或按文档开启不安全认证',
+    'ec.vision_down': '视觉服务无响应：检查 rebot-vision 是否在运行，再试一次', 'ec.vision_timeout': '视觉服务未在时限内应答：稍后再试', 'op.why.take': '强制接管控制权需要操作员权限', 'op.why.default': '这个操作需要操作员权限', 'op.retry': '解锁后自动继续这个操作。',
   },
   en: {
     'doc.title': 'reBot Teleop',
@@ -2753,7 +2772,7 @@ const I18N = {
     'depth.st.op': 'Operator unlock required', 'depth.st.hidden': 'Page hidden: paused',
     'vm.label': 'Vision mode', 'vm.label.show': 'Shown on this page', 'vm.show': 'Show', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco',
     'vm.tip': 'Shown on this page: YOLO for objects, ArUco for markers, Depth (est.) for the model\'s depth estimate; any of them can be on together, drawn over each other. YOLO or ArUco turns continuous detection on for this page; Off turns everything off. Other clients are not affected',
-    'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
+    'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.fail.calib': 'The calibration preview needs ArUco; the vision mode was not switched', 'vm.fail.restore': 'The vision mode was not set back to "{m}"', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
     'aru.sum': 'ArUco board markers: {n}', 'aru.unk': '{n} not on the board (likely false): {ids}', 'aru.tap': 'Tap a marker for its pose', 'aru.sum.s': 'Board {n}', 'aru.unk.s': 'false {ids}', 'aru.picked': 'Selected; tap it again for auto',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
@@ -2933,14 +2952,19 @@ const I18N = {
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
     'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
-    'op.title': 'Operator access', 'op.locked': '🔒 Operator', 'op.unlocked': '🔓 Operator', 'op.badge.locked': 'Operator access: locked, tap to enter the PIN', 'op.badge.unlocked': 'Operator access: unlocked, tap to view or lock',
+    'op.title': 'Operator access', 'op.locked': '🔒 Operator', 'op.unlocked': '🔓 Operator', 'op.badge.locked': 'Operator access: locked. Functions marked 🔒 need an unlock first; tap to enter the PIN', 'op.badge.unlocked': 'Operator access: unlocked, tap to view or lock', 'op.badge.unlocked_m': 'Operator access: unlocked, locks again in {m} min; tap to view or lock', 'op.left': '{m} min',
     'op.hint': 'The PIN is set in the reCamera console, this app\'s settings, group "Operator Access". When it is not set, armd makes a new random PIN at every start and keeps it on the device in /userdata/rebot-teleop/operator.pin (log in as root to read it).',
-    'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Wrong PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Operator unlock is required for this operation',
+    'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Wrong PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Needs operator access: tap Unlock, enter the PIN, then try again',
     'op.rate': 'Too many attempts; try again in {s} s', 'op.state_on': 'Unlocked; locks again in {m} min', 'op.state_on0': 'Unlocked', 'op.expired': 'Operator session expired; locked again', 'op.close': 'Close',
     'op.inline': '🔒 Reset needs operator access · Unlock and reset', 'op.inline_fault': '🔒 Clearing this fault needs operator access · Unlock and clear',
     'op.why.gc': 'Gravity mode needs operator access', 'op.why.det': 'Detection needs operator access', 'op.why.estop': 'Resetting the E-stop needs operator access', 'op.why.fault': 'Clearing this fault needs operator access',
     'op.why.calib': 'Calibration needs operator access', 'op.why.poses': 'Saving or changing poses and motions needs operator access', 'op.why.rec': 'Recording and managing episodes needs operator access', 'op.why.safety': 'Changing safety settings (keep-out boxes, collision guard) needs operator access',
-    'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
+    'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.vision': 'Switching the vision mode (YOLO / ArUco / depth) needs operator access',
+    'op.why.calib_open': 'The calibration wizard switches the vision to ArUco, stores calibration data and writes the calibration; these steps need operator access. Without an unlock the wizard opens, but those steps are refused.',
+    'op.skip': 'Not now', 'op.again.take': 'Unlocked. Tap "Take over control" again to confirm.', 'op.again': 'Unlocked. Actions that move the arm do not run by themselves; tap again.',
+    'ec.lease_busy': 'Another client holds control: ask it to release, or take over on this page', 'ec.lease_lost': 'Another client took control: check the arm, then try again',
+    'ec.not_armed': 'Torque is off: tap Enable first', 'ec.rate': 'Too many wrong PINs: wait, then try again', 'ec.insecure': 'Credentials are not sent over plain http to another host: work on the device, or enable insecure auth as documented',
+    'ec.vision_down': 'The vision service does not answer: check that rebot-vision runs, then try again', 'ec.vision_timeout': 'The vision service did not answer in time: try again shortly', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
   },
 };
 // calibration tools (settings drawer, gripper tool)
@@ -3144,7 +3168,14 @@ Object.assign(I18N.zh, {
   'cw.f.kept': '已保留 {n} 个视图，点「继续」接着采集', 'cw.f.moving': '关节空间移动到位姿 {i}（预位姿 → 目标）…', 'cw.f.unsettled': '未静止',
   'cw.f.solving': '正在求解：{s} s，阶段 {stage}', 'cw.f.solving.hint': '求解在浏览器的后台线程（Web Worker）中运行，期间页面可以继续使用。',
   'cw.f.solve.hint': '在位置 A 拟合、预测位置 B（以及反过来）得到留出误差；应用的是 A + B 一起拟合的结果。每项检查都通过后才能应用。',
-  'cw.f.fail': '有检查未通过，不能应用。留出误差偏大：检查标定板是否平整、采集中是否被碰动；参数超出范围：先用官方工具重新校准电机零位。',
+  'cw.f.fail': '有检查未通过，没有应用：机械臂上现有的标定保持不变，没有任何改动。', 'cw.f.sep': '、', 'cw.f.colon': '：',
+  'cw.f.h.img': '图像噪声偏大。标定板要平整、无反光，画面清晰不模糊；检查是否有误识别的标记 ID。',
+  'cw.f.h.views': '有效视图不够。多采集一些位姿，让标定板出现在画面各处。',
+  'cw.f.h.heldout': '一个位置的结果预测另一个位置的误差偏大。两次摆放要覆盖重叠的关节范围（位置 B 约向前 0.40 m、向侧面 0.20 m），避免需要 J5 超过 60° 的姿态；两次摆放之间和采集中标定板不能被碰动。',
+  'cw.f.h.bounds': '参数超出范围。先用官方工具重新校准电机零位，再重新标定。',
+  'cw.f.h.he': '手眼结果不稳定。采集时让相机姿态变化更大（多转动腕部）。',
+  'cw.f.h.plane': '桌面拟合不一致。标定板要平放在桌面上，采集中不能被碰动。',
+  'cw.f.h.other': '按上表的数值检查后重新采集。',
   'cw.f.acc': '预计定位精度约 {mm} mm（超过 {lim} mm）：可以应用，但视觉抓取可能偏差这么多。常见原因：减速器间隙、支架松动、零点没在收起姿态设置。', 'cw.f.zero': '关节 J{j} 的零位看起来偏了 {d}°：建议用官方工具（reBotArm_control_py example/2_zero_and_read.py / MotorBridge）重新校准该电机零位，再重新运行标定。检查都通过时仍可应用。',
   'cw.f.ho.title': '留出检验', 'cw.f.ho.dir': '方向', 'cw.f.ho.before': '未修正', 'cw.f.ho.after': '修正后', 'cw.f.ho.imp': '降低',
   'cw.f.lv.title': '修正模型级别（留出误差）', 'cw.f.lv.level': '级别', 'cw.f.lv.mean': '平均', 'cw.f.lv.pick': '选择',
@@ -3207,7 +3238,14 @@ Object.assign(I18N.en, {
   'cw.f.kept': '{n} views kept; tap Continue to resume', 'cw.f.moving': 'Joint-space move to pose {i} (pre-pose, then target)…', 'cw.f.unsettled': 'not settled',
   'cw.f.solving': 'Solving: {s} s, stage {stage}', 'cw.f.solving.hint': 'The solve runs in a background thread of the browser (Web Worker); the page stays usable.',
   'cw.f.solve.hint': 'Held-out errors: fitted on placement A, predicting B (and the other way). The fit on A + B together is what gets applied. Every check must pass before Apply.',
-  'cw.f.fail': 'Some checks failed; Apply is not possible. High held-out error: check that the board is flat and was not bumped during capture. Parameter out of range: re-zero the motors with the official tool first.',
+  'cw.f.fail': 'Some checks failed; nothing was applied: the calibration on the arm stays as it was.', 'cw.f.sep': ', ', 'cw.f.colon': ': ',
+  'cw.f.h.img': 'image noise too high. Keep the board flat, without glare, and the image sharp; check for falsely detected marker IDs.',
+  'cw.f.h.views': 'not enough usable views. Capture more poses, with the board in every part of the image.',
+  'cw.f.h.heldout': 'one placement predicts the other badly. The two placements must cover overlapping joint ranges (placement B about 0.40 m forward and 0.20 m sideways); avoid poses that need J5 above 60°; the board must not be bumped between or during the placements.',
+  'cw.f.h.bounds': 'parameters out of range. Re-zero the motors with the official tool first, then calibrate again.',
+  'cw.f.h.he': 'hand-eye result unstable. Vary the camera orientation more while capturing (turn the wrist).',
+  'cw.f.h.plane': 'table fit inconsistent. Lay the board flat on the table; it must not be bumped during capture.',
+  'cw.f.h.other': 'check the values in the table above, then capture again.',
   'cw.f.acc': 'Expected positioning accuracy about {mm} mm (more than {lim} mm): the calibration can be applied, but camera-guided grasps may be off by this much. Usual causes: gear backlash, a loose mount, or a joint zero set off the rest pose.', 'cw.f.zero': 'Joint J{j} zero looks off by {d}°: re-zero the motor with the official tool (reBotArm_control_py example/2_zero_and_read.py / MotorBridge) and run the calibration again. Apply stays possible when the checks pass.',
   'cw.f.ho.title': 'Held-out check', 'cw.f.ho.dir': 'Direction', 'cw.f.ho.before': 'Uncorrected', 'cw.f.ho.after': 'Corrected', 'cw.f.ho.imp': 'Reduction',
   'cw.f.lv.title': 'Correction model level (held-out error)', 'cw.f.lv.level': 'Level', 'cw.f.lv.mean': 'Mean', 'cw.f.lv.pick': 'Choice',
@@ -3627,13 +3665,42 @@ const C = {
 /* =================================================================
    Helpers
    ================================================================= */
-function toast(msg, kind = '', code = '') {
+/* Cause and next step for the codes armd and the page give for common refusals (errWhy). A toast with one of
+   them shows it under its message; OPERATOR_REQUIRED adds an Unlock button (opts.path / opts.body name the
+   refused request for the dialog's reason, opts.retry runs after the unlock: only for requests that do not move
+   the arm). Numeric HTTP statuses are not mapped here: the call site knows what a 502 means. */
+const EC_KEYS = {
+  OPERATOR_REQUIRED: 'err.operator_required', LEASE_REQUIRED: 'err.nolease', NO_LEASE: 'err.nolease', LEASE_BUSY: 'ec.lease_busy',
+  LEASE_LOST: 'ec.lease_lost', NOT_ARMED: 'ec.not_armed', RATE_LIMITED: 'ec.rate', INSECURE_TRANSPORT: 'ec.insecure',
+  VISION_DOWN: 'ec.vision_down', VISION_TIMEOUT: 'ec.vision_timeout', MODEL_NOT_LOADED: 'vm.noyolo', COMMAND_TIMEOUT: 'err.cmdtimeout',
+};
+const errWhy = (code) => (EC_KEYS[code] ? t(EC_KEYS[code]) : '');
+function toast(msg, kind = '', code = '', opts = null) {
+  const op = code === 'OPERATOR_REQUIRED';
+  // the operator dialog is open and already says why
+  if (op && typeof opIsOpen === 'function' && opIsOpen()) return null;
   const el = document.createElement('div');
   el.className = 'toast ' + kind;
-  el.textContent = msg;
-  if (code) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
+  const why = errWhy(code);
+  if (why && !String(msg).includes(why)) {
+    const tx = document.createElement('span'); tx.className = 'toast-txt';
+    const a = document.createElement('span'); a.textContent = msg;
+    const b = document.createElement('span'); b.className = 'toast-why'; b.textContent = why;
+    tx.append(a, b); el.appendChild(tx);
+  } else el.textContent = msg;
+  if (code && !op) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
+  if (op && S.auth.enforced) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'btn btn-primary toast-act'; btn.textContent = t('op.unlock');
+    btn.addEventListener('click', () => {
+      el.remove();
+      const o = opts || {};
+      opRequire(o.path || '', o.body, { retry: !!o.retry }).then((ok) => { if (ok && o.retry) o.retry(); });
+    });
+    el.classList.add('has-act'); el.appendChild(btn);
+  }
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), kind === 'err' || kind === 'warn' ? 4200 : 2600);
+  setTimeout(() => el.remove(), op ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
   return el;
 }
@@ -3662,6 +3729,7 @@ function rpcError(response) {
     message = t('err.collision_hold');
   } else if (response.code === 'OPERATOR_REQUIRED') {
     message = t('err.operator_required');
+    opRefused();
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -4070,8 +4138,10 @@ function onAcquireResponse(ws, msg) {
     renderPreemptModal();
     return;
   }
-  if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
-  if (msg.code === 'OPERATOR_REQUIRED') opRequire('lease.force'); // never auto-resend force
+  // OPERATOR_REQUIRED: the operator dialog gives the reason (not armd's English text); after the unlock the user
+  // confirms the takeover again: a forced takeover is never resent by itself
+  if (req.force) { closePreemptModal(); if (msg.code !== 'OPERATOR_REQUIRED') toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
+  if (msg.code === 'OPERATOR_REQUIRED') opRequire('lease.force', undefined, { retry: false }).then((ok) => { if (ok) toast(t('op.again.take'), 'info'); });
   settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
   renderPreemptModal();
 }
@@ -4846,13 +4916,24 @@ function subDropNow(sub) {
   if (sub.id) { subRequest('DELETE', 'subscribe/' + encodeURIComponent(sub.id), undefined, true).catch(() => {}); sub.id = null; }
 }
 /* Bring OVSUB in line with the overlay preference and the page's visibility. */
+/* Error code for a refused vision request: the cause (errWhy) instead of a bare HTTP status. */
+function vmErrCode(e) {
+  if (!e) return '';
+  if (e.code === 'OPERATOR_REQUIRED') return e.code;
+  if (e.name === 'AbortError') return 'VISION_TIMEOUT';
+  if (e.status === 409) return 'MODEL_NOT_LOADED';
+  if (e.status === 502 || e.status === 503 || e.status === 504) return 'VISION_DOWN';
+  return e.code || (e.status ? String(e.status) : '');
+}
 async function ovSync(byUser = false) {
   const want = VM.subs && OV.on && !document.hidden;
-  const err = await subHold(OVSUB, want ? vmPipelines(OV.pipes) : null);
+  const pipes = OV.pipes;
+  const err = await subHold(OVSUB, want ? vmPipelines(pipes) : null);
   if (err && OV.on) {
     OV.on = false;
-    if (err.code === 'OPERATOR_REQUIRED') { if (byUser) opRequire('/api/v1/vision/subscribe'); }
-    else toast(t(err.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', err.status ? String(err.status) : '');
+    const again = () => ovSet(true, pipes);
+    if (err.code === 'OPERATOR_REQUIRED' && byUser) opRequire('/api/v1/vision/subscribe', undefined, { retry: true }).then((ok) => { if (ok) again(); });
+    else toast(t('vm.fail'), 'err', vmErrCode(err), { path: '/api/v1/vision/subscribe', retry: again });
     await subHold(OVSUB, null);
   }
   DET.enabled = !!(DET.avail && OV.on);
@@ -4987,8 +5068,12 @@ async function setVisionMode(mode) {
     VM.busy = false; S.detHoldUntil = 0; vmApply(data);
   } catch (e) {
     VM.busy = false;
-    if (e.code === 'OPERATOR_REQUIRED') { opRequire('/api/v1/vision/mode'); renderVisionMode(); return; }
-    toast(t(e.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', e.status ? String(e.status) : '');
+    if (e.code === 'OPERATOR_REQUIRED') {
+      renderVisionMode();
+      opRequire('/api/v1/vision/mode', undefined, { retry: true }).then((ok) => { if (ok) setVisionMode(mode); });
+      return;
+    }
+    toast(t('vm.fail'), 'err', vmErrCode(e));
     if (e.status === 502 || e.status === 404) vmFailed(e); else renderVisionMode();
   }
 }
@@ -5002,7 +5087,7 @@ function calVisionMode(open) {
   if (VM.subs) {
     CALVM.task = CALVM.task.then(async () => {
       const err = await subHold(CALSUB, open && !document.hidden ? ['aruco'] : null);
-      if (err) toast(t('vm.fail'), 'warn', err.status ? String(err.status) : '');
+      if (err) toast(t('vm.fail.calib'), 'warn', vmErrCode(err), { path: '/api/v1/vision/subscribe', retry: () => { if (CALVM.open) calVisionMode(true); } });
     });
     return CALVM.task;
   }
@@ -5015,10 +5100,12 @@ function calVisionMode(open) {
       if (want === cur.mode && cur.enabled) return;
       CALVM.prev = { mode: cur.mode, enabled: !!cur.enabled };
       try { vmApply(await vmRequest('POST', { mode: want, enabled: true })); }
-      catch (e) { CALVM.prev = null; toast(t(e.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'warn', e.status ? String(e.status) : ''); }
+      catch (e) { CALVM.prev = null; toast(t('vm.fail.calib'), 'warn', vmErrCode(e), { path: '/api/v1/vision/mode', retry: () => { if (CALVM.open) calVisionMode(true); } }); }
     } else if (CALVM.prev) {
       const prev = CALVM.prev; CALVM.prev = null;
-      try { vmApply(await vmRequest('POST', prev)); } catch (e) { toast(t('vm.fail'), 'warn', e.status ? String(e.status) : ''); }
+      const restore = () => vmRequest('POST', prev).then(vmApply);
+      try { await restore(); }
+      catch (e) { toast(t('vm.fail.restore', { m: prev.mode === 'both' ? 'YOLO + ArUco' : t('vm.' + prev.mode) }), 'warn', vmErrCode(e), { path: '/api/v1/vision/mode', retry: () => restore().catch(() => {}) }); }
     }
   });
   return CALVM.task;
@@ -6634,9 +6721,12 @@ async function cwSessionUpload() {
   try {
     const res = await fetch('/api/v1/calibration/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cwSessionBody()) });
     const d = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error((d && (d.message || d.code)) || 'HTTP ' + res.status);
+    if (!res.ok) throw Object.assign(new Error((d && (d.message || d.code)) || 'HTTP ' + res.status), { code: d && d.code });
     CWZ.sessionId = d.id; CWZ.sessionWarn = '';
-  } catch (e) { CWZ.sessionWarn = t('cw.sess.upfail', { m: e.message }); }
+  } catch (e) {
+    CWZ.sessionWarn = t('cw.sess.upfail', { m: e.code === 'OPERATOR_REQUIRED' ? t('err.operator_required') : e.message });
+    if (e.code === 'OPERATOR_REQUIRED') toast(CWZ.sessionWarn, 'warn', e.code, { path: '/api/v1/calibration/sessions', retry: cwSessionUpload });
+  }
   cwRender();
 }
 const cwWhen = (iso) => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : String(iso || '?'); };
@@ -7187,8 +7277,27 @@ function cwV3Sync() {
 }
 // rendering
 function cwEl(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
-function cwBtn(label, fn, { cls = '', disabled = false, id = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; b.addEventListener('click', fn); return b; }
+function cwBtn(label, fn, { cls = '', disabled = false, id = '', op = '', opMode = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; if (op) { b.dataset.op = op; if (opMode) b.dataset.opMode = opMode; } b.addEventListener('click', fn); return b; }
 const cwFmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '--');
+/* Failed checks of a solve: what stays as it was, then one line per cause with the failed checks and what to change. */
+const CW_GATE_HINT = { rms: 'img', view_rms: 'img', sigma: 'img', views: 'views', markers: 'views', coverage: 'views', kin_views: 'views',
+  kin_heldout_ab: 'heldout', kin_heldout_ba: 'heldout', kin_improve: 'heldout', held_out: 'heldout', kin_bounds: 'bounds',
+  he_pos: 'he', he_rot: 'he', rot_diversity: 'he', plane_spread: 'plane', plane_tilt: 'plane' };
+function cwFailBox(gates) {
+  const box = cwEl('div', 'cwiz-msg cwiz-fail');
+  box.appendChild(cwEl('b', '', t('cw.f.fail')));
+  const by = new Map();
+  for (const g of gates || []) {
+    if (g.ok || g.blocking === false) continue;
+    const h = CW_GATE_HINT[g.key] || 'other';
+    if (!by.has(h)) by.set(h, []);
+    by.get(h).push(t('cw.g.' + g.key));
+  }
+  const ul = cwEl('ul', '');
+  for (const [h, names] of by) ul.appendChild(cwEl('li', '', names.join(t('cw.f.sep')) + t('cw.f.colon') + t('cw.f.h.' + h)));
+  box.appendChild(ul);
+  return box;
+}
 function cwGateRow(g) {
   const tr = document.createElement('tr');
   const unit = { px: ' px', m: ' mm', mm: ' mm', deg: '°', rel: ' %', frac: ' %', cells: '', count: '' }[g.unit] ?? '';
@@ -7345,8 +7454,12 @@ function cwRenderFineSolve(body, p, acts) {
     tb.classList.add('cwiz-par');
     body.appendChild(tb);
   }
-  for (const wn of kin.warnings || []) body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
-  if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.fail')));
+  // the accuracy note says the result can be applied: only for a result that passed every check
+  for (const wn of kin.warnings || []) {
+    if (wn.key === 'accuracy' && !r.ok) continue;
+    body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
+  }
+  if (!r.ok) body.appendChild(cwFailBox(r.gates));
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwVerifyOn() ? cwBtn(t('cw.f.toTip'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-totip' })
       : cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
@@ -7508,7 +7621,7 @@ function cwRender() {
       const resume = CWZ.idx > 0 && left && !CWZ.running;
       const need = 2 * CW.KIN_GATES.minViewsPerPlacement, have = cwFineAccepted(CWZ.place);
       acts(
-        left ? cwBtn(resume ? t('cw.f.continue', { i: CWZ.idx + 1 }) : t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go' }) : null,
+        left ? cwBtn(resume ? t('cw.f.continue', { i: CWZ.idx + 1 }) : t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go', op: '/api/v1/detection/trigger', opMode: 'move' }) : null,
         cwBtn(t('cw.cap.preview'), () => { if (!V3.open) v3Toggle(true); setTimeout(cwV3Sync, 300); }, { id: 'cwiz-prev' }),
         CWZ.place === 0 ? cwBtn(t('cw.f.toB'), cwFineToB, { cls: left ? '' : 'btn-primary', disabled: CWZ.running || have < need, id: 'cwiz-tob' })
           : cwBtn(t('cw.cap.solve'), cwFineSolve, { cls: left ? '' : 'btn-primary', disabled: CWZ.running || have < need, id: 'cwiz-solve' }),
@@ -7516,7 +7629,7 @@ function cwRender() {
       );
       if (have < need && !left) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.few', { v: have, need })));
     } else acts(
-      left ? cwBtn(t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go' }) : null,
+      left ? cwBtn(t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go', op: '/api/v1/detection/trigger', opMode: 'move' }) : null,
       cwBtn(t('cw.cap.preview'), () => { if (!V3.open) v3Toggle(true); setTimeout(cwV3Sync, 300); }, { id: 'cwiz-prev' }),
       cwBtn(t('cw.cap.solve'), cwSolve, { disabled: CWZ.running || acc < 5, id: 'cwiz-solve' }),
       cwRestartBtn(),
@@ -7564,7 +7677,7 @@ function cwRender() {
     acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }, { cls: 'act-back' }),
       CWZ.loaded ? cwBtn(t('cw.sess.verify'), cwVerify, { cls: cwNeedsVerify() ? 'btn-primary' : '', disabled: CWZ.busy, id: 'cwiz-verify' }) : null,
       torqued ? cwBtn(t('cw.f.park'), cwFinePark, { disabled: CWZ.busy, id: 'cwiz-park' }) : null,
-      cwBtn(t(armed ? 'cw.rev.confirm' : 'cw.rev.apply'), cwApply, { cls: 'btn-primary' + (torqued ? ' wide' : ''), disabled: !CWZ.dry || CWZ.busy || torqued || cwNeedsVerify(), id: 'cwiz-apply' }));
+      cwBtn(t(armed ? 'cw.rev.confirm' : 'cw.rev.apply'), cwApply, { cls: 'btn-primary' + (torqued ? ' wide' : ''), disabled: !CWZ.dry || CWZ.busy || torqued || cwNeedsVerify(), id: 'cwiz-apply', op: '/api/v1/calibration/apply' }));
   } else if (CWZ.step === 'applied') {
     const a = CWZ.applied || {};
     if (a.backup) p(t('cw.app.backup', { b: cwBackupName(a.backup) }));
@@ -7574,7 +7687,7 @@ function cwRender() {
     const rb = CWZ.readback;
     if (rb && rb.floor) p(t('cw.app.floor', { f: cwFmt(rb.floor.effective_floor_z_m * 1000, 1), s: t('cw.app.floor.' + rb.floor.source) }));
     const armed = Date.now() < CWZ.armedUntil;
-    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore', cls: armed ? 'armed' : 'act-back' }), cwRestartBtn(),
+    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore', cls: armed ? 'armed' : 'act-back', op: '/api/v1/calibration/restore' }), cwRestartBtn(),
       cwBtn(t('cw.app.done'), () => cwOpen(false), { cls: 'btn-primary' }));
   }
   if (CWZ.status) body.appendChild(cwEl('div', 'cwiz-msg' + (CWZ.statusKind === 'ok' ? ' ok' : ''), CWZ.status));
@@ -7635,7 +7748,7 @@ function renderToolStatus() {
   if (badge) {
     badge.hidden = false;
     setText(badge, req ? t('tool.badge.comm', { id: tool.id }) : tool.id);
-    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? '' : 'is-ok'));
+    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? 'is-stock' : 'is-ok'));
     badge.title = req ? t('tool.comm.hint') : tool.id;
   }
   if (banner) {
@@ -9646,7 +9759,7 @@ function epRender(status, bad) {
     const li = document.createElement('li');
     li.dataset.id = e.id;
     li.classList.toggle('playing', EP.playing === e.id);
-    li.innerHTML = '<span class="en"><b></b><small></small></span><span class="ea"><button class="btn ep-go" type="button"></button><button class="btn ep-del" type="button"></button></span>';
+    li.innerHTML = '<span class="en"><b></b><small></small></span><span class="ea"><button class="btn ep-go" type="button"></button><button class="btn ep-del" type="button" data-op="/api/v1/dataset/episodes"></button></span>';
     li.querySelector('b').textContent = e.id;
     const when = e.created_ms > 0 ? new Date(e.created_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
     li.querySelector('small').textContent = e.error ? t('ep.unreadable') : [epFmtDur(e.duration_s), when].filter(Boolean).join(' · ');
@@ -11064,6 +11177,7 @@ const TOOL_ENTRIES = [
   ['gripper', 'tools.grip', 'tools.grip.desc', 3, () => { ssetOpen(false); gtOpen(true); }],
 ];
 $('tools-zero-open').addEventListener('click', () => { ssetOpen(false); MZ.sel = new Set([6]); MZ.method = 'software'; mzOpen(true); });
+const TOOL_OP = { motor_zero: '/api/v1/calibration/motor_zero', camera: 'calib.open', kinematics: 'calib.open', gripper: '/api/v1/gripper/calibration' };
 const toolShown = (key) => { const c = toolsCaps(); return !!(c && c[key] && c[key].supported); };
 function toolsAvail() { return TOOL_ENTRIES.some(([k]) => toolShown(k)); }
 function toolsOnCaps() {
@@ -11091,6 +11205,7 @@ function toolsRender() {
   for (const [key, title, desc, n, open] of TOOL_ENTRIES) {
     if (!toolShown(key)) continue;
     const b = cwEl('button', 'tool-item'); b.type = 'button'; b.id = 'tool-' + key;
+    b.dataset.op = TOOL_OP[key]; b.dataset.opMode = 'offer'; // each tool writes calibration data
     b.append(cwEl('span', 'tool-n' + (n ? '' : ' none'), n ? String(n) : '–'), cwEl('b', '', t(title)), cwEl('small', '', t(desc)));
     b.addEventListener('click', open);
     list.appendChild(b);
@@ -11170,7 +11285,7 @@ function gtRender() {
   const acts = cwEl('div', 'cwiz-acts');
   const armed = Date.now() < GT.armedUntil;
   acts.append(cwBtn(t('gt.check'), () => gtRun(false), { disabled: GT.busy || !torqued, id: 'gt-check' }),
-    cwBtn(t(armed ? 'gt.store.confirm' : 'gt.store'), () => gtRun(true), { cls: armed ? 'btn-primary' : '', disabled: GT.busy || !torqued, id: 'gt-store' }));
+    cwBtn(t(armed ? 'gt.store.confirm' : 'gt.store'), () => gtRun(true), { cls: armed ? 'btn-primary' : '', disabled: GT.busy || !torqued, id: 'gt-store', op: '/api/v1/gripper/calibration' }));
   body.appendChild(acts);
   if (GT.res) body.appendChild(cwEl('div', 'cwiz-msg' + (GT.res.pass ? ' ok' : ''), t('gt.res', { s: cwFmt(GT.res.stop_rad, 4), o: cwFmt(GT.res.offset_rad, 4), p: t(GT.res.pass ? 'gt.pass' : 'gt.fail') })));
   if (GT.status) body.appendChild(cwEl('div', 'cwiz-msg', GT.status));
@@ -11305,7 +11420,7 @@ function mzRender() {
   body.appendChild(fb);
   const armed = Date.now() < MZ.armedUntil;
   const list = [...MZ.sel].sort((a, b) => a - b).map(mzName).join(', ');
-  acts(cwBtn(armed ? t('mz.confirm', { list }) : t(MZ.busy ? 'mz.running' : 'mz.set'), mzGo, { cls: 'btn-primary wide' + (armed ? ' armed' : ''), id: 'mz-go' }));
+  acts(cwBtn(armed ? t('mz.confirm', { list }) : t(MZ.busy ? 'mz.running' : 'mz.set'), mzGo, { cls: 'btn-primary wide' + (armed ? ' armed' : ''), id: 'mz-go', op: '/api/v1/calibration/motor_zero' }));
   mzRenderFar();
   if (MZ.status) body.appendChild(cwEl('div', 'cwiz-msg', MZ.status));
 }
@@ -11429,7 +11544,7 @@ function posesRender(status) {
     li.dataset.name = p.name;
     const tcp = p.tcp && Array.isArray(p.tcp.position) ? p.tcp.position.map((v) => Math.round(v * 1000)).join(', ') + ' mm' : '';
     const when = Number.isFinite(p.saved_at_ms) && p.saved_at_ms > 0 ? new Date(p.saved_at_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
-    li.innerHTML = '<span class="pn"><b></b><small></small></span><span class="pa"><button class="btn pose-go" type="button"></button><button class="btn pose-del" type="button"></button></span>';
+    li.innerHTML = '<span class="pn"><b></b><small></small></span><span class="pa"><button class="btn pose-go" type="button"></button><button class="btn pose-del" type="button" data-op="/api/v1/poses/delete"></button></span>';
     li.querySelector('b').textContent = p.name;
     const sm = li.querySelector('small');
     sm.textContent = p.stale ? t('pose.stale') : [tcp, when].filter(Boolean).join(' · ');
@@ -11544,8 +11659,19 @@ const TCH_QUICK = '_quick';
 const teachQuick = (s) => !!s && s.name === TCH_QUICK;
 const teachSaved = () => TCH.seqs.filter((s) => !teachQuick(s));
 const TCH_SPEEDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
-// commands that need no motion lease: sent on the control WebSocket without a generation (armd teach::is_lease_free)
+// commands that need no motion lease: sent on the control WebSocket without a generation (armd teach::is_lease_free).
+// None of them moves the arm: a refusal for the operator session opens the dialog and the command runs once more after the unlock.
 function teachCmd(path, body, timeoutMs = 5000) {
+  return teachCmdOnce(path, body, timeoutMs).catch((e) => {
+    if (e.code !== 'OPERATOR_REQUIRED') throw e;
+    return opRequire(path, body, { retry: true }).then(async (ok) => {
+      if (!ok) throw e;
+      await wsOpen(5000);
+      return teachCmdOnce(path, body, timeoutMs);
+    });
+  });
+}
+function teachCmdOnce(path, body, timeoutMs = 5000) {
   if (!S.ws || S.ws.readyState !== 1) return Promise.reject(Object.assign(new Error(t('gc.b.offline')), { code: 'CONNECTION' }));
   const request_id = ++nextRequestId, ws = S.ws;
   return new Promise((resolve, reject) => {
@@ -11653,7 +11779,7 @@ function teachArm(key) {
   TCH.armTimer = setTimeout(() => { TCH.armed = null; teachRender(); }, 3000);
   teachRender(); return false;
 }
-function tchBtn(label, fn, cls = '', disabled = false) { return cwBtn(label, fn, { cls, disabled }); }
+function tchBtn(label, fn, cls = '', disabled = false, op = '') { return cwBtn(label, fn, { cls, disabled, op }); }
 function tchSelect(opts, value, onChange, aria) {
   const s = document.createElement('select');
   for (const [v, txt] of opts) { const o = document.createElement('option'); o.value = String(v); o.textContent = txt; s.appendChild(o); }
@@ -11752,10 +11878,10 @@ function teachRenderEditor(body) {
   head.appendChild(nm);
   body.appendChild(head);
   const acts = cwEl('div', 'tch-row');
-  const save = tchBtn(TCH.dirty || !c.id ? t('tch.save') : t('tch.saved'), () => teachSave(), TCH.dirty || !c.id ? 'btn-primary' : '', TCH.busy || running);
+  const save = tchBtn(TCH.dirty || !c.id ? t('tch.save') : t('tch.saved'), () => teachSave(), TCH.dirty || !c.id ? 'btn-primary' : '', TCH.busy || running, '/api/v1/sequences/save');
   save.id = 'tch-save';
   acts.appendChild(save);
-  if (c.id) { const d = tchBtn(TCH.armed === 'seqdel' ? t('tch.del.confirm') : t('tch.del'), () => teachDelSeq(), 'tch-del' + (TCH.armed === 'seqdel' ? ' armed' : ''), running); d.id = 'tch-seq-del'; acts.appendChild(d); }
+  if (c.id) { const d = tchBtn(TCH.armed === 'seqdel' ? t('tch.del.confirm') : t('tch.del'), () => teachDelSeq(), 'tch-del' + (TCH.armed === 'seqdel' ? ' armed' : ''), running, '/api/v1/sequences/delete'); d.id = 'tch-seq-del'; acts.appendChild(d); }
   body.appendChild(acts);
   // steps
   const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-steps';
@@ -11851,7 +11977,7 @@ function teachRenderPoses(body) {
   const nw = cwEl('div', 'tch-row');
   const nm = tchInput('', () => {}, { aria: t('pose.name'), ph: 'bin_a', cls: 'grow' }); nm.maxLength = 64; nm.id = 'tch-pose-name';
   nm.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); teachSavePose(nm.value.trim()); } });
-  nw.append(nm, tchBtn(t('pose.save'), () => teachSavePose(nm.value.trim()), 'btn-primary'));
+  nw.append(nm, tchBtn(t('pose.save'), () => teachSavePose(nm.value.trim()), 'btn-primary', false, '/api/v1/poses/save'));
   body.appendChild(nw);
   // ticked poses -> play them in tick order (saved as a motion, an identical one is reused) or open them as a new motion
   TCH.pick = TCH.pick.filter((id) => teachPose(id));
@@ -11893,13 +12019,13 @@ function teachRenderPoses(body) {
     if (TCH.edit === 'pose:' + p.id) {
       const r = cwEl('div', 'tch-row');
       const inp = tchInput(p.name, () => {}, { aria: t('tch.rename'), cls: 'grow' }); inp.maxLength = 64; inp.id = 'tch-rename';
-      r.append(inp, tchBtn(t('tch.save'), () => teachRenamePose(p, inp.value.trim()), 'btn-primary'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
+      r.append(inp, tchBtn(t('tch.save'), () => teachRenamePose(p, inp.value.trim()), 'btn-primary', false, '/api/v1/poses/rename'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
       li.appendChild(r);
     }
     const a = cwEl('div', 'tch-acts');
     const k = 'pose:' + p.name;
     a.append(tchBtn(t('pose.go'), () => poseGo(p.name)), tchBtn(t('tch.rename'), () => { TCH.edit = 'pose:' + p.id; teachRender(); }),
-      tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelPose(p), 'tch-del' + (TCH.armed === k ? ' armed' : '')));
+      tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelPose(p), 'tch-del' + (TCH.armed === k ? ' armed' : ''), false, '/api/v1/poses/delete'));
     li.appendChild(a);
     ol.appendChild(li);
   }
@@ -11911,7 +12037,7 @@ function teachRenderEps(body) {
   const r1 = cwEl('div', 'tch-row');
   r1.append(cwEl('span', 'tch-k', t('tch.rec.to')), tchSelect(teachDsNames().map((n) => [n, n]), TCH.ds, (v) => { TCH.ds = v; store('rebot.teach.ds', v); }, t('tch.ds')));
   const nds = tchInput('', () => {}, { aria: t('tch.ds.new'), ph: t('tch.ds.new'), cls: 'grow' }); nds.maxLength = 64; nds.id = 'tch-ds-new';
-  r1.append(nds, tchBtn(t('tch.ds.create'), () => teachCreateDs(nds.value.trim())));
+  r1.append(nds, tchBtn(t('tch.ds.create'), () => teachCreateDs(nds.value.trim()), '', false, '/api/v1/datasets/create'));
   const r2 = cwEl('div', 'tch-row');
   const task = tchInput(TCH.task, (v) => { TCH.task = v; store('rebot.teach.task', v); }, { aria: t('tch.task'), ph: t('tch.task.ph0'), cls: 'grow' }); task.id = 'tch-task';
   r2.append(cwEl('span', 'tch-k', t('tch.task')), task);
@@ -11950,14 +12076,14 @@ function teachRenderEps(body) {
         const r = cwEl('div', 'tch-row');
         const ti = tchInput(e.task || '', () => {}, { aria: t('tch.task'), ph: t('tch.task'), cls: 'grow' }); ti.id = 'tch-ep-task';
         const dsel = tchSelect(teachDsNames().map((n) => [n, n]), e.dataset || 'default', () => {}, t('tch.ds')); dsel.id = 'tch-ep-ds';
-        r.append(ti, dsel, tchBtn(t('tch.save'), () => teachUpdateEp(e, ti.value.trim(), dsel.value), 'btn-primary'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
+        r.append(ti, dsel, tchBtn(t('tch.save'), () => teachUpdateEp(e, ti.value.trim(), dsel.value), 'btn-primary', false, '/api/v1/episodes/update'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
         li.appendChild(r);
       }
       const a = cwEl('div', 'tch-acts');
       const k = 'ep:' + e.id;
       a.append(tchBtn(t('ep.play'), () => teachReplay(e.id, false), 'btn-primary', !!playing || teachRunning()), tchBtn(t('tch.ep.edit'), () => { TCH.edit = 'ep:' + e.id; teachRender(); }));
       const dl = cwEl('a', 'btn', t('tch.ep.dl')); dl.href = '/api/v1/episodes/' + encodeURIComponent(e.id) + '/data'; dl.download = e.id + '.parquet';
-      a.append(dl, tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelEp(e), 'tch-del' + (TCH.armed === k ? ' armed' : '')));
+      a.append(dl, tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelEp(e), 'tch-del' + (TCH.armed === k ? ' armed' : ''), false, '/api/v1/episodes/delete'));
       li.appendChild(a);
       ol.appendChild(li);
     }
@@ -14594,7 +14720,7 @@ function reconnectWS() {
 /* Operator access. The badge in the header opens the dialog; a privileged request refused with OPERATOR_REQUIRED
    opens it with the reason (opRequire). After an unlock the token goes to the open telemetry socket ({type:"auth"}),
    so the lease (and a torqued arm) stays; an armd without that message gets a reconnect, as before. */
-const OP = { waiters: [], why: null, retry: false, ack: null, seq: 0, lastFocus: null };
+const OP = { waiters: [], why: null, retry: false, skip: false, ack: null, seq: 0, lastFocus: null, pass: null, warned: false };
 const opLocked = () => S.auth.enforced && S.auth.role !== 'operator';
 const opIsOpen = () => !!$('op-modal') && !$('op-modal').hidden;
 // Resetting needs the operator: a latched E-stop, a non-recoverable fault, an escalated collision (armd ws.rs)
@@ -14606,6 +14732,8 @@ function clearNeedsOperator() {
 function opReasonKey(path, body) {
   const p = String(path || '');
   if (p === 'lease.force') return 'op.why.take';
+  if (p === 'calib.open') return 'op.why.calib_open';
+  if (p === '/api/v1/vision/mode' || p === '/api/v1/vision/subscribe') return 'op.why.vision';
   if (p === '/api/v1/mode/gravity_comp') return 'op.why.gc';
   if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : 'op.why.fault';
   if (/^\/api\/v1\/(detection|vision)\//.test(p) || p === '/api/v1/grasp/measure') return 'op.why.det';
@@ -14622,16 +14750,62 @@ function opCanRetry(path, body) {
   return (path === '/api/v1/mode/gravity_comp' && !!body && body.enable === true)
     || path === '/api/v1/detection/trigger' || path === '/api/v1/vision/depth' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
 }
-/* Ask for the operator PIN because `path` was refused. Resolves true after an unlock, false on cancel. */
-function opRequire(path, body) {
-  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); }
+/* Ask for the operator PIN because `path` was refused (or is about to be: a [data-op] control). Resolves true
+   after an unlock, false on cancel. opt.retry: the dialog says the action continues after the unlock (default:
+   opCanRetry); opt.skip: the action goes on either way, Cancel reads "Not now". */
+function opRequire(path, body, opt = {}) {
+  // refused while the page showed the session unlocked: it expired or was locked elsewhere
+  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); toast(t('op.expired'), 'warn'); }
   S.auth.enforced = true;
   renderOpBadge();
   return new Promise((resolve) => {
     OP.waiters.push(resolve);
-    openOperatorModal(opReasonKey(path, body), opCanRetry(path, body));
+    openOperatorModal(opReasonKey(path, body), 'retry' in opt ? !!opt.retry : opCanRetry(path, body), !!opt.skip);
   });
 }
+/* armd refused a request with OPERATOR_REQUIRED: the page's session state is wrong (expired, locked elsewhere,
+   or never known). Show the locked badge; no dialog (the caller decides). */
+function opRefused() {
+  if (S.auth.enforced && S.auth.role !== 'operator') return;
+  const was = S.auth.role === 'operator';
+  S.auth.enforced = true; S.auth.role = 'program'; S.auth.expiresIn = null; S.auth.expiresAt = null;
+  scheduleAuthExpiryRefresh(); renderOpBadge();
+  if (was) toast(t('op.expired'), 'warn');
+}
+// every same-origin API answer: a 403 OPERATOR_REQUIRED updates the badge, whichever code path made the request
+{
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const res = await nativeFetch(input, init);
+    if (res.status === 403) {
+      try {
+        const u = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (u.origin === location.origin && u.pathname.startsWith('/api/v1/') && u.pathname !== '/api/v1/auth/unlock') {
+          res.clone().json().then((d) => { if (d && d.code === 'OPERATOR_REQUIRED') opRefused(); }).catch(() => {});
+        }
+      } catch (_) {}
+    }
+    return res;
+  };
+}
+/* Operator-only controls carry data-op="<path>" (the reason in the dialog) and data-op-mode: "gate" (default; the
+   tap runs again after the unlock, Cancel drops it), "offer" (a drawer that holds operator-only steps: the drawer
+   opens after the dialog either way) or "move" (moves the arm or takes control: unlock only, the user taps again;
+   data-op-again names the hint). While locked
+   they show a lock (CSS body.op-locked) and a tap opens the dialog instead of being refused afterwards. */
+document.addEventListener('click', (e) => {
+  const el = e.target && e.target.closest ? e.target.closest('[data-op]') : null;
+  if (!el || !opLocked() || el.disabled) return;
+  if (OP.pass === el) return;
+  e.preventDefault(); e.stopImmediatePropagation();
+  const mode = el.dataset.opMode || 'gate';
+  opRequire(el.dataset.op, undefined, { retry: mode === 'gate', skip: mode === 'offer' }).then((ok) => {
+    const tgt = document.contains(el) ? el : (el.id && $(el.id)) || null;
+    if (!tgt || tgt.disabled) return;
+    if (mode === 'offer' || (ok && mode === 'gate')) { OP.pass = tgt; try { tgt.click(); } finally { OP.pass = null; } }
+    else if (ok) toast(t(el.dataset.opAgain || 'op.again'), 'info');
+  });
+}, true);
 function opSettle(ok) {
   const w = OP.waiters; OP.waiters = [];
   for (const r of w) r(ok);
@@ -14656,19 +14830,25 @@ function opSyncSocket(token) {
     try { ws.send(JSON.stringify({ type: 'auth', seq, token })); } catch (_) { clearTimeout(timer); fallback(); }
   });
 }
+// minutes left in the operator session, null when unknown or locked
+const opLeftMin = () => (S.auth.role === 'operator' && S.auth.expiresAt ? Math.max(0, Math.ceil((S.auth.expiresAt - Date.now()) / 60000)) : null);
 function renderOpBadge() {
   const b = $('btn-op');
+  document.body.classList.toggle('op-locked', opLocked());
   if (!b) return;
   b.hidden = !S.auth.enforced;
   if (!S.auth.enforced) return;
   const unlocked = S.auth.role === 'operator';
+  const left = opLeftMin();
   b.classList.toggle('is-unlocked', unlocked);
   // "🔒 操作员": icon and label apart, so the simple landscape island can drop the label (tb-compact-3)
+  // the last minutes of the session replace the label: an action may be refused soon
+  const soon = unlocked && left != null && left <= 5;
   const txt = unlocked ? t('op.unlocked') : t('op.locked'), sp = txt.indexOf(' ');
   b.textContent = '';
-  if (sp > 0) b.append(cwEl('span', 'op-ic', txt.slice(0, sp)), ' ', cwEl('span', 'op-lbl', txt.slice(sp + 1)));
+  if (sp > 0) b.append(cwEl('span', 'op-ic', txt.slice(0, sp)), ' ', cwEl('span', 'op-lbl', soon ? t('op.left', { m: left }) : txt.slice(sp + 1)));
   else b.textContent = txt;
-  const tip = t(unlocked ? 'op.badge.unlocked' : 'op.badge.locked');
+  const tip = unlocked ? (left != null ? t('op.badge.unlocked_m', { m: left }) : t('op.badge.unlocked')) : t('op.badge.locked');
   b.title = tip; b.setAttribute('aria-label', tip);
   if (opIsOpen()) renderOperatorModal();
 }
@@ -14717,15 +14897,15 @@ function renderOperatorModal() {
   $('op-unlock').hidden = unlocked;
   $('op-lock').hidden = !unlocked;
   $('op-hint').hidden = unlocked;
-  setText($('op-cancel'), t(unlocked ? 'op.close' : 'cancel'));
+  setText($('op-cancel'), t(unlocked ? 'op.close' : OP.skip ? 'op.skip' : 'cancel'));
   const left = unlocked && S.auth.expiresAt ? Math.max(0, Math.round((S.auth.expiresAt - Date.now()) / 60000)) : null;
   setText($('op-state'), unlocked ? (left ? t('op.state_on', { m: left }) : t('op.state_on0')) : '');
 }
-function openOperatorModal(why = null, retry = false) {
+function openOperatorModal(why = null, retry = false, skip = false) {
   const m = $('op-modal');
   if (!m) return;
   const wasOpen = !m.hidden;
-  if (why || !wasOpen) { OP.why = why; OP.retry = retry; }
+  if (why || !wasOpen) { OP.why = why; OP.retry = retry; OP.skip = skip; }
   if (!wasOpen) {
     OP.lastFocus = document.activeElement;
     $('op-pin').value = '';
@@ -14745,7 +14925,7 @@ function closeOperatorModal(ok = false) {
   m.style.top = ''; m.style.height = '';
   document.body.classList.remove('op-open');
   $('op-pin').value = '';
-  OP.why = null; OP.retry = false;
+  OP.why = null; OP.retry = false; OP.skip = false;
   const f = OP.lastFocus; OP.lastFocus = null;
   if (f && typeof f.focus === 'function' && document.contains(f)) { try { f.focus({ preventScroll: true }); } catch (_) {} }
   opSettle(ok);
@@ -14835,6 +15015,7 @@ i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
 }
 schemaReady = loadSchema();
 loadAuthStatus();
+setInterval(() => { if (S.auth.role === 'operator') renderOpBadge(); }, 30000); // minutes left on the badge
 initSandbox();
 connectWS();
 connectDetectionWS();
