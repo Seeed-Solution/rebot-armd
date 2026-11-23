@@ -958,6 +958,8 @@ pub struct PreparedPolicy {
     staged_period: Option<u64>,
     staged_infer_seq: Option<u64>,
     staged_ready: bool,
+    single_step_source: Option<ChunkSource>,
+    single_step_seq: u64,
     chunk_ring: ChunkRing,
     last_step_sources: Vec<ChunkSource>,
     last_run_ctx: Option<ChunkRunContext>,
@@ -1034,6 +1036,8 @@ impl PreparedPolicy {
             staged_period: None,
             staged_infer_seq: None,
             staged_ready: false,
+            single_step_source: None,
+            single_step_seq: 1,
             chunk_ring,
             last_step_sources,
             last_run_ctx: None,
@@ -1061,6 +1065,7 @@ impl PreparedPolicy {
         self.staged_period = None;
         self.staged_infer_seq = None;
         self.staged_ready = false;
+        self.single_step_source = None;
         self.last_step_sources.clear();
     }
 
@@ -1342,21 +1347,43 @@ impl PreparedPolicy {
         self.finalize_step_target()
     }
 
-    /// Off-lock planning stage for chunked policies (`chunk_size > 1`): prunes stale entries,
-    /// runs backend inference when due for `sample_period`, and stages the converted candidate
-    /// target for `sample_period` without consuming the ring slot. Final slot selection,
-    /// freshness, and provenance checks run in [`Self::commit_gate`].
+    /// Off-lock planning stage for both single-step (`chunk_size == 1`) and chunked
+    /// (`chunk_size > 1`) policies: prepares inputs, prunes stale chunk entries, runs backend
+    /// inference when due for `sample_period`, and stages the converted candidate target
+    /// without consuming the ring slot. Final slot selection, freshness, and provenance checks
+    /// run in [`Self::commit_gate`].
     pub fn plan_chunk_step(
         &mut self,
         measured_arm_rad: &[f32],
         vision_features: Option<&[f32]>,
         sample_period: u64,
-        source: ChunkSource,
+        mut source: ChunkSource,
         freshness: Option<&ChunkFreshnessLimits>,
     ) -> Result<Option<u64>, PolicyError> {
+        let dim = self.contract.action_dim;
         let chunking = self.contract.chunking;
-        debug_assert!(chunking.chunk_size > 1);
         self.prepare_infer_input(measured_arm_rad, vision_features)?;
+
+        if chunking.chunk_size <= 1 {
+            self.backend.infer(&self.infer_in, &mut self.infer_out)?;
+            for (idx, &v) in self.infer_out.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(PolicyError::NonFinite(format!(
+                        "model output[{idx}] is non-finite: {v}"
+                    )));
+                }
+            }
+            self.step_out_norm.copy_from_slice(&self.infer_out[..dim]);
+            let _ = self.finalize_step_target()?;
+            let seq = self.single_step_seq;
+            self.single_step_seq = self.single_step_seq.wrapping_add(1).max(1);
+            source.infer_seq = seq;
+            self.single_step_source = Some(source);
+            self.staged_period = Some(sample_period);
+            self.staged_infer_seq = Some(seq);
+            self.staged_ready = true;
+            return Ok(Some(seq));
+        }
 
         if let Some(limits) = freshness {
             self.prune_chunk_buffer(limits);
@@ -1449,16 +1476,18 @@ impl PreparedPolicy {
         Ok((decision, now))
     }
 
-    /// Single final commit gate for chunked policies (`chunk_size > 1`), executed immediately
-    /// before submitting to `policy_step_with_vision`:
+    /// Single final commit gate for both single-step (`chunk_size == 1`) and chunked
+    /// (`chunk_size > 1`) policies, executed immediately before submitting to
+    /// `policy_step_with_vision`:
     ///
-    /// (a) Computes `commit_period` from `now` and selects that period's slot (discarding any
-    ///     passed slots). If the slot has already been committed/passed or is missing, submits
-    ///     nothing.
-    /// (b) Checks every source age of the selected slot against `now` (`max_fresh_*` for a
-    ///     fresh inference from this tick, `max_cached_*` for cached entries). On expiry, drops
-    ///     the whole chunk to force a replan on the next period and submits nothing (without
-    ///     failing the run).
+    /// (a) Computes `commit_period` from `now`. For `chunk_size > 1`, selects that period's
+    ///     slot (discarding passed slots) and skips if already committed/passed or missing;
+    ///     for `chunk_size == 1`, consumes the single freshly inferred staged target.
+    /// (b) Checks every contributing source age against `now` (`max_fresh_*` for a fresh
+    ///     inference from this tick, `max_cached_*` for cached chunk entries). For chunked
+    ///     policies, expiry drops the whole chunk and skips submission without failing the run;
+    ///     for single-step policies, joint freshness continues to be enforced by the supervisor's
+    ///     `STALE_INPUT` fence (keeping single-step live/shadow behaviour unchanged).
     /// (c) Checks provenance (detector model generation, detector target identity, embedding
     ///     ticket identity/invalidation/deadlines) and clears the ring on mismatch.
     pub fn commit_gate(
@@ -1474,6 +1503,35 @@ impl PreparedPolicy {
             .as_nanos()
             / period_ns.max(1))
         .min(u64::MAX as u128) as u64;
+
+        if self.contract.chunking.chunk_size <= 1 {
+            let Some(src) = self.single_step_source.filter(|_| self.staged_ready) else {
+                self.staged_ready = false;
+                return Ok(CommitGateDecision::Skip { commit_period });
+            };
+            if params.vision_generation.is_some()
+                && src.vision_generation != params.vision_generation
+            {
+                self.clear_chunk_buffer();
+                return Ok(CommitGateDecision::Skip { commit_period });
+            }
+            if let (Some(ticket), Some(live_ctx)) =
+                (src.embedding_ticket, params.live_ticket_ctx.as_ref())
+            {
+                if ticket.verify_identity_and_horizon(live_ctx, 0).is_err() {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
+            }
+            self.staged_ready = false;
+            self.staged_period = None;
+            self.staged_infer_seq = None;
+            self.single_step_source = None;
+            return Ok(CommitGateDecision::Submit {
+                target: self.arm_target_rad.clone(),
+                commit_period,
+            });
+        }
 
         // (a) Select the slot for `commit_period`.
         if last_committed_period.is_some_and(|p| commit_period <= p) {
@@ -1978,7 +2036,6 @@ pub fn spawn_policy_runner(
         let mut interval = tokio::time::interval_at(interval_origin, period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let period_ns = period.as_nanos().max(1);
-        let mut last_infer_period: Option<u64> = None;
         let mut last_committed_period: Option<u64> = None;
 
         loop {
@@ -2178,37 +2235,17 @@ pub fn spawn_policy_runner(
                 live_ticket_ctx,
             };
 
-            let periods_elapsed = match last_infer_period {
-                None => 1u32,
-                Some(prev) => cur_period.saturating_sub(prev).clamp(1, u32::MAX as u64) as u32,
-            };
-            last_infer_period = Some(cur_period);
-
             let infer_handle = tokio::task::spawn_blocking(move || {
                 let t0 = Instant::now();
-                let res: Result<Option<Vec<f32>>, PolicyError> = if is_chunked {
-                    prepared
-                        .plan_chunk_step(
-                            &measured,
-                            vision_features.as_deref(),
-                            cur_period,
-                            chunk_source,
-                            Some(&freshness_limits),
-                        )
-                        .map(|_| None)
-                } else {
-                    prepared
-                        .step_infer_with_source(
-                            &measured,
-                            vision_features.as_deref(),
-                            periods_elapsed,
-                            chunk_source,
-                            Some(&freshness_limits),
-                        )
-                        .map(Some)
-                };
+                let res = prepared.plan_chunk_step(
+                    &measured,
+                    vision_features.as_deref(),
+                    cur_period,
+                    chunk_source,
+                    Some(&freshness_limits),
+                );
                 let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
-                (prepared, res.map(|t| (t, infer_us)))
+                (prepared, res.map(|_| infer_us))
             });
             let infer_result = if let Some(dl) = tokio_dl {
                 tokio::select! {
@@ -2224,7 +2261,7 @@ pub fn spawn_policy_runner(
                 infer_handle.await
             };
 
-            let (single_step_target, infer_us) = match infer_result {
+            let infer_us = match infer_result {
                 Err(e) => {
                     tracing::warn!("Policy inference task failed for action {action_id}: {e}");
                     let mut inner = supervisor.inner().write().await;
@@ -2273,8 +2310,8 @@ pub fn spawn_policy_runner(
             let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
             inner.record_policy_step_timing(action_id, infer_us, step_us);
 
-            let detector_post_vision_age_ms = if video_embedding_spec.is_none() {
-                let post_age = if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
+            let _detector_post_vision_checked = if video_embedding_spec.is_none() {
+                if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
                     let age_ms = Instant::now()
                         .saturating_duration_since(vis_cap)
                         .as_millis()
@@ -2300,10 +2337,7 @@ pub fn spawn_policy_runner(
                             }
                         }
                     }
-                    Some(age_ms)
-                } else {
-                    None
-                };
+                }
                 if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
                     if spec.require_model_generation {
                         if let Some(latest_frame) = col.latest() {
@@ -2325,15 +2359,13 @@ pub fn spawn_policy_runner(
                                         ),
                                     ),
                                 };
+                                prepared.clear_chunk_buffer();
                                 inner.fail_policy_run(action_id, reason, message);
                                 break;
                             }
                         }
                     }
                 }
-                post_age
-            } else {
-                None
             };
             if let Some(gate) = active_gate {
                 if let Some(ref emb) = video_embedding_spec {
@@ -2374,39 +2406,39 @@ pub fn spawn_policy_runner(
             } else {
                 None
             };
-            let (target, committed_period, input_age_ms, post_vision_age_ms) = if is_chunked {
-                let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
-                    let live_hub = guard.live_ticket_state();
-                    TicketVerificationContext {
-                        policy_instance_id: live_hub.policy_instance_id,
-                        lease_generation: active_run_lease_generation(&inner, action_id),
-                        producer_epoch: live_hub.producer_epoch,
-                        model_generation: live_hub.model_generation,
-                        invalidation_generation: live_hub.invalidation_generation,
-                        clock_handshake_generation: live_hub.clock_handshake_generation,
-                        now_armd_ms: live_hub.now_armd_ms,
-                    }
-                });
-                let commit_vision_target = if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
-                    col.latest()
-                        .map(|latest| {
-                            extract_top1_target(&latest, spec)
-                                .map_or(DetectorTargetIdentity::Absent, |(_, id)| id)
-                        })
-                        .or(vision_target)
-                } else {
-                    vision_target
-                };
-                let gate_params = CommitGateParams {
-                    max_fresh_joint_age_ms,
-                    max_cached_joint_age_ms: max_source_joint_age_ms,
-                    max_fresh_vision_age_ms,
-                    max_cached_vision_age_ms: max_source_vision_age_ms,
-                    horizon_ms,
-                    vision_generation: locked_generation,
-                    vision_target: commit_vision_target,
-                    live_ticket_ctx: commit_ticket_ctx,
-                };
+            let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
+                let live_hub = guard.live_ticket_state();
+                TicketVerificationContext {
+                    policy_instance_id: live_hub.policy_instance_id,
+                    lease_generation: active_run_lease_generation(&inner, action_id),
+                    producer_epoch: live_hub.producer_epoch,
+                    model_generation: live_hub.model_generation,
+                    invalidation_generation: live_hub.invalidation_generation,
+                    clock_handshake_generation: live_hub.clock_handshake_generation,
+                    now_armd_ms: live_hub.now_armd_ms,
+                }
+            });
+            let commit_vision_target = if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                col.latest()
+                    .map(|latest| {
+                        extract_top1_target(&latest, spec)
+                            .map_or(DetectorTargetIdentity::Absent, |(_, id)| id)
+                    })
+                    .or(vision_target)
+            } else {
+                vision_target
+            };
+            let gate_params = CommitGateParams {
+                max_fresh_joint_age_ms,
+                max_cached_joint_age_ms: max_source_joint_age_ms,
+                max_fresh_vision_age_ms,
+                max_cached_vision_age_ms: max_source_vision_age_ms,
+                horizon_ms,
+                vision_generation: locked_generation,
+                vision_target: commit_vision_target,
+                live_ticket_ctx: commit_ticket_ctx,
+            };
+            let (target, committed_period, input_age_ms, post_vision_age_ms) =
                 match prepared.commit_gate_now(
                     interval_origin_std,
                     period_ns,
@@ -2434,7 +2466,7 @@ pub fn spawn_policy_runner(
                                     .min(u64::MAX as u128) as u64
                             })
                         };
-                        (target, Some(commit_period), input_age, vis_age)
+                        (target, commit_period, input_age, vis_age)
                     }
                     Ok((CommitGateDecision::Skip { .. }, _)) => {
                         continue;
@@ -2448,21 +2480,7 @@ pub fn spawn_policy_runner(
                         inner.fail_policy_run(action_id, reason, e.to_string());
                         break;
                     }
-                }
-            } else {
-                let target = single_step_target.expect("single-step target");
-                let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) =
-                    (emb_commit_now_ms, emb_mapped_ms)
-                {
-                    Some(now_ms.saturating_sub(mapped_ms))
-                } else {
-                    detector_post_vision_age_ms
                 };
-                let input_age_ms = base_input_age_ms.map(|base| {
-                    base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
-                });
-                (target, None, input_age_ms, post_vision_age_ms)
-            };
             if let Err(e) = inner.policy_step_with_vision(
                 action_id,
                 target,
@@ -2474,9 +2492,8 @@ pub fn spawn_policy_runner(
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
             }
-            if let Some(cp) = committed_period {
-                last_committed_period = Some(cp);
-                last_infer_period = Some(cp);
+            if is_chunked {
+                last_committed_period = Some(committed_period);
             }
         }
     })
@@ -2753,6 +2770,95 @@ mod chunking_tests {
         }
         assert_eq!(calls_a.load(Ordering::Relaxed), 4);
         assert_eq!(calls_b.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn chunking_single_step_routes_through_commit_gate() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+        let chunks = vec![
+            make_constant_chunk(state_dim, &[0.1]),
+            make_constant_chunk(state_dim, &[0.2]),
+            make_constant_chunk(state_dim, &[0.3]),
+        ];
+
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(1, 1, None);
+        let (backend, calls) = CountingChunkBackend::new(state_dim, state_dim, chunks);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let gate_ok = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 100,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 50,
+            vision_generation: Some(7),
+            vision_target: None,
+            live_ticket_ctx: None,
+        };
+
+        // Tick 0: fresh inference staged and committed through commit_gate -> 0.1.
+        let mut src0 = ChunkSource::from_joint(origin, Some(5));
+        src0.vision_generation = Some(7);
+        prep.plan_chunk_step(&state, None, 0, src0, None).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        match prep
+            .commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_ok)
+            .unwrap()
+        {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 0);
+                assert!((target[0] - 0.1).abs() < 1e-6);
+            }
+            other => panic!("expected Submit on single-step tick 0, got {other:?}"),
+        }
+
+        // Calling commit_gate again without a new plan_chunk_step skips (no stale reuse).
+        assert_eq!(
+            prep.commit_gate(origin + Duration::from_millis(10), origin, period_ns, Some(0), &gate_ok)
+                .unwrap(),
+            CommitGateDecision::Skip { commit_period: 0 }
+        );
+
+        // Tick 1: generation mismatch at commit_gate refuses submission.
+        let mut src1 = ChunkSource::from_joint(origin + Duration::from_millis(50), Some(5));
+        src1.vision_generation = Some(7);
+        prep.plan_chunk_step(&state, None, 1, src1, None).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let gate_bad_gen = CommitGateParams {
+            vision_generation: Some(8),
+            ..gate_ok.clone()
+        };
+        assert_eq!(
+            prep.commit_gate(
+                origin + Duration::from_millis(55),
+                origin,
+                period_ns,
+                Some(0),
+                &gate_bad_gen,
+            )
+            .unwrap(),
+            CommitGateDecision::Skip { commit_period: 1 }
+        );
+
+        // Tick 2: fresh inference commits 0.3.
+        let mut src2 = ChunkSource::from_joint(origin + Duration::from_millis(100), Some(5));
+        src2.vision_generation = Some(7);
+        prep.plan_chunk_step(&state, None, 2, src2, None).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        match prep
+            .commit_gate(origin + Duration::from_millis(105), origin, period_ns, Some(0), &gate_ok)
+            .unwrap()
+        {
+            CommitGateDecision::Submit { target, commit_period } => {
+                assert_eq!(commit_period, 2);
+                assert!((target[0] - 0.3).abs() < 1e-6);
+            }
+            other => panic!("expected Submit on single-step tick 2, got {other:?}"),
+        }
     }
 
     #[test]
