@@ -29,7 +29,7 @@ use super::broker::{
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
-use super::mailbox::{target_mailbox, TargetFrame, TargetReader, TargetWriter, MAX_DOF};
+use super::mailbox::{target_mailbox, Refusal, RefusalDetail, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
 use super::urgent::StopRequests;
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
@@ -314,7 +314,11 @@ pub trait CoreOps {
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
-    fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str>;
+    ///
+    /// No allocation: the frame is `Copy` with fixed-size arrays; an implementation applies
+    /// `frame.positions()` (a slice of the frame) into the core's preallocated target state.
+    /// (The foundation adapter still delegates to `servo(Vec)`, which allocates: track D.)
+    fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal>;
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
     /// How `action` ended, None while it runs.
@@ -440,10 +444,20 @@ impl CoreOps for SupervisorInner {
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
     }
 
-    fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
-        if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) { return Err(code); }
-        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| static_code(ArmError::Safety(e)))
+    fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+        if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) {
+            let detail = match code {
+                "LEASE_LOST" => {
+                    let preempted = self.last_evicted.as_ref().is_some_and(|(_, g)| *g == frame.authority.lease_generation);
+                    RefusalDetail::LeaseLoss { reason: if preempted { "preempted" } else { "expired" } }
+                }
+                "PLAN_STALE" => RefusalDetail::CurrentRevision(self.workspace_revision),
+                _ => RefusalDetail::None,
+            };
+            return Err(Refusal { code, detail });
+        }
+        if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
+        self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| Refusal::code(static_code(ArmError::Safety(e))))
     }
 
     fn apply_stop(&mut self) { self.stop_motion(); }
@@ -541,7 +555,7 @@ impl CoreOps for StubCore {
     fn commit_primitive(&mut self, _: &Descriptor, _: &Primitive, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_immediate(&mut self, _: &Descriptor, _: ImmediateOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_transition(&mut self, _: &Descriptor, _: TransitionOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
-    fn consume_target(&mut self, _: &TargetFrame, _: &CommitCtx) -> Result<(), &'static str> { self.targets_seen += 1; Err("NOT_WIRED") }
+    fn consume_target(&mut self, _: &TargetFrame, _: &CommitCtx) -> Result<(), Refusal> { self.targets_seen += 1; Err(Refusal::code("NOT_WIRED")) }
     fn apply_stop(&mut self) {}
     fn action_outcome(&self, _: ActionId) -> Option<Outcome> { Some(Outcome::Failed("NOT_WIRED")) }
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
@@ -562,6 +576,8 @@ pub struct ReleaseReport {
     pub command: Option<(RequestId, Result<u64, &'static str>)>,
     /// The target consumed, with its sequence or refusal code.
     pub target: Option<(u64, Result<(), &'static str>)>,
+    /// The full refusal of that target (also reported to the stream's writer).
+    pub target_refusal: Option<Refusal>,
     /// The active action that ended in this release.
     pub ended: Option<(ActionId, Outcome)>,
     /// The hardware poll of this release.
@@ -720,7 +736,10 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // 4. the latest target
         if let Some(f) = self.targets.take() {
             let ctx = self.checkpoint(Checkpoint::BeforeTarget, &mut report);
-            report.target = Some((f.seq, self.core.consume_target(&f, &ctx)));
+            let result = self.core.consume_target(&f, &ctx);
+            self.targets.report(TargetOutcome { stream: f.stream, seq: f.seq, result });
+            report.target_refusal = result.err();
+            report.target = Some((f.seq, result.map_err(|r| r.code)));
         }
         // 5. the control tick (its output gate also holds for a stop arriving during it:
         // `EstopGate::with_stops`)

@@ -17,7 +17,14 @@
 //! At consumption the RT rechecks a frame ([`TargetFrame::check`], track D): arm and boot
 //! identity, its original deadline, the authority (stop, epoch, lease, config revision), the
 //! stream the core authorized, the policy generation, the input and vision ages
-//! ([`TargetAuthority`]); the core adds its configuration hold (`CONFIG_BUSY`).
+//! ([`TargetAuthority`]); the core adds its configuration hold (`CONFIG_BUSY`). The outcome
+//! of every consumed frame goes back to the writer ([`TargetOutcome`], with a [`Refusal`]
+//! detail) for the stream's protocol reply.
+//!
+//! Lease release / disconnect: consumption checks the lease **valid at that instant**, so a
+//! frame buffered before its lease was released is refused (`LEASE_LOST`), never applied.
+//! A closing stream still calls [`TargetWriter::close_stream`] and the core
+//! `revoke_stream`; an explicit stop goes through `StopRequests` as for any stop.
 
 use std::time::{Duration, Instant};
 
@@ -51,6 +58,8 @@ pub struct TargetFrame {
     pub input_at: Instant,
     /// Camera sample time behind the frame (vision policies).
     pub vision_at: Option<Instant>,
+    /// The vision frame behind it (`vision_frame_id` telemetry), None without vision.
+    pub vision_frame_id: Option<u64>,
     /// Original monotonic deadline: not consumed after it (`DEADLINE_EXPIRED`).
     pub deadline: Instant,
     pub dof: u8,
@@ -58,6 +67,47 @@ pub struct TargetFrame {
     /// The protocol lets a newer frame replace this one before it is consumed.
     pub replaceable: bool,
 }
+
+/// Why a target (or a command) was refused: the code and what the client needs to act on
+/// it, without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refusal {
+    pub code: &'static str,
+    pub detail: RefusalDetail,
+}
+
+/// Detail of a [`Refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefusalDetail {
+    #[default]
+    None,
+    /// The current revision (`PLAN_STALE`, `REVISION_MISMATCH`).
+    CurrentRevision(u64),
+    /// `LEASE_LOST`: `"preempted"` (a forced acquire evicted it) or `"expired"`.
+    LeaseLoss { reason: &'static str },
+    /// `WORKSPACE_VIOLATION` / `JOINT_LIMIT`: the joint (or axis) that violated, if known.
+    Limit { joint: Option<u8> },
+}
+
+impl Refusal {
+    pub fn code(code: &'static str) -> Self { Self { code, detail: RefusalDetail::None } }
+}
+
+impl From<&'static str> for Refusal {
+    fn from(code: &'static str) -> Self { Self::code(code) }
+}
+
+/// The RT's answer to one consumed frame, back to the stream's writer
+/// ([`TargetReader::report`], [`TargetWriter::outcomes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetOutcome {
+    pub stream: StreamId,
+    pub seq: u64,
+    pub result: Result<(), Refusal>,
+}
+
+/// Outcomes buffered RT -> writer; when full the RT drops one and counts it.
+pub const OUTCOME_CAPACITY: usize = 16;
 
 /// What the core currently authorizes for targets (core state, `ArmCore::target_authority`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -115,6 +165,7 @@ struct Slot {
 /// The broker's side.
 pub struct TargetWriter {
     producer: Producer<Slot>,
+    outcomes: rtrb::Consumer<TargetOutcome>,
     /// Last sequence of each open stream.
     streams: [Option<(StreamId, u64)>; MAX_STREAMS],
     last: Option<TargetFrame>,
@@ -129,12 +180,15 @@ pub struct TargetWriter {
 /// ```
 pub struct TargetReader {
     consumer: Consumer<Slot>,
+    outcomes: rtrb::Producer<TargetOutcome>,
+    outcomes_dropped: u64,
 }
 
 pub fn target_mailbox() -> (TargetWriter, TargetReader) {
     let empty = Slot { frame: None };
     let (producer, consumer) = triple_buffer(empty, empty, empty);
-    (TargetWriter { producer, streams: [None; MAX_STREAMS], last: None, coalesced: 0 }, TargetReader { consumer })
+    let (otx, orx) = rtrb::RingBuffer::new(OUTCOME_CAPACITY);
+    (TargetWriter { producer, outcomes: orx, streams: [None; MAX_STREAMS], last: None, coalesced: 0 }, TargetReader { consumer, outcomes: otx, outcomes_dropped: 0 })
 }
 
 impl TargetWriter {
@@ -168,6 +222,13 @@ impl TargetWriter {
 
     /// Frames replaced before consumption.
     pub fn coalesced(&self) -> u64 { self.coalesced }
+
+    /// Drains the RT's outcomes of consumed frames (the stream's protocol replies).
+    pub fn outcomes(&mut self, mut each: impl FnMut(TargetOutcome)) -> usize {
+        let mut n = 0;
+        while let Ok(o) = self.outcomes.pop() { each(o); n += 1; }
+        n
+    }
 }
 
 impl TargetReader {
@@ -176,6 +237,14 @@ impl TargetReader {
         if !self.consumer.refresh() { return None; }
         self.consumer.front().frame
     }
+
+    /// Reports how a consumed frame was applied (never waits: counted when the ring is full).
+    pub fn report(&mut self, outcome: TargetOutcome) {
+        if self.outcomes.push(outcome).is_err() { self.outcomes_dropped += 1; }
+    }
+
+    /// Outcomes dropped on a full outcome ring.
+    pub fn outcomes_dropped(&self) -> u64 { self.outcomes_dropped }
 }
 
 #[cfg(test)]
@@ -185,7 +254,7 @@ mod tests {
     fn frame(stream: u64, seq: u64, replaceable: bool) -> TargetFrame {
         let now = Instant::now();
         TargetFrame { arm: ArmId::LOCAL, boot: BootId(1), stream: StreamId(stream), seq, authority: Authority::default(), policy_generation: 0,
-            input_at: now, vision_at: None, deadline: now + Duration::from_secs(5), dof: 2, q: [seq as f32; MAX_DOF], replaceable }
+            input_at: now, vision_at: None, vision_frame_id: None, deadline: now + Duration::from_secs(5), dof: 2, q: [seq as f32; MAX_DOF], replaceable }
     }
 
     #[test]

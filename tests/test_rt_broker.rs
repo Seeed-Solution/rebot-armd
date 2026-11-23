@@ -185,7 +185,7 @@ fn targets_are_rechecked_at_consumption() {
         let mut arr = [0.0; MAX_DOF];
         arr[..q.len()].copy_from_slice(&q);
         arr[0] += dq;
-        TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq, authority, policy_generation: 0, input_at: now, vision_at: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true }
+        TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq, authority, policy_generation: 0, input_at: now, vision_at: None, vision_frame_id: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true }
     };
     // no stream authorized yet: refused
     assert_eq!(tw.submit(frame(1, a, 0.001)), Submitted::Accepted);
@@ -220,7 +220,7 @@ fn a_stub_core_never_acknowledges_success() {
     let a = Authority::default();
     let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap())).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
-    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
+    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, vision_frame_id: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
     assert_eq!(replies(&mut b), vec![Reply::Refused { request: r1, code: "NOT_WIRED" }, Reply::Refused { request: r2, code: "NOT_WIRED" }]);
     assert_eq!((fx.core.commits_seen, fx.core.targets_seen, fx.core.releases), (2, 1, 3));
@@ -405,7 +405,7 @@ fn a_stop_arriving_mid_release_precedes_the_commit_the_target_and_the_output() {
     let mut arr = [0.0; MAX_DOF];
     arr[..q.len()].copy_from_slice(&q);
     fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), ..TargetAuthority::default() });
-    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(), vision_at: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true });
+    tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(), vision_at: None, vision_frame_id: None, deadline: later(), dof: q.len() as u8, q: arr, replaceable: true });
     let s = stop.clone();
     fx.on_checkpoint(move |c| if c == Checkpoint::BeforeTarget { s.request(); });
     let rep = fx.step();
@@ -515,4 +515,26 @@ fn macro_children_name_their_parent_and_a_macro_terminal_carries_its_child_count
     assert!(got.iter().any(|r| matches!(r, Reply::Terminal { action, children: 3, outcome: Outcome::Failed("NOT_HOLDING"), .. } if *action == parent)), "{got:?}");
     let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
     assert!(snap.feedback_queue_bounds.is_empty(), "mock follower: no queue bounds");
+}
+
+#[test]
+fn a_buffered_frame_is_refused_once_its_lease_was_released_and_the_stream_hears_why() {
+    use armd::rt_core::mailbox::{Refusal, RefusalDetail, TargetOutcome};
+    let ((mut fx, _b, mut tw, _stop), generation) = leased(600_000);
+    fx.core.core.authorize_stream(TargetAuthority { stream: Some(StreamId(1)), ..TargetAuthority::default() });
+    let a = auth(&fx);
+    let q = fx.core.commanded_positions.clone();
+    let mut arr = [0.0; MAX_DOF];
+    arr[..q.len()].copy_from_slice(&q);
+    let frame = TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(),
+        vision_at: None, vision_frame_id: Some(77), deadline: later(), dof: q.len() as u8, q: arr, replaceable: true };
+    assert_eq!(tw.submit(frame), Submitted::Accepted);
+    // the WS closes: its lease is released while the frame is buffered
+    fx.core.release_lease("client", generation);
+    let rep = fx.step();
+    assert_eq!(rep.target, Some((1, Err("LEASE_LOST"))));
+    assert_eq!(rep.target_refusal, Some(Refusal { code: "LEASE_LOST", detail: RefusalDetail::LeaseLoss { reason: "expired" } }));
+    let mut got = Vec::new();
+    tw.outcomes(|o| got.push(o));
+    assert_eq!(got, vec![TargetOutcome { stream: StreamId(1), seq: 1, result: Err(rep.target_refusal.unwrap()) }]);
 }
