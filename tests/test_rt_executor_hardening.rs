@@ -2285,3 +2285,171 @@ async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unkn
     assert!(sup_exec.request_shutdown().await.unwrap());
     h_exec.shutdown_and_join().unwrap();
 }
+
+// ============================================================================
+// 14. Emergency / panic timeout detaches stalled thread so final Drop is bounded
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() {
+    struct StalledDisableDriver {
+        enabled: bool,
+        entered: Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<()>>>>,
+        release: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    }
+
+    impl ArmDriver for StalledDisableDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState {
+            if self.enabled {
+                EnableState::Enabled
+            } else {
+                EnableState::Disabled
+            }
+        }
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::ZERO); 7]
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); 7])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            if enable {
+                self.enabled = true;
+                return Ok(());
+            }
+            if let Some(tx) = self.entered.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.release.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+            }
+            self.enabled = false;
+            Ok(())
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    // (a) Emergency teardown timeout: driver blocks past the 60 ms deadline -> emergency teardown
+    // returns `TimedOut` within its bound -> dropping the LAST handle (and supervisor) while the
+    // driver call is STILL BLOCKED returns within a bound (detached, never an unbounded join!).
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let drv = StalledDisableDriver {
+        enabled: false,
+        entered: Arc::new(std::sync::Mutex::new(Some(entered_tx))),
+        release: Arc::new(std::sync::Mutex::new(Some(release_rx))),
+    };
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.set_torque(true).await.unwrap();
+    let hooks = PersistTestHooks {
+        panic_disable_timeout: Some(Duration::from_millis(60)),
+        ..Default::default()
+    };
+    let handle = sup
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+        .await
+        .unwrap();
+
+    let h_em = handle.clone();
+    let t_em = Instant::now();
+    let outcome = tokio::task::spawn_blocking(move || h_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    entered_rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("control thread must have entered blocked set_torque(false)");
+    assert_eq!(outcome, PanicDisableOutcome::TimedOut);
+    assert!(
+        t_em.elapsed() < Duration::from_millis(600),
+        "emergency teardown overran bound: {:?}",
+        t_em.elapsed()
+    );
+
+    // Drop the LAST handle and supervisor while `release_tx` is STILL HELD (driver STILL blocked!):
+    // `Drop` MUST return immediately rather than turning into an unbounded join!
+    let t_drop = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        drop(handle);
+        drop(sup);
+    })
+    .await
+    .unwrap();
+    assert!(
+        t_drop.elapsed() < Duration::from_millis(300),
+        "dropping last handle after emergency timeout blocked for {:?} (unbounded join!)",
+        t_drop.elapsed()
+    );
+    // Unblock the detached thread cleanly now that Drop boundedness has been proved.
+    let _ = release_tx.send(());
+
+    // (b) Panic deadline timeout: same guarantee when dropping the last handle while the
+    // panicked owner thread is STILL blocked inside `set_torque(false)`.
+    let (entered_tx2, entered_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_tx2, release_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+    let (obs_tx2, obs_rx2) = std::sync::mpsc::sync_channel::<()>(1);
+    let obs_tx2 = Arc::new(std::sync::Mutex::new(Some(obs_tx2)));
+    let drv2 = StalledDisableDriver {
+        enabled: false,
+        entered: Arc::new(std::sync::Mutex::new(Some(entered_tx2))),
+        release: Arc::new(std::sync::Mutex::new(Some(release_rx2))),
+    };
+    let sup2 = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv2)));
+    sup2.set_lease_enabled(false).await;
+    sup2.set_torque(true).await.unwrap();
+    let mut cfg2 = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg2.panic_policy = PanicPolicy::StopExecutor;
+    let hooks2 = PersistTestHooks {
+        panic_on_release: Some(2),
+        panic_disable_timeout: Some(Duration::from_millis(60)),
+        on_panic_disable_timeout: Some(Arc::new(move || {
+            if let Some(tx) = obs_tx2.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        })),
+        ..Default::default()
+    };
+    let handle2 = sup2.start_executor_with_hooks(cfg2, hooks2).await.unwrap();
+    tokio::task::spawn_blocking(move || {
+        entered_rx2.recv_timeout(Duration::from_secs(2)).expect("entered blocked disable");
+        obs_rx2.recv_timeout(Duration::from_millis(600)).expect("observer fired TimedOut");
+    })
+    .await
+    .unwrap();
+
+    // Drop the LAST handle and supervisor while `release_tx2` is STILL HELD!
+    let t_drop2 = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        drop(handle2);
+        drop(sup2);
+    })
+    .await
+    .unwrap();
+    assert!(
+        t_drop2.elapsed() < Duration::from_millis(300),
+        "dropping last handle after panic timeout blocked for {:?} (unbounded join!)",
+        t_drop2.elapsed()
+    );
+    let _ = release_tx2.send(());
+}

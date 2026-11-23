@@ -699,12 +699,16 @@ impl OffThreadSinks {
 #[derive(Default)]
 struct TeardownDisable {
     requested: AtomicBool,
+    timed_out: AtomicBool,
     outcome: Mutex<Option<crate::supervisor::PanicDisableOutcome>>,
     done: Condvar,
 }
 
 impl TeardownDisable {
     fn set_outcome(&self, outcome: crate::supervisor::PanicDisableOutcome) {
+        if outcome == crate::supervisor::PanicDisableOutcome::TimedOut {
+            self.timed_out.store(true, Ordering::Release);
+        }
         let mut g = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
         *g = Some(outcome);
         self.done.notify_all();
@@ -783,11 +787,36 @@ impl RtExecutorShared {
 
         if let Some(bound) = emergency_bound {
             // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
-            // if a driver syscall stalls past the bound, do not hang emergency exit.
+            // if a driver syscall stalls past the bound, take and detach the join handle so no
+            // later teardown or `Drop` can join it without a deadline.
             let _ = self.teardown_disable.wait_outcome(bound);
-            if Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50)) {
-                if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let finished = !self.teardown_disable.timed_out.load(Ordering::Acquire)
+                && Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
+            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                if finished {
                     let _ = jh.join();
+                } else {
+                    self.exited.store(true, Ordering::Release);
+                    tracing::error!(
+                        "Emergency teardown: detaching stalled RT executor thread (`armd-control`) after {:?} timeout so later teardown/Drop cannot block indefinitely",
+                        bound
+                    );
+                    drop(jh);
+                }
+            }
+        } else if self.teardown_disable.timed_out.load(Ordering::Acquire) {
+            // A prior panic or emergency deadline observer already recorded `TimedOut`:
+            // wait only briefly for clean exit, then detach so `Drop`/`stop_and_join` stay bounded.
+            let finished = Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50));
+            if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                if finished {
+                    let _ = jh.join();
+                } else {
+                    self.exited.store(true, Ordering::Release);
+                    tracing::error!(
+                        "Teardown: detaching stalled RT executor thread (`armd-control`) after panic/emergency timeout so Drop cannot block indefinitely"
+                    );
+                    drop(jh);
                 }
             }
         } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -799,17 +828,20 @@ impl RtExecutorShared {
             let _ = jh.join();
         }
 
-        // Now wait for persistence cleanup: bounded on emergency teardown (so a hung `sync_all`
-        // cannot block returning the torque-off outcome), full join on normal teardown / Drop.
+        // Now wait for persistence cleanup: bounded + detach on emergency teardown (so a hung
+        // `sync_all` cannot block returning the torque-off outcome or a subsequent `Drop`),
+        // full join on normal teardown / Drop.
         if emergency_bound.is_some() {
-            if Self::wait_flag(&self.persist_exited_cv, Duration::from_millis(50)) {
-                if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let finished = Self::wait_flag(&self.persist_exited_cv, Duration::from_millis(50));
+            if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                if finished {
                     let _ = jh.join();
+                } else {
+                    tracing::warn!(
+                        "Emergency teardown: detaching stalled persistence worker (`armd-persist`) after bounded wait so later teardown/Drop cannot block indefinitely"
+                    );
+                    drop(jh);
                 }
-            } else {
-                tracing::warn!(
-                    "Emergency teardown: persistence worker still blocked in I/O after RT owner disable; returning without waiting"
-                );
             }
         } else if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = jh.join();
@@ -2394,7 +2426,6 @@ fn control_thread_main(
             let policy = cfg.panic_policy;
             let td_obs = Arc::clone(&teardown_disable);
             let exited_obs = Arc::clone(&exited);
-            let cv_obs = Arc::clone(&control_exited_cv);
             let hub_obs = Arc::clone(&hub);
             let timeout_hook = state.hooks.on_panic_disable_timeout.clone();
             let completed = crate::supervisor::run_with_panic_deadline_observer(
@@ -2419,9 +2450,9 @@ fn control_thread_main(
                             std::process::exit(1);
                         }
                         PanicPolicy::StopExecutor => {
+                            // Do NOT mark `control_exited_cv` here: `armd-control` is still blocked
+                            // inside the driver call and must be detached rather than joined.
                             exited_obs.store(true, Ordering::Release);
-                            *cv_obs.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                            cv_obs.1.notify_all();
                             hub_obs.wake();
                             if let Some(hook) = timeout_hook {
                                 hook();
