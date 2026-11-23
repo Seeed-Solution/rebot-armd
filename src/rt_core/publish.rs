@@ -121,15 +121,15 @@ impl RetireRing {
         Self { slots: std::array::from_fn(|_| UnsafeCell::new(None)), head: AtomicU64::new(0), tail: AtomicU64::new(0) }
     }
 
-    /// Producer: hands `obs` over, or gives it back when the ring is full.
-    fn push(&self, head: &mut u64, obs: ArmObservation) -> Result<(), ArmObservation> {
-        if *head - self.tail.load(Ordering::Acquire) >= RETIRE_CAPACITY as u64 { return Err(obs); }
+    /// Producer: hands `obs` over (None), or gives it back when the ring is full.
+    fn push(&self, head: &mut u64, obs: ArmObservation) -> Option<ArmObservation> {
+        if *head - self.tail.load(Ordering::Acquire) >= RETIRE_CAPACITY as u64 { return Some(obs); }
         // SAFETY: see the Sync impl; the replaced value is None (the consumer took it).
         let old = unsafe { (*self.slots[(*head % RETIRE_CAPACITY as u64) as usize].get()).replace(obs) };
         debug_assert!(old.is_none());
         *head += 1;
         self.head.store(*head, Ordering::Release);
-        Ok(())
+        None
     }
 
     /// Consumer (hub mutex held): frees what the producer handed over.
@@ -173,10 +173,8 @@ impl StatePublisher {
         let seq = self.seq;
         let slot = self.producer.back_mut();
         slot.meta = Some(SampleMeta { seq, generation, sampled_at, valid_until });
-        let displaced = slot.obs.replace(obs).and_then(|old| match self.hub.retire.push(&mut self.retire_head, old) {
-            Ok(()) => None,
-            Err(old) => { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); Some(old) }
-        });
+        let displaced = slot.obs.replace(obs).and_then(|old| self.hub.retire.push(&mut self.retire_head, old));
+        if displaced.is_some() { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); }
         copy_into(&mut slot.rt.positions, rt.positions);
         copy_into(&mut slot.rt.velocities, rt.velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
