@@ -382,6 +382,8 @@ pub struct SupervisorInner {
     pub gripper_stream_target: Option<f32>,
     /// Contact regulator of the stream (`gripper_policy.stream_contact_speed_rad_s`).
     pub gripper_stream_contact: Option<GripperStreamContact>,
+    /// Lease generation the gripper stream target was set under (None without a lease).
+    pub gripper_stream_lease: Option<u64>,
     /// A park carried an object (J7 frozen short of closed): release it at the resting pose.
     pub park_gripper_contact: bool,
     pub park_release: Option<ParkRelease>,
@@ -711,6 +713,7 @@ impl SupervisorInner {
             gripper_motion_hold: None,
             gripper_stream_target: None,
             gripper_stream_contact: None,
+            gripper_stream_lease: None,
             park_gripper_contact: false,
             park_release: None,
             pending_normal_unload: false,
@@ -994,6 +997,27 @@ impl SupervisorInner {
         self.gripper_force_ticks = 0;
         self.gripper_stream_target = None;
         self.gripper_stream_contact = None;
+        self.gripper_stream_lease = None;
+    }
+
+    /// End the gripper state of a servo stream or live policy (target, contact regulator) on
+    /// stop, E-stop, fault and lease loss: nothing may advance J7 for that stream afterwards.
+    /// While that state was active and torque is on, J7 holds the measured jaw.
+    pub fn end_gripper_stream(&mut self) {
+        let active = self.gripper_stream_target.is_some() || self.gripper_stream_contact.is_some();
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
+        self.gripper_stream_lease = None;
+        if !active || !self.is_torqued { return; }
+        let Some(g) = self.config.gripper_index() else { return };
+        let Some(&m) = self.measured_positions.get(g) else { return };
+        if !m.is_finite() { return; }
+        let m = self.config.limits.get(g).map_or(m, |l| m.clamp(l.min_position, l.max_position));
+        if g < self.commanded_positions.len() { self.commanded_positions[g] = m; }
+        if g < self.commanded_velocities.len() { self.commanded_velocities[g] = 0.0; }
+        if g < self.target_positions.len() { self.target_positions[g] = m; }
+        if let Some(st) = self.servo_target.as_mut() { if st.len() > g { st[g] = m; } }
+        if let Some(h) = self.gripper_motion_hold.as_mut() { h.0 = m; }
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -1748,6 +1772,7 @@ impl SupervisorInner {
         self.pending_normal_unload = false;
         self.unload_settle = None;
         self.zero_check_persisting = None;
+        self.end_gripper_stream();
         self.target_positions = self.commanded_positions.clone();
     }
 
@@ -3303,6 +3328,7 @@ impl SupervisorInner {
     fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
             self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
+            self.gripper_stream_lease = self.active_lease.as_ref().map(|l| l.generation);
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
                 let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
@@ -5510,7 +5536,15 @@ impl SupervisorInner {
         // 0.1 Gripper stall protection state machine
         if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
             || self.gravity_comp.is_some() || self.last_motion_frame.elapsed() > self.motion_frame_timeout {
+            // stream end: no further advance, the last command stays (it may hold a grip)
             self.gripper_stream_target = None;
+        }
+        // E-stop, fault, torque off or the stream's lease gone (lost, released, preempted)
+        let stream_lease_gone = self.lease_enabled
+            && self.active_lease.as_ref().map(|l| l.generation) != self.gripper_stream_lease;
+        if (self.gripper_stream_target.is_some() || self.gripper_stream_contact.is_some())
+            && (!self.safety.state().is_operational() || !self.is_torqued || stream_lease_gone) {
+            self.end_gripper_stream();
         }
         if let Some(g_idx) = self.config.gripper_index() {
             let (is_bus_fresh, has_torque_feedback, has_load_feedback) = if let Some(ref d) = self.driver {

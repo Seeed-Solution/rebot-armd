@@ -728,3 +728,44 @@ fn rigid_policy_stream_is_regulated() {
         assert!(inner.is_policy_run_active(id));
     }
 }
+
+/// Stop and E-stop end the stream's gripper state: after a torque-cap latch under a closing
+/// stream, the J7 command does not advance again on the following low-torque samples (before,
+/// the stream target outlived the stop until the 200 ms frame timeout).
+#[test]
+fn stop_and_estop_end_the_stream_gripper_state() {
+    for estop in [false, true] {
+        let (mut inner, rig) = rig_with(without_regulator(), Load::Rigid(-2.0, 10.0));
+        let epoch = inner.safety.epoch_id();
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        let mut tripped_for = 0;
+        for _ in 0..(10.0 / DT) as usize {
+            g = (g + DT as f32).min(0.0);
+            target[6] = g;
+            inner.servo(target.clone(), epoch).unwrap();
+            inner.tick(DT);
+            if inner.gripper_force_trips > 0 { tripped_for += 1; }
+            if tripped_for >= 5 { break; }
+        }
+        assert!(inner.gripper_force_trips > 0, "no trip");
+        if estop {
+            inner.requested_estop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            inner.stop_motion();
+        }
+        inner.tick(DT);
+        let at_stop = inner.commanded_positions[6];
+        assert!(inner.gripper_stream_target.is_none() && inner.gripper_stream_contact.is_none(), "estop {estop}");
+        // the block reads about 0 N·m at the held jaw: low-torque samples
+        let mut max_cmd = at_stop;
+        for _ in 0..100 {
+            inner.tick(DT);
+            max_cmd = max_cmd.max(inner.commanded_positions[6]);
+        }
+        let r = rig.lock().unwrap();
+        eprintln!("estop {estop}: J7 command {at_stop:.4} -> max {max_cmd:.4}, measured {:.4}, tau {:.3}", r.q[6], r.tau[6]);
+        assert!(max_cmd <= at_stop + 1e-6, "estop {estop}: J7 command advanced {at_stop} -> {max_cmd}");
+        assert!((at_stop - r.q[6]).abs() < 0.02, "estop {estop}: holds the measured jaw: cmd {at_stop}, jaw {}", r.q[6]);
+    }
+}
