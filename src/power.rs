@@ -702,6 +702,7 @@ impl SupervisorInner {
 }
 
 /// [`SupervisorInner::power_fit_quintic`] with the budget and arm model given (no lock).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::chain::ArmModel, dof: usize,
     traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
     limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
@@ -740,6 +741,7 @@ pub(crate) fn power_fit_quintic_with(budget: Option<&PowerBudget>, arm: &crate::
         Ok((t2, Some(scale)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
 
     /// `observation.power`.
