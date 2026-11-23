@@ -446,6 +446,8 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
+/* phones: the stock tool's name gives way to the header controls (the language switch went off screen) */
+@media (max-width: 600px) { #tool-badge.is-stock { display: none; } }
 .cwiz-fail ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .cwiz-grip { display: grid; gap: 8px; justify-items: start; }
@@ -7742,7 +7744,7 @@ function renderToolStatus() {
   if (badge) {
     badge.hidden = false;
     setText(badge, req ? t('tool.badge.comm', { id: tool.id }) : tool.id);
-    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? '' : 'is-ok'));
+    setCls(badge, 'sc-status-badge plain ' + (req ? 'is-warn' : tool.is_stock ? 'is-stock' : 'is-ok'));
     badge.title = req ? t('tool.comm.hint') : tool.id;
   }
   if (banner) {
