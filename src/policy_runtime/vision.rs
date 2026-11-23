@@ -468,8 +468,17 @@ static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Process-wide monotonic clock in milliseconds (immune to wall-clock rollbacks).
 pub fn monotonic_now_ms() -> u64 {
-    let epoch = MONOTONIC_EPOCH.get_or_init(Instant::now);
-    epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
+    monotonic_ms_at(Instant::now())
+}
+
+/// Convert a monotonic [`Instant`] into process-wide `armd_ms` using the same
+/// [`MONOTONIC_EPOCH`] as [`monotonic_now_ms`].
+pub fn monotonic_ms_at(instant: Instant) -> u64 {
+    let epoch = *MONOTONIC_EPOCH.get_or_init(|| instant);
+    instant
+        .saturating_duration_since(epoch)
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn normalize_sha256_hex(raw: &str, field: &str) -> Result<String, EmbeddingIngestError> {
@@ -728,6 +737,12 @@ pub struct HubCommitGuard<'a> {
 impl<'a> HubCommitGuard<'a> {
     pub fn live_ticket_state(&self) -> LiveEmbeddingTicketState {
         self.inner.live_ticket_state()
+    }
+
+    /// Synthetic test clock override when active (`None` in production, where callers use
+    /// [`monotonic_ms_at`] on the commit gate's `Instant`).
+    pub fn test_now_ms(&self) -> Option<u64> {
+        self.inner.test_now_ms
     }
 }
 

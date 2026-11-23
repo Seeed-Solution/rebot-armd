@@ -23,7 +23,7 @@ use super::units::{
     JointPermutation,
 };
 use super::vision::{
-    embedding_hub_for_supervisor, evaluate_vision_frame, extract_top1_target,
+    embedding_hub_for_supervisor, evaluate_vision_frame, extract_top1_target, monotonic_ms_at,
     DetectorTargetIdentity, EmbeddingSampleDecision, HubCommitGuard, PolicyVisionSource,
     VideoEmbeddingHub, VisionFeatureCollector, VisionStepDecision,
 };
@@ -532,6 +532,9 @@ pub struct CommitGateParams {
     pub vision_generation: Option<u64>,
     pub vision_target: Option<DetectorTargetIdentity>,
     pub live_ticket_ctx: Option<TicketVerificationContext>,
+    /// Optional synthetic `armd_ms` clock override for tests (`None` evaluates embedding
+    /// deadlines directly against `monotonic_ms_at(now)` from the gate's own clock read).
+    pub embedding_clock_override_ms: Option<u64>,
 }
 
 /// Decision returned by [`PreparedPolicy::commit_gate`].
@@ -1504,6 +1507,16 @@ impl PreparedPolicy {
             / period_ns.max(1))
         .min(u64::MAX as u128) as u64;
 
+        let eval_ticket_ctx = params.live_ticket_ctx.as_ref().map(|ctx| {
+            let now_armd_ms = params
+                .embedding_clock_override_ms
+                .unwrap_or_else(|| monotonic_ms_at(now));
+            TicketVerificationContext {
+                now_armd_ms,
+                ..ctx.clone()
+            }
+        });
+
         if self.contract.chunking.chunk_size <= 1 {
             let Some(src) = self.single_step_source.filter(|_| self.staged_ready) else {
                 self.staged_ready = false;
@@ -1516,7 +1529,7 @@ impl PreparedPolicy {
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
             if let (Some(ticket), Some(live_ctx)) =
-                (src.embedding_ticket, params.live_ticket_ctx.as_ref())
+                (src.embedding_ticket, eval_ticket_ctx.as_ref())
             {
                 if ticket.verify_identity_and_horizon(live_ctx, 0).is_err() {
                     self.clear_chunk_buffer();
@@ -1600,7 +1613,7 @@ impl PreparedPolicy {
                 }
             }
             if let (Some(ticket), Some(live_ctx)) =
-                (src.embedding_ticket, params.live_ticket_ctx.as_ref())
+                (src.embedding_ticket, eval_ticket_ctx.as_ref())
             {
                 let ticket_horizon = if is_fresh { 0 } else { params.horizon_ms };
                 if ticket
@@ -2310,7 +2323,7 @@ pub fn spawn_policy_runner(
             let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
             inner.record_policy_step_timing(action_id, infer_us, step_us);
 
-            let _detector_post_vision_checked = if video_embedding_spec.is_none() {
+            if video_embedding_spec.is_none() {
                 if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
                     let age_ms = Instant::now()
                         .saturating_duration_since(vis_cap)
@@ -2366,7 +2379,7 @@ pub fn spawn_policy_runner(
                         }
                     }
                 }
-            };
+            }
             if let Some(gate) = active_gate {
                 if let Some(ref emb) = video_embedding_spec {
                     if let Err(msg) = verify_embedding_release_gate(&gate, emb) {
@@ -2394,18 +2407,16 @@ pub fn spawn_policy_runner(
             // `inner`, re-verify current-tick `InferenceTicket`, then run the single
             // `commit_gate_now` immediately before `policy_step_with_vision`.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
-            let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
-                match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
-                    Ok(now_ms) => Some(now_ms),
-                    Err(violation) => {
-                        prepared.clear_chunk_buffer();
-                        inner.fail_policy_run(action_id, violation.code(), violation.message());
-                        break;
-                    }
+            if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
+                if let Err(violation) =
+                    verify_ticket_in_critical_section(&inner, action_id, ticket, guard)
+                {
+                    prepared.clear_chunk_buffer();
+                    inner.fail_policy_run(action_id, violation.code(), violation.message());
+                    break;
                 }
-            } else {
-                None
-            };
+            }
+            let embedding_clock_override_ms = _hub_guard.as_ref().and_then(|g| g.test_now_ms());
             let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
                 let live_hub = guard.live_ticket_state();
                 TicketVerificationContext {
@@ -2437,6 +2448,7 @@ pub fn spawn_policy_runner(
                 vision_generation: locked_generation,
                 vision_target: commit_vision_target,
                 live_ticket_ctx: commit_ticket_ctx,
+                embedding_clock_override_ms,
             };
             let (target, committed_period, input_age_ms, post_vision_age_ms) =
                 match prepared.commit_gate_now(
@@ -2454,9 +2466,9 @@ pub fn spawn_policy_runner(
                                     .min(u64::MAX as u128) as u64,
                             )
                         });
-                        let vis_age = if let (Some(now_ms), Some(mapped_ms)) =
-                            (emb_commit_now_ms, emb_mapped_ms)
-                        {
+                        let vis_age = if let Some(mapped_ms) = emb_mapped_ms {
+                            let now_ms = embedding_clock_override_ms
+                                .unwrap_or_else(|| monotonic_ms_at(gate_now));
                             Some(now_ms.saturating_sub(mapped_ms))
                         } else {
                             vision_captured_at.map(|cap| {
@@ -2798,6 +2810,7 @@ mod chunking_tests {
             vision_generation: Some(7),
             vision_target: None,
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
 
         // Tick 0: fresh inference staged and committed through commit_gate -> 0.1.
@@ -3170,6 +3183,7 @@ mod chunking_tests {
                 vision_generation: None,
                 vision_target: Some(id_n),
                 live_ticket_ctx: None,
+                embedding_clock_override_ms: None,
             };
             let d = prep
                 .commit_gate(
@@ -3218,6 +3232,7 @@ mod chunking_tests {
                 vision_generation: None,
                 vision_target: Some(target_cube),
                 live_ticket_ctx: None,
+                embedding_clock_override_ms: None,
             };
             prep_r.plan_chunk_step(&state, None, 0, src_r, None).unwrap();
             assert!(matches!(
@@ -3261,6 +3276,7 @@ mod chunking_tests {
             vision_generation: None,
             vision_target: Some(tid1),
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
         prep_t.plan_chunk_step(&state, None, 0, src_t, None).unwrap();
         assert!(matches!(
@@ -3334,6 +3350,7 @@ mod chunking_tests {
             vision_generation: None,
             vision_target: None,
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
 
         // Case 1: planned in period 0, commit_gate runs at 60 ms (period 1) -> submits chunk[1]=0.15.
@@ -3394,6 +3411,7 @@ mod chunking_tests {
             vision_generation: None,
             vision_target: None,
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
 
         // Period 0: fresh inference with base age 90 ms; at t=5ms age=95ms <= 100ms -> submits c0[0].
@@ -3479,6 +3497,7 @@ mod chunking_tests {
             vision_generation: None,
             vision_target: None,
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
         prep_c
             .plan_chunk_step(&state, None, 0, ChunkSource::from_joint(origin, Some(90)), None)
@@ -3564,6 +3583,7 @@ mod chunking_tests {
             vision_generation: None,
             vision_target: None,
             live_ticket_ctx: None,
+            embedding_clock_override_ms: None,
         };
 
         let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
@@ -3618,6 +3638,105 @@ mod chunking_tests {
             .unwrap();
         assert_eq!(d4, CommitGateDecision::Skip { commit_period: 4 });
         assert_eq!(prep.chunk_buffer_len(), 0);
+    }
+
+    #[test]
+    fn chunking_commit_gate_evaluates_embedding_deadline_against_gate_now() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let origin = Instant::now();
+        let origin_ms = monotonic_ms_at(origin);
+        let period_ns = Duration::from_millis(50).as_nanos();
+
+        // Ticket deadline is origin_ms + 30 ms; live_ticket_ctx carries an earlier sample (origin_ms + 5 ms).
+        let ticket = InferenceTicket::new(
+            1,
+            7,
+            1,
+            Some(3),
+            10,
+            1,
+            origin_ms + 60_000,
+            origin_ms + 30,
+            origin_ms + 1_000,
+        );
+        let earlier_ctx = TicketVerificationContext {
+            policy_instance_id: Some(1),
+            lease_generation: Some(7),
+            producer_epoch: Some(1),
+            model_generation: Some(3),
+            invalidation_generation: 10,
+            clock_handshake_generation: 1,
+            now_armd_ms: origin_ms + 5, // earlier sample: would falsely pass if not recomputed from gate `now`
+        };
+
+        // Case 1: chunk_size=4 fresh inference — deadline passes at t=20ms, expires at t=40ms (still period 0).
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let mut src = ChunkSource::from_joint(origin, Some(5));
+        src.embedding_ticket = Some(ticket);
+        let gate_params = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 200,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 100,
+            vision_generation: None,
+            vision_target: None,
+            live_ticket_ctx: Some(earlier_ctx.clone()),
+            embedding_clock_override_ms: None,
+        };
+        prep.plan_chunk_step(&state, None, 0, src, None).unwrap();
+        // Gate `now` = origin + 40 ms (> deadline origin_ms + 30 ms) -> must Skip and clear ring,
+        // ignoring earlier_ctx.now_armd_ms (origin_ms + 5 ms).
+        let d_exp = prep
+            .commit_gate(
+                origin + Duration::from_millis(40),
+                origin,
+                period_ns,
+                None,
+                &gate_params,
+            )
+            .unwrap();
+        assert_eq!(d_exp, CommitGateDecision::Skip { commit_period: 0 });
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Re-plan and check at gate `now` = origin + 20 ms (<= deadline) -> Submit succeeds.
+        prep.plan_chunk_step(&state, None, 0, src, None).unwrap();
+        assert!(matches!(
+            prep.commit_gate(
+                origin + Duration::from_millis(20),
+                origin,
+                period_ns,
+                None,
+                &gate_params,
+            )
+            .unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+
+        // Case 2: chunk_size=1 also evaluates the embedding deadline against gate `now`.
+        let c1 = make_constant_chunk(state_dim, &[0.25]);
+        let (snap1, contract1, cfg1) = make_chunk_snapshot_and_contract(1, 1, None);
+        let (backend1, _) = CountingChunkBackend::new(state_dim, state_dim, vec![c1]);
+        let mut prep1 =
+            PreparedPolicy::from_backend(snap1, contract1, Box::new(backend1), &cfg1).unwrap();
+        prep1.plan_chunk_step(&state, None, 0, src, None).unwrap();
+        assert_eq!(
+            prep1
+                .commit_gate(
+                    origin + Duration::from_millis(40),
+                    origin,
+                    period_ns,
+                    None,
+                    &gate_params,
+                )
+                .unwrap(),
+            CommitGateDecision::Skip { commit_period: 0 }
+        );
     }
 
     #[tokio::test]
