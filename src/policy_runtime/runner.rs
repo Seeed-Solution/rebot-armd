@@ -445,8 +445,12 @@ pub struct PreparedPolicy {
     policy_state_rad: Vec<f32>,
     infer_in: Vec<f32>,
     infer_out: Vec<f32>,
+    step_out_norm: Vec<f32>,
     policy_act_units: Vec<f32>,
     arm_target_rad: Vec<f32>,
+    chunk_step: usize,
+    /// Per-future-step queue of overlapping normalized action predictions (`len <= chunk_size`).
+    chunk_ring: std::collections::VecDeque<Vec<Vec<f32>>>,
 }
 
 impl PreparedPolicy {
@@ -476,9 +480,10 @@ impl PreparedPolicy {
                 actual: backend.input_dim(),
             });
         }
-        if backend.output_dim() != contract.action_dim {
+        let expected_out = contract.expected_output_dim();
+        if backend.output_dim() != expected_out {
             return Err(PolicyError::DimensionMismatch {
-                expected: contract.action_dim,
+                expected: expected_out,
                 actual: backend.output_dim(),
             });
         }
@@ -494,6 +499,7 @@ impl PreparedPolicy {
             .map(|p| (p.closed_rad, p.open_rad));
 
         let dim = contract.action_dim;
+        let chunk_cap = contract.chunking.chunk_size;
         Ok(Self {
             snapshot,
             contract,
@@ -504,9 +510,12 @@ impl PreparedPolicy {
             gripper_bounds,
             policy_state_rad: vec![0.0; dim],
             infer_in: vec![0.0; expected_in],
-            infer_out: vec![0.0; dim],
+            infer_out: vec![0.0; expected_out],
+            step_out_norm: vec![0.0; dim],
             policy_act_units: vec![0.0; dim],
             arm_target_rad: vec![0.0; dim],
+            chunk_step: 0,
+            chunk_ring: std::collections::VecDeque::with_capacity(chunk_cap),
         })
     }
 
@@ -650,12 +659,59 @@ impl PreparedPolicy {
             self.infer_in[dim..dim + vision_dim].copy_from_slice(vf);
         }
 
-        self.backend.infer(&self.infer_in, &mut self.infer_out)?;
-        for (idx, &v) in self.infer_out.iter().enumerate() {
-            if !v.is_finite() {
-                return Err(PolicyError::NonFinite(format!(
-                    "model output[{idx}] is non-finite: {v}"
-                )));
+        let chunking = self.contract.chunking;
+        let need_replan = chunking.chunk_size <= 1
+            || self.chunk_ring.is_empty()
+            || (self.chunk_step % chunking.replan_every == 0);
+
+        if need_replan {
+            self.backend.infer(&self.infer_in, &mut self.infer_out)?;
+            for (idx, &v) in self.infer_out.iter().enumerate() {
+                if !v.is_finite() {
+                    return Err(PolicyError::NonFinite(format!(
+                        "model output[{idx}] is non-finite: {v}"
+                    )));
+                }
+            }
+            if chunking.chunk_size > 1 {
+                if chunking.temporal_ensemble_k.is_none() {
+                    self.chunk_ring.clear();
+                }
+                while self.chunk_ring.len() < chunking.chunk_size {
+                    self.chunk_ring.push_back(Vec::new());
+                }
+                for offset in 0..chunking.chunk_size {
+                    let slice = &self.infer_out[offset * dim..(offset + 1) * dim];
+                    self.chunk_ring[offset].push(slice.to_vec());
+                }
+            }
+        }
+
+        if chunking.chunk_size <= 1 {
+            self.step_out_norm.copy_from_slice(&self.infer_out[..dim]);
+        } else {
+            let preds = self
+                .chunk_ring
+                .pop_front()
+                .ok_or_else(|| PolicyError::InferenceFailed("action chunk buffer unexpectedly empty".into()))?;
+            self.chunk_step = self.chunk_step.saturating_add(1);
+            if let Some(k) = chunking.temporal_ensemble_k.filter(|_| preds.len() > 1) {
+                self.step_out_norm.fill(0.0);
+                let mut w_sum = 0.0f32;
+                for (age_idx, p) in preds.iter().enumerate() {
+                    let w = (-k * (age_idx as f32)).exp();
+                    w_sum += w;
+                    for j in 0..dim {
+                        self.step_out_norm[j] += w * p[j];
+                    }
+                }
+                if w_sum > 0.0 {
+                    for j in 0..dim {
+                        self.step_out_norm[j] /= w_sum;
+                    }
+                }
+            } else if let Some(latest) = preds.last() {
+                self.step_out_norm.copy_from_slice(latest);
             }
         }
 
@@ -663,9 +719,9 @@ impl PreparedPolicy {
             &self.contract.normalization.action_mean,
             &self.contract.normalization.action_std,
         ) {
-            denormalize_action_into(&self.infer_out, mean, std, &mut self.policy_act_units)?;
+            denormalize_action_into(&self.step_out_norm, mean, std, &mut self.policy_act_units)?;
         } else {
-            self.policy_act_units.copy_from_slice(&self.infer_out);
+            self.policy_act_units.copy_from_slice(&self.step_out_norm);
         }
 
         let act_rad = policy_units_to_rad(
@@ -1377,4 +1433,205 @@ pub fn spawn_policy_runner(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod chunking_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct CountingChunkBackend {
+        in_dim: usize,
+        out_dim: usize,
+        calls: usize,
+        chunks: Vec<Vec<f32>>,
+    }
+
+    impl PolicyBackend for CountingChunkBackend {
+        fn backend_name(&self) -> &'static str {
+            "counting_chunk_mock"
+        }
+        fn input_dim(&self) -> usize {
+            self.in_dim
+        }
+        fn output_dim(&self) -> usize {
+            self.out_dim
+        }
+        fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+            let src = &self.chunks[self.calls.min(self.chunks.len() - 1)];
+            output.copy_from_slice(src);
+            self.calls += 1;
+            Ok(())
+        }
+    }
+
+    fn make_chunk_snapshot_and_contract(
+        chunk_size: usize,
+        replan_every: usize,
+        te_k: Option<f32>,
+    ) -> (PolicySnapshot, StrictPolicyContract, ArmConfig) {
+        let cfg = ArmConfig::default();
+        let dim = cfg.dof;
+        let names = cfg.joint_names.clone();
+        let mut pj = serde_json::json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "chunk_unit_test",
+            "unit_mode": "rad",
+            "action_dim": dim,
+            "action_space": "joint_positions",
+            "joint_names": names,
+            "model_file": "model.rmlp",
+            "outputs": {
+                "action": {
+                    "name": "action_chunk",
+                    "shape": [1, chunk_size * dim]
+                }
+            },
+            "chunking": {
+                "chunk_size": chunk_size,
+                "replan_every": replan_every,
+                "temporal_ensemble_k": te_k
+            }
+        });
+        if te_k.is_none() {
+            pj["chunking"].as_object_mut().unwrap().remove("temporal_ensemble_k");
+        }
+        let pj_bytes = serde_json::to_vec(&pj).unwrap();
+        let contract = StrictPolicyContract::parse(&pj_bytes).unwrap();
+        let snap = PolicySnapshot {
+            dir_path: PathBuf::from("."),
+            policy_json_bytes: pj_bytes,
+            model_rel_posix: "model.rmlp".into(),
+            model_bytes: Vec::new(),
+            release_digest: "0".repeat(64),
+        };
+        (snap, contract, cfg)
+    }
+
+    #[test]
+    fn chunking_replan_and_temporal_ensemble_exact_values() {
+        // Test 1: Open-loop chunking without temporal ensemble (chunk_size=4, replan_every=2)
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        let dim = cfg.dof;
+        // Chunk 0 fills step 0..3 with [0.1, 0.2, 0.3, 0.4]; Chunk 1 fills step 2..5 with [0.5, 0.6, 0.7, 0.8]
+        let mut c0 = Vec::with_capacity(4 * dim);
+        let mut c1 = Vec::with_capacity(4 * dim);
+        for k in 0..4 {
+            c0.extend(std::iter::repeat_n((k + 1) as f32 * 0.1, dim));
+            c1.extend(std::iter::repeat_n((k + 5) as f32 * 0.1, dim));
+        }
+        let backend = CountingChunkBackend {
+            in_dim: dim,
+            out_dim: 4 * dim,
+            calls: 0,
+            chunks: vec![c0.clone(), c1.clone()],
+        };
+        let mut prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let state = vec![0.0f32; dim];
+        let a0 = prep.step_infer(&state).unwrap(); // replans chunk 0 -> 0.1
+        let a1 = prep.step_infer(&state).unwrap(); // consumes chunk 0[1] -> 0.2
+        let a2 = prep.step_infer(&state).unwrap(); // replans chunk 1 -> 0.5
+        let a3 = prep.step_infer(&state).unwrap(); // consumes chunk 1[1] -> 0.6
+        assert!((a0[0] - 0.1).abs() < 1e-6);
+        assert!((a1[0] - 0.2).abs() < 1e-6);
+        assert!((a2[0] - 0.5).abs() < 1e-6);
+        assert!((a3[0] - 0.6).abs() < 1e-6);
+
+        // Test 2: Temporal ensembling (chunk_size=4, replan_every=2, k=0.01)
+        let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(4, 2, Some(0.01));
+        let backend2 = CountingChunkBackend {
+            in_dim: dim,
+            out_dim: 4 * dim,
+            calls: 0,
+            chunks: vec![c0, c1],
+        };
+        let mut prep2 = PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
+        let e0 = prep2.step_infer(&state).unwrap(); // only c0[0] = 0.1
+        let e1 = prep2.step_infer(&state).unwrap(); // only c0[1] = 0.2
+        let e2 = prep2.step_infer(&state).unwrap(); // overlaps c0[2]=0.3 (age 0) and c1[0]=0.5 (age 1)
+        assert!((e0[0] - 0.1).abs() < 1e-6);
+        assert!((e1[0] - 0.2).abs() < 1e-6);
+        let w0 = 1.0f32;
+        let w1 = (-0.01f32).exp();
+        let expected_e2 = (w0 * 0.3 + w1 * 0.5) / (w0 + w1);
+        assert!((e2[0] - expected_e2).abs() < 1e-5, "got {}, expected {}", e2[0], expected_e2);
+    }
+
+    #[test]
+    fn chunking_manifest_rejects_invalid_specs() {
+        let base = serde_json::json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "bad_chunk",
+            "unit_mode": "rad",
+            "action_dim": 7,
+            "action_space": "joint_positions",
+            "joint_names": ["j1", "j2", "j3", "j4", "j5", "j6", "g"],
+            "model_file": "model.rmlp"
+        });
+        for bad_chunk in [
+            serde_json::json!({"chunk_size": 0}),
+            serde_json::json!({"chunk_size": 4, "replan_every": 5}),
+            serde_json::json!({"chunk_size": 4, "replan_every": 0}),
+            serde_json::json!({"chunk_size": 4, "temporal_ensemble_k": -0.1}),
+            serde_json::json!({"chunk_size": 200}), // > MAX_CHUNK_SIZE
+        ] {
+            let mut pj = base.clone();
+            pj["chunking"] = bad_chunk;
+            assert!(
+                StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).is_err(),
+                "expected invalid chunking manifest to fail: {pj}"
+            );
+        }
+        // Mismatched outputs.action.shape when chunk_size=4 (expected 28, given 7)
+        let mut pj = base.clone();
+        pj["chunking"] = serde_json::json!({"chunk_size": 4, "replan_every": 2});
+        pj["outputs"] = serde_json::json!({"action": {"name": "a", "shape": [1, 7]}});
+        assert!(StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).is_err());
+    }
+
+    #[test]
+    fn loads_and_steps_exported_microduck_recamera_bundle_when_present() {
+        let bundle = PathBuf::from(
+            "/home/harvest/project/rebot-companion/examples/scenes/microduck_assembly/recamera_bundle",
+        );
+        if !bundle.join("policy.json").is_file() {
+            return;
+        }
+        let snap = PolicySnapshot::load_from_dir(&bundle).expect("load_from_dir");
+        let contract = StrictPolicyContract::parse(&snap.policy_json_bytes).expect("parse contract");
+        assert_eq!(contract.chunking.chunk_size, 24);
+        assert_eq!(contract.chunking.replan_every, 2);
+        assert_eq!(contract.expected_input_dim(), 135);
+        assert_eq!(contract.expected_output_dim(), 168);
+
+        let backend = super::super::load_backend(&snap, &contract).expect("load RMLP backend");
+        assert_eq!(backend.backend_name(), "mlp");
+        let mut cfg = ArmConfig::default();
+        cfg.dof = 7;
+        cfg.joint_names = vec![
+            "joint1".into(),
+            "joint2".into(),
+            "joint3".into(),
+            "joint4".into(),
+            "joint5".into(),
+            "joint6".into(),
+            "gripper".into(),
+        ];
+        while cfg.limits.len() < 7 {
+            cfg.limits.push(cfg.limits[0].clone());
+        }
+        for (i, name) in cfg.joint_names.iter().enumerate() {
+            cfg.limits[i].name = name.clone();
+        }
+        let mut prep = PreparedPolicy::from_backend(snap, contract, backend, &cfg).expect("from_backend");
+        let warm = prep.warmup(5, Duration::from_secs(5)).expect("warmup");
+        let state = vec![0.0f32; cfg.dof];
+        let emb = vec![0.0f32; 128];
+        for _ in 0..6 {
+            let act = prep.step_infer_with_vision(&state, Some(&emb)).expect("step_infer_with_vision");
+            assert_eq!(act.len(), cfg.dof);
+            assert!(act.iter().all(|v| v.is_finite()));
+        }
+        eprintln!("microduck recamera_bundle RMLP warmup p50={}us max={}us", warm.p50, warm.max);
+    }
 }

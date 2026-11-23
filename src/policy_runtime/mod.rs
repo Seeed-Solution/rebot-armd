@@ -15,10 +15,10 @@ pub mod vision;
 use thiserror::Error;
 
 pub use manifest::{
-    compute_release_digest, reject_external_onnx_data, NormalizationStats, PolicySnapshot,
-    StrictPolicyContract, UnitMode, VisionFeatureSpec, VisionLayout, VisionSourceKind,
-    VisionStalePolicy, VisionTargetLostPolicy, DEFAULT_VISION_MIN_SCORE, MAX_MODEL_BYTES,
-    MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
+    compute_release_digest, reject_external_onnx_data, ChunkingSpec, NormalizationStats,
+    PolicySnapshot, StrictPolicyContract, UnitMode, VisionFeatureSpec, VisionLayout,
+    VisionSourceKind, VisionStalePolicy, VisionTargetLostPolicy, DEFAULT_VISION_MIN_SCORE,
+    MAX_CHUNK_SIZE, MAX_MODEL_BYTES, MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
 };
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
@@ -116,9 +116,10 @@ pub fn load_backend(
             actual: backend.input_dim(),
         });
     }
-    if backend.output_dim() != contract.action_dim {
+    let expected_out = contract.expected_output_dim();
+    if backend.output_dim() != expected_out {
         return Err(PolicyError::DimensionMismatch {
-            expected: contract.action_dim,
+            expected: expected_out,
             actual: backend.output_dim(),
         });
     }
