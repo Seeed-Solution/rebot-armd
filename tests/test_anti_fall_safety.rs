@@ -719,7 +719,14 @@ async fn test_gripper_free_travel_friction_is_not_a_stall() {
     supervisor.set_torque(true).await.unwrap();
     supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.472]).await;
     for _ in 0..10 {
-        supervisor.inner().write().await.measured_velocities[6] = -0.36;
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.measured_positions[6] += -0.36 * 0.02;
+            let pos = inner.measured_positions[6];
+            inner.commanded_positions[6] = pos;
+            inner.target_positions[6] = pos;
+            inner.measured_velocities[6] = -0.36;
+        }
         supervisor.tick(0.02).await;
     }
     assert!(!supervisor.is_gripper_stalled().await, "moving gripper must not latch a stall");

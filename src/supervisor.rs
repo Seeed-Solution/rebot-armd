@@ -94,10 +94,13 @@ pub enum PreemptError {
     Cooldown(u64),
 }
 
-/// J7 stall latch: |τ7| at or above this (N·m) with the jaw still, for 6 ticks.
-/// Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's TMAX
-/// is 10, so the same physical torque is 0.80 × 10 / 18.
+/// J7 stall latch: |τ7| at or above this (N·m) with the jaw making no progress over the
+/// stall window. Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's
+/// TMAX is 10, so the same physical torque is 0.80 × 10 / 18.
 pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
+/// Minimum measured position excursion (rad) proving the jaw is advancing under load
+/// (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7).
+pub const GRIPPER_STALL_PROGRESS_EPS: f32 = 0.002;
 /// J7 stall release: |τ7| below this (N·m) for 6 ticks (formerly 0.40 at TMAX 18;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
@@ -347,6 +350,8 @@ pub struct SupervisorInner {
     pub gripper_stalled: bool,
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
+    pub gripper_stall_anchor_pos: Option<f32>,
+    pub gripper_stall_window_s: f64,
     pub gripper_stall_sign: f32,
     pub gripper_prev_hw_overload: bool,
     /// The stall latch was set (or refreshed) by the gripper torque cap.
@@ -683,6 +688,8 @@ impl SupervisorInner {
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
+            gripper_stall_anchor_pos: None,
+            gripper_stall_window_s: 0.0,
             gripper_stall_sign: 0.0,
             gripper_prev_hw_overload: false,
             gripper_force_capped: false,
@@ -826,6 +833,8 @@ impl SupervisorInner {
         self.gripper_prev_hw_overload = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_window_s = 0.0;
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
         self.gripper_stream_target = None;
@@ -1655,6 +1664,8 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_window_s = 0.0;
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
         let duration = motion.expected_duration();
@@ -2187,11 +2198,11 @@ impl SupervisorInner {
                     }
                 }
             } else if !self.gripper_stalled && !gripper_hw_overload {
-                let is_stalled = if has_torque_feedback {
+                let high_effort = if has_torque_feedback {
                     // the stream contact regulator holds the grip instead of the stall hold at
                     // the measured jaw (which reads ~0 N·m on a rigid object and re-squeezes)
                     self.gripper_stream_contact.is_none()
-                        && tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
+                        && tau_g.abs() >= GRIPPER_STALL_LATCH_NM
                 } else {
                     let stall_load_thresh = self.config.gripper_policy.as_ref()
                         .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)
@@ -2199,29 +2210,59 @@ impl SupervisorInner {
                         .map(|frac| (frac * 1.25).clamp(0.18, 0.35))
                         .unwrap_or(0.35);
                     let load_condition = if has_load_feedback { load_g.abs() > stall_load_thresh } else { true };
-                    gap.abs() > 0.08 && v_g.abs() < 0.05 && load_condition
+                    gap.abs() > 0.08 && load_condition
                 };
-                let required_ticks = if has_torque_feedback { 6 } else { 10 };
+                let active_gripper_speed = self.active_trajectory.as_ref()
+                    .and_then(|a| match &a.reference {
+                        crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm.planned_speed),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        let v = f64::from(v_cmd.abs());
+                        (v > 1e-4).then_some(v)
+                    })
+                    .filter(|v| v.is_finite() && *v > 0.0);
+                let base_window_s: f64 = if has_torque_feedback { 0.10 } else { 0.18 };
+                let stall_window_s = match active_gripper_speed {
+                    Some(speed) => base_window_s.max((2.0 * f64::from(GRIPPER_STALL_PROGRESS_EPS) / speed + 0.06).min(1.0)),
+                    None => base_window_s,
+                };
 
-                if is_stalled {
-                    self.gripper_high_torque_ticks += 1;
-                    if self.gripper_high_torque_ticks >= required_ticks {
-                        self.gripper_stalled = true;
-                        let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
-                        self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
-                        self.gripper_low_torque_ticks = 0;
-                        if let Some(&hold) = self.measured_positions.get(g_idx) {
-                            if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
-                            if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
-                            if let Some(ref mut st) = self.servo_target {
-                                if st.len() > g_idx {
-                                    st[g_idx] = hold;
+                if high_effort && p_meas.is_finite() {
+                    let progressed = self.gripper_high_torque_ticks > 0
+                        && self.gripper_stall_anchor_pos
+                            .is_some_and(|anchor| (p_meas - anchor).abs() >= GRIPPER_STALL_PROGRESS_EPS);
+                    if self.gripper_high_torque_ticks == 0 || progressed {
+                        self.gripper_stall_anchor_pos = Some(p_meas);
+                        self.gripper_high_torque_ticks = 1;
+                        self.gripper_stall_window_s = 0.0;
+                    } else {
+                        self.gripper_high_torque_ticks += 1;
+                        self.gripper_stall_window_s += dt;
+                        if self.gripper_high_torque_ticks >= 2
+                            && self.gripper_stall_window_s >= stall_window_s - 1e-9
+                        {
+                            self.gripper_stalled = true;
+                            self.gripper_stall_anchor_pos = None;
+                            self.gripper_stall_window_s = 0.0;
+                            let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
+                            self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
+                            self.gripper_low_torque_ticks = 0;
+                            if let Some(&hold) = self.measured_positions.get(g_idx) {
+                                if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
+                                if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
+                                if let Some(ref mut st) = self.servo_target {
+                                    if st.len() > g_idx {
+                                        st[g_idx] = hold;
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
                     self.gripper_high_torque_ticks = 0;
+                    self.gripper_stall_anchor_pos = None;
+                    self.gripper_stall_window_s = 0.0;
                 }
             } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
                 // torque-cap latch under a stream: held until the stream opens (intake) or ends
