@@ -258,7 +258,7 @@ fn default_timeout_covers_a_full_stroke() {
 
 
 /// The deadline covers the squeeze: a grasp whose squeeze would end after timeout_s fails
-/// GRIPPER_TIMEOUT at the deadline, keeping the squeeze hold (the grip stays).
+/// GRIPPER_TIMEOUT at the deadline; J7 then holds the measured jaw.
 #[test]
 fn deadline_covers_the_squeeze() {
     // contact at -2.0 after about 3.4 s from -5.0 at 1 rad/s: find when the squeeze starts
@@ -287,6 +287,8 @@ fn deadline_covers_the_squeeze() {
     eprintln!("full grasp done after {done_at:.2} s; with timeout {timeout:.2} s: {} {:?} after {t:.2} s, J7 command {:.3}", a.state, a.code, inner.commanded_positions[6]);
     assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id2, "failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
     assert!(t <= timeout + 2.0 * DT + 1e-9, "{t} > {timeout}");
-    assert!(inner.commanded_positions[6] > -2.0, "squeeze hold kept: {}", inner.commanded_positions[6]);
+    // an action that ends without finishing holds the measured jaw (no further compression)
+    inner.tick(DT);
+    assert!((inner.commanded_positions[6] - inner.measured_positions[6]).abs() < 1e-3, "J7 command {} vs jaw {}", inner.commanded_positions[6], inner.measured_positions[6]);
     let _ = id;
 }

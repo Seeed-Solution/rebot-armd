@@ -882,3 +882,40 @@ fn third_cap_trip_stops_the_stream() {
     eprintln!("after the third trip: J7 command {cmd:.4} -> {:.4}, peak {peak:.3} N·m", inner.commanded_positions[6]);
     assert!(inner.commanded_positions[6] <= cmd + 1e-6 && peak <= 0.05, "pressed again: peak {peak}");
 }
+
+/// Stop or E-stop during a plain gripper close onto a soft object, with the command ahead of
+/// the jaw: within one tick the J7 command is the measured jaw and the object is not compressed
+/// further.
+#[test]
+fn stop_during_a_gripper_action_holds_the_measured_jaw() {
+    for estop in [false, true] {
+        let (mut inner, rig) = rig(Load::Rigid(-2.0, 1.5));
+        let epoch = inner.safety.epoch_id();
+        let (_id, _) = inner.start_gripper(close(false), epoch).unwrap();
+        let mut lead = 0.0;
+        for _ in 0..(10.0 / DT) as usize {
+            inner.tick(DT);
+            let q = rig.lock().unwrap().q[6];
+            lead = inner.commanded_positions[6] - q;
+            if q >= -2.0 - 1e-6 && lead >= 0.15 { break; }
+        }
+        let tau_at_stop = rig.lock().unwrap().tau[6];
+        assert!(lead >= 0.15 && tau_at_stop < cap(), "lead {lead}, tau {tau_at_stop}");
+        if estop {
+            inner.requested_estop_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            inner.stop_motion();
+        }
+        inner.tick(DT);
+        let (cmd, meas) = (inner.commanded_positions[6], inner.measured_positions[6]);
+        eprintln!("estop {estop}: lead {lead:.3} rad, tau {tau_at_stop:.3} N·m at the stop; one tick later command {cmd:.4}, jaw {meas:.4}");
+        assert!((cmd - meas).abs() < 1e-3, "estop {estop}: command {cmd} vs jaw {meas}");
+        rig.lock().unwrap().peak_tau = 0.0;
+        for _ in 0..50 {
+            inner.tick(DT);
+            assert!((inner.commanded_positions[6] - cmd).abs() < 1e-6, "estop {estop}: command moved");
+        }
+        let peak = rig.lock().unwrap().peak_tau;
+        assert!(peak <= 0.01, "estop {estop}: still compressing, {peak} N·m");
+    }
+}

@@ -393,6 +393,10 @@ pub struct SupervisorInner {
     pub gripper_stream_contact: Option<GripperStreamContact>,
     /// Lease generation the gripper stream target was set under (None without a lease).
     pub gripper_stream_lease: Option<u64>,
+    /// A gripper action reference was active at the start of the previous tick ...
+    pub gripper_ref_prev: bool,
+    /// ... and it reported done in that tick (a normal end keeps its hold).
+    pub gripper_ref_done: bool,
     /// Grip ramp of the current torque-cap latch (stiffness estimate, trips on this contact);
     /// None while no latch holds.
     pub gripper_cap_ramp: Option<crate::motion::CapRamp>,
@@ -728,6 +732,8 @@ impl SupervisorInner {
             gripper_stream_target: None,
             gripper_stream_contact: None,
             gripper_stream_lease: None,
+            gripper_ref_prev: false,
+            gripper_ref_done: false,
             gripper_cap_ramp: None,
             gripper_over_cap_prev: false,
             park_gripper_contact: false,
@@ -1039,6 +1045,26 @@ impl SupervisorInner {
         if g < self.target_positions.len() { self.target_positions[g] = m; }
         if let Some(st) = self.servo_target.as_mut() { if st.len() > g { st[g] = m; } }
         if let Some(h) = self.gripper_motion_hold.as_mut() { h.0 = m; }
+    }
+
+    /// A gripper action (or macro gripper step) ends without finishing (stop, E-stop, fault,
+    /// lease loss, cancel): J7 command and target go to the measured jaw (clamped to the limits),
+    /// so a command that led the jaw does not keep compressing after the stop.
+    pub fn hold_gripper_at_measured(&mut self) {
+        if !self.is_torqued { return; }
+        let Some(g) = self.config.gripper_index() else { return };
+        let Some(&m) = self.measured_positions.get(g) else { return };
+        if !m.is_finite() { return; }
+        let m = self.config.limits.get(g).map_or(m, |l| m.clamp(l.min_position, l.max_position));
+        if g < self.commanded_positions.len() { self.commanded_positions[g] = m; }
+        if g < self.commanded_velocities.len() { self.commanded_velocities[g] = 0.0; }
+        if g < self.target_positions.len() { self.target_positions[g] = m; }
+        if let Some(st) = self.servo_target.as_mut() { if st.len() > g { st[g] = m; } }
+        if let Some(h) = self.gripper_motion_hold.as_mut() { h.0 = m; }
+    }
+
+    fn gripper_reference_active(&self) -> bool {
+        matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_)))
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -1786,6 +1812,7 @@ impl SupervisorInner {
         }
         #[cfg(feature = "policy-runtime")]
         self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
+        if self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -2458,6 +2485,7 @@ impl SupervisorInner {
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
+        if policy != StopPolicy::NormalUnload && self.gripper_reference_active() { self.hold_gripper_at_measured(); }
         #[cfg(feature = "policy-runtime")]
         match policy {
             StopPolicy::NormalUnload => {
@@ -6123,6 +6151,15 @@ impl SupervisorInner {
         } else {
             None
         };
+        // a gripper action that ended since the last tick without reporting done (lease loss,
+        // fault, cancel), or one still installed while the arm is stopped: hold the measured jaw
+        let grip_active = self.gripper_reference_active();
+        if (self.gripper_ref_prev && !grip_active && !self.gripper_ref_done)
+            || (grip_active && !self.safety.state().is_operational()) {
+            self.hold_gripper_at_measured();
+        }
+        self.gripper_ref_prev = grip_active;
+        self.gripper_ref_done = false;
         let mut grip_learned: Option<(Option<u64>, crate::gripper_baseline::MoveRecord)> = None;
         let cap_k = self.gripper_cap_ramp.map(|r| r.k_est);
         let mut grip_contact: Option<crate::gripper_baseline::ContactInfo> = None;
@@ -6198,6 +6235,7 @@ impl SupervisorInner {
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
+                if matches!(out.status, StepStatus::Done { .. }) { self.gripper_ref_done = true; }
                 deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Arm(mut out))) => {
