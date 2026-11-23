@@ -1557,9 +1557,12 @@ fn merge_check_production_supervisor_estop_gate_with_stops_via_zero_offset_drive
         shared.lock().unwrap().write_joint_targets_bounded(&targets_const(0.35)).unwrap(),
         TxBatchOutcome::Deferred { pending: 3 }
     );
-    // Request and apply an ORDINARY authorized stop (E-stop stays at generation 0 and unlatched).
+    // Request and apply an ORDINARY authorized stop using SupervisorInner::authorized_stop()
+    // before advancing the applied generation (matching src/supervisor.rs:3576-3577; E-stop
+    // stays at generation 0 and unlatched).
     let g = stops.request();
     assert!(inner.estop_gate().pending(), "ordinary stop must be pending before applied");
+    let _ = inner.authorized_stop();
     stops.mark_applied(g);
     assert!(!inner.estop_gate().pending(), "ordinary stop is applied (requested == applied)");
     assert_eq!(inner.estop_gate().generations(), (0, 1));
@@ -1754,4 +1757,252 @@ fn j7_pos_force_autonomous_recovery_obeys_estop_and_handshake_obeys_tx_budget() 
     assert!(confirmed, "J7 handshake should complete once TX budget is restored");
     assert!(bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC)));
     assert!(bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)));
+}
+
+#[test]
+fn deferred_j7_opening_command_rebuilds_with_close_speed_cap_when_feedback_passes_target() {
+    // Blocker regression: defer an opening J7 command (allowed higher speed = 2.0 rad/s, raw 200),
+    // then deliver fresh feedback placing J7 past the target so the command is now CLOSING.
+    // Draining MUST rebuild the J7 frame from live feedback and cap wire speed at close_speed_rad_s
+    // (0.30 rad/s -> raw 30), never replaying the cached opening-speed bytes.
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("enable");
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    // Admission at q = -1.0 toward target = -2.0 (opening toward open_rad = -5.7 at 2.0 rad/s).
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let mut t = targets_const(0.0);
+    t[6] = JointTarget { position: -2.0, velocity: Some(2.0), ..JointTarget::position(-2.0) };
+    assert_eq!(
+        d.write_joint_targets_bounded(&t).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    assert!(!bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)), "J7 must be deferred");
+
+    // Before draining, fresh feedback arrives showing J7 moved to -2.5 (past target -2.0 -> now CLOSING).
+    clock.advance(ms(10));
+    bus.with(|s| {
+        s.motors[6].2 = -2.5;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    bus.clear();
+
+    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
+    let j7_frames: Vec<_> = bus.with(|s| s.tx_accepted.iter().filter(|f| f.id == 0x307).copied().collect());
+    assert_eq!(j7_frames.len(), 1, "expected 1 J7 0x307 frame on drain: {j7_frames:?}");
+    let wire_vel_raw = u16::from_le_bytes([j7_frames[0].data[4], j7_frames[0].data[5]]);
+    assert_eq!(
+        wire_vel_raw, 30,
+        "deferred J7 frame must rebuild from latest feedback with close_speed_rad_s cap (raw 30, not opening 200)"
+    );
+}
+
+#[test]
+fn enable_and_retry_frames_obey_tx_budget_across_polls() {
+    // Major 1 regression: with max_frames = 1 throughout the entire PosForce enable handshake
+    // (CTRL_MODE=4 restore, readback, 0x307 pre-enable hold, 7 initial enable frames, and retries),
+    // NO single poll may transmit more than 1 frame, and enable still completes across polls.
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let p = d.begin_torque(true).expect("begin_torque under max_frames=1");
+    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(
+        bus.with(|s| s.tx_log.len()) <= 1,
+        "begin_torque exceeded max_frames=1: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    let mut confirmed = false;
+    let mut total_enables = 0usize;
+    for step in 0..30 {
+        bus.clear();
+        clock.advance(ms(1));
+        match d.poll_torque(clock.now() + ms(5)).expect("poll_torque under max_frames=1") {
+            armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
+                assert!(
+                    bus.with(|s| s.tx_log.len()) <= 1,
+                    "step {step} exceeded max_frames=1"
+                );
+                confirmed = true;
+                break;
+            }
+            armd::driver::TorqueProgress::Pending { .. } => {
+                let sent = bus.with(|s| s.tx_log.clone());
+                assert!(
+                    sent.len() <= 1,
+                    "step {step} exceeded max_frames=1 (sent {} frames): {sent:?}",
+                    sent.len()
+                );
+                total_enables += sent.iter().filter(|f| f.data == damiao::CMD_ENABLE).count();
+            }
+            other => panic!("unexpected torque outcome: {other:?}"),
+        }
+    }
+    assert!(confirmed, "enable handshake must carry remaining enable frames across max_frames=1 polls and confirm");
+    assert_eq!(total_enables, 7, "all 7 motors enabled 1 frame per poll");
+}
+
+#[test]
+fn mode_handover_preflights_ctrl_mode_plus_hold_atomically_against_tx_budget() {
+    // Major 2 regression: when only 1 TX slot remains (enough for CTRL_MODE=4 but NOT its
+    // required 0x307 hold), BOTH set_joint_modes and set_joint_modes_confirmed MUST refuse
+    // BEFORE transmitting CTRL_MODE=4 (0 frames on the bus).
+    let limits = b601_limits();
+    let (bus, _clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("enable");
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    let mut mit_modes = [JointMode::Position; 7];
+    mit_modes[6] = JointMode::Mit;
+    let hold = targets_const(-1.0);
+    d.set_joint_modes(&mit_modes, &hold).expect("switch J7 to MIT");
+
+    let pos_modes = [JointMode::Position; 7];
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+
+    bus.clear();
+    assert!(d.set_joint_modes(&pos_modes, &hold).is_err());
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "set_joint_modes must not send CTRL_MODE=4 without TX budget room for 0x307 hold: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Restore J7 mode tracking back to Mit and verify set_joint_modes_confirmed too.
+    d.set_tx_budget(TxBudget::default());
+    d.set_joint_modes(&mit_modes, &hold).expect("re-enter MIT");
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    assert!(d.set_joint_modes_confirmed(&pos_modes, &hold).is_err());
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "set_joint_modes_confirmed must not send CTRL_MODE=4 without TX budget room for 0x307 hold: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+}
+
+#[test]
+fn pending_stop_inhibits_round_robin_refresh_and_confirmed_mode_handover() {
+    // Major 3 regression:
+    // Part A: round-robin 0xCC refresh does not transmit while a stop is pending, and resumes
+    // once the stop is applied.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_torque(false).unwrap();
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+
+    let g = stops.request();
+    assert!(inner.estop_gate().pending());
+    clock.advance(ms(120));
+    bus.clear();
+    d.read_joint_states().unwrap();
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "pending stop must inhibit 0xCC refresh sweep: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Once applied (requested == applied), read-only 0xCC telemetry refresh resumes.
+    let _ = inner.authorized_stop();
+    stops.mark_applied(g);
+    assert!(!inner.estop_gate().pending());
+    bus.clear();
+    d.read_joint_states().unwrap();
+    assert!(
+        bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC)),
+        "0xCC refresh should resume once stop is applied"
+    );
+
+    // Part B: set_joint_modes_confirmed under pending stop fails closed with EstopInhibited and 0 frames.
+    let (mut d, bus, _) = enabled_driver();
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+    let _ = stops.request();
+    let mut mit_modes = [JointMode::Position; 7];
+    mit_modes[3] = JointMode::Mit;
+    bus.clear();
+    let err = d.set_joint_modes_confirmed(&mit_modes, &targets_const(0.0)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "confirmed mode handover must obey pending stop: {err:?}");
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "no frames may be sent during confirmed mode handover under pending stop: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
 }

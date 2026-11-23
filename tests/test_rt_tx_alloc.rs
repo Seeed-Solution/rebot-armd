@@ -235,6 +235,9 @@ impl CanTransport for NoAllocDamiaoBus {
             }
         }
     }
+
+    fn supports_bounded_flush(&self) -> bool { true }
+    fn supports_nonblocking_rt(&self) -> bool { true }
 }
 
 fn b601_limits() -> Vec<DamiaoLimits> {
@@ -659,4 +662,117 @@ fn first_recovery_write_does_not_allocate_or_free() {
     res.unwrap();
     assert_eq!(recovered, vec![0, 1, 2, 3, 4, 5, 6]);
     assert_eq!((a, f), (0, 0), "recovery write after take_recovery_writes() touched allocator");
+}
+
+#[test]
+fn budgeted_clear_fault_and_pre_enable_hold_errors_do_not_allocate_or_free() {
+    // Major 4 regression: clear_fault_budgeted preserves zero-alloc TransportError on TX/flush
+    // failure (WouldBlock, ENOBUFS, SocketCanOs ENETDOWN), and finish_pos_force_readback reports
+    // pre-enable hold TX budget exhaustion without heap allocation.
+    let limits = b601_limits();
+    let bus = NoAllocDamiaoBus::new(&limits);
+    let clock = bus.clock.clone();
+    let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap();
+    d.can_mut().push_all_feedback();
+    d.read_joint_states().unwrap();
+    reset_tx_metrics();
+
+    // 1. clear_fault_budgeted TX WouldBlock -> 0 allocs, 0 frees.
+    d.can_mut().mode = Mode::WouldBlockAfter(0);
+    d.can_mut().tx_count = 0;
+    let dl = clock.now() + Duration::from_millis(50);
+    let (ok, a, f) = counted(|| {
+        let res = d.clear_fault_budgeted(dl);
+        matches!(res, Err(ArmDriverError::Transport(TransportError::WouldBlock)))
+    });
+    assert!(ok, "expected typed Transport(WouldBlock)");
+    assert_eq!((a, f), (0, 0), "clear_fault_budgeted WouldBlock touched allocator");
+
+    // 2. clear_fault_budgeted flush ENOBUFS -> 0 allocs, 0 frees.
+    d.can_mut().mode = Mode::Ok;
+    d.can_mut().flush_err = Some(Mode::EnobufsAfter(0));
+    let dl = clock.now() + Duration::from_millis(50);
+    let (ok, a, f) = counted(|| {
+        let res = d.clear_fault_budgeted(dl);
+        matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace)))
+    });
+    assert!(ok, "expected typed Transport(NoBufferSpace)");
+    assert_eq!((a, f), (0, 0), "clear_fault_budgeted flush ENOBUFS touched allocator");
+
+    // 3. clear_fault_budgeted SocketCAN ENETDOWN -> 0 allocs, 0 frees.
+    #[cfg(target_os = "linux")]
+    {
+        d.can_mut().flush_err = None;
+        d.can_mut().mode = Mode::SocketCanOsAfter(0, libc::ENETDOWN);
+        d.can_mut().tx_count = 0;
+        let dl = clock.now() + Duration::from_millis(50);
+        let (ok, a, f) = counted(|| {
+            let res = d.clear_fault_budgeted(dl);
+            matches!(
+                res,
+                Err(ArmDriverError::Transport(TransportError::SocketCanOs {
+                    op: "send",
+                    errno: Some(libc::ENETDOWN),
+                    ..
+                }))
+            )
+        });
+        assert!(ok, "expected typed Transport(SocketCanOs ENETDOWN)");
+        assert_eq!((a, f), (0, 0), "clear_fault_budgeted ENETDOWN touched allocator");
+    }
+
+    // 4. finish_pos_force_readback pre-enable hold TX budget exhaustion -> 0 allocs, 0 frees.
+    let bus_pf = NoAllocDamiaoBus::new(&limits);
+    let clock_pf = bus_pf.clock.clone();
+    let mut d_pf = DamiaoArmDriver::new(bus_pf, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(armd::driver::GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d_pf.can_mut().motors[6].2 = -1.0;
+    d_pf.read_joint_states().unwrap();
+    d_pf.can_mut().push_all_feedback();
+    d_pf.read_joint_states().unwrap();
+    // Advance through mode restore and readback request under default budget.
+    d_pf.begin_torque(true).unwrap();
+    // Poll restore reply -> transitions to Readback.
+    clock_pf.advance(Duration::from_millis(1));
+    d_pf.poll_torque(clock_pf.now() + Duration::from_millis(10)).unwrap();
+    // Poll readback -> sends RID_CTRL_MODE read request and queues reply in NoAllocDamiaoBus!
+    // NoAllocDamiaoBus doesn't simulate REG_READ replies unless we push one directly.
+    clock_pf.advance(Duration::from_millis(1));
+    d_pf.poll_torque(clock_pf.now() + Duration::from_millis(10)).unwrap();
+    // Push CTRL_MODE=4 read reply on expected reply ID 0x17 + fresh J7 feedback, then set max_frames = 0.
+    let [lo, hi] = 7u16.to_le_bytes();
+    let val = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+    let reply = CanFrame::new_standard(
+        0x17,
+        &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, val[0], val[1], val[2], val[3]],
+    )
+    .unwrap();
+    d_pf.can_mut().rx.push_back(reply);
+    d_pf.can_mut().push_all_feedback();
+    d_pf.set_tx_budget(TxBudget {
+        max_frames: 0,
+        max_duration: Duration::from_millis(5),
+        frame_max_age: Duration::from_millis(45),
+    });
+    let dl = clock_pf.now() + Duration::from_millis(10);
+    let (ok, a, f) = counted(|| {
+        let res = d_pf.poll_torque(dl);
+        matches!(res, Err(ArmDriverError::PosForcePreEnableHoldBudgetExhausted { joint: 6 }))
+    });
+    assert!(ok, "expected PosForcePreEnableHoldBudgetExhausted {{ joint: 6 }}");
+    assert_eq!((a, f), (0, 0), "pre-enable hold budget exhaustion touched allocator");
 }
