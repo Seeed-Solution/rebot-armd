@@ -247,6 +247,14 @@ pub struct CommitCtx {
 /// Receive frames the bus owner services per release at most (design: 64 frames or 5 ms).
 pub const RX_FRAME_BUDGET: u16 = 64;
 /// Time the bus owner services per release at most.
+///
+/// A receive pass the budget cuts leaves the unread replies queued and the joints' feedback
+/// older. With the MIT deadline fence armed (gravity compensation, MIT tracking), feedback
+/// that ages past the fence (45 ms) trips the whole group and discards cached output: this
+/// is deliberate (stale feedback never drives MIT output), so the budget has to drain a
+/// release's traffic. Expected per release (inference, not measured): one reply per command
+/// frame and motor, plus status polls, i.e. well under 64 frames for 7 motors at 50 Hz. The
+/// sizing is checked in the device qualification (worst RX age at load), not here.
 pub const RX_TIME_BUDGET: Duration = Duration::from_millis(5);
 
 /// What one [`CoreOps::poll_hardware`] may spend: it returns by `deadline` (the earlier of
