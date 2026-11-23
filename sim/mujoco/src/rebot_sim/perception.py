@@ -896,10 +896,64 @@ class VideoStream:
         self.sent += 1
 
 
-def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
-    """Start the WebSocket server in a thread; returns the server."""
+class SnapshotStore:
+    """`GET /snapshot.jpg` on the video port, as rebot-vision's video server: the current wrist frame as a
+    640x640 JPEG (the 640x360 image letterboxed, bars above and below; armd crops it back). The rig renders
+    it only while snapshots are being asked for (WANT_S after the last request); each frame's JPEG carries
+    its frame id, so two frames of a still scene still differ (a real camera's noise does that; armd's
+    multi-view capture waits for a snapshot that differs from the one before its trigger)."""
+
+    WANT_S = 5.0
+    SIZE = (640, 360)
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.want_until = 0.0
+        self.jpeg: bytes | None = None
+
+    def wanted(self) -> bool:
+        return time.monotonic() < self.want_until
+
+    def put(self, rgb: np.ndarray, frame_id: int) -> None:
+        import io
+
+        from PIL import Image
+
+        w, h = self.SIZE
+        img = Image.fromarray(rgb, mode="RGB").resize((w, h), Image.BILINEAR)
+        box = Image.new("RGB", (w, w), (114, 114, 114))
+        box.paste(img, (0, (w - h) // 2))
+        buf = io.BytesIO()
+        box.save(buf, format="JPEG", quality=90, comment=f"frame {frame_id}".encode())
+        with self.cond:
+            self.jpeg = buf.getvalue()
+            self.cond.notify_all()
+
+    def get(self, timeout: float = 2.0) -> bytes | None:
+        with self.cond:
+            self.want_until = time.monotonic() + self.WANT_S
+            if self.jpeg is None:
+                self.cond.wait(timeout)
+            return self.jpeg
+
+
+def serve_video(host: str, port: int, streams: dict[str, VideoStream], snapshot: SnapshotStore | None = None):
+    """Start the WebSocket server in a thread; returns the server. With `snapshot`, plain HTTP
+    `GET /snapshot.jpg` on the same port answers with the current wrist frame."""
+    from websockets.datastructures import Headers
     from websockets.exceptions import ConnectionClosed
+    from websockets.http11 import Response
     from websockets.sync.server import serve
+
+    def process_request(connection, request):
+        if snapshot is None or urlparse(request.path).path != "/snapshot.jpg":
+            return None
+        jpeg = snapshot.get()
+        if jpeg is None:
+            return Response(503, "Service Unavailable", Headers([("Content-Length", "0")]), b"")
+        return Response(200, "OK", Headers([("Content-Type", "image/jpeg"), ("Content-Length", str(len(jpeg))),
+                                            ("Cache-Control", "no-store")]), jpeg)
 
     def handler(ws):
         path = urlparse(ws.request.path).path.rstrip("/") or "/"
@@ -920,7 +974,7 @@ def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
         finally:
             stream.remove(q)
 
-    server = serve(handler, host, port, compression=None, max_size=2**20)
+    server = serve(handler, host, port, compression=None, max_size=2**20, process_request=process_request)
     threading.Thread(target=server.serve_forever, name="video-ws", daemon=True).start()
     return server
 
@@ -2077,6 +2131,7 @@ class CameraRig:
                 self.dr_summary["generation"] = self.dr_generation
             self._dr_latency_ms = float(self.dr_summary.get("latency_ms", 0.0))
         self.streams = {"/": VideoStream()}
+        self.snapshot = SnapshotStore()
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
         self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
@@ -3486,6 +3541,9 @@ class CameraRig:
                      self.board_markers(self.frame_id), self.last_inference_ms),
                     detector_generation=det_gen,
                 )
+            if self.snapshot.wanted():
+                renderer.update_scene(self.data, camera="wrist", scene_option=opt)
+                self.snapshot.put(renderer.render(), self.frame_id)
             for path, stream in self.streams.items():
                 if not stream.active:
                     continue
@@ -3581,7 +3639,7 @@ def camera_main(
     try:
         rig = CameraRig(cfg, state, SimLink(conn))
         rig.setup()  # renderers and encoders before readiness is reported
-        serve_video(cfg["host"], cfg["video_port"], rig.streams)
+        serve_video(cfg["host"], cfg["video_port"], rig.streams, rig.snapshot)
         PerceptionServer(rig.perception, rig, cfg["host"], cfg["perception_port"])
     except Exception as exc:  # no GL backend, no libx264, port in use
         ready_conn.send({"error": f"camera init failed: {exc!r}"})

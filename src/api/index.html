@@ -585,6 +585,25 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 .grasp-prog .calib-bar { height: 6px; }
 .grasp-acts { display: flex; gap: 8px; }
 .grasp-acts .btn { min-height: 40px; padding: 0 16px; touch-action: manipulation; }
+.meas-card { position: fixed; left: max(16px, env(safe-area-inset-left)); bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 1030; width: min(400px, calc(100vw - 32px)); max-height: 70dvh; overflow-y: auto;
+  display: grid; gap: 8px; padding: 12px 14px; border-radius: 14px; font-size: 13px; line-height: 1.45; color: var(--sc-color-text);
+  background: rgba(255,255,255,0.96); border: 1px solid var(--sc-color-border); box-shadow: 0 6px 20px rgba(0,0,0,0.16); }
+.meas-card[hidden] { display: none; }
+.meas-card h4 { font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.meas-card h4 small { font-weight: 400; color: var(--sc-color-text-secondary); }
+.meas-card .ms-big { font: 600 20px var(--mono); }
+.meas-card dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 12px; }
+.meas-card dt { color: var(--sc-color-text-secondary); }
+.meas-card dd { font-family: var(--mono); overflow-wrap: anywhere; }
+.meas-card .ms-note { font-size: 12px; color: var(--sc-color-text-secondary); }
+.meas-card .ms-warn { padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
+.meas-card .ms-err { padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.meas-card .ms-acts { display: flex; flex-wrap: wrap; gap: 8px; }
+.meas-card .ms-acts .btn { min-height: 40px; padding: 0 14px; }
+.meas-card .ms-est { border-left: 3px solid #faad14; padding-left: 8px; }
+@media (max-width: 480px) {
+  .meas-card { left: 8px; right: 8px; bottom: calc(8px + env(safe-area-inset-bottom)); width: auto; max-height: 62dvh; }
+}
 .grasp-acts .grasp-stop { color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); }
 .grasp-pick { position: absolute; left: 50%; top: 52px; transform: translateX(-50%); z-index: 5; display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100% - 24px);
   padding: 6px 6px 6px 12px; border-radius: 16px; font-size: 13px; font-weight: 500; color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.95); border: 1px solid #ffd591; box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
@@ -635,16 +654,12 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 /* header icon buttons (settings, poses); same look as the full-screen button */
 .hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
 .hd-btn[hidden] { display: none; }
-/* the 点位 button carries its name where the header has room (tablet, desktop); icon only on phones */
-.hd-lbl, .hd-lbl-s { display: none; }
-@media (min-width: 800px) {
-  #btn-pset { width: auto; gap: 6px; padding: 0 10px 0 8px; }
-  #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
-}
-/* the full name ("点位与动作" / "Positions & motions") where the header has room for it */
+/* the 点位 button is a header icon like its neighbours; from 1180 px it adds the short name ("点位" / "Poses"),
+   no wider than the operator badge. The full name ("点位与动作" / "Positions & motions") is its tooltip and label. */
+.hd-lbl-s { display: none; }
 @media (min-width: 1180px) {
-  #btn-pset .hd-lbl { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
-  #btn-pset .hd-lbl-s { display: none; }
+  #btn-pset { width: auto; gap: 5px; padding: 0 9px 0 7px; }
+  #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
 }
 .hd-btn svg { width: 18px; height: 18px; }
 .hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
@@ -1833,7 +1848,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </button>
     <button class="hd-btn" id="btn-pset" type="button" aria-label="点位" title="点位" data-i18n-aria="pose.title" data-i18n-title="pose.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
-      <span class="hd-lbl" id="btn-pset-lbl" data-i18n="pose.title">点位</span><span class="hd-lbl-s" data-i18n="pose.title">点位</span>
+      <span class="hd-lbl-s" data-i18n="pose.title">点位</span>
     </button>
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
@@ -1891,10 +1906,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <div class="grasp-prog" id="grasp-prog" hidden><span id="grasp-phase">--</span><div class="calib-bar"><i id="grasp-fill"></i></div></div>
           <div class="grasp-acts">
             <button class="btn btn-primary" id="grasp-go" type="button" data-i18n="grasp.go">抓取</button>
+            <button class="btn btn-primary" id="meas-go" type="button" data-op="/api/v1/action/measure_multiview" data-op-mode="move" data-i18n="ms.go" hidden>尺寸测量</button>
             <button class="btn" id="grasp-cancel" type="button" data-i18n="grasp.cancel">取消</button>
             <button class="btn grasp-stop" id="grasp-stop" type="button" data-i18n="grasp.stop" hidden>停止</button>
           </div>
         </div>
+        <div class="meas-card" id="meas-card" role="region" aria-live="polite" data-i18n-aria="ms.title" aria-label="尺寸测量" hidden></div>
         <div class="depth-panel" id="depth-panel" role="group" aria-label="深度（模型估计）" hidden>
           <div class="dp-row"><b class="dp-title" id="dp-title">深度（模型估计）</b><button class="btn dp-btn" id="dp-live" type="button" aria-pressed="false">连续</button><button class="btn dp-btn" id="dp-refresh" type="button">刷新</button><button class="btn dp-btn dp-x" id="dp-x" type="button" aria-label="关闭深度显示">×</button></div>
           <div class="dp-leg"><span class="dp-end"><b id="dp-near">近</b> <span class="dp-sub" id="dp-near-m">--</span></span><i class="dp-bar" id="dp-bar"></i><span class="dp-end"><b id="dp-far">远</b> <span class="dp-sub" id="dp-far-m">--</span></span></div>
@@ -2568,6 +2585,29 @@ const I18N = {
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
     'grasp.aria': '点框抓取', 'grasp.go': '抓取', 'grasp.cancel': '取消', 'grasp.stop': '停止',
+    'grasp.gap': '抓取设置仍是默认值（{g}），抓取位置可能对不准。', 'grasp.gap.grip': '夹爪位置没有在画面上点选', 'grasp.gap.cam': '相机没有标定',
+    'ms.go': '尺寸测量', 'ms.title': '尺寸测量', 'ms.confirm': '机械臂将以当前位置为中心，左右各移动约 {cm} cm，在 {n} 个视角拍照（速度 {sp}%），结束后回到起点。实测 3 个视角约 15 秒。',
+    'ms.stop_note': '请站在急停按钮旁，确认物体周围没有障碍。', 'ms.start': '开始测量', 'ms.quick': '快速估计（不移动）',
+    'ms.ph.start': '准备中', 'ms.ph.view': '移到视角 {k} / {n}', 'ms.ph.capture': '拍摄视角 {k} / {n}', 'ms.ph.compute': '计算中', 'ms.ph.return': '回到起点',
+    'ms.hwl': '高 × 宽 × 长（多视角三角测量）', 'ms.r.centroid': '中心（基座坐标）', 'ms.r.points': '物体点数', 'ms.r.edges': '边缘点', 'ms.r.rms': '重投影 RMS',
+    'ms.r.views': '使用视角', 'ms.r.footprint': '轮廓来源', 'ms.r.views_u': '个视角', 'ms.r.fp_none': '无（长宽来自点云）', 'ms.r.conf': '长宽置信度',
+    'ms.r.table': '标定自检', 'ms.r.table_v': '桌面偏差 中位 {med} mm · p90 {p90} mm（{n} 点）', 'ms.r.time': '用时',
+    'ms.r.table_note': '标定自检：三角测量出的桌面点与已标定桌面的偏差，反映相机与机械臂标定的状态，不是物体尺寸的误差。',
+    'ms.copy': '复制数值', 'ms.copied': '已复制', 'ms.copy_fail': '复制失败：请手动记录数值', 'ms.again': '重新测量', 'ms.fail': '测量失败：{why}', 'ms.cancelled': '测量已停止',
+    'ms.est.title': '估计值（单视角深度模型，机械臂不动）', 'ms.est.none': '没有得到估计：{why}', 'ms.est.note': '深度模型估计在近距离偏差较大，仅供参考；准确尺寸请用「开始测量」。',
+    'ms.e.none': '没有测到物体', 'ms.e.OPERATOR_REQUIRED': '需要操作员权限：解锁后再按「开始测量」（会移动机械臂，不会自动重试）',
+    'ms.e.TOO_FEW_POINTS': '物体上可匹配的点太少：让物体均匀受光、换有纹理的背景，或加大视角间距',
+    'ms.e.OUT_OF_FRAME': '移动后物体会出画面：先让物体靠近画面中央，或减小视角间距',
+    'ms.e.TARGET_LOST': '某个视角里找不到物体：从能看到整个物体的位置开始，或减小视角间距',
+    'ms.e.NOT_SETTLED': '机械臂在拍照前没有停稳：检查是否有振动或碰撞，再试一次', 'ms.e.MOVED': '拍照时机械臂在动：再试一次；反复出现请检查关节',
+    'ms.e.FEEDBACK_SLOW': '关节反馈更新太慢：检查连接后再试', 'ms.e.STALE_TELEMETRY': '关节反馈不是最新的：检查连接后再试',
+    'ms.e.IK_UNREACHABLE': '某个视角够不到：把机械臂移近物体后再试', 'ms.e.IK_BRANCH_FLIP': '某个视角需要关节大幅翻转：换一个起始姿态再试',
+    'ms.e.WORKSPACE_VIOLATION': '某个视角超出工作空间或进入禁入区：换一个起始位置', 'ms.e.SOFT_LIMIT_EXCEEDED': '某个视角超出关节软限位：换一个起始位置',
+    'ms.e.DETECTION_UNAVAILABLE': '视觉服务没有返回画面或识别结果：检查相机和识别服务', 'ms.e.UNSUPPORTED': '当前设备不支持（缺少抓取设置里的相机参数，或视觉服务版本过旧）',
+    'ms.e.MARKERS_UNAVAILABLE': '视觉服务没有提供 ArUco 标记',
+    'ms.why.no_lens_centre': '相机镜头位置未知（配置里没有相机安装的镜头中心，先做相机标定）', 'ms.why.no_detection': '这一帧没有识别到所选物体',
+    'ms.why.low_conf': '深度置信度太低', 'ms.why.border': '物体靠近画面边缘', 'ms.why.occluded': '物体被遮挡', 'ms.why.too_few_samples': '桌面深度样本太少',
+    'ms.why.table_contradicts_fk': '桌面拟合与机械臂位姿不一致（检查标定）', 'ms.why.too_flat': '物体太薄，深度分不出', 'ms.e.NOT_ARMED': '力矩已关闭：先按「使能」', 'ms.e.MEASURE_TIMEOUT': '测量超时：检查现场后再试',
     'grasp.ph.start': '准备', 'grasp.ph.open': '张开夹爪', 'grasp.ph.approach': '移到目标上方', 'grasp.ph.centring': '对准目标', 'grasp.ph.centring.n': '对准目标 · 第 {n} 次 · {px} px',
     'grasp.ph.align': '转动夹爪', 'grasp.ph.descend': '下降', 'grasp.ph.close': '夹紧', 'grasp.ph.release': '未夹住，张开', 'grasp.ph.lift': '抬起', 'grasp.ph.done': '完成',
     'grasp.res.ok': '已抓住，交还手动控制', 'grasp.res.fail': '抓取失败：{why}', 'grasp.res.cancel': '抓取已停止：{why}', 'grasp.stopped': '已停止抓取',
@@ -2791,6 +2831,29 @@ const I18N = {
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
     'grasp.aria': 'Tap to grasp', 'grasp.go': 'Grasp', 'grasp.cancel': 'Cancel', 'grasp.stop': 'Stop',
+    'grasp.gap': 'The grasp setup still has defaults ({g}); the grasp may miss.', 'grasp.gap.grip': 'grip position not picked in the image', 'grasp.gap.cam': 'camera not calibrated',
+    'ms.go': 'Measure size', 'ms.title': 'Measure size', 'ms.confirm': 'The arm moves about {cm} cm to each side of the current position, takes {n} views (speed {sp}%) and returns to the start. 3 views took about 15 s on the real arm.',
+    'ms.stop_note': 'Stay at the E-stop and keep the space around the object clear.', 'ms.start': 'Start measuring', 'ms.quick': 'Quick estimate (no motion)',
+    'ms.ph.start': 'Preparing', 'ms.ph.view': 'Moving to view {k} / {n}', 'ms.ph.capture': 'Capturing view {k} / {n}', 'ms.ph.compute': 'Computing', 'ms.ph.return': 'Returning to the start',
+    'ms.hwl': 'Height × width × length (multi-view triangulation)', 'ms.r.centroid': 'Centre (base frame)', 'ms.r.points': 'Object points', 'ms.r.edges': 'edge points', 'ms.r.rms': 'Reprojection RMS',
+    'ms.r.views': 'Views used', 'ms.r.footprint': 'Outline from', 'ms.r.views_u': 'views', 'ms.r.fp_none': 'none (length and width from the points)', 'ms.r.conf': 'Length / width confidence',
+    'ms.r.table': 'Calibration self-check', 'ms.r.table_v': 'table offset median {med} mm · p90 {p90} mm ({n} points)', 'ms.r.time': 'Time',
+    'ms.r.table_note': 'Calibration self-check: how far the triangulated table points lie from the calibrated table. It reflects the camera and arm calibration, not the error of the object size.',
+    'ms.copy': 'Copy values', 'ms.copied': 'Copied', 'ms.copy_fail': 'Copy failed: note the values by hand', 'ms.again': 'Measure again', 'ms.fail': 'Measurement failed: {why}', 'ms.cancelled': 'Measurement stopped',
+    'ms.est.title': 'Estimate (single view, depth model, the arm does not move)', 'ms.est.none': 'No estimate: {why}', 'ms.est.note': 'Depth-model estimates are off at close range; use them as a rough guide. For an accurate size use "Start measuring".',
+    'ms.e.none': 'No object measured', 'ms.e.OPERATOR_REQUIRED': 'Needs operator access: unlock, then tap "Start measuring" again (it moves the arm and is not retried by itself)',
+    'ms.e.TOO_FEW_POINTS': 'too few matchable points on the object: light it evenly, use a textured background, or a wider view spacing',
+    'ms.e.OUT_OF_FRAME': 'the object would leave the image: bring it nearer the image centre, or use a smaller view spacing',
+    'ms.e.TARGET_LOST': 'the object was not found in a view: start where the whole object is in view, or use a smaller view spacing',
+    'ms.e.NOT_SETTLED': 'the arm did not settle before a capture: check for vibration or contact, then try again', 'ms.e.MOVED': 'the arm moved during a capture: try again; if it repeats, check the joints',
+    'ms.e.FEEDBACK_SLOW': 'joint feedback is too slow: check the connection, then try again', 'ms.e.STALE_TELEMETRY': 'joint feedback is not current: check the connection, then try again',
+    'ms.e.IK_UNREACHABLE': 'a view is out of reach: move the arm closer to the object, then try again', 'ms.e.IK_BRANCH_FLIP': 'a view needs a large joint flip: start from another pose',
+    'ms.e.WORKSPACE_VIOLATION': 'a view is outside the workspace or in a keep-out box: start from another position', 'ms.e.SOFT_LIMIT_EXCEEDED': 'a view exceeds a joint soft limit: start from another position',
+    'ms.e.DETECTION_UNAVAILABLE': 'the vision service returned no frame or detection: check the camera and the detector', 'ms.e.UNSUPPORTED': 'not supported here (camera values missing in the grasp setup, or an older vision service)',
+    'ms.e.MARKERS_UNAVAILABLE': 'the vision service provides no ArUco markers',
+    'ms.why.no_lens_centre': 'the camera lens position is unknown (no lens centre in the camera mount; calibrate the camera first)', 'ms.why.no_detection': 'the selected object was not detected in this frame',
+    'ms.why.low_conf': 'depth confidence too low', 'ms.why.border': 'the object is near the image border', 'ms.why.occluded': 'the object is occluded', 'ms.why.too_few_samples': 'too few table depth samples',
+    'ms.why.table_contradicts_fk': 'the table fit disagrees with the arm pose (check the calibration)', 'ms.why.too_flat': 'the object is too flat for the depth model', 'ms.e.NOT_ARMED': 'torque is off: tap Enable first', 'ms.e.MEASURE_TIMEOUT': 'the measurement timed out: check the scene, then try again',
     'grasp.ph.start': 'Starting', 'grasp.ph.open': 'Opening gripper', 'grasp.ph.approach': 'Moving above target', 'grasp.ph.centring': 'Centring on target', 'grasp.ph.centring.n': 'Centring · step {n} · {px} px',
     'grasp.ph.align': 'Turning gripper', 'grasp.ph.descend': 'Descending', 'grasp.ph.close': 'Closing', 'grasp.ph.release': 'Missed, opening', 'grasp.ph.lift': 'Lifting', 'grasp.ph.done': 'Done',
     'grasp.res.ok': 'Object held, manual control is back', 'grasp.res.fail': 'Grasp failed: {why}', 'grasp.res.cancel': 'Grasp stopped: {why}', 'grasp.stopped': 'Grasp stopped',
@@ -3702,7 +3765,12 @@ function toast(msg, kind = '', code = '', opts = null) {
     tx.append(a, b); el.appendChild(tx);
   } else el.textContent = msg;
   if (code && !op) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
-  if (op && S.auth.enforced) {
+  if (opts && opts.act) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'btn btn-primary toast-act'; btn.textContent = opts.act.label;
+    btn.addEventListener('click', () => { el.remove(); opts.act.fn(); });
+    el.classList.add('has-act'); el.appendChild(btn);
+  } else if (op && S.auth.enforced) {
     const btn = document.createElement('button');
     btn.type = 'button'; btn.className = 'btn btn-primary toast-act'; btn.textContent = t('op.unlock');
     btn.addEventListener('click', () => {
@@ -3713,7 +3781,7 @@ function toast(msg, kind = '', code = '', opts = null) {
     el.classList.add('has-act'); el.appendChild(btn);
   }
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), op ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
+  setTimeout(() => el.remove(), op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
   return el;
 }
@@ -3959,6 +4027,7 @@ function connectWS() {
     tkOnObs(o); // after renderMotionLimit: the banner reuses the #ml-chip text
     renderPower(o);
     graspOnObs(o);
+    msOnObs(o);
     epOnObs(o);
     teachOnObs(o);
     syncEpoch(o.epoch_id);
@@ -10802,6 +10871,8 @@ const GR = {
   setup: null, path: null, supported: null, rev: null,
   camDown: null,    // GET /api/v1/grasp/setup camera_down: true = camera-down acquisition, grip pixel unused; null = unknown
 };
+// size measurement state (msRender, below); declared here because renderGrasp reads it
+const MS = { state: null, sel: null, id: null, res: null, err: null, est: null, phase: '', progress: 0 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
 function graspCodeText(code, message) {
   const k = 'grasp.code.' + graspCodeKey(code);
@@ -10832,6 +10903,23 @@ function graspSyncGrip(o) {
     }
   }
 }
+/* Failures that an unset grasp setup can cause (the aim is off): the toast says which values are still the
+   defaults (grip pixel never picked, camera not calibrated) and opens the grasp setup. */
+const GRASP_AIM_CODES = new Set(['NOT_HOLDING', 'CENTRING_FAILED', 'TARGET_LOST']);
+async function graspSetupGaps() {
+  const gaps = [];
+  if (GR.setup == null) await graspLoadSetup(true);
+  const g = GR.setup && GR.setup.grip_pixel_norm;
+  if (GR.camDown !== true && Array.isArray(g) && g[0] === 0.5 && g[1] === 0.5) gaps.push(t('grasp.gap.grip'));
+  try { const c = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(); if (c && c.calibrated === false) gaps.push(t('grasp.gap.cam')); } catch (_) {}
+  return gaps;
+}
+async function graspFailToast(r) {
+  const msg = t('grasp.res.fail', { why: graspCodeText(r.code, r.message) });
+  const gaps = await graspSetupGaps();
+  if (!gaps.length) { toast(msg, 'err', r.code || ''); return; }
+  toast(msg + ' ' + t('grasp.gap', { g: gaps.join(t('cw.f.sep')) }), 'err', r.code || '', { act: { label: t('gset.title'), fn: () => gsetOpen(true) } });
+}
 function graspOnObs(o) {
   graspSyncGrip(o);
   const a = o.action, p = o.previous_action;
@@ -10842,6 +10930,7 @@ function graspOnObs(o) {
     GR.toasted = r.id;
     if (r.id === GR.id) { GR.id = null; GR.sel = null; }
     if (r.state === 'done') toast(t('grasp.res.ok'), 'ok');
+    else if (r.state === 'failed' && GRASP_AIM_CODES.has(r.code)) graspFailToast(r);
     else toast(t(r.state === 'failed' ? 'grasp.res.fail' : 'grasp.res.cancel', { why: graspCodeText(r.code, r.message) }), r.state === 'failed' ? 'err' : 'warn', r.code || '');
   }
 }
@@ -10879,7 +10968,7 @@ function graspVideoPoint(e) {
   return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? [u, v] : null;
 }
 $('video-box').addEventListener('click', (e) => {
-  if (e.target.closest && e.target.closest('.hud, .grasp-bar, .grasp-pick, .vhint-btn, .depth-panel')) return;
+  if (e.target.closest && e.target.closest('.hud, .grasp-bar, .grasp-pick, .vhint-btn, .depth-panel, .meas-card')) return;
   const pt = graspVideoPoint(e);
   if (!pt) return;
   if (GR.pickGrip) { graspSetGrip(pt); return; }
@@ -10893,7 +10982,7 @@ $('video-box').addEventListener('click', (e) => {
     .sort((a, b) => a.w * a.h - b.w * b.h);
   const d = hits[0];
   GR.sel = d ? { label: d.label, score: d.score, box: [d.x0, d.y0, d.x1, d.y1], seenAt: performance.now() } : null;
-  if (d) buzz(10);
+  if (d) { buzz(10); if (MS.state && MS.state !== 'running') msClose(); }
   renderGrasp();
 });
 $('video-box').addEventListener('pointermove', (e) => { ARU.hover = e.pointerType === 'mouse' ? (aruAt(e.clientX, e.clientY) ?? null) : null; });
@@ -10979,6 +11068,9 @@ function renderGrasp() {
   $('grasp-cancel').hidden = !!run;
   $('grasp-stop').hidden = !run;
   $('grasp-go').disabled = GR.sending || !GR.sel;
+  const mg = $('meas-go');
+  mg.hidden = !!run || !(S.caps && S.caps.measure_multiview);
+  mg.disabled = GR.sending || !GR.sel || MS.state === 'running' || MS.state === 'starting';
   if (run) {
     const ph = run.phase || 'start';
     const txt = ph === 'centring' && run.iteration != null && run.error_px != null
@@ -10990,6 +11082,149 @@ function renderGrasp() {
 $('grasp-go').addEventListener('click', graspGo);
 $('grasp-cancel').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
 $('grasp-stop').addEventListener('click', () => graspStop('button'));
+
+/* ---- size measurement of the selected object (capability measure_multiview, WS /api/v1/action/measure_multiview):
+   a confirmation with the range and duration, then the action's progress, then a result card that stays until it is
+   closed or another object is selected. It moves the arm: never sent again by itself (an unlock asks for another tap).
+   "Quick estimate" is the single-view depth-model estimate (POST /api/v1/grasp/measure), labelled as such. ---- */
+const MS_REQ = { views: 3, baseline_m: 0.06, speed_scale: 0.3, return_to_start: true };
+const msMm = (m) => (Number.isFinite(m) ? (m * 1000).toFixed(1) : '--');
+function msClose() { Object.assign(MS, { state: null, sel: null, id: null, res: null, err: null, est: null }); msRender(); }
+function msErrText(code, message) {
+  const k = 'ms.e.' + code;
+  const hint = I18N.zh[k] !== undefined ? t(k) : errWhy(code);
+  return hint || message || code || t('err.rejected');
+}
+function msRow(dl, k, v) { dl.append(cwEl('dt', '', k), cwEl('dd', '', v)); }
+function msResultText() {
+  const o = MS.res && MS.res.objects && MS.res.objects[0];
+  if (!o) return '';
+  return [`${MS.sel ? MS.sel.label : o.label}: H ${msMm(o.height_m)} x W ${msMm(o.width_m)} x L ${msMm(o.length_m)} mm`,
+    `centroid_m ${JSON.stringify(o.centroid_m)}`, `n_points ${o.n_points}`, `reproj_rms_px ${o.reproj_rms_px}`,
+    `footprint ${o.footprint_source ?? '-'} views ${o.footprint_views ?? '-'} conf L ${o.length_confidence ?? '-'} W ${o.width_confidence ?? '-'}`,
+    `table_check ${JSON.stringify(MS.res.table_check || null)}`, `total_ms ${MS.res.timing ? MS.res.timing.total_ms : '-'}`].join('\n');
+}
+async function msCopy() {
+  const txt = msResultText();
+  try { await navigator.clipboard.writeText(txt); toast(t('ms.copied'), 'ok'); return; } catch (_) {}
+  // plain http to the device: no clipboard API; a selected text field and the copy command
+  const ta = document.createElement('textarea'); ta.value = txt; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch (_) {}
+  ta.remove(); toast(t(ok ? 'ms.copied' : 'ms.copy_fail'), ok ? 'ok' : 'warn');
+}
+function msRender() {
+  const c = $('meas-card');
+  if (!c) return;
+  c.hidden = !MS.state;
+  if (!MS.state) return;
+  c.textContent = '';
+  const head = cwEl('h4', '', t('ms.title'));
+  head.appendChild(cwEl('small', '', MS.sel ? MS.sel.label : ''));
+  c.appendChild(head);
+  const acts = cwEl('div', 'ms-acts');
+  const btn = (label, fn, cls = '', id = '') => { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.addEventListener('click', fn); acts.appendChild(b); return b; };
+  if (MS.state === 'confirm' || MS.state === 'starting') {
+    c.appendChild(cwEl('p', '', t('ms.confirm', { cm: (MS_REQ.baseline_m * 50).toFixed(0), n: MS_REQ.views, sp: Math.round(MS_REQ.speed_scale * 100) })));
+    c.appendChild(cwEl('p', 'ms-warn', t('ms.stop_note')));
+    btn(t('ms.start'), msStart, 'btn-primary', 'ms-start').disabled = MS.state === 'starting';
+    btn(t('ms.quick'), msQuick, '', 'ms-quick');
+    btn(t('cancel'), msClose, '', 'ms-cancel');
+  } else if (MS.state === 'running') {
+    const ph = MS.phase || '';
+    const m = /^(view|capture):(\w+)/.exec(ph);
+    const txt = m ? t('ms.ph.' + m[1], { k: m[2] === 'start' ? 1 : Number(m[2]) + 1, n: MS_REQ.views }) : t('ms.ph.' + (ph || 'start'));
+    c.appendChild(cwEl('p', '', txt));
+    const bar = cwEl('div', 'calib-bar'); const fill = document.createElement('i'); fill.style.width = Math.round(MS.progress * 100) + '%'; bar.appendChild(fill); c.appendChild(bar);
+    btn(t('grasp.stop'), () => api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e)), 'grasp-stop', 'ms-stop');
+  } else if (MS.state === 'done') {
+    const o = MS.res && MS.res.objects && MS.res.objects[0];
+    if (!o) c.appendChild(cwEl('p', 'ms-err', t('ms.e.none')));
+    else {
+      c.appendChild(cwEl('div', 'ms-big', `${msMm(o.height_m)} × ${msMm(o.width_m)} × ${msMm(o.length_m)} mm`));
+      c.appendChild(cwEl('div', 'ms-note', t('ms.hwl')));
+      const dl = cwEl('dl', '');
+      msRow(dl, t('ms.r.centroid'), Array.isArray(o.centroid_m) ? o.centroid_m.map(msMm).join(', ') + ' mm' : '--');
+      msRow(dl, t('ms.r.points'), `${o.n_points ?? '--'}` + (o.n_edge_points != null ? ` (${t('ms.r.edges')} ${o.n_edge_points})` : ''));
+      msRow(dl, t('ms.r.rms'), Number.isFinite(o.reproj_rms_px) ? o.reproj_rms_px.toFixed(2) + ' px' : '--');
+      msRow(dl, t('ms.r.views'), String(o.views_used ?? '--'));
+      msRow(dl, t('ms.r.footprint'), o.footprint_source ? `${o.footprint_source} · ${o.footprint_views ?? '?'} ${t('ms.r.views_u')}` : t('ms.r.fp_none'));
+      if (o.length_confidence != null || o.width_confidence != null) msRow(dl, t('ms.r.conf'), `L ${o.length_confidence ?? '--'} · W ${o.width_confidence ?? '--'}`);
+      const tc = MS.res.table_check;
+      msRow(dl, t('ms.r.table'), tc ? t('ms.r.table_v', { med: Number(tc.median_abs_mm).toFixed(1), p90: Number(tc.p90_abs_mm).toFixed(1), n: tc.n_points }) : '--');
+      const tm = MS.res.timing;
+      msRow(dl, t('ms.r.time'), tm && Number.isFinite(tm.total_ms) ? (tm.total_ms / 1000).toFixed(1) + ' s' : '--');
+      c.appendChild(dl);
+      c.appendChild(cwEl('p', 'ms-note', t('ms.r.table_note')));
+    }
+    btn(t('ms.copy'), msCopy, '', 'ms-copy');
+    btn(t('ms.again'), () => { MS.state = 'confirm'; MS.res = null; msRender(); }, '', 'ms-again');
+    btn(t('op.close'), msClose, '', 'ms-close');
+  } else if (MS.state === 'failed') {
+    c.appendChild(cwEl('p', 'ms-err', t('ms.fail', { why: MS.err.text }) + (MS.err.code ? ` (${MS.err.code})` : '')));
+    btn(t('ms.again'), () => { MS.state = 'confirm'; MS.err = null; msRender(); }, '', 'ms-again');
+    btn(t('op.close'), msClose, '', 'ms-close');
+  } else if (MS.state === 'estimate') {
+    const box = cwEl('div', 'ms-est');
+    box.appendChild(cwEl('b', '', t('ms.est.title')));
+    const d = MS.est;
+    if (d && d.measurement) box.appendChild(cwEl('div', 'ms-big', `${msMm(d.measurement.height_m)} × ${msMm(d.measurement.width_m)} × ${msMm(d.measurement.length_m)} mm`));
+    else { const w = (d && d.why) || ''; box.appendChild(cwEl('p', '', t('ms.est.none', { why: I18N.zh['ms.why.' + w] !== undefined ? t('ms.why.' + w) : (w || '--') }))); }
+    box.appendChild(cwEl('p', 'ms-note', t('ms.est.note')));
+    c.appendChild(box);
+    btn(t('ms.start'), () => { MS.state = 'confirm'; msRender(); }, 'btn-primary', 'ms-start-full');
+    btn(t('op.close'), msClose, '', 'ms-close');
+  }
+  c.appendChild(acts);
+}
+function msOpen() {
+  if (!GR.sel) return;
+  if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+  MS.sel = { ...GR.sel }; MS.state = 'confirm'; MS.res = null; MS.err = null; MS.est = null;
+  msRender();
+}
+async function msStart() {
+  if (MS.state !== 'confirm' || !MS.sel) return;
+  MS.state = 'starting'; msRender();
+  const b = MS.sel.box.map((v) => Math.round(Math.min(1, Math.max(0, v)) * 10000) / 10000);
+  try {
+    const ack = await commandRPC('/api/v1/action/measure_multiview', { ...MS_REQ, label: MS.sel.label, target: { box_norm: b } }, true, 5000);
+    MS.id = ack.action_id ?? null; MS.state = 'running'; MS.phase = ''; MS.progress = 0;
+  } catch (e) {
+    // OPERATOR_REQUIRED: commandRPC opened the dialog; a motion is not sent again by itself
+    MS.state = 'failed'; MS.err = { code: e.code || '', text: e.code === 'OPERATOR_REQUIRED' ? t('ms.e.OPERATOR_REQUIRED') : msErrText(e.code, e.message) };
+  }
+  msRender();
+}
+async function msQuick() {
+  if (!MS.sel) return;
+  try {
+    const d = await api('/api/v1/grasp/measure', { label: MS.sel.label }, { quiet: true });
+    const dets = (d && d.detections) || [];
+    const iou = (a, b) => { const x = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])), y = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1])), i = x * y;
+      return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i || 1); };
+    MS.est = dets.slice().sort((p, q) => iou(q.box_norm || [0, 0, 0, 0], MS.sel.box) - iou(p.box_norm || [0, 0, 0, 0], MS.sel.box))[0] || { why: 'no_detection' };
+    MS.state = 'estimate';
+  } catch (e) {
+    MS.state = 'failed'; MS.err = { code: e.code || '', text: msErrText(e.code, e.message) };
+  }
+  msRender();
+}
+function msOnObs(o) {
+  if (MS.id == null) return;
+  const r = [o.action, o.previous_action].find((x) => x && x.id === MS.id);
+  if (!r) return;
+  if (r.state === 'running') {
+    if (MS.state === 'running' && (r.phase !== MS.phase || Math.abs((r.progress || 0) - MS.progress) > 0.01)) { MS.phase = r.phase || ''; MS.progress = r.progress || 0; msRender(); }
+    return;
+  }
+  MS.id = null;
+  if (r.state === 'done') { MS.state = 'done'; MS.res = r.measurement || null; }
+  else { MS.state = 'failed'; MS.err = { code: r.code || '', text: r.state === 'cancelled' ? t('ms.cancelled') : msErrText(r.code, r.message) }; }
+  msRender();
+}
+$('meas-go').addEventListener('click', msOpen);
+i18nHooks.push(msRender);
 
 // ---- grasp setup drawer ----
 const mm = (m) => (Number.isFinite(m) ? Math.round(m * 1000) : null);
@@ -11760,7 +11995,6 @@ function teachOnCaps() {
   if (on) b.hidden = false;
   b.dataset.i18nAria = b.dataset.i18nTitle = on ? 'tch.title' : 'pose.title';
   b.setAttribute('aria-label', t(b.dataset.i18nAria)); b.title = t(b.dataset.i18nTitle);
-  const lb = $('btn-pset-lbl'); lb.dataset.i18n = b.dataset.i18nAria; lb.textContent = t(lb.dataset.i18n);
   b.setAttribute('aria-expanded', String(on && TCH.open));
   if (!on) { TCH.teach = false; TCH.pick = []; if (TCH.open) teachOpen(false); }
   teachBarRender();

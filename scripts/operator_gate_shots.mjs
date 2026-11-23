@@ -70,7 +70,12 @@ const headerCheck = (page) => page.evaluate(() => {
     if (x > 1 && y > 1) ov.push(A.id + 'x' + B.id);
   }
   const bt = document.querySelector('.brand-text');
-  return { ov, out: boxes.filter((x) => x.r.right > innerWidth + 0.5).map((x) => x.id), clip: bt && vis(bt) ? bt.scrollWidth - bt.clientWidth : 0 };
+  // the 点位 button: no wider or taller than its header neighbours (icon buttons, operator badge, language)
+  const sz = (id) => { const e = document.getElementById(id); if (!e || !vis(e)) return null; const r = e.getBoundingClientRect(); return { w: r.width, h: r.height }; };
+  const ps = sz('btn-pset'), nb = ['btn-fs', 'btn-sset', 'btn-op', 'btn-lang'].map(sz).filter(Boolean);
+  const pset = ps && nb.length ? { w: Math.round(ps.w), h: Math.round(ps.h), ok: ps.w <= Math.max(...nb.map((x) => x.w)) + 0.5 && ps.w >= Math.min(...nb.map((x) => x.w)) - 0.5
+    && ps.h <= Math.max(...nb.map((x) => x.h)) + 0.5 && ps.h >= Math.min(...nb.map((x) => x.h)) - 0.5 } : { ok: true };
+  return { pset, ov, out: boxes.filter((x) => x.r.right > innerWidth + 0.5).map((x) => x.id), clip: bt && vis(bt) ? bt.scrollWidth - bt.clientWidth : 0 };
 });
 const VIEWS = [['phone', { width: 390, height: 844 }], ['tablet', { width: 1024, height: 768 }]];
 for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
@@ -108,6 +113,7 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
         await page.setViewportSize({ width: w, height: 800 }); await page.waitForTimeout(120);
         const h = await headerCheck(page);
         ok(!h.ov.length && !h.out.length && h.clip <= 0, `${name} header ${ui} ${w}px ${JSON.stringify(h)}`);
+        ok(h.pset.ok, `${name} header ${ui} ${w}px: 点位 button within its neighbours' size ${JSON.stringify(h.pset)}`);
         if (w === 1024 || w === 768) await page.screenshot({ path: path.join(out, `${name}_0_header_${ui}_${w}.png`), clip: { x: 0, y: 0, width: w, height: 64 } });
       }
     }
