@@ -2589,6 +2589,7 @@ const I18N = {
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
     'grasp.aria': '点框抓取', 'grasp.go': '抓取', 'grasp.cancel': '取消', 'grasp.stop': '停止',
+    'grasp.gap': '抓取设置仍是默认值（{g}），抓取位置可能对不准。', 'grasp.gap.grip': '夹爪位置没有在画面上点选', 'grasp.gap.cam': '相机没有标定',
     'ms.go': '尺寸测量', 'ms.title': '尺寸测量', 'ms.confirm': '机械臂将以当前位置为中心，左右各移动约 {cm} cm，在 {n} 个视角拍照（速度 {sp}%），结束后回到起点。实测 3 个视角约 15 秒。',
     'ms.stop_note': '请站在急停按钮旁，确认物体周围没有障碍。', 'ms.start': '开始测量', 'ms.quick': '快速估计（不移动）',
     'ms.ph.start': '准备中', 'ms.ph.view': '移到视角 {k} / {n}', 'ms.ph.capture': '拍摄视角 {k} / {n}', 'ms.ph.compute': '计算中', 'ms.ph.return': '回到起点',
@@ -2834,6 +2835,7 @@ const I18N = {
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
     'grasp.aria': 'Tap to grasp', 'grasp.go': 'Grasp', 'grasp.cancel': 'Cancel', 'grasp.stop': 'Stop',
+    'grasp.gap': 'The grasp setup still has defaults ({g}); the grasp may miss.', 'grasp.gap.grip': 'grip position not picked in the image', 'grasp.gap.cam': 'camera not calibrated',
     'ms.go': 'Measure size', 'ms.title': 'Measure size', 'ms.confirm': 'The arm moves about {cm} cm to each side of the current position, takes {n} views (speed {sp}%) and returns to the start. 3 views took about 15 s on the real arm.',
     'ms.stop_note': 'Stay at the E-stop and keep the space around the object clear.', 'ms.start': 'Start measuring', 'ms.quick': 'Quick estimate (no motion)',
     'ms.ph.start': 'Preparing', 'ms.ph.view': 'Moving to view {k} / {n}', 'ms.ph.capture': 'Capturing view {k} / {n}', 'ms.ph.compute': 'Computing', 'ms.ph.return': 'Returning to the start',
@@ -3767,7 +3769,12 @@ function toast(msg, kind = '', code = '', opts = null) {
     tx.append(a, b); el.appendChild(tx);
   } else el.textContent = msg;
   if (code && !op) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
-  if (op && S.auth.enforced) {
+  if (opts && opts.act) {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'btn btn-primary toast-act'; btn.textContent = opts.act.label;
+    btn.addEventListener('click', () => { el.remove(); opts.act.fn(); });
+    el.classList.add('has-act'); el.appendChild(btn);
+  } else if (op && S.auth.enforced) {
     const btn = document.createElement('button');
     btn.type = 'button'; btn.className = 'btn btn-primary toast-act'; btn.textContent = t('op.unlock');
     btn.addEventListener('click', () => {
@@ -3778,7 +3785,7 @@ function toast(msg, kind = '', code = '', opts = null) {
     el.classList.add('has-act'); el.appendChild(btn);
   }
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), op ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
+  setTimeout(() => el.remove(), op || (opts && opts.act) ? 9000 : kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
   return el;
 }
@@ -10900,6 +10907,23 @@ function graspSyncGrip(o) {
     }
   }
 }
+/* Failures that an unset grasp setup can cause (the aim is off): the toast says which values are still the
+   defaults (grip pixel never picked, camera not calibrated) and opens the grasp setup. */
+const GRASP_AIM_CODES = new Set(['NOT_HOLDING', 'CENTRING_FAILED', 'TARGET_LOST']);
+async function graspSetupGaps() {
+  const gaps = [];
+  if (GR.setup == null) await graspLoadSetup(true);
+  const g = GR.setup && GR.setup.grip_pixel_norm;
+  if (GR.camDown !== true && Array.isArray(g) && g[0] === 0.5 && g[1] === 0.5) gaps.push(t('grasp.gap.grip'));
+  try { const c = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(); if (c && c.calibrated === false) gaps.push(t('grasp.gap.cam')); } catch (_) {}
+  return gaps;
+}
+async function graspFailToast(r) {
+  const msg = t('grasp.res.fail', { why: graspCodeText(r.code, r.message) });
+  const gaps = await graspSetupGaps();
+  if (!gaps.length) { toast(msg, 'err', r.code || ''); return; }
+  toast(msg + ' ' + t('grasp.gap', { g: gaps.join(t('cw.f.sep')) }), 'err', r.code || '', { act: { label: t('gset.title'), fn: () => gsetOpen(true) } });
+}
 function graspOnObs(o) {
   graspSyncGrip(o);
   const a = o.action, p = o.previous_action;
@@ -10910,6 +10934,7 @@ function graspOnObs(o) {
     GR.toasted = r.id;
     if (r.id === GR.id) { GR.id = null; GR.sel = null; }
     if (r.state === 'done') toast(t('grasp.res.ok'), 'ok');
+    else if (r.state === 'failed' && GRASP_AIM_CODES.has(r.code)) graspFailToast(r);
     else toast(t(r.state === 'failed' ? 'grasp.res.fail' : 'grasp.res.cancel', { why: graspCodeText(r.code, r.message) }), r.state === 'failed' ? 'err' : 'warn', r.code || '');
   }
 }
