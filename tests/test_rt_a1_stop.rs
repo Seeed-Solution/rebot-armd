@@ -350,14 +350,20 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
         ExecutorConfig::for_tests(Duration::from_millis(5)),
         PersistTestHooks { release_delay_once: Some(delay.clone()), ..Default::default() },
     ).await.unwrap();
-    // Count every CAN transmit observed once the owner advances `stops.applied() >= 1`.
+    // Record exact 0-based `tx_log` index on every transmit under `FakeBus`'s mutex so
+    // `tx_log` and the first post-apply boundary are snapshotted atomically with zero skipped frames.
     let stops_obs = handle.stop_requests().clone();
+    let tx_seq = Arc::new(AtomicUsize::new(0));
+    let first_post_apply_idx = Arc::new(AtomicUsize::new(usize::MAX));
     let seen_tx_after_apply = Arc::new(AtomicUsize::new(0));
-    let tx_cnt = seen_tx_after_apply.clone();
+    let (seq_cb, first_cb, cnt_cb) = (tx_seq.clone(), first_post_apply_idx.clone(), seen_tx_after_apply.clone());
     bus.with(|s| {
+        seq_cb.store(s.tx_log.len(), Ordering::SeqCst);
         s.on_tx = Some(Arc::new(move || {
+            let idx = seq_cb.fetch_add(1, Ordering::SeqCst);
             if stops_obs.applied() >= 1 {
-                tx_cnt.fetch_add(1, Ordering::Relaxed);
+                let _ = first_cb.compare_exchange(usize::MAX, idx, Ordering::SeqCst, Ordering::SeqCst);
+                cnt_cb.fetch_add(1, Ordering::SeqCst);
             }
         }));
     });
@@ -384,13 +390,19 @@ async fn no_stale_dynamic_frames_after_applied_stop_and_post_stop_frame_transmit
         saw_cmd_stopped && saw_tgt_stopped
     }).await;
 
-    // Inspect EVERY dynamic POS_VEL frame across all 7 joints from the exact first post-apply transmit onward.
-    let total_post_apply = seen_tx_after_apply.load(Ordering::Relaxed);
-    assert!(total_post_apply >= 7, "expected post-apply hold frames across all 7 joints, got {total_post_apply}");
+    // Inspect EVERY dynamic POS_VEL frame across all 7 joints under one `FakeBus` lock so
+    // `tx_log`, `tx_seq`, `first_post_apply_idx`, and `seen_tx_after_apply` match atomically.
     bus.with(|s| {
-        let start_idx = s.tx_log.len().saturating_sub(total_post_apply).max(tx_before_stop_send);
+        let recorded_seq = tx_seq.load(Ordering::SeqCst);
+        let first_idx = first_post_apply_idx.load(Ordering::SeqCst);
+        let total_post_apply = seen_tx_after_apply.load(Ordering::SeqCst);
+        assert_eq!(s.tx_log.len(), recorded_seq, "tx_log length diverged from on_tx sequence");
+        assert_ne!(first_idx, usize::MAX, "no post-apply CAN frame observed");
+        assert!(first_idx >= tx_before_stop_send, "first post-apply frame {first_idx} preceded stop send {tx_before_stop_send}");
+        assert_eq!(s.tx_log.len() - first_idx, total_post_apply, "post-apply count diverged from tx_log slice");
+        assert!(total_post_apply >= 7, "expected post-apply hold frames across all 7 joints, got {total_post_apply}");
         let mut per_joint = [0usize; 7];
-        for f in &s.tx_log[start_idx..] {
+        for f in &s.tx_log[first_idx..] {
             if (0x101..=0x107).contains(&f.id) {
                 let j = (f.id - 0x101) as usize;
                 let p = decode_pos_vel_p(f);
@@ -638,4 +650,423 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
     assert_eq!(rest_ep.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert!(sup_ep.e_stop_latched.load(Ordering::SeqCst));
     h_ep.stop_and_join();
+}
+
+struct WriteHookGuard(String);
+impl Drop for WriteHookGuard {
+    fn drop(&mut self) {
+        armd::api::ws::set_test_ws_write_paused(&self.0, false);
+        armd::api::ws::set_test_ws_write_timeout(&self.0, None);
+    }
+}
+
+struct SlowDetector {
+    entered: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl SlowDetector {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            release: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    fn release_now(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+}
+
+impl armd::grasp::DetectionSource for SlowDetector {
+    fn inference_enabled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+    fn set_inference(&self, _enabled: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn next_frame(&self, _after: Option<u64>, _wait_ms: u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<armd::grasp::DetectionFrame>, String>> + Send + '_>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn mode_info(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<armd::grasp::ModeInfo, String>> + Send + '_>> {
+        Box::pin(async move {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.released.load(Ordering::Acquire) {
+                let n = self.release.notified();
+                if self.released.load(Ordering::Acquire) { break; }
+                n.await;
+            }
+            Err("simulated slow detector released".into())
+        })
+    }
+}
+
+async fn serve_with_slow_detector(sup: Arc<ArmSupervisor>, det: Arc<SlowDetector>) -> SocketAddr {
+    let deps = armd::grasp::GraspDeps { source: det, setup_path: None };
+    let upstream = armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap();
+    let router = armd::api::create_router_with(sup, upstream, deps, OperatorAuth::disabled());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    addr
+}
+
+fn config_with_slow_task() -> ArmConfig {
+    let mut cfg = ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() };
+    cfg.grasp.as_mut().expect("rebot_dm has grasp setup").tasks.insert(
+        "slow".into(),
+        armd::grasp::GraspTask {
+            overrides: Default::default(),
+            requires: armd::grasp::TaskRequires { model_kind: None, depth: Some(armd::grasp::DepthReq::Any) },
+            models: None,
+            description: None,
+        },
+    );
+    cfg
+}
+
+fn slow_dry_run_body() -> serde_json::Value {
+    json!({"dry_run": true, "task": "slow", "label": "cup", "box_norm": [0.45, 0.45, 0.55, 0.55], "frame_id": 1})
+}
+
+// 6. Blocked writer (stalled socket) + full ordinary queue: E-stop still latches within one release,
+//    Stop still reaches the owner (executor & legacy), and bounded per-write timeout closes stalled sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_writer_and_full_ordinary_queue_still_latches_estop_and_reaches_owner_for_stop() {
+    // (a) Executor mode: writer stalled, ordinary outbound queue filled to capacity (64/64).
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }));
+    let addr = serve(sup.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let conn_exec = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard_exec = WriteHookGuard(conn_exec.clone());
+    let ep0 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep1 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep1, "/api/v1/motion/jog", json!({"target_positions": [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "duration_secs": 1.0})).await["type"], "command_ack");
+
+    let delay = Arc::new(Mutex::new(None));
+    let handle = sup.start_executor_with_hooks(
+        ExecutorConfig::for_tests(Duration::from_millis(5)),
+        PersistTestHooks { release_delay_once: Some(delay.clone()), ..Default::default() },
+    ).await.unwrap();
+    wait_until(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+    let ep_live = sup.observation().await.unwrap().epoch_id;
+
+    // Stall the socket writer inside `write_ws_frame`.
+    armd::api::ws::set_test_ws_write_paused(&conn_exec, true);
+    send(&mut ws, json!({"type": "command", "request_id": 100, "generation": gen, "epoch_id": ep_live, "path": "/api/v1/motion/jog", "body": {}})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_exec) >= 1).await;
+
+    // Fill the ordinary outbound queue to exact capacity (64 control replies) while writer stays blocked.
+    for k in 0..64u64 {
+        send(&mut ws, json!({"type": "command", "request_id": 101 + k, "generation": gen, "epoch_id": ep_live, "path": "/api/v1/motion/jog", "body": {}})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(armd::api::ws::test_ws_writer_blocked_count(&conn_exec) >= 1, "writer must still be stalled");
+
+    // Pause one release, send Stop on the SAME stalled socket -> applies on THAT exact release.
+    *delay.lock().unwrap() = Some(Duration::from_millis(60));
+    wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+    let s_stop = handle.stats().steps.load(Ordering::Relaxed);
+    send(&mut ws, json!({"type": "command", "request_id": 200, "generation": gen, "epoch_id": ep_live, "path": "/api/v1/motion/stop", "body": {}})).await;
+    wait_until(Duration::from_secs(1), || handle.stop_requests().applied() >= 1).await;
+    assert!(handle.stats().steps.load(Ordering::Relaxed) <= s_stop + 1, "Stop did not apply within one release");
+
+    // Pause one release, send E-stop on the SAME stalled socket -> latches immediately AND applies on THAT exact release.
+    *delay.lock().unwrap() = Some(Duration::from_millis(60));
+    wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+    let s_estop = handle.stats().steps.load(Ordering::Relaxed);
+    let t0 = Instant::now();
+    send(&mut ws, json!({"type": "estop"})).await;
+    wait_until(Duration::from_millis(45), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+    assert!(t0.elapsed() < Duration::from_millis(45), "E-stop did not latch immediately from reader");
+    wait_until(Duration::from_secs(1), || {
+        sup.hub().latest().is_some_and(|s| s.obs.safety_state == SafetyState::EStop && s.obs.epoch_id > ep_live)
+    }).await;
+    assert!(handle.stats().steps.load(Ordering::Relaxed) <= s_estop + 1, "E-stop did not apply within one release");
+
+    // Unpause writer -> urgent E-stop `epoch_sync` and urgent Stop `command_ack` are delivered!
+    armd::api::ws::set_test_ws_write_paused(&conn_exec, false);
+    let mut got_sync = false;
+    let mut got_stop_ack = false;
+    for _ in 0..100 {
+        let v = next_of(&mut ws, &["epoch_sync", "command_ack", "command_reject"]).await;
+        if v["type"] == "epoch_sync" && v["safety_state"] == "EStop" { got_sync = true; }
+        if v["type"] == "command_ack" && v["request_id"] == 200 { got_stop_ack = true; }
+        if got_sync && got_stop_ack { break; }
+    }
+    assert!(got_sync && got_stop_ack, "expected both urgent replies: sync={got_sync}, stop_ack={got_stop_ack}");
+    handle.stop_and_join();
+
+    // (b) Legacy mode: writer stalled + worker blocked in slow detector + inbound ordinary queue 64/64 full (+ BACKLOG_FULL).
+    let det = SlowDetector::new();
+    let sup_l = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    let addr_l = serve_with_slow_detector(sup_l.clone(), det.clone()).await;
+    let (mut ws_l, gen_l) = controller(addr_l).await;
+    let conn_l = sup_l.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard_l = WriteHookGuard(conn_l.clone());
+    let ep_l = sup_l.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws_l, gen_l, ep_l, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep_l = sup_l.get_observation().await.epoch_id;
+
+    // Block worker inside `dry_run_task` (`mode_info().await`), start active motion, stall writer, and fill inbound ordinary queue (64/64) + 1 BACKLOG_FULL.
+    send(&mut ws_l, json!({"type": "command", "request_id": 300, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
+    sup_l.inner().write().await.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_l), "legacy_jog").unwrap();
+    assert!(sup_l.inner().read().await.active_trajectory.is_some());
+    armd::api::ws::set_test_ws_write_paused(&conn_l, true);
+    for k in 0..65u64 {
+        send(&mut ws_l, json!({"type": "command", "request_id": 301 + k, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/motion/home", "body": {}})).await;
+    }
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_l) >= 1).await;
+
+    // Stop on the same socket reaches legacy owner and stops active motion while worker & writer are BOTH blocked.
+    send(&mut ws_l, json!({"type": "command", "request_id": 400, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/motion/stop", "body": {}})).await;
+    wait_until(Duration::from_millis(200), || sup_l.inner().try_read().is_ok_and(|g| g.active_trajectory.is_none())).await;
+
+    // E-stop on the same socket latches & applies while worker & writer are BOTH blocked.
+    send(&mut ws_l, json!({"type": "estop"})).await;
+    wait_until(Duration::from_millis(100), || sup_l.e_stop_latched.load(Ordering::SeqCst)).await;
+    wait_until(Duration::from_millis(200), || sup_l.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)).await;
+    det.release_now();
+    armd::api::ws::set_test_ws_write_paused(&conn_l, false);
+
+    // (c) Bounded per-write timeout closes a permanently stalled socket and releases its lease.
+    let (addr_t, sup_t) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws_t, gen_t) = controller(addr_t).await;
+    let ep_t = sup_t.get_observation().await.epoch_id;
+    let conn_id = sup_t.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard_t = WriteHookGuard(conn_id.clone());
+    assert!(armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn_id));
+    armd::api::ws::set_test_ws_write_timeout(&conn_id, Some(Duration::from_millis(80)));
+    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    send(&mut ws_t, json!({"type": "command", "request_id": 10, "generation": gen_t, "epoch_id": ep_t, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn_id)).await;
+    assert!(sup_t.inner().read().await.active_lease.is_none(), "timed-out connection must release its lease");
+}
+
+// 7. Ordinary command awaiting a slow dry-run / detector: E-stop and Stop on the same socket still apply immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_dry_run_detector_does_not_block_estop_or_stop_on_same_socket() {
+    let det = SlowDetector::new();
+    let sup = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    let addr = serve_with_slow_detector(sup.clone(), det.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep0 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep1 = sup.get_observation().await.epoch_id;
+
+    // Start slow dry-run grasp awaiting detector `mode_info().await`.
+    send(&mut ws, json!({"type": "command", "request_id": 500, "generation": gen, "epoch_id": ep1, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
+    // Start active motion while worker is blocked on the detector so Stop has live motion to halt.
+    sup.inner().write().await.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep1), "slow_dry_run_jog").unwrap();
+    assert!(sup.inner().read().await.active_trajectory.is_some());
+
+    // While worker is blocked on the detector, Stop on the SAME socket applies immediately and stops motion.
+    let t_stop = Instant::now();
+    send(&mut ws, json!({"type": "command", "request_id": 501, "generation": gen, "epoch_id": ep1, "path": "/api/v1/motion/stop", "body": {}})).await;
+    let stop_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((stop_ack["type"].as_str(), stop_ack["request_id"].as_u64()), (Some("command_ack"), Some(501)), "{stop_ack}");
+    assert!(t_stop.elapsed() < Duration::from_millis(200), "Stop blocked behind dry-run detector: {:?}", t_stop.elapsed());
+    assert!(sup.inner().read().await.active_trajectory.is_none(), "Stop did not stop active motion");
+
+    // Still while worker is blocked on the detector, E-stop on the SAME socket latches & replies immediately.
+    let t_estop = Instant::now();
+    send(&mut ws, json!({"type": "estop"})).await;
+    let es = next_of(&mut ws, &["epoch_sync", "estop_reject"]).await;
+    assert_eq!((es["type"].as_str(), es["safety_state"].as_str()), (Some("epoch_sync"), Some("EStop")), "{es}");
+    let estop_epoch = es["epoch_id"].as_u64().unwrap();
+    assert!(estop_epoch > ep1);
+    assert!(t_estop.elapsed() < Duration::from_millis(200), "E-stop blocked behind dry-run detector: {:?}", t_estop.elapsed());
+
+    // Release detector -> dry-run reply arrives with monotonic epoch >= estop_epoch.
+    det.release_now();
+    let dry_ack = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((dry_ack["type"].as_str(), dry_ack["request_id"].as_u64()), (Some("command_ack"), Some(500)), "{dry_ack}");
+    assert!(dry_ack["epoch_id"].as_u64().unwrap() >= estop_epoch, "dry-run reply regressed epoch: {dry_ack}");
+}
+
+// 8. Two Stops in a row with the first pending: coalesced into one applied generation, never enter ordinary backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_stops_coalesce_with_same_applied_generation_and_never_enter_backlog() {
+    // (a) Executor mode: two valid Stops + one duplicate-request_id Stop while release is paused.
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }));
+    let addr = serve(sup.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep0 = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+
+    let delay = Arc::new(Mutex::new(None));
+    let handle = sup.start_executor_with_hooks(
+        ExecutorConfig::for_tests(Duration::from_millis(5)),
+        PersistTestHooks { release_delay_once: Some(delay.clone()), ..Default::default() },
+    ).await.unwrap();
+    wait_until(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+    let ep = sup.observation().await.unwrap().epoch_id;
+
+    *delay.lock().unwrap() = Some(Duration::from_millis(80));
+    wait_until(Duration::from_secs(1), || delay.lock().unwrap().is_none()).await;
+
+    send(&mut ws, json!({"type": "command", "request_id": 601, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+    send(&mut ws, json!({"type": "command", "request_id": 602, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+    send(&mut ws, json!({"type": "command", "request_id": 602, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+
+    let mut replies = Vec::new();
+    while replies.len() < 3 {
+        replies.push(next_of(&mut ws, &["command_ack", "command_reject"]).await);
+    }
+    let r601 = replies.iter().find(|r| r["request_id"] == 601).expect("reply 601");
+    let r602_ack = replies.iter().find(|r| r["request_id"] == 602 && r["type"] == "command_ack").expect("coalesced ack 602");
+    let r602_dup = replies.iter().find(|r| r["request_id"] == 602 && r["type"] == "command_reject").expect("duplicate reject 602");
+    let sg1 = r601["stop_generation"].as_u64().unwrap();
+    let sg2 = r602_ack["stop_generation"].as_u64().unwrap();
+    assert_eq!(r601["type"], "command_ack");
+    assert_eq!(sg1, 1, "coalesced Stops must advance StopRequests once, got {sg1}");
+    assert_eq!(sg1, sg2, "both coalesced Stops must receive the same applied stop_generation");
+    assert_eq!(handle.stop_requests().applied(), 1, "owner must apply exactly one stop generation");
+    assert_eq!((r602_dup["status"].as_u64(), r602_dup["code"].as_str()), (Some(400), Some("INVALID_COMMAND")), "{r602_dup}");
+    handle.stop_and_join();
+
+    // (b) Legacy mode: two Stops while `inner.write()` is briefly held coalesce and both ACK.
+    let (addr_l, sup_l) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws_l, gen_l) = controller(addr_l).await;
+    let ep_l = sup_l.get_observation().await.epoch_id;
+    let guard = sup_l.inner().write().await;
+    send(&mut ws_l, json!({"type": "command", "request_id": 701, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/motion/stop", "body": {}})).await;
+    send(&mut ws_l, json!({"type": "command", "request_id": 702, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/motion/stop", "body": {}})).await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    drop(guard);
+    let a1 = next_of(&mut ws_l, &["command_ack", "command_reject"]).await;
+    let a2 = next_of(&mut ws_l, &["command_ack", "command_reject"]).await;
+    assert_eq!((a1["type"].as_str(), a2["type"].as_str()), (Some("command_ack"), Some("command_ack")), "a1={a1}, a2={a2}");
+    let mut ids = [a1["request_id"].as_u64().unwrap(), a2["request_id"].as_u64().unwrap()];
+    ids.sort();
+    assert_eq!(ids, [701, 702]);
+}
+
+// 9. Owner preempted before its queued Stop applies: Stop is rejected per authorization rules
+//    (LEASE_LOST, StopRequests & active motion untouched) in both legacy and executor paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
+    // (a) Legacy path: Client 1 queues Stop while write lock is held by preemption to Client 2.
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws1, gen1) = controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws1, gen1, ep, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep = sup.get_observation().await.epoch_id;
+
+    {
+        let mut inner = sup.inner().write().await;
+        // Client 1 sends Stop while `inner.write()` is held (reader hands it off immediately to urgent Stop task).
+        send(&mut ws1, json!({"type": "command", "request_id": 801, "generation": gen1, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+        send(&mut ws1, json!({"type": "command", "request_id": 802, "generation": gen1, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Preempt Client 1 BEFORE its queued Stop acquires `inner.write()`, and start new motion for Client 2.
+        let (gen2, evicted) = inner.preempt_lease("connection:takeover", "client-2").unwrap();
+        assert!(gen2 > gen1 && evicted.is_some());
+        inner.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "client2_jog").unwrap();
+    }
+    let r1 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
+    let r2 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
+    assert_eq!((r1["type"].as_str(), r1["code"].as_str()), (Some("command_reject"), Some("LEASE_LOST")), "{r1}");
+    assert_eq!((r2["type"].as_str(), r2["code"].as_str()), (Some("command_reject"), Some("LEASE_LOST")), "{r2}");
+    assert!(sup.inner().read().await.active_trajectory.is_some(), "preempted owner's Stop must not cancel new owner's motion");
+
+    // (b) Executor path (`ReleaseEngine` + `UrgentStopIntake`): queued Stop from Owner 1 rejected after preemption.
+    let mut core = SupervisorInner::new(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() });
+    let g1 = core.acquire_lease("connection:owner1").unwrap();
+    core.set_torque(true).unwrap();
+    let ep_e = core.safety.epoch_id();
+    core.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog").unwrap();
+    let (mut engine, _broker, _tw, stops) = ReleaseEngine::new(BootId::fresh(), Capacities::default());
+    let (client, intake) = urgent_stop_channel(4, Arc::new(AtomicBool::new(false)));
+    engine.attach_urgent_stops(intake);
+    let mut rx = client.enqueue_async(UrgentStop {
+        connection: armd::model::HolderLabel::new("connection:owner1"),
+        lease_generation: g1,
+        epoch: Some(ep_e),
+        request_id: 1,
+        request_id_valid: true,
+        body_error: None,
+    }).unwrap();
+    // Preempt Owner 1 before the release drains urgent stops, clear handover settle, and start Owner 2's motion.
+    let (g2, _) = core.preempt_lease("connection:owner2", "owner2").unwrap();
+    assert!(g2 > g1);
+    core.handover_settling_since = None;
+    core.jog_action(vec![0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner2_jog").unwrap();
+    let _rep = engine.step(&mut core, Instant::now, 0.005, Instant::now() + Duration::from_millis(5), 1);
+    client.drain_replies();
+    assert_eq!(rx.try_recv().unwrap().unwrap(), UrgentStopOutcome::LeaseLost { epoch: ep_e });
+    assert_eq!(stops.applied(), 0, "preempted Stop must not advance StopRequests");
+    assert!(core.active_trajectory.is_some(), "preempted Stop must not stop new owner's motion");
+}
+
+// 10. Ordinary outbound queue saturated with control replies: connection closes with an explicit error
+//     frame, releases its lease, and never silently drops a control reply while staying open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_outbound_queue_saturation_closes_connection_with_error_and_drops_nothing_silently() {
+    use futures_util::StreamExt;
+
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _hook_guard = WriteHookGuard(conn_id.clone());
+
+    // Pause writer so ordinary control replies accumulate in `ordinary_out_tx` (cap 64).
+    armd::api::ws::set_test_ws_write_paused(&conn_id, true);
+    send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_id) >= 1).await;
+
+    // Send 70 ordinary commands (> 64 outbound capacity) so reply #66 overflows `ordinary_out_tx`.
+    for id in 2..=71u64 {
+        send(&mut ws, json!({"type": "command", "request_id": id, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    armd::api::ws::set_test_ws_write_paused(&conn_id, false);
+
+    // Read until connection closes: must observe explicit OUTBOUND_QUEUE_FULL error frame + Close,
+    // and never receive replies after a silently dropped gap.
+    let mut saw_error_frame = false;
+    let mut saw_close = false;
+    let mut seen_ack_ids = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" {
+                        saw_error_frame = true;
+                        assert_eq!(v["status"], 503);
+                    } else if v["type"] == "command_ack" {
+                        if let Some(id) = v["request_id"].as_u64() { seen_ack_ids.push(id); }
+                    }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(frame)))) => {
+                saw_close = true;
+                if let Some(f) = frame {
+                    assert_eq!(u16::from(f.code), 1013);
+                    assert_eq!(f.reason.as_str(), "OUTBOUND_QUEUE_FULL");
+                }
+                break;
+            }
+            Ok(None) | Ok(Some(Err(_))) => { saw_close = true; break; }
+            _ => {}
+        }
+    }
+    assert!(saw_error_frame, "connection must send explicit OUTBOUND_QUEUE_FULL error frame before closing");
+    assert!(saw_close, "connection must close on ordinary control reply queue saturation");
+    // No silent-drop gap: received ACKs must be contiguous from 1 (never skipping over dropped replies).
+    for (i, id) in seen_ack_ids.iter().enumerate() {
+        assert_eq!(*id, (i as u64) + 1, "control reply silently dropped before id={id}: {seen_ack_ids:?}");
+    }
+    assert!(seen_ack_ids.len() < 71, "connection must close before completing flooded replies");
+    // Server must release the closed connection's lease so owner state never diverges from client view.
+    wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn_id)).await;
+    assert!(sup.inner().read().await.active_lease.is_none(), "closed connection's lease must be released");
 }
