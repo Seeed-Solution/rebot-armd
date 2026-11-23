@@ -450,7 +450,7 @@ impl From<PolicyError> for ArmError {
 }
 
 /// Fixed-size provenance metadata for the observation that produced an inferred action chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChunkSource {
     /// Monotonic instant when the joint observation was sampled.
     pub joint_captured_at: Instant,
@@ -702,9 +702,11 @@ impl ChunkRing {
                     self.clear();
                     return true;
                 }
-                if limits.vision_target.is_some() && src.vision_target != limits.vision_target {
-                    self.clear();
-                    return true;
+                if let Some(ref cur_target) = limits.vision_target {
+                    if !src.vision_target.is_some_and(|s| s.matches(cur_target)) {
+                        self.clear();
+                        return true;
+                    }
                 }
                 if let (Some(ticket), Some(live_ctx)) =
                     (src.embedding_ticket, limits.live_ticket_ctx.as_ref())
@@ -1512,9 +1514,11 @@ impl PreparedPolicy {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
-            if params.vision_target.is_some() && src.vision_target != params.vision_target {
-                self.clear_chunk_buffer();
-                return Ok(CommitGateDecision::Skip { commit_period });
+            if let Some(ref cur_target) = params.vision_target {
+                if !src.vision_target.is_some_and(|s| s.matches(cur_target)) {
+                    self.clear_chunk_buffer();
+                    return Ok(CommitGateDecision::Skip { commit_period });
+                }
             }
             let is_fresh = fresh_seq.is_some_and(|seq| src.infer_seq == seq);
             let joint_limit = if is_fresh {
@@ -2879,7 +2883,7 @@ mod chunking_tests {
 
         let t0 = Instant::now();
         let ticket = InferenceTicket::new(1, 7, 1, Some(3), 10, 1, 50_000, 1_000, 1_000);
-        let target_a = DetectorTargetIdentity::from_detection(None, "cube", [0.1, 0.2, 0.3, 0.4], 10);
+        let target_a = DetectorTargetIdentity::from_detection(None, "cube", [0.1, 0.2, 0.3, 0.4]);
         let mut src0 = ChunkSource::from_joint(t0, Some(5));
         src0.embedding_ticket = Some(ticket);
         src0.vision_target = Some(target_a);
@@ -2975,31 +2979,130 @@ mod chunking_tests {
     }
 
     #[test]
-    fn chunking_commit_gate_clears_ring_when_detector_target_replaced_while_present() {
+    fn chunking_commit_gate_target_identity_keeps_stationary_and_clears_on_move_or_label() {
+        use crate::grasp::Detection;
+        use super::super::manifest::{VisionFeatureSpec, VisionLayout, VisionSourceKind, VisionTargetLostPolicy};
+
         let state_dim = ArmConfig::default().dof;
         let state = vec![0.0f32; state_dim];
-        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
         let origin = Instant::now();
         let period_ns = Duration::from_millis(50).as_nanos();
 
-        let target_cube =
-            DetectorTargetIdentity::from_detection(None, "cube", [0.10, 0.20, 0.30, 0.40], 10);
+        let make_det = |label: &str, box_norm: [f64; 4]| Detection {
+            label: label.to_string(),
+            score: 0.95,
+            raw_score_valid: true,
+            box_norm,
+            angle_deg: None,
+            angle_conf: None,
+            grasp_width_px: None,
+            mask_focus: false,
+            disp_fg: None,
+            disp_bg: None,
+            depth_conf: None,
+            length_px: None,
+            jaw_clear: None,
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
+        };
+        let vision_spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: None,
+            min_score: 0.3,
+            max_staleness_ms: 500,
+            max_sync_skew_ms: 500,
+            on_target_lost: VisionTargetLostPolicy::Hold,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: false,
+        };
+
+        // Part 1: Stationary target across 10 new frames (frame_id 1..=10, small box jitter with IoU >= 0.5)
+        // keeps the chunk without dropping or replanning.
+        let chunk_size = 12usize;
+        let vals: Vec<f32> = (0..chunk_size).map(|i| 0.05 + i as f32 * 0.01).collect();
+        let c0 = make_constant_chunk(state_dim, &vals);
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(chunk_size, chunk_size, None);
+        let (backend, calls) =
+            CountingChunkBackend::new(state_dim, chunk_size * state_dim, vec![c0]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let frame0 = super::super::vision::PolicyVisionFrame {
+            frame_id: 1,
+            captured_at: Some(origin),
+            detections: vec![make_det("cube", [0.20, 0.20, 0.40, 0.40])],
+            model_generation: None,
+        };
+        let (_, id0) = extract_top1_target(&frame0, &vision_spec).unwrap();
+        let mut src0 = ChunkSource::from_joint(origin, Some(5));
+        src0.vision_target = Some(id0);
+        prep.plan_chunk_step(&state, None, 0, src0, None).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let mut last_committed = None;
+        for step in 0u64..10 {
+            // New frame_id every step with tiny 0.01 jitter (IoU ~0.82 >= 0.5).
+            let jitter = if step % 2 == 0 { 0.0 } else { 0.01 };
+            let frame_n = super::super::vision::PolicyVisionFrame {
+                frame_id: 1 + step,
+                captured_at: Some(origin + Duration::from_millis(step * 50)),
+                detections: vec![make_det(
+                    "cube",
+                    [0.20 + jitter, 0.20, 0.40 + jitter, 0.40],
+                )],
+                model_generation: None,
+            };
+            let (_, id_n) = extract_top1_target(&frame_n, &vision_spec).unwrap();
+            let gate = CommitGateParams {
+                max_fresh_joint_age_ms: 100,
+                max_cached_joint_age_ms: 1000,
+                max_fresh_vision_age_ms: None,
+                max_cached_vision_age_ms: None,
+                horizon_ms: 600,
+                vision_generation: None,
+                vision_target: Some(id_n),
+                live_ticket_ctx: None,
+            };
+            let d = prep
+                .commit_gate(
+                    origin + Duration::from_millis(step * 50 + 5),
+                    origin,
+                    period_ns,
+                    last_committed,
+                    &gate,
+                )
+                .unwrap();
+            match d {
+                CommitGateDecision::Submit { target, commit_period } => {
+                    assert_eq!(commit_period, step);
+                    assert!((target[0] - vals[step as usize]).abs() < 1e-6);
+                }
+                other => panic!("stationary target at frame {} must keep chunk, got {other:?}", 1 + step),
+            }
+            last_committed = Some(step);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "chunk must stay alive across 10 stationary frames");
+        assert_eq!(prep.chunk_buffer_len(), 2);
+
+        // Part 2: Target moved to IoU < 0.5 (same label) or changed label (same box) clears the ring.
+        let target_cube = DetectorTargetIdentity::from_detection(None, "cube", [0.20, 0.20, 0.40, 0.40]);
+        let target_moved_low_iou =
+            DetectorTargetIdentity::from_detection(None, "cube", [0.35, 0.20, 0.55, 0.40]); // IoU = (0.05*0.2)/(0.08-0.01) = 0.14 < 0.5
         let target_other_label =
-            DetectorTargetIdentity::from_detection(None, "cup", [0.10, 0.20, 0.30, 0.40], 10);
-        let target_other_box =
-            DetectorTargetIdentity::from_detection(None, "cube", [0.55, 0.20, 0.75, 0.40], 10);
-        let target_other_frame =
-            DetectorTargetIdentity::from_detection(None, "cube", [0.10, 0.20, 0.30, 0.40], 11);
+            DetectorTargetIdentity::from_detection(None, "cup", [0.20, 0.20, 0.40, 0.40]);
+        let c4 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
 
-        // Each replacement keeps target presence = true (non-Absent) yet must refuse & clear ring.
-        for replacement in [target_other_label, target_other_box, target_other_frame] {
-            let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
-            let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone()]);
-            let mut prep =
-                PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
-            let mut src = ChunkSource::from_joint(origin, Some(5));
-            src.vision_target = Some(target_cube);
-
+        for replacement in [target_moved_low_iou, target_other_label] {
+            let (snap_r, contract_r, cfg_r) = make_chunk_snapshot_and_contract(4, 4, None);
+            let (backend_r, _) =
+                CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c4.clone()]);
+            let mut prep_r =
+                PreparedPolicy::from_backend(snap_r, contract_r, Box::new(backend_r), &cfg_r)
+                    .unwrap();
+            let mut src_r = ChunkSource::from_joint(origin, Some(5));
+            src_r.vision_target = Some(target_cube);
             let gate_same = CommitGateParams {
                 max_fresh_joint_age_ms: 100,
                 max_cached_joint_age_ms: 300,
@@ -3010,19 +3113,18 @@ mod chunking_tests {
                 vision_target: Some(target_cube),
                 live_ticket_ctx: None,
             };
-            prep.plan_chunk_step(&state, None, 0, src, None).unwrap();
+            prep_r.plan_chunk_step(&state, None, 0, src_r, None).unwrap();
             assert!(matches!(
-                prep.commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_same).unwrap(),
+                prep_r.commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_same).unwrap(),
                 CommitGateDecision::Submit { commit_period: 0, .. }
             ));
-            assert_eq!(prep.chunk_buffer_len(), 3);
+            assert_eq!(prep_r.chunk_buffer_len(), 3);
 
-            // Period 1: target is replaced while still present -> commit_gate refuses and clears ring.
             let gate_replaced = CommitGateParams {
                 vision_target: Some(replacement),
                 ..gate_same
             };
-            let d1 = prep
+            let d1 = prep_r
                 .commit_gate(
                     origin + Duration::from_millis(55),
                     origin,
@@ -3032,18 +3134,14 @@ mod chunking_tests {
                 )
                 .unwrap();
             assert_eq!(d1, CommitGateDecision::Skip { commit_period: 1 });
-            assert_eq!(
-                prep.chunk_buffer_len(),
-                0,
-                "replacing top detector target while present must clear the ring"
-            );
+            assert_eq!(prep_r.chunk_buffer_len(), 0);
         }
 
-        // Also verify TrackId-based identity: matching TrackId submits, changed TrackId clears ring.
-        let tid1 = DetectorTargetIdentity::from_detection(Some(42), "cube", [0.1, 0.2, 0.3, 0.4], 10);
-        let tid2 = DetectorTargetIdentity::from_detection(Some(43), "cube", [0.1, 0.2, 0.3, 0.4], 10);
+        // Part 3: TrackId matching ignores box movement; changed TrackId clears ring.
+        let tid1 = DetectorTargetIdentity::from_detection(Some(42), "cube", [0.1, 0.2, 0.3, 0.4]);
+        let tid2 = DetectorTargetIdentity::from_detection(Some(43), "cube", [0.1, 0.2, 0.3, 0.4]);
         let (snap_t, contract_t, cfg_t) = make_chunk_snapshot_and_contract(4, 4, None);
-        let (backend_t, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0]);
+        let (backend_t, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c4]);
         let mut prep_t =
             PreparedPolicy::from_backend(snap_t, contract_t, Box::new(backend_t), &cfg_t).unwrap();
         let mut src_t = ChunkSource::from_joint(origin, Some(5));
@@ -3063,12 +3161,10 @@ mod chunking_tests {
             prep_t.commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_t1).unwrap(),
             CommitGateDecision::Submit { commit_period: 0, .. }
         ));
-        // Period 1 with same TrackId(42): cached action submits.
         assert!(matches!(
             prep_t.commit_gate(origin + Duration::from_millis(55), origin, period_ns, Some(0), &gate_t1).unwrap(),
             CommitGateDecision::Submit { commit_period: 1, .. }
         ));
-        // Period 2 with TrackId(43): refused and ring cleared.
         let gate_t2 = CommitGateParams { vision_target: Some(tid2), ..gate_t1 };
         let d2 = prep_t
             .commit_gate(origin + Duration::from_millis(105), origin, period_ns, Some(1), &gate_t2)

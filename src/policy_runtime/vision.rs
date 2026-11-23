@@ -139,30 +139,33 @@ impl Drop for VisionFeatureCollector {
     }
 }
 
+/// Minimum bounding-box IoU required for two detections with the same label to be treated
+/// as the same target when the detector does not report a track identifier.
+pub const DETECTOR_TARGET_SAME_IOU_MIN: f32 = 0.5;
+
 /// Fixed-size identity of the top-1 detector target used to compute an action chunk.
 ///
 /// Uses [`Self::TrackId`] when the detector supplies a track identifier; otherwise
-/// identifies the target by a 128-bit SHA-256 prefix of its label, its normalized
-/// bounding box quantized to `0..=1000` (`[x1, y1, x2, y2]`), and the `frame_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// identifies the target by a 128-bit SHA-256 prefix of its label and its normalized
+/// `[x1, y1, x2, y2]` bounding box (`frame_id` is excluded so a stationary target stays
+/// identical across new frames).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DetectorTargetIdentity {
     Absent,
     TrackId(u64),
     Detection {
         label_digest: [u8; 16],
-        box_q: [u16; 4],
-        frame_id: u64,
+        box_norm: [f32; 4],
     },
 }
 
 impl DetectorTargetIdentity {
     /// Construct identity from a detector track id when available, otherwise from
-    /// `label` + quantized normalized box `[x1, y1, x2, y2]` + `frame_id`.
+    /// `label` and normalized box `[x1, y1, x2, y2]`.
     pub fn from_detection(
         track_id: Option<u64>,
         label: &str,
         box_norm: [f64; 4],
-        frame_id: u64,
     ) -> Self {
         if let Some(tid) = track_id {
             return Self::TrackId(tid);
@@ -172,13 +175,59 @@ impl DetectorTargetIdentity {
         let full = hasher.finalize();
         let mut label_digest = [0u8; 16];
         label_digest.copy_from_slice(&full[..16]);
-        let q = |v: f64| -> u16 { (v.clamp(0.0, 1.0) * 1000.0).round() as u16 };
-        let box_q = [q(box_norm[0]), q(box_norm[1]), q(box_norm[2]), q(box_norm[3])];
+        let box_f32 = [
+            box_norm[0].clamp(0.0, 1.0) as f32,
+            box_norm[1].clamp(0.0, 1.0) as f32,
+            box_norm[2].clamp(0.0, 1.0) as f32,
+            box_norm[3].clamp(0.0, 1.0) as f32,
+        ];
         Self::Detection {
             label_digest,
-            box_q,
-            frame_id,
+            box_norm: box_f32,
         }
+    }
+
+    /// Returns `true` when `self` and `other` refer to the same target:
+    /// - `Absent` matches `Absent`;
+    /// - `TrackId(a)` matches `TrackId(b)` iff `a == b`;
+    /// - `Detection` matches `Detection` iff the labels match and `IoU >= 0.5`.
+    pub fn matches(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Absent, Self::Absent) => true,
+            (Self::TrackId(a), Self::TrackId(b)) => a == b,
+            (
+                Self::Detection {
+                    label_digest: la,
+                    box_norm: ba,
+                },
+                Self::Detection {
+                    label_digest: lb,
+                    box_norm: bb,
+                },
+            ) => la == lb && box_iou_f32(ba, bb) >= DETECTOR_TARGET_SAME_IOU_MIN,
+            _ => false,
+        }
+    }
+}
+
+fn box_iou_f32(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let ix1 = a[0].max(b[0]);
+    let iy1 = a[1].max(b[1]);
+    let ix2 = a[2].min(b[2]);
+    let iy2 = a[3].min(b[3]);
+    let iw = (ix2 - ix1).max(0.0);
+    let ih = (iy2 - iy1).max(0.0);
+    let inter = iw * ih;
+    if inter <= 0.0 {
+        return 0.0;
+    }
+    let area_a = (a[2] - a[0]).max(0.0) * (a[3] - a[1]).max(0.0);
+    let area_b = (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
     }
 }
 
@@ -240,8 +289,7 @@ pub fn extract_top1_target(
     {
         return None;
     }
-    let identity =
-        DetectorTargetIdentity::from_detection(None, &det.label, det.box_norm, frame.frame_id);
+    let identity = DetectorTargetIdentity::from_detection(None, &det.label, det.box_norm);
     Some(([1.0, cx, cy, w, h, score], identity))
 }
 

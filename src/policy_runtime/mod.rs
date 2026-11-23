@@ -48,7 +48,7 @@ pub use units::{
 pub use vision::{
     evaluate_vision_frame, extract_top1_box_norm_v1, extract_top1_target, DetectionSourceAdapter,
     DetectorTargetIdentity, PolicyVisionFrame, PolicyVisionSource, VisionFeatureCollector,
-    VisionStepDecision,
+    VisionStepDecision, DETECTOR_TARGET_SAME_IOU_MIN,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
