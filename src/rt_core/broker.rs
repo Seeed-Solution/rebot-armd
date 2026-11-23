@@ -106,7 +106,7 @@ impl Authority {
 }
 
 /// Who sent a command and under which authority, until when.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stamp {
     pub arm: ArmId,
     pub boot: BootId,

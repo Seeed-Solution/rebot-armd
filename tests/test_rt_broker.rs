@@ -439,3 +439,33 @@ fn a_deadline_expiring_after_the_release_started_is_refused_at_the_commit() {
     assert_eq!(fx.step().command.unwrap().1, Err("DEADLINE_EXPIRED"));
     assert_eq!(target_of(&fx), before);
 }
+
+#[test]
+fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_ends() {
+    use armd::rt_core::broker::{RequestId, Stamp};
+    use armd::rt_core::config_iface::{Activated, CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Released, Reserved};
+    let (mut fx, mut b, _tw, stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    let revision = fx.core.revision(ConfigDomain::Keepout);
+    let stamp = Stamp { arm: ArmId::LOCAL, boot: BOOT, request: RequestId(900), client: ClientId(5), client_seq: 1, authority: a, deadline: later() };
+    let p = ConfigProposal { domain: ConfigDomain::Keepout, expected_revision: revision, candidate: CandidateId(1), stamp };
+    // a stop since the proposal was prepared: the stale authority cannot inhibit motion
+    stop.request();
+    fx.step();
+    let ctx = fx.ctx(fx.now());
+    assert!(matches!(fx.core.reserve(&p, &ctx), Reserved::Refused { code: "STOPPED", .. }));
+    assert!(!fx.core.core.motion_inhibited_by_config());
+    // prepared under the current authority: granted, and motion is inhibited
+    let p = ConfigProposal { stamp: Stamp { authority: auth(&fx), ..stamp }, ..p };
+    let Reserved::Granted(r) = fx.core.reserve(&p, &ctx) else { panic!("not granted") };
+    assert_eq!(r.stamp().request, RequestId(900));
+    assert!(fx.core.planning_snapshot(&ctx).config_inhibited);
+    submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("CONFIG_BUSY"));
+    // the foundation adapter does not activate: the reservation comes back and is released
+    let Activated::Refused { code: "NOT_WIRED", reservation } = fx.core.activate(r) else { panic!() };
+    assert_eq!(fx.core.release(reservation), Released::Cleared);
+    assert!(!fx.core.core.motion_inhibited_by_config());
+    submit_install(&mut b, 2, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+}

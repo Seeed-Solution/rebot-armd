@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::config_iface::{ConfigDomain, Reservation};
+use super::config_iface::{ConfigDomain, ConfigHold, HeldConfig};
 use super::mailbox::TargetAuthority;
 use super::ids::{ArmId, BusId};
 use super::publish::{state_channel, RtInputs, StateHub, StatePublisher};
@@ -27,12 +27,6 @@ impl FeedbackState {
     pub fn seqs(&self) -> &[u64] { &self.seqs }
     pub fn instant(&self, joint: usize) -> Option<Instant> { self.instants.get(joint).copied().flatten() }
     pub fn seq(&self, joint: usize) -> u64 { self.seqs.get(joint).copied().unwrap_or(0) }
-}
-
-/// Configuration reservations held at a safe point ([`super::config_iface`]).
-#[derive(Default)]
-struct ConfigHold {
-    held: Option<Reservation>,
 }
 
 /// The RT-owned state of one arm.
@@ -179,25 +173,20 @@ impl ArmCore {
 
     // -- configuration reservations -------------------------------------------------------
 
-    /// Holds `r` (one reservation at a time); false when another one is held.
-    pub fn hold_config(&mut self, r: Reservation) -> bool {
-        if self.config.held.is_some() { return false; }
-        self.config.held = Some(r);
-        true
-    }
+    /// The configuration hold state machine ([`super::config_iface::ConfigHold`]).
+    pub fn config(&self) -> &ConfigHold { &self.config }
+    /// The same, to grant, persist, activate, release or reconcile (the `ConfigAuthority` adapter).
+    pub fn config_mut(&mut self) -> &mut ConfigHold { &mut self.config }
 
-    /// Gives `r` up; false when it was not held.
-    pub fn release_config(&mut self, r: &Reservation) -> bool {
-        if self.config.held.as_ref() != Some(r) { return false; }
-        self.config.held = None;
-        true
-    }
+    /// The current hold, as a copyable view.
+    pub fn config_hold(&self) -> Option<HeldConfig> { self.config.held() }
 
-    /// The reservation held on `domain`.
-    pub fn config_held(&self, domain: ConfigDomain) -> Option<&Reservation> { self.config.held.as_ref().filter(|r| r.domain == domain) }
+    /// The hold on `domain`.
+    pub fn config_held(&self, domain: ConfigDomain) -> Option<HeldConfig> { self.config.held().filter(|h| h.domain == domain) }
 
-    /// A held reservation inhibits incompatible motion.
-    pub fn motion_inhibited_by_config(&self) -> bool { self.config.held.as_ref().is_some_and(|r| r.inhibits_motion) }
+    /// A hold inhibits motion (a motion domain is reserved or persisted, or any domain is
+    /// reconciling): checked at motion admission and at commit.
+    pub fn motion_inhibited_by_config(&self) -> bool { self.config.motion_inhibited() }
 
     // -- target streams -------------------------------------------------------------------
 

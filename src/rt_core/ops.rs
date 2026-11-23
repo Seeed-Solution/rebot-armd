@@ -9,7 +9,7 @@
 //! | [`CoreOps::planning_snapshot`] | the state a worker plans from (stamped, owned copy) |
 //! | [`CoreOps::commit_primitive`] | install one admitted primitive (track C, E children) |
 //! | [`CoreOps::consume_target`] | apply one latest target (track D) |
-//! | [`ConfigAuthority`] (`reserve` / `activate` / `release`) | versioned configuration (track B) |
+//! | [`ConfigAuthority`] (`reserve` / `persisted` / `activate` / `release` / reconcile) | versioned configuration (track B) |
 //! | [`CoreOps::poll_hardware`] | the bus owner's progress and confirmations (track A) |
 //! | [`CoreOps::advance`] | one release of the control tick (integrator) |
 //!
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use super::broker::{
     ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, RequestId, RtIntake,
 };
-use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Reservation, Reserved};
+use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
 use super::mailbox::{target_mailbox, TargetFrame, TargetReader, TargetWriter, MAX_DOF};
 use super::urgent::StopRequests;
@@ -152,6 +152,9 @@ pub struct PlanningSnapshot {
     pub feedback_instants: Vec<Option<Instant>>,
     pub feedback_seqs: Vec<u64>,
     pub motion_active: bool,
+    /// A configuration hold inhibits motion (`ArmCore::motion_inhibited_by_config`): refuse
+    /// motion at admission; the commit refuses it with `CONFIG_BUSY`.
+    pub config_inhibited: bool,
     pub taken_at: Instant,
 }
 
@@ -274,6 +277,7 @@ impl CoreOps for SupervisorInner {
             feedback_instants: self.core.feedback().instants().to_vec(),
             feedback_seqs: self.core.feedback().seqs().to_vec(),
             motion_active: self.active_trajectory.is_some(),
+            config_inhibited: self.core.motion_inhibited_by_config(),
             taken_at: ctx.now,
         }
     }
@@ -352,8 +356,8 @@ impl CoreOps for SupervisorInner {
     }
 }
 
-/// The supervisor's configuration revisions; reservations are held in the core. Activation
-/// stays on the existing commit path (`NOT_WIRED` here) until track B moves it.
+/// The supervisor's configuration revisions; holds live in the core. Activation stays on
+/// the existing commit path (`NOT_WIRED` here) until track B moves it.
 impl ConfigAuthority for SupervisorInner {
     fn revision(&self, domain: ConfigDomain) -> u64 {
         match domain {
@@ -369,18 +373,28 @@ impl ConfigAuthority for SupervisorInner {
         }
     }
 
-    fn reserve(&mut self, p: &ConfigProposal, now: Instant) -> Reserved {
+    fn reserve(&mut self, p: &ConfigProposal, ctx: &CommitCtx) -> Reserved {
         let current = self.revision(p.domain);
-        if now > p.stamp.deadline { return Reserved::Refused { code: "DEADLINE_EXPIRED", current }; }
+        if let Some(code) = p.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Reserved::Refused { code, current }; }
         if p.expected_revision != current { return Reserved::Refused { code: "REVISION_MISMATCH", current }; }
-        let r = Reservation { domain: p.domain, from: current, candidate: p.candidate, inhibits_motion: p.domain.affects_motion() };
-        if !self.core.hold_config(r) { return Reserved::Refused { code: "CONFIG_BUSY", current }; }
-        Reserved::Granted(r)
+        match self.core.config_mut().grant(p, current) {
+            Some(r) => Reserved::Granted(r),
+            None => Reserved::Refused { code: "CONFIG_BUSY", current },
+        }
     }
 
-    fn activate(&mut self, _r: Reservation, _durability: Durability) -> Activated { Activated::Refused { code: "NOT_WIRED" } }
+    fn persisted(&mut self, r: &Reservation, durability: Durability) -> Result<(), &'static str> { self.core.config_mut().persisted(r, durability) }
 
-    fn release(&mut self, r: Reservation) { self.core.release_config(&r); }
+    fn activate(&mut self, r: Reservation) -> Activated { self.core.config_mut().activation_failed(r, "NOT_WIRED") }
+
+    fn release(&mut self, r: Reservation) -> Released { self.core.config_mut().release(r) }
+
+    fn begin_reconcile(&mut self, domain: ConfigDomain) -> bool {
+        let active = self.revision(domain);
+        self.core.config_mut().begin_reconcile(domain, active)
+    }
+
+    fn finish_reconcile(&mut self, domain: ConfigDomain) -> bool { self.core.config_mut().finish_reconcile(domain) }
 }
 
 /// A core double for contract tests: refuses every commit and target (`NOT_WIRED`), moves
@@ -399,7 +413,7 @@ impl CoreOps for StubCore {
     fn authority(&self, ctx: &CommitCtx) -> Authority { Authority { stop_generation: ctx.stop_generation, ..Authority::default() } }
     fn planning_snapshot(&self, ctx: &CommitCtx) -> PlanningSnapshot {
         PlanningSnapshot { arm: ArmId::LOCAL, published_seq: 0, authority: self.authority(ctx), measured: Vec::new(), commanded: Vec::new(),
-            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), motion_active: false, taken_at: ctx.now }
+            feedback_instants: Vec::new(), feedback_seqs: Vec::new(), motion_active: false, config_inhibited: false, taken_at: ctx.now }
     }
     fn commit_primitive(&mut self, _: &Descriptor, _: &Primitive, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_immediate(&mut self, _: &Descriptor, _: ImmediateOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
