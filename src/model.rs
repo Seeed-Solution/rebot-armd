@@ -2273,8 +2273,9 @@ pub struct GripperObs {
     pub force_limit_trips: u64,
 }
 
-/// A lease holder's label, stored inline (at most [`HolderLabel::CAPACITY`] bytes, the
-/// limit `acquire_lease` enforces): copying, setting and clearing it never allocate or free.
+/// A short label stored inline (at most [`HolderLabel::CAPACITY`] bytes): a lease holder's
+/// label (the limit `acquire_lease` enforces), a policy stop reason, a gravity-compensation
+/// phase. Copying, setting and clearing it never allocate or free.
 /// Serializes as a JSON string; a longer string is cut at a character boundary.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HolderLabel {
@@ -2298,6 +2299,10 @@ impl HolderLabel {
         // SAFETY-free: `new` copies a prefix ending at a char boundary of a `str`
         std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
     }
+}
+
+impl Default for HolderLabel {
+    fn default() -> Self { Self { len: 0, buf: [0; Self::CAPACITY] } }
 }
 
 impl std::ops::Deref for HolderLabel {
@@ -2459,8 +2464,9 @@ pub struct PolicyObservation {
     pub vision_frame_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_shadow_target: Option<Vec<f32>>,
+    /// Inline (no allocation or free when the tick sets or clears it).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<String>,
+    pub stop_reason: Option<HolderLabel>,
 }
 
 crate::fieldwise_clone!(PolicyObservation { active, action_id, policy_id, artifact_digest, backend, mode, steps, last_input_age_ms, last_vision_age_ms, vision_frame_id, last_shadow_target, stop_reason });
@@ -2572,8 +2578,9 @@ pub struct GravityCompObservation {
     pub supported: bool,
     /// Why entering is refused right now (None when allowed or already active).
     pub blocker: Option<ModeReason>,
-    /// `ramp_in`, `active`, `exiting` or `exit_failed`; None in position mode.
-    pub phase: Option<String>,
+    /// `ramp_in`, `active`, `exiting` or `exit_failed`; None in position mode. Inline (no
+    /// allocation or free when the tick sets or clears it).
+    pub phase: Option<HolderLabel>,
     /// Feed-forward fade-in progress, 0..1.
     pub ramp: f32,
     pub scale: f32,

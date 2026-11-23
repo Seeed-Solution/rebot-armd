@@ -183,7 +183,7 @@ impl Rig {
     }
     fn q(&self) -> [f32; 7] { self.sim.lock().unwrap().q }
     fn modes(&self) -> [JointMode; 7] { self.sim.lock().unwrap().modes }
-    async fn phase(&self) -> Option<String> { self.sup.get_observation().await.gravity_comp.phase }
+    async fn phase(&self) -> Option<String> { self.sup.get_observation().await.gravity_comp.phase.map(|p| p.to_string()) }
 }
 
 fn code(err: ArmError) -> String {
