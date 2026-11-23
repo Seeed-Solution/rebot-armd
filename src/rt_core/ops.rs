@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use super::broker::{
     ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, RequestId, RtIntake,
+    TransitionOp,
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
@@ -189,6 +190,16 @@ impl ServiceBudget {
     }
 }
 
+/// Progress of the driver transition in flight (`HardwarePoll::torque`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TorqueProgress {
+    /// Still waiting for confirmation: service it again at `wake` (the executor wakes then,
+    /// capped at the next release).
+    Pending { wake: Instant },
+    /// Confirmed: the transition's terminal is `Completed`.
+    Done,
+}
+
 /// One hardware poll: feedback validity and enable state, and what the poll serviced (no
 /// bus traffic today: `rx_frames` 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -202,6 +213,16 @@ pub struct HardwarePoll {
     pub rx_frames: u16,
     /// The poll stopped at its budget (deadline or frame bound) with work left.
     pub budget_exhausted: bool,
+    /// The driver transition in flight (None: none): progress, or its failure code (the
+    /// transition's terminal is `Failed(code)`).
+    pub torque: Option<Result<TorqueProgress, &'static str>>,
+}
+
+impl HardwarePoll {
+    /// When the bus owner wants to be serviced before the next release (a pending transition).
+    pub fn wake(&self) -> Option<Instant> {
+        match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
+    }
 }
 
 /// The narrow operations of one arm's core.
@@ -214,6 +235,10 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Starts a driver transition after rechecking the stamp; its progress and outcome come
+    /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
+    /// the transition (the adapter uses the request id's value).
+    fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     /// Applies one target after rechecking it ([`TargetFrame::check`] against the core's
     /// [`super::mailbox::TargetAuthority`], then the configuration hold).
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str>;
@@ -322,6 +347,16 @@ impl CoreOps for SupervisorInner {
         r.map(|_| Committed::authorized(d, None)).map_err(static_code)
     }
 
+    fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.check_commit(d, ctx)?;
+        if self.core.transition_pending() { return Err("TRANSITION_BUSY"); }
+        // delegated: the existing set_torque confirms synchronously; the result is reported
+        // by the next poll, as the bus owner's state machine will (track A)
+        let result = self.set_torque(matches!(op, TransitionOp::TorqueOn)).map(drop).map_err(|e| static_code(ArmError::Safety(e)));
+        self.core.begin_transition(result.map(|()| TorqueProgress::Done));
+        Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
+    }
+
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
         if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) { return Err(code); }
         if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
@@ -338,7 +373,7 @@ impl CoreOps for SupervisorInner {
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
         // no bus servicing is delegated yet (the tick reads feedback): only the budget is reported
         let budget_exhausted = budget.now > budget.deadline;
-        let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, ..HardwarePoll::default() }; };
+        let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() }; };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
         let ages = d.feedback_ages();
         HardwarePoll {
@@ -348,6 +383,7 @@ impl CoreOps for SupervisorInner {
             oldest_feedback_age: ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a))),
             rx_frames: 0,
             budget_exhausted,
+            torque: self.core.poll_transition(),
         }
     }
 
@@ -417,6 +453,7 @@ impl CoreOps for StubCore {
     }
     fn commit_primitive(&mut self, _: &Descriptor, _: &Primitive, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn commit_immediate(&mut self, _: &Descriptor, _: ImmediateOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
+    fn commit_transition(&mut self, _: &Descriptor, _: TransitionOp, _: &CommitCtx) -> Result<Committed, &'static str> { self.commits_seen += 1; Err("NOT_WIRED") }
     fn consume_target(&mut self, _: &TargetFrame, _: &CommitCtx) -> Result<(), &'static str> { self.targets_seen += 1; Err("NOT_WIRED") }
     fn apply_stop(&mut self) {}
     fn action_outcome(&self, _: ActionId) -> Option<Outcome> { Some(Outcome::Failed("NOT_WIRED")) }
@@ -442,6 +479,8 @@ pub struct ReleaseReport {
     pub ended: Option<(ActionId, Outcome)>,
     /// The hardware poll of this release.
     pub poll: HardwarePoll,
+    /// The driver transition that ended in this release.
+    pub transition_ended: Option<(ActionId, Outcome)>,
 }
 
 /// The fixture's clock: virtual monotonic time, advanced by the fixture (one `dt` per
@@ -472,6 +511,8 @@ pub struct ReleaseFixture<O: CoreOps> {
     targets: TargetReader,
     stop: StopRequests,
     active: Option<Installed>,
+    /// The driver transition in flight.
+    transition: Option<Installed>,
     releases: u64,
     clock: VirtualClock,
     hook: Option<Box<dyn FnMut(Checkpoint)>>,
@@ -498,7 +539,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
         let clock = VirtualClock::starting_at(Instant::now());
-        (Self { core, intake, targets: tr, stop: stop.clone(), active: None, releases: 0, clock, hook: None, dt: 0.02 }, broker, tw, stop)
+        (Self { core, intake, targets: tr, stop: stop.clone(), active: None, transition: None, releases: 0, clock, hook: None, dt: 0.02 }, broker, tw, stop)
     }
 
     /// The fixture's virtual clock (clone it to advance time from a test).
@@ -508,6 +549,8 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     pub fn releases(&self) -> u64 { self.releases }
     pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
+    /// The driver transition in flight.
+    pub fn transition(&self) -> Option<ActionId> { self.transition.as_ref().map(Installed::action) }
     pub fn reply_overflow(&self) -> u64 { self.intake.reply_overflow() }
 
     pub fn ctx(&self, now: Instant) -> CommitCtx {
@@ -544,6 +587,15 @@ impl<O: CoreOps> ReleaseFixture<O> {
         if self.apply_pending_stop() { report.stopped = true; }
         // 2. the bus owner, within the release's service budget
         report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
+        let ended = match report.poll.torque {
+            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
+            Some(Err(code)) => Some(Outcome::Failed(code)),
+            _ => None,
+        };
+        if let (Some(outcome), Some(t)) = (ended, self.transition.take()) {
+            report.transition_ended = Some((t.action(), outcome));
+            self.intake.terminal(t, outcome);
+        }
         // 3. one ordinary command (the intake enforces one per release)
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(Checkpoint::BeforeCommit, &mut report);
@@ -555,14 +607,20 @@ impl<O: CoreOps> ReleaseFixture<O> {
                     Some(p) => self.core.commit_primitive(&d, &p, &ctx),
                 },
                 CommandKind::Immediate(op) => self.core.commit_immediate(&d, op, &ctx),
+                CommandKind::Transition(op) => self.core.commit_transition(&d, op, &ctx),
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
-                    if d.kind.starts_action() && c.action().is_some() && c.request() == d.stamp.request {
+                    let install = matches!(d.kind, CommandKind::Install { .. });
+                    if install && c.action().is_some() && c.request() == d.stamp.request {
                         if let Some(old) = self.active.take() { t.terminal_before(old, Outcome::Superseded); }
                     }
                     t.ack(c).map(|acked| {
-                        if let Some(i) = acked.installed { self.active = Some(i); }
+                        match acked.installed {
+                            Some(i) if install => self.active = Some(i),
+                            Some(i) => self.transition = Some(i),
+                            None => {}
+                        }
                         acked.commit_seq
                     })
                 }

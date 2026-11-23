@@ -469,3 +469,21 @@ fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_end
     submit_install(&mut b, 2, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
+
+#[test]
+fn a_torque_transition_is_acked_then_its_terminal_follows_from_the_poll() {
+    use armd::rt_core::broker::TransitionOp;
+    let ((mut fx, mut b, _tw, _stop), _) = leased(600_000);
+    let r = b.submit(ClientId(1), 1, auth(&fx), later(), Submit::Transition(TransitionOp::TorqueOff)).unwrap();
+    assert_eq!(b.reserved(), 2, "ACK and terminal reserved");
+    let rep = fx.step();
+    assert!(rep.command.unwrap().1.is_ok());
+    let t = fx.transition().expect("in flight");
+    assert!(!fx.core.is_torqued);
+    let rep = fx.step();
+    assert_eq!(rep.transition_ended, Some((t, Outcome::Completed)));
+    assert!(fx.transition().is_none());
+    let got = replies(&mut b);
+    assert_eq!(got[1], Reply::Terminal { request: r, action: t, outcome: Outcome::Completed });
+    assert_eq!((b.reserved(), b.outstanding()), (0, 0));
+}

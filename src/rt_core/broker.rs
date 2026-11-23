@@ -153,6 +153,15 @@ pub enum ImmediateOp {
     TorqueOff,
 }
 
+/// A driver transition the bus owner carries out over several releases (track A): the ACK
+/// says it started, the terminal reply says it was confirmed (`Completed`) or failed. The
+/// client-facing torque command stays synchronous: its worker awaits the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOp {
+    TorqueOn,
+    TorqueOff,
+}
+
 /// What a descriptor asks the RT to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
@@ -160,10 +169,14 @@ pub enum CommandKind {
     Install { plan: PlanHandle },
     /// A command without a plan; ACK or refusal only.
     Immediate(ImmediateOp),
+    /// Start a driver transition; a terminal reply follows the ACK.
+    Transition(TransitionOp),
 }
 
 impl CommandKind {
-    pub fn starts_action(&self) -> bool { matches!(self, Self::Install { .. }) }
+    /// A terminal reply follows the ACK (an install or a transition).
+    pub fn starts_action(&self) -> bool { matches!(self, Self::Install { .. } | Self::Transition(_)) }
+    pub fn plan(&self) -> Option<PlanHandle> { match self { Self::Install { plan } => Some(*plan), _ => None } }
 }
 
 /// One entry of the command ring.
@@ -414,6 +427,7 @@ struct Pending {
 pub enum Submit<'a, P> {
     Install(&'a dyn Fn(&mut P)),
     Immediate(ImmediateOp),
+    Transition(TransitionOp),
 }
 
 /// Capacities of one broker (tests use tiny ones).
@@ -481,14 +495,15 @@ pub struct Taken<'a, P> {
 #[must_use = "an acknowledged install owes its terminal reply (RtIntake::terminal)"]
 pub struct Installed {
     request: RequestId,
-    plan: PlanHandle,
+    /// None for a transition.
+    plan: Option<PlanHandle>,
     action: ActionId,
 }
 
 impl Installed {
     pub fn request(&self) -> RequestId { self.request }
     pub fn action(&self) -> ActionId { self.action }
-    pub fn plan(&self) -> PlanHandle { self.plan }
+    pub fn plan(&self) -> Option<PlanHandle> { self.plan }
 }
 
 /// Result of [`Taken::ack`].
@@ -532,7 +547,7 @@ impl<P> Broker<P> {
             self.stats.refused_admission += 1;
             return Err(AdmitError::Disconnected);
         }
-        let terminal = matches!(what, Submit::Install(_));
+        let terminal = matches!(what, Submit::Install(_) | Submit::Transition(_));
         let need = 1 + usize::from(terminal);
         let refused = if self.commands.slots() == 0 { Some(AdmitError::CommandsFull) }
             else if self.reserved + need > self.reply_capacity { Some(AdmitError::RepliesFull) }
@@ -550,6 +565,7 @@ impl<P> Broker<P> {
                 }
             },
             Submit::Immediate(op) => CommandKind::Immediate(op),
+            Submit::Transition(op) => CommandKind::Transition(op),
         };
         self.next_request += 1;
         let request = RequestId(self.next_request);
@@ -657,7 +673,7 @@ impl<P> RtIntake<P> {
     /// The physical end of an acknowledged install (consumes its token: one terminal per
     /// install); retires its plan slot.
     pub fn terminal(&mut self, i: Installed, outcome: Outcome) {
-        self.plans.retire(i.plan);
+        if let Some(plan) = i.plan { self.plans.retire(plan); }
         self.installed -= 1;
         self.reply(Reply::Terminal { request: i.request, action: i.action, outcome });
     }
@@ -671,7 +687,7 @@ impl<P> Taken<'_, P> {
 
     /// The plan of this install (None: not an install, or the slot is stale).
     pub fn plan(&self) -> Option<&P> {
-        match self.d.kind { CommandKind::Install { plan } => self.intake.plans.get(plan), CommandKind::Immediate(_) => None }
+        self.d.kind.plan().and_then(|plan| self.intake.plans.get(plan))
     }
 
     /// Sends the terminal of an earlier install before this command's answer (an install
@@ -680,11 +696,11 @@ impl<P> Taken<'_, P> {
 
     /// Acknowledges the commit proven by `committed`, which must have been made for this
     /// request: a proof of another request refuses the command (`COMMIT_MISMATCH`) instead.
-    /// An install acknowledged without an action is refused too (`COMMIT_MISMATCH`): its
-    /// terminal could never be sent. Returns the commit sequence and the install's token.
+    /// An install or transition acknowledged without an action is refused too
+    /// (`COMMIT_MISMATCH`): its terminal could never be sent. Returns the commit sequence and the install's token.
     pub fn ack(mut self, committed: super::ops::Committed) -> Result<Acked, &'static str> {
-        let install = match self.d.kind { CommandKind::Install { plan } => Some(plan), CommandKind::Immediate(_) => None };
-        if committed.request() != self.d.stamp.request || (install.is_some() && committed.action().is_none()) {
+        let terminal = self.d.kind.starts_action();
+        if committed.request() != self.d.stamp.request || (terminal && committed.action().is_none()) {
             self.refuse_now("COMMIT_MISMATCH");
             return Err("COMMIT_MISMATCH");
         }
@@ -694,8 +710,8 @@ impl<P> Taken<'_, P> {
         let commit_seq = intake.commit_seq;
         let request = self.d.stamp.request;
         intake.reply(Reply::Ack { request, commit_seq, action: committed.action() });
-        let installed = match (install, committed.action()) {
-            (Some(plan), Some(action)) => { intake.installed += 1; Some(Installed { request, plan, action }) }
+        let installed = match (terminal, committed.action()) {
+            (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
             _ => None,
         };
         Ok(Acked { commit_seq, installed })
