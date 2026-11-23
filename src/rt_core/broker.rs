@@ -287,8 +287,17 @@ impl<P> PlanReader<P> {
     }
 
     /// Ends the RT's use of `h` (no allocation, no free: the writer reclaims the slot).
-    /// False when `h` was not live.
-    pub fn retire(&self, h: PlanHandle) -> bool {
+    /// False when `h` was not live. Takes `&mut self` so no `&P` from [`Self::get`] can
+    /// outlive the retirement (the writer may rewrite the slot right after).
+    ///
+    /// ```compile_fail
+    /// let (mut w, mut r) = armd::rt_core::broker::plan_slots(1, || 0u32);
+    /// let h = w.stage(|p| *p = 7).unwrap();
+    /// let p = r.get(h).unwrap();
+    /// r.retire(h);
+    /// let _ = *p;
+    /// ```
+    pub fn retire(&mut self, h: PlanHandle) -> bool {
         let Some(w) = self.slots.words.get(h.index()) else { return false; };
         w.compare_exchange(pack(h.generation, READY), pack(h.generation, RETIRED), Ordering::Release, Ordering::Relaxed).is_ok()
     }
@@ -510,8 +519,8 @@ impl<P> RtIntake<P> {
     /// The plan of an install, None when stale.
     pub fn plan(&self, h: PlanHandle) -> Option<&P> { self.plans.get(h) }
 
-    /// Ends the RT's use of a plan slot.
-    pub fn retire(&self, h: PlanHandle) -> bool { self.plans.retire(h) }
+    /// Ends the RT's use of a plan slot (`&mut self`: no plan reference may outlive it).
+    pub fn retire(&mut self, h: PlanHandle) -> bool { self.plans.retire(h) }
 
     /// Replies the reply ring refused (0 unless a reservation is wrong).
     pub fn reply_overflow(&self) -> u64 { self.reply_overflow }
@@ -645,7 +654,7 @@ mod tests {
 
     #[test]
     fn a_reused_slot_reads_stale_through_an_old_handle() {
-        let (mut w, r) = plan_slots(1, || [0.0f32; 4]);
+        let (mut w, mut r) = plan_slots(1, || [0.0f32; 4]);
         let h1 = w.stage(|p| *p = [1.0; 4]).unwrap();
         assert!(r.retire(h1));
         assert!(!r.retire(h1), "retired once");
@@ -701,7 +710,7 @@ mod tests {
     /// complete plan staged under that handle (stress in place of a model checker).
     #[test]
     fn plan_slots_stress_two_threads() {
-        let (mut w, r) = plan_slots(3, || vec![0u64; 64]);
+        let (mut w, mut r) = plan_slots(3, || vec![0u64; 64]);
         let (mut htx, mut hrx) = rtrb::RingBuffer::<(PlanHandle, u64)>::new(2);
         let reader = std::thread::spawn(move || {
             let mut seen = 0u64;
