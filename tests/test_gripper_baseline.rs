@@ -86,12 +86,17 @@ enum Load {
     OpenBlock(f32, f32),
     /// Something dragging on the jaw between `.0` and `.1` (rad): `.2` N·m more while moving.
     Drag(f32, f32, f32),
+    /// Soft object from `.0` (k 1.5 N·m/rad) that slips out of the jaws after being pressed for
+    /// `.1` ticks (counted in `Rig::pressed`).
+    SlipAfter(f32, u32),
 }
 
 struct Rig {
     q: [f32; 7], v: [f32; 7], tau: [f32; 7], enabled: EnableState,
     finger: Finger, load: Load, seed: u32, offset: f32,
     broke: bool, peak_tau: f32,
+    /// Ticks the SlipAfter object has been pressed.
+    pressed: u32,
 }
 
 impl Rig {
@@ -141,6 +146,11 @@ impl ArmDriver for RigDriver {
                 Load::OpenBlock(..) => free,
                 Load::Drag(a, b, nm) if q >= a.min(b) && q <= a.max(b) && v.abs() > 0.05 => free + nm * v.signum(),
                 Load::Drag(..) => free,
+                Load::SlipAfter(at, n) if q >= at => {
+                    r.pressed += 1;
+                    if r.pressed > n { r.load = Load::Free; free } else { free + 1.5 * (q - at) }
+                }
+                Load::SlipAfter(..) => free,
             };
             r.q[6] = q;
             r.v[6] = v;
@@ -158,7 +168,7 @@ impl ArmDriver for RigDriver {
 
 fn rig(finger: Finger) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled,
-        finger, load: Load::Free, seed: 7, offset: 0.0, broke: false, peak_tau: 0.0 }));
+        finger, load: Load::Free, seed: 7, offset: 0.0, broke: false, peak_tau: 0.0, pressed: 0 }));
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     // the baseline is bound to the follower kind
@@ -462,16 +472,33 @@ fn ordinary_closing_moves_are_not_learned() {
     assert_eq!((obs.close_moves, obs.state.as_str()), (0, "unlearned"), "{obs:?}");
 }
 
-/// An object that slips out of the jaws after the contact is not reported held.
+/// An object that slips out of the jaws after the contact, early or late in the squeeze, is not
+/// reported held; the close reaches the object first (contact near -2.0 rad).
 #[test]
 fn slipped_object_is_not_held() {
-    for learned in [false, true] {
-        let (mut inner, rig) = rig(Finger::New);
-        if learned { learn(&mut inner, &rig, 3); }
-        rig.lock().unwrap().load = Load::Slip(-2.0, 0.25);
-        let (a, _) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
-        eprintln!("slip (learned {learned}): {} holding {:?} at {:.3}", a.state, a.holding, inner.measured_positions[6]);
-        assert_ne!(a.holding, Some(true), "learned {learned}: {a:?}");
+    for (finger, learned) in [(Finger::Old, false), (Finger::New, true)] {
+        for after in [3u32, 8, 14, 20] {
+            let (mut inner, rig) = rig(finger);
+            if learned { learn(&mut inner, &rig, 3); }
+            rig.lock().unwrap().load = Load::SlipAfter(-2.0, after);
+            let epoch = inner.safety.epoch_id();
+            let (id, _) = inner.start_gripper(req(GripperCommand::Close, None, 1.0), epoch).unwrap();
+            let mut first = None;
+            let a = loop {
+                inner.tick(DT);
+                if first.is_none() { first = inner.gripper_last_contact; }
+                let a = inner.last_action.clone().unwrap();
+                assert_eq!(a.id, id);
+                if !a.is_running() { break a; }
+            };
+            let slipped = rig.lock().unwrap().load == Load::Free;
+            eprintln!("slip after {after} ticks (learned {learned}): {} {:?} holding {:?} at {:.3}, first contact {:?}, slipped {slipped}",
+                a.state, a.code, a.holding, inner.measured_positions[6], first.map(|c| c.at_rad));
+            // the close reached and pressed the object
+            assert!(rig.lock().unwrap().pressed > 0, "after {after}: never reached the object");
+            if let Some(c) = first { assert!(c.at_rad > -2.1 && c.at_rad < -1.6, "{c:?}"); }
+            if slipped { assert_ne!(a.holding, Some(true), "after {after}, learned {learned}: {a:?}"); }
+        }
     }
 }
 
@@ -568,7 +595,7 @@ fn lubricated_finger_one_open_then_air_closes() {
 /// Supervisor with the rig driver, ticked at 20 ms of simulated time every millisecond.
 async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>) {
     let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled,
-        finger, load: Load::Free, seed: 11, offset: 0.0, broke: false, peak_tau: 0.0 }));
+        finger, load: Load::Free, seed: 11, offset: 0.0, broke: false, peak_tau: 0.0, pressed: 0 }));
     let sup = Arc::new(armd::ArmSupervisor::new(ArmConfig::rebot_dm()));
     sup.set_driver(Box::new(RigDriver(rig.clone()))).await;
     {
