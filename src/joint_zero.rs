@@ -92,10 +92,14 @@ impl JointZero {
 pub struct ZeroOffsetDriver {
     inner: Box<dyn ArmDriver>,
     offsets: Vec<f32>,
+    /// Motor-side targets of the last write (reused: no allocation per write).
+    motor_targets: Vec<JointTarget>,
 }
 
 impl ZeroOffsetDriver {
-    pub fn new(inner: Box<dyn ArmDriver>, offsets: &[f32]) -> Self { Self { inner, offsets: offsets.to_vec() } }
+    pub fn new(inner: Box<dyn ArmDriver>, offsets: &[f32]) -> Self {
+        Self { inner, offsets: offsets.to_vec(), motor_targets: Vec::with_capacity(offsets.len().max(8)) }
+    }
 
     fn off(&self, i: usize) -> f32 { self.offsets.get(i).copied().unwrap_or(0.0) }
 
@@ -131,12 +135,39 @@ impl ArmDriver for ZeroOffsetDriver {
         }
         Ok(states)
     }
-    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        match self.to_motor(targets) {
-            None => self.inner.write_joint_targets(targets),
-            Some(m) => self.inner.write_joint_targets(&m),
+    fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+        self.inner.read_joint_states_into(out)?;
+        for (i, s) in out.iter_mut().enumerate() {
+            let o = self.off(i);
+            if o != 0.0 { s.position -= o; }
         }
+        Ok(())
     }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        if self.offsets.iter().all(|o| *o == 0.0) { return self.inner.write_joint_targets(targets); }
+        let mut m = std::mem::take(&mut self.motor_targets);
+        m.clear();
+        m.extend(targets.iter().enumerate().map(|(i, t)| {
+            let o = self.off(i);
+            let mut t = t.clone(); // plain fields: no allocation
+            if o != 0.0 { t.position += o; }
+            t
+        }));
+        let r = self.inner.write_joint_targets(&m);
+        self.motor_targets = m;
+        r
+    }
+    fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) { self.inner.feedback_ages_into(out) }
+    fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool { self.inner.feedback_all_within(dof, max_age) }
+    fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) { self.inner.feedback_age_ms_into(out) }
+    fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { self.inner.with_range_check(f) }
+    fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_instants_into(out) }
+    fn feedback_seqs_into(&self, out: &mut Vec<u64>) { self.inner.feedback_seqs_into(out) }
+    fn feedback_queue_bounds_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_queue_bounds_into(out) }
+    fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) { self.inner.feedback_receive_instants_into(out) }
+    fn take_recovery_writes_into(&mut self, out: &mut Vec<usize>) { self.inner.take_recovery_writes_into(out) }
+    fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.inner.joint_loads_into(out) }
+    fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.inner.motor_status_into(out) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
@@ -146,6 +177,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> { self.inner.refresh_enable_state() }
     fn set_abort_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.inner.set_abort_flag(flag) }
+    fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.inner.set_estop_gate(gate) }
     fn set_gripper_index(&mut self, index: Option<usize>) { self.inner.set_gripper_index(index) }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }
     fn motor_status(&self) -> Option<Vec<u8>> { self.inner.motor_status() }

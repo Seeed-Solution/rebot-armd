@@ -431,6 +431,8 @@ impl crate::supervisor::SupervisorInner {
     pub fn mit_gate(&self) -> Result<(), String> {
         let joints = mit_joints(&self.config);
         if joints.is_empty() { return Ok(()); }
+        // fail-closed: no MIT unless the RT executor runs at SCHED_FIFO with locked memory
+        if let Some(why) = crate::rt_core::sched::mit_refusal() { return Err(why); }
         let Some(d) = self.driver.as_ref() else { return Err("MIT needs a motor driver".into()) };
         let mut driver = d.lock().map_err(|_| "driver lock poisoned".to_string())?;
         let supports = driver.supports_mit_mode_switch();
@@ -675,16 +677,32 @@ impl crate::supervisor::SupervisorInner {
     /// feed-forward history advances only after a successful flush; a failed write cancels the
     /// group. MIT lost: nothing is written (None).
     pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
+        self.write_output_slice(&mut targets, dt)
+    }
+
+    /// [`Self::write_output`] of the targets in the tick's scratch (`scratch.targets`, filled by
+    /// the caller): no allocation for the ordinary position output.
+    pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), String>> {
+        let mut targets = std::mem::take(&mut self.scratch.targets);
+        let r = self.write_output_slice(&mut targets, dt);
+        self.scratch.targets = targets;
+        r
+    }
+
+    fn write_output_slice(&mut self, targets: &mut [JointTarget], dt: f64) -> Option<Result<(), String>> {
+        // an E-stop requested since the tick applied the last one: no dynamic output reaches
+        // the bus (the tick applies the stop policy right after, see `tick_control`)
+        if self.estop_request_unapplied() { return None; }
         let ff = match self.mit.owner {
             MitOwner::Off => None,
             MitOwner::Lost => return None,
-            MitOwner::Active => match self.mit_prepare(&mut targets, dt) {
+            MitOwner::Active => match self.mit_prepare(targets, dt) {
                 Ok(ff) => Some(ff),
                 Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
             },
         };
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
-            .map(|mut drv| drv.write_joint_targets(&targets).map_err(|e| e.to_string()));
+            .map(|mut drv| drv.write_joint_targets(targets).map_err(|e| e.to_string()));
         if let Some(ff) = ff {
             match &res {
                 Some(Ok(())) => {

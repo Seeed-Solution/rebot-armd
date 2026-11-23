@@ -168,40 +168,6 @@ fn request_shutdown(inner: &mut SupervisorInner) -> bool {
 
 /// Requests SCHED_FIFO 50 for the calling thread and reads the policy back
 /// (`control_thread` in `GET /api/v1/diagnostics/tick`).
-fn set_realtime_priority() -> Option<armd::diagnostics::tick::ControlThreadSched> {
-    #[cfg(target_os = "linux")]
-    {
-        // musl adds sporadic-server fields; zero them and set only the priority.
-        // SAFETY: sched_param is plain old data, all-zero is a valid value.
-        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-        param.sched_priority = 50;
-        // SAFETY: plain syscall on the calling thread with a valid param struct.
-        // musl stubs sched_setscheduler() with ENOSYS; the pthread call is implemented.
-        let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
-        if rc == 0 {
-            info!("Control loop running at SCHED_FIFO priority 50");
-        } else {
-            warn!("Control loop real-time priority unavailable ({}); using normal scheduling", std::io::Error::from_raw_os_error(rc));
-        }
-        let mut policy: libc::c_int = 0;
-        // SAFETY: as above; both out-pointers are valid for the call.
-        let mut now: libc::sched_param = unsafe { std::mem::zeroed() };
-        let rc_get = unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut now) };
-        if rc_get != 0 {
-            return None;
-        }
-        let name = match policy {
-            libc::SCHED_FIFO => "fifo".to_string(),
-            libc::SCHED_RR => "rr".to_string(),
-            libc::SCHED_OTHER => "other".to_string(),
-            p => p.to_string(),
-        };
-        Some(armd::diagnostics::tick::ControlThreadSched { policy: name, priority: now.sched_priority, realtime: rc == 0 && policy == libc::SCHED_FIFO })
-    }
-    #[cfg(not(target_os = "linux"))]
-    None
-}
-
 /// Boot record, then the black box; any failure leaves armd running without them.
 fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &armd::diagnostics::boot::SystemInfo, started: std::time::Instant) {
     use armd::diagnostics::{self, DiagnosticsState};
@@ -380,6 +346,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(warning) = log_warning {
         warn!("{warning}");
     }
+    // Memory lock before any other thread starts (MCL_FUTURE covers later mappings too).
+    let rt_sched = armd::rt_core::sched::RtSchedConfig::from_env()?;
+    let memory_lock = armd::rt_core::sched::lock_memory(&rt_sched);
+    match &memory_lock {
+        armd::rt_core::sched::MemoryLock::Locked => info!("Process memory locked (mlockall MCL_CURRENT|MCL_FUTURE)"),
+        m => warn!("Process memory not locked ({}); MIT tracking, when configured, is refused", m.describe()),
+    }
     let follower = cli.follower.as_deref().unwrap_or("mock");
     let config = resolve_follower_config(follower, cli.config.as_deref())?;
     let config = apply_cli_tool(config, cli.tool.as_deref())?;
@@ -500,37 +473,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
 
-    // The control loop runs on its own OS thread at real-time priority. On the
-    // single-core SG2002 a tokio task shares one worker with HTTP/WS/video proxies
-    // and with yolo-detector, so a tick could slip past the stall deadline.
+    // The control loop runs on its own OS thread at real-time priority (the RT executor,
+    // `armd::rt_core::executor`). On the single-core SG2002 a tokio task shares one worker with
+    // HTTP/WS/video proxies and with yolo-detector, so a tick could slip past the stall deadline.
+    // SCHED_FIFO 45 by default, below the SPI/CAN interrupt threads at 50 (`armd::rt_core::sched`).
     let control_supervisor = supervisor.clone();
     let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let control_stop_flag = control_stop.clone();
+    let executor_stats = Arc::new(armd::rt_core::executor::ExecutorStats::default());
+    let loop_stats = executor_stats.clone();
     let runtime = tokio::runtime::Handle::current();
     std::thread::Builder::new().name("armd-control".into()).spawn(move || {
-        if let Some(sched) = set_realtime_priority() {
-            control_supervisor.set_control_thread_sched(sched);
+        let sched = armd::rt_core::sched::apply_to_current_thread(&rt_sched, &memory_lock);
+        if sched.realtime {
+            info!("Control loop running at SCHED_FIFO priority {}{}", sched.priority,
+                sched.cpu.map(|c| format!(" on CPU {c}")).unwrap_or_default());
+        } else {
+            warn!("Control loop real-time scheduling unavailable ({}); using normal scheduling, MIT tracking (when configured) refused", sched.errors.join("; "));
         }
+        armd::rt_core::sched::set_readiness(armd::rt_core::sched::RtReadiness::from_sched(&sched));
+        control_supervisor.set_control_thread_sched(sched);
         if std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1") {
             armd::diagnostics::alloc::time_this_thread();
             info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
         }
-        let mut next = std::time::Instant::now() + period;
-        let mut last_tick = std::time::Instant::now();
-        let mut last_late_log: Option<std::time::Instant> = None;
-        while !control_stop_flag.load(Ordering::SeqCst) {
-            let now = std::time::Instant::now();
-            if next > now { std::thread::sleep(next - now); }
-            next += period;
-            let now = std::time::Instant::now();
-            if next < now { next = now + period; } // skip missed ticks
-            let dt = last_tick.elapsed().as_secs_f64();
-            last_tick = now;
-            if dt > 0.080 && last_late_log.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
-                warn!("Control tick late: {:.0} ms since previous tick", dt * 1000.0);
-                last_late_log = Some(now);
-            }
-            // Preserve real elapsed time so the supervisor can detect stalled control ticks.
+        // Absolute releases; missed releases are skipped and dt keeps the real elapsed time so
+        // the supervisor can detect stalled control ticks.
+        armd::rt_core::executor::run_periodic(period, &control_stop_flag, &loop_stats, |dt| {
             let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.block_on(control_supervisor.control_tick(dt));
             }));
@@ -540,8 +509,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
                 std::process::exit(1);
             }
-        }
+        });
     })?;
+    executor_stats.spawn_monitor(control_stop.clone())?;
 
     let operator_auth = resolve_operator_auth(follower, &cli)?;
     supervisor.set_operator_auth_enforced(operator_auth.is_enforced()).await;

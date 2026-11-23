@@ -97,11 +97,13 @@ impl TorqueGuardPolicy {
 
     /// Threshold (N·m) per joint of `config`; None = not watched.
     pub fn thresholds(&self, config: &ArmConfig) -> Vec<Option<f32>> {
-        let gripper = config.gripper_index();
-        (0..config.dof).map(|j| {
-            if !self.enabled || j >= 6 || !self.joints[j] || Some(j) == gripper { return None; }
-            config.damiao_ranges.as_ref().and_then(|r| r.get(j)).map(|r| self.ratio * r.t_max)
-        }).collect()
+        (0..config.dof).map(|j| self.threshold_of(config, j)).collect()
+    }
+
+    /// The threshold of joint `j` ([`Self::thresholds`] without the vector).
+    pub fn threshold_of(&self, config: &ArmConfig, j: usize) -> Option<f32> {
+        if !self.enabled || j >= 6 || !self.joints[j] || config.gripper_index() == Some(j) { return None; }
+        config.damiao_ranges.as_ref().and_then(|r| r.get(j)).map(|r| self.ratio * r.t_max)
     }
 }
 
@@ -298,7 +300,11 @@ impl SupervisorInner {
         let Some(p) = self.config.torque_guard.filter(|p| p.enabled) else { return; };
         let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
             && !self.disable_pending && !self.pending_rearm;
-        let thr = p.thresholds(&self.config);
+        // on the stack: no allocation in the tick (joints beyond the array are never watched)
+        let mut thr_buf = [None; 16];
+        let n = self.config.dof.min(thr_buf.len());
+        for (j, t) in thr_buf.iter_mut().enumerate().take(n) { *t = p.threshold_of(&self.config, j); }
+        let thr = &thr_buf[..n];
         let settling = self.pending_normal_unload && self.active_trajectory.is_none();
         let watching = operational && !settling && self.driver.is_some() && self.collision.torque_feedback
             && self.feedback_numeric_valid && self.hardware_feedback_fresh(std::time::Duration::from_millis(100));
@@ -307,7 +313,7 @@ impl SupervisorInner {
         let had_hold = previous_hold.is_some();
         let motion_target = if let Some(t) = self.servo_target.as_deref() { Some(t) }
             else if self.active_trajectory.is_some() { Some(&self.target_positions[..]) } else { None };
-        if let Some(j) = self.torque_guard.step(&self.torques, &thr, dt, now, &p, operational, watching, &self.measured_positions,
+        if let Some(j) = self.torque_guard.step(&self.torques, thr, dt, now, &p, operational, watching, &self.measured_positions,
             &self.commanded_positions, motion_target) {
             let threshold = thr[j].unwrap_or(f32::INFINITY);
             self.torque_trip(j, self.torques[j], threshold, &p, previous_hold.is_some_and(|h| h.joint == j));

@@ -631,9 +631,11 @@ impl ArmModel {
     /// to the tip plus the offset (configuration independent).
     pub fn joint_reach(&self, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
         let n = self.arm_dof();
-        let (origins, end): (Vec<Vec3>, Vec3) = match self {
-            Self::RebotDevArm(off, c) => { let f = k::frames_prepared(off, c.as_deref()); (f.origins.to_vec(), f.end.p) }
-            Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); (f.origins[..n].to_vec(), f.end.p) }
+        // on the stack: the control tick builds workspace evaluators (no allocation)
+        let mut origins = [[0.0; 3]; MAX_CHAIN_JOINTS];
+        let end: Vec3 = match self {
+            Self::RebotDevArm(off, c) => { let f = k::frames_prepared(off, c.as_deref()); origins[..f.origins.len()].copy_from_slice(&f.origins); f.end.p }
+            Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); origins[..n].copy_from_slice(&f.origins[..n]); f.end.p }
         };
         let mut reach = [0.0; MAX_CHAIN_JOINTS];
         let mut acc = max_offset + k::norm(&k::sub(&end, &origins[n - 1]));
@@ -996,6 +998,17 @@ impl WorkspaceFailure {
     }
 }
 
+/// The vectors of a [`WorkspaceEvaluator`], kept between evaluators
+/// ([`WorkspaceEvaluator::new_with_tcp_in`] / [`WorkspaceEvaluator::recycle`]).
+#[derive(Debug, Default)]
+pub struct EvalBufs {
+    end_locals: Vec<[f64; 3]>,
+    capsules: Vec<(Option<FrameRef>, [f64; 3], [f64; 3], f64)>,
+    cap_reaches: Vec<[f64; MAX_CHAIN_JOINTS]>,
+    self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
+    keepouts: Vec<([f64; 3], [f64; 3])>,
+}
+
 /// Precomputed per-constraint workspace evaluator (points + optional link capsules + optional self-collision pairs).
 #[derive(Debug, Clone)]
 pub struct WorkspaceEvaluator<'a> {
@@ -1041,7 +1054,21 @@ impl<'a> WorkspaceEvaluator<'a> {
         cam: &'a crate::model::CameraMount,
         tcp_offset: [f64; 3],
     ) -> Self {
-        let mut end_locals = Vec::with_capacity(1 + ws.check_points_end_m.len() + 1);
+        Self::new_with_tcp_in(model, ws, cam, tcp_offset, &mut EvalBufs::default())
+    }
+
+    /// [`Self::new_with_tcp`] with its vectors taken from `bufs` (no allocation once they
+    /// have the capacity); [`Self::recycle`] gives them back. The control tick's form.
+    pub fn new_with_tcp_in(
+        model: &'a ArmModel,
+        ws: &'a crate::model::WorkspacePolicy,
+        cam: &'a crate::model::CameraMount,
+        tcp_offset: [f64; 3],
+        bufs: &mut EvalBufs,
+    ) -> Self {
+        let mut end_locals = std::mem::take(&mut bufs.end_locals);
+        end_locals.clear();
+        end_locals.reserve(1 + ws.check_points_end_m.len() + 1);
         end_locals.push([0.0; 3]);
         for p in &ws.check_points_end_m {
             end_locals.push(p.map(f64::from));
@@ -1057,8 +1084,12 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
         let end_reach = model.joint_reach(max_end_off);
 
-        let mut capsules = Vec::with_capacity(ws.link_capsules.len());
-        let mut cap_reaches = Vec::with_capacity(ws.link_capsules.len());
+        let mut capsules = std::mem::take(&mut bufs.capsules);
+        capsules.clear();
+        capsules.reserve(ws.link_capsules.len());
+        let mut cap_reaches = std::mem::take(&mut bufs.cap_reaches);
+        cap_reaches.clear();
+        cap_reaches.reserve(ws.link_capsules.len());
         for c in &ws.link_capsules {
             let fr = model.resolve_frame(&c.frame);
             let a = c.a_m.map(f64::from);
@@ -1073,7 +1104,8 @@ impl<'a> WorkspaceEvaluator<'a> {
         }
 
         let arm_dof = model.arm_dof();
-        let mut self_pairs = Vec::new();
+        let mut self_pairs = std::mem::take(&mut bufs.self_pairs);
+        self_pairs.clear();
         if ws.self_collision_enabled && !ws.link_capsules.is_empty() {
             self_pairs.reserve(ws.self_collision_pairs.len());
             for [id_a, id_b] in &ws.self_collision_pairs {
@@ -1096,11 +1128,9 @@ impl<'a> WorkspaceEvaluator<'a> {
             }
         }
 
-        let keepouts: Vec<([f64; 3], [f64; 3])> = ws
-            .keepout_boxes
-            .iter()
-            .map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from)))
-            .collect();
+        let mut keepouts = std::mem::take(&mut bufs.keepouts);
+        keepouts.clear();
+        keepouts.extend(ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))));
 
         let num_end_pts = end_locals.len();
         let num_geoms = num_end_pts + capsules.len();
@@ -1137,6 +1167,15 @@ impl<'a> WorkspaceEvaluator<'a> {
             total_slots,
             escape_tol: k::WORKSPACE_EPS,
         }
+    }
+
+    /// Gives the evaluator's vectors back to `bufs` for the next [`Self::new_with_tcp_in`].
+    pub fn recycle(self, bufs: &mut EvalBufs) {
+        bufs.end_locals = self.end_locals;
+        bufs.capsules = self.capsules;
+        bufs.cap_reaches = self.cap_reaches;
+        bufs.self_pairs = self.self_pairs;
+        bufs.keepouts = self.keepouts;
     }
 
     pub fn with_escape_tol(mut self, escape_tol: f64) -> Self {

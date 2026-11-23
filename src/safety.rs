@@ -92,12 +92,14 @@ impl FaultCode {
 }
 
 /// `observation.fault`: present whenever the safety state is Fault or EStop.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct FaultInfo {
     pub code: FaultCode,
     pub message: String,
     pub recoverable: bool,
 }
+
+crate::fieldwise_clone!(FaultInfo { code, message, recoverable });
 
 impl FaultReason {
     pub fn message(&self) -> String {
@@ -272,6 +274,15 @@ impl SafetyManager {
     }
 
     /// Structured cause of the current Fault / EStop; None in any other state.
+    /// The `code` of [`Self::fault`] without building its message.
+    pub fn fault_code(&self) -> Option<FaultCode> {
+        match &self.state {
+            SafetyState::EStop => Some(FaultCode::Estop),
+            SafetyState::Fault(reason) => Some(self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))),
+            _ => None,
+        }
+    }
+
     pub fn fault(&self) -> Option<FaultInfo> {
         let (code, message) = match &self.state {
             SafetyState::EStop => (FaultCode::Estop, "E-stop latched".to_string()),

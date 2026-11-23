@@ -159,7 +159,7 @@ impl QuinticPolynomial {
 }
 
 /// Trajectory point sample across all joints
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrajectoryPoint {
     pub positions: Vec<f32>,
     pub velocities: Vec<f32>,
@@ -227,6 +227,37 @@ impl MultiJointQuinticTrajectory {
     pub fn step(&mut self, dt: f64) -> TrajectoryPoint {
         self.elapsed += dt;
         self.sample(self.elapsed)
+    }
+
+    /// [`Self::step`] into `out`, reusing its vectors (no allocation once they have the
+    /// capacity: the control tick's form).
+    pub fn step_into(&mut self, dt: f64, out: &mut TrajectoryPoint) {
+        self.elapsed += dt;
+        self.sample_into(self.elapsed, out);
+    }
+
+    /// Positions and velocities of [`Self::step`] into `positions` / `velocities` (reused).
+    pub fn step_pv_into(&mut self, dt: f64, positions: &mut Vec<f32>, velocities: &mut Vec<f32>) {
+        self.elapsed += dt;
+        let t = self.elapsed;
+        positions.clear();
+        velocities.clear();
+        for poly in &self.polynomials {
+            positions.push(poly.position(t) as f32);
+            velocities.push(poly.velocity(t) as f32);
+        }
+    }
+
+    /// [`Self::sample`] into `out`, reusing its vectors.
+    pub fn sample_into(&self, t: f64, out: &mut TrajectoryPoint) {
+        out.positions.clear();
+        out.velocities.clear();
+        out.accelerations.clear();
+        for poly in &self.polynomials {
+            out.positions.push(poly.position(t) as f32);
+            out.velocities.push(poly.velocity(t) as f32);
+            out.accelerations.push(poly.acceleration(t) as f32);
+        }
     }
 
     /// Sample at specific elapsed time

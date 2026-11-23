@@ -16,7 +16,15 @@ pub mod ids;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod publish;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod executor;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod record_ring;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod sched;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod scratch;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod urgent;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod triple;
 
@@ -84,6 +92,12 @@ mod core {
 
         /// `seq` of the last publication (0: none yet).
         pub fn published_seq(&self) -> u64 { self.hub().published_seq() }
+
+        /// The observation of the publication slot the next [`Self::publish`] writes, moved
+        /// out to be filled in place (`SupervisorInner::fill_observation`) and handed back by
+        /// `publish`: the tick reuses its memory instead of building a new observation. None
+        /// before the slot held one.
+        pub fn take_observation_buffer(&mut self) -> Option<ArmObservation> { self.publisher.take_back_observation() }
 
         /// Publishes one tick's observation (see [`StatePublisher::publish`]); returns the
         /// displaced observation for the caller to drop after releasing the lock.

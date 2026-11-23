@@ -551,7 +551,7 @@ impl PowerMonitor {
 fn r3(v: f32) -> f32 { (v * 1000.0).round() / 1000.0 }
 
 /// `observation.power`: null when the profile has no enabled `power_budget`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct PowerObservation {
     /// An estimate exists (fresh feedback within [`STALE_HOLD_S`]); the numbers below are 0 otherwise.
     pub valid: bool,
@@ -574,6 +574,8 @@ pub struct PowerObservation {
     /// A power hold is in force (`motion_limit.reason` = `power`).
     pub hold: bool,
 }
+
+crate::fieldwise_clone!(PowerObservation { valid, bus_a, peak_a, rated_a, ratio, regen_w, per_joint_a, scale, limiting, hold });
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
@@ -746,22 +748,32 @@ impl SupervisorInner {
 
     /// `observation.power`.
     pub fn power_observation(&self) -> Option<PowerObservation> {
-        let budget = self.power_budget()?;
+        let mut out = None;
+        self.power_observation_into(&mut out);
+        out
+    }
+
+    /// [`Self::power_observation`] into `out`, reusing its memory.
+    pub fn power_observation_into(&self, out: &mut Option<PowerObservation>) {
+        let Some(budget) = self.power_budget() else { *out = None; return; };
         let m = &self.power;
         let n = budget.joints.len().min(MAX_JOINTS);
         let v = |x: f32| if m.valid { r3(x) } else { 0.0 };
-        Some(PowerObservation {
-            valid: m.valid,
-            bus_a: v(m.bus_a),
-            peak_a: v(m.peak_5s.max()),
-            rated_a: budget.supply_rated_a,
-            ratio: v(m.bus_a / budget.supply_rated_a),
-            regen_w: v(m.regen_w),
-            per_joint_a: m.joint_a[..n].iter().map(|a| v(*a)).collect(),
-            scale: r3(m.gov.scale),
-            limiting: m.gov.scale < 0.999 || m.gov.hold.is_some(),
-            hold: m.gov.hold.is_some(),
-        })
+        let o = out.get_or_insert_with(|| PowerObservation {
+            valid: false, bus_a: 0.0, peak_a: 0.0, rated_a: 0.0, ratio: 0.0, regen_w: 0.0,
+            per_joint_a: Vec::with_capacity(MAX_JOINTS), scale: 1.0, limiting: false, hold: false,
+        });
+        o.valid = m.valid;
+        o.bus_a = v(m.bus_a);
+        o.peak_a = v(m.peak_5s.max());
+        o.rated_a = budget.supply_rated_a;
+        o.ratio = v(m.bus_a / budget.supply_rated_a);
+        o.regen_w = v(m.regen_w);
+        o.per_joint_a.clear();
+        o.per_joint_a.extend(m.joint_a[..n].iter().map(|a| v(*a)));
+        o.scale = r3(m.gov.scale);
+        o.limiting = m.gov.scale < 0.999 || m.gov.hold.is_some();
+        o.hold = m.gov.hold.is_some();
     }
 
     /// `GET /api/v1/diagnostics/power`.

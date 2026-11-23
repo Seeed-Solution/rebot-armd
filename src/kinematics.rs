@@ -613,7 +613,7 @@ pub fn shoulder_reach_from(p: &Vec3, s: &[f64; 2]) -> f64 {
 // ---- Cartesian workspace check ----
 
 /// Structured details attached to `WORKSPACE_VIOLATION` errors and observations.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkspaceViolationDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraint_id: Option<String>,
@@ -624,6 +624,8 @@ pub struct WorkspaceViolationDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
+
+crate::fieldwise_clone!(WorkspaceViolationDetail { constraint_id, geometry_id, violation_phase, reason });
 
 impl WorkspaceViolationDetail {
     pub fn with_phase(mut self, phase: &str) -> Self {

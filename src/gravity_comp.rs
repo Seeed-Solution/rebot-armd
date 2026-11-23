@@ -82,7 +82,9 @@ pub struct GravityCompRequest {
     pub damping_kd: Option<Vec<f32>>,
 }
 
-fn reason(code: &str, message: impl Into<String>) -> ModeReason { ModeReason { code: code.into(), message: message.into() } }
+fn reason(code: &'static str, message: impl Into<std::borrow::Cow<'static, str>>) -> ModeReason {
+    ModeReason { code: code.into(), message: message.into() }
+}
 
 fn arm6(v: &[f32]) -> [f32; ARM] {
     let mut a = [0.0; ARM];
@@ -149,12 +151,16 @@ impl SupervisorInner {
         if self.gravity_comp.is_some() { return None; }
         // MIT torque commands are only as right as the mapping ranges: require the
         // startup range check to have passed when the driver ran one.
-        let check = self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check()));
-        match check.as_ref().map(|c| c.status) {
-            Some(RangeCheckStatus::Mismatch) => return Some(reason("DRIVER_RANGE_MISMATCH", check.map(|c| c.message).unwrap_or_default())),
-            Some(RangeCheckStatus::Unverified) => return Some(reason("DRIVER_RANGE_UNVERIFIED", check.map(|c| c.message).unwrap_or_default())),
-            _ => {}
+        // the check by reference: copied (its message) only when it blocks
+        let mut blocked = None;
+        if let Some(Ok(drv)) = self.driver.as_ref().map(|d| d.lock()) {
+            drv.with_range_check(&mut |c| match c.map(|c| (c.status, c)) {
+                Some((RangeCheckStatus::Mismatch, c)) => blocked = Some(reason("DRIVER_RANGE_MISMATCH", c.message.clone())),
+                Some((RangeCheckStatus::Unverified, c)) => blocked = Some(reason("DRIVER_RANGE_UNVERIFIED", c.message.clone())),
+                _ => {}
+            });
         }
+        if blocked.is_some() { return blocked; }
         let policy = self.gravity_comp_policy()?;
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(reason("ESTOP_ACTIVE", "E-stop is latched"));
@@ -206,7 +212,7 @@ impl SupervisorInner {
     /// Enter gravity compensation. Idempotent while the mode is on.
     pub fn enter_gravity_comp(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
-        if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message)); }
+        if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message.into_owned())); }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
         let scale = request.scale.unwrap_or(policy.scale);
@@ -570,23 +576,35 @@ impl SupervisorInner {
     }
 
     pub fn gravity_comp_observation(&self) -> GravityCompObservation {
-        let support = self.gravity_comp_support();
-        let mut obs = GravityCompObservation {
-            supported: support.is_ok(),
-            blocker: self.gravity_comp_blocker(),
-            last_exit: self.gravity_comp_last_exit.clone(),
-            scale: self.gravity_comp_policy().map_or(0.0, |p| p.scale),
-            damping_kd: self.gravity_comp_policy().map_or_else(Vec::new, |p| p.damping_kd.clone()),
-            ..Default::default()
-        };
-        if let Some(run) = &self.gravity_comp {
-            obs.phase = Some(run.phase.name().into());
-            obs.ramp = run.ramp();
-            obs.scale = run.scale;
-            obs.damping_kd = run.damping_kd.to_vec();
-            obs.tau_ff = run.tau_ff.to_vec();
-        }
+        let mut obs = GravityCompObservation::default();
+        self.gravity_comp_observation_into(&mut obs);
         obs
+    }
+
+    /// [`Self::gravity_comp_observation`] into `obs`, reusing its memory.
+    pub fn gravity_comp_observation_into(&self, obs: &mut GravityCompObservation) {
+        obs.supported = self.gravity_comp_support().is_ok();
+        let blocker = self.gravity_comp_blocker();
+        if obs.blocker != blocker { obs.blocker = blocker; }
+        crate::rt_core::scratch::set_opt_eq(&mut obs.last_exit, self.gravity_comp_last_exit.as_ref());
+        obs.scale = self.gravity_comp_policy().map_or(0.0, |p| p.scale);
+        match self.gravity_comp_policy() {
+            Some(p) => obs.damping_kd.clone_from(&p.damping_kd),
+            None => obs.damping_kd.clear(),
+        }
+        obs.ramp = 0.0;
+        obs.tau_ff.clear();
+        match &self.gravity_comp {
+            Some(run) => {
+                crate::rt_core::scratch::set_opt_str(&mut obs.phase, Some(run.phase.name()));
+                obs.ramp = run.ramp();
+                obs.scale = run.scale;
+                obs.damping_kd.clear();
+                obs.damping_kd.extend_from_slice(&run.damping_kd);
+                obs.tau_ff.extend_from_slice(&run.tau_ff);
+            }
+            None => obs.phase = None,
+        }
     }
 
     /// Used by clear_fault: a fault cannot be cleared before POS_VEL is confirmed again.

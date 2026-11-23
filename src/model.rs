@@ -51,7 +51,7 @@ pub struct JointRangeReading {
 }
 
 /// Startup check of the motors' mapping ranges (published as `driver_range_check`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct DriverRangeCheck {
     pub status: RangeCheckStatus,
     pub message: String,
@@ -60,10 +60,53 @@ pub struct DriverRangeCheck {
     pub duration_ms: u64,
 }
 
+crate::fieldwise_clone!(DriverRangeCheck { status, message, joints, duration_ms });
 
+
+
+/// `Clone` whose `clone_from` copies field by field, so `String` / `Vec` / `Option` fields
+/// reuse their memory: the control tick fills its published observation in place without
+/// allocating while the shape does not change (armd 1.6 RT core). Every field must be
+/// listed (a missing one does not compile).
+#[macro_export]
+macro_rules! fieldwise_clone {
+    ($t:ident { $($f:ident),* $(,)? }) => {
+        impl Clone for $t {
+            fn clone(&self) -> Self { Self { $($f: self.$f.clone()),* } }
+            fn clone_from(&mut self, src: &Self) { $(self.$f.clone_from(&src.$f);)* }
+        }
+    };
+}
+
+/// Up to [`ArmJoints::CAP`] joint indices without a heap allocation (the arm joints of a
+/// profile, [`ArmConfig::arm_joints`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArmJoints {
+    idx: [usize; Self::CAP],
+    len: usize,
+}
+
+impl ArmJoints {
+    pub const CAP: usize = 16;
+
+    pub fn collect_from(it: impl IntoIterator<Item = usize>) -> Self {
+        let mut s = Self { idx: [0; Self::CAP], len: 0 };
+        for i in it {
+            assert!(s.len < Self::CAP, "more than {} arm joints", Self::CAP);
+            s.idx[s.len] = i;
+            s.len += 1;
+        }
+        s
+    }
+}
+
+impl std::ops::Deref for ArmJoints {
+    type Target = [usize];
+    fn deref(&self) -> &[usize] { &self.idx[..self.len] }
+}
 
 /// Limits for a single joint
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct JointLimit {
     pub name: String,
     pub min_position: f32,
@@ -71,6 +114,8 @@ pub struct JointLimit {
     pub max_velocity: f32,
     pub max_acceleration: f32,
 }
+
+crate::fieldwise_clone!(JointLimit { name, min_position, max_position, max_velocity, max_acceleration });
 
 impl JointLimit {
     pub fn new(
@@ -91,7 +136,7 @@ impl JointLimit {
 }
 
 /// Dynamic state of a single joint
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct JointState {
     pub position: f32,
     pub velocity: f32,
@@ -1606,6 +1651,12 @@ impl ArmConfig {
         (0..self.dof).filter(|i| Some(*i) != g).take(self.arm_dof()).collect()
     }
 
+    /// [`Self::arm_joint_indices`] without a heap allocation (the control tick's form).
+    pub fn arm_joints(&self) -> ArmJoints {
+        let g = self.gripper_index();
+        ArmJoints::collect_from((0..self.dof).filter(|i| Some(*i) != g).take(self.arm_dof()))
+    }
+
     /// The joint layout the Cartesian action planner, gravity compensation and the gripper
     /// actions use: 6 arm joints followed by the gripper at index 6.
     pub fn six_plus_gripper(&self) -> bool {
@@ -2065,7 +2116,17 @@ impl ArmConfig {
     /// Joint limits for servo stepping: `max_velocity` capped at `servo_max_velocity`
     /// per joint, except the 7-DOF gripper (index 6).
     pub fn servo_limits(&self) -> Vec<JointLimit> {
-        let mut limits = self.limits.clone();
+        let mut limits = Vec::with_capacity(self.limits.len());
+        self.servo_limits_into(&mut limits);
+        limits
+    }
+
+    /// [`Self::servo_limits`] into `limits`, reusing its memory.
+    pub fn servo_limits_into(&self, limits: &mut Vec<JointLimit>) {
+        limits.truncate(self.limits.len());
+        let have = limits.len();
+        for (d, s) in limits.iter_mut().zip(&self.limits) { d.clone_from(s); }
+        limits.extend(self.limits[have..].iter().cloned());
         if let Some(caps) = &self.servo_max_velocity {
             let gripper_idx = self.gripper_index();
             for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
@@ -2074,7 +2135,6 @@ impl ArmConfig {
                 }
             }
         }
-        limits
     }
 
     /// Factory for reBot Arm B601-DM with 6 arm joints + 1 gripper joint (7 DOF total)
@@ -2214,7 +2274,7 @@ pub struct GripperObs {
 }
 
 /// Full arm telemetry / observation
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
     pub timestamp: f64,
     pub positions: Vec<f32>,
@@ -2302,8 +2362,26 @@ pub struct ArmObservation {
     pub policy: Option<PolicyObservation>,
 }
 
+impl ArmObservation {
+    /// An observation with every field empty (filled by `SupervisorInner::fill_observation`).
+    pub fn blank() -> Self {
+        Self {
+            timestamp: 0.0, positions: Vec::new(), velocities: Vec::new(), torques: Vec::new(), temperatures: Vec::new(),
+            is_torqued: false, safety_state: SafetyState::Idle, epoch_id: 0, gravity_compensated: false,
+            gravity_torques: Vec::new(), driver_capabilities: DriverCapabilities::default(), enable_state: EnableState::default(),
+            feedback_age_ms: Vec::new(), disable_pending: false, feedback_valid: false, commanded_positions: Vec::new(),
+            action: None, previous_action: None, control_mode: ControlMode::default(), gravity_comp: GravityCompObservation::default(),
+            driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
+            fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
+            loads: None, policy: None,
+        }
+    }
+}
+
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy });
+
 /// Policy runtime execution state published in `observation.policy`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PolicyObservation {
     pub active: bool,
@@ -2325,8 +2403,10 @@ pub struct PolicyObservation {
     pub stop_reason: Option<String>,
 }
 
+crate::fieldwise_clone!(PolicyObservation { active, action_id, policy_id, artifact_digest, backend, mode, steps, last_input_age_ms, last_vision_age_ms, vision_frame_id, last_shadow_target, stop_reason });
+
 /// Gripper zero state published in `observation.gripper_zero`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GripperZeroObservation {
     /// `ok`, `out_of_range`, `checked`, or `calib_invalid`.
     pub state: String,
@@ -2335,12 +2415,16 @@ pub struct GripperZeroObservation {
     pub offset_rad: Option<f32>,
 }
 
+crate::fieldwise_clone!(GripperZeroObservation { state, j7, offset_rad });
+
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MotorError {
     pub code: u8,
     pub name: String,
 }
+
+crate::fieldwise_clone!(MotorError { code, name });
 
 /// Why armd is shaping or refusing the requested motion (`observation.motion_limit`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2401,14 +2485,17 @@ pub enum ControlMode {
 }
 
 /// A code with a human-readable message (entry blocker or exit reason).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModeReason {
-    pub code: String,
-    pub message: String,
+    /// Static text in every case but formatted messages: building one does not allocate.
+    pub code: std::borrow::Cow<'static, str>,
+    pub message: std::borrow::Cow<'static, str>,
 }
 
+crate::fieldwise_clone!(ModeReason { code, message });
+
 /// Why the last gravity-compensation session ended.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct GravityCompExit {
     pub code: String,
     pub message: String,
@@ -2416,8 +2503,10 @@ pub struct GravityCompExit {
     pub at: f64,
 }
 
+crate::fieldwise_clone!(GravityCompExit { code, message, at });
+
 /// Gravity-compensation state published with every observation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct GravityCompObservation {
     /// The profile and driver support the mode.
     pub supported: bool,
@@ -2433,6 +2522,8 @@ pub struct GravityCompObservation {
     pub tau_ff: Vec<f32>,
     pub last_exit: Option<GravityCompExit>,
 }
+
+crate::fieldwise_clone!(GravityCompObservation { supported, blocker, phase, ramp, scale, damping_kd, tau_ff, last_exit });
 
 /// Field description in the observation schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
