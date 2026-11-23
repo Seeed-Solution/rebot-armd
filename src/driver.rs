@@ -8287,3 +8287,383 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         Ok(self.cached_states.clone())
     }
 }
+
+#[cfg(test)]
+mod tx_chokepoint_tests {
+    use super::*;
+    use crate::rt_core::urgent::{EstopGate, StopRequests};
+    use crate::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct TestBus {
+        clock: Arc<MockClock>,
+        tx: Arc<Mutex<Vec<CanFrame>>>,
+        rx: Arc<Mutex<VecDeque<CanFrame>>>,
+        on_tx: Arc<Mutex<Option<Box<dyn FnMut(&CanFrame) -> Result<(), TransportError> + Send>>>>,
+    }
+
+    impl TestBus {
+        fn new() -> (Self, Arc<MockClock>) {
+            let clock = Arc::new(MockClock::new());
+            let bus = Self {
+                clock: clock.clone(),
+                tx: Arc::new(Mutex::new(Vec::new())),
+                rx: Arc::new(Mutex::new(VecDeque::new())),
+                on_tx: Arc::new(Mutex::new(None)),
+            };
+            (bus, clock)
+        }
+
+        fn tx_len(&self) -> usize {
+            self.tx.lock().unwrap().len()
+        }
+
+        fn tx_frames(&self) -> Vec<CanFrame> {
+            self.tx.lock().unwrap().clone()
+        }
+
+        fn clear_tx(&self) {
+            self.tx.lock().unwrap().clear();
+        }
+
+        fn push_feedback(&self, motor_id: u16, pos: f32, state: u8, limits: &DamiaoLimits) {
+            let p = damiao::float_to_uint(pos, limits.p_min, limits.p_max, 16);
+            let v = damiao::float_to_uint(0.0, limits.v_min, limits.v_max, 12);
+            let t = damiao::float_to_uint(0.0, limits.t_min, limits.t_max, 12);
+            let data = [
+                ((state & 0x0f) << 4) | (motor_id as u8 & 0x0f),
+                (p >> 8) as u8,
+                p as u8,
+                (v >> 4) as u8,
+                (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+                t as u8,
+                30,
+                30,
+            ];
+            self.rx
+                .lock()
+                .unwrap()
+                .push_back(CanFrame::new_standard(0x10 + motor_id, &data).unwrap());
+        }
+    }
+
+    impl CanTransport for TestBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            Some(self.clock.clone())
+        }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if let Some(cb) = self.on_tx.lock().unwrap().as_mut() {
+                cb(frame)?;
+            }
+            self.tx.lock().unwrap().push(*frame);
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.rx.lock().unwrap().pop_front().ok_or(TransportError::WouldBlock)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    const ALL_TX_KINDS: [TxKind; 9] = [
+        TxKind::Disable,
+        TxKind::Target,
+        TxKind::Hold,
+        TxKind::RollbackHold(0),
+        TxKind::ModeWrite,
+        TxKind::Refresh,
+        TxKind::Recovery,
+        TxKind::ClearFault,
+        TxKind::Handshake,
+    ];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StopCase {
+        NoStop,
+        Pending,
+        Latched,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BudgetCase {
+        Available,
+        Exhausted,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DeadlineCase {
+        Ok,
+        Passed,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Expected {
+        Sent,
+        Deferred,
+        RefusedDeadline,
+        RefusedStop,
+    }
+
+    fn expected_outcome(
+        kind: TxKind,
+        stop: StopCase,
+        budget: BudgetCase,
+        deadline: DeadlineCase,
+    ) -> Expected {
+        // Step 1: Deadline (if given) always runs first for every TxKind.
+        if deadline == DeadlineCase::Passed {
+            return Expected::RefusedDeadline;
+        }
+        // Step 2: Tick TX budget runs before stop gate (Disable exempt).
+        if budget == BudgetCase::Exhausted && !matches!(kind, TxKind::Disable) {
+            return Expected::Deferred;
+        }
+        // Step 3: Stop gate by TxKind.
+        match kind {
+            TxKind::Disable => Expected::Sent,
+            TxKind::Refresh | TxKind::RollbackHold(_) => match stop {
+                StopCase::Pending => Expected::RefusedStop,
+                StopCase::NoStop | StopCase::Latched => Expected::Sent,
+            },
+            TxKind::Target
+            | TxKind::Hold
+            | TxKind::ModeWrite
+            | TxKind::Recovery
+            | TxKind::ClearFault
+            | TxKind::Handshake => match stop {
+                StopCase::NoStop => Expected::Sent,
+                StopCase::Pending | StopCase::Latched => Expected::RefusedStop,
+            },
+        }
+    }
+
+    #[test]
+    fn send_chokepoint_table_all_kinds_stop_budget_deadline() {
+        let limits = DamiaoLimits::default();
+        let mut cells_checked = 0usize;
+
+        for &kind in &ALL_TX_KINDS {
+            for &stop in &[StopCase::NoStop, StopCase::Pending, StopCase::Latched] {
+                for &budget in &[BudgetCase::Available, BudgetCase::Exhausted] {
+                    for &deadline_case in &[DeadlineCase::Ok, DeadlineCase::Passed] {
+                        let (bus, clock) = TestBus::new();
+                        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1])
+                            .with_limits(limits);
+
+                        // Establish an empty-queue receive bound + fresh feedback on J1 so
+                        // RollbackHold(0) satisfies step 4 freshness whenever step 3 admits it.
+                        drv.read_joint_states().unwrap();
+                        bus.push_feedback(1, 0.25, 1, &limits);
+                        drv.read_joint_states().unwrap();
+                        bus.clear_tx();
+
+                        // Configure stop/E-stop state.
+                        let req = Arc::new(AtomicU64::new(match stop {
+                            StopCase::NoStop => 0,
+                            StopCase::Pending | StopCase::Latched => 1,
+                        }));
+                        let app = Arc::new(AtomicU64::new(match stop {
+                            StopCase::NoStop => 0,
+                            StopCase::Pending => 0,
+                            StopCase::Latched => 1,
+                        }));
+                        let latched = Arc::new(AtomicBool::new(stop == StopCase::Latched));
+                        drv.set_estop_gate(EstopGate::new(req, app));
+                        drv.set_abort_flag(latched);
+
+                        // Configure per-tick TX budget.
+                        drv.set_tx_budget(TxBudget {
+                            max_frames: 1,
+                            max_duration: Duration::from_millis(5),
+                            frame_max_age: Duration::from_millis(45),
+                        });
+                        if budget == BudgetCase::Exhausted {
+                            drv.record_tx_pass_attempt();
+                        }
+
+                        // Configure deadline.
+                        let now = clock.now();
+                        let deadline = match deadline_case {
+                            DeadlineCase::Ok => Some(Deadline::after(now, Duration::from_millis(10))),
+                            DeadlineCase::Passed => Some(Deadline { at: now }),
+                        };
+
+                        let stamp = drv.current_stop_stamp();
+                        let mut build_called = false;
+                        let res = drv.send(kind, Some(stamp), deadline, false, |d| {
+                            build_called = true;
+                            Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.25, 1.0))
+                        });
+
+                        let want = expected_outcome(kind, stop, budget, deadline_case);
+                        match want {
+                            Expected::Sent => {
+                                assert!(
+                                    res.is_ok(),
+                                    "cell ({kind:?}, {stop:?}, {budget:?}, {deadline_case:?}) expected Sent, got {res:?}"
+                                );
+                                assert_eq!(bus.tx_len(), 1, "expected 1 TX for {kind:?}/{stop:?}/{budget:?}/{deadline_case:?}");
+                                assert!(build_called, "build must run for Sent cell");
+                            }
+                            Expected::Deferred => {
+                                assert!(
+                                    matches!(res, Err(TxRefusal::Deferred)),
+                                    "cell ({kind:?}, {stop:?}, {budget:?}, {deadline_case:?}) expected Deferred, got {res:?}"
+                                );
+                                assert_eq!(bus.tx_len(), 0);
+                                assert!(!build_called, "budget check must run before build");
+                            }
+                            Expected::RefusedDeadline => {
+                                assert!(
+                                    matches!(res, Err(TxRefusal::DeadlinePassed)),
+                                    "cell ({kind:?}, {stop:?}, {budget:?}, {deadline_case:?}) expected DeadlinePassed, got {res:?}"
+                                );
+                                assert_eq!(bus.tx_len(), 0);
+                                assert!(!build_called, "deadline check must run before build");
+                            }
+                            Expected::RefusedStop => {
+                                assert!(
+                                    matches!(res, Err(TxRefusal::StopInhibited)),
+                                    "cell ({kind:?}, {stop:?}, {budget:?}, {deadline_case:?}) expected StopInhibited, got {res:?}"
+                                );
+                                assert_eq!(bus.tx_len(), 0);
+                                assert!(!build_called, "stop gate must run before build");
+                            }
+                        }
+                        cells_checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells_checked, ALL_TX_KINDS.len() * 3 * 2 * 2);
+    }
+
+    #[test]
+    fn send_chokepoint_enforces_fresh_rollback_stop_stamp_and_drain_deadline() {
+        let limits = DamiaoLimits::default();
+
+        // 1. Latched RollbackHold(0) with STALE feedback (> 100 ms) fails closed in step 4 even
+        //    if the caller's build closure would return a frame; fresh feedback allows send.
+        let (bus, clock) = TestBus::new();
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
+        drv.read_joint_states().unwrap();
+        bus.push_feedback(1, 0.35, 1, &limits);
+        drv.read_joint_states().unwrap();
+        drv.set_estop_gate(EstopGate::new(Arc::new(AtomicU64::new(1)), Arc::new(AtomicU64::new(1))));
+        drv.set_abort_flag(Arc::new(AtomicBool::new(true)));
+
+        clock.advance(Duration::from_millis(101));
+        bus.clear_tx();
+        let mut called = false;
+        let stale_res = drv.send(TxKind::RollbackHold(0), None, None, false, |d| {
+            called = true;
+            Some(damiao::build_pos_vel_frame(0x100, d.motor_ids[0], 0.35, 1.0))
+        });
+        assert!(matches!(stale_res, Err(TxRefusal::BuildRefused)), "stale latched rollback must fail closed: {stale_res:?}");
+        assert!(!called, "step 4 latched freshness guard must refuse before build");
+        assert_eq!(bus.tx_len(), 0);
+
+        // Refresh feedback -> now fresh (<= 100 ms) latched RollbackHold(0) sends.
+        drv.read_joint_states().unwrap();
+        bus.push_feedback(1, 0.35, 1, &limits);
+        drv.read_joint_states().unwrap();
+        bus.clear_tx();
+        assert!(drv
+            .send(TxKind::RollbackHold(0), None, None, false, |d| {
+                let pos = d.fresh_measured_position(0, POS_FORCE_FEEDBACK_MAX_AGE)?;
+                Some(d.pos_vel_frame(0, pos))
+            })
+            .is_ok());
+        assert_eq!(bus.tx_len(), 1);
+
+        // 2. Step 4 `build == None` fails closed without consuming tick TX budget.
+        drv.begin_tx_tick();
+        drv.set_tx_budget(TxBudget {
+            max_frames: 1,
+            max_duration: Duration::from_millis(5),
+            frame_max_age: Duration::from_millis(45),
+        });
+        drv.set_abort_flag(Arc::new(AtomicBool::new(false)));
+        bus.clear_tx();
+        assert!(matches!(
+            drv.send(TxKind::Target, None, None, false, |_| None),
+            Err(TxRefusal::BuildRefused)
+        ));
+        assert_eq!(bus.tx_len(), 0);
+        // Budget slot was NOT consumed by BuildRefused, so the next valid frame succeeds.
+        assert!(drv
+            .send(TxKind::Target, None, None, false, |d| Some(d.pos_vel_frame(0, 0.0)))
+            .is_ok());
+        assert_eq!(bus.tx_len(), 1);
+
+        // 3. Step 5 stop-generation stamp check: applied stop between admission and send
+        //    refuses every non-Disable kind with StopStampChanged (0 TX), while Disable sends.
+        for &kind in &ALL_TX_KINDS {
+            let (bus, _clock) = TestBus::new();
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
+            let stops = StopRequests::new();
+            drv.set_estop_gate(
+                EstopGate::new(Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+                    .with_stops(stops.clone()),
+            );
+            let old_stamp = drv.current_stop_stamp();
+            let g = stops.request();
+            stops.mark_applied(g);
+            bus.clear_tx();
+            let res = drv.send(kind, Some(old_stamp), None, false, |d| {
+                Some(damiao::build_disable_frame(d.motor_ids[0]))
+            });
+            if matches!(kind, TxKind::Disable) {
+                assert!(res.is_ok(), "Disable must ignore stop stamp: {res:?}");
+                assert_eq!(bus.tx_len(), 1);
+            } else {
+                assert!(
+                    matches!(res, Err(TxRefusal::StopStampChanged)),
+                    "{kind:?} must fail with StopStampChanged after applied stop: {res:?}"
+                );
+                assert_eq!(bus.tx_len(), 0);
+            }
+        }
+
+        // 4. Deferred restore drain stops once w.deadline passes mid-drain (0 frames after deadline).
+        let (bus, clock) = TestBus::new();
+        let clock_hook = clock.clone();
+        *bus.on_tx.lock().unwrap() = Some(Box::new(move |_| {
+            // Advance clock past the 50 ms restore deadline on the very first transmitted frame.
+            clock_hook.advance(Duration::from_millis(60));
+            Ok(())
+        }));
+        let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2]).with_limits(limits);
+        drv.joint_modes[0] = Some(DamiaoControlMode::Mit);
+        drv.joint_modes[1] = Some(DamiaoControlMode::Mit);
+        let mut w = ModeWrite {
+            modes: [DamiaoControlMode::PosVel; MAX_MODE_JOINTS],
+            sent: [0; MAX_MODE_JOINTS],
+            sent_len: 0,
+            unsent: [0; MAX_MODE_JOINTS],
+            unsent_len: 0,
+            hold_failed: [0; MAX_MODE_JOINTS],
+            hold_failed_len: 0,
+            deferred: [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            deferred_stage: [0; MAX_MODE_JOINTS],
+            deferred_len: 2,
+            hold_pos: [0.0; MAX_MODE_JOINTS],
+            dual_hold: false,
+            flush_ok: true,
+            deadline: Deadline::after(clock.now(), REGISTER_REPLY_TIMEOUT),
+        };
+        drv.drain_restore_deferred(&mut w).unwrap();
+        assert_eq!(
+            bus.tx_frames().len(),
+            1,
+            "drain_restore_deferred must stop starting frames once deadline passes: {:?}",
+            bus.tx_frames()
+        );
+    }
+}

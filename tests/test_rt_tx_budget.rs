@@ -2509,3 +2509,67 @@ fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
     );
     assert!(!d2.torque_transition_pending() && !d2.is_enabled());
 }
+
+#[test]
+fn damiao_has_single_can_transmit_chokepoint_in_driver_rs() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/driver.rs"))
+        .expect("read src/driver.rs");
+    let dm_start = src
+        .find("// 3. Damiao Brushless Arm Driver")
+        .expect("Damiao driver section header");
+    let rs_start = src
+        .find("// 4. RobStride Actuator Arm Driver")
+        .expect("RobStride driver section header");
+    assert!(dm_start < rs_start);
+    let dm_section = &src[dm_start..rs_start];
+    let base_line = src[..dm_start].lines().count();
+
+    let mut transmit_sites = Vec::new();
+    let mut in_send_fn = false;
+    let mut send_brace_depth = 0isize;
+    for (idx, raw_line) in dm_section.lines().enumerate() {
+        let code = raw_line.split("//").next().unwrap_or("");
+        let trimmed = code.trim();
+        if trimmed.starts_with("fn send(") || trimmed == "fn send(" {
+            in_send_fn = true;
+            send_brace_depth = 0;
+        }
+        if code.contains("can.transmit") || code.contains(".transmit(") {
+            transmit_sites.push((base_line + idx + 1, in_send_fn, raw_line.trim().to_string()));
+        }
+        if in_send_fn {
+            send_brace_depth += code.matches('{').count() as isize;
+            send_brace_depth -= code.matches('}').count() as isize;
+            if send_brace_depth <= 0 && code.contains('}') {
+                in_send_fn = false;
+            }
+        }
+    }
+
+    assert_eq!(
+        transmit_sites.len(),
+        1,
+        "Damiao driver must have EXACTLY ONE can.transmit call site (inside DamiaoArmDriver::send), found: {transmit_sites:?}"
+    );
+    assert!(
+        transmit_sites[0].1,
+        "Damiao's single can.transmit call must reside inside DamiaoArmDriver::send, found at line {}: {}",
+        transmit_sites[0].0,
+        transmit_sites[0].2
+    );
+
+    // Ensure no legacy bypass helpers were reintroduced in DamiaoArmDriver.
+    for forbidden in [
+        "fn transmit_instrumented",
+        "fn transmit_budgeted_gated",
+        "fn transmit_checked",
+        "fn tx_mit_gated",
+        "fn transmit_with_retry_gated",
+        "fn retransmit(",
+    ] {
+        assert!(
+            !dm_section.contains(forbidden),
+            "forbidden legacy TX bypass helper `{forbidden}` found in DamiaoArmDriver"
+        );
+    }
+}
