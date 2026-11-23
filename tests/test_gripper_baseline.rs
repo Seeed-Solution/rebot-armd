@@ -79,9 +79,6 @@ enum Load {
     /// 2026-11-20 incident (test_gripper_force): from -1.75 rad the torque rises 0.85 -> 5.0 N·m
     /// at -0.5 rad while the jaw keeps moving at ~1 rad/s; at 5 N·m the finger breaks.
     Incident,
-    /// Soft object from `.0` (k1 1.5 N·m/rad) that slips out of the jaws once pressed `.1` rad:
-    /// then nothing is left between the fingers.
-    Slip(f32, f32),
     /// Rigid obstacle outside the jaws at `.0` while opening (stiffness `.1` N·m/rad).
     OpenBlock(f32, f32),
     /// Something dragging on the jaw between `.0` and `.1` (rad): `.2` N·m more while moving.
@@ -138,10 +135,6 @@ impl ArmDriver for RigDriver {
                 Load::Soft(..) => free,
                 Load::Incident if q >= -1.75 => 0.85 + (q + 1.75) * (5.0 - 0.85) / 1.25,
                 Load::Incident => free,
-                Load::Slip(at, slip) if q >= at => {
-                    if q - at >= slip { r.load = Load::Free; free } else { free + 1.5 * (q - at) }
-                }
-                Load::Slip(..) => free,
                 Load::OpenBlock(at, k) if q <= at => { q = at; v = 0.0; -(k * (at - t.position)).max(0.0) }
                 Load::OpenBlock(..) => free,
                 Load::Drag(a, b, nm) if q >= a.min(b) && q <= a.max(b) && v.abs() > 0.05 => free + nm * v.signum(),
