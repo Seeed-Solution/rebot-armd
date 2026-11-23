@@ -938,13 +938,17 @@ impl SupervisorInner {
             drop(drv);
             if pos.iter().any(Option::is_some) { self.reapply_driver_limits(); }
         }
+        let mut gripper_zero_moved = false;
         for (i, (o, n)) in old.iter().zip(offsets).enumerate() {
             let d = o - n;
             if d == 0.0 { continue; }
+            if Some(i) == self.config.gripper_index() { gripper_zero_moved = true; }
             for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
                 if let Some(p) = v.get_mut(i) { *p += d; }
             }
         }
+        // the free-motion baseline is indexed by jaw position: a new gripper zero invalidates it
+        if gripper_zero_moved && self.gripper_baseline.is_some() { self.reset_gripper_baseline(); }
         if old.len() > 5 && offsets.len() > 5 && old[5] != offsets[5] {
             self.zero_convention = Default::default();
         }
@@ -4382,7 +4386,11 @@ impl SupervisorInner {
         let policy = self.config.gripper_policy.as_ref()?;
         let tool = &self.config.active_tool;
         let follower = self.follower.as_deref();
-        let matches = self.gripper_baseline.as_ref().is_some_and(|b| b.belongs_to(&tool.id, &tool.config_digest, follower));
+        let lo = policy.closed_rad.min(policy.open_rad);
+        let hi = policy.closed_rad.max(policy.open_rad);
+        // same tool and follower, and the same stroke (a gripper calibration offset moves it)
+        let matches = self.gripper_baseline.as_ref().is_some_and(|b| b.belongs_to(&tool.id, &tool.config_digest, follower)
+            && (b.lo_rad - lo).abs() < 1e-3 && (b.hi_rad - hi).abs() < 1e-3);
         if !matches {
             if self.gripper_baseline.is_some() {
                 tracing::info!("Gripper baseline belongs to another tool; starting unlearned for {}", tool.id);

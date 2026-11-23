@@ -655,3 +655,32 @@ async fn calibration_action_obstructed_or_stopped_learns_nothing() {
         assert!(inner.gripper_calibration.is_none());
     }
 }
+
+/// A new gripper zero (or a gripper calibration offset that moves the stroke) invalidates the
+/// position-indexed baseline; a zero of another joint keeps it.
+#[test]
+fn gripper_zero_change_invalidates_the_baseline() {
+    let (mut inner, rig) = rig(Finger::New);
+    learn(&mut inner, &rig, 1);
+    assert_ne!(baseline_obs(&inner).state, "unlearned");
+    // zeros are set with torque off
+    inner.is_torqued = false;
+    let mut offsets = vec![0.0f32; 7];
+    offsets[2] = 0.01;
+    inner.set_joint_zero_offsets(&offsets).unwrap();
+    assert_ne!(baseline_obs(&inner).state, "unlearned", "another joint's zero");
+    offsets[6] = 0.05;
+    inner.set_joint_zero_offsets(&offsets).unwrap();
+    assert_eq!(baseline_obs(&inner).state, "unlearned");
+    assert!(inner.gripper_baseline_dirty);
+    inner.set_joint_zero_offsets(&[0.0; 7]).unwrap();
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    // a moved stroke (gripper calibration offset): the next motion starts unlearned
+    learn(&mut inner, &rig, 1);
+    let p = inner.config.gripper_policy.as_mut().unwrap();
+    p.closed_rad += 0.02;
+    p.open_rad += 0.02;
+    inner.gripper_baseline_for_motion();
+    assert_eq!(baseline_obs(&inner).state, "unlearned");
+}
