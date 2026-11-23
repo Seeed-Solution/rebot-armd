@@ -23,8 +23,9 @@ use super::units::{
     JointPermutation,
 };
 use super::vision::{
-    embedding_hub_for_supervisor, evaluate_vision_frame, EmbeddingSampleDecision, HubCommitGuard,
-    PolicyVisionSource, VideoEmbeddingHub, VisionFeatureCollector, VisionStepDecision,
+    embedding_hub_for_supervisor, evaluate_vision_frame, extract_top1_target,
+    DetectorTargetIdentity, EmbeddingSampleDecision, HubCommitGuard, PolicyVisionSource,
+    VideoEmbeddingHub, VisionFeatureCollector, VisionStepDecision,
 };
 use super::{load_backend, PolicyBackend, PolicyError};
 
@@ -459,8 +460,8 @@ pub struct ChunkSource {
     pub vision_captured_at: Option<Instant>,
     /// Detector vision model generation locked at inference time, if any.
     pub vision_generation: Option<u64>,
-    /// Whether a valid detector target was present at inference (`false` on `ZeroFeatures`).
-    pub vision_target_present: Option<bool>,
+    /// Fixed-size identity of the detector target this chunk was computed for, if any.
+    pub vision_target: Option<DetectorTargetIdentity>,
     /// Video-embedding inference ticket captured for this chunk, if any.
     pub embedding_ticket: Option<InferenceTicket>,
     /// Monotonic sequence id assigned when this chunk was pushed into `ChunkRing`.
@@ -474,7 +475,7 @@ impl ChunkSource {
             joint_base_age_ms,
             vision_captured_at: None,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             embedding_ticket: None,
             infer_seq: 0,
         }
@@ -516,7 +517,7 @@ pub struct ChunkFreshnessLimits {
     pub max_source_vision_age_ms: Option<u64>,
     pub horizon_ms: u64,
     pub vision_generation: Option<u64>,
-    pub vision_target_present: Option<bool>,
+    pub vision_target: Option<DetectorTargetIdentity>,
     pub live_ticket_ctx: Option<TicketVerificationContext>,
 }
 
@@ -529,7 +530,7 @@ pub struct CommitGateParams {
     pub max_cached_vision_age_ms: Option<u64>,
     pub horizon_ms: u64,
     pub vision_generation: Option<u64>,
-    pub vision_target_present: Option<bool>,
+    pub vision_target: Option<DetectorTargetIdentity>,
     pub live_ticket_ctx: Option<TicketVerificationContext>,
 }
 
@@ -701,9 +702,7 @@ impl ChunkRing {
                     self.clear();
                     return true;
                 }
-                if limits.vision_target_present.is_some()
-                    && src.vision_target_present != limits.vision_target_present
-                {
+                if limits.vision_target.is_some() && src.vision_target != limits.vision_target {
                     self.clear();
                     return true;
                 }
@@ -1513,9 +1512,7 @@ impl PreparedPolicy {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
-            if params.vision_target_present.is_some()
-                && src.vision_target_present != params.vision_target_present
-            {
+            if params.vision_target.is_some() && src.vision_target != params.vision_target {
                 self.clear_chunk_buffer();
                 return Ok(CommitGateDecision::Skip { commit_period });
             }
@@ -2047,7 +2044,7 @@ pub fn spawn_policy_runner(
                 vision_features,
                 vision_captured_at,
                 vision_frame_id,
-                vision_target_present,
+                vision_target,
                 emb_ticket,
                 emb_mapped_ms,
             ) = if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
@@ -2120,11 +2117,12 @@ pub fn spawn_policy_runner(
                         features,
                         vision_age_ms: _,
                         frame_id,
+                        target_identity,
                     } => (
                         Some(features.to_vec()),
                         frame.as_ref().and_then(|f| f.captured_at),
                         Some(frame_id),
-                        Some(features[0] > 0.5),
+                        Some(target_identity),
                         None,
                         None,
                     ),
@@ -2162,7 +2160,7 @@ pub fn spawn_policy_runner(
                 joint_base_age_ms: base_input_age_ms,
                 vision_captured_at,
                 vision_generation: locked_generation,
-                vision_target_present,
+                vision_target,
                 embedding_ticket: emb_ticket,
                 infer_seq: 0,
             };
@@ -2172,7 +2170,7 @@ pub fn spawn_policy_runner(
                 max_source_vision_age_ms,
                 horizon_ms,
                 vision_generation: locked_generation,
-                vision_target_present,
+                vision_target,
                 live_ticket_ctx,
             };
 
@@ -2385,6 +2383,16 @@ pub fn spawn_policy_runner(
                         now_armd_ms: live_hub.now_armd_ms,
                     }
                 });
+                let commit_vision_target = if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                    col.latest()
+                        .map(|latest| {
+                            extract_top1_target(&latest, spec)
+                                .map_or(DetectorTargetIdentity::Absent, |(_, id)| id)
+                        })
+                        .or(vision_target)
+                } else {
+                    vision_target
+                };
                 let gate_params = CommitGateParams {
                     max_fresh_joint_age_ms,
                     max_cached_joint_age_ms: max_source_joint_age_ms,
@@ -2392,7 +2400,7 @@ pub fn spawn_policy_runner(
                     max_cached_vision_age_ms: max_source_vision_age_ms,
                     horizon_ms,
                     vision_generation: locked_generation,
-                    vision_target_present,
+                    vision_target: commit_vision_target,
                     live_ticket_ctx: commit_ticket_ctx,
                 };
                 match prepared.commit_gate_now(
@@ -2829,7 +2837,7 @@ mod chunking_tests {
             max_source_vision_age_ms: None,
             horizon_ms: 200,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
         let a0 = prep
@@ -2871,9 +2879,10 @@ mod chunking_tests {
 
         let t0 = Instant::now();
         let ticket = InferenceTicket::new(1, 7, 1, Some(3), 10, 1, 50_000, 1_000, 1_000);
+        let target_a = DetectorTargetIdentity::from_detection(None, "cube", [0.1, 0.2, 0.3, 0.4], 10);
         let mut src0 = ChunkSource::from_joint(t0, Some(5));
         src0.embedding_ticket = Some(ticket);
-        src0.vision_target_present = Some(true);
+        src0.vision_target = Some(target_a);
 
         let valid_ctx = TicketVerificationContext {
             policy_instance_id: Some(1),
@@ -2890,7 +2899,7 @@ mod chunking_tests {
             max_source_vision_age_ms: None,
             horizon_ms: 200,
             vision_generation: None,
-            vision_target_present: Some(true),
+            vision_target: Some(target_a),
             live_ticket_ctx: Some(valid_ctx.clone()),
         };
         let a0 = prep
@@ -2954,15 +2963,118 @@ mod chunking_tests {
         assert!(prep.sync_run_context(live_ctx));
         assert_eq!(prep.chunk_buffer_len(), 0);
 
-        // Repopulate and test detector target lost (true -> false) clears ring
+        // Repopulate and test detector target lost (target_a -> Absent) clears ring
         let _ = prep.step_infer_with_source(&state, None, 1, src0, Some(&valid_limits)).unwrap();
         assert_eq!(prep.chunk_buffer_len(), 3);
         let target_lost_limits = ChunkFreshnessLimits {
-            vision_target_present: Some(false),
+            vision_target: Some(DetectorTargetIdentity::Absent),
             ..valid_limits
         };
         assert!(prep.prune_chunk_buffer(&target_lost_limits));
         assert_eq!(prep.chunk_buffer_len(), 0);
+    }
+
+    #[test]
+    fn chunking_commit_gate_clears_ring_when_detector_target_replaced_while_present() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let origin = Instant::now();
+        let period_ns = Duration::from_millis(50).as_nanos();
+
+        let target_cube =
+            DetectorTargetIdentity::from_detection(None, "cube", [0.10, 0.20, 0.30, 0.40], 10);
+        let target_other_label =
+            DetectorTargetIdentity::from_detection(None, "cup", [0.10, 0.20, 0.30, 0.40], 10);
+        let target_other_box =
+            DetectorTargetIdentity::from_detection(None, "cube", [0.55, 0.20, 0.75, 0.40], 10);
+        let target_other_frame =
+            DetectorTargetIdentity::from_detection(None, "cube", [0.10, 0.20, 0.30, 0.40], 11);
+
+        // Each replacement keeps target presence = true (non-Absent) yet must refuse & clear ring.
+        for replacement in [target_other_label, target_other_box, target_other_frame] {
+            let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+            let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone()]);
+            let mut prep =
+                PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+            let mut src = ChunkSource::from_joint(origin, Some(5));
+            src.vision_target = Some(target_cube);
+
+            let gate_same = CommitGateParams {
+                max_fresh_joint_age_ms: 100,
+                max_cached_joint_age_ms: 300,
+                max_fresh_vision_age_ms: None,
+                max_cached_vision_age_ms: None,
+                horizon_ms: 200,
+                vision_generation: None,
+                vision_target: Some(target_cube),
+                live_ticket_ctx: None,
+            };
+            prep.plan_chunk_step(&state, None, 0, src, None).unwrap();
+            assert!(matches!(
+                prep.commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_same).unwrap(),
+                CommitGateDecision::Submit { commit_period: 0, .. }
+            ));
+            assert_eq!(prep.chunk_buffer_len(), 3);
+
+            // Period 1: target is replaced while still present -> commit_gate refuses and clears ring.
+            let gate_replaced = CommitGateParams {
+                vision_target: Some(replacement),
+                ..gate_same
+            };
+            let d1 = prep
+                .commit_gate(
+                    origin + Duration::from_millis(55),
+                    origin,
+                    period_ns,
+                    Some(0),
+                    &gate_replaced,
+                )
+                .unwrap();
+            assert_eq!(d1, CommitGateDecision::Skip { commit_period: 1 });
+            assert_eq!(
+                prep.chunk_buffer_len(),
+                0,
+                "replacing top detector target while present must clear the ring"
+            );
+        }
+
+        // Also verify TrackId-based identity: matching TrackId submits, changed TrackId clears ring.
+        let tid1 = DetectorTargetIdentity::from_detection(Some(42), "cube", [0.1, 0.2, 0.3, 0.4], 10);
+        let tid2 = DetectorTargetIdentity::from_detection(Some(43), "cube", [0.1, 0.2, 0.3, 0.4], 10);
+        let (snap_t, contract_t, cfg_t) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend_t, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0]);
+        let mut prep_t =
+            PreparedPolicy::from_backend(snap_t, contract_t, Box::new(backend_t), &cfg_t).unwrap();
+        let mut src_t = ChunkSource::from_joint(origin, Some(5));
+        src_t.vision_target = Some(tid1);
+        let gate_t1 = CommitGateParams {
+            max_fresh_joint_age_ms: 100,
+            max_cached_joint_age_ms: 300,
+            max_fresh_vision_age_ms: None,
+            max_cached_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target: Some(tid1),
+            live_ticket_ctx: None,
+        };
+        prep_t.plan_chunk_step(&state, None, 0, src_t, None).unwrap();
+        assert!(matches!(
+            prep_t.commit_gate(origin + Duration::from_millis(5), origin, period_ns, None, &gate_t1).unwrap(),
+            CommitGateDecision::Submit { commit_period: 0, .. }
+        ));
+        // Period 1 with same TrackId(42): cached action submits.
+        assert!(matches!(
+            prep_t.commit_gate(origin + Duration::from_millis(55), origin, period_ns, Some(0), &gate_t1).unwrap(),
+            CommitGateDecision::Submit { commit_period: 1, .. }
+        ));
+        // Period 2 with TrackId(43): refused and ring cleared.
+        let gate_t2 = CommitGateParams { vision_target: Some(tid2), ..gate_t1 };
+        let d2 = prep_t
+            .commit_gate(origin + Duration::from_millis(105), origin, period_ns, Some(1), &gate_t2)
+            .unwrap();
+        assert_eq!(d2, CommitGateDecision::Skip { commit_period: 2 });
+        assert_eq!(prep_t.chunk_buffer_len(), 0);
     }
 
     #[test]
@@ -3018,7 +3130,7 @@ mod chunking_tests {
             max_cached_vision_age_ms: None,
             horizon_ms: 100,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
 
@@ -3078,7 +3190,7 @@ mod chunking_tests {
             max_cached_vision_age_ms: None,
             horizon_ms: 200,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
 
@@ -3112,7 +3224,7 @@ mod chunking_tests {
             max_source_vision_age_ms: None,
             horizon_ms: 200,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
         prep_b
@@ -3163,7 +3275,7 @@ mod chunking_tests {
             max_cached_vision_age_ms: None,
             horizon_ms: 100,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
         prep_c
@@ -3181,7 +3293,7 @@ mod chunking_tests {
             max_source_vision_age_ms: None,
             horizon_ms: 100,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
         prep_c
@@ -3248,7 +3360,7 @@ mod chunking_tests {
             max_cached_vision_age_ms: None,
             horizon_ms: 200,
             vision_generation: None,
-            vision_target_present: None,
+            vision_target: None,
             live_ticket_ctx: None,
         };
 

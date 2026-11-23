@@ -46,8 +46,9 @@ pub use units::{
     policy_units_to_rad, rad_to_policy_units, JointPermutation,
 };
 pub use vision::{
-    evaluate_vision_frame, extract_top1_box_norm_v1, DetectionSourceAdapter, PolicyVisionFrame,
-    PolicyVisionSource, VisionFeatureCollector, VisionStepDecision,
+    evaluate_vision_frame, extract_top1_box_norm_v1, extract_top1_target, DetectionSourceAdapter,
+    DetectorTargetIdentity, PolicyVisionFrame, PolicyVisionSource, VisionFeatureCollector,
+    VisionStepDecision,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

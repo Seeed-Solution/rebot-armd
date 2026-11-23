@@ -139,12 +139,55 @@ impl Drop for VisionFeatureCollector {
     }
 }
 
-/// Extract `[1.0, cx, cy, w, h, score]` from the highest-score valid detection
-/// matching `spec.target_label` and `spec.min_score`.
-pub fn extract_top1_box_norm_v1(
+/// Fixed-size identity of the top-1 detector target used to compute an action chunk.
+///
+/// Uses [`Self::TrackId`] when the detector supplies a track identifier; otherwise
+/// identifies the target by a 128-bit SHA-256 prefix of its label, its normalized
+/// bounding box quantized to `0..=1000` (`[x1, y1, x2, y2]`), and the `frame_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorTargetIdentity {
+    Absent,
+    TrackId(u64),
+    Detection {
+        label_digest: [u8; 16],
+        box_q: [u16; 4],
+        frame_id: u64,
+    },
+}
+
+impl DetectorTargetIdentity {
+    /// Construct identity from a detector track id when available, otherwise from
+    /// `label` + quantized normalized box `[x1, y1, x2, y2]` + `frame_id`.
+    pub fn from_detection(
+        track_id: Option<u64>,
+        label: &str,
+        box_norm: [f64; 4],
+        frame_id: u64,
+    ) -> Self {
+        if let Some(tid) = track_id {
+            return Self::TrackId(tid);
+        }
+        let mut hasher = crate::gravity::Sha256::new();
+        hasher.update(label.as_bytes());
+        let full = hasher.finalize();
+        let mut label_digest = [0u8; 16];
+        label_digest.copy_from_slice(&full[..16]);
+        let q = |v: f64| -> u16 { (v.clamp(0.0, 1.0) * 1000.0).round() as u16 };
+        let box_q = [q(box_norm[0]), q(box_norm[1]), q(box_norm[2]), q(box_norm[3])];
+        Self::Detection {
+            label_digest,
+            box_q,
+            frame_id,
+        }
+    }
+}
+
+/// Extract `[1.0, cx, cy, w, h, score]` and the fixed-size [`DetectorTargetIdentity`]
+/// from the highest-score valid detection matching `spec.target_label` and `spec.min_score`.
+pub fn extract_top1_target(
     frame: &PolicyVisionFrame,
     spec: &VisionFeatureSpec,
-) -> Option<[f32; 6]> {
+) -> Option<([f32; 6], DetectorTargetIdentity)> {
     let mut best: Option<&Detection> = None;
     for det in &frame.detections {
         if let Some(ref target) = spec.target_label {
@@ -197,7 +240,18 @@ pub fn extract_top1_box_norm_v1(
     {
         return None;
     }
-    Some([1.0, cx, cy, w, h, score])
+    let identity =
+        DetectorTargetIdentity::from_detection(None, &det.label, det.box_norm, frame.frame_id);
+    Some(([1.0, cx, cy, w, h, score], identity))
+}
+
+/// Extract `[1.0, cx, cy, w, h, score]` from the highest-score valid detection
+/// matching `spec.target_label` and `spec.min_score`.
+pub fn extract_top1_box_norm_v1(
+    frame: &PolicyVisionFrame,
+    spec: &VisionFeatureSpec,
+) -> Option<[f32; 6]> {
+    extract_top1_target(frame, spec).map(|(features, _)| features)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +260,7 @@ pub enum VisionStepDecision {
         features: [f32; 6],
         vision_age_ms: u64,
         frame_id: u64,
+        target_identity: DetectorTargetIdentity,
     },
     Hold,
     Stop {
@@ -322,17 +377,19 @@ pub fn evaluate_vision_frame(
         );
     }
 
-    match extract_top1_box_norm_v1(frame, spec) {
-        Some(features) => VisionStepDecision::Ready {
+    match extract_top1_target(frame, spec) {
+        Some((features, target_identity)) => VisionStepDecision::Ready {
             features,
             vision_age_ms,
             frame_id: frame.frame_id,
+            target_identity,
         },
         None => match spec.on_target_lost {
             VisionTargetLostPolicy::ZeroFeatures => VisionStepDecision::Ready {
                 features: [0.0; 6],
                 vision_age_ms,
                 frame_id: frame.frame_id,
+                target_identity: DetectorTargetIdentity::Absent,
             },
             VisionTargetLostPolicy::Hold => VisionStepDecision::Hold,
             VisionTargetLostPolicy::Stop => VisionStepDecision::Stop {
