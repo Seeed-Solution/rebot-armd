@@ -9,7 +9,7 @@ mod mit_support;
 
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, DamiaoArmDriver};
+use armd::driver::{ArmDriver, DamiaoArmDriver, GripperPosForce};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{Authority, BootId, Broker, Capacities, ClientId, Outcome, Reply, Submit, TransitionOp};
 use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport};
@@ -30,10 +30,19 @@ struct Rig {
     seq: u64,
 }
 
-fn rig() -> Rig {
+fn rig() -> Rig { rig_with(|d| d) }
+
+/// J7 in Damiao position-force mode with a current ceiling (track A's gripper drive).
+fn pos_force(d: DamiaoArmDriver<FakeBus>) -> DamiaoArmDriver<FakeBus> {
+    d.with_gripper_pos_force(GripperPosForce { joint: 6, current_raw: 220, close_speed_rad_s: 0.30, closed_rad: 0.0, open_rad: -5.7,
+        calibrated: false, ceiling_torque_nm: None, torque_reference: None }).unwrap()
+}
+
+fn rig_with(drive: impl FnOnce(DamiaoArmDriver<FakeBus>) -> DamiaoArmDriver<FakeBus>) -> Rig {
     let clock = MockClock::new();
     let bus = FakeBus::with_clock(&limits(), clock.clone());
-    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(limits()).unwrap();
+    let d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(limits()).unwrap();
+    let mut d = drive(d);
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
     d.check_mapping_ranges();
@@ -147,3 +156,37 @@ fn a_disable_waits_for_fresh_disabled_feedback_and_holds_no_output_meanwhile() {
 }
 
 
+
+/// The torque-related frames of a log: register writes / reads (0x7FF) and enable / disable.
+fn handshake_frames(bus: &FakeBus) -> Vec<(u32, [u8; 8])> {
+    bus.tx_log().iter().filter(|f| f.id == 0x7FF || f.data == damiao::CMD_ENABLE || f.data == damiao::CMD_DISABLE).map(|f| (f.id, f.data)).collect()
+}
+
+#[test]
+fn the_rt_enable_sends_the_j7_position_force_handshake_like_the_blocking_enable() {
+    let is_write = |f: &(u32, [u8; 8])| f.0 == 0x7FF && f.1[2] == damiao::REG_WRITE && f.1[3] == damiao::RID_CTRL_MODE;
+    let is_read = |f: &(u32, [u8; 8])| f.0 == 0x7FF && f.1[2] == damiao::REG_READ && f.1[3] == damiao::RID_CTRL_MODE;
+    // the blocking path (legacy set_torque) as the reference
+    let mut blocking = rig_with(pos_force);
+    blocking.bus.clear_log();
+    blocking.fx.core.set_torque(true).expect("blocking enable");
+    let reference = handshake_frames(&blocking.bus);
+    // the RT transition path
+    let mut r = rig_with(pos_force);
+    r.bus.clear_log();
+    r.submit(TransitionOp::TorqueOn);
+    assert!(r.step().command.unwrap().1.is_ok());
+    assert_eq!(r.until_ended(20).1, Outcome::Completed);
+    let frames = handshake_frames(&r.bus);
+    assert_eq!(frames, reference, "same handshake frames, same order");
+    let write = frames.iter().position(is_write).expect("mode-4 write");
+    let read = frames.iter().position(is_read).expect("mode readback");
+    let enable = frames.iter().position(|f| f.1 == damiao::CMD_ENABLE).expect("enable frame");
+    assert!(write < read && read < enable, "write {write} < read {read} < enable {enable}: {frames:?}");
+    assert_eq!(frames[write].1[4..8], damiao::CTRL_MODE_POS_FORCE.to_le_bytes());
+    assert_eq!(r.bus.with(|s| s.motors[6].ctrl_mode()), damiao::CTRL_MODE_POS_FORCE);
+    // the cap is visible through the supervisor's (joint-zero wrapped) driver
+    let cap = r.fx.core.driver.as_ref().unwrap().lock().unwrap().motor_current_cap().expect("current cap");
+    assert!(cap.active && cap.current_raw == Some(220), "{cap:?}");
+    assert!(r.fx.core.is_torqued);
+}

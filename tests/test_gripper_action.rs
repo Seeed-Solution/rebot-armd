@@ -221,7 +221,8 @@ fn open_after_a_latched_grasp_travels_to_open() {
     }
 }
 
-/// A stall in the travel direction still holds J7 (motor protection), whatever the torque sign.
+/// A stall in the travel direction still holds J7 (motor protection), whatever the torque sign,
+/// and a non-grasp close that stalls far short of its target fails with GRIPPER_TIMEOUT.
 #[test]
 fn close_into_an_obstacle_latches_and_holds_at_measured() {
     for tau_sign in [1.0, -1.0] {
@@ -230,7 +231,7 @@ fn close_into_an_obstacle_latches_and_holds_at_measured() {
         let epoch = inner.safety.epoch_id();
         let (id, _) = inner.start_gripper(request(GripperCommand::Close, None, false, 8.0), epoch).unwrap();
         let a = run(&mut inner, id, 8.0);
-        assert_eq!(a.state, "done", "torque sign {tau_sign}: {a:?}");
+        assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "torque sign {tau_sign}: {a:?}");
         assert!(inner.gripper_stalled && inner.gripper_stall_sign == 1.0, "torque sign {tau_sign}");
         assert!((inner.commanded_positions[6] - inner.measured_positions[6]).abs() < 1e-3,
             "torque sign {tau_sign}: J7 command {} held at measured {}", inner.commanded_positions[6], inner.measured_positions[6]);

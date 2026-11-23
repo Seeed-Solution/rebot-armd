@@ -677,19 +677,67 @@ impl crate::supervisor::SupervisorInner {
     /// feed-forward history advances only after a successful flush; a failed write cancels the
     /// group. MIT lost: nothing is written (None).
     pub(crate) fn write_output(&mut self, mut targets: Vec<JointTarget>, dt: f64) -> Option<Result<(), String>> {
-        self.write_output_slice(&mut targets, dt)
+        self.write_output_slice(&mut targets, dt, None)
+    }
+
+    /// [`Self::write_output`] with explicit active joint limits (used by rejection-fallback braking
+    /// before `tracking.fallback_ramp` is installed).
+    pub(crate) fn write_output_with_limits(
+        &mut self,
+        mut targets: Vec<JointTarget>,
+        dt: f64,
+        limits: &[crate::model::JointLimit],
+    ) -> Option<Result<(), String>> {
+        self.write_output_slice(&mut targets, dt, Some(limits))
     }
 
     /// [`Self::write_output`] of the targets in the tick's scratch (`scratch.targets`, filled by
     /// the caller): no allocation for the ordinary position output.
     pub(crate) fn write_output_scratch(&mut self, dt: f64) -> Option<Result<(), String>> {
         let mut targets = std::mem::take(&mut self.scratch.targets);
-        let r = self.write_output_slice(&mut targets, dt);
+        let r = self.write_output_slice(&mut targets, dt, None);
         self.scratch.targets = targets;
         r
     }
 
-    fn write_output_slice(&mut self, targets: &mut [JointTarget], dt: f64) -> Option<Result<(), String>> {
+    /// Velocity ceiling (rad/s) currently authorized for joint `g` by the active motion,
+    /// persistent gripper hold, fallback ramp, servo stream, or profile limit.
+    fn active_joint_velocity_ceiling(&self, g: usize) -> Option<f32> {
+        let base = if let Some(active) = &self.active_trajectory {
+            if let crate::motion::Reference::Gripper(gm) = &active.reference {
+                if gm.gripper_index == g {
+                    return Some(gm.wire_velocity_ceiling());
+                }
+            }
+            active.motion_limits.as_ref().and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+        } else if let Some(ramp) = &self.tracking.fallback_ramp {
+            ramp.limits.get(g).map(|l| l.max_velocity)
+        } else if let Some(lim) = self.tracking.retained_motion_limits.as_ref().and_then(|ls| ls.get(g)) {
+            Some(lim.max_velocity)
+        } else if self.servo_target.is_some() {
+            let mut v = self.config.limits.get(g)?.max_velocity;
+            #[cfg(feature = "policy-runtime")]
+            if let Some(ref run) = self.policy_run {
+                if run.mode == crate::policy_runtime::PolicyMode::Live {
+                    if let Some(ref gate) = run.verified_release_gate {
+                        v *= (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
+                    }
+                }
+            }
+            Some(v)
+        } else {
+            None
+        };
+        let ceiling = base.or_else(|| self.config.limits.get(g).map(|l| l.max_velocity))?;
+        Some(self.gripper_hold_vel_ceiling.map_or(ceiling, |hold_v| ceiling.min(hold_v)))
+    }
+
+    fn write_output_slice(
+        &mut self,
+        targets: &mut [JointTarget],
+        dt: f64,
+        override_limits: Option<&[crate::model::JointLimit]>,
+    ) -> Option<Result<(), String>> {
         // an E-stop requested since the tick applied the last one: no dynamic output reaches
         // the bus (the tick applies the stop policy right after, see `tick_control`)
         if self.estop_request_unapplied() { return None; }
@@ -701,8 +749,53 @@ impl crate::supervisor::SupervisorInner {
                 Err(e) => return Some(Err(format!("MIT output refused: {e}"))),
             },
         };
+        let active_pf_ceiling = self.config.gripper_index().and_then(|g| {
+            override_limits
+                .and_then(|ls| ls.get(g).map(|l| l.max_velocity))
+                .map(|c| self.gripper_hold_vel_ceiling.map_or(c, |h| c.min(h)))
+                .or_else(|| self.active_joint_velocity_ceiling(g))
+        });
         let res = self.driver.as_ref().and_then(|d| d.lock().ok())
-            .map(|mut drv| drv.write_joint_targets(targets).map_err(|e| e.to_string()));
+            .map(|mut drv| {
+                // Enforce the active authorized velocity ceiling across both moving ticks and
+                // zero-velocity position targets (e.g. grasp squeeze, settle, hold) on an active
+                // pos-force gripper joint:
+                // - When the authorized ceiling quantizes to raw >= 1, bound zero-velocity targets
+                //   and any over-ceiling velocity to `wire_speed_f32(ceiling_raw)`, and floor
+                //   transient sub-quantum accel/braking velocities (0 < |v| < 0.01) to raw 1
+                //   (always <= authorized ceiling and <= close_speed_rad_s).
+                // - When the authorized ceiling itself encodes to 0 (unrepresentable), never fall
+                //   back to vlim()/close_speed_rad_s or bump up to raw 1: forward the
+                //   unrepresentable ceiling/velocity so DamiaoArmDriver fails closed with 0 frames.
+                if let Some(cap) = drv.motor_current_cap().filter(|c| c.mode == "pos_force" && c.active) {
+                    if let Some(t) = targets.get_mut(cap.joint) {
+                        if !t.velocity.is_some_and(|v| !v.is_finite()) {
+                            let ceiling_raw = active_pf_ceiling
+                                .filter(|c| c.is_finite() && *c > 0.0)
+                                .map(crate::model::DamiaoGripperDrive::quantize_vel_raw)
+                                .unwrap_or(0);
+                            let close_ok = cap.close_speed_rad_s
+                                .is_some_and(|cs| cs.is_finite() && crate::model::DamiaoGripperDrive::quantize_vel_raw(cs) >= 1);
+                            if ceiling_raw >= 1 && close_ok {
+                                let ceiling_wire = crate::model::DamiaoGripperDrive::wire_speed_f32(ceiling_raw);
+                                if t.velocity.is_none_or(|v| v == 0.0) {
+                                    t.velocity = Some(ceiling_wire);
+                                } else if let Some(v) = t.velocity {
+                                    let wire_raw = (f64::from(v.abs()) * 100.0)
+                                        .ceil()
+                                        .clamp(1.0, f64::from(ceiling_raw)) as u16;
+                                    t.velocity = Some(crate::model::DamiaoGripperDrive::wire_speed_f32(wire_raw).copysign(v));
+                                }
+                            } else if t.velocity.is_none_or(|v| v == 0.0) {
+                                if let Some(c) = active_pf_ceiling.filter(|c| c.is_finite() && *c > 0.0) {
+                                    t.velocity = Some(c);
+                                }
+                            }
+                        }
+                    }
+                }
+                drv.write_joint_targets(targets).map_err(|e| e.to_string())
+            });
         if let Some(ff) = ff {
             match &res {
                 Some(Ok(())) => {
