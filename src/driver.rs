@@ -2488,6 +2488,13 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     /// `rx_seq` snapshot when `last_enable_command` was recorded so pre-command feedback cannot
     /// satisfy `enable_state()` even if a virtual clock does not advance between receive and send.
     last_enable_command_rx_seq: Option<u64>,
+    /// True when `last_enable_command` was recorded by a disable command (as opposed to enable).
+    last_command_was_disable: bool,
+    /// Sticky torque-off proof: set once every motor confirmed `state == 0` via post-command
+    /// feedback after a disable request; stays `Disabled` for `enable_state()` even without
+    /// newer polls (e.g. after an unacknowledged MIT fence trip) until a later enable request
+    /// or non-zero motor state feedback is observed.
+    disable_confirmed_sticky: bool,
     awaiting_rx_boundary: bool,
     is_enabling: bool,
     last_warn_sec: AtomicU64,
@@ -2620,6 +2627,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_query_instant: None,
             last_enable_command: None,
             last_enable_command_rx_seq: None,
+            last_command_was_disable: false,
+            disable_confirmed_sticky: false,
             awaiting_rx_boundary: false,
             is_enabling: false,
             last_warn_sec: AtomicU64::new(0),
@@ -3470,6 +3479,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
 
         self.is_enabling = true;
+        self.last_command_was_disable = false;
+        self.disable_confirmed_sticky = false;
 
         match max_rx_frames {
             Some(0) => {
@@ -3664,6 +3675,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let handshake_start = self.now();
         self.last_enable_command = Some(handshake_start);
         self.last_enable_command_rx_seq = Some(self.rx_seq);
+        self.last_command_was_disable = false;
+        self.disable_confirmed_sticky = false;
         self.last_feedback_instant.fill(None);
 
         for i in 0..self.motor_ids.len() {
@@ -3825,6 +3838,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let cmd_start = self.now();
         self.last_enable_command = Some(cmd_start);
         self.last_enable_command_rx_seq = Some(self.rx_seq);
+        self.last_command_was_disable = true;
+        self.disable_confirmed_sticky = false;
         let mut last_err = None;
         for &id in &self.motor_ids {
             let frame = damiao::build_disable_frame(id);
@@ -3871,6 +3886,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         match window.service(self.now(), mask, all_fresh, None) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
+                self.disable_confirmed_sticky = true;
                 if mit_fenced { self.mit_fence = None; }
                 Ok(TorqueProgress::Done(TorqueOutcome::Confirmed))
             }
@@ -3991,7 +4007,20 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn enable_state(&self) -> EnableState {
-        if self.awaiting_rx_boundary || self.motor_status.is_empty() || !self.is_feedback_valid() {
+        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
+            return EnableState::Unknown;
+        }
+        // A disable confirmed by post-command feedback is sticky for shutdown: `enable_state()`
+        // stays `Disabled` until a later enable request (or non-zero motor feedback) arrives,
+        // even when no newer polls can be sent (e.g. after an unacknowledged MIT fence trip).
+        if self.disable_confirmed_sticky
+            && !self.is_enabled
+            && !self.is_enabling
+            && self.motor_status.iter().all(|&state| state == 0)
+        {
+            return EnableState::Disabled;
+        }
+        if !self.is_feedback_valid() {
             return EnableState::Unknown;
         }
         // Every motor must have reported current feedback since startup, and (once an enable or
@@ -4050,7 +4079,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_torque_flag(&mut self, enabled: bool) {
         self.is_enabled = enabled;
-        if !enabled {
+        if enabled {
+            self.last_command_was_disable = false;
+            self.disable_confirmed_sticky = false;
+        } else {
             self.pending_rearm = true;
         }
     }
@@ -4165,6 +4197,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if res.is_err() || !unconfirmed.is_empty() {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
+        self.disable_confirmed_sticky = true;
         self.mit_fence = None;
         Ok(())
     }
@@ -4439,6 +4472,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let cmd_start = self.now();
             self.last_enable_command = Some(cmd_start);
             self.last_enable_command_rx_seq = Some(self.rx_seq);
+            self.last_command_was_disable = true;
+            self.disable_confirmed_sticky = false;
             self.is_enabled = false;
             self.pending_rearm = true;
             self.last_query_instant = Some(cmd_start);
@@ -4446,6 +4481,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         let unconfirmed_before = self.unconfirmed_disable_joints();
         if unconfirmed_before.is_empty() && self.enable_state() == EnableState::Disabled {
+            self.disable_confirmed_sticky = true;
             self.mit_fence = None;
             return Some(Ok(Vec::new()));
         }
@@ -4476,6 +4512,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
         let remaining = self.unconfirmed_disable_joints();
         if remaining.is_empty() && self.enable_state() == EnableState::Disabled {
+            self.disable_confirmed_sticky = true;
             self.mit_fence = None;
         }
         Some(Ok(remaining))
@@ -4777,6 +4814,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                             self.feedback_queue_bound[idx] = self.rx_empty_instant;
                             self.last_feedback_seq[idx] = self.rx_seq;
                             self.motor_status[idx] = feedback.state_or_error;
+                            if feedback.state_or_error != 0 {
+                                self.disable_confirmed_sticky = false;
+                            }
                         }
                     }
                     if frames_processed >= max_frames || self.rx_over(t0) {
@@ -4804,6 +4844,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
         }
         self.last_poll_rx = Some((frames_processed as u16, !rx_drained && !hit_err));
+        if self.last_command_was_disable
+            && !self.is_enabled
+            && !self.is_enabling
+            && !self.awaiting_rx_boundary
+            && !self.motor_status.is_empty()
+            && self.is_feedback_valid()
+            && (0..self.motor_ids.len()).all(|i| {
+                self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                    && self.motor_status[i] == 0
+            })
+        {
+            self.disable_confirmed_sticky = true;
+        }
 
         // Evaluate feedback age only after receive() explicitly reports an empty
         // queue. If the bounded budget expires first, defer recovery to the next

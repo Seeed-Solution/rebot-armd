@@ -2124,3 +2124,164 @@ async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors
         }
     });
 }
+
+// ============================================================================
+// 13. Sticky confirmed disable after MIT fence trip & repeated Unknown shutdown disable
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mit_fence_trip_confirmed_disable_stays_shutdown_ready_and_repeated_unknown_shutdown_disables() {
+    // (a) MIT fence trip (unacknowledged -> `poll_tx_allowed() == false`) -> disable confirmed ->
+    // 1 s with ZERO polls -> `enable_state()` stays sticky `Disabled` and `shutdown_ready()` is true!
+    // Output MIT trip/ack logic remains intact (targets still refused until explicit recovery).
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&dm_limits(), clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    drv.set_torque(true).unwrap();
+    assert_eq!(drv.enable_state(), EnableState::Enabled);
+
+    // Arm MIT fence, advance past the 45 ms deadline, and trigger a fence trip (unacknowledged!).
+    drv.set_mit_deadline_fence(Some(Duration::from_millis(45)), Duration::from_millis(200));
+    clock.advance(Duration::from_millis(50));
+    let _ = drv.read_joint_states();
+    assert!(drv.mit_fence_trip().is_some(), "MIT deadline fence must be tripped");
+
+    // Disable torque and confirm from fresh post-command state-0 feedback while leaving the
+    // MIT fence trip UNACKNOWLEDGED (`poll_tx_allowed()` stays false).
+    drv.set_torque(false).unwrap();
+    assert_eq!(drv.enable_state(), EnableState::Disabled);
+    assert!(drv.mit_fence_trip().is_some(), "unacknowledged MIT fence trip must remain set");
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    assert!(sup.shutdown_ready().await);
+
+    // Advance virtual clock by 1 full second with ZERO polls (and verify `read_joint_states()`
+    // transmits 0 refresh polls because the MIT fence trip is still unacknowledged!).
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.tx_log.clear();
+    });
+    clock.advance(Duration::from_secs(1));
+    {
+        let inner = sup.inner().read().await;
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        drv.read_joint_states().unwrap();
+        assert!(!drv.is_feedback_valid(), "1 s without polls must make feedback ages stale (>250 ms)");
+        assert!(drv.mit_fence_trip().is_some(), "MIT fence trip for output must stay active");
+        assert!(
+            drv.write_joint_targets(&vec![JointTarget::position(0.0); 7]).is_err(),
+            "output must still be refused while MIT fence trip is active"
+        );
+        assert_eq!(
+            drv.enable_state(),
+            EnableState::Disabled,
+            "confirmed post-command disable must stay sticky Disabled after 1 s without polls"
+        );
+    }
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "unacknowledged MIT fence trip must not transmit refresh polls"
+    );
+    assert!(
+        sup.shutdown_ready().await,
+        "shutdown_ready must be true 1 s after confirmed disable following an MIT fence trip"
+    );
+    assert!(
+        sup.request_shutdown().await.unwrap(),
+        "request_shutdown must succeed on sticky confirmed disable"
+    );
+
+    // Verify a later enable request clears sticky Disabled (so enable_state is no longer sticky).
+    {
+        let inner = sup.inner().write().await;
+        inner.e_stop_latched.store(false, Ordering::SeqCst);
+        let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+        let _ = drv.begin_torque(true);
+        assert_ne!(
+            drv.enable_state(),
+            EnableState::Disabled,
+            "starting a later enable request must clear sticky Disabled"
+        );
+    }
+
+    // (b) Repeated shutdown signal when state is Unknown issues a new bounded disable request
+    // (Legacy path): fresh Damiao driver starts with no feedback (`Unknown`) and `immediate_replies`
+    // enabled so motors only answer explicit commands.
+    let bus_rep = FakeBus::new(&dm_limits());
+    bus_rep.with(|s| {
+        s.immediate_replies = true;
+        s.tx_log.clear();
+    });
+    let drv_rep = DamiaoArmDriver::new(bus_rep.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    let sup_rep = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_rep)));
+    sup_rep.set_lease_enabled(false).await;
+    assert!(!sup_rep.shutdown_ready().await);
+
+    // 1st shutdown signal: refused because state is Unknown; latches EStop.
+    assert!(!sup_rep.request_shutdown().await.unwrap());
+    assert!(
+        !bus_rep.with(|s| s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)),
+        "first refused shutdown signal only latches EStop"
+    );
+    // Repeated shutdown signal while still Unknown: MUST issue a bounded disable request!
+    assert!(
+        sup_rep.request_shutdown().await.unwrap(),
+        "repeated shutdown signal while Unknown must send bounded disable and confirm"
+    );
+    for id in 1u32..=7 {
+        assert!(
+            bus_rep.with(|s| s.tx_log.iter().any(|f| f.id == id && f.data == armd::protocol::damiao::CMD_DISABLE)),
+            "repeated Unknown shutdown must transmit CMD_DISABLE to motor J{id}"
+        );
+    }
+    assert!(sup_rep.shutdown_ready().await);
+
+    // (c) Repeated shutdown signal while Unknown on the RT executor path also issues a bounded
+    // non-blocking disable request rather than only re-checking.
+    let bus_exec = FakeBus::new(&dm_limits());
+    bus_exec.with(|s| {
+        s.immediate_replies = true;
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
+    let drv_exec = DamiaoArmDriver::new(bus_exec.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    let sup_exec = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_exec)));
+    sup_exec.set_lease_enabled(false).await;
+    let h_exec = sup_exec
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(1), || h_exec.stats().steps.load(Ordering::Relaxed) >= 2).await;
+    assert!(!sup_exec.request_shutdown().await.unwrap());
+    bus_exec.with(|s| {
+        s.tx_log.clear();
+        for m in &mut s.motors {
+            m.silent = false;
+        }
+    });
+    // Repeated shutdown signal while Unknown: issues bounded disable frames (`CMD_DISABLE`).
+    let _ = sup_exec.request_shutdown().await.unwrap();
+    for id in 1u32..=7 {
+        assert!(
+            bus_exec.with(|s| s.tx_log.iter().any(|f| f.id == id && f.data == armd::protocol::damiao::CMD_DISABLE)),
+            "executor repeated Unknown shutdown must transmit CMD_DISABLE to motor J{id}"
+        );
+    }
+    wait_until_async(Duration::from_secs(1), || h_exec.shutdown_ready().unwrap_or(false)).await;
+    assert!(sup_exec.request_shutdown().await.unwrap());
+    h_exec.shutdown_and_join().unwrap();
+}

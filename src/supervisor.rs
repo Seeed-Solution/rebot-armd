@@ -560,6 +560,9 @@ pub struct SupervisorInner {
     /// shutdown readiness is confirmed; permanently blocks `clear_fault`, torque enable, and
     /// actuator motion admission while keeping hardware disable paths permitted.
     pub shutdown_committed: bool,
+    /// True after a shutdown request was refused because hardware `enable_state()` was `Unknown`,
+    /// so a repeated shutdown signal issues a bounded disable request instead of only re-checking.
+    pub(crate) shutdown_refused_unknown: bool,
     /// Preallocated bounded journal of immutable E-stop acknowledgements recorded at the exact
     /// moment [`Self::consume_pending_estop`] applies each urgent request (cap 64; never grows).
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
@@ -837,6 +840,7 @@ impl SupervisorInner {
             persist_capacity_available: true,
             rt_executor_owned: false,
             shutdown_committed: false,
+            shutdown_refused_unknown: false,
             pending_estop_acks: std::collections::VecDeque::with_capacity(
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
@@ -1670,11 +1674,22 @@ impl SupervisorInner {
         }
     }
 
+    fn driver_enable_state_unknown(&self) -> bool {
+        self.driver.as_ref().is_some_and(|d| {
+            d.lock().is_ok_and(|drv| {
+                drv.capabilities().enable_feedback && drv.enable_state() == EnableState::Unknown
+            })
+        })
+    }
+
     /// Authoritative shutdown gate shared by legacy lock and RT executor ownership paths.
     /// Returns `true` when safe to stop the control loop and exit; returns `false` after
-    /// latching stop when hardware disable is not yet confirmed.
+    /// latching stop when hardware disable is not yet confirmed. When shutdown was refused
+    /// because the hardware enable state is `Unknown`, a repeated shutdown signal issues a
+    /// bounded disable request rather than only re-checking.
     pub fn request_shutdown(&mut self) -> bool {
         if self.driver.is_none() || self.shutdown_ready() {
+            self.shutdown_refused_unknown = false;
             tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
             self.e_stop_latched.store(true, Ordering::SeqCst);
             return true;
@@ -1682,6 +1697,24 @@ impl SupervisorInner {
         if !self.safety.state().is_stopped() {
             self.execute_stop(StopPolicy::EStopLatch);
         }
+        let unknown = self.driver_enable_state_unknown();
+        if unknown && self.shutdown_refused_unknown && (!self.is_torqued || self.disable_pending) {
+            if self.rt_executor_owned {
+                if self.torque_transition.is_none() {
+                    let _ = self.request_disable();
+                }
+            } else {
+                let outcome = self.attempt_panic_disable(PANIC_DISABLE_TIMEOUT);
+                outcome.log("Repeated shutdown disable while state Unknown", PANIC_DISABLE_TIMEOUT);
+            }
+            if self.shutdown_ready() {
+                self.shutdown_refused_unknown = false;
+                tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
+                self.e_stop_latched.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        self.shutdown_refused_unknown = unknown;
         false
     }
 
@@ -4636,9 +4669,11 @@ impl ArmSupervisor {
                 None => Err(executor_unavailable()),
             },
             OWNER_LEGACY => {
-                let mut inner = self.inner.write().await;
+                let mut inner = self.inner.clone().write_owned().await;
                 if self.check_legacy_under_guard(&inner).is_ok() {
-                    return Ok(inner.request_shutdown());
+                    return tokio::task::spawn_blocking(move || inner.request_shutdown())
+                        .await
+                        .map_err(|e| ArmError::Internal(format!("request_shutdown blocking task failed: {e}")));
                 }
                 drop(inner);
                 match self.executor_handle() {

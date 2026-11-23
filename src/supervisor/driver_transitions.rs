@@ -1569,6 +1569,7 @@ impl SupervisorInner {
             return Ok(self.safety.state().clone());
         }
         self.e_stop_latched.store(false, Ordering::SeqCst);
+        self.shutdown_refused_unknown = false;
         Self::check_concurrent_estop(self)?;
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
