@@ -44,21 +44,55 @@ static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 /// enqueueing it. 0 (no pause) outside tests.
 pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Test hook: override the bounded per-write socket timeout (ms). 0 uses [`WS_WRITE_TIMEOUT`].
-pub static TEST_WS_WRITE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
-
-static TEST_WS_WRITE_PAUSED: AtomicBool = AtomicBool::new(false);
+static TEST_WS_WRITE_HOOKS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static TEST_WS_WRITE_PAUSED_CONNS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TEST_WS_WRITE_TIMEOUT_CONNS: LazyLock<Mutex<HashMap<String, Duration>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static TEST_WS_WRITE_UNPAUSE: LazyLock<tokio::sync::Notify> = LazyLock::new(tokio::sync::Notify::new);
 
-/// Number of WS writer tasks currently blocked inside a test-simulated stalled socket write.
-pub static TEST_WS_WRITER_BLOCKED_COUNT: AtomicUsize = AtomicUsize::new(0);
+fn refresh_write_hooks_active() {
+    let paused = !TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    let timed = !TEST_WS_WRITE_TIMEOUT_CONNS.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+    TEST_WS_WRITE_HOOKS_ACTIVE.store(paused || timed, Ordering::Release);
+}
 
-/// Test hook: pause or unpause outbound WebSocket writes to simulate a stalled socket.
-pub fn set_test_ws_write_paused(paused: bool) {
-    TEST_WS_WRITE_PAUSED.store(paused, Ordering::Release);
+/// Test hook: pause or unpause outbound WebSocket writes for a single connection ID.
+pub fn set_test_ws_write_paused(connection_id: &str, paused: bool) {
+    {
+        let mut map = TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        if paused {
+            map.entry(connection_id.to_owned()).or_insert(0);
+        } else {
+            map.remove(connection_id);
+        }
+    }
+    refresh_write_hooks_active();
     if !paused {
         TEST_WS_WRITE_UNPAUSE.notify_waiters();
     }
+}
+
+/// Test hook: override the bounded per-write timeout for a single connection ID.
+pub fn set_test_ws_write_timeout(connection_id: &str, timeout: Option<Duration>) {
+    {
+        let mut map = TEST_WS_WRITE_TIMEOUT_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+        match timeout {
+            Some(dur) => { map.insert(connection_id.to_owned(), dur); }
+            None => { map.remove(connection_id); }
+        }
+    }
+    refresh_write_hooks_active();
+}
+
+/// Test hook: number of writer tasks currently blocked in a simulated write stall for `connection_id`.
+pub fn test_ws_writer_blocked_count(connection_id: &str) -> usize {
+    TEST_WS_WRITE_PAUSED_CONNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(connection_id)
+        .copied()
+        .unwrap_or(0)
 }
 
 async fn test_ack_stamp_delay() {
@@ -66,9 +100,18 @@ async fn test_ack_stamp_delay() {
     if ms > 0 { tokio::time::sleep(Duration::from_millis(ms)).await; }
 }
 
-fn ws_write_timeout() -> Duration {
-    let ms = TEST_WS_WRITE_TIMEOUT_MS.load(Ordering::Relaxed);
-    if ms > 0 { Duration::from_millis(ms) } else { WS_WRITE_TIMEOUT }
+fn ws_write_timeout(connection_id: &str) -> Duration {
+    if TEST_WS_WRITE_HOOKS_ACTIVE.load(Ordering::Acquire) {
+        if let Some(dur) = TEST_WS_WRITE_TIMEOUT_CONNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(connection_id)
+            .copied()
+        {
+            return dur;
+        }
+    }
+    WS_WRITE_TIMEOUT
 }
 
 /// `?obs_hz=N`: send at most N observations per second on this connection (clamped to
@@ -384,26 +427,43 @@ fn enforce_monotonic_epoch(last_wire_epoch: &mut Option<(u64, Option<Value>)>, r
 }
 
 async fn write_ws_frame(
+    connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: Message,
     timeout_dur: Duration,
 ) -> Result<(), ()> {
     tokio::time::timeout(timeout_dur, async {
-        if TEST_WS_WRITE_PAUSED.load(Ordering::Acquire) {
-            struct BlockedGuard;
-            impl Drop for BlockedGuard {
-                fn drop(&mut self) {
-                    TEST_WS_WRITER_BLOCKED_COUNT.fetch_sub(1, Ordering::Release);
+        if TEST_WS_WRITE_HOOKS_ACTIVE.load(Ordering::Acquire) {
+            let is_paused = || {
+                TEST_WS_WRITE_PAUSED_CONNS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(connection_id)
+            };
+            if is_paused() {
+                struct BlockedGuard(String);
+                impl Drop for BlockedGuard {
+                    fn drop(&mut self) {
+                        let mut map = TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(c) = map.get_mut(&self.0) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
                 }
-            }
-            TEST_WS_WRITER_BLOCKED_COUNT.fetch_add(1, Ordering::AcqRel);
-            let _guard = BlockedGuard;
-            while TEST_WS_WRITE_PAUSED.load(Ordering::Acquire) {
-                let notified = TEST_WS_WRITE_UNPAUSE.notified();
-                if !TEST_WS_WRITE_PAUSED.load(Ordering::Acquire) {
-                    break;
+                {
+                    let mut map = TEST_WS_WRITE_PAUSED_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(c) = map.get_mut(connection_id) {
+                        *c += 1;
+                    }
                 }
-                notified.await;
+                let _guard = BlockedGuard(connection_id.to_owned());
+                while is_paused() {
+                    let notified = TEST_WS_WRITE_UNPAUSE.notified();
+                    if !is_paused() {
+                        break;
+                    }
+                    notified.await;
+                }
             }
         }
         sender.send(msg).await
@@ -1046,6 +1106,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Task 3: Writer task with urgent-first priority, monotonic wire epoch guard,
     // latest-wins telemetry, explicit error close on control queue saturation, and bounded write timeout.
+    let writer_connection = connection.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut last_sent: Option<f64> = None;
         let mut last_wire_epoch: Option<(u64, Option<Value>)> = None;
@@ -1054,29 +1115,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 biased;
                 msg = revocation_rx.recv() => match msg {
                     Some(msg) => {
-                        if write_ws_frame(&mut sender, msg, ws_write_timeout()).await.is_err() { break; }
+                        if write_ws_frame(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
                     None => break,
                 },
                 reply = estop_out_rx.recv() => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&mut sender, Message::Text(val.to_string().into()), ws_write_timeout()).await.is_err() { break; }
+                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
                     None => break,
                 },
                 reply = stop_out_rx.recv() => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&mut sender, Message::Text(val.to_string().into()), ws_write_timeout()).await.is_err() { break; }
+                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
                     None => break,
                 },
                 fatal = fatal_rx.recv() => match fatal {
                     Some(fatal) => {
-                        let flush_timeout = ws_write_timeout().min(WS_FATAL_FLUSH_TIMEOUT);
-                        let _ = write_ws_frame(&mut sender, Message::Text(fatal.error_value().to_string().into()), flush_timeout).await;
-                        let _ = write_ws_frame(&mut sender, Message::Close(Some(fatal.close_frame())), flush_timeout).await;
+                        let flush_timeout = ws_write_timeout(&writer_connection).min(WS_FATAL_FLUSH_TIMEOUT);
+                        let _ = write_ws_frame(&writer_connection, &mut sender, Message::Text(fatal.error_value().to_string().into()), flush_timeout).await;
+                        let _ = write_ws_frame(&writer_connection, &mut sender, Message::Close(Some(fatal.close_frame())), flush_timeout).await;
                         break;
                     }
                     None => break,
@@ -1084,7 +1145,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 reply = ordinary_out_rx.recv() => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
-                        if write_ws_frame(&mut sender, Message::Text(val.to_string().into()), ws_write_timeout()).await.is_err() { break; }
+                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
                     None => break,
                 },
@@ -1102,7 +1163,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             last_sent = Some(obs.timestamp);
                         }
                         if let Ok(text) = serde_json::to_string(&obs) {
-                            if write_ws_frame(&mut sender, Message::Text(text.into()), ws_write_timeout()).await.is_err() { break; }
+                            if write_ws_frame(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
@@ -2288,7 +2349,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             ordinary_queue.close();
             worker_task.abort();
             if fatal_triggered.load(Ordering::Acquire) {
-                let _ = tokio::time::timeout(ws_write_timeout().min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
+                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
             }
             writer_task.abort();
         }
@@ -2296,7 +2357,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             reader_task.abort();
             ordinary_queue.close();
             if fatal_triggered.load(Ordering::Acquire) {
-                let _ = tokio::time::timeout(ws_write_timeout().min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
+                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
             }
             writer_task.abort();
         }
