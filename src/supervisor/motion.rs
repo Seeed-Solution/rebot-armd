@@ -685,6 +685,23 @@ impl SupervisorInner {
         false
     }
 
+    /// Releases whichever lease `client_id` currently holds under the owner lock, regardless of
+    /// generation (used by WS teardown so a concurrent acquire cannot outlive connection close).
+    pub fn release_lease_for_connection(&mut self, client_id: &str) -> bool {
+        if self.detached {
+            return false;
+        }
+        let Some(gen) = self
+            .active_lease
+            .as_ref()
+            .filter(|active| active.client_id == client_id)
+            .map(|active| active.generation)
+        else {
+            return false;
+        };
+        self.release_lease(client_id, gen)
+    }
+
     /// Records the label a lease holder sent with `acquire_lease` (shown to other clients).
     pub fn set_lease_label(&mut self, client_id: &str, generation: u64, label: &str) {
         if self.detached {

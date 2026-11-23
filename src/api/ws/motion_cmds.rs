@@ -150,11 +150,21 @@ impl PlannedMacro {
     }
 }
 
+/// Aborts a tracked child task handle when dropped.
+pub(super) struct AbortOnDrop(pub(super) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A macro action being planned and checked (grasp preflight: model switch, up to ~7 s) in a
-/// task of its own, so the receive loop still reads stop / e-stop on the connection meanwhile.
+/// tracked connection task, aborted automatically on drop so preflight never outlives the socket.
 pub(super) struct MacroCheck {
     pub(super) request_id: Value,
     pub(super) generation: u64,
     pub(super) enqueued_stop_gen: u64,
-    pub(super) task: tokio::task::JoinHandle<Result<PlannedMacro, ArmError>>,
+    pub(super) abort: AbortOnDrop,
+    pub(super) rx: tokio::sync::oneshot::Receiver<Result<PlannedMacro, ArmError>>,
 }

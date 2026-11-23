@@ -662,6 +662,7 @@ impl Drop for WriteHookGuard {
 
 struct SlowDetector {
     entered: Arc<AtomicBool>,
+    active_calls: Arc<AtomicUsize>,
     released: Arc<AtomicBool>,
     release: Arc<tokio::sync::Notify>,
 }
@@ -670,6 +671,7 @@ impl SlowDetector {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             entered: Arc::new(AtomicBool::new(false)),
+            active_calls: Arc::new(AtomicUsize::new(0)),
             released: Arc::new(AtomicBool::new(false)),
             release: Arc::new(tokio::sync::Notify::new()),
         })
@@ -693,6 +695,12 @@ impl armd::grasp::DetectionSource for SlowDetector {
     }
     fn mode_info(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<armd::grasp::ModeInfo, String>> + Send + '_>> {
         Box::pin(async move {
+            struct ActiveGuard(Arc<AtomicUsize>);
+            impl Drop for ActiveGuard {
+                fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
+            }
+            self.active_calls.fetch_add(1, Ordering::SeqCst);
+            let _guard = ActiveGuard(self.active_calls.clone());
             self.entered.store(true, Ordering::SeqCst);
             while !self.released.load(Ordering::Acquire) {
                 let n = self.release.notified();
@@ -1409,4 +1417,109 @@ async fn auth_and_heartbeat_bypass_full_ordinary_backlog_and_fatal_overflow_flus
     assert!(saw_close, "connection must close after flushing fatal error frame");
     assert!(t_unpause.elapsed() < Duration::from_secs(1), "fatal flush exceeded 1 s grace");
     det2.release_now();
+}
+
+// 16. Round 3 Item 6 (Major): teardown tracks and joins all spawned connection tasks (macro
+//     preflight + urgent completions), takes the owner lock first to release any lease held by
+//     the connection, and releases any late acquire immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_teardown_joins_spawned_tasks_and_releases_late_acquire_under_lock() {
+    // (a) Macro preflight task is aborted and joined BEFORE connection teardown completes.
+    let det = SlowDetector::new();
+    let sup = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    {
+        // Place the arm at a look-down pose so `grasp::plan` succeeds and enters `grasp::preflight`.
+        let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+        let inspect6: [f64; 6] = std::array::from_fn(|i| INSPECT[i] as f64);
+        let p0 = arm.fk(&inspect6).p;
+        let goal = armd::kinematics::Pose::new(armd::grasp::look_down(&arm.fk(&inspect6).r), [p0[0], p0[1], 0.24]);
+        let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
+        let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
+        let mut q = inspect6;
+        for _ in 0..20 {
+            let sol = arm.solve_dls(&goal, &q, &lo, &hi, armd::kinematics::PAR.w);
+            q = sol.q;
+            if sol.ok { break; }
+        }
+        let q7: Vec<f32> = (0..7).map(|i| if i < 6 { q[i] as f32 } else { 0.0 }).collect();
+        let mut inner = sup.inner().write().await;
+        inner.commanded_positions = q7.clone();
+        inner.measured_positions = q7.clone();
+        inner.target_positions = q7;
+    }
+    let addr = serve_with_slow_detector(sup.clone(), det.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let ep = sup.get_observation().await.epoch_id;
+    let torque_ack = ws_reply(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}}), &["command_ack", "command_reject"]).await;
+    assert_eq!(torque_ack["type"], "command_ack", "{torque_ack}");
+    let ep = sup.get_observation().await.epoch_id;
+
+    // Launch a real grasp macro whose preflight blocks inside `SlowDetector::mode_info()`.
+    send(&mut ws, json!({
+        "type": "command", "request_id": 10, "generation": gen, "epoch_id": ep,
+        "path": "/api/v1/action/grasp",
+        "body": {"task": "slow", "label": "cup", "box_norm": [0.48, 0.48, 0.52, 0.52], "frame_id": 1}
+    })).await;
+    wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
+    assert_eq!(det.active_calls.load(Ordering::SeqCst), 1, "macro preflight must be running");
+
+    // Drop WS while macro preflight is blocked: teardown must abort+join preflight AND release lease.
+    drop(ws);
+    wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn_id)).await;
+    assert_eq!(det.active_calls.load(Ordering::SeqCst), 0, "macro preflight task outlived connection teardown");
+    assert!(sup.inner().read().await.active_lease.is_none(), "lease must be released on teardown");
+    assert!(sup.get_observation().await.action.is_none(), "aborted macro must never start");
+
+    // (b) Late `acquire_lease` held at owner lock during disconnect is cleaned up (never leaks a lease).
+    let (addr2, sup2) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws2, gen2) = controller(addr2).await;
+    let conn2 = sup2.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _worker_guard = WorkerLockHookGuard(conn2.clone());
+    let rel = ws_reply(&mut ws2, json!({"type": "release_lease", "generation": gen2}), &["lease_released"]).await;
+    assert_eq!(rel["success"], true);
+    assert!(sup2.inner().read().await.active_lease.is_none());
+
+    // Pause worker right before `inner.write()`, send acquire_lease, then drop WS while acquire is pending.
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn2, true);
+    send(&mut ws2, json!({"type": "acquire_lease", "client_id": "late-acquirer", "seq": 5})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn2) >= 1).await;
+    drop(ws2);
+    // Unpause right after drop so worker either gets aborted or hits `worker_closing` under `inner.write()`.
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn2, false);
+    wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn2)).await;
+    assert!(sup2.inner().read().await.active_lease.is_none(), "late acquire must never survive teardown");
+
+    // (c) Urgent Stop completion task blocked behind owner lock is bounded-grace aborted and joined on disconnect.
+    let (addr3, sup3) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws3, gen3) = controller(addr3).await;
+    let conn3 = sup3.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let ep3 = sup3.get_observation().await.epoch_id;
+    let t_ack = ws_reply(&mut ws3, json!({"type": "command", "request_id": 1, "generation": gen3, "epoch_id": ep3, "path": "/api/v1/torque", "body": {"enable": true}}), &["command_ack", "command_reject"]).await;
+    assert_eq!(t_ack["type"], "command_ack", "{t_ack}");
+    let ep3 = sup3.get_observation().await.epoch_id;
+    let held_sup = sup3.clone();
+    let hold_guard = tokio::spawn(async move {
+        let _w = held_sup.inner().write().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    });
+    // Wait until the lock holder definitely owns `inner.write()`.
+    wait_until(Duration::from_secs(1), || sup3.inner().try_read().is_err()).await;
+    // Send urgent Stop while owner lock is held, then drop WS so the urgent task cannot complete within 250ms grace.
+    send(&mut ws3, json!({"type": "command", "request_id": 2, "generation": gen3, "epoch_id": ep3, "path": "/api/v1/motion/stop", "body": {}})).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(ws3);
+    hold_guard.await.unwrap();
+    wait_until(Duration::from_secs(1), || !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn3)).await;
+    assert!(sup3.inner().read().await.active_lease.is_none(), "lease must be released after teardown");
+    // The urgent Stop task was aborted and joined before the lock freed, so it never ran late.
+    assert_eq!(sup3.inner().read().await.safety.epoch_id(), ep3, "aborted urgent Stop task must not run after teardown");
+
+    // (d) Direct owner-lock-first `release_lease_for_connection` releases whichever generation a connection holds.
+    let mut core = SupervisorInner::new(ArmConfig::rebot_dm());
+    let g_a = core.acquire_lease("connection:late").unwrap();
+    assert!(g_a >= 1 && core.active_lease.is_some());
+    assert!(!core.release_lease_for_connection("connection:other"));
+    assert!(core.release_lease_for_connection("connection:late"));
+    assert!(core.active_lease.is_none());
 }

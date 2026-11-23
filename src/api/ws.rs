@@ -285,6 +285,8 @@ const AUTH_OUT_CAPACITY: usize = 16;
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum bounded grace (<= 1 s) to let the writer flush an explicit fatal error + Close frame.
 const WS_FATAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// Maximum bounded grace to join connection-scoped child tasks before aborting and joining them.
+const WS_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Handled by the ordinary worker while a [`MacroCheck`] runs; motion commands stay queued in
 /// order within the bounded ordinary queue. (E-stop, `/api/v1/motion/stop`, `auth`, and
@@ -663,6 +665,87 @@ impl HeartbeatSlot {
             g.1 = true;
         }
         self.notify.notify_waiters();
+    }
+}
+
+struct ConnectionTasksInner {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+/// Tracks every spawned child task belonging to one WS connection so teardown waits with a
+/// bounded timeout, aborts any remaining tasks, and joins every handle before returning.
+#[derive(Clone)]
+struct ConnectionTasks {
+    inner: Arc<Mutex<ConnectionTasksInner>>,
+}
+
+impl ConnectionTasks {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ConnectionTasksInner {
+                handles: Vec::new(),
+                closed: false,
+            })),
+        }
+    }
+
+    fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let _ = self.spawn_abortable(fut);
+    }
+
+    fn spawn_abortable<F>(&self, fut: F) -> tokio::task::AbortHandle
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let handle = tokio::spawn(fut);
+        let abort = handle.abort_handle();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.closed {
+            abort.abort();
+            g.handles.push(handle);
+            return abort;
+        }
+        g.handles.retain(|h| !h.is_finished());
+        g.handles.push(handle);
+        abort
+    }
+
+    async fn shutdown_and_join(&self, grace: Duration) {
+        let mut handles = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.closed = true;
+            std::mem::take(&mut g.handles)
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        for h in &mut handles {
+            if h.is_finished() {
+                let _ = h.await;
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, &mut *h).await.is_err() {
+                h.abort();
+                let _ = h.await;
+            }
+        }
+        // Drain any task registered concurrently right before `closed = true` was observed.
+        loop {
+            let extra = {
+                let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut g.handles)
+            };
+            if extra.is_empty() {
+                break;
+            }
+            for h in extra {
+                h.abort();
+                let _ = h.await;
+            }
+        }
     }
 }
 
@@ -1285,6 +1368,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let ordinary_queue = OrdinaryQueue::new();
     let heartbeat_slot = HeartbeatSlot::default();
     let ws_auth = WsAuth::new(auth, ws_token, explicit_auth);
+    let tasks = ConnectionTasks::new();
+    let connection_closing = Arc::new(AtomicBool::new(false));
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel::<Option<CancelSignal>>(None);
 
     #[cfg(feature = "policy-runtime")]
@@ -1529,6 +1614,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let reader_ordinary_queue = ordinary_queue.clone();
     let reader_heartbeat_slot = heartbeat_slot.clone();
     let reader_ws_auth = ws_auth.clone();
+    let reader_tasks = tasks.clone();
     let reader_cancel_tx = cancel_tx.clone();
     let reader_writer = writer.clone();
     #[cfg(feature = "policy-runtime")]
@@ -1573,7 +1659,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let stop_gen = reader_stop_gen.clone();
                 let cancel_tx = reader_cancel_tx.clone();
                 let writer_c = reader_writer.clone();
-                tokio::spawn(async move {
+                reader_tasks.spawn(async move {
                     let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
                         Ok((state, epoch)) => (
                             json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
@@ -1709,7 +1795,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             let writer_c = reader_writer.clone();
                             #[cfg(feature = "policy-runtime")]
                             let policy_gen_c = reader_policy_stop_gen.clone();
-                            tokio::spawn(async move {
+                            reader_tasks.spawn(async move {
                                 let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
                                 let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
                                 deliver_urgent_stop_batch(
@@ -1728,7 +1814,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             let writer_c = reader_writer.clone();
                             #[cfg(feature = "policy-runtime")]
                             let policy_gen_c = reader_policy_stop_gen.clone();
-                            tokio::spawn(async move {
+                            reader_tasks.spawn(async move {
                                 let mut pre_drained: Option<Vec<Value>> = None;
                                 let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, |applied_epoch| {
                                     // Advance connection stop generation, notify macro cancellation,
@@ -1786,12 +1872,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_stop_gen = conn_stop_gen.clone();
     let worker_ordinary_queue = ordinary_queue.clone();
     let worker_writer = writer.clone();
+    let worker_tasks = tasks.clone();
+    let worker_closing = connection_closing.clone();
     let recv_deps = deps;
     let recv_calib = calib;
     #[cfg(feature = "policy-runtime")]
     let recv_sandbox = sandbox;
     #[cfg(feature = "policy-runtime")]
-    let ws_closed = ws_closed.clone();
+    let worker_ws_closed = ws_closed.clone();
     #[cfg(feature = "policy-runtime")]
     let policy_stop_gen = policy_stop_gen.clone();
     let worker_ws_auth = ws_auth.clone();
@@ -1815,7 +1903,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     if let Some(sig) = sig {
                         if macro_check.as_ref().is_some_and(|c| sig.gen > c.enqueued_stop_gen) {
                             let check = macro_check.take().expect("checked above");
-                            check.task.abort();
+                            check.abort.0.abort();
                             let mut r = json!({"type":"command_reject", "request_id":check.request_id, "status":409, "code":sig.code, "error":sig.code, "message":"Stopped before the action began"});
                             if let Some(ep) = sig.epoch { r["epoch_id"] = json!(ep); }
                             if !worker_writer.send_ordinary_control(r).await { break; }
@@ -1856,7 +1944,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                     continue;
                 }
-                joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").task).await }, if macro_active => {
+                joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, enqueued_stop_gen, .. } = macro_check.take().expect("checked above");
                     let owner_transferred = || {
                         let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
@@ -1924,7 +2012,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
-                tokio::spawn(async move {
+                worker_tasks.spawn(async move {
                     let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
                     let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
                 });
@@ -1951,7 +2039,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or(caller_label),
                 };
                 let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
-                tokio::spawn(async move {
+                worker_tasks.spawn(async move {
                     let path = value["path"].as_str().unwrap_or("").to_string();
                     let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
                     let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
@@ -1979,6 +2067,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 if kind == "acquire_lease" {
+                    if worker_closing.load(Ordering::SeqCst) {
+                        // Teardown already started while waiting for the owner lock: never keep
+                        // (or evict another client for) a late lease acquire.
+                        let _ = inner.release_lease_for_connection(&recv_connection);
+                        recv_generation.store(0, Ordering::SeqCst);
+                        response = None;
+                    } else {
                         let label = value.get("client_id").and_then(Value::as_str).unwrap_or("");
                         let seq = value.get("seq").and_then(Value::as_u64);
                         let force_val = value.get("force");
@@ -2015,17 +2110,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         } else {
                                             match inner.preempt_lease(&recv_connection, label) {
                                                 Ok((generation, evicted)) => {
-                                                    let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                    *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                    if previous != generation { last_sequence = None; }
-                                                    let mut reply = json!({
-                                                        "type": "lease_granted",
-                                                        "client_id": label,
-                                                        "generation": generation
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                    evicted_notify = evicted;
+                                                    if worker_closing.load(Ordering::SeqCst) {
+                                                        // Late acquire completing after teardown started: release immediately.
+                                                        let _ = inner.release_lease(&recv_connection, generation);
+                                                        recv_generation.store(0, Ordering::SeqCst);
+                                                        response = None;
+                                                    } else {
+                                                        let previous = recv_generation.swap(generation, Ordering::SeqCst);
+                                                        *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
+                                                        if previous != generation { last_sequence = None; }
+                                                        let mut reply = json!({
+                                                            "type": "lease_granted",
+                                                            "client_id": label,
+                                                            "generation": generation
+                                                        });
+                                                        if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                        response = Some(reply);
+                                                        evicted_notify = evicted;
+                                                    }
                                                 }
                                                 Err(crate::supervisor::PreemptError::Cooldown(remaining)) => {
                                                     let mut reply = json!({
@@ -2050,17 +2152,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     } else {
                                         match inner.acquire_lease(&recv_connection) {
                                             Ok(generation) => {
-                                                inner.set_lease_label(&recv_connection, generation, label);
-                                                let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                if previous != generation { last_sequence = None; }
-                                                let mut reply = json!({
-                                                    "type": "lease_granted",
-                                                    "client_id": label,
-                                                    "generation": generation
-                                                });
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
+                                                if worker_closing.load(Ordering::SeqCst) {
+                                                    // Late acquire completing after teardown started: release immediately.
+                                                    let _ = inner.release_lease(&recv_connection, generation);
+                                                    recv_generation.store(0, Ordering::SeqCst);
+                                                    response = None;
+                                                } else {
+                                                    inner.set_lease_label(&recv_connection, generation, label);
+                                                    let previous = recv_generation.swap(generation, Ordering::SeqCst);
+                                                    *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
+                                                    if previous != generation { last_sequence = None; }
+                                                    let mut reply = json!({
+                                                        "type": "lease_granted",
+                                                        "client_id": label,
+                                                        "generation": generation
+                                                    });
+                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                    response = Some(reply);
+                                                }
                                             }
                                             Err((code, 0)) if code == "OWNER_TRANSFERRED" => {
                                                 let mut reply = json!({
@@ -2081,6 +2190,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 }
                             }
                         }
+                    }
                     } else {
                         let local_generation = recv_generation.load(Ordering::SeqCst);
                         let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
@@ -2360,14 +2470,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // (lease re-check, then begin), while later ordinary commands stay in the bounded queue.
                 if let Some((request_id, pending, generation)) = pending_macro.take() {
                     let source = recv_deps.source.clone();
-                    let task = tokio::spawn(async move {
-                        let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await
-                            .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-                        // grasp task requirements: checked without the lock, before the action begins
-                        if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
-                        Ok(planned)
+                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+                    let abort = worker_tasks.spawn_abortable(async move {
+                        let planned_res = async {
+                            let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await
+                                .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
+                            // grasp task requirements: checked without the lock, before the action begins
+                            if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
+                            Ok(planned)
+                        }.await;
+                        let _ = res_tx.send(planned_res);
                     });
-                    macro_check = Some(MacroCheck { request_id, generation, enqueued_stop_gen, task });
+                    macro_check = Some(MacroCheck {
+                        request_id,
+                        generation,
+                        enqueued_stop_gen,
+                        abort: motion_cmds::AbortOnDrop(abort),
+                        rx: res_rx,
+                    });
                 }
                 // Replay: the episode is read and checked without the lock; install re-checks.
                 if let Some((request_id, input, generation)) = pending_replay.take() {
@@ -2405,7 +2525,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let conn = recv_connection.clone();
                     let gen_now = recv_generation.clone();
                     let tx = ack_tx.clone();
-                    let ws_closed_c = ws_closed.clone();
+                    let ws_closed_c = worker_ws_closed.clone();
                     let stop_gen_c = policy_stop_gen.clone();
                     let my_stop_gen = stop_gen_c.load(Ordering::SeqCst);
                     let pending_loads_c = pending_policy_loads.clone();
@@ -2427,7 +2547,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let policy_live_allowed = pending.policy_live_allowed;
                     let i_am_at_the_arm = pending.request.i_am_at_the_arm;
                     let ws_auth_c = ws_auth.clone();
-                    tokio::spawn(async move {
+                    worker_tasks.spawn(async move {
                         let _load_guard = load_guard;
                         let mut loading_guard = loading_guard;
                         let policy_id_load = policy_id.clone();
@@ -2627,12 +2747,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     for (k, v) in dry.fields() { ack[k.as_str()] = v; }
                     response = Some(ack);
                 }
-                // Calibration apply / restore: its own task (HTTP to rebot-vision, file writes);
+                // Calibration apply / restore: its own tracked task (HTTP to rebot-vision, file writes);
                 // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
                 if let Some((request_id, job, generation, epoch, busy)) = pending_calibration.take() {
                     let (sup, calib, conn, gen_now, tx) = (recv_supervisor.clone(), recv_calib.clone(), recv_connection.clone(), recv_generation.clone(), ack_tx.clone());
                     let ws_auth_c = ws_auth.clone();
-                    tokio::spawn(async move {
+                    let tasks_c = worker_tasks.clone();
+                    worker_tasks.spawn(async move {
                         let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
                             if !ws_auth_c.is_operator() {
                                 return Err(crate::calibration::CalibError::new(403, "OPERATOR_REQUIRED", "Operator session expired or locked during calibration"));
@@ -2648,16 +2769,19 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         // the busy flag is released by the guard, also when the job panics
                         let guard = busy.then(|| crate::calibration::BusyGuard::new(sup.clone()));
                         let job_sup = sup.clone();
-                        let job_task = tokio::spawn(async move {
-                            match job {
+                        let (job_tx, job_rx) = tokio::sync::oneshot::channel();
+                        let job_abort = tasks_c.spawn_abortable(async move {
+                            let res = match job {
                                 CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
                                 CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
                                 CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
                                 CalibJob::JointZeroRestore(name) => crate::motor_zero::restore(&job_sup, &calib, name, &check).await,
                                 CalibJob::MitQualification(file) => crate::mit::store_qualification(&job_sup, &calib, *file, &check).await,
-                            }
+                            };
+                            let _ = job_tx.send(res);
                         });
-                        let result = job_task.await.unwrap_or_else(|e| {
+                        let _abort_inner = motion_cmds::AbortOnDrop(job_abort);
+                        let result = job_rx.await.unwrap_or_else(|e| {
                             tracing::error!("calibration task failed: {e}");
                             Err(crate::calibration::CalibError::new(500, "INTERNAL", format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups")))
                         });
@@ -2674,7 +2798,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let sup = recv_supervisor.clone();
                     let tx = ack_tx.clone();
                     let (ws_auth_c, conn_c, gen_now) = (ws_auth.clone(), recv_connection.clone(), recv_generation.clone());
-                    tokio::spawn(async move {
+                    worker_tasks.spawn(async move {
                         let reply = persist_and_activate(sup, request_id, prepared, generation, epoch, ws_auth_c, conn_c, gen_now).await;
                         let _ = tx.send(reply).await;
                     });
@@ -2710,49 +2834,56 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
         }
     });
-    tokio::select! {
-        _ = &mut writer_task => {
-            reader_task.abort();
-            worker_task.abort();
-            heartbeat_slot.close();
-            heartbeat_task.abort();
-        }
-        _ = &mut reader_task => {
-            ordinary_queue.close();
-            heartbeat_slot.close();
-            worker_task.abort();
-            heartbeat_task.abort();
-            if fatal_triggered.load(Ordering::Acquire) {
-                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
+    enum FirstExit { Writer, Reader, Worker, Heartbeat }
+    let first_exit = tokio::select! {
+        _ = &mut writer_task => FirstExit::Writer,
+        _ = &mut reader_task => FirstExit::Reader,
+        _ = &mut worker_task => FirstExit::Worker,
+        _ = &mut heartbeat_task => FirstExit::Heartbeat,
+    };
+    // Mark connection closing first so any concurrent acquire under the owner lock releases immediately.
+    connection_closing.store(true, Ordering::SeqCst);
+    #[cfg(feature = "policy-runtime")]
+    ws_closed.store(true, Ordering::SeqCst);
+    ordinary_queue.close();
+    heartbeat_slot.close();
+
+    // Stop and JOIN all primary tasks so none outlives teardown; give writer <= 1 s grace on fatal overflow.
+    if !matches!(first_exit, FirstExit::Reader) {
+        reader_task.abort();
+        let _ = reader_task.await;
+    }
+    if !matches!(first_exit, FirstExit::Worker) {
+        worker_task.abort();
+        let _ = worker_task.await;
+    }
+    if !matches!(first_exit, FirstExit::Heartbeat) {
+        heartbeat_task.abort();
+        let _ = heartbeat_task.await;
+    }
+    if !matches!(first_exit, FirstExit::Writer) {
+        if fatal_triggered.load(Ordering::Acquire) {
+            let grace = ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT);
+            if tokio::time::timeout(grace, &mut writer_task).await.is_err() {
+                writer_task.abort();
+                let _ = writer_task.await;
             }
+        } else {
             writer_task.abort();
-        }
-        _ = &mut worker_task => {
-            reader_task.abort();
-            ordinary_queue.close();
-            heartbeat_slot.close();
-            heartbeat_task.abort();
-            if fatal_triggered.load(Ordering::Acquire) {
-                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
-            }
-            writer_task.abort();
-        }
-        _ = &mut heartbeat_task => {
-            reader_task.abort();
-            ordinary_queue.close();
-            worker_task.abort();
-            if fatal_triggered.load(Ordering::Acquire) {
-                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
-            }
-            writer_task.abort();
+            let _ = writer_task.await;
         }
     }
+    // Wait up to bounded grace for tracked child tasks (urgent E-stop/Stop, macro preflight, etc.),
+    // then abort any remaining and join EVERY handle before releasing the owner lease.
+    tasks.shutdown_and_join(WS_TEARDOWN_JOIN_TIMEOUT).await;
+
     if supervisor.owner_mode() == crate::supervisor::OWNER_LEGACY {
         supervisor.recorder_connection_closed(&connection).await;
-        let generation = connection_generation.load(Ordering::SeqCst);
+        // Take the owner lock FIRST and release whichever lease this connection currently holds.
         let mut inner = supervisor.inner().write().await;
-        if !inner.detached && generation != 0 && inner.release_lease(&connection, generation) {
+        if !inner.detached && inner.release_lease_for_connection(&connection) {
             inner.stop_motion();
         }
+        connection_generation.store(0, Ordering::SeqCst);
     }
 }
