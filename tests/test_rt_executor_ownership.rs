@@ -771,6 +771,10 @@ struct OrderRecordingCore {
     inner: SupervisorInner,
     log: Arc<Mutex<Vec<&'static str>>>,
     published: bool,
+    /// Shared broker handle polled INSIDE `publish()` so any terminal prematurely emitted
+    /// before publication fails inside the release itself.
+    broker: Option<Arc<Mutex<armd::rt_core::broker::Broker<PlanSlot>>>>,
+    replies_seen_during_publish: Vec<Reply>,
 }
 
 impl CoreOps for OrderRecordingCore {
@@ -837,6 +841,14 @@ impl CoreOps for OrderRecordingCore {
         self.published = true;
         self.log.lock().unwrap().push("publish");
         self.inner.publish(ts, gen);
+        // Sample the broker reply queue INSIDE Step 6 `publish()` (before Step 7 runs) so a
+        // reversed Step 7 -> Step 6 order is caught directly inside the release.
+        if let Some(ref broker) = self.broker {
+            broker.lock().unwrap().poll(|_, r| {
+                self.replies_seen_during_publish.push(r);
+                true
+            });
+        }
     }
     fn now_timestamp(&self) -> f64 {
         self.inner.now_timestamp()
@@ -859,9 +871,16 @@ fn exact_release_order_and_unconditional_checkpoints() {
     inner.lease_enabled = false;
     inner.tick(0.02);
 
-    let mut core = OrderRecordingCore { inner, log: log.clone(), published: false };
-    let (mut engine, mut broker, mut tw, stop) =
+    let (mut engine, broker, mut tw, stop) =
         ReleaseEngine::new(BootId(7), Capacities { commands: 4, plans: 2, replies: 8 });
+    let broker = Arc::new(Mutex::new(broker));
+    let mut core = OrderRecordingCore {
+        inner,
+        log: log.clone(),
+        published: false,
+        broker: Some(broker.clone()),
+        replies_seen_during_publish: Vec::new(),
+    };
     let log_hook = log.clone();
     engine.on_checkpoint(move |cp| {
         log_hook.lock().unwrap().push(match cp {
@@ -876,18 +895,23 @@ fn exact_release_order_and_unconditional_checkpoints() {
     let auth0 = core.authority(&engine.ctx(now));
 
     // Release 1: install a pending torque transition so Release 2 tests poll-boundary delivery before Step 3.
-    let req_tr = broker.submit(ClientId(1), 1, auth0, deadline, Submit::Transition(TransitionOp::TorqueOn)).unwrap();
+    let req_tr = broker
+        .lock()
+        .unwrap()
+        .submit(ClientId(1), 1, auth0, deadline, Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
     let r1 = engine.step(&mut core, || now, 0.02, now + Duration::from_millis(20), 1);
     assert!(r1.command.unwrap().1.is_ok(), "{r1:?}");
     // Unconditional BeforeTarget fired even with no target queued!
     assert!(log.lock().unwrap().contains(&"cp:BeforeTarget"));
-    broker.poll(|_, _| true);
+    broker.lock().unwrap().poll(|_, _| true);
 
     // Release 2: authorized stop at Step 1 + transition completes on Step 2 poll (arm becomes torqued!)
     // + 2 queued ordinary commands (at most 1 taken: short quintic finishing in 1 tick)
     // + 2 targets coalesced to 1 (consumed after BeforeTarget) + advance_output + publish + action_outcome.
     log.lock().unwrap().clear();
     core.published = false;
+    core.replies_seen_during_publish.clear();
     stop.request();
     let auth1 = Authority { stop_generation: stop.current(), ..core.authority(&engine.ctx(now)) };
     let start = core.inner.commanded_positions.clone();
@@ -895,9 +919,15 @@ fn exact_release_order_and_unconditional_checkpoints() {
     target_q[0] += 0.001;
     let prim = Primitive::joint_quintic(&start, &target_q, 0.01).unwrap();
     let req_install = broker
+        .lock()
+        .unwrap()
         .submit(ClientId(1), 2, auth1, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(prim)))
         .unwrap();
-    let req_imm = broker.submit(ClientId(1), 3, auth1, deadline, Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    let req_imm = broker
+        .lock()
+        .unwrap()
+        .submit(ClientId(1), 3, auth1, deadline, Submit::Immediate(ImmediateOp::Heartbeat))
+        .unwrap();
     let frame = |seq| TargetFrame {
         arm: ArmId::LOCAL,
         boot: BootId(7),
@@ -939,16 +969,35 @@ fn exact_release_order_and_unconditional_checkpoints() {
         ]
     );
 
-    // Step 3 install ack precedes Step 7 transition terminal (delivered strictly AFTER Step 6 publish)!
+    // Assert INSIDE the release (via `publish()` hook): Step 3's non-superseding `req_install` ACK
+    // was already queued by Step 6, while `req_tr`'s transition terminal was NOT emitted yet.
+    assert!(
+        matches!(
+            core.replies_seen_during_publish.as_slice(),
+            [Reply::Ack { request, .. }] if *request == req_install
+        ),
+        "transition terminal must NOT be delivered before/during Step 6 publish: {:?}",
+        core.replies_seen_during_publish
+    );
+    // Strictly AFTER Step 6 publish (in Step 7), `req_tr`'s transition terminal is delivered!
     let mut replies = Vec::new();
-    broker.poll(|_, r| {
+    broker.lock().unwrap().poll(|_, r| {
         replies.push(r);
         true
     });
-    assert!(matches!(replies[0], Reply::Ack { request, .. } if request == req_install), "{replies:?}");
-    assert!(matches!(replies[1], Reply::Terminal { request, outcome: Outcome::Completed, .. } if request == req_tr), "{replies:?}");
+    assert!(
+        matches!(
+            replies.as_slice(),
+            [Reply::Terminal { request, outcome: Outcome::Completed, .. }] if *request == req_tr
+        ),
+        "transition terminal must be emitted strictly after Step 6 publish: {replies:?}"
+    );
 
-    // Also verify sub-release `service_wake` publishes strictly BEFORE delivering a transition terminal!
+    // Also verify sub-release `service_wake` publishes strictly BEFORE delivering a transition terminal
+    // by polling `w_broker` directly INSIDE `wake_core::publish()`!
+    let (mut w_eng, w_broker, _w_tw, _w_stop) =
+        ReleaseEngine::new(BootId(8), Capacities { commands: 4, plans: 2, replies: 8 });
+    let w_broker = Arc::new(Mutex::new(w_broker));
     let mut wake_core = OrderRecordingCore {
         inner: {
             let mut i = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(StepConfirmDriver {
@@ -962,24 +1011,32 @@ fn exact_release_order_and_unconditional_checkpoints() {
         },
         log: Arc::new(Mutex::new(Vec::new())),
         published: false,
+        broker: Some(w_broker.clone()),
+        replies_seen_during_publish: Vec::new(),
     };
-    let (mut w_eng, mut w_broker, _w_tw, _w_stop) =
-        ReleaseEngine::new(BootId(8), Capacities { commands: 4, plans: 2, replies: 8 });
     let w_auth = wake_core.authority(&w_eng.ctx(now));
     let w_req = w_broker
+        .lock()
+        .unwrap()
         .submit(ClientId(1), 1, w_auth, deadline, Submit::Transition(TransitionOp::TorqueOn))
         .unwrap();
     let mut w_rep = w_eng.step(&mut wake_core, || now, 0.02, now + Duration::from_millis(20), 1);
     assert!(w_rep.command.unwrap().1.is_ok());
-    w_broker.poll(|_, _| true);
+    w_broker.lock().unwrap().poll(|_, _| true);
     wake_core.log.lock().unwrap().clear();
     wake_core.published = false;
+    wake_core.replies_seen_during_publish.clear();
     let wake_published = w_eng.service_wake(&mut wake_core, now, now + Duration::from_millis(20), 2, &mut w_rep);
     assert!(wake_published, "completing wake must publish updated state before terminal");
     assert!(wake_core.published);
     assert_eq!(*wake_core.log.lock().unwrap(), vec!["poll_transition_wake", "publish"]);
+    assert!(
+        wake_core.replies_seen_during_publish.is_empty(),
+        "service_wake transition terminal must NOT be emitted before publish(): {:?}",
+        wake_core.replies_seen_during_publish
+    );
     let mut wake_replies = Vec::new();
-    w_broker.poll(|_, r| {
+    w_broker.lock().unwrap().poll(|_, r| {
         wake_replies.push(r);
         true
     });
@@ -996,6 +1053,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
     for step_idx in 3..=6 {
         log.lock().unwrap().clear();
         core.published = false;
+        core.replies_seen_during_publish.clear();
         let r = engine.step(&mut core, || now, 0.1, now + Duration::from_millis(20), step_idx);
         if step_idx == 3 {
             r3_cmd = r.command.map(|(req, _)| req);
@@ -1009,7 +1067,7 @@ fn exact_release_order_and_unconditional_checkpoints() {
     assert_eq!(r3_cmd, Some(req_imm), "second queued command must be taken on Release 3");
     assert!(matches!(install_ended, Some((_, Outcome::Completed))), "install must finish Completed: {install_ended:?}");
     replies.clear();
-    broker.poll(|_, r| {
+    broker.lock().unwrap().poll(|_, r| {
         replies.push(r);
         true
     });
@@ -1205,6 +1263,7 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
     // and NOT collapse the release `dt` spanning that wake!
     let wakes_before = handle.stats().wakes.load(Ordering::Relaxed);
     let steps_before_wake = handle.stats().steps.load(Ordering::Relaxed);
+    let samples_before_wake = sup.tick_samples().len();
     let req = submit_broker_transition(&handle, 1, TransitionOp::TorqueOn);
     assert_eq!(wait_broker_terminal(&handle, req, Duration::from_secs(2)), Outcome::Completed);
     let wakes_after = handle.stats().wakes.load(Ordering::Relaxed);
@@ -1213,19 +1272,25 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
         "expected a genuine sub-release wake (wakes {wakes_before} -> {wakes_after})"
     );
     let steps_at_terminal = handle.stats().steps.load(Ordering::Relaxed);
+    let target_steps = steps_at_terminal + 2;
+    let min_wake_samples = (target_steps.saturating_sub(steps_before_wake) as usize).max(2);
     wait_until_async(Duration::from_secs(1), || {
-        handle.stats().steps.load(Ordering::Relaxed) >= steps_at_terminal + 2
+        handle.stats().steps.load(Ordering::Relaxed) >= target_steps
+            && sup.tick_samples().len() >= samples_before_wake + min_wake_samples
     })
     .await;
-    // Inspect the exact release interval spanning the wake (plus surrounding releases).
-    let span_count = (handle.stats().steps.load(Ordering::Relaxed) - steps_before_wake) as usize;
-    let recent: Vec<u32> = sup
-        .tick_samples()
-        .into_iter()
-        .rev()
-        .take(span_count.clamp(2, 6))
+    // Slice the exact non-empty diagnostic window produced strictly across the injected wake.
+    let all_samples = sup.tick_samples();
+    let recent: Vec<u32> = all_samples[samples_before_wake..]
+        .iter()
         .map(|s| s.period_us)
         .collect();
+    assert!(
+        recent.len() >= min_wake_samples,
+        "wake diagnostic window must be non-empty and cover the injected wake (got {} < {}): {recent:?}",
+        recent.len(),
+        min_wake_samples
+    );
     assert!(
         recent.iter().all(|&p| p >= 7_000),
         "sub-release wake reset release dt below ~10ms period: {recent:?}"
@@ -1499,8 +1564,53 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
     assert!(sup_dm.request_shutdown().await.unwrap());
     h_dm.shutdown_and_join().unwrap();
 
-    // (c) Mock watchdog park parity: arm with short lease parks and unloads on lease expiry under Executor.
-    let sup_wd = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 40, ..ArmConfig::rebot_dm() }));
+    // (c) Mock watchdog park parity: start BOTH Legacy and Executor from a genuinely moved pose
+    // away from resting, verify both actively move along the park trajectory while torqued (never
+    // immediately disabling at the start pose), and compare their final resting pose & state!
+    let wd_cfg = ArmConfig { lease_timeout_ms: 40, ..ArmConfig::rebot_dm() };
+    let resting = wd_cfg.resting_positions().to_vec();
+    let max_dist = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    };
+    assert!(
+        max_dist(&INSPECT, &resting) > 0.5,
+        "watchdog park test must start from a moved pose far from resting: start={INSPECT:?}, resting={resting:?}"
+    );
+
+    // Reference Legacy watchdog park trace from the moved pose.
+    let sup_wd_leg = Arc::new(ArmSupervisor::new(wd_cfg.clone()));
+    {
+        let mut inner = sup_wd_leg.inner().write().await;
+        inner.lease_enabled = true;
+        inner.acquire_lease("wd-client").unwrap();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.set_torque(true).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let mut saw_motion_leg = false;
+    let mut final_leg = None;
+    for _ in 0..400 {
+        let obs = sup_wd_leg.tick(0.02).await;
+        if obs.is_torqued && max_dist(&obs.positions, &INSPECT) > 0.1 {
+            saw_motion_leg = true;
+        }
+        if !obs.is_torqued && obs.safety_state == SafetyState::Idle {
+            final_leg = Some(obs);
+            break;
+        }
+    }
+    let final_leg = final_leg.expect("legacy watchdog park did not complete");
+    assert!(saw_motion_leg, "legacy watchdog park must move away from start pose while torqued");
+    assert!(
+        max_dist(&final_leg.positions, &resting) < 0.02,
+        "legacy watchdog park did not reach resting pose: got={:?}, resting={resting:?}",
+        final_leg.positions
+    );
+
+    // Executor watchdog park trace from the exact same moved pose.
+    let sup_wd = Arc::new(ArmSupervisor::new(wd_cfg));
     {
         let mut inner = sup_wd.inner().write().await;
         inner.lease_enabled = true;
@@ -1514,19 +1624,37 @@ async fn parity_sim_udp_loopback_and_damiao_and_router_allowlist() {
         .start_executor(ExecutorConfig::for_tests(Duration::from_millis(10)))
         .await
         .unwrap();
-    // Wait until watchdog park finishes unloading torque (is_torqued -> false).
     let wd_deadline = Instant::now() + Duration::from_secs(8);
+    let mut saw_motion_exec = false;
     let mut last_obs = None;
-    loop {
+    let final_exec = loop {
         if let Ok(obs) = sup_wd.observation().await {
+            if obs.is_torqued && max_dist(&obs.positions, &INSPECT) > 0.1 {
+                saw_motion_exec = true;
+            }
             if !obs.is_torqued && obs.safety_state == SafetyState::Idle {
-                break;
+                break obs;
             }
             last_obs = Some((obs.is_torqued, obs.safety_state, obs.positions));
         }
         assert!(Instant::now() < wd_deadline, "watchdog park did not complete under executor; last_obs={last_obs:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(
+        saw_motion_exec,
+        "executor watchdog park disabled without moving along park trajectory from start pose"
+    );
+    assert!(
+        max_dist(&final_exec.positions, &resting) < 0.02,
+        "executor watchdog park did not reach resting pose: got={:?}, resting={resting:?}",
+        final_exec.positions
+    );
+    assert!(
+        max_dist(&final_exec.positions, &final_leg.positions) < 0.02,
+        "executor watchdog park diverged from legacy trace: exec={:?}, legacy={:?}",
+        final_exec.positions,
+        final_leg.positions
+    );
 
     // (d) Router middleware allowlist check in `OWNER_EXECUTOR`.
     let app = create_router_with_auth(sup_wd.clone(), OperatorAuth::disabled());
