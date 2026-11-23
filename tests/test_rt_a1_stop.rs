@@ -1218,3 +1218,102 @@ async fn estop_burst_beyond_urgent_capacity_still_latches_and_delivers_all_repli
     let extra = ws_reply(&mut ws, json!({"type": "estop"}), &["epoch_sync", "estop_reject"]).await;
     assert_eq!((extra["type"].as_str(), extra["safety_state"].as_str()), (Some("epoch_sync"), Some("EStop")), "{extra}");
 }
+
+// 14. Round 3 Item 4 (Major): writer delivers lease_granted strictly before a preemption
+//     lease_lost of the same generation, and never skips action terminals under latest-wins telemetry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_delivers_lease_grant_before_preemption_loss_and_never_skips_action_terminals() {
+    // (a) Grant-before-loss causal order: pause Client 1's writer, grant gen 2 on ordinary queue,
+    //     preempt gen 2 from Client 2 onto urgent revocation queue -> Client 1 receives grant THEN loss!
+    let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws1, gen1) = controller(addr).await;
+    let conn1 = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard1 = WriteHookGuard(conn1.clone());
+    // Release gen 1 cleanly so gen 2 can be acquired while Client 1's writer is paused.
+    let rel = ws_reply(&mut ws1, json!({"type": "release_lease", "generation": gen1}), &["lease_released"]).await;
+    assert_eq!(rel["success"], true);
+
+    armd::api::ws::set_test_ws_write_paused(&conn1, true);
+    send(&mut ws1, json!({"type": "auth", "seq": 1, "token": null})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn1) >= 1).await;
+
+    // Client 1 acquires gen 2 (reply waits in ordinary_out_tx behind the blocked write).
+    send(&mut ws1, json!({"type": "acquire_lease", "client_id": "c1", "seq": 2})).await;
+    wait_until(Duration::from_secs(1), || {
+        sup.inner().try_read().is_ok_and(|g| g.active_lease.as_ref().is_some_and(|l| l.client_id == conn1 && l.generation > gen1))
+    }).await;
+    let gen2 = sup.inner().read().await.active_lease.as_ref().unwrap().generation;
+
+    // Client 2 force-preempts gen 2 (pushes lease_lost(gen2, preempted) onto Client 1's URGENT revocation_tx).
+    let (mut ws2, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    let g3 = ws_reply(&mut ws2, json!({"type": "acquire_lease", "client_id": "c2", "seq": 1, "force": true}), &["lease_granted"]).await;
+    assert!(g3["generation"].as_u64().unwrap() > gen2);
+
+    // Unpause Client 1's writer: lease_granted(gen2) MUST precede lease_lost(gen2, preempted).
+    armd::api::ws::set_test_ws_write_paused(&conn1, false);
+    let m1 = next_of(&mut ws1, &["lease_granted", "lease_lost"]).await;
+    let m2 = next_of(&mut ws1, &["lease_granted", "lease_lost"]).await;
+    assert_eq!((m1["type"].as_str(), m1["generation"].as_u64()), (Some("lease_granted"), Some(gen2)), "grant must precede loss: m1={m1}, m2={m2}");
+    assert_eq!((m2["type"].as_str(), m2["generation"].as_u64(), m2["reason"].as_str()), (Some("lease_lost"), Some(gen2), Some("preempted")), "loss must follow grant: m1={m1}, m2={m2}");
+
+    // (b) Action terminals are never skipped by latest-wins telemetry (even with `?obs_hz=1` decimation).
+    let (addr_t, sup_t) = spawn_server(ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() }).await;
+    let (mut ws_t, _) = connect_async(format!("ws://{addr_t}/api/v1/ws?obs_hz=1")).await.unwrap();
+    let g = ws_reply(&mut ws_t, json!({"type": "acquire_lease", "client_id": "term", "seq": 1}), &["lease_granted"]).await;
+    let gen_t = g["generation"].as_u64().unwrap();
+    let conn_t = sup_t.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard_t = WriteHookGuard(conn_t.clone());
+    let ep_t = sup_t.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws_t, gen_t, ep_t, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+
+    // Stall writer on a control reply first, then emit 3 rapid actions and confirm the dispatcher
+    // forwarded all 3 observations into the broadcast channel before unpausing the writer.
+    let mut rx_probe = sup_t.subscribe_telemetry().unwrap();
+    armd::api::ws::set_test_ws_write_paused(&conn_t, true);
+    send(&mut ws_t, json!({"type": "auth", "seq": 99, "token": null})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn_t) >= 1).await;
+
+    let (id1, id2, id3) = {
+        let mut inner = sup_t.inner().write().await;
+        let id1 = inner.begin_action("move_1", None);
+        inner.finish_action(id1, "done", None, None, None, None, None);
+        drop(inner);
+        sup_t.tick(0.02).await;
+        let o1 = tokio::time::timeout(Duration::from_secs(1), rx_probe.recv()).await.unwrap().unwrap();
+        assert_eq!(o1.action.as_ref().map(|a| (a.id, a.state.as_str())), Some((id1, "done")));
+
+        let mut inner = sup_t.inner().write().await;
+        let id2 = inner.begin_action("move_2", None);
+        let id3 = inner.begin_action("move_3", None); // supersedes id2 -> id2 becomes previous_action, id1 dropped from latest obs!
+        drop(inner);
+        sup_t.tick(0.02).await;
+        let o2 = tokio::time::timeout(Duration::from_secs(1), rx_probe.recv()).await.unwrap().unwrap();
+        assert_eq!(o2.previous_action.as_ref().map(|a| (a.id, a.state.as_str())), Some((id2, "cancelled")));
+
+        sup_t.tick(0.02).await;
+        let _o3 = tokio::time::timeout(Duration::from_secs(1), rx_probe.recv()).await.unwrap().unwrap();
+        (id1, id2, id3)
+    };
+    armd::api::ws::set_test_ws_write_paused(&conn_t, false);
+
+    // Client MUST observe terminals for BOTH id1 (done) and id2 (cancelled/SUPERSEDED), plus id3.
+    let mut saw_id1_done = false;
+    let mut saw_id2_superseded = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && (!saw_id1_done || !saw_id2_superseded) {
+        use futures_util::StreamExt;
+        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) =
+            tokio::time::timeout(Duration::from_millis(200), ws_t.next()).await
+        {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                for a in [v.get("action"), v.get("previous_action")].into_iter().flatten() {
+                    if a["id"].as_u64() == Some(id1) && a["state"].as_str() == Some("done") { saw_id1_done = true; }
+                    if a["id"].as_u64() == Some(id2) && a["state"].as_str() == Some("cancelled") && a["code"].as_str() == Some("SUPERSEDED") {
+                        saw_id2_superseded = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_id1_done && saw_id2_superseded, "action terminal skipped (id1={id1} done={saw_id1_done}, id2={id2} sup={saw_id2_superseded}, id3={id3})");
+}

@@ -503,6 +503,42 @@ fn enforce_monotonic_epoch(last_wire_epoch: &mut Option<(u64, Option<Value>)>, r
     }
 }
 
+fn extract_lease_loss_gen(msg: &Message) -> Option<u64> {
+    let Message::Text(t) = msg else { return None; };
+    let v: Value = serde_json::from_str(t).ok()?;
+    if v.get("type").and_then(Value::as_str) == Some("lease_lost") {
+        v.get("generation").and_then(Value::as_u64)
+    } else {
+        None
+    }
+}
+
+struct ActionTerminalTracker {
+    seen: VecDeque<u64>,
+}
+
+impl ActionTerminalTracker {
+    fn new() -> Self {
+        Self { seen: VecDeque::with_capacity(64) }
+    }
+
+    /// Returns `true` when `obs` carries a terminal (`!is_running()`) action in `action` or
+    /// `previous_action` whose ID has not yet been emitted on this connection.
+    fn record_unseen_terminals(&mut self, obs: &crate::model::ArmObservation) -> bool {
+        let mut found = false;
+        for act in [obs.previous_action.as_ref(), obs.action.as_ref()].into_iter().flatten() {
+            if !act.is_running() && !self.seen.contains(&act.id) {
+                if self.seen.len() >= 64 {
+                    self.seen.pop_front();
+                }
+                self.seen.push_back(act.id);
+                found = true;
+            }
+        }
+        found
+    }
+}
+
 async fn write_ws_frame(
     connection_id: &str,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -1200,18 +1236,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     let _conn_guard = ConnectionGuard(connection.clone());
 
-    // Task 3: Writer task with urgent-first priority, monotonic wire epoch guard,
-    // latest-wins telemetry, explicit error close on control queue saturation, and bounded write timeout.
+    // Task 3: Writer task with urgent-first priority, causal grant-before-loss ordering, monotonic
+    // wire epoch guard, action-terminal preservation (never skipped by latest-wins telemetry),
+    // explicit error close on control queue saturation, and bounded write timeout.
     let writer_connection = connection.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut last_sent: Option<f64> = None;
         let mut last_wire_epoch: Option<(u64, Option<Value>)> = None;
+        let mut max_granted_gen: u64 = 0;
+        let mut deferred_losses: VecDeque<(u64, Message)> = VecDeque::new();
+        let mut terminal_tracker = ActionTerminalTracker::new();
+        let mut pending_terminals: VecDeque<crate::model::ArmObservation> = VecDeque::new();
+        let mut pending_latest_telemetry: Option<crate::model::ArmObservation> = None;
         loop {
             tokio::select! {
                 biased;
                 msg = revocation_rx.recv() => match msg {
                     Some(msg) => {
-                        if write_ws_frame(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        if let Some(loss_gen) = extract_lease_loss_gen(&msg).filter(|&g| g > max_granted_gen) {
+                            // Causal order: hold a preemption loss until its lease_granted is written.
+                            deferred_losses.push_back((loss_gen, msg));
+                        } else if write_ws_frame(&writer_connection, &mut sender, msg, ws_write_timeout(&writer_connection)).await.is_err() {
+                            break;
+                        }
                     }
                     None => break,
                 },
@@ -1240,26 +1287,80 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 reply = ordinary_out_rx.recv() => match reply {
                     Some(mut val) => {
+                        let granted_gen = if val.get("type").and_then(Value::as_str) == Some("lease_granted") {
+                            val.get("generation").and_then(Value::as_u64)
+                        } else {
+                            None
+                        };
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
                         if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        if let Some(g) = granted_gen {
+                            max_granted_gen = max_granted_gen.max(g);
+                            let mut write_failed = false;
+                            let n = deferred_losses.len();
+                            for _ in 0..n {
+                                if let Some((lg, lmsg)) = deferred_losses.pop_front() {
+                                    if lg <= max_granted_gen {
+                                        if write_ws_frame(&writer_connection, &mut sender, lmsg, ws_write_timeout(&writer_connection)).await.is_err() {
+                                            write_failed = true;
+                                            break;
+                                        }
+                                    } else {
+                                        deferred_losses.push_back((lg, lmsg));
+                                    }
+                                }
+                            }
+                            if write_failed { break; }
+                        }
                     }
                     None => break,
                 },
-                observation = telemetry.recv() => match observation {
-                    Ok(mut obs) => {
-                        loop {
-                            match telemetry.try_recv() {
-                                Ok(newer) => obs = newer,
-                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-                                Err(_) => break,
-                            }
+                _ = std::future::ready(()), if !pending_terminals.is_empty() => {
+                    if let Some(obs) = pending_terminals.pop_front() {
+                        if let Ok(text) = serde_json::to_string(&obs) {
+                            if write_ws_frame(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                         }
+                    }
+                },
+                _ = std::future::ready(()), if pending_latest_telemetry.is_some() => {
+                    if let Some(obs) = pending_latest_telemetry.take() {
                         if let Some(rate) = obs_rate {
                             if !rate.due(last_sent, obs.timestamp) { continue; }
                             last_sent = Some(obs.timestamp);
                         }
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if write_ws_frame(&writer_connection, &mut sender, Message::Text(text.into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                        }
+                    }
+                },
+                observation = telemetry.recv() => match observation {
+                    Ok(first) => {
+                        let mut classify = |obs: crate::model::ArmObservation| -> bool {
+                            if terminal_tracker.record_unseen_terminals(&obs) {
+                                if pending_terminals.len() >= ORDINARY_OUT_CAPACITY {
+                                    return true;
+                                }
+                                pending_terminals.push_back(obs);
+                                pending_latest_telemetry = None;
+                            } else {
+                                pending_latest_telemetry = Some(obs);
+                            }
+                            false
+                        };
+                        let mut overflowed = classify(first);
+                        while !overflowed {
+                            match telemetry.try_recv() {
+                                Ok(newer) => overflowed = classify(newer),
+                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                        if overflowed {
+                            let fatal = FatalClose::outbound_queue_full();
+                            let flush_timeout = ws_write_timeout(&writer_connection).min(WS_FATAL_FLUSH_TIMEOUT);
+                            let _ = write_ws_frame(&writer_connection, &mut sender, Message::Text(fatal.error_value().to_string().into()), flush_timeout).await;
+                            let _ = write_ws_frame(&writer_connection, &mut sender, Message::Close(Some(fatal.close_frame())), flush_timeout).await;
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
