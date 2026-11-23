@@ -10,9 +10,13 @@ use serde_json::Value;
 use crate::api::sandbox::validate_pack_id;
 use crate::model::{ArmConfig, JointLimit, PolicyObservation};
 use crate::motion::MotionError;
+use crate::safety::SafetyState;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
-use super::manifest::{PolicySnapshot, StrictPolicyContract, VideoEmbeddingSpec, VisionStalePolicy};
+use super::manifest::{
+    validate_chunking_horizon, PolicySnapshot, StrictPolicyContract, VideoEmbeddingSpec,
+    VisionStalePolicy,
+};
 use super::release_gate::VerifiedReleaseGate;
 use super::units::{
     denormalize_action_into, normalize_state_into, policy_units_to_rad, rad_to_policy_units,
@@ -53,6 +57,17 @@ pub fn max_policy_input_age_ms(fps: f64) -> u64 {
         return MAX_POLICY_INPUT_AGE_MS;
     }
     ((2000.0 / fps).round() as u64).clamp(MIN_POLICY_INPUT_AGE_MS, MAX_POLICY_INPUT_AGE_MS)
+}
+
+/// Largest age (ms) of the source observation behind a cached action-chunk entry:
+/// `max_policy_input_age_ms(fps) + replan_every * period_ms`.
+pub fn max_cached_chunk_source_age_ms(fps: f64, replan_every: usize) -> u64 {
+    let base = max_policy_input_age_ms(fps);
+    if !fps.is_finite() || fps <= 0.0 {
+        return base;
+    }
+    let horizon_ms = ((replan_every as f64) * (1000.0 / fps)).round().max(0.0) as u64;
+    base.saturating_add(horizon_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,11 +448,81 @@ impl From<PolicyError> for ArmError {
     }
 }
 
-/// Preallocated circular buffer of future action-chunk slots.
+/// Fixed-size provenance metadata for the observation that produced an inferred action chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkSource {
+    /// Monotonic instant when the joint observation was sampled.
+    pub joint_captured_at: Instant,
+    /// Driver-reported joint feedback age (ms) at `joint_captured_at`, when available.
+    pub joint_base_age_ms: Option<u64>,
+    /// Monotonic instant when the detector vision frame was captured, if any.
+    pub vision_captured_at: Option<Instant>,
+    /// Detector vision model generation locked at inference time, if any.
+    pub vision_generation: Option<u64>,
+    /// Whether a valid detector target was present at inference (`false` on `ZeroFeatures`).
+    pub vision_target_present: Option<bool>,
+    /// Video-embedding inference ticket captured for this chunk, if any.
+    pub embedding_ticket: Option<InferenceTicket>,
+}
+
+impl ChunkSource {
+    pub fn from_joint(joint_captured_at: Instant, joint_base_age_ms: Option<u64>) -> Self {
+        Self {
+            joint_captured_at,
+            joint_base_age_ms,
+            vision_captured_at: None,
+            vision_generation: None,
+            vision_target_present: None,
+            embedding_ticket: None,
+        }
+    }
+
+    pub fn joint_age_ms(&self, now: Instant) -> u64 {
+        let elapsed = now
+            .saturating_duration_since(self.joint_captured_at)
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.joint_base_age_ms.unwrap_or(0).saturating_add(elapsed)
+    }
+
+    pub fn vision_age_ms(&self, now: Instant) -> Option<u64> {
+        self.vision_captured_at.map(|t| {
+            now.saturating_duration_since(t)
+                .as_millis()
+                .min(u64::MAX as u128) as u64
+        })
+    }
+}
+
+/// Execution-state snapshot used to clear the action-chunk ring on stop/E-stop,
+/// fault, lease change/revocation, epoch change, or shadow↔live mode switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkRunContext {
+    pub mode: PolicyMode,
+    pub epoch_id: u64,
+    pub lease_generation: Option<u64>,
+    pub active_ok: bool,
+}
+
+/// Freshness and ticket-validity bounds enforced against cached chunk provenance before
+/// executing a cached action.
+#[derive(Debug, Clone)]
+pub struct ChunkFreshnessLimits {
+    pub now: Instant,
+    pub max_source_joint_age_ms: u64,
+    pub max_source_vision_age_ms: Option<u64>,
+    pub horizon_ms: u64,
+    pub vision_generation: Option<u64>,
+    pub vision_target_present: Option<bool>,
+    pub live_ticket_ctx: Option<TicketVerificationContext>,
+}
+
+/// Preallocated circular buffer of future action-chunk slots and fixed-storage provenance.
 ///
 /// Allocates `chunk_size` slots × up to `chunk_size` overlapping predictions × `action_dim`
-/// floats once in [`ChunkRing::new`] (`PreparedPolicy::from_backend`). No heap allocations
-/// occur while pushing chunks, discarding skipped periods, or popping the current action.
+/// floats (plus fixed-size provenance tables) once in [`ChunkRing::new`]
+/// (`PreparedPolicy::from_backend`). No heap allocations occur while pushing chunks,
+/// pruning stale/invalidated provenance, discarding skipped periods, or popping actions.
 struct ChunkRing {
     chunk_size: usize,
     max_preds: usize,
@@ -448,6 +533,11 @@ struct ChunkRing {
     counts: Vec<usize>,
     /// Flat storage laid out as `[physical_slot][pred_idx][dim]`.
     data: Vec<f32>,
+    /// Fixed-capacity ring of source metadata for at most `max_preds` concurrently active chunks.
+    sources: Vec<Option<ChunkSource>>,
+    next_source_slot: usize,
+    /// Parallel index into `sources` laid out as `[physical_slot][pred_idx]`.
+    source_ids: Vec<usize>,
 }
 
 impl ChunkRing {
@@ -461,6 +551,9 @@ impl ChunkRing {
                 len: 0,
                 counts: Vec::new(),
                 data: Vec::new(),
+                sources: Vec::new(),
+                next_source_slot: 0,
+                source_ids: Vec::new(),
             };
         }
         let max_preds = if temporal_ensemble { chunk_size } else { 1 };
@@ -472,6 +565,9 @@ impl ChunkRing {
             len: 0,
             counts: vec![0; chunk_size],
             data: vec![0.0; chunk_size * max_preds * action_dim],
+            sources: vec![None; max_preds],
+            next_source_slot: 0,
+            source_ids: vec![0; chunk_size * max_preds],
         }
     }
 
@@ -492,8 +588,13 @@ impl ChunkRing {
     }
 
     #[inline]
+    fn pred_slot(&self, phys: usize, pred_idx: usize) -> usize {
+        phys * self.max_preds + pred_idx
+    }
+
+    #[inline]
     fn pred_offset(&self, phys: usize, pred_idx: usize) -> usize {
-        (phys * self.max_preds + pred_idx) * self.action_dim
+        self.pred_slot(phys, pred_idx) * self.action_dim
     }
 
     fn clear(&mut self) {
@@ -501,8 +602,10 @@ impl ChunkRing {
             let phys = self.phys_slot(offset);
             self.counts[phys] = 0;
         }
+        self.sources.fill(None);
         self.head = 0;
         self.len = 0;
+        self.next_source_slot = 0;
     }
 
     fn discard_front(&mut self, count: usize) {
@@ -514,11 +617,122 @@ impl ChunkRing {
         }
     }
 
-    fn push_chunk(&mut self, flat_chunk: &[f32], clear_existing: bool) {
+    /// Enforce source provenance invalidation and freshness limits across cached predictions.
+    ///
+    /// - Any hard invalidation (revoked/mismatched embedding ticket identity or invalidation
+    ///   generation, detector model-generation mismatch, or detector target lost/replaced)
+    ///   clears the entire ring immediately.
+    /// - Any prediction whose source observation exceeded `max_source_joint_age_ms`,
+    ///   `max_source_vision_age_ms`, or its embedding window horizon is dropped in place;
+    ///   if the front slot loses all predictions, the whole ring is cleared to force a replan.
+    fn prune_invalid_or_stale(&mut self, limits: &ChunkFreshnessLimits) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        // Pass 1: hard invalidation clears the entire ring.
+        for offset in 0..self.len {
+            let phys = self.phys_slot(offset);
+            let count = self.counts[phys];
+            for pred_idx in 0..count {
+                let src_id = self.source_ids[self.pred_slot(phys, pred_idx)];
+                let Some(src) = self.sources[src_id] else {
+                    self.clear();
+                    return true;
+                };
+                if limits.vision_generation.is_some()
+                    && src.vision_generation != limits.vision_generation
+                {
+                    self.clear();
+                    return true;
+                }
+                if limits.vision_target_present.is_some()
+                    && src.vision_target_present != limits.vision_target_present
+                {
+                    self.clear();
+                    return true;
+                }
+                if let (Some(ticket), Some(live_ctx)) =
+                    (src.embedding_ticket, limits.live_ticket_ctx.as_ref())
+                {
+                    if let Err(v) = ticket.verify_identity_and_horizon(live_ctx, limits.horizon_ms)
+                    {
+                        if !matches!(
+                            v,
+                            TicketViolation::WindowNewestExpired { .. }
+                                | TicketViolation::WindowOldestExpired { .. }
+                        ) {
+                            self.clear();
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: drop predictions whose source observation age exceeded the freshness limit.
+        let dim = self.action_dim;
+        let mut dropped_any = false;
+        for offset in 0..self.len {
+            let phys = self.phys_slot(offset);
+            let count = self.counts[phys];
+            let mut write_idx = 0usize;
+            for read_idx in 0..count {
+                let src_id = self.source_ids[self.pred_slot(phys, read_idx)];
+                let fresh = self.sources[src_id].is_some_and(|src| {
+                    if src.joint_age_ms(limits.now) > limits.max_source_joint_age_ms {
+                        return false;
+                    }
+                    if let Some(max_v) = limits.max_source_vision_age_ms {
+                        if src.vision_age_ms(limits.now).is_some_and(|age| age > max_v) {
+                            return false;
+                        }
+                    }
+                    if let (Some(ticket), Some(live_ctx)) =
+                        (src.embedding_ticket, limits.live_ticket_ctx.as_ref())
+                    {
+                        if ticket
+                            .verify_identity_and_horizon(live_ctx, limits.horizon_ms)
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                if fresh {
+                    if write_idx != read_idx {
+                        let src_off = self.pred_offset(phys, read_idx);
+                        let dst_off = self.pred_offset(phys, write_idx);
+                        self.data.copy_within(src_off..src_off + dim, dst_off);
+                        let dst_slot = self.pred_slot(phys, write_idx);
+                        self.source_ids[dst_slot] = src_id;
+                    }
+                    write_idx += 1;
+                } else {
+                    dropped_any = true;
+                }
+            }
+            self.counts[phys] = write_idx;
+        }
+
+        if self.counts[self.head] == 0 {
+            self.clear();
+            return true;
+        }
+        while self.len > 0 && self.counts[self.phys_slot(self.len - 1)] == 0 {
+            self.len -= 1;
+        }
+        dropped_any
+    }
+
+    fn push_chunk(&mut self, flat_chunk: &[f32], source: ChunkSource, clear_existing: bool) {
         debug_assert_eq!(flat_chunk.len(), self.chunk_size * self.action_dim);
         if clear_existing {
             self.clear();
         }
+        let src_slot = self.next_source_slot;
+        self.sources[src_slot] = Some(source);
+        self.next_source_slot = (self.next_source_slot + 1) % self.max_preds;
         for offset in 0..self.chunk_size {
             let phys = self.phys_slot(offset);
             if offset >= self.len {
@@ -531,6 +745,8 @@ impl ChunkRing {
                 let src_off = offset * self.action_dim;
                 self.data[dst_off..dst_off + self.action_dim]
                     .copy_from_slice(&flat_chunk[src_off..src_off + self.action_dim]);
+                let p_slot = self.pred_slot(phys, pred_idx);
+                self.source_ids[p_slot] = src_slot;
                 self.counts[phys] = pred_idx + 1;
             }
         }
@@ -541,7 +757,9 @@ impl ChunkRing {
         &mut self,
         temporal_ensemble_k: Option<f32>,
         out: &mut [f32],
+        used_sources: &mut Vec<ChunkSource>,
     ) -> Result<(), PolicyError> {
+        used_sources.clear();
         if self.len == 0 {
             return Err(PolicyError::InferenceFailed(
                 "action chunk buffer unexpectedly empty".into(),
@@ -567,6 +785,10 @@ impl ChunkRing {
                 for (dst, &src) in out.iter_mut().zip(pred.iter()) {
                     *dst += w * src;
                 }
+                let src_id = self.source_ids[self.pred_slot(phys, age_idx)];
+                if let Some(src) = self.sources[src_id] {
+                    used_sources.push(src);
+                }
             }
             if w_sum > 0.0 {
                 for v in out.iter_mut() {
@@ -574,8 +796,13 @@ impl ChunkRing {
                 }
             }
         } else {
-            let off = self.pred_offset(phys, count - 1);
+            let last_idx = count - 1;
+            let off = self.pred_offset(phys, last_idx);
             out.copy_from_slice(&self.data[off..off + dim]);
+            let src_id = self.source_ids[self.pred_slot(phys, last_idx)];
+            if let Some(src) = self.sources[src_id] {
+                used_sources.push(src);
+            }
         }
         self.counts[phys] = 0;
         self.head = (self.head + 1) % self.chunk_size;
@@ -584,12 +811,16 @@ impl ChunkRing {
     }
 
     #[cfg(test)]
-    fn storage_snapshot(&self) -> (usize, usize, usize, usize) {
+    fn storage_snapshot(&self) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
         (
             self.counts.capacity(),
             self.counts.as_ptr() as usize,
             self.data.capacity(),
             self.data.as_ptr() as usize,
+            self.sources.capacity(),
+            self.sources.as_ptr() as usize,
+            self.source_ids.capacity(),
+            self.source_ids.as_ptr() as usize,
         )
     }
 }
@@ -611,6 +842,8 @@ pub struct PreparedPolicy {
     arm_target_rad: Vec<f32>,
     periods_since_replan: usize,
     chunk_ring: ChunkRing,
+    last_step_sources: Vec<ChunkSource>,
+    last_run_ctx: Option<ChunkRunContext>,
 }
 
 impl PreparedPolicy {
@@ -664,6 +897,7 @@ impl PreparedPolicy {
             dim,
             contract.chunking.temporal_ensemble_k.is_some(),
         );
+        let last_step_sources = Vec::with_capacity(chunk_ring.max_preds);
         Ok(Self {
             snapshot,
             contract,
@@ -680,6 +914,8 @@ impl PreparedPolicy {
             arm_target_rad: vec![0.0; dim],
             periods_since_replan: 0,
             chunk_ring,
+            last_step_sources,
+            last_run_ctx: None,
         })
     }
 
@@ -693,6 +929,52 @@ impl PreparedPolicy {
 
     pub fn contract(&self) -> &StrictPolicyContract {
         &self.contract
+    }
+
+    /// Drop all cached action-chunk predictions and source metadata, forcing a fresh
+    /// inference on the next step.
+    pub fn clear_chunk_buffer(&mut self) {
+        self.chunk_ring.clear();
+        self.periods_since_replan = 0;
+        self.last_step_sources.clear();
+    }
+
+    /// Number of future control periods currently buffered in the chunk ring.
+    pub fn chunk_buffer_len(&self) -> usize {
+        self.chunk_ring.len()
+    }
+
+    /// Provenance records of the chunk(s) that contributed to the most recently emitted action.
+    pub fn last_step_sources(&self) -> &[ChunkSource] {
+        &self.last_step_sources
+    }
+
+    /// Clear the whole chunk ring on stop/E-stop, fault, lease change or revocation,
+    /// epoch change, or shadow↔live mode switch. Returns `true` if cleared.
+    pub fn sync_run_context(&mut self, ctx: ChunkRunContext) -> bool {
+        let must_clear = !ctx.active_ok
+            || ctx.lease_generation.is_none()
+            || self.last_run_ctx.is_some_and(|prev| {
+                prev.mode != ctx.mode
+                    || prev.epoch_id != ctx.epoch_id
+                    || prev.lease_generation != ctx.lease_generation
+            });
+        self.last_run_ctx = Some(ctx);
+        if must_clear {
+            self.clear_chunk_buffer();
+            return true;
+        }
+        false
+    }
+
+    /// Prune expired or invalidated cached chunks against `limits`. Returns `true` if any
+    /// cached prediction or the whole ring was dropped.
+    pub fn prune_chunk_buffer(&mut self, limits: &ChunkFreshnessLimits) -> bool {
+        let dropped = self.chunk_ring.prune_invalid_or_stale(limits);
+        if self.chunk_ring.is_empty() {
+            self.periods_since_replan = 0;
+        }
+        dropped
     }
 
     /// Test hook: every inference sleeps `delay` first (see
@@ -773,6 +1055,20 @@ impl PreparedPolicy {
         vision_features: Option<&[f32]>,
         periods_elapsed: u32,
     ) -> Result<Vec<f32>, PolicyError> {
+        let source = ChunkSource::from_joint(Instant::now(), None);
+        self.step_infer_with_source(measured_arm_rad, vision_features, periods_elapsed, source, None)
+    }
+
+    /// Run one full inference step with explicit source provenance and optional cached-chunk
+    /// freshness/invalidation bounds.
+    pub fn step_infer_with_source(
+        &mut self,
+        measured_arm_rad: &[f32],
+        vision_features: Option<&[f32]>,
+        periods_elapsed: u32,
+        source: ChunkSource,
+        freshness: Option<&ChunkFreshnessLimits>,
+    ) -> Result<Vec<f32>, PolicyError> {
         let dim = self.contract.action_dim;
         let vision_dim = self.contract.vision_feature_dim();
         if measured_arm_rad.len() != dim {
@@ -846,6 +1142,7 @@ impl PreparedPolicy {
 
         let chunking = self.contract.chunking;
         if chunking.chunk_size <= 1 {
+            self.last_step_sources.clear();
             self.backend.infer(&self.infer_in, &mut self.infer_out)?;
             for (idx, &v) in self.infer_out.iter().enumerate() {
                 if !v.is_finite() {
@@ -856,6 +1153,9 @@ impl PreparedPolicy {
             }
             self.step_out_norm.copy_from_slice(&self.infer_out[..dim]);
         } else {
+            if let Some(limits) = freshness {
+                self.prune_chunk_buffer(limits);
+            }
             let elapsed = periods_elapsed.max(1) as usize;
             let skipped = if self.chunk_ring.is_empty() {
                 0
@@ -882,17 +1182,27 @@ impl PreparedPolicy {
             self.chunk_ring.discard_front(skipped);
 
             if need_replan {
-                self.chunk_ring
-                    .push_chunk(&self.infer_out, chunking.temporal_ensemble_k.is_none());
+                self.chunk_ring.push_chunk(
+                    &self.infer_out,
+                    source,
+                    chunking.temporal_ensemble_k.is_none(),
+                );
                 self.periods_since_replan = 0;
             } else {
                 self.periods_since_replan = next_periods_since_replan;
             }
 
-            self.chunk_ring
-                .pop_front_into(chunking.temporal_ensemble_k, &mut self.step_out_norm)?;
+            self.chunk_ring.pop_front_into(
+                chunking.temporal_ensemble_k,
+                &mut self.step_out_norm,
+                &mut self.last_step_sources,
+            )?;
         }
 
+        self.finalize_step_target()
+    }
+
+    fn finalize_step_target(&mut self) -> Result<Vec<f32>, PolicyError> {
         if let (Some(mean), Some(std)) = (
             &self.contract.normalization.action_mean,
             &self.contract.normalization.action_std,
@@ -949,7 +1259,7 @@ pub fn prepare_policy(dir: &Path, config: &ArmConfig) -> Result<PreparedPolicy, 
 
 /// Immutable per-step inference ticket captured before inference and re-verified
 /// synchronously inside the target-commit critical section before emitting any target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InferenceTicket {
     policy_instance_id: u64,
     lease_generation: u64,
@@ -1025,6 +1335,17 @@ impl InferenceTicket {
     }
 
     pub fn verify(&self, live: &TicketVerificationContext) -> Result<(), TicketViolation> {
+        self.verify_identity_and_horizon(live, 0)
+    }
+
+    /// Verify all identity, lease, epoch, generation, invalidation, and clock-handshake fields
+    /// strictly, allowing the observation window deadlines to cover up to `horizon_ms` of
+    /// open-loop chunk playback.
+    pub fn verify_identity_and_horizon(
+        &self,
+        live: &TicketVerificationContext,
+        horizon_ms: u64,
+    ) -> Result<(), TicketViolation> {
         if live.policy_instance_id != Some(self.policy_instance_id) {
             return Err(TicketViolation::PolicyInstanceMismatch {
                 expected: self.policy_instance_id,
@@ -1067,16 +1388,18 @@ impl InferenceTicket {
                 expires_at_ms: self.clock_handshake_expires_at_ms,
             });
         }
-        if live.now_armd_ms > self.window_newest_deadline_ms {
+        let newest_limit = self.window_newest_deadline_ms.saturating_add(horizon_ms);
+        if live.now_armd_ms > newest_limit {
             return Err(TicketViolation::WindowNewestExpired {
                 now_ms: live.now_armd_ms,
-                deadline_ms: self.window_newest_deadline_ms,
+                deadline_ms: newest_limit,
             });
         }
-        if live.now_armd_ms > self.window_oldest_deadline_ms {
+        let oldest_limit = self.window_oldest_deadline_ms.saturating_add(horizon_ms);
+        if live.now_armd_ms > oldest_limit {
             return Err(TicketViolation::WindowOldestExpired {
                 now_ms: live.now_armd_ms,
-                deadline_ms: self.window_oldest_deadline_ms,
+                deadline_ms: oldest_limit,
             });
         }
         Ok(())
@@ -1231,7 +1554,21 @@ pub fn spawn_policy_runner(
     } else {
         DEFAULT_POLICY_FPS
     };
+    if let Err(err) = validate_chunking_horizon(prepared.contract().chunking, clamped_fps) {
+        return tokio::spawn(async move {
+            let mut inner = supervisor.inner().write().await;
+            inner.fail_policy_run(action_id, "INVALID_POLICY", err.to_string());
+        });
+    }
     let period = Duration::from_secs_f64(1.0 / clamped_fps);
+    let replan_every = prepared.contract().chunking.replan_every;
+    let horizon_ms = ((replan_every as f64) * (1000.0 / clamped_fps))
+        .round()
+        .max(0.0) as u64;
+    let max_source_joint_age_ms = max_cached_chunk_source_age_ms(clamped_fps, replan_every);
+    let max_source_vision_age_ms = vision_spec
+        .as_ref()
+        .map(|s| s.max_staleness_ms.saturating_add(horizon_ms));
     let tokio_dl = deadline.map(tokio::time::Instant::from_std);
 
     tokio::spawn(async move {
@@ -1303,6 +1640,7 @@ pub fn spawn_policy_runner(
                 tokio::select! {
                     biased;
                     _ = tokio::time::sleep_until(dl) => {
+                        prepared.clear_chunk_buffer();
                         let mut inner = supervisor.inner().write().await;
                         inner.finish_policy_run(action_id, "MAX_SECONDS");
                         break;
@@ -1319,113 +1657,174 @@ pub fn spawn_policy_runner(
             let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
+                    prepared.clear_chunk_buffer();
                     let mut inner = supervisor.inner().write().await;
                     inner.finish_policy_run(action_id, "MAX_SECONDS");
                     break;
                 }
             }
 
-            let (measured, prop_age_range_ms, captured_at, snap_lease_gen) = {
+            let (measured, prop_age_range_ms, captured_at, snap_lease_gen, run_ctx) = {
                 let inner = supervisor.inner().read().await;
-                if !inner.is_policy_run_active(action_id) {
+                let Some(run) = inner.policy_run.as_ref().filter(|r| r.action_id == action_id) else {
+                    prepared.clear_chunk_buffer();
                     break;
-                }
+                };
+                let lease_gen = active_run_lease_generation(&inner, action_id);
+                let active_ok = !inner.estop_pending()
+                    && !matches!(
+                        inner.safety.state(),
+                        SafetyState::EStop | SafetyState::Fault(_)
+                    )
+                    && inner.safety.epoch_id() == run.epoch_id;
+                let ctx = ChunkRunContext {
+                    mode: run.mode,
+                    epoch_id: run.epoch_id,
+                    lease_generation: lease_gen,
+                    active_ok,
+                };
                 (
                     inner.measured_positions.clone(),
                     inner.policy_input_age_range_ms(),
                     Instant::now(),
-                    active_run_lease_generation(&inner, action_id),
+                    lease_gen,
+                    ctx,
                 )
             };
+            prepared.sync_run_context(run_ctx);
             let base_input_age_ms = prop_age_range_ms.map(|(_, max_prop)| max_prop);
 
-            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_ms) =
-                if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
-                    let Some(lease_gen) = snap_lease_gen else {
-                        let mut inner = supervisor.inner().write().await;
-                        inner.fail_policy_run(
-                            action_id,
-                            "LEASE_LOST",
-                            "Control lease lost or expired before embedding step",
-                        );
-                        break;
-                    };
-                    match hub.sample_window(emb_spec, emb_run_started_ms) {
-                        EmbeddingSampleDecision::Ready(win) => {
-                            let ticket = InferenceTicket::new(
-                                action_id,
-                                lease_gen,
-                                win.producer_epoch,
-                                win.model_generation,
-                                win.invalidation_generation,
-                                win.clock_handshake_generation,
-                                win.clock_handshake_expires_at_ms,
-                                win.window_newest_deadline_ms,
-                                win.window_oldest_deadline_ms,
-                            );
-                            (
-                                Some(win.features),
-                                None,
-                                Some(win.newest_frame_id),
-                                Some(ticket),
-                                Some(win.newest_mapped_at_ms),
-                            )
-                        }
-                        EmbeddingSampleDecision::Hold => {
-                            supervisor.inner().write().await.hold_policy_run(action_id);
-                            continue;
-                        }
-                        EmbeddingSampleDecision::Stop { reason, message } => {
-                            let mut inner = supervisor.inner().write().await;
-                            inner.fail_policy_run(action_id, reason, message);
-                            break;
-                        }
-                    }
-                } else if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
-                    let frame = col.latest();
-                    let now = Instant::now();
-                    let prop_elapsed_ms = now
-                        .saturating_duration_since(captured_at)
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64;
-                    let synced_prop_age_range_ms = prop_age_range_ms.map(|(lo, hi)| {
-                        (
-                            lo.saturating_add(prop_elapsed_ms),
-                            hi.saturating_add(prop_elapsed_ms),
-                        )
-                    });
-                    match evaluate_vision_frame(
-                        frame.as_ref(),
-                        spec,
-                        run_started_at,
-                        now,
-                        synced_prop_age_range_ms,
-                        &mut locked_generation,
-                    ) {
-                        VisionStepDecision::Ready {
-                            features,
-                            vision_age_ms: _,
-                            frame_id,
-                        } => (
-                            Some(features.to_vec()),
-                            frame.as_ref().and_then(|f| f.captured_at),
-                            Some(frame_id),
-                            None,
-                            None,
-                        ),
-                        VisionStepDecision::Hold => {
-                            supervisor.inner().write().await.hold_policy_run(action_id);
-                            continue;
-                        }
-                        VisionStepDecision::Stop { reason, message } => {
-                            let mut inner = supervisor.inner().write().await;
-                            inner.fail_policy_run(action_id, reason, message);
-                            break;
-                        }
-                    }
-                } else {
-                    (None, None, None, None, None)
+            let (
+                vision_features,
+                vision_captured_at,
+                vision_frame_id,
+                vision_target_present,
+                emb_ticket,
+                emb_mapped_ms,
+            ) = if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
+                let Some(lease_gen) = snap_lease_gen else {
+                    prepared.clear_chunk_buffer();
+                    let mut inner = supervisor.inner().write().await;
+                    inner.fail_policy_run(
+                        action_id,
+                        "LEASE_LOST",
+                        "Control lease lost or expired before embedding step",
+                    );
+                    break;
                 };
+                match hub.sample_window(emb_spec, emb_run_started_ms) {
+                    EmbeddingSampleDecision::Ready(win) => {
+                        let ticket = InferenceTicket::new(
+                            action_id,
+                            lease_gen,
+                            win.producer_epoch,
+                            win.model_generation,
+                            win.invalidation_generation,
+                            win.clock_handshake_generation,
+                            win.clock_handshake_expires_at_ms,
+                            win.window_newest_deadline_ms,
+                            win.window_oldest_deadline_ms,
+                        );
+                        (
+                            Some(win.features),
+                            None,
+                            Some(win.newest_frame_id),
+                            None,
+                            Some(ticket),
+                            Some(win.newest_mapped_at_ms),
+                        )
+                    }
+                    EmbeddingSampleDecision::Hold => {
+                        prepared.clear_chunk_buffer();
+                        supervisor.inner().write().await.hold_policy_run(action_id);
+                        continue;
+                    }
+                    EmbeddingSampleDecision::Stop { reason, message } => {
+                        prepared.clear_chunk_buffer();
+                        let mut inner = supervisor.inner().write().await;
+                        inner.fail_policy_run(action_id, reason, message);
+                        break;
+                    }
+                }
+            } else if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                let frame = col.latest();
+                let now = Instant::now();
+                let prop_elapsed_ms = now
+                    .saturating_duration_since(captured_at)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                let synced_prop_age_range_ms = prop_age_range_ms.map(|(lo, hi)| {
+                    (
+                        lo.saturating_add(prop_elapsed_ms),
+                        hi.saturating_add(prop_elapsed_ms),
+                    )
+                });
+                match evaluate_vision_frame(
+                    frame.as_ref(),
+                    spec,
+                    run_started_at,
+                    now,
+                    synced_prop_age_range_ms,
+                    &mut locked_generation,
+                ) {
+                    VisionStepDecision::Ready {
+                        features,
+                        vision_age_ms: _,
+                        frame_id,
+                    } => (
+                        Some(features.to_vec()),
+                        frame.as_ref().and_then(|f| f.captured_at),
+                        Some(frame_id),
+                        Some(features[0] > 0.5),
+                        None,
+                        None,
+                    ),
+                    VisionStepDecision::Hold => {
+                        prepared.clear_chunk_buffer();
+                        supervisor.inner().write().await.hold_policy_run(action_id);
+                        continue;
+                    }
+                    VisionStepDecision::Stop { reason, message } => {
+                        prepared.clear_chunk_buffer();
+                        let mut inner = supervisor.inner().write().await;
+                        inner.fail_policy_run(action_id, reason, message);
+                        break;
+                    }
+                }
+            } else {
+                (None, None, None, None, None, None)
+            };
+
+            let live_ticket_ctx = embedding_hub.as_ref().map(|hub| {
+                let guard = hub.lock_for_commit();
+                let live_hub = guard.live_ticket_state();
+                TicketVerificationContext {
+                    policy_instance_id: live_hub.policy_instance_id,
+                    lease_generation: snap_lease_gen,
+                    producer_epoch: live_hub.producer_epoch,
+                    model_generation: live_hub.model_generation,
+                    invalidation_generation: live_hub.invalidation_generation,
+                    clock_handshake_generation: live_hub.clock_handshake_generation,
+                    now_armd_ms: live_hub.now_armd_ms,
+                }
+            });
+            let chunk_source = ChunkSource {
+                joint_captured_at: captured_at,
+                joint_base_age_ms: base_input_age_ms,
+                vision_captured_at,
+                vision_generation: locked_generation,
+                vision_target_present,
+                embedding_ticket: emb_ticket,
+            };
+            let freshness_limits = ChunkFreshnessLimits {
+                now: Instant::now(),
+                max_source_joint_age_ms,
+                max_source_vision_age_ms,
+                horizon_ms,
+                vision_generation: locked_generation,
+                vision_target_present,
+                live_ticket_ctx,
+            };
 
             let periods_elapsed = match last_infer_period {
                 None => 1u32,
@@ -1435,10 +1834,12 @@ pub fn spawn_policy_runner(
 
             let infer_handle = tokio::task::spawn_blocking(move || {
                 let t0 = Instant::now();
-                let res = prepared.step_infer_with_vision_periods(
+                let res = prepared.step_infer_with_source(
                     &measured,
                     vision_features.as_deref(),
                     periods_elapsed,
+                    chunk_source,
+                    Some(&freshness_limits),
                 );
                 let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 (prepared, res.map(|t| (t, infer_us)))
@@ -1515,6 +1916,7 @@ pub fn spawn_policy_runner(
                     if age_ms > spec.max_staleness_ms {
                         match spec.on_stale {
                             VisionStalePolicy::Stop => {
+                                prepared.clear_chunk_buffer();
                                 inner.fail_policy_run(
                                     action_id,
                                     "VISION_STALE",
@@ -1526,6 +1928,7 @@ pub fn spawn_policy_runner(
                                 break;
                             }
                             VisionStalePolicy::Hold => {
+                                prepared.clear_chunk_buffer();
                                 inner.hold_policy_run(action_id);
                                 continue;
                             }
@@ -1596,8 +1999,35 @@ pub fn spawn_policy_runner(
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
-                    Ok(now_ms) => Some(now_ms),
+                    Ok(now_ms) => {
+                        let live_hub = guard.live_ticket_state();
+                        let live_ctx = TicketVerificationContext {
+                            policy_instance_id: live_hub.policy_instance_id,
+                            lease_generation: active_run_lease_generation(&inner, action_id),
+                            producer_epoch: live_hub.producer_epoch,
+                            model_generation: live_hub.model_generation,
+                            invalidation_generation: live_hub.invalidation_generation,
+                            clock_handshake_generation: live_hub.clock_handshake_generation,
+                            now_armd_ms: live_hub.now_armd_ms,
+                        };
+                        let mut cached_violation = None;
+                        for src in prepared.last_step_sources() {
+                            if let Some(src_ticket) = src.embedding_ticket {
+                                if let Err(v) = src_ticket.verify_identity_and_horizon(&live_ctx, horizon_ms) {
+                                    cached_violation = Some(v);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(violation) = cached_violation {
+                            prepared.clear_chunk_buffer();
+                            inner.fail_policy_run(action_id, violation.code(), violation.message());
+                            break;
+                        }
+                        Some(now_ms)
+                    }
                     Err(violation) => {
+                        prepared.clear_chunk_buffer();
                         inner.fail_policy_run(action_id, violation.code(), violation.message());
                         break;
                     }
@@ -1620,6 +2050,7 @@ pub fn spawn_policy_runner(
                 post_vision_age_ms,
                 vision_frame_id,
             ) {
+                prepared.clear_chunk_buffer();
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
             }
@@ -1959,6 +2390,206 @@ mod chunking_tests {
             );
         }
         assert_eq!(calls_te.load(Ordering::Relaxed), 50);
+    }
+
+    #[test]
+    fn chunking_stale_source_drops_chunk_and_forces_replan() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+
+        // 20 Hz, replan_every=4 -> STALE_INPUT=100ms, horizon=200ms, max_source_age=300ms.
+        let max_age_ms = max_cached_chunk_source_age_ms(20.0, 4);
+        assert_eq!(max_age_ms, 300);
+
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, calls) =
+            CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone(), c1.clone()]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let t0 = Instant::now();
+        let src0 = ChunkSource::from_joint(t0, Some(10));
+        let fresh_at_t0 = ChunkFreshnessLimits {
+            now: t0,
+            max_source_joint_age_ms: max_age_ms,
+            max_source_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target_present: None,
+            live_ticket_ctx: None,
+        };
+        let a0 = prep
+            .step_infer_with_source(&state, None, 1, src0, Some(&fresh_at_t0))
+            .unwrap();
+        assert!((a0[0] - 0.1).abs() < 1e-6);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // 50 ms later: source age = 60 ms <= 300 ms -> uses cached c0[1].
+        let t1 = t0 + Duration::from_millis(50);
+        let fresh_at_t1 = ChunkFreshnessLimits { now: t1, ..fresh_at_t0.clone() };
+        let a1 = prep
+            .step_infer_with_source(&state, None, 1, ChunkSource::from_joint(t1, Some(10)), Some(&fresh_at_t1))
+            .unwrap();
+        assert!((a1[0] - 0.2).abs() < 1e-6);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // 350 ms after t0: source age = 360 ms > 300 ms -> chunk dropped and replans c1 immediately.
+        let t2 = t0 + Duration::from_millis(350);
+        let stale_at_t2 = ChunkFreshnessLimits { now: t2, ..fresh_at_t0 };
+        let a2 = prep
+            .step_infer_with_source(&state, None, 1, ChunkSource::from_joint(t2, Some(10)), Some(&stale_at_t2))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!((a2[0] - 0.5).abs() < 1e-6, "stale chunk must be dropped and replanned, got {}", a2[0]);
+    }
+
+    #[test]
+    fn chunking_invalidated_ticket_and_run_context_clear_ring() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.1, 0.2, 0.3, 0.4]);
+        let c1 = make_constant_chunk(state_dim, &[0.5, 0.6, 0.7, 0.8]);
+
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 4, None);
+        let (backend, calls) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0, c1]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+
+        let t0 = Instant::now();
+        let ticket = InferenceTicket::new(1, 7, 1, Some(3), 10, 1, 50_000, 1_000, 1_000);
+        let mut src0 = ChunkSource::from_joint(t0, Some(5));
+        src0.embedding_ticket = Some(ticket);
+        src0.vision_target_present = Some(true);
+
+        let valid_ctx = TicketVerificationContext {
+            policy_instance_id: Some(1),
+            lease_generation: Some(7),
+            producer_epoch: Some(1),
+            model_generation: Some(3),
+            invalidation_generation: 10,
+            clock_handshake_generation: 1,
+            now_armd_ms: 500,
+        };
+        let valid_limits = ChunkFreshnessLimits {
+            now: t0,
+            max_source_joint_age_ms: 300,
+            max_source_vision_age_ms: None,
+            horizon_ms: 200,
+            vision_generation: None,
+            vision_target_present: Some(true),
+            live_ticket_ctx: Some(valid_ctx.clone()),
+        };
+        let a0 = prep
+            .step_infer_with_source(&state, None, 1, src0, Some(&valid_limits))
+            .unwrap();
+        assert!((a0[0] - 0.1).abs() < 1e-6);
+        assert_eq!(prep.chunk_buffer_len(), 3);
+
+        // Invalidate the source embedding ticket (invalidation_generation bumped 10 -> 11).
+        let invalidated_limits = ChunkFreshnessLimits {
+            live_ticket_ctx: Some(TicketVerificationContext {
+                invalidation_generation: 11,
+                ..valid_ctx.clone()
+            }),
+            ..valid_limits.clone()
+        };
+        assert!(prep.prune_chunk_buffer(&invalidated_limits));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Repopulate buffer, then verify every ChunkRunContext trigger clears the whole ring:
+        // stop/E-stop/fault (active_ok=false), lease change, lease revocation, mode switch.
+        let base_ctx = ChunkRunContext {
+            mode: PolicyMode::Shadow,
+            epoch_id: 1,
+            lease_generation: Some(7),
+            active_ok: true,
+        };
+        prep.sync_run_context(base_ctx);
+        let _ = prep
+            .step_infer_with_source(&state, None, 1, src0, Some(&valid_limits))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(prep.chunk_buffer_len(), 3);
+
+        // Stop / E-stop / Fault
+        assert!(prep.sync_run_context(ChunkRunContext { active_ok: false, ..base_ctx }));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Repopulate and test lease revocation
+        prep.sync_run_context(base_ctx);
+        let _ = prep.step_infer_with_source(&state, None, 1, src0, Some(&valid_limits)).unwrap();
+        assert_eq!(prep.chunk_buffer_len(), 3);
+        assert!(prep.sync_run_context(ChunkRunContext { lease_generation: None, ..base_ctx }));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Repopulate and test lease change
+        prep.sync_run_context(base_ctx);
+        let _ = prep.step_infer_with_source(&state, None, 1, src0, Some(&valid_limits)).unwrap();
+        assert_eq!(prep.chunk_buffer_len(), 3);
+        assert!(prep.sync_run_context(ChunkRunContext { lease_generation: Some(8), ..base_ctx }));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Repopulate and test shadow <-> live mode switch
+        let live_ctx = ChunkRunContext {
+            mode: PolicyMode::Live,
+            lease_generation: Some(8),
+            ..base_ctx
+        };
+        let _ = prep.step_infer_with_source(&state, None, 1, src0, Some(&valid_limits)).unwrap();
+        assert_eq!(prep.chunk_buffer_len(), 3);
+        assert!(prep.sync_run_context(live_ctx));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+
+        // Repopulate and test detector target lost (true -> false) clears ring
+        let _ = prep.step_infer_with_source(&state, None, 1, src0, Some(&valid_limits)).unwrap();
+        assert_eq!(prep.chunk_buffer_len(), 3);
+        let target_lost_limits = ChunkFreshnessLimits {
+            vision_target_present: Some(false),
+            ..valid_limits
+        };
+        assert!(prep.prune_chunk_buffer(&target_lost_limits));
+        assert_eq!(prep.chunk_buffer_len(), 0);
+    }
+
+    #[test]
+    fn chunking_horizon_over_1000ms_is_refused_in_manifest_and_at_start() {
+        let base = serde_json::json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "horizon_test",
+            "unit_mode": "rad",
+            "action_dim": 7,
+            "action_space": "joint_positions",
+            "joint_names": ["j1", "j2", "j3", "j4", "j5", "j6", "g"],
+            "model_file": "model.rmlp"
+        });
+
+        // 21 * (1000 / 20) = 1050 ms > 1000 ms -> refused at manifest parse.
+        let mut over = base.clone();
+        over["fps"] = serde_json::json!(20.0);
+        over["chunking"] = serde_json::json!({"chunk_size": 24, "replan_every": 21});
+        let err = StrictPolicyContract::parse(&serde_json::to_vec(&over).unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("replan_every") && msg.contains("fps"), "unexpected error: {msg}");
+
+        // Exact boundary: 20 * (1000 / 20) = 1000 ms -> accepted.
+        let mut exact = base.clone();
+        exact["fps"] = serde_json::json!(20.0);
+        exact["chunking"] = serde_json::json!({"chunk_size": 24, "replan_every": 20});
+        assert!(StrictPolicyContract::parse(&serde_json::to_vec(&exact).unwrap()).is_ok());
+
+        // Manifest omits fps -> accepted at parse, refused at start when effective fps yields > 1000 ms.
+        let mut no_fps = base;
+        no_fps["chunking"] = serde_json::json!({"chunk_size": 24, "replan_every": 15});
+        let contract = StrictPolicyContract::parse(&serde_json::to_vec(&no_fps).unwrap()).unwrap();
+        let start_err = validate_chunking_horizon(contract.chunking, 10.0).unwrap_err();
+        let start_msg = start_err.to_string();
+        assert!(
+            start_msg.contains("replan_every") && start_msg.contains("fps"),
+            "unexpected start error: {start_msg}"
+        );
+        assert!(validate_chunking_horizon(contract.chunking, 20.0).is_ok());
     }
 
     #[test]

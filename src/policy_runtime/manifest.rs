@@ -25,6 +25,8 @@ pub const MAX_VISION_STALENESS_MS: u64 = 500;
 pub const MAX_VIDEO_WINDOW_SPAN_MS: u64 = 2000;
 pub const MAX_POLICY_INPUT_WIDTH: usize = 1024;
 pub const MAX_CHUNK_SIZE: usize = 128;
+/// Maximum open-loop action-chunk horizon `replan_every * (1000 / fps)` in milliseconds.
+pub const MAX_OPEN_LOOP_HORIZON_MS: f64 = 1000.0;
 pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
 const MAX_ONNX_PROTO_DEPTH: usize = 32;
 
@@ -523,6 +525,9 @@ impl StrictPolicyContract {
         let normalization = parse_normalization(obj.get("normalization"), action_dim)?;
 
         let fps = parse_optional_positive_f64(obj.get("fps"), "fps")?;
+        if let Some(f) = fps {
+            validate_chunking_horizon(chunking, f)?;
+        }
         let max_step_rad = parse_optional_positive_f32(obj.get("max_step_rad"), "max_step_rad")?;
         let max_first_step_rad =
             parse_optional_positive_f32(obj.get("max_first_step_rad"), "max_first_step_rad")?;
@@ -551,6 +556,27 @@ impl StrictPolicyContract {
     pub fn expected_output_dim(&self) -> usize {
         self.action_dim * self.chunking.chunk_size
     }
+}
+
+/// Validate that the open-loop chunk horizon `replan_every * (1000 / fps)` does not exceed
+/// [`MAX_OPEN_LOOP_HORIZON_MS`] (1000 ms).
+pub fn validate_chunking_horizon(chunking: ChunkingSpec, fps: f64) -> Result<(), PolicyError> {
+    if chunking.chunk_size <= 1 {
+        return Ok(());
+    }
+    if !fps.is_finite() || fps <= 0.0 {
+        return Err(PolicyError::InvalidManifest(
+            "chunking.replan_every horizon requires positive finite fps".into(),
+        ));
+    }
+    if (chunking.replan_every as f64) * 1000.0 > MAX_OPEN_LOOP_HORIZON_MS * fps {
+        let horizon_ms = (chunking.replan_every as f64) * (1000.0 / fps);
+        return Err(PolicyError::InvalidManifest(format!(
+            "chunking.replan_every ({}) at fps ({fps}) yields open-loop horizon {horizon_ms:.1} ms exceeding maximum {MAX_OPEN_LOOP_HORIZON_MS:.0} ms",
+            chunking.replan_every
+        )));
+    }
+    Ok(())
 }
 
 fn parse_chunking_section(val: Option<&Value>, action_dim: usize) -> Result<ChunkingSpec, PolicyError> {

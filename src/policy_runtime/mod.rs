@@ -15,10 +15,11 @@ pub mod vision;
 use thiserror::Error;
 
 pub use manifest::{
-    compute_release_digest, reject_external_onnx_data, ChunkingSpec, NormalizationStats,
-    PolicySnapshot, StrictPolicyContract, UnitMode, VisionFeatureSpec, VisionLayout,
-    VisionSourceKind, VisionStalePolicy, VisionTargetLostPolicy, DEFAULT_VISION_MIN_SCORE,
-    MAX_CHUNK_SIZE, MAX_MODEL_BYTES, MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
+    compute_release_digest, reject_external_onnx_data, validate_chunking_horizon, ChunkingSpec,
+    NormalizationStats, PolicySnapshot, StrictPolicyContract, UnitMode, VisionFeatureSpec,
+    VisionLayout, VisionSourceKind, VisionStalePolicy, VisionTargetLostPolicy,
+    DEFAULT_VISION_MIN_SCORE, MAX_CHUNK_SIZE, MAX_MODEL_BYTES, MAX_OPEN_LOOP_HORIZON_MS,
+    MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
 };
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
@@ -30,11 +31,13 @@ pub use release_gate::{
     RELEASE_GATE_SCHEMA_VERSION, SUPERVISED_FIRST_RUN_MAX_SPEED_SCALE,
 };
 pub use runner::{
-    compute_policy_deadline, parse_policy_start_request, prepare_policy, spawn_policy_runner,
-    validate_policy_fps, PolicyMode, PolicyRun, PolicyRunStart, PolicyStartRequest, PreparedPolicy,
-    max_policy_input_age_ms, DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
-    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, PolicyStepStats, SpeedGateReport, WarmupInferUs,
-    POLICY_STATS_RING, SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
+    compute_policy_deadline, max_cached_chunk_source_age_ms, max_policy_input_age_ms,
+    parse_policy_start_request, prepare_policy, spawn_policy_runner, validate_policy_fps,
+    ChunkFreshnessLimits, ChunkRunContext, ChunkSource, PolicyMode, PolicyRun, PolicyRunStart,
+    PolicyStartRequest, PolicyStepStats, PreparedPolicy, SpeedGateReport, WarmupInferUs,
+    DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
+    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, POLICY_STATS_RING,
+    SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
 };
 #[cfg(feature = "policy-tract")]
 pub use tract_backend::TractBackend;
