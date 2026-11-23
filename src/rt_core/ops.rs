@@ -417,7 +417,7 @@ impl CoreOps for StubCore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReleaseReport {
     pub release: u64,
-    /// An urgent stop was applied first.
+    /// An urgent stop was applied in this release (at its start or at a checkpoint).
     pub stopped: bool,
     /// The ordinary command taken, with its commit sequence or refusal code.
     pub command: Option<(RequestId, Result<u64, &'static str>)>,
@@ -456,11 +456,24 @@ pub struct ReleaseFixture<O: CoreOps> {
     intake: RtIntake<Primitive>,
     targets: TargetReader,
     stop: StopRequests,
-    applied_stop: u64,
     active: Option<Installed>,
     releases: u64,
     clock: VirtualClock,
+    hook: Option<Box<dyn FnMut(Checkpoint)>>,
     pub dt: f64,
+}
+
+/// The points of a release where the fixture re-reads the stop generation and the time
+/// (and applies a stop that arrived since): a stop or a deadline can never be overtaken by
+/// the command, target or output that follows it in the same release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// Before the ordinary command commits.
+    BeforeCommit,
+    /// Before the latest target is consumed.
+    BeforeTarget,
+    /// Before the control tick computes and sends its output.
+    BeforeOutput,
 }
 
 impl<O: CoreOps> ReleaseFixture<O> {
@@ -470,7 +483,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
         let clock = VirtualClock::starting_at(Instant::now());
-        (Self { core, intake, targets: tr, stop: stop.clone(), applied_stop: 0, active: None, releases: 0, clock, dt: 0.02 }, broker, tw, stop)
+        (Self { core, intake, targets: tr, stop: stop.clone(), active: None, releases: 0, clock, hook: None, dt: 0.02 }, broker, tw, stop)
     }
 
     /// The fixture's virtual clock (clone it to advance time from a test).
@@ -486,23 +499,39 @@ impl<O: CoreOps> ReleaseFixture<O> {
         CommitCtx { arm: self.intake.arm(), boot: self.intake.boot(), now, stop_generation: self.stop.current() }
     }
 
+    /// Runs `hook` at every [`Checkpoint`] just before the fixture samples the stop
+    /// generation and the time there (tests: a stop or a clock step arriving mid-release).
+    pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + 'static) { self.hook = Some(Box::new(hook)); }
+
+    /// Applies a stop requested since the last one applied; true when it did.
+    fn apply_pending_stop(&mut self) -> bool {
+        let generation = self.stop.current();
+        if generation == self.stop.applied() { return false; }
+        self.core.apply_stop();
+        self.stop.mark_applied(generation);
+        true
+    }
+
+    /// `at`: re-reads the stop generation (applying a new stop first) and the time.
+    fn checkpoint(&mut self, at: Checkpoint, report: &mut ReleaseReport) -> CommitCtx {
+        if let Some(hook) = self.hook.as_mut() { hook(at); }
+        if self.apply_pending_stop() { report.stopped = true; }
+        self.ctx(self.clock.now())
+    }
+
     /// One release.
     pub fn step(&mut self) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
         let started = self.clock.now();
         let release_deadline = started + Duration::from_secs_f64(self.dt);
-        let ctx = self.ctx(started);
         // 1. urgent stop, independent of the command ring's capacity
-        if ctx.stop_generation != self.applied_stop {
-            self.applied_stop = ctx.stop_generation;
-            self.core.apply_stop();
-            report.stopped = true;
-        }
+        if self.apply_pending_stop() { report.stopped = true; }
         // 2. the bus owner, within the release's service budget
         report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
         // 3. one ordinary command (the intake enforces one per release)
         self.intake.begin_release(self.releases);
+        let ctx = self.checkpoint(Checkpoint::BeforeCommit, &mut report);
         if let Some(mut t) = self.intake.take() {
             let d = *t.descriptor();
             let result = match d.kind {
@@ -530,9 +559,12 @@ impl<O: CoreOps> ReleaseFixture<O> {
         }
         // 4. the latest target
         if let Some(f) = self.targets.take() {
+            let ctx = self.checkpoint(Checkpoint::BeforeTarget, &mut report);
             report.target = Some((f.seq, self.core.consume_target(&f, &ctx)));
         }
-        // 5. the control tick
+        // 5. the control tick (its output gate also holds for a stop arriving during it:
+        // `EstopGate::with_stops`)
+        self.checkpoint(Checkpoint::BeforeOutput, &mut report);
         self.core.advance(self.dt, self.releases);
         // 6. terminal of the active action
         if let Some(action) = self.active() {

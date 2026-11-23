@@ -9,7 +9,7 @@ use armd::rt_core::broker::{
     AdmitError, Authority, BootId, Broker, Capacities, ClientId, ImmediateOp, Outcome, Reply, RequestId, Submit,
 };
 use armd::rt_core::mailbox::{StreamId, Submitted, TargetFrame, TargetWriter, MAX_DOF};
-use armd::rt_core::ops::{CoreOps, Primitive, ReleaseFixture, StubCore};
+use armd::rt_core::ops::{Checkpoint, CoreOps, Primitive, ReleaseFixture, StubCore};
 use armd::rt_core::urgent::StopRequests;
 use armd::{ArmConfig, SupervisorInner};
 
@@ -362,4 +362,59 @@ fn a_deadline_that_passes_between_releases_is_refused_in_virtual_time() {
     std::thread::sleep(Duration::from_millis(15));
     assert!(fx.step().command.unwrap().1.is_ok());
     assert_eq!(fx.step().command.unwrap().1, Err("DEADLINE_EXPIRED"));
+}
+
+#[test]
+fn a_stop_arriving_mid_release_precedes_the_commit_the_target_and_the_output() {
+    // before the commit: the queued command admitted under the old generation is refused
+    let (mut fx, mut b, _tw, stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    submit_install(&mut b, 1, a, later(), quintic(&fx, 0.1, 1.0)).unwrap();
+    let s = stop.clone();
+    fx.on_checkpoint(move |c| if c == Checkpoint::BeforeCommit { s.request(); });
+    let rep = fx.step();
+    assert!(rep.stopped);
+    assert_eq!(rep.command.unwrap().1, Err("STOPPED"));
+    assert!(fx.active().is_none() && fx.core.active_trajectory.is_none());
+    assert!(!stop.pending(), "applied in the same release");
+
+    // before the target: the buffered target admitted under the old generation is refused
+    let (mut fx, _b, mut tw, stop) = fixture(Capacities::default());
+    let a = auth(&fx);
+    let q = fx.core.commanded_positions.clone();
+    let mut arr = [0.0; MAX_DOF];
+    arr[..q.len()].copy_from_slice(&q);
+    tw.submit(TargetFrame { stream: StreamId(1), seq: 1, authority: a, policy_generation: 0, input_at: fx.now(), vision_at: None, dof: q.len() as u8, q: arr, replaceable: true });
+    let s = stop.clone();
+    fx.on_checkpoint(move |c| if c == Checkpoint::BeforeTarget { s.request(); });
+    let rep = fx.step();
+    assert!(rep.stopped);
+    assert_eq!(rep.target, Some((1, Err("STOPPED"))));
+
+    // before the output: the running motion is stopped before the tick moves it again
+    let (mut fx, mut b, _tw, stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.2, 2.0)).unwrap();
+    fx.step();
+    fx.step();
+    let action = fx.active().unwrap();
+    let s = stop.clone();
+    fx.on_checkpoint(move |c| if c == Checkpoint::BeforeOutput { s.request(); });
+    let rep = fx.step();
+    assert!(rep.stopped);
+    assert_eq!(rep.ended, Some((action, Outcome::Stopped)), "stopped before this release's output");
+    assert!(fx.core.active_trajectory.is_none());
+}
+
+#[test]
+fn a_deadline_expiring_after_the_release_started_is_refused_at_the_commit() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    let deadline = fx.now() + Duration::from_millis(1);
+    submit_install(&mut b, 1, a, deadline, quintic(&fx, 0.05, 0.5)).unwrap();
+    let clock = fx.clock().clone();
+    // the release starts before the deadline; time passes it before the commit
+    fx.on_checkpoint(move |c| if c == Checkpoint::BeforeCommit { clock.advance(Duration::from_millis(2)); });
+    let before = target_of(&fx);
+    assert_eq!(fx.step().command.unwrap().1, Err("DEADLINE_EXPIRED"));
+    assert_eq!(target_of(&fx), before);
 }

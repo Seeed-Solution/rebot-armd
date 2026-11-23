@@ -10,20 +10,32 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Requested vs applied E-stop generations of one arm.
+/// Requested vs applied E-stop generations of one arm, and optionally its authorized-stop
+/// generations ([`Self::with_stops`]): the output gate.
 #[derive(Debug, Clone)]
 pub struct EstopGate {
     requested: Arc<AtomicU64>,
     applied: Arc<AtomicU64>,
+    stops: Option<StopRequests>,
 }
 
 impl EstopGate {
-    pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self { Self { requested, applied } }
+    pub fn new(requested: Arc<AtomicU64>, applied: Arc<AtomicU64>) -> Self { Self { requested, applied, stops: None } }
 
-    /// An E-stop was requested and the tick has not applied it yet.
+    /// The gate also holds output while an authorized stop is requested and not applied
+    /// ([`StopRequests::pending`]): a stop that arrives after the release's last check
+    /// still stops the remaining frames.
+    pub fn with_stops(mut self, stops: StopRequests) -> Self {
+        self.stops = Some(stops);
+        self
+    }
+
+    /// An E-stop (or, with [`Self::with_stops`], an authorized stop) was requested and the
+    /// tick has not applied it yet.
     #[inline]
     pub fn pending(&self) -> bool {
         self.requested.load(Ordering::SeqCst) != self.applied.load(Ordering::SeqCst)
+            || self.stops.as_ref().is_some_and(StopRequests::pending)
     }
 }
 
@@ -31,9 +43,13 @@ impl EstopGate {
 /// without the command ring, so it is never refused for capacity. Commands carry the
 /// generation they were admitted under ([`super::broker::Authority::stop_generation`]); the
 /// RT refuses older ones (`STOPPED`) and ends the active motion of an older generation.
+///
+/// The RT records the generation it applied ([`Self::mark_applied`]); until then the stop is
+/// [`Self::pending`] and an output gate built [`EstopGate::with_stops`] holds output.
 #[derive(Debug, Clone, Default)]
 pub struct StopRequests {
     generation: Arc<AtomicU64>,
+    applied: Arc<AtomicU64>,
 }
 
 impl StopRequests {
@@ -49,6 +65,17 @@ impl StopRequests {
     /// A stop was requested after a command admitted at `admitted`.
     #[inline]
     pub fn stopped_since(&self, admitted: u64) -> bool { self.current() != admitted }
+
+    /// The RT applied every stop up to `generation` (it stopped motion after reading it).
+    pub fn mark_applied(&self, generation: u64) { self.applied.fetch_max(generation, Ordering::SeqCst); }
+
+    /// The last generation the RT applied.
+    #[inline]
+    pub fn applied(&self) -> u64 { self.applied.load(Ordering::SeqCst) }
+
+    /// A stop was requested and the RT has not applied it yet.
+    #[inline]
+    pub fn pending(&self) -> bool { self.current() != self.applied() }
 }
 
 #[cfg(test)]
@@ -64,6 +91,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_output_gate_observes_ordinary_stops_until_applied() {
+        let (req, app) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let stops = StopRequests::new();
+        let plain = EstopGate::new(req.clone(), app.clone());
+        let gate = EstopGate::new(req, app).with_stops(stops.clone());
+        assert!(!gate.pending());
+        let g = stops.request();
+        assert!(gate.pending() && stops.pending());
+        assert!(!plain.pending(), "a gate without stops sees E-stops only");
+        stops.mark_applied(g);
+        assert!(!gate.pending());
+        stops.mark_applied(g - 1);
+        assert_eq!(stops.applied(), g, "applied never goes back");
+    }
 
     #[test]
     fn pending_until_applied() {
