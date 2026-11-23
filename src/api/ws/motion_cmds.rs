@@ -155,5 +155,6 @@ impl PlannedMacro {
 pub(super) struct MacroCheck {
     pub(super) request_id: Value,
     pub(super) generation: u64,
+    pub(super) enqueued_stop_gen: u64,
     pub(super) task: tokio::task::JoinHandle<Result<PlannedMacro, ArmError>>,
 }
