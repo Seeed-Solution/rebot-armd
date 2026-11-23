@@ -2045,9 +2045,10 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
         (d, bus, clock, wake)
     };
 
-    // (b) Timely reply (deadline - 1 ms) followed in the SAME receive_feedback pass by a benign
-    //     late reply (deadline + 1 ms, stationary, state 0): both RefreshBeforeRestore and
-    //     PreEnableRefresh accept and enable, and the 0x307 pre-enable hold uses the timely position.
+    // (b) Timely reply (deadline - 1 ms) followed in the SAME receive_feedback pass by a newer
+    //     stationary torque-off reply (deadline + 1 ms, state 0): both RefreshBeforeRestore and
+    //     PreEnableRefresh accept and enable, and the 0x307 pre-enable hold uses the newest
+    //     fresh validated stationary position (-1.2), not the older -1.6 sample.
     for already_mode_4 in [false, true] {
         let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
         clock.advance(wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1)));
@@ -2076,7 +2077,7 @@ fn enable_refresh_transmit_boundary_and_live_safety_veto() {
             let hold_f = log[hold];
             let hold_pos = f32::from_le_bytes([hold_f.data[0], hold_f.data[1], hold_f.data[2], hold_f.data[3]]);
             let hold_vel = u16::from_le_bytes([hold_f.data[4], hold_f.data[5]]);
-            assert!((hold_pos - (-1.6)).abs() < 1e-3, "expected timely hold position -1.6, got {hold_pos}");
+            assert!((hold_pos - (-1.2)).abs() < 1e-3, "expected newest validated hold position -1.2, got {hold_pos}");
             assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "pre-enable hold exceeded close_speed_rad_s: vel_raw={hold_vel}");
         }
     }

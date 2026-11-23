@@ -3853,7 +3853,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn finish_pos_force_readback(&mut self, joint: usize, refresh_sample: Option<RefreshSample>) -> Result<TorqueProgress, ArmDriverError> {
-        let hold_pos = if let Some(sample) = refresh_sample {
+        if let Some(sample) = refresh_sample {
             let sample_fresh = sample.position.is_finite()
                 && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
                 && sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
@@ -3872,15 +3872,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     ),
                 );
             }
-            if self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
-                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
-            }
-            sample.position
-        } else {
-            let Some(measured_pos) = self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE) else {
-                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
-            };
-            measured_pos
+        }
+        // Hold at the position of the newest fresh sample that passes the live freshness,
+        // stationarity, and torque-off checks below (not an older first-timely sample).
+        let Some(hold_pos) = self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE) else {
+            return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
         };
         let still = self.cached_states[joint].velocity.is_finite() && self.cached_states[joint].velocity.abs() <= 0.05;
         let status = self.motor_status[joint];
