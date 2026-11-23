@@ -160,7 +160,8 @@ fn test_damiao_set_torque_fast_path_and_rearm_handshake() {
 }
 
 #[test]
-fn test_damiao_write_targets_retries_on_would_block() {
+fn test_damiao_write_targets_defers_on_would_block_without_sleeping() {
+    use armd::driver::{ArmDriverError, TxBatchOutcome};
     use armd::transport::TransportError;
 
     struct FlakyCanTransport {
@@ -187,7 +188,7 @@ fn test_damiao_write_targets_retries_on_would_block() {
         }
     }
 
-    // A: 2 WouldBlock occurrences: recovered within 3 retries -> succeeds
+    // A: bounded write defers on WouldBlock without sleeping, then delivers when the queue clears
     let mut driver = DamiaoArmDriver::new(
         FlakyCanTransport {
             would_block_count: 2,
@@ -196,12 +197,25 @@ fn test_damiao_write_targets_retries_on_would_block() {
         vec![1],
     );
 
-    let res = driver.write_joint_targets(&[JointTarget::position(0.5)]);
-    assert!(res.is_ok(), "Write joint targets must succeed after transient WouldBlock retry");
+    assert_eq!(
+        driver.write_joint_targets_bounded(&[JointTarget::position(0.5)]).unwrap(),
+        TxBatchOutcome::Deferred { pending: 1 }
+    );
+    assert_eq!(driver.can_mut().tx_frames.len(), 0);
+    assert_eq!(driver.pending_tx_len(), 1);
+    assert_eq!(
+        driver.drain_pending_tx().unwrap(),
+        TxBatchOutcome::Deferred { pending: 1 }
+    );
+    assert_eq!(
+        driver.drain_pending_tx().unwrap(),
+        TxBatchOutcome::Complete
+    );
     assert_eq!(driver.can_mut().tx_frames.len(), 1);
+    assert_eq!(driver.pending_tx_len(), 0);
 
-    // B: 4 WouldBlock occurrences: exceeds 3 retries -> returns error
-    let mut driver_failing = DamiaoArmDriver::new(
+    // B: legacy write_joint_targets fails closed with TxDeferred and drops queued frames
+    let mut driver_legacy = DamiaoArmDriver::new(
         FlakyCanTransport {
             would_block_count: 4,
             tx_frames: Vec::new(),
@@ -209,8 +223,9 @@ fn test_damiao_write_targets_retries_on_would_block() {
         vec![1],
     );
 
-    let res_fail = driver_failing.write_joint_targets(&[JointTarget::position(0.5)]);
-    assert!(res_fail.is_err(), "Exceeding max retries must return error");
+    let res_fail = driver_legacy.write_joint_targets(&[JointTarget::position(0.5)]);
+    assert!(matches!(res_fail, Err(ArmDriverError::TxDeferred { pending: 1 })), "{res_fail:?}");
+    assert_eq!(driver_legacy.pending_tx_len(), 0, "legacy fail-closed write clears pending queue");
 }
 
 #[test]
