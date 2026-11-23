@@ -37,7 +37,8 @@
 //! queued, no plan slot stays taken, active motion is untouched.
 
 use std::collections::HashMap;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -210,6 +211,8 @@ pub struct PlanSlots<P> {
 // state is READY with the handle's generation (Acquire load after the writer's Release
 // store); the writer does not touch a READY slot until the reader moved it to RETIRED
 // (Release) and the writer saw that (Acquire). `P: Send` moves between the two threads.
+// Only one thread reads: `PlanReader` is neither `Clone` nor `Sync`, so `&P` never reaches
+// two threads at once through it (which `P: Send` alone would not make sound).
 unsafe impl<P: Send> Sync for PlanSlots<P> {}
 
 /// The broker's side of the plan slots.
@@ -218,9 +221,28 @@ pub struct PlanWriter<P> {
     retired: u64,
 }
 
-/// The RT's side of the plan slots.
+/// The RT's side of the plan slots. Not `Clone` and not `Sync`: exactly one thread reads
+/// through it. [`Self::get`] hands out `&P` for `P: Send` only, so two threads sharing a
+/// `&PlanReader` could otherwise both reach the same slot (e.g. a `&Cell` of it). It is
+/// `Send`: it can move to the RT thread.
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<armd::rt_core::broker::PlanReader<std::cell::Cell<u32>>>();
+/// ```
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<armd::rt_core::broker::PlanReader<u32>>();
+/// ```
+///
+/// ```
+/// fn send<T: Send>() {}
+/// send::<armd::rt_core::broker::PlanReader<std::cell::Cell<u32>>>();
+/// ```
 pub struct PlanReader<P> {
     slots: Arc<PlanSlots<P>>,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 /// `capacity` pre-touched plan slots, each built (allocated and written) by `make` now.
@@ -230,7 +252,7 @@ pub fn plan_slots<P: Send>(capacity: usize, mut make: impl FnMut() -> P) -> (Pla
         words: (0..capacity).map(|_| AtomicU64::new(pack(0, FREE))).collect(),
         plans: (0..capacity).map(|_| UnsafeCell::new(make())).collect(),
     });
-    (PlanWriter { slots: slots.clone(), retired: 0 }, PlanReader { slots })
+    (PlanWriter { slots: slots.clone(), retired: 0 }, PlanReader { slots, _not_sync: PhantomData })
 }
 
 impl<P> PlanWriter<P> {
@@ -566,6 +588,18 @@ mod tests {
     fn later() -> Instant { Instant::now() + Duration::from_secs(5) }
 
     fn plan(v: f32) -> impl Fn(&mut [f32; 4]) { move |p| *p = [v; 4] }
+
+    // Compile-time: `PlanReader<P>` (and so `RtIntake<P>`) is never `Sync`, even for
+    // `P: Sync`; `<T as NotSync<_>>::CHECK` is ambiguous, and fails to compile, when `T: Sync`.
+    trait NotSync<A> { const CHECK: () = (); }
+    impl<T: ?Sized> NotSync<()> for T {}
+    #[allow(dead_code)]
+    struct IsSync;
+    impl<T: ?Sized + Sync> NotSync<IsSync> for T {}
+    const _: () = <PlanReader<std::cell::Cell<u32>> as NotSync<_>>::CHECK;
+    const _: () = <PlanReader<u32> as NotSync<_>>::CHECK;
+    const _: () = <RtIntake<u32> as NotSync<_>>::CHECK;
+    fn _reader_is_send<T: Send>() { fn send<S: Send>() {} send::<PlanReader<T>>(); }
 
     #[test]
     fn authority_rechecks_in_order() {
