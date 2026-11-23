@@ -77,15 +77,156 @@ fn enable_writes_mode_4_reads_it_back_then_enables() {
     let log = bus.tx_log();
     let write = log.iter().position(|f| f.id == 0x7FF && f.data == reg_write(7, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)).expect("mode write");
     let read = log.iter().position(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)).expect("readback");
+    let hold = log.iter().position(|f| f.id == 0x307).expect("pre-enable pos-force hold");
     let enable = log.iter().position(|f| f.id == 7 && f.data == damiao::CMD_ENABLE).expect("enable frame");
-    assert!(write < read && read < enable, "order write {write} < read {read} < enable {enable}: {log:?}");
-    assert!(j7_commands(&log).is_empty(), "J7 command frame before the first target: {:?}", j7_commands(&log));
+    assert!(write < read && read < hold && hold < enable, "order write {write} < read {read} < hold {hold} < enable {enable}: {log:?}");
+    let cmds = j7_commands(&log);
+    assert_eq!(cmds.len(), 1, "only the pre-enable hold frame before enable: {cmds:?}");
+    let hold_pos = f32::from_le_bytes([cmds[0].data[0], cmds[0].data[1], cmds[0].data[2], cmds[0].data[3]]);
+    let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
+    let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
+    assert!((hold_pos - (-1.0)).abs() < 1e-3, "hold position {hold_pos}");
+    assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "hold velocity {hold_vel}");
+    assert_eq!(hold_cur, RAW);
     assert_eq!(log.iter().filter(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE).count(), 1, "only J7's mode is written");
     assert_eq!(bus.with(|s| s.motors[J7].ctrl_mode()), damiao::CTRL_MODE_POS_FORCE);
     assert_eq!(d.joint_control_modes()[J7], Some(DamiaoControlMode::PosForce));
     let cap = d.motor_current_cap().unwrap();
     assert!(cap.active && !cap.calibrated && cap.mode == "pos_force" && cap.current_raw == Some(RAW), "{cap:?}");
     assert!(cap.note.contains("uncalibrated"));
+}
+
+#[test]
+fn enable_after_restart_with_j7_already_in_mode_4_emits_readback_hold_enable() {
+    // Motor stayed powered across a host restart: J7 is already in CTRL_MODE 4 with a stale
+    // firmware target at 0.0 (closed), while the jaw is physically open at -1.75 rad.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    bus.with(|s| {
+        for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+        s.motors[J7].q = -1.75;
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        s.motors[J7].last_pos_force = Some((0.0, 200, RAW));
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(GripperPosForce { close_speed_rad_s: 0.306, ..pf() }).unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    bus.clear_log();
+
+    // Before enable, readback has not run yet so capped operation is unavailable.
+    assert!(!d.motor_current_cap().unwrap().active);
+    assert!(d.write_joint_targets(&targets(-1.75)).is_err());
+
+    d.set_torque(true).expect("enable after restart");
+    let log = bus.tx_log();
+    assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode rewritten when already 4: {log:?}");
+    let read = log.iter().position(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)).expect("readback");
+    let hold = log.iter().position(|f| f.id == 0x307).expect("pre-enable hold");
+    let enable = log.iter().position(|f| f.id == 7 && f.data == damiao::CMD_ENABLE).expect("enable");
+    assert!(read < hold && hold < enable, "order read {read} < hold {hold} < enable {enable}: {log:?}");
+    let cmds = j7_commands(&log);
+    assert_eq!(cmds.len(), 1, "{cmds:?}");
+    let hold_pos = f32::from_le_bytes([cmds[0].data[0], cmds[0].data[1], cmds[0].data[2], cmds[0].data[3]]);
+    let hold_vel = u16::from_le_bytes([cmds[0].data[4], cmds[0].data[5]]);
+    let hold_cur = u16::from_le_bytes([cmds[0].data[6], cmds[0].data[7]]);
+    assert!((hold_pos - (-1.75)).abs() < 1e-3, "hold position {hold_pos}");
+    assert_eq!(hold_vel, 30, "pre-enable hold must quantize 0.306 downward to 30 (0.30 rad/s), got {hold_vel}");
+    assert_eq!(hold_cur, RAW);
+    let last_pf = bus.with(|s| s.motors[J7].last_pos_force).expect("motor received pre-enable hold");
+    assert!((last_pf.0 - (-1.75)).abs() < 1e-3 && last_pf.1 == 30 && last_pf.2 == RAW, "{last_pf:?}");
+    assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+
+    // Without fresh J7 feedback after restart (mode already 4), enable must fail closed before sending a hold or enable.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    bus.with(|s| {
+        s.motors[J7].q = -1.75;
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(pf()).unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    clock.advance(Duration::from_millis(200));
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    bus.clear_log();
+    let err = d.set_torque(true).unwrap_err().to_string();
+    assert!(err.contains("no fresh measured position"), "{err}");
+    assert!(j7_commands(&bus.tx_log()).is_empty(), "sent J7 hold on stale feedback");
+    assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE), "sent enable on stale feedback");
+    assert!(!d.is_enabled());
+
+    // A frame queued BEFORE the driver's first empty-queue observation has unknown age and must not
+    // supply the pre-enable hold position on restart either.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock);
+    bus.with(|s| {
+        s.motors[J7].q = -1.75;
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        s.push_all_feedback();
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(pf()).unwrap();
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    bus.clear_log();
+    let err = d.set_torque(true).unwrap_err().to_string();
+    assert!(err.contains("no fresh measured position"), "accepted unknown-age startup sample: {err}");
+    assert!(j7_commands(&bus.tx_log()).is_empty(), "sent J7 hold on unknown-age startup sample");
+    assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+    assert!(!d.is_enabled());
+
+    // Repeated set_torque(true) when J7 feedback is 150 ms old (> 100 ms pos-force bound, < 250 ms
+    // driver bound) while J1-J6 stay fresh at state 1 must NOT take the fast path: it fails closed
+    // without sending a hold or enable frame.
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(150));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    d.read_joint_states().unwrap();
+    assert!(d.is_feedback_valid(), "J7 at 150 ms is still within 250 ms driver bound");
+    bus.clear_log();
+    let err = d.set_torque(true).unwrap_err().to_string();
+    assert!(err.contains("no fresh measured position"), "took fast path past 100 ms J7 bound: {err}");
+    assert!(j7_commands(&bus.tx_log()).is_empty(), "sent J7 hold with 150 ms stale feedback");
+    assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+    assert!(!d.is_enabled() && !d.motor_current_cap().unwrap().active);
+
+    // check_mapping_ranges must NOT promote a PosForce joint from a wrong-CAN-ID CTRL_MODE=4 reply,
+    // and must NOT promote an uncertain non-PosForce joint back to Some(PosVel).
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock);
+    bus.with(|s| {
+        s.motors[J7].q = -1.75;
+        s.motors[J7].reply_id = 0x16; // wrong MST_ID for J7
+        s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(pf()).unwrap();
+    d.check_mapping_ranges();
+    assert_eq!(d.joint_control_modes()[J7], None, "promoted J7 to PosForce from wrong CAN ID 0x16");
+
+    let (mut d_leg, bus_leg, _) = rig(false);
+    // Force J1 mode to None via a failed mode switch, then run check_mapping_ranges: J1 must stay None.
+    bus_leg.with(|s| s.motors[0].no_write_ack = true);
+    let mut mit_j1 = vec![armd::driver::JointMode::Position; 7];
+    mit_j1[0] = armd::driver::JointMode::Mit;
+    assert!(d_leg.set_joint_modes(&mit_j1, &targets(-1.0)).is_err());
+    assert_eq!(d_leg.joint_control_modes()[0], None);
+    d_leg.check_mapping_ranges();
+    assert_eq!(d_leg.joint_control_modes()[0], None, "check_mapping_ranges promoted uncertain non-PosForce joint");
 }
 
 #[test]
