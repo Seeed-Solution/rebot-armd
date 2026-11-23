@@ -19,7 +19,7 @@
 //!   with `generation >= g`.
 //! - `meta.valid_until` is the local deadline after which time-derived fields would flip
 //!   without a write (lease expiry, previous-action window, 250 ms feedback freshness behind
-//!   `feedback_valid` / `enable_state`; `SupervisorInner::observation_valid_for`), capped at
+//!   `feedback_valid` / `enable_state`; `SupervisorInner::observation_valid_until`), capped at
 //!   two control periods.
 //! - `rt` holds the per-joint feedback the tick also used (positions, velocities, receive
 //!   instants and per-joint feedback sequence numbers), sized for this arm's profile.
@@ -142,6 +142,12 @@ struct HubState {
     latest: Option<Arc<Snapshot>>,
 }
 
+/// Result of [`StateHub::try_latest`].
+pub enum Poll {
+    Ready(Option<Arc<Snapshot>>),
+    Busy,
+}
+
 /// The readers' side (the dispatcher): the newest sample, and the wake-up of the dispatcher
 /// thread that forwards samples to subscribers.
 pub struct StateHub {
@@ -175,6 +181,10 @@ impl StateHub {
     /// side when the last `Arc` drops, not in the tick).
     pub fn latest(&self) -> Option<Arc<Snapshot>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::refresh(&mut st)
+    }
+
+    fn refresh(st: &mut HubState) -> Option<Arc<Snapshot>> {
         if st.consumer.refresh() {
             let slot = st.consumer.front_mut();
             if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.take()) {
@@ -188,6 +198,15 @@ impl StateHub {
     /// Holds the readers' mutex (tests: a preempted reader).
     #[doc(hidden)]
     pub fn reader_guard(&self) -> impl Drop + '_ { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
+
+    /// [`latest`](Self::latest) without waiting: `Busy` while another reader holds the hub.
+    pub fn try_latest(&self) -> Poll {
+        match self.state.try_lock() {
+            Ok(mut st) => Poll::Ready(Self::refresh(&mut st)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Poll::Ready(Self::refresh(&mut p.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => Poll::Busy,
+        }
+    }
 
     /// `seq` of the newest publication, without the hub mutex (0: none yet).
     pub fn published_seq(&self) -> u64 { self.published.load(Ordering::Acquire) }

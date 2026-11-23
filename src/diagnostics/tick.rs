@@ -166,6 +166,9 @@ pub struct ObservationCacheStats {
     /// Hits that waited for the next tick's sample (a write or an expiry since the last one).
     #[serde(default)]
     pub waited: u64,
+    /// Requests answered 503 `OBSERVATION_UNAVAILABLE` (no sample and the lock stayed busy).
+    #[serde(default)]
+    pub unavailable: u64,
     /// Samples published by the tick so far.
     #[serde(default)]
     pub published: u64,

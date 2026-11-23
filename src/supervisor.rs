@@ -1735,24 +1735,28 @@ impl SupervisorInner {
         }
     }
 
-    /// How long `obs` (computed now by [`Self::current_observation`]) stays correct with
-    /// no write: until the first clock-driven flip of the lease holder, the previous-action
-    /// window or the 250 ms feedback freshness behind `feedback_valid` / `enable_state`.
-    pub fn observation_valid_for(&self, obs: &ArmObservation) -> Duration {
+    /// When `obs` (computed by [`Self::current_observation`]) was sampled and the absolute
+    /// local deadline until which it stays correct with no write: the first clock-driven
+    /// flip of the lease holder (`acquired_at + lease_timeout`), the previous-action window
+    /// (`start_time + until`) or the 250 ms feedback freshness behind `feedback_valid` /
+    /// `enable_state`, capped at `max_age` after the sample. Both come from the clocks the
+    /// observation was computed from, so a later publication does not extend them.
+    pub fn observation_valid_until(&self, obs: &ArmObservation, max_age: Duration) -> (Instant, Instant) {
         const FEEDBACK_FRESH: Duration = Duration::from_millis(250);
-        let mut valid = Duration::MAX;
+        let sampled = self.start_time + Duration::from_secs_f64(obs.timestamp.max(0.0));
+        let mut until = sampled + max_age;
         if let Some(lease) = self.active_lease.as_ref() {
-            valid = valid.min(self.lease_timeout.saturating_sub(lease.acquired_at.elapsed()));
+            until = until.min(lease.acquired_at + self.lease_timeout);
         }
-        if let Some((_, until)) = self.previous_action.as_ref() {
-            if obs.timestamp < *until { valid = valid.min(Duration::from_secs_f64(until - obs.timestamp)); }
+        if let Some((_, end)) = self.previous_action.as_ref() {
+            if obs.timestamp < *end { until = until.min(self.start_time + Duration::from_secs_f64(*end)); }
         }
-        // ages are whole ms, truncated: one more ms of margin
+        // ages are whole ms, truncated and read after `timestamp`: one more ms of margin
         if let Some(oldest) = obs.feedback_age_ms.iter().flatten().max() {
             let age = Duration::from_millis(oldest.saturating_add(1));
-            if age <= FEEDBACK_FRESH { valid = valid.min(FEEDBACK_FRESH - age); }
+            if age <= FEEDBACK_FRESH { until = until.min(sampled + (FEEDBACK_FRESH - age)); }
         }
-        valid
+        (sampled, until.max(sampled))
     }
 
     pub fn current_observation(&self) -> ArmObservation {
@@ -7563,11 +7567,15 @@ pub struct ArmSupervisor {
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
     obs_waits: AtomicU64,
+    obs_unavailable: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
 const OBS_POLL: Duration = Duration::from_millis(1);
+
+/// How long [`ArmSupervisor::observation`] waits for the read lock when no sample answers.
+pub const OBS_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 /// A published sample, or the read guard when no sample answers (no control loop running).
 enum Fresh<'a> {
@@ -7603,6 +7611,7 @@ impl ArmSupervisor {
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
             obs_waits: AtomicU64::new(0),
+            obs_unavailable: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7642,7 +7651,8 @@ impl ArmSupervisor {
         &self.inner
     }
 
-    /// The current observation, without the supervisor lock while the control loop runs.
+    /// The current observation, without the supervisor lock while the control loop runs
+    /// (`GET /api/v1/observation`).
     ///
     /// Served from the tick's publication (`crate::rt_core::publish`): a sample answers when
     /// it was taken after every write that completed before this call (its lock generation is
@@ -7650,11 +7660,23 @@ impl ArmSupervisor {
     /// previous-action window, feedback freshness, two control periods). Otherwise, while a
     /// sample younger than two control periods shows the control loop running, the call waits
     /// for the next tick's sample (at most two periods). Without a running loop the
-    /// observation is computed under the read lock, as before.
+    /// observation is computed under the read lock, waiting for it at most
+    /// [`OBS_LOCK_WAIT`]; when neither gives fresh state in time the call fails with 503
+    /// `OBSERVATION_UNAVAILABLE` instead of waiting further. The hub is only polled
+    /// (never waited for), and not at all while the read guard is held.
+    pub async fn observation(&self) -> Result<ArmObservation, ArmError> {
+        match self.fresh(true).await? {
+            Fresh::Sample(s) => Ok(s.obs.clone()),
+            Fresh::Locked(inner) => Ok(inner.current_observation()),
+        }
+    }
+
+    /// [`Self::observation`] for in-process callers and tests: when it is unavailable, waits
+    /// for the read lock without a bound (the 1.5 behaviour).
     pub async fn get_observation(&self) -> ArmObservation {
-        match self.fresh(true).await {
-            Fresh::Sample(s) => s.obs.clone(),
-            Fresh::Locked(inner) => inner.current_observation(),
+        match self.observation().await {
+            Ok(obs) => obs,
+            Err(_) => self.inner.read().await.current_observation(),
         }
     }
 
@@ -7664,33 +7686,56 @@ impl ArmSupervisor {
         s.meta.generation >= want && now <= s.meta.valid_until
     }
 
-    async fn fresh(&self, count: bool) -> Fresh<'_> {
+    async fn fresh(&self, count: bool) -> Result<Fresh<'_>, ArmError> {
+        use crate::rt_core::publish::Poll;
         let want = self.inner.generation();
         let started = Instant::now();
         let bound = self.wait_bound();
         let mut waited = false;
-        while let Some(s) = self.hub.latest() {
+        loop {
             let now = Instant::now();
-            if Self::answers(&s, want, now) {
-                if count {
-                    self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
-                    if waited { self.obs_waits.fetch_add(1, Ordering::Relaxed); }
+            match self.hub.try_latest() {
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(s)) => {
+                    if Self::answers(&s, want, now) {
+                        if count {
+                            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
+                            if waited { self.obs_waits.fetch_add(1, Ordering::Relaxed); }
+                        }
+                        return Ok(Fresh::Sample(s));
+                    }
+                    if now.saturating_duration_since(s.meta.sampled_at) > bound { break; }
                 }
-                return Fresh::Sample(s);
+                // another reader holds the hub: look again
+                Poll::Busy => {}
             }
-            if now.duration_since(s.meta.sampled_at) > bound || now.duration_since(started) >= bound { break; }
+            if now.duration_since(started) >= bound { break; }
             waited = true;
             tokio::time::sleep(OBS_POLL).await;
         }
-        let inner = self.inner.read().await;
-        // a tick may have published while this call waited for the lock
-        if let Some(s) = self.hub.latest().filter(|s| Self::answers(s, want, Instant::now())) {
-            drop(inner);
-            if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
-            return Fresh::Sample(s);
+        let Ok(inner) = tokio::time::timeout(OBS_LOCK_WAIT, self.inner.read()).await else {
+            // a stalled tick (or writer) holds the lock: one last non-blocking look
+            if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+                if Self::answers(&s, want, Instant::now()) {
+                    if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                    return Ok(Fresh::Sample(s));
+                }
+            }
+            if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+            return Err(ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
+                message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() });
+        };
+        // a tick may have published while this call waited for the lock; never wait for the
+        // hub while holding the guard
+        if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+            if Self::answers(&s, want, Instant::now()) {
+                drop(inner);
+                if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                return Ok(Fresh::Sample(s));
+            }
         }
         if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
-        Fresh::Locked(inner)
+        Ok(Fresh::Locked(inner))
     }
 
     /// The newest sample while the control loop runs (one younger than two control
@@ -8006,12 +8051,10 @@ impl ArmSupervisor {
             let pending_zc = inner.pending_zero_check_persist.take();
             let control_hz = inner.config.control_frequency_hz;
             // Published before the guard drops: no other write can come in between.
-            let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
-                .min(inner.observation_valid_for(&obs));
+            let (sampled_at, valid_until) = inner.observation_valid_until(&obs, Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1))));
             let kept = keep.then(|| obs.clone());
-            let at = Instant::now();
             let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *inner;
-            let displaced = core.publish(generation, at, at + max_age, obs, measured_positions, measured_velocities);
+            let displaced = core.publish(generation, sampled_at, valid_until, obs, measured_positions, measured_velocities);
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
             (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, displaced,
@@ -8300,6 +8343,7 @@ impl ArmSupervisor {
             misses: self.obs_cache_misses.load(Ordering::Relaxed),
             publish_skipped: 0,
             waited: self.obs_waits.load(Ordering::Relaxed),
+            unavailable: self.obs_unavailable.load(Ordering::Relaxed),
             published: self.hub.published_seq(),
         };
         snap
@@ -8423,6 +8467,48 @@ mod observation_snapshot_tests {
         assert_eq!((c.hits, c.misses, c.waited), (1, 0, 1));
     }
 
+    /// A tick that stalls inside its write guard: GET /observation answers 503 within its
+    /// bounds instead of waiting for the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_tick_gives_observation_unavailable_in_bounded_time() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.tick(0.02).await;
+        let stalled = sup.inner().write().await; // the tick never releases its guard
+        let t = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(3), sup.observation()).await.expect("must not hang");
+        let e = r.expect_err("no fresh state");
+        assert!(matches!(&e, ArmError::Rejected { status: 503, code, .. } if code == "OBSERVATION_UNAVAILABLE"), "{e:?}");
+        assert!(t.elapsed() < OBS_LOCK_WAIT + Duration::from_millis(300), "{:?}", t.elapsed());
+        assert_eq!(sup.tick_stats().observation_cache.unavailable, 1);
+        drop(stalled);
+        assert!(sup.observation().await.is_ok());
+    }
+
+    /// A preempted reader holding the hub mutex: a request after a write neither waits for
+    /// it nor holds the read guard while waiting for it, so ticks keep running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_stuck_on_the_hub_does_not_block_the_fallback_or_the_tick() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.tick(0.02).await;
+        sup.set_temperatures(vec![50.0; 7]).await;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let sup = sup.clone();
+            std::thread::spawn(move || {
+                let _g = sup.hub.reader_guard();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        let obs = tokio::time::timeout(Duration::from_secs(2), sup.observation()).await.expect("bounded").unwrap();
+        assert_eq!(obs.temperatures, vec![50.0; 7]);
+        tokio::time::timeout(Duration::from_millis(500), sup.tick(0.02)).await.expect("tick runs");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+    }
+
     /// Recording boundaries: the saved frames are exactly the ticks between start and stop,
     /// with the values the 1.5 in-tick append recorded (the tick's observation timestamp,
     /// measured and commanded positions), also across ring drains.
@@ -8490,8 +8576,15 @@ mod observation_snapshot_tests {
         inner.active_lease = None;
         let mut obs = inner.current_observation();
         obs.feedback_age_ms = vec![Some(10), Some(240), None];
-        assert_eq!(inner.observation_valid_for(&obs), Duration::from_millis(9));
+        let cap = Duration::from_secs(1);
+        let (at, until) = inner.observation_valid_until(&obs, cap);
+        assert_eq!(until - at, Duration::from_millis(9));
+        assert_eq!(at, inner.start_time + Duration::from_secs_f64(obs.timestamp));
         obs.feedback_age_ms = vec![Some(300)];
-        assert_eq!(inner.observation_valid_for(&obs), Duration::MAX);
+        let (at, until) = inner.observation_valid_until(&obs, cap);
+        assert_eq!(until - at, cap);
+        // the deadline comes from the sample, not from when it is evaluated
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(inner.observation_valid_until(&obs, cap), (at, until));
     }
 }

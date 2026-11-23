@@ -380,8 +380,8 @@ impl From<ArmError> for ApiError {
 /// GET /api/v1/observation
 pub async fn get_observation(
     State(supervisor): State<Arc<ArmSupervisor>>,
-) -> Json<ArmObservation> {
-    Json(supervisor.get_observation().await)
+) -> Result<Json<ArmObservation>, ApiError> {
+    Ok(Json(supervisor.observation().await?))
 }
 
 /// GET /api/v1/observation/schema
