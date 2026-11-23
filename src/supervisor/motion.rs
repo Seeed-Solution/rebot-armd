@@ -89,6 +89,102 @@ impl SupervisorInner {
         self.apply_stop_policy(policy);
     }
 
+    /// Execute the `StopPolicy::EStopLatch` transition without ever blocking on `driver`.
+    /// Separated from `self.driver` so tests can verify real multi-thread mutex contention
+    /// against the exact production latch path in safe Rust.
+    #[doc(hidden)]
+    pub fn apply_estop_latch_with_driver(&mut self, driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        // Immediate rigid lock at current position, latch E-Stop, advance epoch.
+        // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
+        self.pending_normal_unload = false;
+        self.unload_settle = None;
+        self.active_trajectory = None;
+        self.servo_target = None;
+
+        // Lock onto measured_positions only when finite and the supervisor's own coherent
+        // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
+        // alongside `measured_positions`) is provably within the 250 ms freshness bound
+        // against the driver's clock. Use non-blocking `try_lock` so E-stop never waits on
+        // a contended driver mutex; if contended, poisoned, stale, or unbounded, hold
+        // `commanded_positions`.
+        const ESTOP_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
+        let (driver_contended, snapshot_fresh) = match driver {
+            None => (false, self.feedback_numeric_valid),
+            Some(d) => match d.try_lock() {
+                Err(_) => (true, false),
+                Ok(drv) => {
+                    let now = drv.clock_now();
+                    let dof = self.config.dof;
+                    let fb = self.core.feedback();
+                    let fresh = self.feedback_numeric_valid
+                        && (0..dof).all(|i| {
+                            fb.instant(i).is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                        })
+                        && {
+                            drv.feedback_queue_bounds_into(&mut self.scratch.fb.bounds);
+                            if self.scratch.fb.bounds.is_empty() {
+                                true
+                            } else {
+                                self.joint_feedback_queue_bounds.len() == dof
+                                    && self.joint_feedback_queue_bounds.iter().all(|b| {
+                                        b.is_some_and(|t| now.saturating_duration_since(t) <= ESTOP_FEEDBACK_MAX_AGE)
+                                    })
+                            }
+                        };
+                    (false, fresh)
+                }
+            },
+        };
+        if self.measured_positions.iter().all(|p| p.is_finite())
+            && self.measured_positions.len() == self.config.dof
+            && snapshot_fresh
+        {
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+        }
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+
+        // Transition floating gravity compensation to Exiting using the freshness-gated
+        // hold position (never overwriting pre-stop commands with stale readings and never taking
+        // a blocking `d.lock()` in `gravity_comp_write_now`).
+        let mut exited_gravity_comp = false;
+        if let Some(run) = self.gravity_comp.as_mut() {
+            if run.phase.floating() {
+                let mut hold = [0.0f32; 6];
+                for (dst, &src) in hold.iter_mut().zip(&self.commanded_positions) { *dst = src; }
+                run.phase = crate::gravity_comp::GravityCompPhase::Exiting { hold, elapsed_s: 0.0 };
+                run.position = hold;
+                for (dst, &src) in run.kp.iter_mut().zip(&run.policy.hold_kp) { *dst = src; }
+                for (dst, &src) in run.kd.iter_mut().zip(&run.policy.hold_kd) { *dst = src; }
+                self.tracking.invalidate();
+                let at = self.start_time.elapsed().as_secs_f64();
+                tracing::warn!("Gravity compensation exit: ESTOP E-stop");
+                self.gravity_comp_last_exit = Some(crate::model::GravityCompExit {
+                    code: "ESTOP".into(),
+                    message: "E-stop".into(),
+                    at,
+                });
+                exited_gravity_comp = true;
+            }
+        }
+
+        self.commanded_velocities.fill(0.0);
+        if driver.is_none() {
+            self.measured_velocities.fill(0.0);
+        }
+        // Send the stiff MIT exit hold immediately when uncontended; never block on a held mutex.
+        if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
+            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), driver) {
+                if let Ok(mut drv) = d.try_lock() {
+                    if let Err(e) = drv.write_joint_targets(&targets) {
+                        tracing::error!("Gravity comp hold write failed: {e}");
+                    }
+                }
+            }
+        }
+        self.safety.trigger_e_stop();
+    }
+
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() {
@@ -286,25 +382,9 @@ impl SupervisorInner {
                 }
             }
             StopPolicy::EStopLatch => {
-                self.e_stop_latched.store(true, Ordering::SeqCst);
-                self.exit_gravity_comp("ESTOP", "E-stop");
-                // Immediate rigid lock at current position, latch E-Stop, advance epoch
-                // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false
-                self.pending_normal_unload = false;
-                self.unload_settle = None;
-                self.active_trajectory = None;
-                self.servo_target = None;
-                if self.measured_positions.iter().all(|p| p.is_finite())
-                    && self.measured_positions.len() == self.config.dof
-                {
-                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
-                }
-                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
-                self.commanded_velocities.fill(0.0);
-                if self.driver.is_none() {
-                    self.measured_velocities.fill(0.0);
-                }
-                self.safety.trigger_e_stop();
+                let driver = self.driver.take();
+                self.apply_estop_latch_with_driver(driver.as_ref());
+                self.driver = driver;
             }
             StopPolicy::ThermalTrip => {
                 self.stop_motion();
@@ -821,6 +901,9 @@ impl SupervisorInner {
         // 3. Only renew lease AFTER command validation and planning succeed
         self.last_heartbeat = Instant::now();
 
+        if self.config.gripper_index().is_some_and(|g| (target_positions[g] - self.commanded_positions[g]).abs() > 1e-4) {
+            self.gripper_hold_vel_ceiling = None;
+        }
         self.servo_target = None;
         self.servo_ws_min_depths = None;
         self.target_positions = target_positions;

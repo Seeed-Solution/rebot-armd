@@ -509,7 +509,7 @@ impl SupervisorInner {
                         kd: None,
                     })
                     .collect();
-                let write_res = self.write_output(targets, 1.0 / f64::from(self.config.control_frequency_hz.max(1)));
+                let write_res = self.write_output_with_limits(targets, 1.0 / f64::from(self.config.control_frequency_hz.max(1)), &ramp.limits);
                 match write_res {
                     Some(Ok(())) => {
                         let done = fb.done;

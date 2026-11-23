@@ -199,6 +199,10 @@ fn damiao_legacy_mode_restore_retry_and_final_target_flush_respect_estop_gate() 
         .unwrap();
     drv_r.set_estop_gate(EstopGate::new(estop_req_r.clone(), estop_app_r));
     drv_r.read_joint_states().unwrap();
+    // Establish an empty-queue receive bound before pushing fresh J7 feedback so
+    // `fresh_measured_position(6)` passes and `begin_torque(true)` enters `write_modes_send`.
+    raw_r.with(|s| s.push_all_feedback());
+    drv_r.read_joint_states().unwrap();
     // Legacy path (`rt_no_sleep` remains false); inject WouldBlock on attempt 1 of mode restore.
     bus_r.tx_calls.store(0, Ordering::SeqCst);
     bus_r.flush_calls.store(0, Ordering::SeqCst);

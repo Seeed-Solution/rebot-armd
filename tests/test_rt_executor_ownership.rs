@@ -2719,6 +2719,10 @@ fn damiao_mid_retry_and_mode_restore_estop_and_legacy_gravity_comp_exit() {
     let mut bus_pf2 = CountingBus::new(raw_pf2.clone(), Some(clock.clone()));
     bus_pf2.estop_on_tx = Some((estop_req_pf2.clone(), 1)); // latch on very first mode-write frame!
     let mut drv_pf2 = make_pf_drv(bus_pf2.clone());
+    // Establish an empty-queue receive bound before pushing fresh J7 feedback so
+    // `begin_torque_budgeted(true, 0)` enters `write_modes_send` directly (testing mid-TX E-stop).
+    raw_pf2.with(|s| s.push_all_feedback());
+    drv_pf2.read_joint_states().unwrap();
     drv_pf2.set_estop_gate(armd::rt_core::urgent::EstopGate::new(estop_req_pf2.clone(), estop_app_pf2));
     // Ensure flush gets inhibited right after the 1st mode write frame!
     bus_pf2.tx_seen.store(0, Ordering::SeqCst);
