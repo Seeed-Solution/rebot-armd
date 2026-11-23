@@ -8,8 +8,8 @@
 //! lock ([`persist_and_activate`]); at the commit boundary (one supervisor write guard) the
 //! connection's authorization, lease and epoch are rechecked, the domain is reserved at the
 //! revision the candidate was built from, the file is renamed into place, the candidate is
-//! applied and the reservation activated. The directory sync runs after the guard is
-//! released and decides `durability_confirmed`.
+//! applied and the reservation activated (`DurableUnconfirmed` until the directory sync,
+//! which runs after the guard is released and decides `durability_confirmed`).
 
 #[allow(unused_imports)]
 use super::*;
@@ -166,7 +166,7 @@ impl PreparedConfigWrite {
 
     /// Commits a write with nothing to persist: reserve, apply, activate (`Volatile`).
     pub(super) fn commit(self, inner: &mut SupervisorInner) -> Result<Vec<(&'static str, Value)>, ArmError> {
-        inner.commit_config(self.domain(), self.base_revision(), 0, Durability::Volatile, |inner| self.apply(inner)).map(|(fields, _)| fields)
+        inner.commit_config(self.domain(), self.base_revision(), 0, |inner| self.apply(inner)).map(|(fields, _)| fields)
     }
 
     /// Applies the candidate (moves its domain to the next revision); called only under a
@@ -293,12 +293,17 @@ fn commit_staged(
     let dir_sync = match staged.rename_only() {
         Ok(d) => d,
         Err(e) => {
-            crate::rt_core::config_iface::ConfigAuthority::release(inner, reservation);
+            let _ = crate::rt_core::config_iface::ConfigAuthority::release(inner, reservation);
             tracing::warn!("State file not published: {e}");
             return Err(command_reject(inner, request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}"))));
         }
     };
-    match inner.activate_config_candidate(reservation, Durability::Durable, |inner| prepared.apply(inner)) {
+    // renamed; the directory sync runs after the guard (`durability_confirmed` in the ack)
+    let reservation = match inner.config_persisted(reservation, Durability::DurableUnconfirmed) {
+        Ok(r) => r,
+        Err(err) => return Err(command_reject(inner, request_id, err.into())),
+    };
+    match inner.activate_config_candidate(reservation, |inner| prepared.apply(inner)) {
         Ok((fields, _)) => {
             let mut ack = command_ack(inner, request_id, None);
             for (key, field) in fields { ack[key] = field; }
@@ -306,8 +311,9 @@ fn commit_staged(
             Ok((ack, dir_sync))
         }
         Err(err) => {
-            // The file is in place but the candidate is not active: on the next start the
-            // loader activates the file (active and durable versions reconcile there).
+            // The file is in place but the candidate is not active: the hold is Reconciling
+            // (motion inhibited, further changes CONFIG_BUSY) until the next start, whose
+            // loader activates the file.
             tracing::error!("{} written but not activated: {err}", dir_sync.target().display());
             Err(command_reject(inner, request_id, err.into()))
         }

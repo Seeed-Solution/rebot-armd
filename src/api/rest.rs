@@ -931,17 +931,18 @@ pub async fn post_tool_commissioning_confirm(
         let ds = match staged.rename_only() {
             Ok(ds) => ds,
             Err(e) => {
-                crate::rt_core::config_iface::ConfigAuthority::release(&mut *inner, reservation);
+                let _ = crate::rt_core::config_iface::ConfigAuthority::release(&mut *inner, reservation);
                 return Err(ApiError::persist_failed(format!("commissioning rename failed: {e}")));
             }
         };
-        let ((active_tool, _), revision) = inner.activate_config_candidate(reservation, crate::rt_core::config_iface::Durability::Durable, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
+        let reservation = inner.config_persisted(reservation, crate::rt_core::config_iface::Durability::DurableUnconfirmed)?;
+        let ((active_tool, _), revision) = inner.activate_config_candidate(reservation, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
         (ds, active_tool, revision)
     } else {
         let mut inner = supervisor.inner().write().await;
         crate::tool::precheck_commissioning_confirm(&inner, &prepared)?;
         let base = prepared.base_revision;
-        let ((active_tool, _), revision) = inner.commit_config(crate::rt_core::config_iface::ConfigDomain::ToolCommissioning, base, 0, crate::rt_core::config_iface::Durability::Volatile, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
+        let ((active_tool, _), revision) = inner.commit_config(crate::rt_core::config_iface::ConfigDomain::ToolCommissioning, base, 0, |inner| crate::tool::commit_commissioning_confirm(inner, prepared))?;
         return Ok(Json(serde_json::json!({
             "active_tool": active_tool,
             "commissioning_required": active_tool.commissioning_required,
