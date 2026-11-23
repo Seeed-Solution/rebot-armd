@@ -582,6 +582,8 @@ pub struct SupervisorInner {
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
     /// Highest E-stop request generation dropped if `pending_estop_acks` ever reached capacity 64.
     pub(crate) estop_ack_overflow_gen: u64,
+    /// Preallocated queue of heap-owning motion payloads retired on `armd-control` for off-thread drop.
+    pub(crate) pending_retired_stops: std::collections::VecDeque<crate::rt_core::urgent::RetiredStopPayloads>,
     /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
     pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -706,11 +708,11 @@ impl SupervisorInner {
             feedback_numeric_valid: true,
             sim_time_s: 0.0,
             last_still_since_s: None,
-            still_anchor_positions: Vec::new(),
+            still_anchor_positions: Vec::with_capacity(dof),
             still_window_ever_moved: false,
-            table_still_first_rx_instants: Vec::new(),
-            table_still_last_rx_instants: Vec::new(),
-            table_still_anchor_positions: Vec::new(),
+            table_still_first_rx_instants: Vec::with_capacity(dof),
+            table_still_last_rx_instants: Vec::with_capacity(dof),
+            table_still_anchor_positions: Vec::with_capacity(dof),
             torques: vec![0.0; dof],
             loads: vec![0.0; dof],
             temperatures: vec![25.0; dof],
@@ -805,7 +807,7 @@ impl SupervisorInner {
             gravity_torques_ramped: vec![0.0; dof],
             last_can_feedback_instant: None,
             core: crate::rt_core::ArmCore::new(dof),
-            joint_feedback_queue_bounds: Vec::new(),
+            joint_feedback_queue_bounds: Vec::with_capacity(dof),
             scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
             ws_eval_bufs: Default::default(),
             bus_loss_instant: None,
@@ -863,6 +865,9 @@ impl SupervisorInner {
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
             estop_ack_overflow_gen: 0,
+            pending_retired_stops: std::collections::VecDeque::with_capacity(
+                crate::rt_core::urgent::URGENT_STOP_CAPACITY,
+            ),
             before_publish_hook: None,
         }
     }
@@ -4960,6 +4965,17 @@ impl ArmSupervisor {
         &self,
         stop: crate::rt_core::urgent::UrgentStop,
     ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
+        self.urgent_stop_with_legacy_hook(stop, || {}).await
+    }
+
+    /// Like [`Self::urgent_stop`], running `on_legacy_applied` strictly inside the legacy
+    /// `inner.write()` critical section alongside the stop mutation (so `policy_stop_gen`
+    /// advances atomically with respect to concurrent policy-load installation).
+    pub(crate) async fn urgent_stop_with_legacy_hook(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+        on_legacy_applied: impl FnOnce(),
+    ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
         use crate::rt_core::urgent::UrgentStopOutcome;
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::urgent_stop");
         match self.owner_mode() {
@@ -4990,6 +5006,7 @@ impl ArmSupervisor {
                     guard.exit_gravity_comp("STOPPED", "Stop command");
                     guard.stop_motion();
                     guard.request_macro_stop();
+                    on_legacy_applied();
                     return Ok(UrgentStopOutcome::Applied {
                         stop_generation: 0,
                         applied_to_motion: true,
@@ -5765,5 +5782,53 @@ mod observation_snapshot_tests {
         // the deadline comes from the sample, not from when it is evaluated
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(inner.observation_valid_until(&obs, cap), (at, until));
+    }
+
+    #[tokio::test]
+    async fn legacy_urgent_stop_advances_policy_gen_inside_write_lock_only_on_apply() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        let conn = "connection:policy-race";
+        let (gen, ep) = {
+            let mut inner = sup.inner().write().await;
+            let g = inner.acquire_lease(conn).unwrap();
+            inner.set_torque(true).unwrap();
+            (g, inner.safety.epoch_id())
+        };
+        let policy_stop_gen = Arc::new(AtomicU64::new(0));
+        let mk = |lg, e| crate::rt_core::urgent::UrgentStop {
+            connection: crate::model::HolderLabel::new(conn),
+            lease_generation: lg,
+            epoch: Some(e),
+            request_id: 1,
+            request_id_valid: true,
+            body_error: None,
+        };
+        // Refused stop (wrong epoch / wrong lease) must NOT advance policy_stop_gen.
+        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), || { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
+        assert!(matches!(r_refused, crate::rt_core::urgent::UrgentStopOutcome::EpochMismatch { .. }));
+        assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 0);
+
+        // Authorized stop must advance policy_stop_gen BEFORE releasing `inner.write()`, so a
+        // concurrent policy-load installer queued on `inner.write()` observes the bump immediately.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (s1, p1, e1, r1) = (sup.clone(), policy_stop_gen.clone(), entered.clone(), release.clone());
+        let stop_task = tokio::spawn(async move {
+            s1.urgent_stop_with_legacy_hook(mk(gen, ep), || {
+                p1.fetch_add(1, Ordering::SeqCst);
+                e1.notify_one();
+                // Yield briefly while still holding `inner.write()` so the installer task queues on the lock.
+                std::thread::sleep(Duration::from_millis(15));
+                r1.notify_one();
+            }).await.unwrap()
+        });
+        entered.notified().await;
+        // Now acquire `inner.write()` just like policy-load completion does: as soon as the lock
+        // is granted, `policy_stop_gen` MUST already be 1 (zero race window after Stop applies).
+        let _guard = sup.inner().write().await;
+        assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 1);
+        drop(_guard);
+        let outcome = stop_task.await.unwrap();
+        assert!(matches!(outcome, crate::rt_core::urgent::UrgentStopOutcome::Applied { .. }));
     }
 }

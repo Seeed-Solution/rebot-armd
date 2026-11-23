@@ -27,8 +27,8 @@ use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE
 use super::publish::StateHub;
 use super::sched::{self, MemoryLock, RtReadiness, RtSchedConfig};
 use super::urgent::{
-    urgent_stop_channel, StopRequests, UrgentStop, UrgentStopClient, UrgentStopError,
-    UrgentStopOutcome, URGENT_STOP_CAPACITY,
+    urgent_stop_channel, RetiredStopPayloads, StopRequests, UrgentStop, UrgentStopClient,
+    UrgentStopError, UrgentStopOutcome, URGENT_STOP_CAPACITY,
 };
 use crate::diagnostics::tick::{LockPhases, ThreadUsage, TickSample, UsageMark};
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
@@ -659,6 +659,7 @@ pub(crate) struct OffThreadSinks {
     diag_rx: Mutex<Consumer<TickSample>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
     reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
+    reclaim_stop_rx: Mutex<Consumer<RetiredStopPayloads>>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
@@ -688,6 +689,12 @@ impl OffThreadSinks {
             let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(arc) = rx.pop() {
                 drop(arc);
+            }
+        }
+        {
+            let mut rx = self.reclaim_stop_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(retired) = rx.pop() {
+                drop(retired);
             }
         }
         self.maint_client.drain_replies();
@@ -1077,6 +1084,7 @@ pub(crate) fn spawn_executor(
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
+    let (reclaim_stop_tx, reclaim_stop_rx) = RingBuffer::<RetiredStopPayloads>::new(URGENT_STOP_CAPACITY);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -1101,6 +1109,7 @@ pub(crate) fn spawn_executor(
         diag_rx: Mutex::new(diag_rx),
         estop_reg: estop_reg.clone(),
         reclaim_state_rx: Mutex::new(reclaim_state_rx),
+        reclaim_stop_rx: Mutex::new(reclaim_stop_rx),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -1157,6 +1166,7 @@ pub(crate) fn spawn_executor(
                 estop_ack_tx,
                 estop_overflow_gen,
                 reclaim_state_tx,
+                reclaim_stop_tx,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -1239,6 +1249,7 @@ struct ControlState {
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_stop_tx: Producer<RetiredStopPayloads>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     /// Reply for a maintenance op serviced before Step 3 commit / Step 6 publish, held until
@@ -1275,8 +1286,9 @@ impl ControlState {
         }
     }
 
-    /// Moves retired fault `Arc<SafetyState>` snapshots off `armd-control` into the bounded SPSC
-    /// reclamation ring (never pops when the ring is full so no `Arc` can drop on `armd-control`).
+    /// Moves retired fault `Arc<SafetyState>` snapshots and retired heap motion payloads off
+    /// `armd-control` into bounded SPSC reclamation rings (never popping when full so nothing
+    /// drops on `armd-control`).
     fn drain_retired_states(&mut self, core: &mut SupervisorInner) {
         let mut drained = false;
         while !self.reclaim_state_tx.is_full() {
@@ -1286,6 +1298,31 @@ impl ControlState {
             let _ = self.reclaim_state_tx.push(arc);
             drained = true;
         }
+        while !self.reclaim_stop_tx.is_full() {
+            let Some(retired) = core.pending_retired_stops.pop_front() else {
+                break;
+            };
+            let _ = self.reclaim_stop_tx.push(retired);
+            drained = true;
+        }
+        if drained {
+            core.core.hub().wake();
+        }
+    }
+
+    /// On panic before publication: retire unpublished `pending_estop_acks` state `Arc`s
+    /// off-thread WITHOUT emitting `EstopAck` (waiters receive `503 EXECUTOR_STOPPED` while
+    /// `e_stop_latched` remains true).
+    fn retire_unpublished_estop_acks(&mut self, core: &mut SupervisorInner) {
+        let mut drained = false;
+        while !self.reclaim_state_tx.is_full() {
+            let Some(ack) = core.pending_estop_acks.pop_front() else {
+                break;
+            };
+            let _ = self.reclaim_state_tx.push(ack.state);
+            drained = true;
+        }
+        core.estop_ack_overflow_gen = 0;
         if drained {
             core.core.hub().wake();
         }
@@ -2163,6 +2200,7 @@ fn control_thread_main(
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
     reclaim_state_tx: Producer<Arc<SafetyState>>,
+    reclaim_stop_tx: Producer<RetiredStopPayloads>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -2191,6 +2229,7 @@ fn control_thread_main(
     core.rt_executor_owned = true;
     core.before_publish_hook = hooks.before_publish.clone();
     core.safety.set_off_thread_reclaim(true);
+    core.prewarm_rt_buffers();
     if let Some(ref d) = core.driver {
         if let Ok(mut drv) = d.lock() {
             drv.set_rt_mode(true);
@@ -2227,6 +2266,7 @@ fn control_thread_main(
         estop_ack_tx,
         estop_overflow_gen,
         reclaim_state_tx,
+        reclaim_stop_tx,
         maint_req_rx,
         maint_rep_tx,
         pending_maint_reply: None,
@@ -2564,13 +2604,18 @@ fn control_thread_main(
     // waking sinks.
     state.drain_maintenance_stopped();
     state.drain_persistence_stopped(&core);
-    if !panicked && (!core.pending_estop_acks.is_empty() || engine.has_applied_urgent_stop_pending()) {
-        publish_gen += 1;
-        let ts = core.now_timestamp();
-        core.publish(ts, publish_gen);
+    if !panicked {
+        if !core.pending_estop_acks.is_empty() || engine.has_applied_urgent_stop_pending() {
+            publish_gen += 1;
+            let ts = core.now_timestamp();
+            core.publish(ts, publish_gen);
+        }
+        engine.drain_urgent_stops_stopped(true);
+        state.emit_estop_ack_if_advanced(&mut core);
+    } else {
+        engine.drain_urgent_stops_stopped(false);
+        state.retire_unpublished_estop_acks(&mut core);
     }
-    engine.drain_urgent_stops_stopped(!panicked);
-    state.emit_estop_ack_if_advanced(&mut core);
     state.drain_retired_states(&mut core);
     exited.store(true, Ordering::Release);
     *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -2792,6 +2837,7 @@ mod tests {
         let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
         let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
         let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (reclaim_stop_tx, _) = RingBuffer::<RetiredStopPayloads>::new(2);
         let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
         let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
         let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
@@ -2818,6 +2864,7 @@ mod tests {
             estop_ack_tx,
             estop_overflow_gen: Arc::new(AtomicU64::new(0)),
             reclaim_state_tx,
+            reclaim_stop_tx,
             maint_req_rx,
             maint_rep_tx,
             pending_maint_reply: None,

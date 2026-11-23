@@ -62,15 +62,44 @@ impl SupervisorInner {
         }
     }
 
-    /// Explicit user release uses the same bounded deceleration as a stream timeout.
-    pub fn stop_motion(&mut self) {
-        drop(self.stop_motion_retiring());
+    pub(crate) fn retire_servo_ws_min_depths(&mut self) {
+        if let Some(depths) = self.servo_ws_min_depths.take() {
+            if depths.1.is_heap() {
+                self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                    servo_ws_min_depths: Some(depths),
+                    ..Default::default()
+                });
+            }
+        }
     }
 
-    /// [`Self::stop_motion`] returning any heap-owning motion payloads (`ActiveTrajectory`
-    /// with owned storage, `UnloadSettle`, or heap `SlotBuf`) for off-thread disposal so
-    /// RT urgent stops perform zero frees on the control thread.
-    pub(crate) fn stop_motion_retiring(&mut self) -> crate::rt_core::urgent::RetiredStopPayloads {
+    pub(crate) fn retire_motion_payloads(&mut self) {
+        self.release_servo_target();
+        let servo_ws_min_depths = self.servo_ws_min_depths.take().filter(|d| d.1.is_heap());
+        let trajectory = self.active_trajectory.take().filter(|t| t.has_heap_storage());
+        let unload_settle = self.unload_settle.take();
+        if trajectory.is_some() || unload_settle.is_some() || servo_ws_min_depths.is_some() {
+            self.push_retired_stop(crate::rt_core::urgent::RetiredStopPayloads {
+                trajectory,
+                unload_settle,
+                servo_ws_min_depths,
+            });
+        }
+    }
+
+    fn push_retired_stop(&mut self, retired: crate::rt_core::urgent::RetiredStopPayloads) {
+        if self.rt_executor_owned
+            && self.pending_retired_stops.len() < self.pending_retired_stops.capacity()
+        {
+            self.pending_retired_stops.push_back(retired);
+        } else {
+            drop(retired);
+        }
+    }
+
+    /// Explicit user release uses the same bounded deceleration as a stream timeout.
+    /// In RT executor mode, heap-owning motion payloads are retired off-thread (zero RT frees).
+    pub fn stop_motion(&mut self) {
         // a STOP cancels a park deferred behind the MIT hand back
         if std::mem::take(&mut self.mit.park_after_hand_back) {
             if let Some(id) = self.mit.deferred_park_action.take() {
@@ -82,24 +111,11 @@ impl SupervisorInner {
         if self.policy_run.is_some() {
             self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         }
-        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        let mut retired = crate::rt_core::urgent::RetiredStopPayloads::default();
-        if let Some(depths) = self.servo_ws_min_depths.take() {
-            if depths.1.is_heap() {
-                retired.servo_ws_min_depths = Some(depths);
-            }
-        }
-        if let Some(traj) = self.active_trajectory.take() {
-            if traj.has_heap_storage() {
-                retired.trajectory = Some(traj);
-            }
-        }
+        self.retire_motion_payloads();
         self.pending_normal_unload = false;
-        retired.unload_settle = self.unload_settle.take();
         self.zero_check_persisting = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
-        retired
     }
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {
@@ -115,9 +131,7 @@ impl SupervisorInner {
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;
-        self.unload_settle = None;
-        self.active_trajectory = None;
-        self.servo_target = None;
+        self.retire_motion_payloads();
 
         // Lock onto measured_positions only when finite and the supervisor's own coherent
         // feedback snapshot (`core.feedback()` + `joint_feedback_queue_bounds`, captured
@@ -224,9 +238,9 @@ impl SupervisorInner {
             tracing::warn!("NormalUnload unsupported: resting pose or confirmed velocity/torque/enable feedback unavailable; no unload motion started");
             return;
         }
-        self.servo_target = None;
+        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
+        self.retire_servo_ws_min_depths();
         self.servo_stream_active = false;
         // M1: keep output history across NormalUnload so park ramps any residual lead out smoothly
         // instead of dropping active lead in a single tick.
@@ -641,9 +655,7 @@ impl SupervisorInner {
         }
         self.watchdog_park = None;
         self.pending_normal_unload = false;
-        self.unload_settle = None;
-        self.active_trajectory = None;
-        self.servo_target = None; self.servo_settled_ticks.fill(0);
+        self.retire_motion_payloads(); self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
         self.servo_stream_active = false;
         self.tracking.invalidate();
@@ -1444,27 +1456,18 @@ impl SupervisorInner {
     /// RT-safe: when keeping a watchdog park, records fields into [`crate::rt_core::ops::stop_diag`]
     /// without tracing or allocating; a normal-priority thread formats off-thread.
     pub fn authorized_stop(&mut self) -> bool {
-        let (applied, retired) = self.authorized_stop_rt();
-        drop(retired);
-        applied
-    }
-
-    /// [`Self::authorized_stop`] returning any heap-owning motion payloads for off-thread
-    /// retirement on `armd-control` (zero allocations and zero frees for all reachable
-    /// executor states).
-    pub(crate) fn authorized_stop_rt(&mut self) -> (bool, crate::rt_core::urgent::RetiredStopPayloads) {
         if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload) {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
-            return (false, crate::rt_core::urgent::RetiredStopPayloads::default());
+            return false;
         }
         if self.gravity_comp.is_some() {
             self.exit_gravity_comp("STOPPED", "Stop command");
         }
-        let retired = self.stop_motion_retiring();
+        self.stop_motion();
         if self.macro_run.is_some() {
             self.request_macro_stop();
         }
-        (true, retired)
+        true
     }
 
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {

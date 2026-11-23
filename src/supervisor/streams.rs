@@ -133,6 +133,23 @@ impl SupervisorInner {
     }
 
     /// Full workspace sweep check for a servo streaming or braking tick.
+    /// Pre-warms `ws_eval_bufs` before `armd-control` enters `SCHED_FIFO` so the first
+    /// braking tick after an RT urgent stop performs zero heap allocations.
+    pub fn prewarm_rt_buffers(&mut self) {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        if let Some((ws, cam)) = self.workspace_policy() {
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(
+                &self.config.arm_model,
+                ws,
+                cam,
+                self.config.tcp_offset,
+                &mut bufs,
+            );
+            eval.recycle(&mut bufs);
+        }
+        self.ws_eval_bufs = bufs;
+    }
+
     pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
         // the evaluator's vectors are reused from tick to tick (no allocation in the tick)
         let mut bufs = std::mem::take(&mut self.ws_eval_bufs);

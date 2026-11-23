@@ -177,7 +177,6 @@ pub struct UrgentStopReply {
     /// Preserves an `Applied` reply's `Arc<SafetyState>` if a panic converts the reply to
     /// `ExecutorStopped` before publication, avoiding any `Arc` drop on `armd-control`.
     pub returned_state: Option<Arc<crate::safety::SafetyState>>,
-    pub retired: RetiredStopPayloads,
 }
 
 /// RT-side intake for bounded urgent stop requests (owned exclusively by `ReleaseEngine` /
@@ -196,47 +195,31 @@ impl UrgentStopIntake {
     /// authorized and applied.
     pub fn drain_requests<F>(&mut self, mut handle: F) -> bool
     where
-        F: FnMut(&UrgentStop) -> (UrgentStopOutcome, RetiredStopPayloads),
+        F: FnMut(&UrgentStop) -> UrgentStopOutcome,
     {
         let mut drained = 0usize;
         let mut applied_any = false;
         while drained < self.capacity && self.pending.len() < self.capacity {
-            let Ok(req) = self.req_rx.pop() else {
-                break;
-            };
+            let Ok(req) = self.req_rx.pop() else { break; };
             drained += 1;
-            let (outcome, retired) = handle(&req.stop);
-            if matches!(outcome, UrgentStopOutcome::Applied { .. }) {
-                applied_any = true;
-            }
-            self.pending.push_back(UrgentStopReply {
-                id: req.id,
-                outcome,
-                returned_state: None,
-                retired,
-            });
+            let outcome = handle(&req.stop);
+            if matches!(outcome, UrgentStopOutcome::Applied { .. }) { applied_any = true; }
+            self.pending.push_back(UrgentStopReply { id: req.id, outcome, returned_state: None });
         }
         applied_any
     }
 
-    pub fn has_pending_replies(&self) -> bool {
-        !self.pending.is_empty()
-    }
+    pub fn has_pending_replies(&self) -> bool { !self.pending.is_empty() }
 
     pub fn has_applied_pending(&self) -> bool {
-        self.pending
-            .iter()
-            .any(|r| matches!(r.outcome, UrgentStopOutcome::Applied { .. }))
+        self.pending.iter().any(|r| matches!(r.outcome, UrgentStopOutcome::Applied { .. }))
     }
 
-    /// Flushes completed replies into `rep_tx` strictly after publication. Returns `true` when
-    /// at least one reply was pushed.
+    /// Flushes completed replies into `rep_tx` strictly after publication.
     pub fn flush_replies(&mut self) -> bool {
         let mut pushed = false;
         while !self.rep_tx.is_full() {
-            let Some(reply) = self.pending.pop_front() else {
-                break;
-            };
+            let Some(reply) = self.pending.pop_front() else { break; };
             let _ = self.rep_tx.push(reply);
             pushed = true;
         }
@@ -244,11 +227,10 @@ impl UrgentStopIntake {
     }
 
     /// Exit/panic drain on `armd-control`:
-    /// - `flush_existing == true` (clean exit after publication): flushes already-computed
-    ///   pending replies as-is.
+    /// - `flush_existing == true` (clean exit after publication): flushes pending replies as-is.
     /// - `flush_existing == false` (panic exit): converts unpublished pending replies into
-    ///   `ExecutorStopped`, moving any `Arc<SafetyState>` into `returned_state` and keeping
-    ///   `retired` payloads intact so nothing drops on `armd-control`.
+    ///   `ExecutorStopped`, moving any `Arc<SafetyState>` into `returned_state` so nothing drops
+    ///   on `armd-control`.
     ///
     /// Then converts any remaining unconsumed requests on `req_rx` into `ExecutorStopped`.
     pub fn drain_stopped(&mut self, flush_existing: bool) -> bool {
@@ -257,9 +239,7 @@ impl UrgentStopIntake {
             pushed |= self.flush_replies();
         } else {
             while !self.rep_tx.is_full() {
-                let Some(mut reply) = self.pending.pop_front() else {
-                    break;
-                };
+                let Some(mut reply) = self.pending.pop_front() else { break; };
                 if let UrgentStopOutcome::Applied { safety_state, .. } = reply.outcome {
                     reply.returned_state = Some(safety_state);
                 }
@@ -269,14 +249,11 @@ impl UrgentStopIntake {
             }
         }
         while !self.rep_tx.is_full() {
-            let Ok(req) = self.req_rx.pop() else {
-                break;
-            };
+            let Ok(req) = self.req_rx.pop() else { break; };
             let _ = self.rep_tx.push(UrgentStopReply {
                 id: req.id,
                 outcome: UrgentStopOutcome::ExecutorStopped,
                 returned_state: None,
-                retired: RetiredStopPayloads::default(),
             });
             pushed = true;
         }
@@ -317,9 +294,7 @@ impl UrgentStopClientInner {
     fn pop_all_replies(&mut self) {
         while let Ok(reply) = self.rep_rx.pop() {
             self.in_flight = self.in_flight.saturating_sub(1);
-            // Explicitly drop retired RT payloads and returned state Arcs off-thread.
             drop(reply.returned_state);
-            drop(reply.retired);
             if let Some(waiter) = self.waiters.remove(&reply.id) {
                 let res = match reply.outcome {
                     UrgentStopOutcome::ExecutorStopped => Err(UrgentStopError::Stopped),
@@ -408,10 +383,10 @@ impl UrgentStopClient {
     /// Awaits a previously enqueued urgent-stop ticket while periodically draining replies.
     pub async fn await_ticket(
         &self,
-        mut rx: tokio::sync::oneshot::Receiver<Result<UrgentStopOutcome, UrgentStopError>>,
+        rx: &mut tokio::sync::oneshot::Receiver<Result<UrgentStopOutcome, UrgentStopError>>,
     ) -> Result<UrgentStopOutcome, UrgentStopError> {
         loop {
-            match tokio::time::timeout(Duration::from_millis(2), &mut rx).await {
+            match tokio::time::timeout(Duration::from_millis(2), &mut *rx).await {
                 Ok(Ok(res)) => return res,
                 Ok(Err(_)) => return Err(UrgentStopError::Stopped),
                 Err(_) => self.drain_replies(),
@@ -420,8 +395,8 @@ impl UrgentStopClient {
     }
 
     pub async fn submit_async(&self, stop: UrgentStop) -> Result<UrgentStopOutcome, UrgentStopError> {
-        let rx = self.enqueue_async(stop)?;
-        self.await_ticket(rx).await
+        let mut rx = self.enqueue_async(stop)?;
+        self.await_ticket(&mut rx).await
     }
 
     pub fn submit_sync(&self, stop: UrgentStop) -> Result<UrgentStopOutcome, UrgentStopError> {
@@ -513,7 +488,7 @@ mod tests {
         assert_eq!(client.enqueue_async(sample_stop(3, 1)).unwrap_err(), UrgentStopError::QueueFull);
         assert_eq!(client.in_flight(), 2);
 
-        assert!(!intake.drain_requests(|_| (UrgentStopOutcome::LeaseLost { epoch: 1 }, RetiredStopPayloads::default())));
+        assert!(!intake.drain_requests(|_| UrgentStopOutcome::LeaseLost { epoch: 1 }));
         assert!(intake.flush_replies());
         client.drain_replies();
         assert_eq!(client.in_flight(), 0);
@@ -527,14 +502,11 @@ mod tests {
         let exited = Arc::new(AtomicBool::new(false));
         let (client, mut intake) = urgent_stop_channel(4, exited.clone());
         let mut rx = client.enqueue_async(sample_stop(1, 5)).unwrap();
-        assert!(intake.drain_requests(|_| (
-            UrgentStopOutcome::Applied {
-                stop_generation: 1, applied_to_motion: true, epoch: 5,
-                safety_state: Arc::new(crate::safety::SafetyState::Armed),
-                is_torqued: true, control_mode_gravity_comp: false,
-            },
-            RetiredStopPayloads::default(),
-        )));
+        assert!(intake.drain_requests(|_| UrgentStopOutcome::Applied {
+            stop_generation: 1, applied_to_motion: true, epoch: 5,
+            safety_state: Arc::new(crate::safety::SafetyState::Armed),
+            is_torqued: true, control_mode_gravity_comp: false,
+        }));
         let mut g = client.inner.lock().unwrap();
         g.drain_replies_with_hook(|| {
             assert!(intake.flush_replies());
@@ -562,7 +534,6 @@ mod tests {
                 safety_state: state_arc, is_torqued: true, control_mode_gravity_comp: false,
             },
             returned_state: None,
-            retired: RetiredStopPayloads::default(),
         });
         assert!(intake.drain_stopped(false));
         assert!(weak.upgrade().is_some(), "Arc<SafetyState> must survive panic drain for off-thread drop");

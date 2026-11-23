@@ -8,10 +8,7 @@ use super::*;
 
 // The caller holds the same write lock used to verify lease and epoch.
 pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
-    if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
-    if let Some(duration) = body.get("duration_secs").filter(|v| !v.is_null()) {
-        if duration.as_f64().is_none() { return Err(invalid_command("duration_secs must be numeric")); }
-    }
+    validate_command_body_common(body).map_err(invalid_command)?;
     match path {
         "/api/v1/torque" | "/api/v1/arm" => {
             let enabled = body.get("enable").and_then(Value::as_bool)
@@ -60,11 +57,6 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Va
             let id = inner.unload_action()?;
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
-        }
-        "/api/v1/motion/stop" => {
-            inner.exit_gravity_comp("STOPPED", "Stop command");
-            inner.stop_motion();
-            inner.request_macro_stop();
         }
         "/api/v1/mode/gravity_comp" => {
             let enable = body.get("enable").and_then(Value::as_bool)

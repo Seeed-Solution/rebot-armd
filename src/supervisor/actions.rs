@@ -183,14 +183,16 @@ impl SupervisorInner {
                     }
                 }
             }
-            tracing::info!(
-                "Action {} ({}) {}{}{}",
-                id,
-                a.kind,
-                state,
-                if code.is_some() { " " } else { "" },
-                code.unwrap_or(""),
-            );
+            if !self.rt_executor_owned {
+                tracing::info!(
+                    "Action {} ({}) {}{}{}",
+                    id,
+                    a.kind,
+                    state,
+                    if code.is_some() { " " } else { "" },
+                    code.unwrap_or(""),
+                );
+            }
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -1111,12 +1113,12 @@ impl SupervisorInner {
         let is_policy = false;
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let lease_now = self.active_lease.as_ref().map(|l| l.generation);
-        let cause: Option<(&str, &str, String)> = match self.safety.state() {
-            SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
-            SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
-            SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
-            _ if !is_park && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
-            _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
+        let cause: Option<(&str, &str, Option<String>)> = match self.safety.state() {
+            SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", (!self.rt_executor_owned).then(|| "E-stop latched".into()))),
+            SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", (!self.rt_executor_owned).then(|| "Lease watchdog expired".into()))),
+            SafetyState::Fault(r) => Some(("failed", "FAULT", (!self.rt_executor_owned).then(|| match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") }))),
+            _ if !is_park && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", (!self.rt_executor_owned).then(|| "Lease watchdog expired; parking".into()))),
+            _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", (!self.rt_executor_owned).then(|| "Control lease lost or released".into()))),
             _ => None,
         };
         if let Some((state, code, message)) = cause {
@@ -1131,10 +1133,10 @@ impl SupervisorInner {
                     "LEASE_LOST" => "LEASE_LOST",
                     _ => "FAULT",
                 };
-                self.terminate_policy_run(reason, state, Some(code), Some(message));
+                self.terminate_policy_run(reason, state, Some(code), message);
                 return;
             }
-            self.finish_action(id, state, Some(code), Some(message), None, None, None);
+            self.finish_action(id, state, Some(code), message, None, None, None);
             return;
         }
         if is_policy {

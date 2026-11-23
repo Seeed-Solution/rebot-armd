@@ -30,7 +30,7 @@ use super::broker::{
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
 use super::mailbox::{target_mailbox, Refusal, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
-use super::urgent::{RetiredStopPayloads, StopRequests, UrgentStop, UrgentStopIntake, UrgentStopOutcome};
+use super::urgent::{StopRequests, UrgentStop, UrgentStopIntake, UrgentStopOutcome};
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
 
@@ -493,8 +493,8 @@ pub trait CoreOps {
         _req: &UrgentStop,
         _stops: &StopRequests,
         _now: Instant,
-    ) -> (UrgentStopOutcome, RetiredStopPayloads) {
-        (UrgentStopOutcome::ExecutorStopped, RetiredStopPayloads::default())
+    ) -> UrgentStopOutcome {
+        UrgentStopOutcome::ExecutorStopped
     }
     /// How `action` ended, None while it runs.
     fn action_outcome(&self, action: ActionId) -> Option<Outcome>;
@@ -882,39 +882,33 @@ impl CoreOps for SupervisorInner {
         req: &UrgentStop,
         stops: &StopRequests,
         now: Instant,
-    ) -> (UrgentStopOutcome, RetiredStopPayloads) {
+    ) -> UrgentStopOutcome {
         let epoch = self.safety.epoch_id();
         if req.lease_generation == 0
             || !self.validate_lease_at(req.connection.as_str(), req.lease_generation, now)
         {
-            return (UrgentStopOutcome::LeaseLost { epoch }, RetiredStopPayloads::default());
+            return UrgentStopOutcome::LeaseLost { epoch };
         }
         if req.epoch != Some(epoch) {
-            return (UrgentStopOutcome::EpochMismatch { epoch }, RetiredStopPayloads::default());
+            return UrgentStopOutcome::EpochMismatch { epoch };
         }
         if !req.request_id_valid {
-            return (UrgentStopOutcome::InvalidRequestId, RetiredStopPayloads::default());
+            return UrgentStopOutcome::InvalidRequestId;
         }
         if let Some(message) = req.body_error {
-            return (
-                UrgentStopOutcome::InvalidBody { message, epoch },
-                RetiredStopPayloads::default(),
-            );
+            return UrgentStopOutcome::InvalidBody { message, epoch };
         }
         let stop_generation = stops.request();
-        let (applied_to_motion, retired) = self.authorized_stop_rt();
+        let applied_to_motion = self.authorized_stop();
         stops.mark_applied(stop_generation);
-        (
-            UrgentStopOutcome::Applied {
-                stop_generation,
-                applied_to_motion,
-                epoch: self.safety.epoch_id(),
-                safety_state: self.safety.state_arc(),
-                is_torqued: self.is_torqued,
-                control_mode_gravity_comp: self.gravity_comp_active(),
-            },
-            retired,
-        )
+        UrgentStopOutcome::Applied {
+            stop_generation,
+            applied_to_motion,
+            epoch: self.safety.epoch_id(),
+            safety_state: self.safety.state_arc(),
+            is_torqued: self.is_torqued,
+            control_mode_gravity_comp: self.gravity_comp_active(),
+        }
     }
 
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
