@@ -565,6 +565,8 @@ pub struct SupervisorInner {
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
     /// Highest E-stop request generation dropped if `pending_estop_acks` ever reached capacity 64.
     pub(crate) estop_ack_overflow_gen: u64,
+    /// Deterministic test hook invoked inside `publish_at` strictly before `core.publish(...)`.
+    pub(crate) before_publish_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Summary of the release's Step-2 hardware poll passed into Step-5 `tick_control`
@@ -839,6 +841,7 @@ impl SupervisorInner {
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
             estop_ack_overflow_gen: 0,
+            before_publish_hook: None,
         }
     }
 
@@ -1190,6 +1193,9 @@ impl SupervisorInner {
         let control_hz = self.config.control_frequency_hz;
         let (sampled_at, valid_until) = self.observation_valid_until(&obs, Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1))));
         let kept = keep.then(|| (*obs).clone());
+        if let Some(ref hook) = self.before_publish_hook {
+            hook();
+        }
         let SupervisorInner { core, measured_positions, measured_velocities, .. } = self;
         core.publish(obs, generation, sampled_at, valid_until, measured_positions, measured_velocities);
         TickPublished { kept, body_end }
@@ -4386,17 +4392,33 @@ impl ArmSupervisor {
         inner.release_lease(client_id, generation)
     }
 
+    fn executor_lease_active(&self) -> bool {
+        if self.owner_mode() != OWNER_EXECUTOR {
+            return false;
+        }
+        let Some(handle) = self.executor_handle() else {
+            return false;
+        };
+        if handle.is_exited() {
+            return false;
+        }
+        let want = self.executor_base_gen.load(Ordering::Acquire).saturating_add(1);
+        let now = Instant::now();
+        self.hub
+            .latest()
+            .is_some_and(|s| Self::answers(&s, want, now) && s.obs.lease_holder.is_some())
+    }
+
     pub async fn is_lease_active(&self) -> bool {
         if self.owner_mode() == OWNER_EXECUTOR {
-            return self.hub.latest().is_some_and(|s| s.obs.lease_holder.is_some());
+            return self.executor_lease_active();
         }
         let inner = self.inner.read().await;
         if self.check_legacy_under_guard(&inner).is_ok() {
             return inner.is_lease_active();
         }
         drop(inner);
-        self.owner_mode() == OWNER_EXECUTOR
-            && self.hub.latest().is_some_and(|s| s.obs.lease_holder.is_some())
+        self.executor_lease_active()
     }
 
     pub async fn validate_servo_lease(&self, client_id: &str, generation: u64) -> bool {

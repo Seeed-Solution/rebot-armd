@@ -1281,6 +1281,12 @@ async fn detached_shell_lease_calls_refuse_after_executor_transfer_without_shado
     assert!(sup.is_lease_active().await);
 
     handle.stop_and_join();
+    // Once the RT owner has exited, `is_lease_active()` must NOT keep reporting an active lease
+    // from the stale final snapshot.
+    assert!(
+        !sup.is_lease_active().await,
+        "exited executor must not report an active lease from stale final snapshot"
+    );
 }
 
 // ============================================================================
@@ -1826,6 +1832,109 @@ async fn step2_simultaneous_disable_confirm_and_overtemp_latches_thermal_trip() 
     assert!(disables_sent.load(Ordering::SeqCst) >= 1);
     // And Step 2b `clear_fault()` must refuse while temperature stays above reset threshold.
     assert!(sup.clear_fault().await.is_err());
+
+    handle.stop_and_join();
+}
+
+// ============================================================================
+// 11. E-stop acknowledgement waits for Step 6 StateHub publication barrier
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn estop_ack_waits_for_step6_publication_barrier() {
+    let bus = FakeBus::new(&dm_limits());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.set_torque(true).await.unwrap();
+
+    // Arm the publication barrier once `trigger_e_stop_checked()` has bumped `requested_estop_count`
+    // and Step 1 has applied E-stop: pause right BEFORE Step 6 `core.publish(...)`!
+    let armed = Arc::new(AtomicBool::new(false));
+    let (at_pub_tx, at_pub_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_pub_tx, release_pub_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let armed_h = armed.clone();
+    let estop_latched_ref = sup.e_stop_latched.clone();
+    let at_pub_tx = Arc::new(std::sync::Mutex::new(Some(at_pub_tx)));
+    let release_pub_rx = Arc::new(std::sync::Mutex::new(Some(release_pub_rx)));
+
+    let hooks = PersistTestHooks {
+        before_publish: Some(Arc::new(move || {
+            if armed_h.load(Ordering::Acquire) && estop_latched_ref.load(Ordering::Acquire) {
+                if let Some(tx) = at_pub_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                    if let Some(rx) = release_pub_rx.lock().unwrap().take() {
+                        let _ = rx.recv_timeout(Duration::from_secs(5));
+                    }
+                }
+            }
+        })),
+        ..Default::default()
+    };
+
+    let handle = sup
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 3).await;
+
+    let snap_before = sup.hub().latest().expect("operational snapshot before E-stop");
+    assert_eq!(snap_before.obs.safety_state, SafetyState::Armed);
+    let epoch_before = snap_before.obs.epoch_id;
+
+    // Arm barrier right before triggering E-stop.
+    armed.store(true, Ordering::Release);
+    let sup_es = sup.clone();
+    let estop_task = tokio::spawn(async move { sup_es.trigger_e_stop_checked().await });
+
+    // Wait until `armd-control` has applied E-stop in Step 1 and is now paused strictly BEFORE Step 6 publish!
+    tokio::task::spawn_blocking(move || {
+        at_pub_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("armd-control must pause at Step 6 before_publish barrier");
+    })
+    .await
+    .unwrap();
+
+    // While paused BEFORE Step 6 publication:
+    // 1. StateHub MUST still expose the previous operational Armed snapshot.
+    // 2. `trigger_e_stop_checked()` MUST NOT have received its acknowledgement yet!
+    let snap_paused = sup.hub().latest().expect("snapshot while paused before publish");
+    assert_eq!(snap_paused.obs.safety_state, SafetyState::Armed);
+    assert_eq!(snap_paused.obs.epoch_id, epoch_before);
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(
+        !estop_task.is_finished(),
+        "E-stop acknowledgement must NOT be delivered before Step 6 StateHub publication"
+    );
+
+    // Release Step 6 publication -> E-stop ack now resolves, and `StateHub` MUST ALREADY expose
+    // the stopped snapshot and new epoch at the exact moment the ack returns!
+    let _ = release_pub_tx.send(());
+    let (ack_state, ack_epoch) = estop_task.await.unwrap().expect("E-stop ack");
+    assert_eq!(ack_state, SafetyState::EStop);
+    assert!(ack_epoch > epoch_before);
+
+    let snap_after = sup.hub().latest().expect("snapshot immediately after E-stop ack");
+    assert_eq!(
+        snap_after.obs.safety_state,
+        SafetyState::EStop,
+        "StateHub must already expose SafetyState::EStop when E-stop ack resolves"
+    );
+    assert_eq!(
+        snap_after.obs.epoch_id,
+        ack_epoch,
+        "StateHub epoch must already match acknowledged E-stop epoch"
+    );
 
     handle.stop_and_join();
 }

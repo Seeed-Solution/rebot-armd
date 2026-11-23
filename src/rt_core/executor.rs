@@ -587,6 +587,8 @@ pub struct PersistTestHooks {
     /// Invoked by the independent panic deadline observer when a blocking driver call stalls
     /// past the panic-disable deadline under `PanicPolicy::StopExecutor`.
     pub on_panic_disable_timeout: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs on `armd-control` strictly before Step 6 `StateHub` publication.
+    pub before_publish: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 enum PersistCmd {
@@ -1010,7 +1012,7 @@ pub(crate) fn spawn_executor(
     let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
-    let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(2);
+    let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
 
     let estop_overflow_gen = Arc::new(AtomicU64::new(0));
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -1320,6 +1322,86 @@ impl ControlState {
                 returned_offsets,
                 returned_probe,
             });
+        }
+    }
+
+    /// Exit-path persistence drain: returns any queued `PersistCmd` heap payloads off-thread
+    /// via `persist_rep_tx` and wakes `armd-persist` WITHOUT performing any unpublished live
+    /// state mutations (`last_action`, `gripper_calib_revision`, `force_reconcile`).
+    fn drain_persistence_stopped(&mut self, core: &SupervisorInner) {
+        let mut woke = false;
+        while let Ok(cmd) = self.persist_cmd_rx.pop() {
+            let reply = match cmd {
+                PersistCmd::Reserve {
+                    new_policy,
+                    jaw_opening,
+                    probe,
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Reserved {
+                    reservation: None,
+                    policy: Some(new_policy),
+                    returned_jaw: jaw_opening,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
+                    _returned_probe: probe,
+                },
+                PersistCmd::Fail {
+                    code,
+                    message,
+                    unused_policy,
+                    unused_jaw,
+                    ..
+                }
+                | PersistCmd::Abort {
+                    code,
+                    message,
+                    unused_policy,
+                    unused_jaw,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: unused_policy,
+                    _returned_jaw: unused_jaw,
+                    _returned_code: Some(code),
+                    _returned_msg: Some(message),
+                    _returned_warning: None,
+                    _returned_probe: self.take_reply_probe(),
+                },
+                PersistCmd::Activate {
+                    new_policy,
+                    new_jaw,
+                    warning,
+                    code_buf,
+                    msg_buf,
+                    ..
+                } => PersistReply::Done {
+                    _returned_policy: Some(new_policy),
+                    _returned_jaw: new_jaw,
+                    _returned_code: Some(code_buf),
+                    _returned_msg: Some(msg_buf),
+                    _returned_warning: warning,
+                    _returned_probe: self.take_reply_probe(),
+                },
+            };
+            let _ = self.persist_rep_tx.push(reply);
+            woke = true;
+        }
+        self.persist_granted = None;
+        if self.disconnect_code_buf.is_some() || self.disconnect_msg_buf.is_some() {
+            let _ = self.persist_rep_tx.push(PersistReply::Done {
+                _returned_policy: None,
+                _returned_jaw: None,
+                _returned_code: self.disconnect_code_buf.take(),
+                _returned_msg: self.disconnect_msg_buf.take(),
+                _returned_warning: None,
+                _returned_probe: None,
+            });
+            woke = true;
+        }
+        if woke {
+            self.persist_wake.unpark();
+            core.core.hub().wake();
         }
     }
 
@@ -2034,6 +2116,7 @@ fn control_thread_main(
     // BEFORE applying SCHED_FIFO so normal-priority helper threads (e.g. `armd-sim-rx`) can
     // never suffer single-CPU priority inversion during startup.
     core.rt_executor_owned = true;
+    core.before_publish_hook = hooks.before_publish.clone();
     core.safety.set_off_thread_reclaim(true);
     if let Some(ref d) = core.driver {
         if let Ok(mut drv) = d.lock() {
@@ -2154,17 +2237,13 @@ fn control_thread_main(
                 release_deadline,
                 publish_gen,
                 |core, ctx| {
-                    // Strict Arc lifetime ordering: drain all pending E-stop acks / retired states
-                    // from Steps 1-2 BEFORE maintenance can run `ClearFault` and retire a fault Arc,
-                    // then run persistence reconciliation and at most one bounded maintenance op
-                    // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3 commit,
-                    // Step 5 output, and Step 6 publication.
-                    state.emit_estop_ack_if_advanced(core);
-                    state.drain_retired_states(core);
+                    // Run persistence reconciliation and at most one bounded maintenance op
+                    // strictly AFTER Step 2 fresh feedback intake and strictly BEFORE Step 3
+                    // commit, Step 5 output, and Step 6 publication. Hold E-stop acknowledgements
+                    // in `core.pending_estop_acks` (keeping their `Arc<SafetyState>` alive) and
+                    // deliver them ONLY after Step 6 publishes the corresponding snapshot.
                     state.service_persistence(core, ctx);
                     state.service_one_maintenance(core, ctx, release_deadline);
-                    state.emit_estop_ack_if_advanced(core);
-                    state.drain_retired_states(core);
                     control_stop.load(Ordering::Acquire)
                 },
             );
@@ -2400,12 +2479,18 @@ fn control_thread_main(
         }
     }
 
-    // Clean exit drain: return queued maintenance payloads off-thread, reconcile any abandoned
-    // persistence reservation, flush unacked E-stops, and signal exit before waking sinks.
+    // Clean exit drain: return queued maintenance and persistence payloads off-thread without
+    // performing unpublished live state mutations, publish before flushing any unacked E-stops,
+    // and signal exit before waking sinks.
     state.drain_maintenance_stopped();
-    let exit_ctx = engine.ctx(Instant::now());
-    state.service_persistence(&mut core, &exit_ctx);
+    state.drain_persistence_stopped(&core);
+    if !core.pending_estop_acks.is_empty() {
+        publish_gen += 1;
+        let ts = core.now_timestamp();
+        core.publish(ts, publish_gen);
+    }
     state.emit_estop_ack_if_advanced(&mut core);
+    state.drain_retired_states(&mut core);
     exited.store(true, Ordering::Release);
     *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     control_exited_cv.1.notify_all();
@@ -2607,5 +2692,99 @@ mod tests {
         let delivered = rx.try_recv().expect("final estop ack must be delivered, not lost to exited");
         assert_eq!(delivered.unwrap(), (SafetyState::EStop, 42));
         assert!(reg.waiters.is_empty());
+    }
+
+    #[test]
+    fn exit_drain_returns_persist_payloads_without_mutating_live_state() {
+        let mut core = SupervisorInner::new(crate::model::ArmConfig::rebot_dm());
+        core.lease_enabled = false;
+        core.set_torque(true).unwrap();
+        let epoch = core.safety.epoch_id();
+        let (action_id, _) = core
+            .start_gripper_zero_check(&serde_json::json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
+            .unwrap();
+        core.zero_check_persisting = Some(action_id);
+        let action_before = core.last_action.clone().expect("running zero_check action");
+        assert!(action_before.is_running());
+
+        let (_, maint_req_rx) = RingBuffer::<MaintRequest>::new(2);
+        let (maint_rep_tx, _) = RingBuffer::<MaintReply>::new(2);
+        let (estop_ack_tx, _) = RingBuffer::<EstopAck>::new(2);
+        let (reclaim_state_tx, _) = RingBuffer::<Arc<SafetyState>>::new(2);
+        let (persist_job_tx, _) = RingBuffer::<PendingZeroCheckPersist>::new(2);
+        let (mut persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
+        let (persist_rep_tx, mut persist_rep_rx) = RingBuffer::<PersistReply>::new(4);
+
+        let probe_dropped_on = Arc::new(Mutex::new(None::<ThreadId>));
+        struct DropTracker(Arc<Mutex<Option<ThreadId>>>);
+        impl Drop for DropTracker {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some(thread::current().id());
+            }
+        }
+        let hooks = PersistTestHooks {
+            reply_drop_probe: Some(Arc::new(Mutex::new(Some(Box::new(DropTracker(
+                probe_dropped_on.clone(),
+            )))))),
+            ..Default::default()
+        };
+
+        let (_, _, _, stop_requests) = ReleaseEngine::new(BootId(1), Capacities::default());
+        let mut state = ControlState {
+            shutdown_committed: false,
+            control_stop: Arc::new(AtomicBool::new(true)),
+            stop_requests,
+            estop_ack_tx,
+            estop_overflow_gen: Arc::new(AtomicU64::new(0)),
+            reclaim_state_tx,
+            maint_req_rx,
+            maint_rep_tx,
+            pending_maint_reply: None,
+            persist_job_tx,
+            persist_cmd_rx,
+            persist_rep_tx,
+            persist_wake: thread::current(),
+            persist_granted: Some((action_id, ConfigDomain::GripperCalibration)),
+            next_persist_req: 1,
+            disconnect_code_buf: Some(String::from("buf")),
+            disconnect_msg_buf: Some(String::from("msg")),
+            hooks,
+        };
+
+        // Queue a `PersistCmd::Fail` after the last release AND simulate an active reservation
+        // with an abandoned producer (`drop(persist_cmd_tx)`).
+        persist_cmd_tx
+            .push(PersistCmd::Fail {
+                action_id,
+                code: "PERSIST_FAILED".into(),
+                message: "late fail queued during clean exit".into(),
+                unused_policy: None,
+                unused_jaw: None,
+            })
+            .unwrap();
+        drop(persist_cmd_tx);
+
+        state.drain_persistence_stopped(&core);
+
+        // Live state must NOT have been mutated after the last publish!
+        assert_eq!(core.last_action.as_ref().map(|a| a.state.as_str()), Some("running"));
+        assert_eq!(core.zero_check_persisting, Some(action_id));
+        assert!(
+            !core.core.config().motion_inhibited(),
+            "exit drain must not transition live config authority to Reconciling"
+        );
+        assert!(state.persist_granted.is_none());
+        // Payloads must still be queued in `persist_rep_rx` (not dropped on the owner thread).
+        assert!(
+            probe_dropped_on.lock().unwrap().is_none(),
+            "returned persistence payloads must remain alive until dropped off-thread"
+        );
+        let mut drained = 0usize;
+        while let Ok(rep) = persist_rep_rx.pop() {
+            drained += 1;
+            drop(rep);
+        }
+        assert_eq!(drained, 2, "expected returned Fail payload reply and disconnect buffer reply");
+        assert!(probe_dropped_on.lock().unwrap().is_some());
     }
 }

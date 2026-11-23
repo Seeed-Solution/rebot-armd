@@ -1039,9 +1039,12 @@ impl ReleaseEngine {
         let pre_ctx = self.ctx(now_fn());
         let stopping = pre_commit(core, &pre_ctx);
         if stopping {
+            // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
+            // or finished transition) strictly BEFORE delivering terminals, maintenance replies,
+            // or E-stop acknowledgements.
+            let ts = core.now_timestamp();
+            core.publish(ts, publish_generation);
             if let Some((t, outcome)) = finished_transition {
-                let ts = core.now_timestamp();
-                core.publish(ts, publish_generation);
                 self.intake.terminal(t, outcome);
             }
             return report;
@@ -1134,13 +1137,17 @@ impl ReleaseEngine {
         publish_generation: u64,
         report: &mut ReleaseReport,
     ) -> bool {
-        if self.apply_pending_urgent(core) { report.stopped = true; }
+        let urgent_applied = self.apply_pending_urgent(core);
+        if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake(&budget);
-        if let Some((t, outcome)) = self.take_finished_transition(report) {
+        let finished = self.take_finished_transition(report);
+        if urgent_applied || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
-            self.intake.terminal(t, outcome);
+            if let Some((t, outcome)) = finished {
+                self.intake.terminal(t, outcome);
+            }
             return true;
         }
         false
