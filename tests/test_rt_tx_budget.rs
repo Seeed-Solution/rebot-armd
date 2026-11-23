@@ -12,7 +12,7 @@
 //! - Fail-closed legacy supervisor bridge on a backpressured final release batch
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -2004,5 +2004,107 @@ fn pending_stop_inhibits_round_robin_refresh_and_confirmed_mode_handover() {
         bus.with(|s| s.tx_log.is_empty()),
         "no frames may be sent during confirmed mode handover under pending stop: {:?}",
         bus.with(|s| s.tx_log.clone())
+    );
+}
+
+#[test]
+fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh_measured_hold() {
+    // Part A: Pending stop + plain set_joint_modes forward switch -> Err(EstopInhibited) and 0 frames.
+    let (mut d, bus, _) = enabled_driver();
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+    let _ = stops.request();
+    let mut mit_modes = [JointMode::Position; 7];
+    mit_modes[3] = JointMode::Mit;
+    bus.clear();
+    let err = d.set_joint_modes(&mit_modes, &targets_const(0.0)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "pending stop must refuse plain set_joint_modes: {err:?}");
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "pending stop + set_joint_modes must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Part B: Latched E-stop (abort_flag = true, estop_gate NOT pending) + forward switch ->
+    // BOTH plain set_joint_modes and set_joint_modes_confirmed refuse with 0 frames.
+    let (mut d, bus, _) = enabled_driver();
+    d.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    bus.clear();
+    let err_plain = d.set_joint_modes(&mit_modes, &targets_const(0.0)).unwrap_err();
+    assert!(is_estop_inhibited(&err_plain), "latched E-stop must refuse plain forward switch: {err_plain:?}");
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "latched E-stop + plain forward switch must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+    let err_conf = d.set_joint_modes_confirmed(&mit_modes, &targets_const(0.0)).unwrap_err();
+    assert!(is_estop_inhibited(&err_conf), "latched E-stop must refuse confirmed forward switch: {err_conf:?}");
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "latched E-stop + confirmed forward switch must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // Part C: Base-mode rollback while stopped/latched:
+    // (C1) Stale feedback (> 100 ms) -> sends 0 frames and fails closed.
+    // (C2) Fresh feedback at measured q = 0.42 while caller passes bogus hold 1.75 ->
+    //      allowed, and the transmitted POS_VEL hold targets the fresh measured 0.42 (NOT 1.75).
+    let (mut d, bus, clock) = enabled_driver();
+    // Establish empty-queue boundary + fresh feedback, then switch J4 into MIT.
+    d.read_joint_states().unwrap();
+    bus.with(|s| {
+        s.motors[3].2 = 0.42;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    d.set_joint_modes(&mit_modes, &targets_const(0.42)).expect("enter MIT on J4");
+
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+    d.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    let _ = stops.request();
+
+    // C1: Age J4 feedback past 100 ms -> base-mode rollback MUST send 0 frames and fail closed.
+    clock.advance(ms(120));
+    bus.clear();
+    let pos_modes = [JointMode::Position; 7];
+    let err_stale = d.set_joint_modes(&pos_modes, &targets_const(1.75)).unwrap_err();
+    assert!(
+        err_stale.to_string().contains("fresh feedback"),
+        "expected stale rollback failure, got {err_stale:?}"
+    );
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "base-mode rollback without fresh feedback must send 0 frames: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    // C2: Deliver fresh feedback at measured q = 0.42 -> base-mode rollback succeeds and overrides
+    // caller's stale/arbitrary 1.75 hold with the fresh measured 0.42 position.
+    d.read_joint_states().unwrap(); // refresh empty-queue boundary (no 0xCC sent while stop pending)
+    bus.with(|s| {
+        s.motors[3].2 = 0.42;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    bus.clear();
+    d.set_joint_modes(&pos_modes, &targets_const(1.75))
+        .expect("base-mode rollback with fresh feedback must succeed");
+    let tx = bus.with(|s| s.tx_accepted.clone());
+    let hold_frames: Vec<_> = tx.iter().filter(|f| f.id == 0x104).copied().collect();
+    assert_eq!(hold_frames.len(), 1, "expected 1 POS_VEL hold frame for J4: {tx:?}");
+    let wire_pos = f32::from_le_bytes([
+        hold_frames[0].data[0],
+        hold_frames[0].data[1],
+        hold_frames[0].data[2],
+        hold_frames[0].data[3],
+    ]);
+    assert!(
+        (wire_pos - 0.42).abs() < 1e-2,
+        "rollback hold must use fresh measured position ~0.42, not caller 1.75 (got {wire_pos})"
     );
 }
