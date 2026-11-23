@@ -508,7 +508,12 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
             let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
             let p = r0.pin(h).unwrap();
             assert_eq!(p.path.len(), 1);
+            assert_eq!(p.path.capacity(), 1);
+            assert!(p.payload_bytes() > 0);
+            assert_eq!(p.path.samples()[0][0], 0.25);
             drop(p);
+            assert_eq!(w0.free(), 0);
+            assert!(w0.stage(|_| {}).is_none());
             assert!(r0.retire(h));
             assert_eq!(w0.reclaim(), 1);
         });
