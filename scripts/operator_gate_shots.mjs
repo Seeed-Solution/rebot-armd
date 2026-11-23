@@ -15,7 +15,9 @@
 //     to locked, the dialog opens, the PIN runs the switch;
 //  5. the badge shows the minutes left in the last 5 minutes of a session;
 //  6. a failed fine calibration (stubbed result): no "can be applied" accuracy note, one line per failed cause;
-//  7. the enable switch label in the E-stop state fits the switch.
+//  7. the enable switch label in the E-stop state fits the switch and breaks only between words;
+//  0. (tablet context) the header at 360-1440 px, simple and expert: no overlap, nothing off screen, title not clipped;
+//  the unlock after an expired session removes the "expired" and Unlock toasts.
 // The PIN dialog, the calibration drawer and the failure box are checked after their animations ended: the element
 // at their centre and four inner points belongs to them.
 // PNGs to OUT. Exits non-zero if a check fails.
@@ -55,6 +57,21 @@ const onTop = (page, sel) => page.evaluate((s) => {
 }, sel);
 async function enterPin(page) { await page.fill('#op-pin', PIN); await page.press('#op-pin', 'Enter'); return waitFor(page, () => $('op-modal').hidden && S.auth.role === 'operator'); }
 
+// header at 360-1440 px, simple and expert: no two header items overlap, nothing past the right edge, the title not clipped
+const HEADER_W = [360, 390, 430, 560, 640, 768, 820, 900, 1000, 1024, 1180, 1280, 1366, 1440];
+const headerCheck = (page) => page.evaluate(() => {
+  const vis = (e) => { const c = getComputedStyle(e), q = e.getBoundingClientRect(); return c.display !== 'none' && c.visibility !== 'hidden' && q.width > 0 && !e.hidden; };
+  const boxes = [...document.querySelector('.topbar').querySelectorAll(':scope > *, .brand-text, .head-stats > *')].filter(vis)
+    .map((e) => ({ id: e.id || String(e.className).split(' ')[0] || e.tagName, r: e.getBoundingClientRect(), e }));
+  const ov = [];
+  for (let i = 0; i < boxes.length; i++) for (let j = i + 1; j < boxes.length; j++) {
+    const A = boxes[i], B = boxes[j]; if (A.e.contains(B.e) || B.e.contains(A.e)) continue;
+    const x = Math.min(A.r.right, B.r.right) - Math.max(A.r.left, B.r.left), y = Math.min(A.r.bottom, B.r.bottom) - Math.max(A.r.top, B.r.top);
+    if (x > 1 && y > 1) ov.push(A.id + 'x' + B.id);
+  }
+  const bt = document.querySelector('.brand-text');
+  return { ov, out: boxes.filter((x) => x.r.right > innerWidth + 0.5).map((x) => x.id), clip: bt && vis(bt) ? bt.scrollWidth - bt.clientWidth : 0 };
+});
 const VIEWS = [['phone', { width: 390, height: 844 }], ['tablet', { width: 1024, height: 768 }]];
 for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   const name = `${vname}_${lang}`;
@@ -83,6 +100,20 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   ok(await waitFor(page, () => S.obs && S.dof > 0 && S.auth.enforced && VM.state === 'ok', null, 15000), name + ' telemetry, auth enforced, vision stub');
   await page.waitForTimeout(400);
 
+  // 0. header fit (once per language, on the tablet context; auth enforced, the operator chip shown)
+  if (vname === 'tablet') {
+    for (const ui of ['simple', 'expert']) {
+      await page.evaluate((u) => setUi(u), ui);
+      for (const w of HEADER_W) {
+        await page.setViewportSize({ width: w, height: 800 }); await page.waitForTimeout(120);
+        const h = await headerCheck(page);
+        ok(!h.ov.length && !h.out.length && h.clip <= 0, `${name} header ${ui} ${w}px ${JSON.stringify(h)}`);
+        if (w === 1024 || w === 768) await page.screenshot({ path: path.join(out, `${name}_0_header_${ui}_${w}.png`), clip: { x: 0, y: 0, width: w, height: 64 } });
+      }
+    }
+    await page.evaluate(() => setUi('expert'));
+    await page.setViewportSize(view); await page.waitForTimeout(200);
+  }
   // 1. lock marks while locked
   ok(await page.evaluate(() => document.body.classList.contains('op-locked')), name + ' body.op-locked');
   ok(/🔒/.test(await lockGlyph(page, '#btn-calib') || ''), name + ' calibration button shows a lock');
@@ -170,6 +201,8 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   ok(await waitFor(page, () => !$('op-modal').hidden && S.auth.role !== 'operator' && document.body.classList.contains('op-locked')), name + ' expired session: badge locked, dialog open');
   ok((await toasts(page)).some((x) => x.text.includes(lang === 'zh' ? '过期' : 'expired')), name + ' expired session: toast says so');
   ok(await enterPin(page), name + ' PIN unlocks (expiry)');
+  const stale = (await toasts(page)).filter((x) => x.act || x.text.includes(lang === 'zh' ? '过期' : 'expired'));
+  ok(!stale.length, `${name} unlock dismisses the "expired" and Unlock toasts ${JSON.stringify(stale)}`);
   await page.waitForTimeout(800);
   ok(vmPosts.length > n1, `${name} switch ran after the new unlock (${vmPosts.slice(n1).join(',')})`);
 
@@ -205,6 +238,14 @@ for (const lang of ['zh', 'en']) for (const [vname, view] of VIEWS) {
   const lbl = await page.evaluate(() => { const b = $('enable-txt'), sw = $('btn-enable'); const r = b.getBoundingClientRect(), q = sw.getBoundingClientRect();
     return { text: b.textContent, sw: b.scrollWidth, cw: b.clientWidth, inside: r.right <= q.right + 0.5 && r.bottom <= q.bottom + 0.5 }; });
   ok(lbl.text.length > 3 && lbl.sw <= lbl.cw + 1 && lbl.inside, `${name} E-stop reset label fits the switch ${JSON.stringify(lbl)}`);
+  // breaks only between words: each word (and each CJK run) lies on one line, at most two lines
+  const brk = await page.evaluate(() => {
+    const el = $('enable-txt'), tn = el.firstChild, txt = tn.textContent, split = [];
+    let i = 0; for (const w of txt.split(' ')) { const r = document.createRange(); r.setStart(tn, i); r.setEnd(tn, i + w.length);
+      const tops = new Set([...r.getClientRects()].map((q) => Math.round(q.top))); if (tops.size > 1) split.push(w); i += w.length + 1; }
+    const lh = parseFloat(getComputedStyle(el).lineHeight); return { split, lines: Math.round(el.getBoundingClientRect().height / lh) };
+  });
+  ok(!brk.split.length && brk.lines <= 2, `${name} E-stop reset label breaks between words only ${JSON.stringify(brk)}`);
   await page.screenshot({ path: path.join(out, `${name}_8_estop_label.png`), clip: { x: 0, y: 0, width: view.width, height: Math.min(view.height, 520) } });
   // reset (the session is unlocked here) so the next viewport starts without a latched E-stop
   await page.evaluate(() => clearFault());

@@ -170,6 +170,19 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .ui-switch { margin: 0 auto; }
 .ui-switch button { min-width: 112px; }
 .ui-switch .short { display: none; }
+/* the title never runs under the mode switch: it does not shrink below its text; it drops the subtitle, then the
+   text, as the header narrows (header probe at 360-1440 px, zh / en, simple / expert) */
+.brand { flex: none; }
+@media (max-width: 1279px) { .brand-text .full { display: none; } }
+@media (max-width: 999px) { .brand-text { display: none; } }
+@media (max-width: 1279px) { .ui-switch button { min-width: 88px; } }
+@media (max-width: 899px) {
+  .topbar { gap: 8px; }
+  .head-stats #link-badge { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { min-width: 0; padding: 0 10px; }
+}
 .head-stats { display: flex; align-items: center; gap: 8px; }
 .speed-pill {
   width: 52px; height: 26px; border-radius: 13px; padding: 0; margin: 0;
@@ -446,8 +459,8 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
-/* phones: the stock tool's name gives way to the header controls (the language switch went off screen) */
-@media (max-width: 600px) { #tool-badge.is-stock { display: none; } }
+/* phones and tablets: the stock tool's name gives way to the header controls (the language switch went off screen) */
+@media (max-width: 999px) { #tool-badge.is-stock { display: none; } }
 .cwiz-fail ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .cwiz-grip { display: grid; gap: 8px; justify-items: start; }
@@ -629,7 +642,7 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
   #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
 }
 /* the full name ("点位与动作" / "Positions & motions") where the header has room for it */
-@media (min-width: 1000px) {
+@media (min-width: 1180px) {
   #btn-pset .hd-lbl { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
   #btn-pset .hd-lbl-s { display: none; }
 }
@@ -1417,10 +1430,10 @@ body::before {
 .safety-row .sw.holding .sw-track .thumb { width: 22px; }
 .safety-row .sw-text b { font-size: 14px; white-space: nowrap; }
 .safety-row .sw-text small { font-size: 10px; line-height: 1.2; }
-/* "⚠️ 点击复位急停" / "Tap to reset E-Stop" is longer than "Enable": it wraps instead of being cut off, and the
-   hint under it gives way (the safety card's note says the same) */
-.safety-row #enable-txt { white-space: normal; overflow-wrap: break-word; line-height: 1.2; }
-.safety-row .sw.clear .sw-text small { display: none; }
+/* reset state: the switch is a tap target, not a toggle. The track and the hint give way (the safety card's note says
+   the same) and the short label ("⚠️ 复位急停" / "⚠️ Reset E‑Stop") breaks only between words */
+.safety-row #enable-txt { white-space: normal; word-break: keep-all; overflow-wrap: normal; line-height: 1.2; }
+.safety-row .sw.clear .sw-text small, .safety-row .sw.clear .sw-track { display: none; }
 .safety-row .btn-estop { padding: 0 10px; gap: 6px; font-size: 15px; }
 .safety-row .btn-estop svg { width: 18px; height: 18px; flex: none; }
 .safety-row .btn-estop small { font-size: 10px; }
@@ -2627,7 +2640,7 @@ const I18N = {
     'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
     'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
-    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障',
+    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.reset_estop_s': '⚠️ 复位急停', 'en.clear_fault_s': '⚠️ 清除故障', 'en.clear_fault': '⚠️ 点击清除故障',
     'mit.recovery.confirm': '电机指令超时已到期。清除故障会关闭所有关节的力矩，机械臂会像收纳断电一样下落。请先托住机械臂或让它处于支撑位，再在提示消失前点一次确认。',
     'mit.recovery.done': '已恢复：所有关节力矩已关闭', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒：停靠并卸力',
@@ -2848,7 +2861,7 @@ const I18N = {
     'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
     'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
-    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault',
+    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.reset_estop_s': '⚠️ Reset E‑Stop', 'en.clear_fault_s': '⚠️ Clear fault', 'en.clear_fault': '⚠️ Tap to clear fault',
     'mit.recovery.confirm': 'A motor command timeout expired. Clearing turns torque off on every joint and the arm drops like a park torque-off. Support the arm or bring it to rest, then tap again while this warning is shown to confirm.',
     'mit.recovery.done': 'Recovered: torque is off on every joint', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s: park and turn torque off',
@@ -13541,7 +13554,7 @@ function frame(ts) {
   const opClear = live && stopped && opLocked() && clearNeedsOperator();
   $('op-inline').hidden = !opClear;
   if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop_s') : t('en.clear_fault_s')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
   setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;
   $('btn-stop').disabled = !live;
@@ -14755,7 +14768,7 @@ function opCanRetry(path, body) {
    opCanRetry); opt.skip: the action goes on either way, Cancel reads "Not now". */
 function opRequire(path, body, opt = {}) {
   // refused while the page showed the session unlocked: it expired or was locked elsewhere
-  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); toast(t('op.expired'), 'warn'); }
+  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); opToastExpired(); }
   S.auth.enforced = true;
   renderOpBadge();
   return new Promise((resolve) => {
@@ -14763,6 +14776,9 @@ function opRequire(path, body, opt = {}) {
     openOperatorModal(opReasonKey(path, body), 'retry' in opt ? !!opt.retry : opCanRetry(path, body), !!opt.skip);
   });
 }
+/* "Session expired" and Unlock toasts describe a locked session: they go when it is unlocked again. */
+function opToastExpired() { const el = toast(t('op.expired'), 'warn'); if (el) el.classList.add('op-stale'); }
+function opDropStaleToasts() { document.querySelectorAll('#toasts .toast.op-stale, #toasts .toast.has-act').forEach((x) => x.remove()); }
 /* armd refused a request with OPERATOR_REQUIRED: the page's session state is wrong (expired, locked elsewhere,
    or never known). Show the locked badge; no dialog (the caller decides). */
 function opRefused() {
@@ -14770,7 +14786,7 @@ function opRefused() {
   const was = S.auth.role === 'operator';
   S.auth.enforced = true; S.auth.role = 'program'; S.auth.expiresIn = null; S.auth.expiresAt = null;
   scheduleAuthExpiryRefresh(); renderOpBadge();
-  if (was) toast(t('op.expired'), 'warn');
+  if (was) opToastExpired();
 }
 // every same-origin API answer: a 403 OPERATOR_REQUIRED updates the badge, whichever code path made the request
 {
@@ -14876,7 +14892,7 @@ async function loadAuthStatus() {
     S.auth.enforced = !!d.auth_enforced;
     S.auth.role = d.role || 'program';
     S.auth.expiresIn = d.expires_in_s ?? null;
-    if (was === 'operator' && S.auth.role !== 'operator' && S.auth.enforced) toast(t('op.expired'), 'warn');
+    if (was === 'operator' && S.auth.role !== 'operator' && S.auth.enforced) opToastExpired();
     scheduleAuthExpiryRefresh();
     renderOpBadge();
   } catch (_) {}
@@ -14955,6 +14971,7 @@ async function submitOperatorPin(ev) {
     renderOpBadge();
     await opSyncSocket(d.token || null);
     closeOperatorModal(true);
+    opDropStaleToasts();
     toast(t('op.unlocked_msg'), 'ok');
   } catch (e) {
     setText($('op-status'), e.message || t('err.reqfail'));
