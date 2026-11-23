@@ -3245,6 +3245,7 @@ Object.assign(I18N.zh, {
   'cw.f.solving': '正在求解：{s} s，阶段 {stage}', 'cw.f.solving.hint': '求解在浏览器的后台线程（Web Worker）中运行，期间页面可以继续使用。',
   'cw.f.solve.hint': '在位置 A 拟合、预测位置 B（以及反过来）得到留出误差；应用的是 A + B 一起拟合的结果。每项检查都通过后才能应用。',
   'cw.f.fail': '有检查未通过，没有应用：机械臂上现有的标定保持不变，没有任何改动。', 'cw.f.sep': '、', 'cw.f.colon': '：',
+  'cw.f.h.flat': '标定板不平：估计弯曲约 {bow} mm（最大 {max} mm，在 {id} 号标记）——请贴在玻璃、铝板等刚性平板上重拍。按弯曲后的形状计算，误差从 {r0} 降到 {r1} px；这个结果不会被应用。',
   'cw.f.h.img': '图像噪声偏大。标定板要平整、无反光，画面清晰不模糊；检查是否有误识别的标记 ID。',
   'cw.f.h.views': '有效视图不够。多采集一些位姿，让标定板出现在画面各处。',
   'cw.f.h.heldout': '一个位置的结果预测另一个位置的误差偏大。两次摆放要覆盖重叠的关节范围（位置 B 约向前 0.40 m、向侧面 0.20 m），避免需要 J5 超过 60° 的姿态；两次摆放之间和采集中标定板不能被碰动。',
@@ -3315,6 +3316,7 @@ Object.assign(I18N.en, {
   'cw.f.solving': 'Solving: {s} s, stage {stage}', 'cw.f.solving.hint': 'The solve runs in a background thread of the browser (Web Worker); the page stays usable.',
   'cw.f.solve.hint': 'Held-out errors: fitted on placement A, predicting B (and the other way). The fit on A + B together is what gets applied. Every check must pass before Apply.',
   'cw.f.fail': 'Some checks failed; nothing was applied: the calibration on the arm stays as it was.', 'cw.f.sep': ', ', 'cw.f.colon': ': ',
+  'cw.f.h.flat': 'the board is not flat: estimated bow about {bow} mm (largest {max} mm, at marker {id}). Mount it on a rigid flat plate (glass, aluminium) and capture again. With the bent shape the error drops from {r0} to {r1} px; that result is never applied.',
   'cw.f.h.img': 'image noise too high. Keep the board flat, without glare, and the image sharp; check for falsely detected marker IDs.',
   'cw.f.h.views': 'not enough usable views. Capture more poses, with the board in every part of the image.',
   'cw.f.h.heldout': 'one placement predicts the other badly. The two placements must cover overlapping joint ranges (placement B about 0.40 m forward and 0.20 m sideways); avoid poses that need J5 above 60°; the board must not be bumped between or during the placements.',
@@ -7365,7 +7367,7 @@ const cwFmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toF
 const CW_GATE_HINT = { rms: 'img', view_rms: 'img', sigma: 'img', views: 'views', markers: 'views', coverage: 'views', kin_views: 'views',
   kin_heldout_ab: 'heldout', kin_heldout_ba: 'heldout', kin_improve: 'heldout', held_out: 'heldout', kin_bounds: 'bounds',
   he_pos: 'he', he_rot: 'he', rot_diversity: 'he', plane_spread: 'plane', plane_tilt: 'plane' };
-function cwFailBox(gates) {
+function cwFailBox(gates, flatness = null) {
   const box = cwEl('div', 'cwiz-msg cwiz-fail');
   box.appendChild(cwEl('b', '', t('cw.f.fail')));
   const by = new Map();
@@ -7376,7 +7378,11 @@ function cwFailBox(gates) {
     by.get(h).push(t('cw.g.' + g.key));
   }
   const ul = cwEl('ul', '');
-  for (const [h, names] of by) ul.appendChild(cwEl('li', '', names.join(t('cw.f.sep')) + t('cw.f.colon') + t('cw.f.h.' + h)));
+  // a bent board explains the image error (calib_wizard.js boardFlatness): say so instead of the generic noise hint
+  const flat = flatness && flatness.explains;
+  const hint = (h) => (h === 'img' && flat ? t('cw.f.h.flat', { bow: flatness.bowMm.toFixed(1), max: Math.abs(flatness.worst.mm).toFixed(1), id: flatness.worst.id,
+    r0: flatness.rms0.toFixed(2), r1: flatness.rms1.toFixed(2) }) : t('cw.f.h.' + h));
+  for (const [h, names] of by) ul.appendChild(cwEl('li', h === 'img' && flat ? 'cwiz-flat' : '', names.join(t('cw.f.sep')) + t('cw.f.colon') + hint(h)));
   box.appendChild(ul);
   return box;
 }
@@ -7541,7 +7547,7 @@ function cwRenderFineSolve(body, p, acts) {
     if (wn.key === 'accuracy' && !r.ok) continue;
     body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
   }
-  if (!r.ok) body.appendChild(cwFailBox(r.gates));
+  if (!r.ok) body.appendChild(cwFailBox(r.gates, r.flatness));
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwVerifyOn() ? cwBtn(t('cw.f.toTip'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-totip' })
       : cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
@@ -7742,7 +7748,7 @@ function cwRender() {
       if (r.intr.dropped && r.intr.dropped.length) row(t('cw.r.dropped', { list: r.intr.dropped.map((d) => '#' + (d.i + 1) + ' ' + d.rms.toFixed(2) + ' px').join(', ') }), '');
       body.appendChild(box);
     }
-    if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.solve.fail')));
+    if (!r.ok) body.appendChild(r.flatness && r.flatness.explains ? cwFailBox(r.gates, r.flatness) : cwEl('div', 'cwiz-msg', t('cw.solve.fail')));
     acts(CWZ.loaded || !CWZ.est || !CWZ.plan.length ? null : cwBtn(t('cw.cap.more'), () => {
       const q = S.obs && S.obs.positions ? cwModelQ(S.obs.positions) : CWZ.plan[CWZ.plan.length - 1].q;
       CWZ.plan.push(...cwPlan(CWZ.est, q, 8, CWZ.plan.map((x) => x.T))); CWZ.step = 'capture'; cwRender(); cwV3Sync();
