@@ -3480,17 +3480,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.readback_or_enable()
     }
 
-    /// Serve the base-mode restore: replies complete before the deadline -> readback / enable;
-    /// once the deadline passes, post-deadline replies are ignored and missing joints fail closed.
+    /// Serve the base-mode restore: replies recorded strictly before the deadline complete ->
+    /// readback / enable; at or after the deadline, no new RX frames are accepted and already-recorded
+    /// timely replies are still evaluated before timing out missing joints.
     fn poll_restore(&mut self, w: ModeWrite) -> Result<TorqueProgress, ArmDriverError> {
-        if w.deadline.passed(self.now()) {
-            let failed = self.write_modes_finish(w);
-            self.enable_failed();
-            return Err(ArmDriverError::HardwareFault(format!(
-                "Control mode of joints {:?} could not be restored before enable",
-                failed.iter().map(|i| i + 1).collect::<Vec<_>>())));
+        if !w.deadline.passed(self.now()) {
+            let _ = self.read_joint_states();
         }
-        let _ = self.read_joint_states();
         if w.deadline.passed(self.now()) {
             self.register_reply_log.retain(|(_, _, rx_at, _, _)| !w.deadline.passed(*rx_at));
             self.register_replies.clear();
@@ -3553,18 +3549,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Serve the readback: the request goes out once a receive pass observed an empty queue; only
     /// a read reply dequeued after that (expected master CAN ID, motor ID, read opcode, CTRL_MODE)
-    /// and strictly before the 50 ms deadline counts; value 4 enables.
+    /// and recorded strictly before the 50 ms deadline counts; value 4 enables even when processed
+    /// at the advertised expiry wake.
     fn poll_readback(&mut self, mut r: ModeReadback) -> Result<TorqueProgress, ArmDriverError> {
-        if r.deadline.passed(self.now()) {
-            return self.readback_failed(r.joint, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()));
-        }
-        let _ = self.read_joint_states();
-        if r.deadline.passed(self.now()) {
-            return self.readback_failed(r.joint, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()));
+        let expired_before_read = r.deadline.passed(self.now());
+        if !expired_before_read {
+            let _ = self.read_joint_states();
         }
         let id = self.motor_ids[r.joint];
         match r.boundary {
-            None if self.last_read_drained => {
+            None if !expired_before_read && !r.deadline.passed(self.now()) && self.last_read_drained => {
                 let boundary = self.rx_empty_seq;
                 self.register_reply_log.clear();
                 if let Err(e) = self.can.transmit(&damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE)).and_then(|()| self.can.flush()) {

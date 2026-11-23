@@ -572,6 +572,121 @@ fn readback_reply_at_or_after_50ms_deadline_times_out_fail_closed() {
 }
 
 #[test]
+fn timely_readback_and_restore_replies_accepted_at_expiry_wake() {
+    let reg_reply = |op: u8, val: u32| {
+        let b = val.to_le_bytes();
+        CanFrame::new_standard(0x17, &[7, 0, op, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+    };
+
+    // 1. Readback: reply arrives and is recorded by an intervening read 1 ms before expiry,
+    //    then processed at the exact advertised expiry wake -> accepted and enables cleanly.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.motors[J7].silent_after_mode_ack = true);
+    let mut p = d.begin_torque(true).unwrap();
+    let wake = loop {
+        match p {
+            armd::driver::TorqueProgress::Pending { wake } if bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) => {
+                break wake;
+            }
+            armd::driver::TorqueProgress::Pending { .. } => {
+                clock.advance(Duration::from_micros(500));
+                p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            }
+            armd::driver::TorqueProgress::Done(_) => panic!("finished before readback"),
+        }
+    };
+    let to_pre = wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+    clock.advance(to_pre);
+    bus.with(|s| {
+        s.motors[J7].silent = false;
+        s.rx.push_back(reg_reply(damiao::REG_READ, damiao::CTRL_MODE_POS_FORCE));
+    });
+    // Intervening receive records the reply at wake - 1 ms (strictly before deadline).
+    d.read_joint_states().unwrap();
+    // Advance to the exact advertised expiry wake and poll: timely reply must be accepted.
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(clock.now(), wake);
+    let mut p = d.poll_torque(clock.now() + Duration::from_millis(5))
+        .expect("timely readback recorded 1 ms before expiry must be accepted at expiry wake");
+    while let armd::driver::TorqueProgress::Pending { .. } = p {
+        clock.advance(Duration::from_micros(500));
+        p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+    }
+    assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+
+    // 2. Readback negative control: a reply read AT the exact expiry wake (rx_at == deadline)
+    //    is not timely and must still time out fail-closed.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.motors[J7].silent_after_mode_ack = true);
+    let mut p = d.begin_torque(true).unwrap();
+    let wake = loop {
+        match p {
+            armd::driver::TorqueProgress::Pending { wake } if bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) => {
+                break wake;
+            }
+            armd::driver::TorqueProgress::Pending { .. } => {
+                clock.advance(Duration::from_micros(500));
+                p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            }
+            armd::driver::TorqueProgress::Done(_) => panic!("finished before readback"),
+        }
+    };
+    clock.advance(wake.saturating_duration_since(clock.now()));
+    bus.with(|s| {
+        s.motors[J7].silent = false;
+        s.rx.push_back(reg_reply(damiao::REG_READ, damiao::CTRL_MODE_POS_FORCE));
+    });
+    d.read_joint_states().unwrap(); // rx_at == wake (at deadline, not before)
+    let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+    assert!(err.contains("no fresh reply within 50 ms"), "{err}");
+    assert!(!d.is_enabled());
+
+    // 3. Restore: mode-write ACK arrives and is recorded 1 ms before expiry, then processed at
+    //    the exact advertised restore expiry wake -> accepted, proceeds to readback and enables.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.motors[J7].no_write_ack = true);
+    let p = d.begin_torque(true).unwrap();
+    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    // First poll observes no ACK yet and advertises restore expiry wake.
+    let wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+        armd::driver::TorqueProgress::Pending { wake } => wake,
+        other => panic!("expected Pending restore wake, got {other:?}"),
+    };
+    let to_pre = wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+    clock.advance(to_pre);
+    bus.with(|s| {
+        s.motors[J7].no_write_ack = false;
+        s.rx.push_back(reg_reply(damiao::REG_WRITE, damiao::CTRL_MODE_POS_FORCE));
+    });
+    d.read_joint_states().unwrap(); // records ACK at wake - 1 ms
+    clock.advance(Duration::from_millis(1));
+    assert_eq!(clock.now(), wake);
+    let mut p = d.poll_torque(clock.now() + Duration::from_millis(5))
+        .expect("timely restore ACK recorded 1 ms before expiry must be accepted at expiry wake");
+    // Refresh J7 feedback so the subsequent readback -> pre-enable hold stays within 100 ms.
+    bus.with(|s| s.push_all_feedback());
+    while let armd::driver::TorqueProgress::Pending { .. } = p {
+        clock.advance(Duration::from_micros(500));
+        p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+    }
+    assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+
+    // 4. Restore negative control: no timely ACK before expiry wake (ACK sits unread at wake) -> fails closed.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.motors[J7].no_write_ack = true);
+    let _ = d.begin_torque(true).unwrap();
+    let wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+        armd::driver::TorqueProgress::Pending { wake } => wake,
+        other => panic!("expected Pending restore wake, got {other:?}"),
+    };
+    clock.advance(wake.saturating_duration_since(clock.now()));
+    bus.with(|s| s.rx.push_back(reg_reply(damiao::REG_WRITE, damiao::CTRL_MODE_POS_FORCE)));
+    let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+    assert!(err.contains("could not be restored before enable"), "{err}");
+    assert!(!d.is_enabled());
+}
+
+#[test]
 fn recovery_hold_of_a_stale_j7_is_capped() {
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();
