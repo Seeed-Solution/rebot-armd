@@ -7547,23 +7547,29 @@ pub struct ArmSupervisor {
     /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
     tick_stats_wait_us: AtomicU64,
     control_sched: std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>,
-    /// The observation the last tick computed, served by [`Self::get_observation`].
-    obs_snapshot: std::sync::Mutex<Option<ObservationSnapshot>>,
+    /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
+    hub: Arc<crate::rt_core::publish::StateHub>,
+    /// Serializes the start of the dispatcher thread.
+    dispatcher_start: std::sync::Mutex<()>,
+    /// Control period of the last tick (µs): bounds how long a reader waits for a sample.
+    control_period_us: AtomicU64,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
-    obs_publish_skipped: AtomicU64,
+    obs_waits: AtomicU64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// An observation computed by the control tick under the write lock.
-struct ObservationSnapshot {
-    /// Lock generation of the tick's write guard: no other write guard was taken since
-    /// while [`SupervisorLock::generation`] still equals it.
-    generation: u64,
-    at: Instant,
-    /// Older than this, time-derived fields (feedback age, lease expiry) are recomputed.
-    max_age: Duration,
-    obs: Arc<ArmObservation>,
+/// How often a reader that waits for the next sample looks again.
+const OBS_POLL: Duration = Duration::from_millis(1);
+
+/// A published sample, or the read guard when no sample answers (no control loop running).
+enum Fresh<'a> {
+    Sample(Arc<crate::rt_core::publish::Snapshot>),
+    Locked(crate::supervisor_lock::SupReadGuard<'a, SupervisorInner>),
+}
+
+impl Drop for ArmSupervisor {
+    fn drop(&mut self) { self.hub.close(); }
 }
 
 impl ArmSupervisor {
@@ -7574,6 +7580,8 @@ impl ArmSupervisor {
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
+        let hub = inner.core.hub().clone();
+        let control_period_us = (1e6 / f64::from(inner.config.control_frequency_hz.max(1))) as u64;
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
@@ -7582,10 +7590,12 @@ impl ArmSupervisor {
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
             tick_stats_wait_us: AtomicU64::new(0),
             control_sched: std::sync::Mutex::new(None),
-            obs_snapshot: std::sync::Mutex::new(None),
+            hub,
+            dispatcher_start: std::sync::Mutex::new(()),
+            control_period_us: AtomicU64::new(control_period_us),
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
-            obs_publish_skipped: AtomicU64::new(0),
+            obs_waits: AtomicU64::new(0),
             config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -7598,8 +7608,25 @@ impl ArmSupervisor {
         self.inner.write().await.operator_auth_enforced = enforced;
     }
 
+    /// Every tick's observation, forwarded by the dispatcher thread (started here); a
+    /// lagging receiver skips observations, a lagging dispatcher forwards only the newest.
     pub fn subscribe_telemetry(&self) -> broadcast::Receiver<ArmObservation> {
-        self.telemetry_tx.subscribe()
+        let rx = self.telemetry_tx.subscribe();
+        self.ensure_dispatcher();
+        rx
+    }
+
+    /// Starts the dispatcher thread once: a normal-priority thread woken by every
+    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers.
+    fn ensure_dispatcher(&self) {
+        if self.hub.has_dispatcher() { return; }
+        let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
+        if self.hub.has_dispatcher() { return; }
+        let (hub, tx) = (Arc::clone(&self.hub), self.telemetry_tx.clone());
+        match std::thread::Builder::new().name("armd-dispatch".into()).spawn(move || dispatch_loop(&hub, &tx)) {
+            Ok(handle) => { self.hub.set_dispatcher(handle.thread().clone()); }
+            Err(e) => tracing::error!("Cannot start the observation dispatcher thread: {e}"),
+        }
     }
 
     #[doc(hidden)]
@@ -7607,50 +7634,81 @@ impl ArmSupervisor {
         &self.inner
     }
 
-    /// The current observation. Served from the snapshot of the last tick while no write
-    /// guard was taken since and the snapshot is younger than two control periods, so a
-    /// polling client does not hold the read lock the real-time tick waits for; else
-    /// computed under the read lock.
+    /// The current observation, without the supervisor lock while the control loop runs.
+    ///
+    /// Served from the tick's publication (`crate::rt_core::publish`): a sample answers when
+    /// it was taken after every write that completed before this call (its lock generation is
+    /// at least the one seen here) and its validity deadline has not passed (lease expiry,
+    /// previous-action window, feedback freshness, two control periods). Otherwise, while a
+    /// sample younger than two control periods shows the control loop running, the call waits
+    /// for the next tick's sample (at most two periods). Without a running loop the
+    /// observation is computed under the read lock, as before.
     pub async fn get_observation(&self) -> ArmObservation {
-        if let Some(obs) = self.cached_observation() {
-            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
-            return (*obs).clone();
+        match self.fresh(true).await {
+            Fresh::Sample(s) => s.obs.clone(),
+            Fresh::Locked(inner) => inner.current_observation(),
+        }
+    }
+
+    fn wait_bound(&self) -> Duration { Duration::from_micros(2 * self.control_period_us.load(Ordering::Relaxed)) }
+
+    fn answers(s: &crate::rt_core::publish::Snapshot, want: u64, now: Instant) -> bool {
+        s.meta.generation >= want && now <= s.meta.valid_until
+    }
+
+    async fn fresh(&self, count: bool) -> Fresh<'_> {
+        let want = self.inner.generation();
+        let started = Instant::now();
+        let bound = self.wait_bound();
+        let mut waited = false;
+        while let Some(s) = self.hub.latest() {
+            let now = Instant::now();
+            if Self::answers(&s, want, now) {
+                if count {
+                    self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if waited { self.obs_waits.fetch_add(1, Ordering::Relaxed); }
+                }
+                return Fresh::Sample(s);
+            }
+            if now.duration_since(s.meta.sampled_at) > bound || now.duration_since(started) >= bound { break; }
+            waited = true;
+            tokio::time::sleep(OBS_POLL).await;
         }
         let inner = self.inner.read().await;
-        // A tick may have published while this call waited for the lock: serve that one
-        // instead of recomputing (and of a timestamp older than the published one).
-        if let Some(obs) = self.cached_observation() {
+        // a tick may have published while this call waited for the lock
+        if let Some(s) = self.hub.latest().filter(|s| Self::answers(s, want, Instant::now())) {
             drop(inner);
-            self.obs_cache_hits.fetch_add(1, Ordering::Relaxed);
-            return (*obs).clone();
+            if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+            return Fresh::Sample(s);
         }
-        self.obs_cache_misses.fetch_add(1, Ordering::Relaxed);
-        inner.current_observation()
+        if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
+        Fresh::Locked(inner)
     }
 
-    fn cached_observation(&self) -> Option<Arc<ArmObservation>> {
-        let generation = self.inner.generation();
-        let snap = self.obs_snapshot.lock().unwrap_or_else(|e| e.into_inner());
-        snap.as_ref()
-            .filter(|s| s.generation == generation && s.at.elapsed() <= s.max_age)
-            .map(|s| Arc::clone(&s.obs))
+    /// The newest sample while the control loop runs (one younger than two control
+    /// periods), for feedback reads: the per-joint feedback fields are written by the tick
+    /// (and by torque and fault handshakes, whose feedback the next sample carries).
+    fn running_sample(&self) -> Option<Arc<crate::rt_core::publish::Snapshot>> {
+        self.hub.latest().filter(|s| s.meta.sampled_at.elapsed() <= self.wait_bound())
     }
 
-    /// Never blocks the tick: when a reader holds the snapshot mutex the tick skips the
-    /// publication; the previous snapshot carries an older generation and is not served.
-    /// Returns the replaced snapshot (or `snap` when skipped) for the caller to drop after
-    /// it released the supervisor lock: freeing an observation is several deallocations.
-    #[must_use]
-    fn publish_observation(&self, snap: ObservationSnapshot) -> Option<ObservationSnapshot> {
-        let mut slot = match self.obs_snapshot.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                self.obs_publish_skipped.fetch_add(1, Ordering::Relaxed);
-                return Some(snap);
-            }
-        };
-        slot.replace(snap)
+    /// [`SupervisorInner::arm_feedback_snapshot`] from the newest sample while the control
+    /// loop runs, else under the read lock. `arm`: the profile's arm joint indices
+    /// (`config.arm_joint_indices()`).
+    pub async fn arm_feedback_snapshot(&self, arm: &[usize]) -> (Vec<f32>, Vec<f32>, Vec<Option<Instant>>, Vec<u64>) {
+        match self.running_sample() {
+            Some(s) => s.rt.arm_feedback(arm),
+            None => self.inner.read().await.arm_feedback_snapshot(),
+        }
+    }
+
+    /// The measured joint positions from the newest sample while the control loop runs,
+    /// else under the read lock.
+    pub async fn measured_positions(&self) -> Vec<f32> {
+        match self.running_sample() {
+            Some(s) => s.rt.positions.clone(),
+            None => self.inner.read().await.measured_positions.clone(),
+        }
     }
 
     /// Scheduling of the control thread, reported by it after its real-time request.
@@ -7907,19 +7965,21 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
-        Arc::unwrap_or_clone(self.tick_shared(dt).await)
+        self.tick_shared(dt, true).await.expect("tick keeps a copy when asked")
     }
 
     /// [`Self::tick`] for the control loop, which does not use the observation: saves a copy.
     pub async fn control_tick(&self, dt: f64) {
-        self.tick_shared(dt).await;
+        self.tick_shared(dt, false).await;
     }
 
-    async fn tick_shared(&self, dt: f64) -> Arc<ArmObservation> {
+    /// One tick; publishes its observation (`crate::rt_core::publish`) and returns a copy
+    /// when `keep`.
+    async fn tick_shared(&self, dt: f64, keep: bool) -> Option<ArmObservation> {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot, pre, publish, allocs) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, displaced, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
@@ -7930,7 +7990,7 @@ impl ArmSupervisor {
             inner.tick_phases_us = [0; 5];
             let body_start = Instant::now();
             inner.tick_phase_mark = Some(body_start);
-            let obs = Arc::new(inner.tick(dt));
+            let obs = inner.tick(dt);
             inner.tick_phase(4);
             let body_end = inner.tick_phase_mark.take().unwrap_or(body_start);
             let phases = inner.tick_phases_us;
@@ -7940,15 +8000,20 @@ impl ArmSupervisor {
             // Published before the guard drops: no other write can come in between.
             let max_age = Duration::from_secs_f64(2.0 / f64::from(control_hz.max(1)))
                 .min(inner.observation_valid_for(&obs));
-            let old_snapshot = self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
+            let kept = keep.then(|| obs.clone());
+            let at = Instant::now();
+            let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *inner;
+            let displaced = core.publish(generation, at, at + max_age, obs, measured_positions, measured_velocities);
             let lock_end = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
-            (obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot,
+            (kept, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, displaced,
                 body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
-        drop(old_snapshot);
+        // freeing an observation is several deallocations: after the lock
+        drop(displaced);
+        self.control_period_us.store((1e6 / f64::from(control_hz.max(1))) as u64, Ordering::Relaxed);
         if let Some(job) = pending_zc {
             let sup_inner = Arc::clone(&self.inner);
             let cw_lock = Arc::clone(&self.config_write_mutex);
@@ -8164,8 +8229,6 @@ impl ArmSupervisor {
                 }
             });
         }
-        // Broadcast observation to any active WebSocket listeners
-        let _ = self.telemetry_tx.send((*obs).clone());
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
         let done = Instant::now();
         let log = log.unwrap_or_default();
@@ -8227,7 +8290,9 @@ impl ArmSupervisor {
         snap.observation_cache = crate::diagnostics::tick::ObservationCacheStats {
             hits: self.obs_cache_hits.load(Ordering::Relaxed),
             misses: self.obs_cache_misses.load(Ordering::Relaxed),
-            publish_skipped: self.obs_publish_skipped.load(Ordering::Relaxed),
+            publish_skipped: 0,
+            waited: self.obs_waits.load(Ordering::Relaxed),
+            published: self.hub.published_seq(),
         };
         snap
     }
@@ -8241,6 +8306,28 @@ impl ArmSupervisor {
     }
 }
 
+/// The dispatcher thread: forwards each new sample to the telemetry receivers (one clone
+/// per sample, off the control thread) until the supervisor is dropped.
+fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender<ArmObservation>) {
+    #[cfg(target_os = "linux")]
+    {
+        // a normal-priority thread even when started from a real-time one
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: plain call on the calling thread with a valid parameter.
+        unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_OTHER, &param) };
+    }
+    let mut last = 0;
+    while !hub.is_closed() {
+        if hub.published_seq() != last {
+            if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
+                last = s.meta.seq;
+                if tx.receiver_count() > 0 { let _ = tx.send(s.obs.clone()); }
+            }
+        }
+        std::thread::park_timeout(Duration::from_millis(50));
+    }
+}
+
 #[cfg(test)]
 #[path = "supervisor_servo_order_tests.rs"]
 mod servo_order_tests;
@@ -8250,40 +8337,40 @@ mod observation_snapshot_tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reader_holding_the_snapshot_mutex_does_not_delay_the_tick() {
+    async fn a_reader_holding_the_hub_does_not_delay_the_tick() {
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
         sup.tick(0.02).await;
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
             let sup = sup.clone();
-            // a preempted reader: holds the mutex until released
+            // a preempted reader: holds the readers' mutex until released
             std::thread::spawn(move || {
-                let _g = sup.obs_snapshot.lock().unwrap();
+                let _g = sup.hub.reader_guard();
                 held_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             })
         };
         held_rx.recv().unwrap();
         let t = Instant::now();
-        let obs = tokio::time::timeout(Duration::from_millis(500), sup.tick(0.02)).await.expect("tick must not wait for the snapshot mutex");
+        let mut last = 0.0;
+        for _ in 0..3 {
+            last = tokio::time::timeout(Duration::from_millis(500), sup.tick(0.02)).await.expect("tick must not wait for readers").timestamp;
+        }
         assert!(t.elapsed() < Duration::from_millis(100), "{:?}", t.elapsed());
         release_tx.send(()).unwrap();
         holder.join().unwrap();
-        // the skipped publication leaves the older snapshot, which is not served
+        // nothing was skipped: the newest sample is the last tick's
         let served = sup.get_observation().await;
-        assert!(served.timestamp >= obs.timestamp);
+        assert_eq!(served.timestamp, last);
         let c = sup.tick_stats().observation_cache;
-        assert_eq!((c.hits, c.misses, c.publish_skipped), (0, 1, 1));
-        sup.tick(0.02).await;
-        sup.get_observation().await;
-        assert_eq!(sup.tick_stats().observation_cache.hits, 1);
+        assert_eq!((c.hits, c.misses, c.publish_skipped, c.published), (1, 0, 0, 4));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reader_that_waited_for_the_lock_serves_the_snapshot_published_meanwhile() {
+    async fn a_reader_that_waited_for_the_lock_serves_the_sample_published_meanwhile() {
         let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-        let writer = sup.inner().write().await;
+        let mut writer = sup.inner().write().await;
         let reader = {
             let sup = sup.clone();
             tokio::spawn(async move { sup.get_observation().await })
@@ -8292,16 +8379,35 @@ mod observation_snapshot_tests {
         // what a tick does under its guard
         let mut published = writer.current_observation();
         published.timestamp = 123.0;
-        let _ = sup.publish_observation(ObservationSnapshot {
-            generation: sup.inner().generation(),
-            at: Instant::now(),
-            max_age: Duration::from_secs(1),
-            obs: Arc::new(published),
-        });
+        let generation = sup.inner().generation();
+        let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *writer;
+        let _ = core.publish(generation, Instant::now(), Instant::now() + Duration::from_secs(1), published, measured_positions, measured_velocities);
         drop(writer);
         assert_eq!(reader.await.unwrap().timestamp, 123.0);
         let c = sup.tick_stats().observation_cache;
         assert_eq!((c.hits, c.misses), (1, 0));
+    }
+
+    /// Read-your-writes: a write after the tick is answered by the next tick's sample, not
+    /// by the older one and not under the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_waits_for_the_next_sample_while_the_loop_runs() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.tick(0.02).await;
+        sup.set_temperatures(vec![55.0; 7]).await;
+        let ticker = {
+            let sup = sup.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                sup.tick(0.02).await
+            })
+        };
+        let obs = sup.get_observation().await;
+        let ticked = ticker.await.unwrap();
+        assert_eq!(obs.temperatures, vec![55.0; 7]);
+        assert_eq!(obs.timestamp, ticked.timestamp);
+        let c = sup.tick_stats().observation_cache;
+        assert_eq!((c.hits, c.misses, c.waited), (1, 0, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

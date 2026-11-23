@@ -180,6 +180,10 @@ impl StateHub {
         st.latest.clone()
     }
 
+    /// Holds the readers' mutex (tests: a preempted reader).
+    #[doc(hidden)]
+    pub fn reader_guard(&self) -> impl Drop + '_ { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
+
     /// `seq` of the newest publication, without the hub mutex (0: none yet).
     pub fn published_seq(&self) -> u64 { self.published.load(Ordering::Acquire) }
 

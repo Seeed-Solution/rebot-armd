@@ -720,7 +720,7 @@ async fn settle(ctx: &MacroCtx, plan: &Plan, min_s: f64) -> Result<f64, Stop> {
     let mut last_seqs: Option<Vec<u64>> = None;
     loop {
         ctx.check().await?;
-        let (pos, vel, _, seqs) = { ctx.sup.inner().read().await.arm_feedback_snapshot() };
+        let (pos, vel, _, seqs) = ctx.sup.arm_feedback_snapshot(&arm).await;
         if last_seqs.as_deref().is_some_and(|prev| feedback_advanced(prev, &seqs)) {
             win.push_back((pos, vel));
             if win.len() > STILL_WINDOW { win.pop_front(); }
@@ -781,7 +781,7 @@ impl BracketTrack {
         let out = samples.clone();
         let task = tokio::spawn(async move {
             loop {
-                let q = sup.inner().read().await.measured_positions.clone();
+                let q = sup.measured_positions().await;
                 if let Ok(mut v) = out.lock() { v.push(q); }
                 tokio::time::sleep(BRACKET_TRACK_SAMPLE).await;
             }

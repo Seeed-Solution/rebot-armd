@@ -152,15 +152,23 @@ pub struct ControlThreadSched {
     pub realtime: bool,
 }
 
-/// Observations served by `GET /api/v1/observation` from the tick's snapshot (`hits`) or
-/// computed under the supervisor read lock (`misses`); a hit after waiting for the read
-/// lock (a tick published meanwhile) counts as a hit.
+/// Observations served by `GET /api/v1/observation` from the tick's published sample
+/// (`hits`, `crate::rt_core::publish`) or computed under the supervisor read lock
+/// (`misses`: no control loop running); a hit after waiting for the read lock (a tick
+/// published meanwhile) counts as a hit.
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 pub struct ObservationCacheStats {
     pub hits: u64,
     pub misses: u64,
-    /// Ticks that skipped publishing because a reader held the snapshot mutex.
+    /// Always 0 since 1.6: the tick publishes without a mutex and never skips (kept for
+    /// clients of 1.5).
     pub publish_skipped: u64,
+    /// Hits that waited for the next tick's sample (a write or an expiry since the last one).
+    #[serde(default)]
+    pub waited: u64,
+    /// Samples published by the tick so far.
+    #[serde(default)]
+    pub published: u64,
 }
 
 /// Percentiles of the tick's lock phases.
