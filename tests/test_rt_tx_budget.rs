@@ -1273,3 +1273,77 @@ fn frames_expiring_during_flush_drop_stale_and_return_timeout() {
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.would_block, m.dropped_stale, m.pending), (1, 1, 6, 0));
 }
+
+#[test]
+fn refresh_round_robin_covers_all_stale_motors_without_starving_j7() {
+    // All 7 motors stay silent (stale >= 100 ms) while TX budget allows only 1 refresh per pass.
+    // Within 7 consecutive passes every motor 1..=7 (including J7) must receive a 0xCC refresh.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_torque(false).unwrap();
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+
+    // Suppress automatic 0xCC replies by making transmit drop them? VirtualBus pushes feedback
+    // inside handle_frame on 0xCC; clear rx before each pass so all 7 motors stay stale!
+    clock.advance(ms(120));
+    bus.clear();
+    let mut refreshed_ids = Vec::new();
+    for pass in 0..7 {
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        let pass_ids: Vec<u16> = bus.with(|s| {
+            s.tx_accepted
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                .collect()
+        });
+        assert_eq!(pass_ids.len(), 1, "pass {pass} must send exactly 1 refresh under max_frames=1: {pass_ids:?}");
+        refreshed_ids.extend(pass_ids);
+        clock.advance(ms(20));
+    }
+    assert_eq!(
+        refreshed_ids,
+        vec![1, 2, 3, 4, 5, 6, 7],
+        "7 constrained passes must refresh every stale motor J1..J7 without starving J7"
+    );
+
+    // Immediately after the full 7-motor sweep finishes (20 ms < 100 ms cooldown), no extra 0xCC spam.
+    bus.with(|s| {
+        s.rx.clear();
+        s.tx_log.clear();
+        s.tx_accepted.clear();
+    });
+    d.read_joint_states().unwrap();
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "100 ms cooldown must apply once a full refresh sweep completes"
+    );
+
+    // After 100 ms cooldown, the next sweep starts again at J1 and again covers J1..J7 in 7 passes
+    // even when passes are spaced 120 ms apart.
+    clock.advance(ms(100));
+    let mut second_round = Vec::new();
+    for _ in 0..7 {
+        bus.with(|s| {
+            s.rx.clear();
+            s.tx_log.clear();
+            s.tx_accepted.clear();
+        });
+        d.read_joint_states().unwrap();
+        let pass_ids: Vec<u16> = bus.with(|s| {
+            s.tx_accepted
+                .iter()
+                .filter(|f| f.id == 0x7FF && f.data[2] == 0xCC)
+                .map(|f| u16::from_le_bytes([f.data[0], f.data[1]]))
+                .collect()
+        });
+        assert_eq!(pass_ids.len(), 1);
+        second_round.extend(pass_ids);
+        clock.advance(ms(120));
+    }
+    assert_eq!(second_round, vec![1, 2, 3, 4, 5, 6, 7]);
+}

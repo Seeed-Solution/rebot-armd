@@ -2617,6 +2617,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     estop_requested: Option<std::sync::Arc<AtomicU64>>,
     /// Monotonic authorized-stop generation counter (for stamping queued motion frames).
     stop_requests: Option<crate::rt_core::urgent::StopRequests>,
+    /// Round-robin start index for budget-constrained 0xCC refresh sweeps.
+    refresh_cursor: usize,
+    /// Bitmask of stale joints not yet polled in the current 0xCC refresh sweep.
+    refresh_unfinished: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2866,6 +2870,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             tick_tx: None,
             estop_requested: None,
             stop_requests: None,
+            refresh_cursor: 0,
+            refresh_unfinished: 0,
         }
     }
 
@@ -3398,6 +3404,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         // nothing cached or queued may be replayed: the group's outputs are uncertain
         self.last_target_frames.fill(None);
+        self.refresh_unfinished = 0;
         self.discard_pending_tx_stopped();
     }
 
@@ -3807,6 +3814,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.discard_pending_tx_stopped();
         self.begin_tx_tick();
+        self.refresh_unfinished = 0;
         // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1
         // (never after an MIT deadline trip: the rearm restores the modes and re-enables)
         if self.mit_fence_trip.is_none()
@@ -4053,6 +4061,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.discard_pending_tx_stopped();
         self.begin_tx_tick();
+        self.refresh_unfinished = 0;
         // MIT tracking: before the first disable frame, discard every cached target so no
         // later recovery can replay one, whatever the disable's outcome (the fence stays
         // armed until the disable is confirmed).
@@ -5061,40 +5070,73 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // Damiao motors only transmit in reply to a frame. When feedback goes stale
         // (idle, bus glitch, motor power dip) nothing would ever refresh it, so a
         // fault could never be cleared. Poll stale motors with the read-only 0xCC
-        // refresh; it does not change enable state or targets.
+        // refresh; it does not change enable state or targets. Under a tight TX budget,
+        // continue the sweep round-robin across consecutive passes until every stale motor
+        // has been polled before starting the 100 ms cooldown.
         const REFRESH_AFTER: Duration = Duration::from_millis(100);
-        if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling && self.poll_tx_allowed()
-            && self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER)
-        {
-            // the stale motors as a bit set taken before the first transmit (no allocation)
-            let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
-            let stale = (0..n).filter(|&i| self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER))
-                .fold(0u64, |m, i| m | (1 << i));
-            if stale != 0 {
-                let _ = self.ensure_tx_pass();
-                let mut refresh_sent = false;
-                for i in (0..n).filter(|i| stale & (1 << i) != 0) {
-                    if !self.can_start_tick_tx() {
-                        break;
+        if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling && self.poll_tx_allowed() {
+            let cooldown_ready = self.last_refresh_instant.is_none_or(|t| self.since(t) >= REFRESH_AFTER);
+            if cooldown_ready || self.refresh_unfinished != 0 {
+                // the stale motors as a bit set taken before the first transmit (no allocation)
+                let n = self.motor_ids.len().min(self.last_feedback_instant.len()).min(64);
+                let stale = (0..n)
+                    .filter(|&i| self.last_feedback_instant[i].is_none_or(|t| self.since(t) >= REFRESH_AFTER))
+                    .fold(0u64, |m, i| m | (1 << i));
+                let mut remaining = if self.refresh_unfinished != 0 {
+                    let cont = stale & self.refresh_unfinished;
+                    if cont != 0 {
+                        cont
+                    } else if cooldown_ready {
+                        stale
+                    } else {
+                        0
                     }
-                    let id = self.motor_ids[i];
-                    self.record_tx_pass_attempt();
-                    match self.transmit_instrumented(&damiao::build_refresh_frame(id)) {
-                        Ok(()) => refresh_sent = true,
-                        Err(e) if e.is_tx_backpressure() => {
-                            self.mark_tx_pass_backpressured();
+                } else {
+                    stale
+                };
+                if remaining != 0 && n > 0 {
+                    let _ = self.ensure_tx_pass();
+                    let start = self.refresh_cursor % n;
+                    let mut refresh_sent = false;
+                    for offset in 0..n {
+                        let i = (start + offset) % n;
+                        if remaining & (1 << i) == 0 {
+                            continue;
+                        }
+                        if !self.can_start_tick_tx() {
                             break;
                         }
-                        Err(_) => {}
+                        let id = self.motor_ids[i];
+                        self.record_tx_pass_attempt();
+                        match self.transmit_instrumented(&damiao::build_refresh_frame(id)) {
+                            Ok(()) => {
+                                refresh_sent = true;
+                                remaining &= !(1 << i);
+                                self.refresh_cursor = (i + 1) % n;
+                            }
+                            Err(e) if e.is_tx_backpressure() => {
+                                self.mark_tx_pass_backpressured();
+                                break;
+                            }
+                            Err(_) => {
+                                remaining &= !(1 << i);
+                                self.refresh_cursor = (i + 1) % n;
+                            }
+                        }
                     }
-                }
-                if refresh_sent {
-                    if let Err(e) = self.can.flush() {
-                        self.mark_tx_pass_backpressured();
-                        self.discard_pending_tx_stopped();
-                        return Err(e.into());
+                    if refresh_sent {
+                        if let Err(e) = self.can.flush() {
+                            self.mark_tx_pass_backpressured();
+                            self.discard_pending_tx_stopped();
+                            return Err(e.into());
+                        }
                     }
-                    self.last_refresh_instant = Some(self.now());
+                    self.refresh_unfinished = remaining;
+                    if remaining == 0 && refresh_sent {
+                        self.last_refresh_instant = Some(self.now());
+                    }
+                } else {
+                    self.refresh_unfinished = 0;
                 }
             }
         }
