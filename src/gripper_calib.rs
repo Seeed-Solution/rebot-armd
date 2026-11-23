@@ -235,16 +235,22 @@ fn initial_max_nm(inner: &SupervisorInner) -> f32 {
         .map_or(0.45, |c| c - crate::gripper_baseline::MARGIN_FLOOR_NM)
 }
 
+/// First-value limit of a calibration stroke: CALIBRATION_MAX_TORQUE_FRACTION of the cap.
+fn calibration_initial_max_nm(inner: &SupervisorInner) -> f32 {
+    inner.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm)
+        .map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c)
+}
+
 /// Queued moves and the baseline they apply to, taken under the lock: (moves, baseline,
-/// generation, initial_max_nm).
-type LearnJob = (Vec<crate::gripper_baseline::MoveRecord>, crate::gripper_baseline::FreeTorqueBaseline, u64, f32);
+/// generation, (initial_max_nm, calibration initial_max_nm)).
+type LearnJob = (Vec<crate::gripper_baseline::MoveRecord>, crate::gripper_baseline::FreeTorqueBaseline, u64, (f32, f32));
 
 fn take_learn_job(inner: &mut SupervisorInner) -> Option<LearnJob> {
     if inner.gripper_baseline_pending.is_empty() { return None; }
     let moves = std::mem::replace(&mut inner.gripper_baseline_pending,
         Vec::with_capacity(crate::supervisor::GRIPPER_BASELINE_PENDING_MAX));
     let base = inner.gripper_baseline_for_motion()?;
-    Some((moves, base, inner.gripper_baseline_generation, initial_max_nm(inner)))
+    Some((moves, base, inner.gripper_baseline_generation, (initial_max_nm(inner), calibration_initial_max_nm(inner))))
 }
 
 /// Learn the moves into the baseline (no lock held). True when anything changed.
@@ -252,7 +258,7 @@ fn run_learn_job(job: &mut LearnJob) -> bool {
     let (moves, base, _, initial) = job;
     let mut changed = false;
     for rec in moves.iter() {
-        let out = base.learn(rec, *initial);
+        let out = base.learn(rec, if rec.calibration { initial.1 } else { initial.0 });
         if out.bins_updated > 0 || out.bins_rejected > 0 {
             changed = true;
             tracing::debug!("Gripper baseline: {:?} move {:.2} -> {:.2} rad: {} bins updated, {} rejected ({})",
@@ -369,4 +375,162 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
             inner.gripper_calib_invalid = true;
         }
     }
+}
+
+// ---- gripper_calibrate: one action, strokes with nothing in the jaws ----
+
+/// WS command path of the empty-gripper calibration action.
+pub const CALIBRATE_PATH: &str = "/api/v1/action/gripper_calibrate";
+/// A stroke must end within this distance of its target (rad; the real gripper opens to about
+/// -5.61 against a -5.70 command).
+pub const CALIBRATION_TARGET_TOL_RAD: f32 = crate::motion::GRIPPER_STOP_SHORT_RAD;
+/// |τ| p95 of a stroke above this fraction of `max_close_torque_nm` is not free motion.
+pub const CALIBRATION_MAX_TORQUE_FRACTION: f32 = 0.85;
+/// Without a torque cap: |τ| p95 limit of a stroke (N·m).
+pub const CALIBRATION_MAX_TORQUE_NM: f32 = 0.85;
+
+/// One calibration stroke: `fraction` None = open, else move to that fraction (closing).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stroke { pub fraction: Option<f64>, pub speed: f64 }
+
+/// The strokes: close to 5 %, then 4 x (open, close to 5 %) at 1.0 rad/s, 2 x at 0.3 rad/s
+/// (slow band), and a final open.
+pub fn strokes() -> Vec<Stroke> {
+    let close = |speed| Stroke { fraction: Some(0.05), speed };
+    let open = |speed| Stroke { fraction: None, speed };
+    let mut v = vec![close(1.0)];
+    for _ in 0..4 { v.push(open(1.0)); v.push(close(1.0)); }
+    for _ in 0..2 { v.push(open(0.3)); v.push(close(0.3)); }
+    v.push(open(1.0));
+    v
+}
+
+/// Start `gripper_calibrate`: one action whose orchestrator runs the [`strokes`] as gripper
+/// sub-motions; stop, E-stop and lease loss end it like any macro action. Each stroke must reach
+/// its target with no contact, stall or torque cap trip, |τ| p95 below
+/// CALIBRATION_MAX_TORQUE_FRACTION x cap, and every bin within the profile of the earlier
+/// strokes; otherwise the action fails CALIBRATION_OBSTRUCTED and the baseline stays as it was.
+/// When all strokes pass, the baseline is replaced by the one learned from them.
+pub fn begin_calibration(inner: &mut SupervisorInner, sup: &std::sync::Arc<ArmSupervisor>, epoch: u64, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+    let (Some(_), Some(policy)) = (inner.config.gripper_index(), inner.config.gripper_policy.clone()) else {
+        return Err(MotionError::Unsupported("Gripper calibration needs a profile with a gripper joint and policy".into()).into());
+    };
+    let torque_feedback = inner.driver.as_ref().and_then(|d| d.lock().ok().map(|d| d.capabilities().torque_feedback)).unwrap_or(true);
+    if !torque_feedback {
+        return Err(MotionError::Unsupported("Gripper calibration needs torque feedback".into()).into());
+    }
+    let id = inner.begin_orchestrated_action("gripper_calibrate", tag, epoch)?;
+    let list = strokes();
+    inner.gripper_calibration = Some(crate::supervisor::GripperCalibrationRun { id, records: Vec::with_capacity(list.len() + 2) });
+    let span = f64::from((policy.open_rad - policy.closed_rad).abs());
+    let expected: f64 = list.iter().map(|s| span * 0.95 / s.speed + 1.5).sum();
+    let sup2 = sup.clone();
+    tokio::spawn(async move {
+        let worker = { let sup = sup2.clone(); tokio::spawn(async move { run_calibration(sup, id).await }) };
+        if let Err(e) = worker.await {
+            let mut inner = sup2.inner().write().await;
+            inner.gripper_calibration = None;
+            inner.finish_macro(id, "failed", Some("INTERNAL"), Some(format!("calibration orchestrator failed: {e}")), None, None);
+        }
+    });
+    Ok((id, expected))
+}
+
+/// Start `gripper_calibrate` without a WS lease check (tests, in-process agents).
+pub async fn start_calibration(sup: &std::sync::Arc<ArmSupervisor>) -> Result<(u64, f64), ArmError> {
+    let mut inner = sup.inner().write().await;
+    let epoch = inner.safety.epoch_id();
+    begin_calibration(&mut inner, sup, epoch, None)
+}
+
+async fn run_calibration(sup: std::sync::Arc<ArmSupervisor>, id: u64) {
+    use crate::macro_action::{MacroCtx, Stop};
+    let ctx = MacroCtx {
+        sup: sup.clone(), id,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(400),
+        phase_timeout_s: 40.0,
+        timeout_code: "CALIBRATION_TIMEOUT",
+        timeout_message: "the gripper calibration did not finish within its time bound".into(),
+    };
+    let result = calibration_strokes(&ctx).await;
+    let mut inner = sup.inner().write().await;
+    inner.gripper_calibration = None;
+    match result {
+        Ok(base) => {
+            if !inner.macro_alive(id) { return; }
+            inner.gripper_baseline = Some(base);
+            inner.gripper_baseline_pending.clear();
+            inner.gripper_baseline_generation += 1;
+            inner.gripper_baseline_dirty = true;
+            inner.gripper_last_contact = None;
+            tracing::info!("Gripper calibration {id}: baseline learned from {} strokes", strokes().len());
+            inner.finish_macro(id, "done", None, None, None, None);
+        }
+        Err(Stop::Fail(code, message)) => {
+            tracing::warn!("Gripper calibration {id} failed: {code}: {message}");
+            inner.finish_macro(id, "failed", Some(&code), Some(message), None, None);
+        }
+        Err(Stop::Cancelled) => {}
+    }
+}
+
+/// |τ| quantile `q` of a stroke's samples (0 without samples).
+fn torque_quantile(rec: &crate::gripper_baseline::MoveRecord, q: f32) -> f32 {
+    let mut v: Vec<f32> = rec.samples.iter().map(|s| s.1).collect();
+    if v.is_empty() { return 0.0; }
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[((v.len() - 1) as f32 * q).round() as usize]
+}
+
+async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crate::gripper_baseline::FreeTorqueBaseline, crate::macro_action::Stop> {
+    use crate::macro_action::{arm_fail, fail};
+    let obstructed = |m: String| fail("CALIBRATION_OBSTRUCTED", m);
+    let (policy, g, mut scratch, limit_nm) = {
+        let inner = ctx.sup.inner().read().await;
+        let policy = inner.config.gripper_policy.clone().ok_or_else(|| fail("UNSUPPORTED", "no gripper policy"))?;
+        let g = inner.config.gripper_index().ok_or_else(|| fail("UNSUPPORTED", "no gripper joint"))?;
+        let tool = &inner.config.active_tool;
+        let scratch = crate::gripper_baseline::FreeTorqueBaseline::new(policy.closed_rad, policy.open_rad,
+            Some(tool.id.clone()), Some(tool.config_digest.clone()), inner.follower.clone());
+        let limit = policy.max_close_torque_nm.map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c);
+        (policy, g, scratch, limit)
+    };
+    let list = strokes();
+    for (i, st) in list.iter().enumerate() {
+        let n = i + 1;
+        let phase = format!("stroke:{n}/{}", list.len());
+        ctx.phase(&phase, i as f32 / list.len() as f32).await?;
+        let command = if st.fraction.is_some() { crate::motion::GripperCommand::Move } else { crate::motion::GripperCommand::Open };
+        let request = crate::motion::GripperRequest { command, fraction: st.fraction, grasp: false, speed: st.speed, timeout_s: None, tag: None };
+        let target = st.fraction.map_or(policy.open_rad, |f| policy.closed_rad + f as f32 * (policy.open_rad - policy.closed_rad));
+        let (limit_s, before) = {
+            let mut inner = ctx.sup.inner().write().await;
+            if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
+            let before = inner.gripper_calibration.as_ref().map_or(0, |c| c.records.len());
+            let l = inner.start_macro_gripper_learning(ctx.id, request, crate::motion::LearnMode::Calibration).map_err(arm_fail)?;
+            (l, before)
+        };
+        ctx.wait_sub(&phase, limit_s + 10.0).await?;
+        let (at, rec) = {
+            let inner = ctx.sup.inner().read().await;
+            let at = inner.measured_positions.get(g).copied().unwrap_or(f32::NAN);
+            (at, inner.gripper_calibration.as_ref().and_then(|c| c.records.get(before).cloned()))
+        };
+        if !(at - target).abs().le(&CALIBRATION_TARGET_TOL_RAD) {
+            return Err(obstructed(format!("stroke {n}: the jaw stopped at {at:.3} rad, {:.3} rad short of {target:.3} rad; check that nothing is in or against the jaws", (at - target).abs())));
+        }
+        let Some(rec) = rec else {
+            return Err(obstructed(format!("stroke {n}: a contact, stall or torque cap trip on the way; check that nothing is in or against the jaws")));
+        };
+        let p95 = torque_quantile(&rec, 0.95);
+        if p95 > limit_nm {
+            return Err(obstructed(format!("stroke {n}: |torque| p95 {p95:.2} N·m above {limit_nm:.2} N·m")));
+        }
+        let out = scratch.learn(&rec, limit_nm);
+        if out.bins_rejected > 0 {
+            return Err(obstructed(format!("stroke {n}: torque above the free-motion profile of the earlier strokes in {} position bins", out.bins_rejected)));
+        }
+    }
+    scratch.ts = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+    Ok(scratch)
 }

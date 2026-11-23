@@ -50,6 +50,8 @@ enum Finger {
     New,
     /// Old finger (2026-11-20): 0.40 N·m whatever the position (as `test_gripper_force`).
     Old,
+    /// New finger, `.0` x its torque everywhere (lower friction after lubrication).
+    NewScaled(f32),
     /// New finger lubricated: the measured lubricated shape, closing 10 % higher (0.57 N·m at
     /// -6.0), noise ±0.15 N·m per tick (σ 0.087: p90 about 0.11 above the median, as measured).
     Lube,
@@ -61,6 +63,7 @@ impl Finger {
         let base = match self {
             Finger::New => 1.3 * shape(q) * if v > 0.0 { 1.04 } else { 1.0 } + noise,
             Finger::Old => 0.40,
+            Finger::NewScaled(f) => f * 1.3 * shape(q) * if v > 0.0 { 1.04 } else { 1.0 } + noise,
             Finger::Lube => interp(&SHAPE_LUBE, q) * if v > 0.0 { 1.1 } else { 1.0 } + 2.5 * noise,
         };
         base.max(0.0) * v.signum()
@@ -81,6 +84,8 @@ enum Load {
     Slip(f32, f32),
     /// Rigid obstacle outside the jaws at `.0` while opening (stiffness `.1` N·m/rad).
     OpenBlock(f32, f32),
+    /// Something dragging on the jaw between `.0` and `.1` (rad): `.2` N·m more while moving.
+    Drag(f32, f32, f32),
 }
 
 struct Rig {
@@ -134,6 +139,8 @@ impl ArmDriver for RigDriver {
                 Load::Slip(..) => free,
                 Load::OpenBlock(at, k) if q <= at => { q = at; v = 0.0; -(k * (at - t.position)).max(0.0) }
                 Load::OpenBlock(..) => free,
+                Load::Drag(a, b, nm) if q >= a.min(b) && q <= a.max(b) && v.abs() > 0.05 => free + nm * v.signum(),
+                Load::Drag(..) => free,
             };
             r.q[6] = q;
             r.v[6] = v;
@@ -233,8 +240,10 @@ fn new_finger_unlearned_uses_the_absolute_rule_and_learns_from_opens() {
     for k in 0..4 {
         let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
         assert_eq!(a.state, "done");
+        // the first open sets the bins (at most contact_torque_nm - 0.15 = 0.45 N·m); later opens
+        // more than the contact margin above that are not learned (only a calibration raises it)
         let obs = baseline_obs(&inner);
-        assert!(obs.open_moves as usize == k + 1 && obs.close_moves == 0, "{obs:?}");
+        assert!(obs.open_moves >= 1 && obs.close_moves == 0, "{obs:?}");
         inner.gripper_last_contact = None;
         let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
         let c = inner.gripper_last_contact;
@@ -368,18 +377,19 @@ fn old_finger_contact_unchanged_by_the_baseline() {
     assert!(p1 <= p0 + 0.05, "{p0} vs {p1}");
 }
 
-/// After lubrication (free torque halved) the baseline follows down over a few unloaded moves.
+/// After lubrication (free torque 0.65 x everywhere) the baseline follows down over a few
+/// unloaded moves.
 #[test]
 fn baseline_follows_lower_friction() {
     let (mut inner, rig) = rig(Finger::New);
     learn(&mut inner, &rig, 4);
     let at = |inner: &SupervisorInner| inner.gripper_baseline.as_ref().unwrap().estimate(-4.5, Direction::Close, 1.0).unwrap().baseline_nm;
     let high = at(&inner);
-    rig.lock().unwrap().finger = Finger::Old; // 0.40 instead of ~0.6
+    rig.lock().unwrap().finger = Finger::NewScaled(0.65);
     learn(&mut inner, &rig, 4);
     let low = at(&inner);
     eprintln!("baseline at -4.5 close: {high:.3} -> {low:.3}");
-    assert!(high > 0.55 && (low - 0.40).abs() < 0.05, "{high} -> {low}");
+    assert!(high > 0.55 && (low - 0.65 * high).abs() < 0.05, "{high} -> {low}");
 }
 
 /// The baseline is written next to the gripper calibration, one file per follower, and loaded
@@ -551,4 +561,97 @@ fn lubricated_finger_one_open_then_air_closes() {
         assert_eq!(a.state, "done");
     }
     assert_eq!(baseline_obs(&inner).close_moves, 0);
+}
+
+// ---- gripper_calibrate action (orchestrator in armd) ----
+
+/// Supervisor with the rig driver, ticked at 20 ms of simulated time every millisecond.
+async fn calib_rig(finger: Finger) -> (Arc<armd::ArmSupervisor>, Arc<Mutex<Rig>>) {
+    let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled,
+        finger, load: Load::Free, seed: 11, offset: 0.0, broke: false, peak_tau: 0.0 }));
+    let sup = Arc::new(armd::ArmSupervisor::new(ArmConfig::rebot_dm()));
+    sup.set_driver(Box::new(RigDriver(rig.clone()))).await;
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.follower = Some("rig".into());
+        inner.tick(DT);
+        inner.set_torque(true).unwrap();
+    }
+    let ticker = sup.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        loop { interval.tick().await; ticker.tick(DT).await; }
+    });
+    (sup, rig)
+}
+
+async fn calib_wait(sup: &armd::ArmSupervisor, id: u64, mut each: impl FnMut(&armd::motion::ActionStatus)) -> armd::motion::ActionStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "calibration {id} not finished");
+        let a = { let inner = sup.inner().read().await; inner.last_action.clone().unwrap() };
+        assert_eq!(a.id, id);
+        each(&a);
+        if !a.is_running() { return a; }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calibration_action_learns_from_free_strokes() {
+    let (sup, _rig) = calib_rig(Finger::New).await;
+    let (id, expected) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+    assert!(expected > 60.0, "{expected}");
+    let mut phases = Vec::new();
+    let a = calib_wait(&sup, id, |a| { if let Some(p) = a.phase.clone() { if phases.last() != Some(&p) { phases.push(p); } } }).await;
+    let inner = sup.inner().read().await;
+    let obs = inner.gripper_baseline_observation();
+    eprintln!("calibration: {} {:?}, {} phases, baseline {obs:?}", a.state, a.code, phases.len());
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!(phases.iter().any(|p| p == "stroke:14/14"), "{phases:?}");
+    assert_eq!(obs.state, "learned", "{obs:?}");
+    assert!(inner.gripper_baseline_dirty);
+}
+
+/// A compliant obstacle in the jaws (or against them) fails the calibration with
+/// CALIBRATION_OBSTRUCTED and leaves the learned baseline as it was; Stop cancels it the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calibration_action_obstructed_or_stopped_learns_nothing() {
+    for case in ["soft", "drag", "stop"] {
+        let (sup, rig) = calib_rig(Finger::New).await;
+        let before = {
+            let mut inner = sup.inner().write().await;
+            inner.gripper_baseline_for_motion();
+            inner.gripper_baseline.clone()
+        };
+        if case == "soft" { rig.lock().unwrap().load = Load::Soft(-3.0, 1.0, 4.0); }
+        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let mut stopped = false;
+        let sup2 = sup.clone();
+        let a = calib_wait(&sup, id, |a| {
+            if case == "drag" && !stopped && a.phase.as_deref() == Some("stroke:6/14") {
+                stopped = true;
+                rig.lock().unwrap().load = Load::Drag(-2.5, -0.8, 0.25);
+            }
+            if case == "stop" && !stopped && a.phase.as_deref() == Some("stroke:4/14") {
+                stopped = true;
+                let sup3 = sup2.clone();
+                tokio::spawn(async move { let mut inner = sup3.inner().write().await; inner.stop_motion(); inner.request_macro_stop(); });
+            }
+        }).await;
+        // the orchestrator ends its run record once it sees the end
+        for _ in 0..200 {
+            if sup.inner().read().await.gripper_calibration.is_none() { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let inner = sup.inner().read().await;
+        eprintln!("{case}: {} {:?} {:?}", a.state, a.code, a.message);
+        match case {
+            "soft" | "drag" => assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("CALIBRATION_OBSTRUCTED")), "{a:?}"),
+            _ => assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("STOPPED")), "{a:?}"),
+        }
+        assert_eq!(inner.gripper_baseline, before, "{case}: baseline changed");
+        assert!(inner.gripper_calibration.is_none());
+    }
 }

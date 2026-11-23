@@ -1363,7 +1363,7 @@ impl GripperMotion {
         if (self.target - m_g).abs() > self.policy.holding_gap_rad.max(GRIPPER_STOP_SHORT_RAD) { return; }
         let Some(samples) = self.samples.take() else { return };
         let direction = if (self.target - self.start) * self.close_dir() > 0.0 { Direction::Close } else { Direction::Open };
-        self.learned = Some(MoveRecord { direction, start_rad: self.start, end_rad: m_g, samples });
+        self.learned = Some(MoveRecord { direction, start_rad: self.start, end_rad: m_g, samples, calibration: self.learn == LearnMode::Calibration });
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.

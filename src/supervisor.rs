@@ -112,7 +112,15 @@ pub const GRIPPER_STALL_BASELINE_RAISE_MAX_NM: f32 = 0.15;
 /// processed (no allocation on the control tick).
 pub const GRIPPER_BASELINE_PENDING_MAX: usize = 4;
 
-/// What a gripper action does with the learned free-motion baseline (`"baseline"` in the body).
+/// Records of the strokes of a running `gripper_calibrate` action (id), in stroke order.
+#[derive(Debug, Clone)]
+pub struct GripperCalibrationRun {
+    pub id: u64,
+    pub records: Vec<crate::gripper_baseline::MoveRecord>,
+}
+
+/// What a gripper action does with the learned free-motion baseline (tests and tools; the API
+/// calibrates with the `gripper_calibrate` action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GripperBaselineCmd {
     /// Ordinary action: only opening moves are learned.
@@ -371,6 +379,9 @@ pub struct SupervisorInner {
     /// Finished unloaded gripper moves waiting to be learned off the control tick
     /// (`crate::gripper_calib::spawn_baseline_persister`); at most GRIPPER_BASELINE_PENDING_MAX.
     pub gripper_baseline_pending: Vec<crate::gripper_baseline::MoveRecord>,
+    /// Running `gripper_calibrate` action: its strokes' records, learned only when every stroke
+    /// passed (crate::gripper_calib).
+    pub gripper_calibration: Option<GripperCalibrationRun>,
     /// Bumped by every baseline change made under the lock (reset, learned result stored); a
     /// learning pass computed from an older generation is dropped.
     pub gripper_baseline_generation: u64,
@@ -784,6 +795,7 @@ impl SupervisorInner {
             gripper_baseline_dirty: false,
             gripper_baseline_pending: Vec::with_capacity(GRIPPER_BASELINE_PENDING_MAX),
             gripper_baseline_generation: 0,
+            gripper_calibration: None,
             gripper_last_contact: None,
             gripper_zero_checked: false,
             gripper_calib_invalid: false,
@@ -4268,6 +4280,12 @@ impl SupervisorInner {
 
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        self.start_macro_gripper_learning(id, request, crate::motion::LearnMode::Opening)
+    }
+
+    /// [`Self::start_macro_gripper`] recording the move for the baseline as `learn` allows
+    /// (`gripper_calibrate` strokes: `LearnMode::Calibration`).
+    pub fn start_macro_gripper_learning(&mut self, id: u64, request: GripperRequest, learn: crate::motion::LearnMode) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
@@ -4281,7 +4299,7 @@ impl SupervisorInner {
         self.releasing = matches!(request.command, GripperCommand::Open);
         let baseline = self.gripper_baseline_for_motion();
         let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx)
-            .with_baseline(baseline, crate::motion::LearnMode::Opening);
+            .with_baseline(baseline, learn);
         let duration = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
@@ -6097,7 +6115,7 @@ impl SupervisorInner {
         } else {
             None
         };
-        let mut grip_learned: Option<crate::gripper_baseline::MoveRecord> = None;
+        let mut grip_learned: Option<(Option<u64>, crate::gripper_baseline::MoveRecord)> = None;
         let cap_k = self.gripper_cap_ramp.map(|r| r.k_est);
         let mut grip_contact: Option<crate::gripper_baseline::ContactInfo> = None;
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
@@ -6128,7 +6146,7 @@ impl SupervisorInner {
                 Reference::Gripper(grip) => {
                     grip.set_cap_stiffness(cap_k);
                     let out = grip.step(&ctx);
-                    grip_learned = grip.take_learning();
+                    grip_learned = grip.take_learning().map(|r| (active.action_id, r));
                     if let Some(c) = grip.last_contact { grip_contact = Some(c); }
                     Stepped::Action(out)
                 }
@@ -6148,9 +6166,14 @@ impl SupervisorInner {
             Some((active.action_id, out))
         } else { None };
         if let Some(c) = grip_contact { self.gripper_last_contact = Some(c); }
-        if let Some(rec) = grip_learned {
-            // learned off the tick (gripper_calib::spawn_baseline_persister); capacity is reserved
-            if self.gripper_baseline_pending.len() < GRIPPER_BASELINE_PENDING_MAX { self.gripper_baseline_pending.push(rec); }
+        if let Some((action_id, rec)) = grip_learned {
+            if let Some(cal) = self.gripper_calibration.as_mut().filter(|c| Some(c.id) == action_id) {
+                // a calibration stroke: checked and learned by its orchestrator (capacity reserved)
+                if cal.records.len() < cal.records.capacity() { cal.records.push(rec); }
+            } else if self.gripper_baseline_pending.len() < GRIPPER_BASELINE_PENDING_MAX {
+                // learned off the tick (gripper_calib::spawn_baseline_persister); capacity is reserved
+                self.gripper_baseline_pending.push(rec);
+            }
         }
         if let Some(id) = approach_started {
             // macro actions (grasp, place) already have a phase `approach`: theirs is `final_approach`

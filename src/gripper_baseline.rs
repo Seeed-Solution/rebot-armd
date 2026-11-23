@@ -41,12 +41,12 @@ pub const CONTACT_CAP_FRACTION: f32 = 0.85;
 /// lubrication, only makes the contact detection more sensitive).
 pub const MAX_RISE_PER_MOVE_NM: f32 = 0.05;
 pub const MAX_FALL_PER_MOVE_NM: f32 = 0.10;
-/// A bin median of one move more than max(OUTLIER_SPREADS x spread, OUTLIER_FLOOR_NM) above the
-/// learned median is an outlier and not learned; OUTLIER_STREAK such moves in a row are taken as
-/// a real change (bounded by MAX_RISE_PER_MOVE_NM).
-pub const OUTLIER_SPREADS: f32 = 4.0;
-pub const OUTLIER_FLOOR_NM: f32 = 0.2;
-pub const OUTLIER_STREAK: u32 = 3;
+/// A move is learned only when every bin it covers is within the learned profile: its median
+/// at most max(ACCEPT_FLOOR_NM, ACCEPT_SPREADS x spread) above the learned median (the contact
+/// margin). One bin above it rejects the whole move (a dragging open, a compliant object): a
+/// higher free-motion torque is taken only by a calibration (`gripper_calibrate`).
+pub const ACCEPT_FLOOR_NM: f32 = MARGIN_FLOOR_NM;
+pub const ACCEPT_SPREADS: f32 = MARGIN_SPREADS;
 /// EWMA weight floor of a new move (1 / (moves + 1) until it reaches this).
 pub const EWMA_MIN_WEIGHT: f32 = 0.25;
 /// ... for a move below the learned median.
@@ -76,9 +76,6 @@ pub struct Table {
     pub spread_nm: [f32; BINS],
     /// Accepted moves per bin (0: not learned).
     pub moves: [u32; BINS],
-    /// Consecutive outlier moves per bin.
-    #[serde(default)]
-    pub outlier_streak: [u32; BINS],
 }
 
 /// Persisted free-motion torque baseline.
@@ -172,6 +169,9 @@ pub struct MoveRecord {
     pub start_rad: f32,
     pub end_rad: f32,
     pub samples: MoveSamples,
+    /// A calibration stroke (nothing in the jaws, checked): its first value per bin is not
+    /// limited to the absolute rule's free-motion torque.
+    pub calibration: bool,
 }
 
 /// What [`FreeTorqueBaseline::learn`] did with a move.
@@ -317,7 +317,8 @@ impl FreeTorqueBaseline {
 
     /// Learn from one unloaded move. Samples near the start and the end of the move and samples
     /// slower than LEARN_MIN_SPEED_RAD_S are dropped; each bin with at least
-    /// LEARN_MIN_BIN_SAMPLES samples gets the move's robust median, bounded and outlier-checked.
+    /// LEARN_MIN_BIN_SAMPLES samples gets the move's robust median, bounded; a move with a bin
+    /// above the learned profile (ACCEPT_*) is rejected as a whole.
     /// A bin's first value is at most `initial_max_nm` (the free-motion torque the absolute
     /// contact rule allows for: `contact_torque_nm` − MARGIN_FLOOR_NM); it then rises by at most
     /// MAX_RISE_PER_MOVE_NM per move.
@@ -333,29 +334,32 @@ impl FreeTorqueBaseline {
             let slow = v < SLOW_BAND_MAX_RAD_S;
             groups[usize::from(slow) * BINS + self.bin(q)].push(tau);
         }
+        // per bin (median, spread) of this move; any bin above the learned profile rejects it
+        let mut stats: Vec<(usize, bool, f32, f32)> = Vec::new();
         for (gi, g) in groups.iter_mut().enumerate() {
             if g.len() < LEARN_MIN_BIN_SAMPLES { continue; }
-            let (slow, b) = (gi >= BINS, gi % BINS);
             let (m, s) = robust_stats(g);
+            stats.push((gi % BINS, gi >= BINS, m, s));
+        }
+        let above = stats.iter().filter(|&&(b, slow, m, _)| {
+            let t = self.table(rec.direction, slow);
+            t.moves[b] > 0 && m - t.median_nm[b] > ACCEPT_FLOOR_NM.max(ACCEPT_SPREADS * t.spread_nm[b])
+        }).count();
+        if above > 0 {
+            out.bins_rejected = above;
+            self.rejected_moves += 1;
+            return out;
+        }
+        for (b, slow, m, s) in stats {
             let t = self.table_mut(rec.direction, slow);
             if t.moves[b] == 0 {
                 t.median_nm[b] = m.min(initial_max_nm.max(0.0));
                 t.spread_nm[b] = s.clamp(MIN_SPREAD_NM, MAX_SPREAD_NM);
                 t.moves[b] = 1;
-                t.outlier_streak[b] = 0;
                 out.bins_updated += 1;
                 continue;
             }
             let dev = m - t.median_nm[b];
-            let outlier = dev > OUTLIER_FLOOR_NM.max(OUTLIER_SPREADS * t.spread_nm[b]);
-            if outlier {
-                t.outlier_streak[b] += 1;
-                if t.outlier_streak[b] < OUTLIER_STREAK {
-                    out.bins_rejected += 1;
-                    continue;
-                }
-            }
-            t.outlier_streak[b] = 0;
             // a lower torque is followed faster (it only makes the detection more sensitive)
             let floor = if dev < 0.0 { EWMA_MIN_WEIGHT_FALL } else { EWMA_MIN_WEIGHT };
             let w = (1.0 / (t.moves[b] as f32 + 1.0)).max(floor);
@@ -369,7 +373,6 @@ impl FreeTorqueBaseline {
         if out.bins_updated > 0 {
             match rec.direction { Direction::Close => self.close_moves += 1, Direction::Open => self.open_moves += 1 }
         }
-        if out.bins_rejected > 0 { self.rejected_moves += 1; }
         out
     }
 }
@@ -424,7 +427,7 @@ mod tests {
             let q = from + (to - from) * i as f32 / n as f32;
             samples.push(q, f(q), speed);
         }
-        MoveRecord { direction: dir, start_rad: from, end_rad: to, samples }
+        MoveRecord { direction: dir, start_rad: from, end_rad: to, samples, calibration: false }
     }
 
     #[test]
@@ -442,14 +445,20 @@ mod tests {
         assert_eq!(b.state(), "learned");
         let e = b.estimate(-3.0, Direction::Close, 1.0).unwrap();
         assert!(!e.other_direction && (e.baseline_nm - shape(-3.0)).abs() < 0.03, "{e:?}");
-        // a move with an object pressing (+0.5 N·m) is rejected twice, then taken in bounded steps
-        let before = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
-        for _ in 0..2 {
+        // a move with an object pressing (+0.5 N·m) is rejected, however often it comes; a move
+        // pressing in one bin only is rejected as a whole
+        let before = b.clone();
+        for _ in 0..5 {
             let o = b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0), 2.0);
-            assert!(o.bins_rejected > 0);
+            assert!(o.bins_rejected > 0 && o.bins_updated == 0);
         }
-        assert_eq!(b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm, before);
-        b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.5, 1.0), 2.0);
+        let o = b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + if (-3.2..-2.8).contains(&q) { 0.4 } else { 0.0 }, 1.0), 2.0);
+        assert!(o.bins_rejected > 0 && o.bins_updated == 0, "{o:?}");
+        assert_eq!(b.estimate(-3.0, Direction::Close, 1.0), before.estimate(-3.0, Direction::Close, 1.0));
+        assert_eq!(b.rejected_moves, before.rejected_moves + 6);
+        // within the profile (+0.1 N·m): taken, at most MAX_RISE_PER_MOVE_NM
+        let before = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
+        b.learn(&record(Direction::Close, -5.7, 0.0, |q| shape(q) + 0.1, 1.0), 2.0);
         let after = b.estimate(-3.0, Direction::Close, 1.0).unwrap().baseline_nm;
         assert!(after > before && after - before <= MAX_RISE_PER_MOVE_NM + 1e-4, "{before} -> {after}");
         // a lower baseline (lubrication) is followed, at most MAX_FALL_PER_MOVE_NM per move
