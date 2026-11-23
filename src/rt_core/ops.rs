@@ -29,7 +29,7 @@ use super::broker::{
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
-use super::mailbox::{target_mailbox, Refusal, RefusalDetail, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
+use super::mailbox::{target_mailbox, Refusal, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
 use super::urgent::StopRequests;
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
@@ -447,19 +447,9 @@ impl CoreOps for SupervisorInner {
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
-        if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) {
-            let detail = match code {
-                "LEASE_LOST" => {
-                    let preempted = self.last_evicted.as_ref().is_some_and(|(_, g)| *g == frame.authority.lease_generation);
-                    RefusalDetail::LeaseLoss { reason: if preempted { "preempted" } else { "expired" } }
-                }
-                "PLAN_STALE" => RefusalDetail::CurrentRevision(self.workspace_revision),
-                _ => RefusalDetail::None,
-            };
-            return Err(Refusal { code, detail });
-        }
-        if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
-        self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| Refusal::code(static_code(ArmError::Safety(e))))
+        // track D: identity, deadline, authority, stream, policy generation, input / camera
+        // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
+        self.consume_target_frame(frame, ctx)
     }
 
     fn apply_stop(&mut self) { self.stop_motion(); }
