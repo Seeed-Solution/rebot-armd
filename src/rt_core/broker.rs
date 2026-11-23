@@ -291,11 +291,13 @@ pub struct PlanSlots<P> {
 // WRITING (no handle to it exists yet, and reached only after `RETIRED` with `pins[i] == 0`
 // observed via Acquire), and read only through `PlanReader::get` while the state is READY
 // with the handle's generation (Acquire load after the writer's Release store) or through
-// `PlanSlotRef` while `pins[i] > 0` (acquired while READY, released on drop). The writer
-// does not touch a READY or pinned RETIRED slot until the reader moved it to RETIRED
-// (Release), all borrows dropped (Release), and the writer observed both (Acquire).
-// `PlanReader` is neither `Clone` nor `Sync`, and `PlanSlotRef<P>` is `Send`/`Sync` only
-// when `P: Send + Sync`, so `&P` never reaches two threads at once unless `P: Sync`.
+// `PlanSlotRef` while `pins[i] > 0` (acquired via `PlanReader::pin`, which requires `P: Sync`,
+// while READY and released on drop). The writer does not touch a READY or pinned RETIRED slot
+// until the reader moved it to RETIRED (Release), all borrows dropped (Release), and the
+// writer observed both (Acquire). `PlanReader` is neither `Clone` nor `Sync` (so `get` only
+// ever hands out `&P` on one thread at a time for non-`Sync` `P`), and pinning requires
+// `P: Sync` so moving `PlanReader` to another thread while a `PlanSlotRef` lives cannot give
+// two threads concurrent `&P` to a `!Sync` type.
 unsafe impl<P: Send> Sync for PlanSlots<P> {}
 
 /// An immutable, pinned borrow of a published plan slot that can outlive a single release
@@ -472,22 +474,6 @@ impl<P> PlanReader<P> {
         Some(unsafe { &*self.slots.plans[h.index()].get() })
     }
 
-    /// Pins a live slot for immutable borrowing past this release (zero allocations).
-    /// None when `h` belongs to another pool or was retired / reused.
-    pub fn pin(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> {
-        if h.pool != self.slots.pool { return None; }
-        let idx = h.index();
-        let w = self.slots.words.get(idx)?;
-        if w.load(Ordering::Acquire) != pack(h.generation, READY) { return None; }
-        let prev = self.slots.pins[idx].fetch_add(1, Ordering::Acquire);
-        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
-        if w.load(Ordering::Acquire) != pack(h.generation, READY) {
-            self.slots.pins[idx].fetch_sub(1, Ordering::Release);
-            return None;
-        }
-        Some(PlanSlotRef { slots: self.slots.clone(), handle: h })
-    }
-
     /// Ends the RT's use of `h` (no allocation, no free: the writer reclaims the slot).
     /// False when `h` was not live. Takes `&mut self` so no `&P` from [`Self::get`] can
     /// outlive the retirement (the writer may rewrite the slot right after).
@@ -503,6 +489,42 @@ impl<P> PlanReader<P> {
         if h.pool != self.slots.pool { return false; }
         let Some(w) = self.slots.words.get(h.index()) else { return false; };
         w.compare_exchange(pack(h.generation, READY), pack(h.generation, RETIRED), Ordering::Release, Ordering::Relaxed).is_ok()
+    }
+}
+
+impl<P: Sync> PlanReader<P> {
+    /// Pins a live slot for immutable borrowing past this release (zero allocations).
+    /// None when `h` belongs to another pool or was retired / reused.
+    ///
+    /// Requires `P: Sync`: `PlanReader` is `Send`, so safe code can pin a slot on one thread
+    /// and move `PlanReader` to another thread to call [`Self::get`]; requiring `P: Sync`
+    /// prevents two threads from holding `&P` to a non-`Sync` plan simultaneously.
+    ///
+    /// ```compile_fail
+    /// use std::cell::Cell;
+    /// let (mut w, r) = armd::rt_core::broker::plan_slots(1, || Cell::new(0u32));
+    /// let h = w.stage(|p| p.set(7)).unwrap();
+    /// let _pinned = r.pin(h);
+    /// ```
+    ///
+    /// ```
+    /// let (mut w, r) = armd::rt_core::broker::plan_slots(1, || 0u32);
+    /// let h = w.stage(|p| *p = 7).unwrap();
+    /// let pinned = r.pin(h).unwrap();
+    /// assert_eq!(*pinned, 7);
+    /// ```
+    pub fn pin(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> {
+        if h.pool != self.slots.pool { return None; }
+        let idx = h.index();
+        let w = self.slots.words.get(idx)?;
+        if w.load(Ordering::Acquire) != pack(h.generation, READY) { return None; }
+        let prev = self.slots.pins[idx].fetch_add(1, Ordering::Acquire);
+        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
+        if w.load(Ordering::Acquire) != pack(h.generation, READY) {
+            self.slots.pins[idx].fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(PlanSlotRef { slots: self.slots.clone(), handle: h })
     }
 }
 
@@ -797,9 +819,6 @@ impl<P> RtIntake<P> {
     /// The plan of a live install, None when stale.
     pub fn plan(&self, h: PlanHandle) -> Option<&P> { self.plans.get(h) }
 
-    /// Pins a live plan slot for immutable borrowing until terminal retirement.
-    pub fn plan_ref(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> { self.plans.pin(h) }
-
     /// Replies the reply ring refused (0 unless a reservation is wrong).
     pub fn reply_overflow(&self) -> u64 { self.reply_overflow }
 
@@ -822,17 +841,17 @@ impl<P> RtIntake<P> {
     pub fn broker_gone(&self) -> bool { self.commands.is_abandoned() }
 }
 
+impl<P: Sync> RtIntake<P> {
+    /// Pins a live plan slot for immutable borrowing until terminal retirement.
+    pub fn plan_ref(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> { self.plans.pin(h) }
+}
+
 impl<P> Taken<'_, P> {
     pub fn descriptor(&self) -> &Descriptor { &self.d }
 
     /// The plan of this install (None: not an install, or the slot is stale).
     pub fn plan(&self) -> Option<&P> {
         self.d.kind.plan().and_then(|plan| self.intake.plans.get(plan))
-    }
-
-    /// Pins this install's plan slot for immutable borrowing until terminal retirement.
-    pub fn plan_ref(&self) -> Option<PlanSlotRef<P>> {
-        self.d.kind.plan().and_then(|plan| self.intake.plans.pin(plan))
     }
 
     /// Sends the terminal of an earlier install before this command's answer (an install
@@ -870,6 +889,13 @@ impl<P> Taken<'_, P> {
         if let CommandKind::Install { plan } = self.d.kind { self.intake.plans.retire(plan); }
         let request = self.d.stamp.request;
         self.intake.reply(Reply::Refused { request, code });
+    }
+}
+
+impl<P: Sync> Taken<'_, P> {
+    /// Pins this install's plan slot for immutable borrowing until terminal retirement.
+    pub fn plan_ref(&self) -> Option<PlanSlotRef<P>> {
+        self.d.kind.plan().and_then(|plan| self.intake.plans.pin(plan))
     }
 }
 
