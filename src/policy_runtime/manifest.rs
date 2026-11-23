@@ -1139,8 +1139,11 @@ fn validate_outputs_shape(outputs: &Value, action_dim: usize, chunk_size: usize)
                 })?;
             match dims.as_slice() {
                 [d] | [1, d] if *d == expected_flat => {}
-                [1, k, d] if chunk_size > 1 && *k == chunk_size && *d == action_dim => {}
-                [k, d] if chunk_size > 1 && *k == chunk_size && *d == action_dim => {}
+                [1, k, d] | [k, d] if chunk_size > 1 && *k == chunk_size && *d == action_dim => {
+                    return Err(PolicyError::InvalidManifest(format!(
+                        "outputs.action.shape {shape} is not supported; export flattened [1, {expected_flat}] (chunk_size * action_dim)"
+                    )));
+                }
                 [d] | [1, d] => {
                     return Err(PolicyError::DimensionMismatch {
                         expected: expected_flat,
@@ -1149,7 +1152,7 @@ fn validate_outputs_shape(outputs: &Value, action_dim: usize, chunk_size: usize)
                 }
                 _ => {
                     return Err(PolicyError::InvalidManifest(format!(
-                        "outputs.action.shape {shape} is not supported; expected [{expected_flat}] or [1, {expected_flat}]"
+                        "outputs.action.shape {shape} is not supported; export flattened [1, {expected_flat}] (or [{expected_flat}])"
                     )));
                 }
             }

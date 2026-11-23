@@ -2851,6 +2851,26 @@ mod chunking_tests {
         pj["chunking"] = serde_json::json!({"chunk_size": 4, "replan_every": 2});
         pj["outputs"] = serde_json::json!({"action": {"name": "a", "shape": [1, 7]}});
         assert!(StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).is_err());
+
+        // Unflattened [K, D] and [1, K, D] output shapes are rejected with instructions to export [1, K*D].
+        for unflat in [serde_json::json!([4, 7]), serde_json::json!([1, 4, 7])] {
+            let mut pj = base.clone();
+            pj["chunking"] = serde_json::json!({"chunk_size": 4, "replan_every": 2});
+            pj["outputs"] = serde_json::json!({"action": {"name": "a", "shape": unflat}});
+            let err = StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("[1, 28]"),
+                "expected error to recommend flattened [1, 28], got: {msg}"
+            );
+        }
+        // Flattened [1, K*D] and [K*D] output shapes are accepted.
+        for flat in [serde_json::json!([1, 28]), serde_json::json!([28])] {
+            let mut pj = base.clone();
+            pj["chunking"] = serde_json::json!({"chunk_size": 4, "replan_every": 2});
+            pj["outputs"] = serde_json::json!({"action": {"name": "a", "shape": flat}});
+            assert!(StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).is_ok());
+        }
     }
 
     #[test]
