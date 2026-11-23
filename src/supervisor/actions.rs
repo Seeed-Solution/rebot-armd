@@ -564,67 +564,99 @@ impl SupervisorInner {
     /// `JointQuinticLimited` plans from the commanded state with `max_velocity` (0: the
     /// profile's); `duration_s` is the prepared estimate and is not enforced.
     pub fn commit_macro_child(&mut self, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
-        use crate::rt_core::ops::{Primitive, START_TOLERANCE};
-        let code = |e: ArmError| -> &'static str {
-            let c = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
-            crate::rt_core::ops::TERMINAL_CODES.iter().find(|k| **k == c).copied().unwrap_or("REJECTED")
-        };
+        use crate::rt_core::ops::Primitive;
         let Some(spec) = primitive.child().copied() else { return Err("INVALID_COMMAND"); };
-        let id = spec.ticket.parent.0;
-        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id)) else { return Err("PARENT_REPLACED"); };
-        if spec.ticket.child_seq != run.child.seq.wrapping_add(1) { return Err("PLAN_STALE"); }
-        if run.sub == SubState::Running { return Err("MOTION_BUSY"); }
         let start = match primitive {
             Primitive::CartesianPath { dof, start, .. } | Primitive::Gripper { dof, start, .. }
             | Primitive::JointQuinticLimited { dof, start, .. } | Primitive::Replay { dof, start, .. } => &start[..usize::from(*dof).min(start.len())],
             _ => return Err("INVALID_COMMAND"),
         };
-        if start.len() != self.commanded_positions.len()
-            || start.iter().zip(&self.commanded_positions).any(|(s, c)| !s.is_finite() || (s - c).abs() >= START_TOLERANCE) {
-            return Err("PLAN_STALE");
+        if matches!(primitive, Primitive::CartesianPath { n, .. } if *n != 1) {
+            self.commit_child_checks(&spec, start)?;
+            return Err("UNSUPPORTED");
         }
-        self.guard_next_macro_child(id, spec.contact);
-        let installed = match *primitive {
+        let primitive = *primitive;
+        self.commit_child_install(spec, start, now, move |this, id| match primitive {
             Primitive::JointQuinticLimited { dof, q, max_velocity, .. } => {
-                let mut limits = self.planning_limits();
+                let mut limits = this.planning_limits();
                 for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
                     if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
                 }
-                self.install_macro_quintic(id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+                this.install_macro_quintic(id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
             }
             Primitive::Gripper { fraction, speed, grasp, .. } => {
                 let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
                 let request = GripperRequest { command, fraction: (command == GripperCommand::Move).then_some(f64::from(fraction)), grasp,
                     speed: f64::from(speed), timeout_s: Some(spec.timeout_s), tag: None };
-                self.start_macro_gripper(id, request).map(drop)
+                this.start_macro_gripper(id, request).map(drop)
             }
-            Primitive::CartesianPath { n, waypoints, speed_mps, .. } => {
-                if n != 1 { self.guard_next_macro_child(id, None); return Err("UNSUPPORTED"); }
+            Primitive::CartesianPath { waypoints, speed_mps, .. } => {
                 let w = waypoints[0];
                 let goal = crate::kinematics::Pose::new(crate::kinematics::rpy_to_r(f64::from(w[3]), f64::from(w[4]), f64::from(w[5])),
                     [f64::from(w[0]), f64::from(w[1]), f64::from(w[2])]);
-                self.plan_input().and_then(|input| {
+                this.plan_input().and_then(|input| {
                     let speed = crate::motion::Speed { linear: f64::from(speed_mps), angular: crate::motion::DEFAULT_ANGULAR_RPS };
                     let path = crate::motion::plan_cartesian(&input, goal, speed).map_err(ArmError::from)?;
-                    self.install_macro_path(id, &input, path).map(drop)
+                    this.install_macro_path(id, &input, path).map(drop)
                 })
             }
             Primitive::Replay { episode, speed, gripper, .. } => {
                 let request = crate::replay::ReplayRequest { episode: episode.as_str().to_string(), speed: f64::from(speed), gripper, tag: None, allow_stale: false };
-                let epoch = self.safety.epoch_id();
-                self.replay_input(request, epoch)
+                let epoch = this.safety.epoch_id();
+                this.replay_input(request, epoch)
                     .and_then(crate::replay::plan)
-                    .and_then(|planned| self.install_macro_replay(id, planned).map(drop))
+                    .and_then(|planned| this.install_macro_replay(id, planned).map(drop))
             }
-            _ => return Err("INVALID_COMMAND"),
+            _ => Err(MotionError::InvalidCommand("not a child primitive".into()).into()),
+        })
+    }
+
+    /// The checks of a child commit before anything is installed: the ticket's parent is the
+    /// running macro, the ticket is its next child, no child runs, and `start` is the
+    /// commanded position (every joint, gripper included, `>= START_TOLERANCE`).
+    fn commit_child_checks(&self, spec: &crate::rt_core::ops::ChildSpec, start: &[f32]) -> Result<u64, &'static str> {
+        use crate::rt_core::ops::START_TOLERANCE;
+        let id = spec.ticket.parent.0;
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id)) else { return Err("PARENT_REPLACED"); };
+        if spec.ticket.child_seq != run.child.seq.wrapping_add(1) { return Err("PLAN_STALE"); }
+        if run.sub == SubState::Running { return Err("MOTION_BUSY"); }
+        if start.len() != self.commanded_positions.len()
+            || start.iter().zip(&self.commanded_positions).any(|(s, c)| !s.is_finite() || (s - c).abs() >= START_TOLERANCE) {
+            return Err("PLAN_STALE");
+        }
+        Ok(id)
+    }
+
+    /// Commits one child of the running macro: [`Self::commit_child_checks`], the child's
+    /// contact guard, `install(self, parent id)`, then its RT deadline. A refused install
+    /// leaves no guard armed. Returns the parent.
+    pub(crate) fn commit_child_install(&mut self, spec: crate::rt_core::ops::ChildSpec, start: &[f32], now: Instant,
+        install: impl FnOnce(&mut Self, u64) -> Result<(), ArmError>) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+        let code = |e: ArmError| -> &'static str {
+            let c = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
+            crate::rt_core::ops::TERMINAL_CODES.iter().find(|k| **k == c).copied().unwrap_or("REJECTED")
         };
-        if let Err(e) = installed {
+        let id = self.commit_child_checks(&spec, start)?;
+        self.guard_next_macro_child(id, spec.contact);
+        if let Err(e) = install(self, id) {
             self.guard_next_macro_child(id, None);
             return Err(code(e));
         }
         let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
         self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
         Ok(crate::rt_core::broker::ActionId(id))
+    }
+
+    /// Installs a prepared Cartesian path as a sub-motion of macro action `id` (the RT
+    /// commit of a `Primitive::Prepared` child: no IK). Returns its planned duration.
+    pub(crate) fn install_macro_prepared_path(&mut self, id: u64, path: JointPath, power_noted: bool) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
+        self.check_prepared_fresh(epoch)?;
+        let duration = self.start_path_motion_at(epoch, &path)?;
+        if power_noted { self.note_action_power_scale(id, path.power_scale); }
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        self.set_macro_sub_running(id);
+        Ok(duration + 0.5)
     }
 
     /// Ends the running macro without its orchestrator (a guard, a fault, a newer action):

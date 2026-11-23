@@ -181,6 +181,30 @@ pub fn prepare_joint_move(snap: &crate::rt_core::ops::PlanningSnapshot, q: &[f32
     crate::rt_core::ops::Primitive::joint_quintic(&snap.commanded, q, duration_s)
 }
 
+/// Worker-side preparation of a planned Cartesian path for the RT broker (C2): its joint
+/// samples and path parameters go into a plan slot (`PlanSlot::copy_from` stages it without
+/// reallocating), so the commit installs it without IK. `start` is the snapshot's commanded
+/// position, which the path's first sample must match (arm joints and gripper,
+/// `START_TOLERANCE`). `CONFIG_BUSY` under a configuration hold, `PLAN_STALE` when the path
+/// was planned from another start, `PLAN_TOO_LARGE` beyond `MAX_PATH_SAMPLES`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_cartesian_path(snap: &crate::rt_core::ops::PlanningSnapshot, path: &JointPath, child: Option<crate::rt_core::ops::ChildSpec>)
+    -> Result<crate::rt_core::ops::PlanSlot, &'static str> {
+    use crate::rt_core::{mailbox::MAX_DOF, ops::{PathKind, PlanSlot, Primitive, MAX_PATH_SAMPLES, START_TOLERANCE}};
+    if snap.config_inhibited { return Err("CONFIG_BUSY"); }
+    let dof = snap.commanded.len();
+    if dof == 0 || dof > MAX_DOF || dof > 7 || path.dof != dof || path.q.len() < 2 || path.q.len() != path.s.len() { return Err("INVALID_COMMAND"); }
+    if path.q.len() > MAX_PATH_SAMPLES { return Err("PLAN_TOO_LARGE"); }
+    if path.q[0][..dof].iter().zip(&snap.commanded).any(|(a, b)| (a - b).abs() >= START_TOLERANCE) { return Err("PLAN_STALE"); }
+    let mut slot = PlanSlot::with_path_capacity(path.q.len());
+    for (q, s) in path.q.iter().zip(&path.s) { slot.path.push(&q[..dof], *s)?; }
+    let mut start = [0.0; MAX_DOF];
+    start[..dof].copy_from_slice(&snap.commanded);
+    slot.primitive = Primitive::Prepared { child, dof: dof as u8, start, kind: PathKind::Cartesian, duration_s: path.duration,
+        power_scale: Some(path.power_scale) };
+    Ok(slot)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed {
     pub linear: f64,

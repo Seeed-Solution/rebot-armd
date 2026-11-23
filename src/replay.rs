@@ -156,6 +156,36 @@ fn lerp_frames(a: &RecordFrame, b: &RecordFrame, t: f64) -> Vec<f32> {
 }
 
 /// Load, resample and check an episode for replay. Pure (file read, no lock).
+/// Worker-side preparation of a replay for the RT broker (E3): the episode `plan` read and
+/// resampled (file I/O here, on the worker) goes into a plan slot as joint samples, so the
+/// commit installs it without reading the file. The worker checks the tool provenance the
+/// legacy install checks (`TOOL_MISMATCH`) and names the active tool it checked against;
+/// the commit refuses when that tool changed. `start` is the commanded position the episode
+/// was loaded from. `PLAN_TOO_LARGE` beyond `MAX_PATH_SAMPLES` samples.
+pub fn prepare_replay(plan: &ReplayPlan, active_tool_digest: &str, child: Option<crate::rt_core::ops::ChildSpec>)
+    -> Result<crate::rt_core::ops::PlanSlot, &'static str> {
+    use crate::rt_core::{mailbox::MAX_DOF, ops::{tool_digest_hash, EpisodeRef, PathKind, PlanSlot, Primitive, MAX_PATH_SAMPLES}};
+    let input = &plan.input;
+    let dof = input.start.len();
+    if dof == 0 || dof > MAX_DOF || plan.samples.is_empty() || plan.samples.iter().any(|q| q.len() != dof) { return Err("INVALID_COMMAND"); }
+    if plan.samples.len() > MAX_PATH_SAMPLES { return Err("PLAN_TOO_LARGE"); }
+    if plan.planned_tool_digest != active_tool_digest { return Err("TOOL_MISMATCH"); }
+    let approach_moves_gripper = input.gripper_idx.is_some_and(|g| input.request.gripper && (plan.samples[0][g] - input.start[g]).abs() > 1e-3);
+    if input.request.gripper && (plan.has_gripper_motion || approach_moves_gripper) && !plan.tool_provenance_ok { return Err("TOOL_MISMATCH"); }
+    let episode = EpisodeRef::new(&input.request.episode).ok_or("INVALID_COMMAND")?;
+    let mut slot = PlanSlot::with_path_capacity(plan.samples.len());
+    for (k, q) in plan.samples.iter().enumerate() { slot.path.push(q, k as f64)?; }
+    let mut start = [0.0; MAX_DOF];
+    start[..dof].copy_from_slice(&input.start);
+    slot.primitive = Primitive::Prepared {
+        child, dof: dof as u8, start,
+        kind: PathKind::Replay { episode, speed: input.request.speed as f32, gripper: input.request.gripper, sample_dt: plan.sample_dt,
+            tool_digest: tool_digest_hash(active_tool_digest) },
+        duration_s: plan.duration, power_scale: plan.power_scale,
+    };
+    Ok(slot)
+}
+
 pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
     let id = &input.request.episode;
     let sidecar = match input.store.get_or_adopt(id, &input.zero_offsets, &input.joint_names, input.profile_id.as_deref(), f64::from(input.control_hz)) {
@@ -593,6 +623,10 @@ impl SupervisorInner {
     /// limits, then start the action. Returns (action id, expected duration).
     pub fn install_replay(&mut self, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
         let (motion, first, scales) = self.replay_motion(plan)?;
+        self.install_replay_motion(motion, first, scales)
+    }
+
+    fn install_replay_motion(&mut self, motion: ReplayMotion, first: Vec<f32>, scales: [Option<f64>; 2]) -> Result<(u64, f64), ArmError> {
         let episode = motion.episode.clone();
         let expected = motion.expected_duration();
         let tag = motion.tag.clone();
@@ -614,6 +648,10 @@ impl SupervisorInner {
     pub fn install_macro_replay(&mut self, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
         self.macro_sub_ready_pub(id)?;
         let (motion, first, scales) = self.replay_motion(plan)?;
+        self.install_macro_replay_motion(id, motion, first, scales)
+    }
+
+    fn install_macro_replay_motion(&mut self, id: u64, motion: ReplayMotion, first: Vec<f32>, scales: [Option<f64>; 2]) -> Result<f64, ArmError> {
         let expected = motion.expected_duration();
         self.start_replay_motion(first)?;
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
@@ -632,6 +670,68 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = std::time::Instant::now();
         Ok(())
+    }
+
+    /// The approach to the first frame: validated, planned from the commanded state, power
+    /// fitted and checked against the workspace (no IK). Returns it with its power scale.
+    fn replay_approach(&self, first: &[f32], epoch: u64) -> Result<(MultiJointQuinticTrajectory, Option<f64>), ArmError> {
+        self.safety.validate_motion_command(Some(epoch), first, &self.config.limits)?;
+        let limits = self.planning_limits();
+        let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, first,
+            &vec![0.0; self.config.dof], None, &limits)?;
+        let (traj, approach_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, first, &limits, true)?;
+        let checks = self.workspace_samples(&traj)?;
+        self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
+        Ok((traj, approach_scale))
+    }
+
+    /// The motion of a prepared replay (the RT commit of `Primitive::Prepared` with
+    /// `PathKind::Replay`): its samples are the slot's (read and resampled by the worker,
+    /// `prepare_replay`), so nothing here reads a file. The commit already checked the
+    /// prepared start and the workspace revision; this checks the epoch, the replay
+    /// preconditions and the tool the worker checked the provenance against, then plans the
+    /// approach. Returns (motion, first frame, power scales).
+    pub(crate) fn prepared_replay_motion(&mut self, dof: usize, path: &crate::rt_core::ops::PreparedPath, kind: crate::rt_core::ops::PathKind,
+        duration: f64, power_scale: Option<f64>, epoch: u64) -> Result<(ReplayMotion, Vec<f32>, [Option<f64>; 2]), ArmError> {
+        let crate::rt_core::ops::PathKind::Replay { episode, speed, gripper, sample_dt, tool_digest } = kind else {
+            return Err(MotionError::InvalidCommand("not a prepared replay".into()).into());
+        };
+        if path.is_empty() || dof != self.config.dof || !(sample_dt.is_finite() && sample_dt > 0.0) || !(duration.is_finite() && duration >= 0.0) {
+            return Err(MotionError::InvalidCommand("prepared replay without samples".into()).into());
+        }
+        if self.safety.epoch_id() != epoch {
+            return Err(MotionError::PlanStale("epoch changed while loading the episode".into()).into());
+        }
+        self.replay_preconditions()?;
+        if crate::rt_core::ops::tool_digest_hash(&self.config.active_tool.config_digest) != tool_digest {
+            return Err(rejected(409, "TOOL_MISMATCH", format!(
+                "Replay for episode '{}' was prepared for another tool than the active '{}'", episode.as_str(), self.config.active_tool.id)));
+        }
+        let gripper_idx = self.config.gripper_index();
+        let hold_gripper = gripper_idx.filter(|_| !gripper).map(|g| self.commanded_positions[g]);
+        let samples: Vec<Vec<f32>> = path.samples().iter().map(|q| q[..dof].to_vec()).collect();
+        let mut first = samples[0].clone();
+        if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
+        let (traj, approach_scale) = self.replay_approach(&first, epoch)?;
+        let motion = ReplayMotion {
+            episode: episode.as_str().to_string(), speed: f64::from(speed) * power_scale.unwrap_or(1.0), gripper,
+            gripper_idx, samples, sample_dt, duration, hold_gripper, tag: None,
+            approach_duration: traj.duration, phase: Phase::Approach(traj),
+        };
+        Ok((motion, first, [power_scale, approach_scale]))
+    }
+
+    /// Installs a prepared replay as a `replay` action. Returns (action id, expected duration).
+    pub(crate) fn install_prepared_replay(&mut self, prepared: (ReplayMotion, Vec<f32>, [Option<f64>; 2])) -> Result<(u64, f64), ArmError> {
+        let (motion, first, scales) = prepared;
+        self.install_replay_motion(motion, first, scales)
+    }
+
+    /// Installs a prepared replay as a sub-motion of macro action `id`. Returns its expected duration.
+    pub(crate) fn install_macro_prepared_replay(&mut self, id: u64, prepared: (ReplayMotion, Vec<f32>, [Option<f64>; 2])) -> Result<f64, ArmError> {
+        self.macro_sub_ready_pub(id)?;
+        let (motion, first, scales) = prepared;
+        self.install_macro_replay_motion(id, motion, first, scales)
     }
 
     /// Checks of an install and the motion: (motion, first frame, power scales).
@@ -670,13 +770,7 @@ impl SupervisorInner {
                 input.request.episode, plan.recorded_tool_id, plan.recorded_tool_digest, self.config.active_tool.id, self.config.active_tool.config_digest
             )));
         }
-        self.safety.validate_motion_command(Some(input.epoch), &first, &self.config.limits)?;
-        let limits = self.planning_limits();
-        let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &first,
-            &vec![0.0; self.config.dof], None, &limits)?;
-        let (traj, approach_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &first, &limits, true)?;
-        let checks = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
+        let (traj, approach_scale) = self.replay_approach(&first, input.epoch)?;
 
         let ReplayPlan { input, samples, sample_dt, duration, power_scale, .. } = plan;
         let motion = ReplayMotion {

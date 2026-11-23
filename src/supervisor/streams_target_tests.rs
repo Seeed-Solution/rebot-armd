@@ -12,7 +12,7 @@ use crate::model::ArmConfig;
 use crate::rt_core::broker::{Authority, BootId, Broker, Capacities};
 use crate::rt_core::ids::ArmId;
 use crate::rt_core::mailbox::{Refusal, RefusalDetail, TargetFrame, TargetOutcome, MAX_DOF};
-use crate::rt_core::ops::{Primitive, ReleaseFixture};
+use crate::rt_core::ops::{PlanSlot, ReleaseFixture};
 use crate::rt_core::urgent::StopRequests;
 use crate::supervisor::{ArmError, SupervisorInner};
 
@@ -21,7 +21,7 @@ const BOOT: BootId = BootId(7);
 
 struct Rig {
     fx: ReleaseFixture<SupervisorInner>,
-    _broker: Broker<Primitive>,
+    _broker: Broker<PlanSlot>,
     port: TargetPort,
     stop: StopRequests,
     stream: ServoStream,

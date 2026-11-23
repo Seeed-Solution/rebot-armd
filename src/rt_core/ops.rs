@@ -93,6 +93,106 @@ pub enum Primitive {
     JointQuinticLimited { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], q: [f32; MAX_DOF], duration_s: f64, max_velocity: [f32; MAX_DOF], settle_s: f64 },
     /// Replay of a recorded episode.
     Replay { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], episode: EpisodeRef, speed: f32, gripper: bool },
+    /// A joint-sample path the worker prepared into the slot's [`PreparedPath`] (Cartesian
+    /// path: IK solved; replay: episode read and resampled), installed by
+    /// [`CoreOps::commit_prepared`] without IK or file I/O. `start` is the commanded position
+    /// it was prepared from (checked as for `JointQuintic`); `child` names a macro parent.
+    Prepared { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], kind: PathKind, duration_s: f64, power_scale: Option<f64> },
+}
+
+/// What a [`Primitive::Prepared`] path is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathKind {
+    /// Samples at path parameters `0..=1` (`PreparedPath::params`, first sample = start),
+    /// run over `duration_s` with the quintic time law of a Cartesian path.
+    Cartesian,
+    /// Recorded samples every `sample_dt` s of recorded time (`duration_s` recorded), played
+    /// at `speed` after an approach quintic from the commanded position to the first sample
+    /// (planned at the commit: no IK). `gripper` false keeps the gripper's command.
+    /// `tool_digest`: [`tool_digest_hash`] of the active tool the worker checked the
+    /// episode's tool provenance against (`TOOL_MISMATCH` at the commit when it changed).
+    Replay { episode: EpisodeRef, speed: f32, gripper: bool, sample_dt: f64, tool_digest: u64 },
+}
+
+/// FNV-1a hash of a tool configuration digest (no allocation): the prepared replay names the
+/// tool its provenance was checked against.
+pub fn tool_digest_hash(digest: &str) -> u64 {
+    digest.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Joint samples one plan slot's [`PreparedPath`] holds (allocated when the slot is built;
+/// a longer path or episode is refused `PLAN_TOO_LARGE` when it is prepared).
+pub const MAX_PATH_SAMPLES: usize = 2048;
+
+/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated once (plan slot
+/// construction) and refilled in place: preparing never reallocates it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedPath {
+    samples: Vec<[f32; MAX_DOF]>,
+    params: Vec<f64>,
+}
+
+impl PreparedPath {
+    pub fn with_capacity(n: usize) -> Self { Self { samples: Vec::with_capacity(n), params: Vec::with_capacity(n) } }
+    pub fn capacity(&self) -> usize { self.samples.capacity().min(self.params.capacity()) }
+    pub fn clear(&mut self) { self.samples.clear(); self.params.clear(); }
+    pub fn len(&self) -> usize { self.samples.len() }
+    pub fn is_empty(&self) -> bool { self.samples.is_empty() }
+    pub fn samples(&self) -> &[[f32; MAX_DOF]] { &self.samples }
+    pub fn params(&self) -> &[f64] { &self.params }
+
+    /// Appends sample `q` at path parameter `s` (a replay passes its sample index).
+    /// `PLAN_TOO_LARGE` when the buffer is full (it never grows), `INVALID_COMMAND` for more
+    /// than [`MAX_DOF`] joints or a non-finite value.
+    pub fn push(&mut self, q: &[f32], s: f64) -> Result<(), &'static str> {
+        if q.len() > MAX_DOF || !s.is_finite() || q.iter().any(|v| !v.is_finite()) { return Err("INVALID_COMMAND"); }
+        if self.samples.len() >= self.capacity() { return Err("PLAN_TOO_LARGE"); }
+        let mut a = [0.0; MAX_DOF];
+        a[..q.len()].copy_from_slice(q);
+        self.samples.push(a);
+        self.params.push(s);
+        Ok(())
+    }
+
+    /// `other`'s samples into this buffer (`PLAN_TOO_LARGE` when they do not fit; nothing
+    /// is reallocated).
+    pub fn copy_from(&mut self, other: &PreparedPath) -> Result<(), &'static str> {
+        if other.len() > self.capacity() { return Err("PLAN_TOO_LARGE"); }
+        self.clear();
+        self.samples.extend_from_slice(&other.samples);
+        self.params.extend_from_slice(&other.params);
+        Ok(())
+    }
+}
+
+/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanSlot {
+    pub primitive: Primitive,
+    pub path: PreparedPath,
+}
+
+impl Default for PlanSlot {
+    /// A slot with a [`MAX_PATH_SAMPLES`] path buffer (pre-touched by the allocation).
+    fn default() -> Self { Self::with_path_capacity(MAX_PATH_SAMPLES) }
+}
+
+impl PlanSlot {
+    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+
+    /// Stages a primitive that reads no path (the path is cleared).
+    pub fn set(&mut self, p: Primitive) {
+        self.primitive = p;
+        self.path.clear();
+    }
+
+    /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
+    pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
+        self.primitive = Primitive::None;
+        self.path.copy_from(&other.path)?;
+        self.primitive = other.primitive;
+        Ok(())
+    }
 }
 
 /// Waypoints a [`Primitive::CartesianPath`] carries at most.
@@ -152,7 +252,8 @@ impl Primitive {
     pub fn child(&self) -> Option<&ChildSpec> {
         match self {
             Self::None | Self::JointQuintic { .. } => None,
-            Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. } => child.as_ref(),
+            Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. }
+            | Self::Prepared { child, .. } => child.as_ref(),
         }
     }
 
@@ -330,6 +431,11 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Installs a [`Primitive::Prepared`] with its slot's `path` after rechecking its stamp
+    /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
+    fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
     /// Starts a driver transition after rechecking the stamp; its progress and outcome come
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
     /// the transition (the adapter uses the request id's value).
@@ -360,7 +466,7 @@ fn static_code(e: ArmError) -> &'static str {
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE",
     ];
     if let ArmError::Motion(m) = &e { return m.code(); }
@@ -379,6 +485,20 @@ impl SupervisorInner {
     fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        Ok(())
+    }
+}
+
+impl SupervisorInner {
+    /// The checks every motion commit shares: identity, deadline, stop, epoch, a lease valid
+    /// now, configuration revision (`check_commit`); the active revision, reservations and
+    /// feedback (track C); a child's parent is the one its stamp was admitted under.
+    fn check_motion_commit(&self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_commit(d, ctx)?;
+        if let Some(code) = self.motion_commit_blocker(&d.stamp.authority) { return Err(code); }
+        if let Some(c) = primitive.child() {
+            if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }
+        }
         Ok(())
     }
 }
@@ -413,16 +533,10 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        // identity, deadline, stop, epoch, a lease valid now, configuration revision
-        self.check_commit(d, ctx)?;
-        // the configuration authority's active revision, reservations, feedback (track C)
-        if let Some(code) = self.motion_commit_blocker(&d.stamp.authority) { return Err(code); }
-        // a child names the parent its stamp was admitted under
-        if let Some(c) = primitive.child() {
-            if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }
-        }
+        self.check_motion_commit(d, primitive, ctx)?;
         match primitive {
-            Primitive::None => Err("INVALID_COMMAND"),
+            // a prepared path is installed with its slot's samples (`commit_prepared`)
+            Primitive::None | Primitive::Prepared { .. } => Err("INVALID_COMMAND"),
             // macro children (track E): installed for the running macro named by the ticket;
             // the committed action is the parent (its terminal carries the child count)
             Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
@@ -438,6 +552,40 @@ impl CoreOps for SupervisorInner {
                 self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
+            }
+        }
+    }
+
+    fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.check_motion_commit(d, primitive, ctx)?;
+        let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else { return Err("INVALID_COMMAND"); };
+        let n = usize::from(dof);
+        if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
+        let epoch = d.stamp.authority.epoch;
+        let committed = |r: Result<u64, ArmError>| r.map(|id| Committed::authorized(d, Some(ActionId(id)))).map_err(static_code);
+        match kind {
+            PathKind::Cartesian => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                let joint_path = self.prepared_joint_path(n, path, duration_s, power_scale)?;
+                match child {
+                    None => committed(self.install_prepared_path(epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        this.install_macro_prepared_path(id, joint_path, power_scale.is_some()).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+            PathKind::Replay { .. } => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                match child {
+                    None => {
+                        let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
+                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                    }
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
+                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
             }
         }
     }
@@ -669,7 +817,7 @@ impl VirtualClock {
 /// a test advanced.
 pub struct ReleaseFixture<O: CoreOps> {
     pub core: O,
-    intake: RtIntake<Primitive>,
+    intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
     active: Option<Installed>,
@@ -696,8 +844,8 @@ pub enum Checkpoint {
 
 impl<O: CoreOps> ReleaseFixture<O> {
     /// The fixture, the broker feeding it, the target writer and the stop handle.
-    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<Primitive>, TargetWriter, StopRequests) {
-        let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, Primitive::default);
+    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, PlanSlot::default);
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
         let clock = VirtualClock::starting_at(Instant::now());
@@ -755,9 +903,10 @@ impl<O: CoreOps> ReleaseFixture<O> {
         if let Some(mut t) = self.intake.take() {
             let d = *t.descriptor();
             let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan().copied() {
+                CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
-                    Some(p) => self.core.commit_primitive(&d, &p, &ctx),
+                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => self.core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
+                    Some(slot) => self.core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => self.core.commit_immediate(&d, op, &ctx),
                 CommandKind::Transition(op) => self.core.commit_transition(&d, op, &ctx),

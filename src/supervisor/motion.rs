@@ -886,6 +886,42 @@ impl SupervisorInner {
         Ok((id, duration + 0.5))
     }
 
+    /// The checks `check_plan_fresh` makes of a plan input, for a prepared path whose start
+    /// and workspace revision the commit already checked: the epoch, and an idle arm.
+    pub(crate) fn check_prepared_fresh(&self, epoch: u64) -> Result<(), ArmError> {
+        if self.safety.epoch_id() != epoch {
+            return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
+        }
+        match self.action_preconditions() {
+            Err(ArmError::Motion(MotionError::MotionBusy(reason))) => Err(MotionError::PlanStale(format!("arm no longer idle ({reason})")).into()),
+            other => other,
+        }
+    }
+
+    /// The [`JointPath`] of a prepared Cartesian path (`dof` joints, samples at the slot's
+    /// path parameters): `INVALID_COMMAND` for fewer than two samples, more joints than a
+    /// path sample holds, or parameters that do not run from 0 to 1 without going back.
+    pub(crate) fn prepared_joint_path(&self, dof: usize, path: &crate::rt_core::ops::PreparedPath, duration_s: f64, power_scale: Option<f64>)
+        -> Result<JointPath, &'static str> {
+        let s = path.params();
+        let ok = path.len() >= 2 && dof <= 7 && dof == self.config.dof && duration_s.is_finite() && duration_s > 0.0
+            && s.first() == Some(&0.0) && s.last() == Some(&1.0) && s.windows(2).all(|w| w[1] >= w[0]);
+        if !ok { return Err("INVALID_COMMAND"); }
+        let q = path.samples().iter().map(|x| { let mut a = [0.0f32; 7]; a[..dof].copy_from_slice(&x[..dof]); a }).collect();
+        Ok(JointPath { dof, arm_dof: self.config.arm_dof(), q, s: s.to_vec(), duration: duration_s, power_scale: power_scale.unwrap_or(1.0) })
+    }
+
+    /// Installs a prepared Cartesian path as a `move_to` action (the RT commit: no IK).
+    /// Returns (action id, expected duration).
+    pub(crate) fn install_prepared_path(&mut self, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
+        self.check_prepared_fresh(epoch)?;
+        let duration = self.start_path_motion_at(epoch, &path)?;
+        let id = self.begin_action("move_to", None);
+        if power_noted { self.note_action_power_scale(id, path.power_scale); }
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        Ok((id, duration + 0.5))
+    }
+
     /// Joint-space goal seeds besides the current joints ([`crate::motion::goal_seeds`]): the
     /// profile home and the resting pose (when it differs), arm joints only.
     pub fn goal_seed_poses(&self) -> Vec<[f64; 6]> {
@@ -1033,8 +1069,13 @@ impl SupervisorInner {
     }
 
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
+        self.start_path_motion_at(input.epoch, path)
+    }
+
+    /// [`Self::start_path_motion`] for a path planned under safety epoch `epoch`.
+    pub(crate) fn start_path_motion_at(&mut self, epoch: u64, path: &JointPath) -> Result<f64, ArmError> {
         let last = path.last_slice().to_vec();
-        self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
+        self.safety.validate_motion_command(Some(epoch), &last, &self.config.limits)?;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;

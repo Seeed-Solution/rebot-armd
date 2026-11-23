@@ -12,7 +12,7 @@ use std::time::Duration;
 use armd::driver::{ArmDriver, DamiaoArmDriver};
 use armd::protocol::damiao::{self, DamiaoLimits};
 use armd::rt_core::broker::{Authority, BootId, Broker, Capacities, ClientId, Outcome, Reply, Submit, TransitionOp};
-use armd::rt_core::ops::{CoreOps, Primitive, ReleaseFixture, ReleaseReport};
+use armd::rt_core::ops::{CoreOps, PlanSlot, ReleaseFixture, ReleaseReport};
 use armd::transport::MockClock;
 use armd::{ArmConfig, SupervisorInner};
 use mit_support::FakeBus;
@@ -24,7 +24,7 @@ fn limits() -> Vec<DamiaoLimits> { ArmConfig::rebot_dm().damiao_ranges.unwrap().
 
 struct Rig {
     fx: ReleaseFixture<SupervisorInner>,
-    b: Broker<Primitive>,
+    b: Broker<PlanSlot>,
     bus: FakeBus,
     clock: MockClock,
     seq: u64,

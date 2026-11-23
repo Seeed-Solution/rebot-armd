@@ -10,7 +10,7 @@ use armd::rt_core::broker::{
 };
 use armd::rt_core::ids::ArmId;
 use armd::rt_core::mailbox::{StreamId, Submitted, TargetAuthority, TargetFrame, TargetWriter, MAX_DOF};
-use armd::rt_core::ops::{Checkpoint, CoreOps, Primitive, ReleaseFixture, StubCore};
+use armd::rt_core::ops::{Checkpoint, CoreOps, PlanSlot, Primitive, ReleaseFixture, StubCore};
 use armd::rt_core::urgent::StopRequests;
 use armd::{ArmConfig, SupervisorInner};
 
@@ -24,7 +24,7 @@ fn supervisor() -> SupervisorInner {
     inner
 }
 
-type Fx = (ReleaseFixture<SupervisorInner>, Broker<Primitive>, TargetWriter, StopRequests);
+type Fx = (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, TargetWriter, StopRequests);
 
 fn fixture(caps: Capacities) -> Fx { ReleaseFixture::new(supervisor(), BOOT, caps) }
 
@@ -39,11 +39,11 @@ fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Pr
     Primitive::joint_quintic(&start, &q, duration_s).unwrap()
 }
 
-fn submit_install(b: &mut Broker<Primitive>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
-    b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut Primitive| *slot = p))
+fn submit_install(b: &mut Broker<PlanSlot>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
+    b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p)))
 }
 
-fn replies(b: &mut Broker<Primitive>) -> Vec<Reply> {
+fn replies(b: &mut Broker<PlanSlot>) -> Vec<Reply> {
     let mut v = Vec::new();
     b.poll(|_, r| { v.push(r); true });
     v
@@ -218,7 +218,7 @@ fn targets_are_rechecked_at_consumption() {
 fn a_stub_core_never_acknowledges_success() {
     let (mut fx, mut b, mut tw, _stop) = ReleaseFixture::new(StubCore::default(), BOOT, Capacities { commands: 4, plans: 2, replies: 8 });
     let a = Authority::default();
-    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap())).unwrap();
+    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut PlanSlot| p.set(Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap()))).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
     tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, vision_frame_id: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
