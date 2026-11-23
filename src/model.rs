@@ -1177,6 +1177,72 @@ impl DamiaoRange {
     }
 }
 
+/// How the Damiao driver commands the gripper joint (`ArmConfig::damiao_gripper`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DamiaoGripperMode {
+    /// Position-force (CTRL_MODE 4): every frame carries `current_ceiling_raw`.
+    PosForce,
+    /// Legacy POS_VEL (CTRL_MODE 2): no motor current cap.
+    PosVel,
+}
+
+/// Damiao gripper drive: base mode, motor current ceiling and closing speed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DamiaoGripperDrive {
+    pub mode: DamiaoGripperMode,
+    /// Current ceiling of every position-force frame, in 1/10000 of the motor's maximum phase
+    /// current (1..=10000). Its torque equivalent is a property of the motor and the gripper
+    /// and must be commissioned on the arm (docs/gripper_pos_force.md).
+    pub current_ceiling_raw: u16,
+    /// Speed limit of closing frames (rad/s).
+    pub close_speed_rad_s: f32,
+    /// The ceiling's torque equivalent was measured; false: `current_ceiling_raw` is a placeholder.
+    #[serde(default)]
+    pub calibrated: bool,
+    /// Measured torque equivalent of the ceiling (N·m), from commissioning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_torque_nm: Option<f32>,
+    /// `external` (independent force / torque reference) or `feedback_equivalent` (the motor's
+    /// own torque feedback only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque_reference: Option<String>,
+}
+
+impl DamiaoGripperDrive {
+    /// B601-DM J7 default: position-force with raw 220, the value armd sent this gripper before
+    /// 2026-11-06 (2.2 % of the maximum phase current). UNCALIBRATED placeholder: its torque
+    /// equivalent was never measured (2.2 % of the DM-J4310-2EC datasheet peak of 7 N·m would
+    /// be about 0.15 N·m; datasheet value, not verified on this unit).
+    pub fn rebot_dm() -> Self {
+        Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 220, close_speed_rad_s: 0.30,
+            calibrated: false, ceiling_torque_nm: None, torque_reference: None }
+    }
+
+    /// Legacy profile: J7 in POS_VEL, no motor current cap.
+    pub fn legacy_pos_vel() -> Self {
+        Self { mode: DamiaoGripperMode::PosVel, ..Self::rebot_dm() }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=10_000).contains(&self.current_ceiling_raw) {
+            return Err("damiao_gripper.current_ceiling_raw must be 1..=10000".into());
+        }
+        if !(self.close_speed_rad_s.is_finite() && self.close_speed_rad_s > 0.0) {
+            return Err("damiao_gripper.close_speed_rad_s must be positive".into());
+        }
+        if self.calibrated && !self.ceiling_torque_nm.is_some_and(|t| t.is_finite() && t > 0.0) {
+            return Err("damiao_gripper: calibrated needs a positive ceiling_torque_nm".into());
+        }
+        if let Some(r) = &self.torque_reference {
+            if r != "external" && r != "feedback_equivalent" {
+                return Err("damiao_gripper.torque_reference must be external or feedback_equivalent".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
@@ -1294,6 +1360,10 @@ pub struct ArmConfig {
     /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
     #[serde(default)]
     pub damiao_ranges: Option<Vec<DamiaoRange>>,
+    /// Damiao gripper drive (ignored without a gripper joint); None: the gripper uses the arm's
+    /// POS_VEL base mode without being reported (profiles from before this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damiao_gripper: Option<DamiaoGripperDrive>,
     /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_cap: Option<SpeedCap>,
@@ -1441,6 +1511,7 @@ impl Default for ArmConfig {
             gravity_comp: None,
             joint_tracking: None,
             damiao_ranges: None,
+            damiao_gripper: None,
             speed_cap: None,
             backlash_approach: None,
             collision: None,
@@ -1940,6 +2011,8 @@ impl ArmConfig {
             let max_w = crate::tool::baseline_grasp_limits(self).0;
             validate_effective_gripper_policy(g, lim, max_w)?;
         }
+        // without a gripper joint the block is ignored (gripper_drive_from_profile)
+        if let Some(g) = &self.damiao_gripper { g.validate()?; }
         if let Some(ranges) = &self.damiao_ranges {
             let ok = |x: f32| x.is_finite() && x > 0.0;
             if ranges.len() != self.dof || !ranges.iter().all(|r| ok(r.p_max) && ok(r.v_max) && ok(r.t_max)) {
@@ -2196,6 +2269,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7,
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
+            damiao_gripper: Some(DamiaoGripperDrive::rebot_dm()),
             speed_cap: None,
             // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the
             // final grasp / place descent end from the same side (src/backlash.rs)

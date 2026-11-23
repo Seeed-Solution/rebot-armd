@@ -376,6 +376,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_dof = config.dof;
     let feetech_config = config.feetech.clone();
     let gripper_index = config.gripper_index();
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let gripper_drive = armd::driver::gripper_drive_from_profile(&config)?;
     let supervisor = Arc::new(ArmSupervisor::new(config));
     // before the control loop: frees retired observations, feeds telemetry and recordings
     supervisor.start_dispatcher()?;
@@ -414,6 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(limits) = damiao_limits {
                         driver = driver.with_joint_limits(limits)?;
                     }
+                    driver = driver.with_gripper_drive(gripper_drive)?;
                     // Read-only register check before anything can enable the motors.
                     driver.check_mapping_ranges();
                     supervisor.set_driver(Box::new(driver)).await;
