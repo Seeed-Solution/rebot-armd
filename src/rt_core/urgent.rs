@@ -27,8 +27,42 @@ impl EstopGate {
     }
 }
 
+/// Authorized-stop requests (design section 4): a stop increments the generation directly,
+/// without the command ring, so it is never refused for capacity. Commands carry the
+/// generation they were admitted under ([`super::broker::Authority::stop_generation`]); the
+/// RT refuses older ones (`STOPPED`) and ends the active motion of an older generation.
+#[derive(Debug, Clone, Default)]
+pub struct StopRequests {
+    generation: Arc<AtomicU64>,
+}
+
+impl StopRequests {
+    pub fn new() -> Self { Self::default() }
+
+    /// Requests a stop; returns its generation (lock and allocation free).
+    pub fn request(&self) -> u64 { self.generation.fetch_add(1, Ordering::SeqCst) + 1 }
+
+    /// The current generation.
+    #[inline]
+    pub fn current(&self) -> u64 { self.generation.load(Ordering::SeqCst) }
+
+    /// A stop was requested after a command admitted at `admitted`.
+    #[inline]
+    pub fn stopped_since(&self, admitted: u64) -> bool { self.current() != admitted }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_requests_invalidate_older_generations() {
+        let s = super::StopRequests::new();
+        let admitted = s.current();
+        assert!(!s.stopped_since(admitted));
+        assert_eq!(s.clone().request(), 1);
+        assert!(s.stopped_since(admitted));
+        assert!(!s.stopped_since(s.current()));
+    }
+
     use super::*;
 
     #[test]

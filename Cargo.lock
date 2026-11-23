@@ -81,6 +81,7 @@ dependencies = [
  "parquet",
  "reqwest",
  "roxmltree",
+ "rtrb",
  "serde",
  "serde_json",
  "serialport",
@@ -2146,6 +2147,12 @@ checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "rtrb"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5974e397833d890f2f74963408e0d4a6cd8eda2f6a445ae06750291b5d7a997e"
 
 [[package]]
 name = "rustc_version"

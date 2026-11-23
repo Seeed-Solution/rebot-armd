@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::config_iface::{ConfigDomain, Reservation};
 use super::ids::{ArmId, BusId};
 use super::publish::{state_channel, RtInputs, StateHub, StatePublisher};
 use super::record_ring::{Fence, Finished, RecordProducer, RecordRing};
@@ -27,6 +28,12 @@ impl FeedbackState {
     pub fn seq(&self, joint: usize) -> u64 { self.seqs.get(joint).copied().unwrap_or(0) }
 }
 
+/// Configuration reservations held at a safe point ([`super::config_iface`]).
+#[derive(Default)]
+struct ConfigHold {
+    held: Option<Reservation>,
+}
+
 /// The RT-owned state of one arm.
 ///
 /// One `ArmCore` per arm, owned by exactly one local owner (during the migration
@@ -34,8 +41,8 @@ impl FeedbackState {
 /// its bus endpoint names one physical bus. Its state lives in private aggregates reached
 /// only through the narrow operations below; there is no general mutable accessor.
 ///
-/// Aggregates today: feedback bookkeeping ([`FeedbackState`]), the state publication and the
-/// recording producer. Tracks A-E move the remaining
+/// Aggregates today: feedback bookkeeping ([`FeedbackState`]), the state publication, the
+/// recording producer and configuration reservations. Tracks A-E move the remaining
 /// RT-owned state here as further private aggregates (joint state, trajectories, servo
 /// history, gripper state, torque and driver transitions, lease / watchdog / fault state,
 /// numeric safety configuration); until a track moves one, it stays in `SupervisorInner`
@@ -47,6 +54,7 @@ pub struct ArmCore {
     publisher: StatePublisher,
     /// Recording samples of the running teach session.
     record: RecordProducer,
+    config: ConfigHold,
 }
 
 impl ArmCore {
@@ -59,6 +67,7 @@ impl ArmCore {
             feedback: FeedbackState { instants: vec![None; dof], seqs: vec![0; dof] },
             publisher,
             record: RecordProducer::new(dof),
+            config: ConfigHold::default(),
         }
     }
 
@@ -163,4 +172,26 @@ impl ArmCore {
     pub fn record_dropped(&self) -> u64 { self.record.dropped() }
     /// The recording ring (after the first session).
     pub fn record_ring(&self) -> Option<&Arc<RecordRing>> { self.record.ring() }
+
+    // -- configuration reservations -------------------------------------------------------
+
+    /// Holds `r` (one reservation at a time); false when another one is held.
+    pub fn hold_config(&mut self, r: Reservation) -> bool {
+        if self.config.held.is_some() { return false; }
+        self.config.held = Some(r);
+        true
+    }
+
+    /// Gives `r` up; false when it was not held.
+    pub fn release_config(&mut self, r: &Reservation) -> bool {
+        if self.config.held.as_ref() != Some(r) { return false; }
+        self.config.held = None;
+        true
+    }
+
+    /// The reservation held on `domain`.
+    pub fn config_held(&self, domain: ConfigDomain) -> Option<&Reservation> { self.config.held.as_ref().filter(|r| r.domain == domain) }
+
+    /// A held reservation inhibits incompatible motion.
+    pub fn motion_inhibited_by_config(&self) -> bool { self.config.held.as_ref().is_some_and(|r| r.inhibits_motion) }
 }

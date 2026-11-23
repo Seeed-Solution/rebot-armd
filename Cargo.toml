@@ -38,6 +38,8 @@ roxmltree = "0.21"
 # armd.wasm (MJCF composition, used by rebot-companion's bundle_export):
 #   cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# RT core broker rings (src/rt_core/broker.rs); checked for riscv64gc-unknown-linux-musl and wasm32
+rtrb = "=0.4.1"
 mview-stereo = { path = "crates/mview-stereo" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "json", "http1", "multipart"] }
