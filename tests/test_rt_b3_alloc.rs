@@ -24,10 +24,11 @@ use armd::rt_core::executor::ExecutorConfig;
 use armd::rt_core::ops::{CoreOps, ServiceBudget};
 use armd::safety::{
     BoundedFaultReason, BoundedSafetyState, ClearFaultDriverError, ClearFaultError, ClearFaultRefusal,
-    FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, SAFETY_LOG_CAPACITY,
+    FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, DETAIL_UNAVAILABLE,
+    SAFETY_LOG_CAPACITY,
 };
 use armd::transport::{MockClock, TransportError};
-use armd::{ArmConfig, ArmError, ArmSupervisor, SupervisorInner};
+use armd::{ArmConfig, ArmError, ArmSupervisor, StopPolicy, SupervisorInner};
 use mit_support::FakeBus;
 
 #[derive(Clone, Default)]
@@ -106,6 +107,7 @@ struct RestingSupportDriver {
     hw_fault: bool,
     timeout_on_reset: bool,
     positions: Vec<f32>,
+    temperature: Arc<Mutex<f32>>,
     clock: MockClock,
 }
 
@@ -137,9 +139,11 @@ impl ArmDriver for RestingSupportDriver {
     }
     fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
         out.clear();
+        let temp = *self.temperature.lock().unwrap();
         for i in 0..self.dof {
             let mut st = JointState::default();
             st.position = self.positions.get(i).copied().unwrap_or(0.0);
+            st.temperature = temp;
             out.push(st);
         }
         Ok(())
@@ -148,7 +152,14 @@ impl ArmDriver for RestingSupportDriver {
         self.read_joint_states_into(out)?; Ok((self.dof as u16, false))
     }
     fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
-    fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+        self.enable = if enable { EnableState::Enabled } else { EnableState::Disabled };
+        Ok(())
+    }
+    fn begin_torque_budgeted(&mut self, enable: bool, _: u16) -> Result<armd::driver::TorqueProgress, ArmDriverError> {
+        self.enable = if enable { EnableState::Enabled } else { EnableState::Disabled };
+        Ok(armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed))
+    }
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn clear_fault_disables_joints(&self) -> Vec<usize> { if self.disables_arm { vec![0] } else { Vec::new() } }
     fn clear_fault_disables_arm_joint(&self, arm_dof: usize) -> bool { self.disables_arm && arm_dof > 0 }
@@ -345,7 +356,8 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     let rs_drv = RestingSupportDriver {
         dof: cfg.dof, enable: EnableState::Enabled, feedback_valid: true,
         age: Some(Duration::from_millis(10)), disables_arm: true, hw_fault: false,
-        timeout_on_reset: false, positions: cfg.resting_positions().to_vec(), clock: MockClock::new(),
+        timeout_on_reset: false, positions: cfg.resting_positions().to_vec(),
+        temperature: Arc::new(Mutex::new(30.0)), clock: MockClock::new(),
     };
     let mut rs = SupervisorInner::new(cfg.clone()).with_driver(Box::new(rs_drv));
     rs.lease_enabled = false;
@@ -399,7 +411,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     let to_drv = RestingSupportDriver {
         dof: cfg.dof, enable: EnableState::Enabled, feedback_valid: true, age: Some(Duration::from_millis(10)),
         disables_arm: false, hw_fault: true, timeout_on_reset: true,
-        positions: cfg.resting_positions().to_vec(), clock: MockClock::new(),
+        positions: cfg.resting_positions().to_vec(), temperature: Arc::new(Mutex::new(30.0)), clock: MockClock::new(),
     };
     let mut to = SupervisorInner::new(cfg.clone()).with_driver(Box::new(to_drv));
     to.safety.set_off_thread_reclaim(true);
@@ -430,7 +442,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     let rt_drv = RestingSupportDriver {
         dof: cfg.dof, enable: EnableState::Enabled, feedback_valid: true,
         age: Some(Duration::from_millis(10)), disables_arm: true, hw_fault: false,
-        timeout_on_reset: false, positions: off_home.clone(), clock: MockClock::new(),
+        timeout_on_reset: false, positions: off_home.clone(), temperature: Arc::new(Mutex::new(30.0)), clock: MockClock::new(),
     };
     let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(rt_drv)));
     {
@@ -457,4 +469,210 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     assert!(api.message.ends_with("); support the arm at rest first"), "{}", api.message);
     assert_eq!(sup.tick_samples()[before..].iter().map(|s| s.usage.lock_alloc_calls).max().unwrap_or(0), 0);
     handle.stop_and_join();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_pool_still_latches_thermal_trip_during_bus_loss_and_watchdog_and_blocks_clear_until_cooldown() {
+    let _serial = global_log().guard.lock().await;
+    for (initial_reason, initial_kind, initially_recoverable) in [
+        (FaultReason::BusLoss, FaultKind::BusLoss, false),
+        (FaultReason::WatchdogTimeout, FaultKind::WatchdogTimeout, true),
+    ] {
+        // Test both RT (`clear_fault_executor_bounded`) and legacy (`clear_fault`) paths.
+        for use_rt in [true, false] {
+            let mut cfg = ArmConfig::rebot_dm();
+            cfg.max_temperature = 75.0;
+            let temp_ctl = Arc::new(Mutex::new(30.0f32));
+            let drv = RestingSupportDriver {
+                dof: cfg.dof,
+                enable: EnableState::Enabled,
+                feedback_valid: true,
+                age: Some(Duration::from_millis(10)),
+                disables_arm: false,
+                hw_fault: false,
+                timeout_on_reset: false,
+                positions: cfg.resting_positions().to_vec(),
+                temperature: Arc::clone(&temp_ctl),
+                clock: MockClock::new(),
+            };
+            let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(drv));
+            inner.lease_enabled = false;
+            inner.is_torqued = true;
+            inner.feedback_numeric_valid = true;
+            inner.rt_executor_owned = use_rt;
+            inner.temperatures = vec![30.0; cfg.dof];
+            inner.safety.set_off_thread_reclaim(use_rt);
+
+            // Exhaust the entire preallocated fault-slot pool before latching any fault.
+            let held_pool = inner.safety.drain_fault_arc_pool_for_test();
+            assert_eq!(inner.safety.fault_arc_pool_len(), 0);
+
+            // Latch BusLoss or WatchdogTimeout, then raise temperature above limit so ThermalTrip fires.
+            inner.safety.trigger_fault(initial_reason.clone());
+            assert_eq!(*inner.safety.state(), SafetyState::Fault(initial_reason.clone()));
+            assert_eq!(inner.safety.fault().unwrap().recoverable, initially_recoverable);
+            *temp_ctl.lock().unwrap() = 85.0;
+            inner.temperatures[0] = 85.0;
+
+            alloc::time_this_thread();
+            let _ = alloc::take();
+            inner.apply_stop_policy(StopPolicy::ThermalTrip);
+            let trip_allocs = alloc::take();
+            if use_rt {
+                assert_eq!(trip_allocs.calls, 0, "ThermalTrip while pool exhausted must do 0 heap ops: {trip_allocs:?}");
+            }
+
+            // Current Arc stays the existing fault (no Arc::new), while BOTH kinds are recorded
+            // and `recoverable` reflects the non-recoverable ThermalTrip.
+            assert_eq!(*inner.safety.state(), SafetyState::Fault(initial_reason.clone()));
+            assert!(inner.safety.has_latched_fault_kind(initial_kind));
+            assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+            assert!(!inner.safety.fault().unwrap().recoverable);
+
+            // A second thermal trip does not churn epoch_id once ThermalTrip is already recorded.
+            let ep_after_trip = inner.safety.epoch_id();
+            inner.apply_stop_policy(StopPolicy::ThermalTrip);
+            assert_eq!(inner.safety.epoch_id(), ep_after_trip);
+
+            // clear_fault MUST check EVERY recorded kind: stale bus feedback fails first,
+            // then fresh feedback with hot temperature STILL fails thermal cooldown.
+            if use_rt {
+                inner.feedback_numeric_valid = false;
+                let _ = alloc::take();
+                let err_fb = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+                assert_eq!(alloc::take().calls, 0, "stale feedback refusal must do 0 heap ops");
+                assert_eq!(err_fb, ClearFaultError::Rejected(ClearFaultRefusal::FreshFeedbackRequired));
+                inner.feedback_numeric_valid = true;
+
+                let _ = alloc::take();
+                let err = inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
+                assert_eq!(alloc::take().calls, 0, "thermal clear refusal must do 0 heap ops");
+                assert_eq!(err, ClearFaultError::Rejected(ClearFaultRefusal::TemperatureConfirmationRequired));
+                assert_api_clear_fault_text(err, "Temperature must be confirmed below the reset threshold");
+            } else {
+                // Legacy path with driver checks fresh driver temperatures against recorded ThermalTrip.
+                let err_drv = inner.clear_fault().unwrap_err();
+                assert_eq!(
+                    err_drv,
+                    SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into())
+                );
+                // Also verify the tick -> check_thermal_protection -> legacy no-driver clear_fault path.
+                let mut sim = SupervisorInner::new(cfg.clone());
+                sim.lease_enabled = false;
+                sim.is_torqued = true;
+                sim.temperatures = vec![30.0; cfg.dof];
+                let _held_sim = sim.safety.drain_fault_arc_pool_for_test();
+                sim.safety.trigger_fault(initial_reason.clone());
+                sim.temperatures[0] = 85.0;
+                sim.tick(0.02);
+                assert_eq!(*sim.safety.state(), SafetyState::Fault(initial_reason.clone()));
+                assert!(sim.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+                let ep_sim = sim.safety.epoch_id();
+                sim.tick(0.02);
+                assert_eq!(sim.safety.epoch_id(), ep_sim, "repeat tick must not churn epoch once ThermalTrip recorded");
+                let err = sim.clear_fault().unwrap_err();
+                assert_eq!(err, SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+                sim.temperatures[0] = 50.0;
+                assert_eq!(sim.clear_fault().unwrap(), SafetyState::Idle);
+                assert!(!sim.safety.has_latched_fault());
+            }
+
+            // Cool below reset threshold -> clear_fault now succeeds and resets the latched-kind record.
+            *temp_ctl.lock().unwrap() = 50.0;
+            inner.temperatures[0] = 50.0;
+            if use_rt {
+                assert_eq!(inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap(), SafetyState::Idle);
+            } else {
+                assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+            }
+            assert!(!inner.safety.has_latched_fault());
+            assert_eq!(inner.safety.latched_fault_kinds(), 0);
+            drop(held_pool);
+        }
+    }
+}
+
+#[test]
+fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
+    let mut sm = SafetyManager::new();
+    sm.set_off_thread_reclaim(true);
+    let held_pool = sm.drain_fault_arc_pool_for_test();
+    assert_eq!(sm.fault_arc_pool_len(), 0);
+
+    // Prebuild heap-bearing reasons off-measurement so we measure ONLY SafetyManager latching.
+    let jl = FaultReason::JointLimitExceeded {
+        joint_idx: 2,
+        joint_name: "joint_3".into(),
+        value: 3.2,
+        min: -2.0,
+        max: 2.0,
+    };
+    let other = FaultReason::Other("motor overcurrent".into());
+
+    alloc::time_this_thread();
+    let _ = alloc::take();
+
+    // 1. First fault from Idle with empty pool: NEVER calls Arc::new; moves to preallocated
+    //    `detail unavailable` fault Arc while recording exact kind + detail.
+    let res_jl = sm.try_trigger_fault_coded(FaultCode::JointLimit, jl);
+    let first_allocs = alloc::take();
+    assert_eq!(first_allocs.calls, 0, "first fault with empty pool must never allocate: {first_allocs:?}");
+    assert_eq!(*sm.state(), SafetyState::Fault(FaultReason::Other(DETAIL_UNAVAILABLE.into())));
+    assert_eq!(sm.fault_code(), Some(FaultCode::JointLimit));
+    assert!(sm.has_latched_fault_kind(FaultKind::JointLimitExceeded));
+    assert!(matches!(
+        sm.latched_fault_detail(FaultKind::JointLimitExceeded).map(|d| d.reason),
+        Some(BoundedFaultReason::JointLimitExceeded { joint_idx: 2, .. })
+    ));
+
+    // 2. Latch every remaining FaultKind while the pool stays completely empty (0 heap ops).
+    let _ = alloc::take();
+    let res_th = sm.try_trigger_fault_coded(
+        FaultCode::ThermalTrip,
+        FaultReason::ThermalTrip { joint_idx: 1, temperature: 92.0, limit: 80.0 },
+    );
+    let res_bus = sm.try_trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    let res_wd = sm.try_trigger_fault_coded(FaultCode::WatchdogTimeout, FaultReason::WatchdogTimeout);
+    let res_other = sm.try_trigger_fault_coded(FaultCode::HardwareFault, other);
+    let rest_allocs = alloc::take();
+    assert_eq!(rest_allocs.calls, 0, "latching all fault kinds with empty pool must do 0 heap ops: {rest_allocs:?}");
+
+    assert!(res_bus.is_ok() && res_wd.is_ok(), "cached BusLoss/WatchdogTimeout arcs do not need pool slots");
+    let (_, ret_jl) = res_jl.unwrap_err();
+    let (_, ret_th) = res_th.unwrap_err();
+    let (_, ret_other) = res_other.unwrap_err();
+
+    for kind in FaultKind::ALL {
+        assert!(sm.has_latched_fault_kind(kind), "missing latched kind {kind:?}");
+        assert!(sm.latched_fault_detail(kind).is_some(), "missing detail for {kind:?}");
+    }
+
+    // 3. Lazy fault when pool is empty skips closure (0 alloc) and records kind with "detail unavailable".
+    let mut sm_lazy = SafetyManager::new();
+    sm_lazy.set_off_thread_reclaim(true);
+    let held_lazy = sm_lazy.drain_fault_arc_pool_for_test();
+    let mut called = false;
+    let _ = alloc::take();
+    sm_lazy.trigger_fault_coded_lazy(FaultCode::ThermalTrip, || {
+        called = true;
+        FaultReason::ThermalTrip { joint_idx: 0, temperature: 99.0, limit: 80.0 }
+    });
+    let lazy_allocs = alloc::take();
+    assert!(!called);
+    assert_eq!(lazy_allocs.calls, 0);
+    assert!(sm_lazy.has_latched_fault_kind(FaultKind::ThermalTrip));
+    assert_eq!(*sm_lazy.state(), SafetyState::Fault(FaultReason::Other(DETAIL_UNAVAILABLE.into())));
+    assert_eq!(
+        sm_lazy.latched_fault_detail(FaultKind::ThermalTrip).map(|d| format!("{:?}", d.reason)),
+        Some(format!("Other(\"{DETAIL_UNAVAILABLE}\")"))
+    );
+
+    // Clearing resets all latched kinds.
+    assert_eq!(sm.clear_fault_bounded().unwrap(), SafetyState::Idle);
+    assert!(!sm.has_latched_fault());
+    assert_eq!(sm.latched_fault_kinds(), 0);
+    for kind in FaultKind::ALL {
+        assert!(sm.latched_fault_detail(kind).is_none());
+    }
+    drop((ret_jl, ret_th, ret_other, held_pool, held_lazy));
 }

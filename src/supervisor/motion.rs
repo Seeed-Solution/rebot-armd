@@ -392,7 +392,7 @@ impl SupervisorInner {
                 self.commanded_accelerations.fill(0.0);
                 let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
                     .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
-                if !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
+                if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip) {
                     self.safety.trigger_fault(FaultReason::ThermalTrip { joint_idx, temperature, limit: self.config.max_temperature });
                 }
                 if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }

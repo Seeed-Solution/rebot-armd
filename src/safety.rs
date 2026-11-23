@@ -245,6 +245,64 @@ pub const SAFETY_LOG_CAPACITY: usize = 64;
 pub const SAFETY_LOG_TEXT_CAPACITY: usize = 320;
 /// Maximum inline bytes stored for a joint name in a deferred safety log event.
 pub const SAFETY_JOINT_NAME_CAPACITY: usize = 64;
+/// Fallback message recorded when a latched fault's detail storage is unavailable.
+pub const DETAIL_UNAVAILABLE: &str = "detail unavailable";
+
+/// Discriminant of [`FaultReason`] tracked in [`SafetyManager`]'s fixed-size latched-kind bitmask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FaultKind {
+    JointLimitExceeded = 0,
+    ThermalTrip = 1,
+    BusLoss = 2,
+    WatchdogTimeout = 3,
+    Other = 4,
+}
+
+impl FaultKind {
+    pub const COUNT: usize = 5;
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::JointLimitExceeded,
+        Self::ThermalTrip,
+        Self::BusLoss,
+        Self::WatchdogTimeout,
+        Self::Other,
+    ];
+
+    #[inline]
+    pub const fn bit(self) -> u8 {
+        1u8 << (self as u8)
+    }
+
+    #[inline]
+    pub const fn from_reason(reason: &FaultReason) -> Self {
+        match reason {
+            FaultReason::JointLimitExceeded { .. } => Self::JointLimitExceeded,
+            FaultReason::ThermalTrip { .. } => Self::ThermalTrip,
+            FaultReason::BusLoss => Self::BusLoss,
+            FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::Other(_) => Self::Other,
+        }
+    }
+
+    #[inline]
+    pub const fn from_code(code: FaultCode) -> Self {
+        match code {
+            FaultCode::JointLimit => Self::JointLimitExceeded,
+            FaultCode::ThermalTrip => Self::ThermalTrip,
+            FaultCode::BusLoss => Self::BusLoss,
+            FaultCode::WatchdogTimeout => Self::WatchdogTimeout,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Last bounded detail captured for one [`FaultKind`] latched since the last clear.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LatchedFaultDetail {
+    pub code: FaultCode,
+    pub reason: BoundedFaultReason,
+}
 
 /// Fixed-capacity UTF-8 text buffer stored inline without heap allocation.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -629,6 +687,7 @@ pub struct SafetyManager {
     estop_arc: Arc<SafetyState>,
     bus_loss_arc: Arc<SafetyState>,
     watchdog_timeout_arc: Arc<SafetyState>,
+    detail_unavailable_arc: Arc<SafetyState>,
     fault_arc_pool: [Option<Arc<SafetyState>>; FAULT_ARC_POOL_CAPACITY],
     fault_arc_pool_len: usize,
     retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
@@ -643,6 +702,10 @@ pub struct SafetyManager {
     epoch_id: u64,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
+    /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
+    latched_fault_kinds: u8,
+    /// Fixed-size inline record of the last detail per latched [`FaultKind`].
+    latched_fault_details: [Option<LatchedFaultDetail>; FaultKind::COUNT],
 }
 
 impl Clone for SafetyManager {
@@ -655,6 +718,7 @@ impl Clone for SafetyManager {
             estop_arc: Arc::clone(&self.estop_arc),
             bus_loss_arc: Arc::clone(&self.bus_loss_arc),
             watchdog_timeout_arc: Arc::clone(&self.watchdog_timeout_arc),
+            detail_unavailable_arc: Arc::clone(&self.detail_unavailable_arc),
             // Fresh unique pool slots so `Arc::get_mut` always succeeds on both instances.
             fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
             fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
@@ -669,6 +733,8 @@ impl Clone for SafetyManager {
             log_dropped: self.log_dropped,
             epoch_id: self.epoch_id,
             fault_code: self.fault_code,
+            latched_fault_kinds: self.latched_fault_kinds,
+            latched_fault_details: self.latched_fault_details,
         }
     }
 }
@@ -684,6 +750,9 @@ impl Default for SafetyManager {
             estop_arc: Arc::new(SafetyState::EStop),
             bus_loss_arc: Arc::new(SafetyState::Fault(FaultReason::BusLoss)),
             watchdog_timeout_arc: Arc::new(SafetyState::Fault(FaultReason::WatchdogTimeout)),
+            detail_unavailable_arc: Arc::new(SafetyState::Fault(FaultReason::Other(
+                DETAIL_UNAVAILABLE.into(),
+            ))),
             fault_arc_pool: std::array::from_fn(|_| Some(Arc::new(SafetyState::Idle))),
             fault_arc_pool_len: FAULT_ARC_POOL_CAPACITY,
             retired_state_arcs: std::array::from_fn(|_| None),
@@ -697,6 +766,8 @@ impl Default for SafetyManager {
             log_dropped: 0,
             epoch_id: 1,
             fault_code: None,
+            latched_fault_kinds: 0,
+            latched_fault_details: [None; FaultKind::COUNT],
         }
     }
 }
@@ -777,6 +848,64 @@ impl SafetyManager {
         self.fault_arc_pool_len
     }
 
+    /// True when `kind` has been latched since the last successful clear to `Idle`.
+    #[inline]
+    pub fn has_latched_fault_kind(&self, kind: FaultKind) -> bool {
+        (self.latched_fault_kinds & kind.bit()) != 0
+    }
+
+    /// True when at least one fault kind is currently latched since the last clear.
+    #[inline]
+    pub fn has_latched_fault(&self) -> bool {
+        self.latched_fault_kinds != 0
+    }
+
+    /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
+    #[inline]
+    pub fn latched_fault_kinds(&self) -> u8 {
+        self.latched_fault_kinds
+    }
+
+    /// Last inline detail recorded for `kind` since the last clear, if any.
+    #[inline]
+    pub fn latched_fault_detail(&self, kind: FaultKind) -> Option<&LatchedFaultDetail> {
+        self.latched_fault_details[kind as usize].as_ref()
+    }
+
+    /// Empties the preallocated fault-slot pool for deterministic exhaustion tests.
+    #[doc(hidden)]
+    pub fn drain_fault_arc_pool_for_test(&mut self) -> Vec<Arc<SafetyState>> {
+        let mut drained = Vec::with_capacity(self.fault_arc_pool_len);
+        while self.fault_arc_pool_len > 0 {
+            self.fault_arc_pool_len -= 1;
+            if let Some(arc) = self.fault_arc_pool[self.fault_arc_pool_len].take() {
+                drained.push(arc);
+            }
+        }
+        drained
+    }
+
+    fn record_latched_fault(&mut self, kind: FaultKind, detail: LatchedFaultDetail) {
+        self.latched_fault_kinds |= kind.bit();
+        self.latched_fault_details[kind as usize] = Some(detail);
+    }
+
+    fn any_latched_non_recoverable(&self) -> bool {
+        self.latched_fault_details
+            .iter()
+            .flatten()
+            .any(|d| !d.code.recoverable())
+    }
+
+    fn emit_or_queue_fault_log(&mut self, reason: &BoundedFaultReason, code: FaultCode) {
+        if self.deferred_logging {
+            let from = BoundedSafetyState::from_state(&self.state_arc);
+            self.queue_log_event(SafetyLogEvent::Fault { from, reason: *reason, code });
+        } else {
+            tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, reason);
+        }
+    }
+
     /// Returns a clean, uniquely owned `SafetyState::Idle` `Arc` recycled off-thread back into
     /// the bounded fault slot pool; returns `Err(arc)` without dropping if rejected.
     pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) -> Result<(), Arc<SafetyState>> {
@@ -831,7 +960,9 @@ impl SafetyManager {
     }
 
     fn is_cached_fault_arc(&self, arc: &Arc<SafetyState>) -> bool {
-        Arc::ptr_eq(arc, &self.bus_loss_arc) || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
+        Arc::ptr_eq(arc, &self.bus_loss_arc)
+            || Arc::ptr_eq(arc, &self.watchdog_timeout_arc)
+            || Arc::ptr_eq(arc, &self.detail_unavailable_arc)
     }
 
     fn allocate_fault_arc(&mut self, reason: FaultReason) -> Result<Arc<SafetyState>, FaultReason> {
@@ -839,7 +970,7 @@ impl SafetyManager {
             FaultReason::BusLoss => Ok(Arc::clone(&self.bus_loss_arc)),
             FaultReason::WatchdogTimeout => Ok(Arc::clone(&self.watchdog_timeout_arc)),
             other => {
-                if self.fault_arc_pool_len > 0 {
+                while self.fault_arc_pool_len > 0 {
                     self.fault_arc_pool_len -= 1;
                     if let Some(mut arc) = self.fault_arc_pool[self.fault_arc_pool_len].take() {
                         if let Some(slot) = Arc::get_mut(&mut arc) {
@@ -848,10 +979,7 @@ impl SafetyManager {
                         }
                     }
                 }
-                if self.off_thread_reclaim && matches!(*self.state_arc, SafetyState::Fault(_)) {
-                    return Err(other);
-                }
-                Ok(Arc::new(SafetyState::Fault(other)))
+                Err(other)
             }
         }
     }
@@ -925,7 +1053,11 @@ impl SafetyManager {
             SafetyState::Fault(reason) => (self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason)), reason.message()),
             _ => return None,
         };
-        Some(FaultInfo { code, message, recoverable: code.recoverable() })
+        Some(FaultInfo {
+            code,
+            message,
+            recoverable: code.recoverable() && !self.any_latched_non_recoverable(),
+        })
     }
 
     /// Advance epoch and latch Fault immediately; the code follows from the reason.
@@ -943,57 +1075,63 @@ impl SafetyManager {
             && self.retired_len >= RETIRED_STATE_CAPACITY)
     }
 
-    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated (or the
-    /// bounded fault slot pool is empty while already faulted), fails closed without invoking
-    /// `make_reason` (0 heap alloc / 0 drop on RT).
+    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated or the
+    /// bounded fault slot pool is empty, skips `make_reason` (0 heap alloc / 0 drop on RT) while
+    /// STILL latching the fault kind with `"detail unavailable"` (and moving a non-faulted state
+    /// to the preallocated `"detail unavailable"` fault Arc without calling `Arc::new`).
     pub fn trigger_fault_coded_lazy(
         &mut self,
         code: FaultCode,
         make_reason: impl FnOnce() -> FaultReason,
     ) -> u64 {
-        if !self.can_accept_fault_transition()
-            || (self.off_thread_reclaim
-                && matches!(*self.state_arc, SafetyState::Fault(_))
-                && self.fault_arc_pool_len == 0)
-        {
+        if !self.can_accept_fault_transition() || self.fault_arc_pool_len == 0 {
+            let kind = FaultKind::from_code(code);
+            let reason = BoundedFaultReason::Other(BoundedText::new(DETAIL_UNAVAILABLE));
+            self.record_latched_fault(kind, LatchedFaultDetail { code, reason });
+            self.emit_or_queue_fault_log(&reason, code);
+            if !matches!(*self.state_arc, SafetyState::Fault(_)) {
+                self.fault_code = Some(code);
+                let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
+                debug_assert!(replaced);
+            }
             self.epoch_id = self.epoch_id.wrapping_add(1);
             return self.epoch_id;
         }
         self.trigger_fault_coded(code, make_reason())
     }
 
-    /// Fallible fault latch that returns `Err((epoch, reason))` without dropping `reason` when
-    /// off-thread reclamation is saturated while already faulted.
+    /// Fallible fault latch that ALWAYS records the fault kind in the fixed-size latched record
+    /// (and never falls back to `Arc::new`). When off-thread reclamation is saturated or the
+    /// preallocated fault-slot pool is empty, keeps the current `Fault` Arc (or switches a
+    /// non-faulted state to the preallocated `"detail unavailable"` fault Arc) and returns
+    /// `Err((epoch, reason))` so the caller does not drop heap-bearing `reason` on the RT thread.
     pub fn try_trigger_fault_coded(
         &mut self,
         code: FaultCode,
         reason: FaultReason,
     ) -> Result<u64, (u64, FaultReason)> {
+        let kind = FaultKind::from_reason(&reason);
+        let bounded_reason = BoundedFaultReason::from_reason(&reason);
+        self.record_latched_fault(kind, LatchedFaultDetail { code, reason: bounded_reason });
         if !self.can_accept_fault_transition() {
+            self.emit_or_queue_fault_log(&bounded_reason, code);
             self.epoch_id = self.epoch_id.wrapping_add(1);
             return Err((self.epoch_id, reason));
         }
-        let log_ev = if self.deferred_logging {
-            Some(SafetyLogEvent::Fault {
-                from: BoundedSafetyState::from_state(&self.state_arc),
-                reason: BoundedFaultReason::from_reason(&reason),
-                code,
-            })
-        } else {
-            None
-        };
         let next_arc = match self.allocate_fault_arc(reason) {
             Ok(arc) => arc,
             Err(reason) => {
+                self.emit_or_queue_fault_log(&bounded_reason, code);
+                if !matches!(*self.state_arc, SafetyState::Fault(_)) {
+                    self.fault_code = Some(code);
+                    let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
+                    debug_assert!(replaced);
+                }
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 return Err((self.epoch_id, reason));
             }
         };
-        if let Some(ev) = log_ev {
-            self.queue_log_event(ev);
-        } else if let SafetyState::Fault(ref stored_reason) = *next_arc {
-            tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, stored_reason);
-        }
+        self.emit_or_queue_fault_log(&bounded_reason, code);
         self.fault_code = Some(code);
         let replaced = self.try_replace_state_arc(next_arc);
         debug_assert!(replaced);
@@ -1024,6 +1162,8 @@ impl SafetyManager {
                     tracing::info!("Safety: cleared -> Idle");
                 }
                 self.fault_code = None;
+                self.latched_fault_kinds = 0;
+                self.latched_fault_details = [None; FaultKind::COUNT];
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(SafetyState::Idle)
             }

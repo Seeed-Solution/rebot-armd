@@ -1419,7 +1419,7 @@ impl SupervisorInner {
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
         }
-        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
+        if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
         }
@@ -1449,7 +1449,7 @@ impl SupervisorInner {
                 return self.mit_expiry_recovery();
             }
         }
-        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+        let thermal = self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
             let disabling = drv.clear_fault_disables_joints();
@@ -1702,11 +1702,11 @@ impl SupervisorInner {
         if let Some(ref err) = self.driver_config_error {
             return Err(E::Rejected(R::DriverConfigError(BoundedText::new(err))));
         }
-        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
+        if !self.safety.state().is_stopped() && !self.safety.has_latched_fault() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() { return Err(E::Rejected(R::GravityCompUnconfirmed)); }
         if self.disable_pending { return Err(E::Rejected(R::DisablePending)); }
         if self.mit.owner == crate::mit::MitOwner::Lost { return Err(E::Rejected(R::MitLostUnsupported)); }
-        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+        let thermal = self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip);
         if let Some(ref d) = self.driver {
             let mut scratch_ages = std::mem::take(&mut self.scratch.ages);
             let mut drv = match d.lock() {

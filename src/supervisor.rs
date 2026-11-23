@@ -1655,7 +1655,7 @@ impl SupervisorInner {
                 .temperatures
                 .iter()
                 .any(|t| t.is_finite() && *t > self.config.max_temperature)
-            && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }))
+            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
         {
             self.apply_stop_policy(StopPolicy::ThermalTrip);
         }
