@@ -155,6 +155,56 @@ pub const IK_LIMIT_MARGIN: f64 = 0.02;
 /// Auto-level threshold (cockpit `CFG.view.levelCos`).
 pub fn level_cos() -> f64 { (15.0f64).to_radians().cos() }
 
+/// A prepared plan is stale when a commanded joint (arm joints and the gripper) moved by at
+/// least this much since the plan's start was taken (rad).
+pub const PLAN_START_TOL_RAD: f64 = 1e-4;
+
+/// Whether `commanded` left the start of a plan: an arm joint differs from `arm_q0` or the
+/// gripper (index `gripper_idx`, a missing joint reads 0) from `gripper_q0` by [`PLAN_START_TOL_RAD`] or more.
+pub fn plan_start_moved(commanded: &[f32], arm_q0: &[f64], gripper_idx: usize, gripper_q0: f32) -> bool {
+    let arm = arm_q0.iter().enumerate()
+        .any(|(i, q0)| commanded.get(i).is_none_or(|q| (f64::from(*q) - q0).abs() >= PLAN_START_TOL_RAD));
+    arm || (commanded.get(gripper_idx).copied().unwrap_or(0.0) - gripper_q0).abs() >= PLAN_START_TOL_RAD as f32
+}
+
+/// Worker-side preparation of a joint move for the RT broker (armd 1.6 RT core, track C):
+/// the joint quintic from the snapshot's commanded joints to `q` in `duration_s`, to submit
+/// under `snap.authority`. Refused before admission (nothing is queued) when a configuration
+/// hold inhibits motion (`CONFIG_BUSY`) or `q` does not fit (`INVALID_COMMAND`); the commit
+/// rechecks everything (stamp, lease, start, configuration, feedback).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_joint_move(snap: &crate::rt_core::ops::PlanningSnapshot, q: &[f32], duration_s: f64) -> Result<crate::rt_core::ops::Primitive, &'static str> {
+    if snap.config_inhibited { return Err("CONFIG_BUSY"); }
+    if q.len() != snap.commanded.len() || !q.iter().all(|v| v.is_finite()) || !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("INVALID_COMMAND");
+    }
+    crate::rt_core::ops::Primitive::joint_quintic(&snap.commanded, q, duration_s)
+}
+
+/// Worker-side preparation of a planned Cartesian path for the RT broker (C2): its joint
+/// samples and path parameters go into a plan slot (`PlanSlot::copy_from` stages it without
+/// reallocating), so the commit installs it without IK. `start` is the snapshot's commanded
+/// position, which the path's first sample must match (arm joints and gripper,
+/// `START_TOLERANCE`). `CONFIG_BUSY` under a configuration hold, `PLAN_STALE` when the path
+/// was planned from another start, `PLAN_TOO_LARGE` beyond `MAX_PATH_SAMPLES`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_cartesian_path(snap: &crate::rt_core::ops::PlanningSnapshot, path: &JointPath, child: Option<crate::rt_core::ops::ChildSpec>)
+    -> Result<crate::rt_core::ops::PlanSlot, &'static str> {
+    use crate::rt_core::{mailbox::MAX_DOF, ops::{PathKind, PlanSlot, Primitive, MAX_PATH_SAMPLES, START_TOLERANCE}};
+    if snap.config_inhibited { return Err("CONFIG_BUSY"); }
+    let dof = snap.commanded.len();
+    if dof == 0 || dof > MAX_DOF || dof > 7 || path.dof != dof || path.q.len() < 2 || path.q.len() != path.s.len() { return Err("INVALID_COMMAND"); }
+    if path.q.len() > MAX_PATH_SAMPLES { return Err("PLAN_TOO_LARGE"); }
+    if path.q[0][..dof].iter().zip(&snap.commanded).any(|(a, b)| (a - b).abs() >= START_TOLERANCE) { return Err("PLAN_STALE"); }
+    let mut slot = PlanSlot::with_path_capacity(path.q.len());
+    for (q, s) in path.q.iter().zip(&path.s) { slot.path.push(&q[..dof], *s)?; }
+    let mut start = [0.0; MAX_DOF];
+    start[..dof].copy_from_slice(&snap.commanded);
+    slot.primitive = Primitive::Prepared { child, dof: dof as u8, start, kind: PathKind::Cartesian, duration_s: path.duration,
+        power_scale: Some(path.power_scale) };
+    Ok(slot)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Speed {
     pub linear: f64,

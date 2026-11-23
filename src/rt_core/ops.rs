@@ -29,7 +29,7 @@ use super::broker::{
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
-use super::mailbox::{target_mailbox, Refusal, RefusalDetail, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
+use super::mailbox::{target_mailbox, Refusal, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
 use super::urgent::StopRequests;
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
@@ -93,6 +93,106 @@ pub enum Primitive {
     JointQuinticLimited { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], q: [f32; MAX_DOF], duration_s: f64, max_velocity: [f32; MAX_DOF], settle_s: f64 },
     /// Replay of a recorded episode.
     Replay { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], episode: EpisodeRef, speed: f32, gripper: bool },
+    /// A joint-sample path the worker prepared into the slot's [`PreparedPath`] (Cartesian
+    /// path: IK solved; replay: episode read and resampled), installed by
+    /// [`CoreOps::commit_prepared`] without IK or file I/O. `start` is the commanded position
+    /// it was prepared from (checked as for `JointQuintic`); `child` names a macro parent.
+    Prepared { child: Option<ChildSpec>, dof: u8, start: [f32; MAX_DOF], kind: PathKind, duration_s: f64, power_scale: Option<f64> },
+}
+
+/// What a [`Primitive::Prepared`] path is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PathKind {
+    /// Samples at path parameters `0..=1` (`PreparedPath::params`, first sample = start),
+    /// run over `duration_s` with the quintic time law of a Cartesian path.
+    Cartesian,
+    /// Recorded samples every `sample_dt` s of recorded time (`duration_s` recorded), played
+    /// at `speed` after an approach quintic from the commanded position to the first sample
+    /// (planned at the commit: no IK). `gripper` false keeps the gripper's command.
+    /// `tool_digest`: [`tool_digest_hash`] of the active tool the worker checked the
+    /// episode's tool provenance against (`TOOL_MISMATCH` at the commit when it changed).
+    Replay { episode: EpisodeRef, speed: f32, gripper: bool, sample_dt: f64, tool_digest: u64 },
+}
+
+/// FNV-1a hash of a tool configuration digest (no allocation): the prepared replay names the
+/// tool its provenance was checked against.
+pub fn tool_digest_hash(digest: &str) -> u64 {
+    digest.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Joint samples one plan slot's [`PreparedPath`] holds (allocated when the slot is built;
+/// a longer path or episode is refused `PLAN_TOO_LARGE` when it is prepared).
+pub const MAX_PATH_SAMPLES: usize = 2048;
+
+/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated once (plan slot
+/// construction) and refilled in place: preparing never reallocates it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedPath {
+    samples: Vec<[f32; MAX_DOF]>,
+    params: Vec<f64>,
+}
+
+impl PreparedPath {
+    pub fn with_capacity(n: usize) -> Self { Self { samples: Vec::with_capacity(n), params: Vec::with_capacity(n) } }
+    pub fn capacity(&self) -> usize { self.samples.capacity().min(self.params.capacity()) }
+    pub fn clear(&mut self) { self.samples.clear(); self.params.clear(); }
+    pub fn len(&self) -> usize { self.samples.len() }
+    pub fn is_empty(&self) -> bool { self.samples.is_empty() }
+    pub fn samples(&self) -> &[[f32; MAX_DOF]] { &self.samples }
+    pub fn params(&self) -> &[f64] { &self.params }
+
+    /// Appends sample `q` at path parameter `s` (a replay passes its sample index).
+    /// `PLAN_TOO_LARGE` when the buffer is full (it never grows), `INVALID_COMMAND` for more
+    /// than [`MAX_DOF`] joints or a non-finite value.
+    pub fn push(&mut self, q: &[f32], s: f64) -> Result<(), &'static str> {
+        if q.len() > MAX_DOF || !s.is_finite() || q.iter().any(|v| !v.is_finite()) { return Err("INVALID_COMMAND"); }
+        if self.samples.len() >= self.capacity() { return Err("PLAN_TOO_LARGE"); }
+        let mut a = [0.0; MAX_DOF];
+        a[..q.len()].copy_from_slice(q);
+        self.samples.push(a);
+        self.params.push(s);
+        Ok(())
+    }
+
+    /// `other`'s samples into this buffer (`PLAN_TOO_LARGE` when they do not fit; nothing
+    /// is reallocated).
+    pub fn copy_from(&mut self, other: &PreparedPath) -> Result<(), &'static str> {
+        if other.len() > self.capacity() { return Err("PLAN_TOO_LARGE"); }
+        self.clear();
+        self.samples.extend_from_slice(&other.samples);
+        self.params.extend_from_slice(&other.params);
+        Ok(())
+    }
+}
+
+/// One plan slot: the primitive and the prepared path a [`Primitive::Prepared`] reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanSlot {
+    pub primitive: Primitive,
+    pub path: PreparedPath,
+}
+
+impl Default for PlanSlot {
+    /// A slot with a [`MAX_PATH_SAMPLES`] path buffer (pre-touched by the allocation).
+    fn default() -> Self { Self::with_path_capacity(MAX_PATH_SAMPLES) }
+}
+
+impl PlanSlot {
+    pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+
+    /// Stages a primitive that reads no path (the path is cleared).
+    pub fn set(&mut self, p: Primitive) {
+        self.primitive = p;
+        self.path.clear();
+    }
+
+    /// Stages a slot the worker prepared (`PLAN_TOO_LARGE`: nothing staged; the slot is empty).
+    pub fn copy_from(&mut self, other: &PlanSlot) -> Result<(), &'static str> {
+        self.primitive = Primitive::None;
+        self.path.copy_from(&other.path)?;
+        self.primitive = other.primitive;
+        Ok(())
+    }
 }
 
 /// Waypoints a [`Primitive::CartesianPath`] carries at most.
@@ -143,15 +243,17 @@ impl EpisodeRef {
 }
 
 /// A prepared start differs from the commanded position when a joint (gripper included)
-/// moved by at least this much (rad; `SupervisorInner::check_plan_fresh`).
-pub const START_TOLERANCE: f32 = 1e-4;
+/// moved by at least this much (rad): the threshold of `SupervisorInner::check_plan_fresh`
+/// ([`crate::motion::PLAN_START_TOL_RAD`]).
+pub const START_TOLERANCE: f32 = crate::motion::PLAN_START_TOL_RAD as f32;
 
 impl Primitive {
     /// The child ticket of a macro child (None: a plain primitive).
     pub fn child(&self) -> Option<&ChildSpec> {
         match self {
             Self::None | Self::JointQuintic { .. } => None,
-            Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. } => child.as_ref(),
+            Self::CartesianPath { child, .. } | Self::Gripper { child, .. } | Self::JointQuinticLimited { child, .. } | Self::Replay { child, .. }
+            | Self::Prepared { child, .. } => child.as_ref(),
         }
     }
 
@@ -178,13 +280,13 @@ pub const TERMINAL_CODES: &[&str] = &[
     "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "HARDWARE_FAULT", "ENABLE_FAILED",
     "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
     "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
-    "FEEDBACK_UNCONFIRMED", "INVALID_FEEDBACK", "UNLOAD_FAILED",
+    "FEEDBACK_UNCONFIRMED", "FEEDBACK_STALE", "INVALID_FEEDBACK", "UNLOAD_FAILED",
     // motion and action failures
     "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
     "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
     "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
     "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
-    "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE",
+    "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE", "POWER_LIMIT",
 ];
 
 /// The static form of an action's code (None: it named none or an unlisted one).
@@ -246,6 +348,14 @@ pub struct CommitCtx {
 /// Receive frames the bus owner services per release at most (design: 64 frames or 5 ms).
 pub const RX_FRAME_BUDGET: u16 = 64;
 /// Time the bus owner services per release at most.
+///
+/// A receive pass the budget cuts leaves the unread replies queued and the joints' feedback
+/// older. With the MIT deadline fence armed (gravity compensation, MIT tracking), feedback
+/// that ages past the fence (45 ms) trips the whole group and discards cached output: this
+/// is deliberate (stale feedback never drives MIT output), so the budget has to drain a
+/// release's traffic. Expected per release (inference, not measured): one reply per command
+/// frame and motor, plus status polls, i.e. well under 64 frames for 7 motors at 50 Hz. The
+/// sizing is checked in the device qualification (worst RX age at load), not here.
 pub const RX_TIME_BUDGET: Duration = Duration::from_millis(5);
 
 /// What one [`CoreOps::poll_hardware`] may spend: it returns by `deadline` (the earlier of
@@ -298,6 +408,17 @@ impl HardwarePoll {
     pub fn wake(&self) -> Option<Instant> {
         match self.torque { Some(Ok(TorqueProgress::Pending { wake })) => Some(wake), _ => None }
     }
+
+    /// The executor's extra service within the release ending at `release`: the pending
+    /// transition's wake when it comes before the release (None: serve it at the release).
+    pub fn wake_before(&self, release: Instant) -> Option<Instant> { self.wake().filter(|w| *w < release) }
+}
+
+/// Extra hardware services the executor runs within one release at most (a transition's
+/// retry cadence is 25 ms and its confirmation service 2 ms: a 20 ms release needs a few).
+pub const MAX_SERVICE_WAKES: u32 = 8;
+
+impl HardwarePoll {
 }
 
 /// The narrow operations of one arm's core.
@@ -310,6 +431,11 @@ pub trait CoreOps {
     /// Installs `primitive` for `d` after rechecking its stamp; refusal leaves active motion unchanged.
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str>;
     fn commit_immediate(&mut self, d: &Descriptor, op: ImmediateOp, ctx: &CommitCtx) -> Result<Committed, &'static str>;
+    /// Installs a [`Primitive::Prepared`] with its slot's `path` after rechecking its stamp
+    /// (as `commit_primitive`); no IK and no file I/O. Default: `UNSUPPORTED`.
+    fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        Err("UNSUPPORTED")
+    }
     /// Starts a driver transition after rechecking the stamp; its progress and outcome come
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
     /// the transition (the adapter uses the request id's value).
@@ -340,7 +466,8 @@ fn static_code(e: ArmError) -> &'static str {
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
-        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL",
+        "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE",
     ];
     if let ArmError::Motion(m) = &e { return m.code(); }
     let code = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
@@ -358,6 +485,20 @@ impl SupervisorInner {
     fn check_commit(&self, d: &Descriptor, ctx: &CommitCtx) -> Result<(), &'static str> {
         if let Some(code) = d.stamp.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Err(code); }
         if self.lease_enabled && d.stamp.authority.lease_generation == 0 { return Err("NO_LEASE"); }
+        Ok(())
+    }
+}
+
+impl SupervisorInner {
+    /// The checks every motion commit shares: identity, deadline, stop, epoch, a lease valid
+    /// now, configuration revision (`check_commit`); the active revision, reservations and
+    /// feedback (track C); a child's parent is the one its stamp was admitted under.
+    fn check_motion_commit(&self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<(), &'static str> {
+        self.check_commit(d, ctx)?;
+        if let Some(code) = self.motion_commit_blocker(&d.stamp.authority) { return Err(code); }
+        if let Some(c) = primitive.child() {
+            if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }
+        }
         Ok(())
     }
 }
@@ -392,15 +533,16 @@ impl CoreOps for SupervisorInner {
     }
 
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
-        self.check_commit(d, ctx)?;
-        if self.core.motion_inhibited_by_config() { return Err("CONFIG_BUSY"); }
-        // a child names the parent its stamp was admitted under
-        if let Some(c) = primitive.child() {
-            if c.ticket.parent.0 != d.stamp.authority.parent_generation || c.ticket.parent.0 == 0 { return Err("PARENT_REPLACED"); }
-        }
+        self.check_motion_commit(d, primitive, ctx)?;
         match primitive {
-            Primitive::None => Err("INVALID_COMMAND"),
-            Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => Err("UNSUPPORTED"),
+            // a prepared path is installed with its slot's samples (`commit_prepared`)
+            Primitive::None | Primitive::Prepared { .. } => Err("INVALID_COMMAND"),
+            // macro children (track E): installed for the running macro named by the ticket;
+            // the committed action is the parent (its terminal carries the child count)
+            Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
+                if primitive.child().is_none() { return Err("UNSUPPORTED"); }
+                self.commit_macro_child(primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
+            }
             Primitive::JointQuintic { dof, start, q, duration_s } => {
                 // the fields are public: a hand-built primitive may name more joints than it holds
                 let n = usize::from(*dof);
@@ -410,6 +552,40 @@ impl CoreOps for SupervisorInner {
                 self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
+            }
+        }
+    }
+
+    fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.check_motion_commit(d, primitive, ctx)?;
+        let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else { return Err("INVALID_COMMAND"); };
+        let n = usize::from(dof);
+        if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
+        let epoch = d.stamp.authority.epoch;
+        let committed = |r: Result<u64, ArmError>| r.map(|id| Committed::authorized(d, Some(ActionId(id)))).map_err(static_code);
+        match kind {
+            PathKind::Cartesian => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                let joint_path = self.prepared_joint_path(n, path, duration_s, power_scale)?;
+                match child {
+                    None => committed(self.install_prepared_path(epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        this.install_macro_prepared_path(id, joint_path, power_scale.is_some()).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+            PathKind::Replay { .. } => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                match child {
+                    None => {
+                        let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
+                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                    }
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
+                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
             }
         }
     }
@@ -438,31 +614,23 @@ impl CoreOps for SupervisorInner {
 
     fn commit_transition(&mut self, d: &Descriptor, op: TransitionOp, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.check_commit(d, ctx)?;
-        if self.core.transition_pending() { return Err("TRANSITION_BUSY"); }
-        // delegated: the existing set_torque confirms synchronously; the result is reported
-        // by the next poll, as the bus owner's state machine will (track A)
-        let result = self.set_torque(matches!(op, TransitionOp::TorqueOn)).map(drop).map_err(|e| static_code(ArmError::Safety(e)));
-        self.core.begin_transition(result.map(|()| TorqueProgress::Done));
+        if self.core.transition_pending() || self.torque_transition_pending() { return Err("TRANSITION_BUSY"); }
+        // starts the bus owner's handshake (ArmDriver::begin_torque); a refusal before any
+        // frame refuses the commit, a later failure is the transition's terminal
+        let progress = self.begin_torque_transition(matches!(op, TransitionOp::TorqueOn)).map_err(|e| static_code(ArmError::Safety(e)))?;
+        // the next service is the next poll (the begin's wake is on the driver's clock)
+        self.core.begin_transition(progress.map(|p| match p { TorqueProgress::Pending { .. } => TorqueProgress::Pending { wake: ctx.now }, done => done }));
         Ok(Committed::authorized(d, Some(ActionId(d.stamp.request.0))))
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
-        if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx), &self.core.target_authority()) {
-            let detail = match code {
-                "LEASE_LOST" => {
-                    let preempted = self.last_evicted.as_ref().is_some_and(|(_, g)| *g == frame.authority.lease_generation);
-                    RefusalDetail::LeaseLoss { reason: if preempted { "preempted" } else { "expired" } }
-                }
-                "PLAN_STALE" => RefusalDetail::CurrentRevision(self.workspace_revision),
-                _ => RefusalDetail::None,
-            };
-            return Err(Refusal { code, detail });
-        }
-        if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
-        self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| Refusal::code(static_code(ArmError::Safety(e))))
+        // track D: identity, deadline, authority, stream, policy generation, input / camera
+        // ages, config hold, then the servo / policy step checks (supervisor::streams::targets)
+        self.consume_target_frame(frame, ctx)
     }
 
-    fn apply_stop(&mut self) { self.stop_motion(); }
+    // ends client motion; a running watchdog park belongs to the lease watchdog and continues
+    fn apply_stop(&mut self) { self.authorized_stop(); }
 
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
         // a macro's terminal record outlives its action record (finish_action, a newer action)
@@ -474,7 +642,10 @@ impl CoreOps for SupervisorInner {
     fn action_children(&self, action: ActionId) -> u32 { self.core.last_macro().filter(|m| m.action == action).map_or(0, |m| m.children) }
 
     fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
-        // no bus servicing is delegated yet (the tick reads feedback): only the budget is reported
+        // the torque transition in flight: one service of the driver's handshake (or the
+        // supervisor's disable confirmation) within the budget; its progress replaces the
+        // core's. Feedback is otherwise still read by the tick.
+        if let Some(progress) = self.service_torque_transition(budget) { self.core.begin_transition(progress); }
         let budget_exhausted = budget.now > budget.deadline;
         let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, torque: self.core.poll_transition(), ..HardwarePoll::default() }; };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
@@ -495,8 +666,17 @@ impl CoreOps for SupervisorInner {
     }
 }
 
-/// The supervisor's configuration revisions; holds live in the core. Activation stays on
-/// the existing commit path (`NOT_WIRED` here) until track B moves it.
+/// The supervisor's configuration revisions; holds live in the core.
+///
+/// Protocol at the existing commit boundary (one supervisor write guard, track B): the worker
+/// keeps the candidate (its payload, keyed by the reservation's `CandidateId`) and stages its
+/// file off the lock; under the lock it rechecks authorization, lease and epoch, then
+/// [`ConfigAuthority::reserve`]s the domain at the revision the candidate was built from,
+/// renames the file into place and reports [`ConfigAuthority::persisted`], applies the
+/// candidate (`SupervisorInner::activate_config_candidate`, which moves the domain to
+/// `from + 1`) and [`ConfigAuthority::activate`]s the reservation, which confirms the new
+/// revision and ends the hold. A failure before the rename releases the reservation; a
+/// failure after it leaves the hold `Reconciling`.
 impl ConfigAuthority for SupervisorInner {
     fn revision(&self, domain: ConfigDomain) -> u64 {
         match domain {
@@ -524,7 +704,28 @@ impl ConfigAuthority for SupervisorInner {
 
     fn persisted(&mut self, r: &Reservation, durability: Durability) -> Result<(), &'static str> { self.core.config_mut().persisted(r, durability) }
 
-    fn activate(&mut self, r: Reservation) -> Activated { self.core.config_mut().activation_failed(r, "NOT_WIRED") }
+    /// Confirms a reservation whose candidate was applied: the domain must be at `from + 1`.
+    /// The durability is the one reported by [`ConfigAuthority::persisted`] (`Volatile`
+    /// without it). Refusals: `NOT_HELD` (another grant or none), `RECONCILING`,
+    /// `NOT_APPLIED` (still at `from`), `REVISION_MISMATCH` (moved elsewhere); before
+    /// persistence the reservation comes back, after it the hold is `Reconciling`.
+    fn activate(&mut self, r: Reservation) -> Activated {
+        let Some(held) = self.core.config_held(r.domain()).filter(|h| h.grant == Some(r.grant())) else {
+            return Activated::Refused { code: "NOT_HELD", reservation: r };
+        };
+        let durability = match held.state {
+            super::config_iface::HoldState::Reserved => Durability::Volatile,
+            super::config_iface::HoldState::PersistedAwaitingActivation { durability } => durability,
+            super::config_iface::HoldState::Reconciling => return self.core.config_mut().activation_failed(r, "RECONCILING"),
+        };
+        let revision = self.revision(r.domain());
+        if revision != r.from() + 1 {
+            let code = if revision == r.from() { "NOT_APPLIED" } else { "REVISION_MISMATCH" };
+            return self.core.config_mut().activation_failed(r, code);
+        }
+        self.core.config_mut().activated(&r);
+        Activated::Active { revision, durability }
+    }
 
     fn release(&mut self, r: Reservation) -> Released { self.core.config_mut().release(r) }
 
@@ -586,6 +787,9 @@ pub struct ReleaseReport {
     pub poll: HardwarePoll,
     /// The driver transition that ended in this release.
     pub transition_ended: Option<(ActionId, Outcome)>,
+    /// Extra hardware services at a pending transition's wake within this release
+    /// (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]); `poll` is the last one.
+    pub wakes: u32,
 }
 
 /// The fixture's clock: virtual monotonic time, advanced by the fixture (one `dt` per
@@ -607,12 +811,13 @@ impl VirtualClock {
 
 /// Advances one core one release at a time, in the executor's order: urgent stop, hardware
 /// poll, at most one ordinary command, the latest target, the control tick, terminal
-/// detection. Tests and tracks drive it deterministically: no thread, and virtual time
+/// detection, then extra hardware services at a pending transition's wake before the next
+/// release (`HardwarePoll::wake_before`, at most [`MAX_SERVICE_WAKES`]). Tests and tracks drive it deterministically: no thread, and virtual time
 /// ([`VirtualClock`]): release `k` (from 1) starts at `clock.base() + (k - 1) * dt` plus what
 /// a test advanced.
 pub struct ReleaseFixture<O: CoreOps> {
     pub core: O,
-    intake: RtIntake<Primitive>,
+    intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
     active: Option<Installed>,
@@ -639,8 +844,8 @@ pub enum Checkpoint {
 
 impl<O: CoreOps> ReleaseFixture<O> {
     /// The fixture, the broker feeding it, the target writer and the stop handle.
-    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<Primitive>, TargetWriter, StopRequests) {
-        let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, Primitive::default);
+    pub fn new(core: O, boot: BootId, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, PlanSlot::default);
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
         let clock = VirtualClock::starting_at(Instant::now());
@@ -691,25 +896,17 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // 1. urgent stop, independent of the command ring's capacity
         if self.apply_pending_stop() { report.stopped = true; }
         // 2. the bus owner, within the release's service budget
-        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
-        let ended = match report.poll.torque {
-            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
-            Some(Err(code)) => Some(Outcome::Failed(code)),
-            _ => None,
-        };
-        if let (Some(outcome), Some(t)) = (ended, self.transition.take()) {
-            report.transition_ended = Some((t.action(), outcome));
-            self.intake.terminal(t, outcome);
-        }
+        self.service_hardware(release_deadline, &mut report);
         // 3. one ordinary command (the intake enforces one per release)
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(Checkpoint::BeforeCommit, &mut report);
         if let Some(mut t) = self.intake.take() {
             let d = *t.descriptor();
             let result = match d.kind {
-                CommandKind::Install { .. } => match t.plan().copied() {
+                CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
-                    Some(p) => self.core.commit_primitive(&d, &p, &ctx),
+                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => self.core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
+                    Some(slot) => self.core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => self.core.commit_immediate(&d, op, &ctx),
                 CommandKind::Transition(op) => self.core.commit_transition(&d, op, &ctx),
@@ -756,9 +953,36 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 report.ended = Some((action, outcome));
             }
         }
+        // 7. the executor wakes again at a pending transition's wake before the next release
+        // (a transition committed in this release is first served at the next one)
+        let mut next = report.poll.wake_before(release_deadline);
+        while let Some(wake) = next {
+            if report.wakes == MAX_SERVICE_WAKES { break; }
+            report.wakes += 1;
+            self.clock.advance(wake.saturating_duration_since(self.clock.now()));
+            self.service_hardware(release_deadline, &mut report);
+            next = report.poll.wake_before(release_deadline);
+        }
         // the next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
+    }
+
+    /// One `poll_hardware` within the release's budget; a transition it ends gets its terminal.
+    fn service_hardware(&mut self, release_deadline: Instant, report: &mut ReleaseReport) {
+        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
+        let ended = match report.poll.torque {
+            Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
+            Some(Err(code)) => Some(Outcome::Failed(code)),
+            _ => None,
+        };
+        // (the transition is taken only when it ended: a pending one stays in flight)
+        if let Some(outcome) = ended {
+            if let Some(t) = self.transition.take() {
+                report.transition_ended = Some((t.action(), outcome));
+                self.intake.terminal(t, outcome);
+            }
+        }
     }
 }
 
@@ -777,6 +1001,22 @@ mod tests {
     }
 
     #[test]
+    fn the_commit_start_check_uses_the_plan_start_threshold() {
+        assert_eq!(START_TOLERANCE, crate::motion::PLAN_START_TOL_RAD as f32);
+        let t = START_TOLERANCE;
+        assert!(start_matches(&[0.0, 0.0], &[t * 0.5, 0.0]));
+        assert!(!start_matches(&[0.0, 0.0], &[0.0, t]));
+    }
+
+    #[test]
+    fn delegated_feedback_and_config_codes_keep_their_name() {
+        for code in ["FEEDBACK_STALE", "CONFIG_BUSY"] {
+            assert_eq!(static_code(ArmError::detailed(409, code, "x", serde_json::json!({}))), code);
+        }
+        assert_eq!(static_code(ArmError::detailed(409, "SOMETHING_NEW", "x", serde_json::json!({}))), "REJECTED");
+    }
+
+    #[test]
     fn terminal_outcomes_keep_their_cause() {
         assert_eq!(outcome_of("running", None), None);
         assert_eq!(outcome_of("done", None), Some(Outcome::Completed));
@@ -789,6 +1029,7 @@ mod tests {
         assert_eq!(outcome_of("failed", Some("FOLLOWING_ERROR")), Some(Outcome::Failed("FOLLOWING_ERROR")));
         assert_eq!(outcome_of("failed", Some("SOMETHING_NEW")), Some(Outcome::Failed("FAILED")));
         assert_eq!(outcome_of("failed", None), Some(Outcome::Failed("FAILED")));
+        assert_eq!(outcome_of("failed", Some("FEEDBACK_STALE")), Some(Outcome::Failed("FEEDBACK_STALE")));
         // every fault code is listed
         for c in crate::safety::FaultCode::ALL {
             let name = serde_json::to_value(c).unwrap();

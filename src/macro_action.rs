@@ -9,6 +9,24 @@
 //! [`MacroRun`] (the running macro) keyed by action id; `reconcile_action` treats any action
 //! with a matching run the same way, whatever its kind.
 //!
+//! # Child primitives (armd 1.6 RT core, track E)
+//!
+//! Every installed sub-motion is a *child* of the macro: [`MacroRun::children`] counts the
+//! physically installed ones and [`MacroRun::child`] is the RT record of the current one
+//! ([`ChildRecord`]: sequence number, deadline, timeout result, contact guard). The worker
+//! holds a [`ChildTicket`] (parent action id + child sequence) and only accepts the result of
+//! that child; a cancelled or replaced parent reads as [`Stop::Cancelled`].
+//!
+//! The control tick (`reconcile_action`) decides what must be decided before further
+//! movement, without the worker taking the write lock: it ends the child at its deadline
+//! (`Failed` with the macro's timeout code, the motion stopped) and, with a [`ContactGuard`]
+//! stops a descent at the measured position on contact ([`ContactWatch`]).
+//!
+//! The broker's child primitives (`rt_core::ops::Primitive::{CartesianPath, Gripper,
+//! JointQuinticLimited, Replay}`, each with a [`ChildSpec`]) install through
+//! `SupervisorInner::commit_macro_child` with the same record; a macro that ends leaves a
+//! `rt_core::MacroTerminal` (outcome with its code, child count) in the core.
+//!
 //! [`SupervisorInner::install_macro_path`]: crate::supervisor::SupervisorInner::install_macro_path
 //! [`SupervisorInner::start_macro_gripper`]: crate::supervisor::SupervisorInner::start_macro_gripper
 use std::sync::Arc;
@@ -17,10 +35,15 @@ use std::time::{Duration, Instant};
 use crate::api::rest::ApiError;
 use crate::kinematics::Pose;
 use crate::motion::{self, GoalFrame, GoalSpec, GripperCommand, GripperRequest, Speed};
-use crate::supervisor::{ArmError, ArmSupervisor};
+use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+pub use crate::rt_core::broker::ActionId;
+/// The child identity and contact guard of the RT contract (`rt_core::ops`).
+pub use crate::rt_core::ops::{ChildSpec, ChildTicket, ContactGuard};
 
 /// Poll period of the orchestrator while a sub-motion runs.
 pub const POLL: Duration = Duration::from_millis(20);
+/// The worker ends an overdue child itself only when no control tick did within this.
+pub const OVERDUE_GRACE: Duration = Duration::from_millis(500);
 
 /// How an orchestrator phase ended early.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,11 +83,63 @@ pub enum SubState {
 pub struct MacroRun {
     pub id: u64,
     pub epoch: u64,
+    /// State of the current child ([`Self::child`]).
     pub sub: SubState,
     /// `/motion/stop` arrived while no sub-motion was running.
     pub stop_requested: bool,
     pub phase: Option<String>,
     pub phase_start: Option<Instant>,
+    /// Children physically installed so far.
+    pub children: u32,
+    /// RT record of the current (last installed) child.
+    pub child: ChildRecord,
+    /// Contact guard of the next installed child ([`ContactGuard`]).
+    pub next_guard: Option<ContactGuard>,
+}
+
+impl MacroRun {
+    /// A run without children.
+    pub fn new(id: u64, epoch: u64) -> Self {
+        Self { id, epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None,
+            children: 0, child: ChildRecord::default(), next_guard: None }
+    }
+
+    /// A child was installed: the next sequence number, the pending guard, state Running.
+    pub fn begin_child(&mut self) {
+        self.children += 1;
+        self.child = ChildRecord { seq: self.child.seq.wrapping_add(1), guard: self.next_guard.take(), ..ChildRecord::default() };
+        self.sub = SubState::Running;
+    }
+
+    /// The ticket of the current child (None before the first).
+    pub fn ticket(&self) -> Option<ChildTicket> {
+        (self.children > 0).then_some(ChildTicket { parent: ActionId(self.id), child_seq: self.child.seq })
+    }
+}
+
+/// RT record of a macro's current child.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChildRecord {
+    /// 1 for the first child of the run.
+    pub seq: u32,
+    /// The tick fails the child (code and message of `timeout`) when it still runs after this.
+    pub deadline: Option<Instant>,
+    pub timeout: Option<(String, String)>,
+    pub guard: Option<ContactGuard>,
+    pub watch: ContactWatch,
+}
+
+/// What the contact guard ([`ContactGuard`]) of a child saw, evaluated by the control tick
+/// while the child's motion runs: peak |residual| of J2 / J3 (grasp diagnostics), peak
+/// J1..J(arm) tracking error, and where a residual above its bound ended the child.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ContactWatch {
+    pub peak_residual_nm: Option<[f32; 2]>,
+    pub peak_tracking_rad: Option<f32>,
+    /// Base-frame TCP height (m) where the contact stop ended the child.
+    pub contact_tcp_z_m: Option<f64>,
+    /// The joint whose residual exceeded its bound.
+    pub contact_joint: Option<usize>,
 }
 
 /// Same-side final approach of a macro sub-motion ([`MacroCtx::move_arm_with`]).
@@ -123,33 +198,50 @@ impl MacroCtx {
         })
     }
 
-    /// Wait for the installed sub-motion; stop it on a timeout.
-    pub async fn wait_sub(&self, phase: &str, limit_s: f64) -> Result<SubDone, Stop> {
-        let until = Instant::now() + Duration::from_secs_f64(limit_s.min(self.phase_timeout_s));
-        self.wait_sub_until(phase, until).await
+    /// RT deadline of a child that may run `limit_s` (at most `phase_timeout_s`, at most the
+    /// whole-action deadline).
+    fn child_deadline(&self, limit_s: f64) -> Instant {
+        let s = limit_s.min(self.phase_timeout_s);
+        let s = if s.is_finite() { s.clamp(0.0, 1e6) } else { 1e6 };
+        (Instant::now() + Duration::from_secs_f64(s)).min(self.deadline)
     }
 
-    async fn wait_sub_until(&self, phase: &str, until: Instant) -> Result<SubDone, Stop> {
+    /// Under the install guard, right after a child of this macro was installed: arms its RT
+    /// deadline (`limit_s`, see [`child_deadline`](Self::child_deadline)) and returns its ticket.
+    /// None when no child of this macro is installed.
+    pub fn arm_child(&self, inner: &mut SupervisorInner, phase: &str, limit_s: f64) -> Option<ChildTicket> {
+        inner.arm_macro_child(self.id, self.child_deadline(limit_s), self.timeout_code, format!("Phase {phase} did not finish in time"))
+    }
+
+    /// Wait for the installed sub-motion for at most `limit_s` (arms its RT deadline first; an
+    /// install site that holds the guard uses [`arm_child`](Self::arm_child) and
+    /// [`wait_child`](Self::wait_child) instead).
+    pub async fn wait_sub(&self, phase: &str, limit_s: f64) -> Result<SubDone, Stop> {
+        let ticket = {
+            let mut inner = self.sup.inner().write().await;
+            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            self.arm_child(&mut inner, phase, limit_s)
+        };
+        let Some(ticket) = ticket else { return Err(Stop::Cancelled); };
+        self.wait_child(ticket).await
+    }
+
+    /// Wait for child `ticket` with the read lock only: its result, [`Stop::Cancelled`] when
+    /// the parent ended or was replaced. The control tick ends an overdue child (its timeout
+    /// failure); only when no tick did so for [`OVERDUE_GRACE`] does the worker end it.
+    pub async fn wait_child(&self, ticket: ChildTicket) -> Result<SubDone, Stop> {
         loop {
             tokio::time::sleep(POLL).await;
-            {
-                // poll with the read lock; the write lock only to stop on a timeout
+            let overdue = {
                 let inner = self.sup.inner().read().await;
-                if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-                match inner.macro_sub(self.id) {
+                match inner.macro_child_state(ticket) {
+                    None => return Err(Stop::Cancelled),
                     Some(SubState::Done(d)) => return Ok(d),
                     Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
-                    _ => {}
+                    Some(_) => inner.macro_child_overdue(ticket, Instant::now(), OVERDUE_GRACE),
                 }
-            }
-            let now = Instant::now();
-            if now > until || now > self.deadline {
-                let mut inner = self.sup.inner().write().await;
-                if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-                if let Some(SubState::Done(d)) = inner.macro_sub(self.id) { return Ok(d); }
-                if inner.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(self.id)) { inner.stop_motion(); }
-                return Err(fail(self.timeout_code, format!("Phase {phase} did not finish in time")));
-            }
+            };
+            if overdue { self.sup.inner().write().await.expire_macro_child(Instant::now()); }
         }
     }
 
@@ -240,11 +332,11 @@ impl MacroCtx {
                 return Err(before(arm_fail(e.into())));
             }
         };
-        let limit = {
+        let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
             match inner.install_macro_path_same_side_with_rules(self.id, &input, path, pre, plan.as_ref(), effective_rules.as_ref()) {
-                Ok(l) => l,
+                Ok(l) => self.arm_child(&mut inner, phase, l * 2.0 + 5.0),
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
                         inner.set_action_workspace_violation(self.id, detail);
@@ -254,7 +346,7 @@ impl MacroCtx {
             }
         };
         let t0 = Instant::now();
-        let sub_res = self.wait_sub(phase, limit * 2.0 + 5.0).await;
+        let sub_res = match ticket { Some(t) => self.wait_child(t).await, None => Err(Stop::Cancelled) };
         let ms = t0.elapsed().as_millis() as u32;
         {
             let mut inner = self.sup.inner().write().await;
@@ -284,11 +376,12 @@ impl MacroCtx {
         sub_res.map_err(|s| (s, true))
     }
 
-    /// Reconcile a planned gripper sub-motion with the remaining macro budget before installation;
-    /// pos-force closes wait up to their planned deadline (bounded by `self.deadline`), while
-    /// pos-vel and opening moves keep `phase_timeout_s`.
+    /// Reconcile a planned gripper sub-motion with the remaining macro budget before installation,
+    /// arm its RT child deadline under the same write lock, and wait on its `ChildTicket`:
+    /// pos-force closes arm up to `(timeout_s + 10 s).min(self.deadline)` (not clamped to
+    /// `phase_timeout_s`), while pos-vel and opening moves use `arm_child` (`phase_timeout_s`).
     async fn run_gripper(&self, phase: &str, request: GripperRequest) -> Result<SubDone, Stop> {
-        let (duration, timeout_s, is_pos_force_close) = {
+        let ticket = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
             let now = Instant::now();
@@ -296,7 +389,8 @@ impl MacroCtx {
                 return Err(fail(self.timeout_code, self.timeout_message.clone()));
             }
             let remaining_s = self.deadline.duration_since(now).as_secs_f64();
-            inner.start_macro_gripper_within(self.id, request, Some(remaining_s), true)
+            let (duration, timeout_s, is_pos_force_close) = inner
+                .start_macro_gripper_within(self.id, request, Some(remaining_s), true)
                 .map_err(|e| match e {
                     ArmError::Motion(crate::motion::MotionError::InvalidCommand(msg))
                         if msg.contains("remaining macro budget") =>
@@ -304,14 +398,16 @@ impl MacroCtx {
                         fail(self.timeout_code, format!("Phase {phase}: {msg}"))
                     }
                     other => arm_fail(other),
-                })?
+                })?;
+            if is_pos_force_close {
+                let s = if timeout_s.is_finite() { (timeout_s + 10.0).clamp(0.0, 1e6) } else { 1e6 };
+                let deadline = (now + Duration::from_secs_f64(s)).min(self.deadline);
+                inner.arm_macro_child(self.id, deadline, self.timeout_code, format!("Phase {phase} did not finish in time"))
+            } else {
+                self.arm_child(&mut inner, phase, duration + 10.0)
+            }
         };
-        if is_pos_force_close {
-            let until = (Instant::now() + Duration::from_secs_f64(timeout_s + 10.0)).min(self.deadline);
-            self.wait_sub_until(phase, until).await
-        } else {
-            self.wait_sub(phase, duration + 10.0).await
-        }
+        self.wait_child(ticket.ok_or(Stop::Cancelled)?).await
     }
 
     /// Run a gripper open / close sub-motion and wait for it.

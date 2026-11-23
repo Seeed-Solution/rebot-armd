@@ -347,7 +347,7 @@ impl SupervisorInner {
         if let Some(id) = running {
             self.finish_action(id, "failed", Some("TORQUE_LIMIT"), Some(message), None, None, None);
         }
-        self.macro_run = None;
+        self.drop_macro_run("failed", Some("TORQUE_LIMIT"));
         // M1: preserve previous tracking output across the torque-guard backoff so active
         // lead ramps smoothly in the relieving direction instead of dropping in one tick.
         let preserved_tracking = self

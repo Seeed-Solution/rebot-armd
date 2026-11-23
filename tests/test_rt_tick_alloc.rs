@@ -435,3 +435,40 @@ fn ticks_with_a_full_retire_ring_do_not_touch_the_allocator() {
 fn count_ticks_stalled(inner: &mut SupervisorInner, n: usize) -> Vec<(u64, u64)> {
     (0..n).map(|_| { let (p, a, f) = counted(|| inner.tick_publish(0.02, 1, false)); drop(p); (a, f) }).collect()
 }
+
+/// The observation's inline labels: a policy run's stop reason and the gravity-compensation
+/// phase change (set, replaced, cleared) without allocating or freeing.
+#[cfg(feature = "policy-runtime")]
+#[test]
+fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
+    use armd::model::{GravityCompObservation, HolderLabel, PolicyObservation};
+    use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+    let mut inner = supervisor(false);
+    let gen = inner.acquire_lease("alloc").expect("lease");
+    let epoch = inner.safety.epoch_id();
+    inner.begin_policy_run(PolicyRunStart {
+        epoch_id: epoch, connection_id: "alloc".into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
+        backend: "mlp".into(), mode: PolicyMode::Shadow, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
+        i_am_at_the_arm: false, verified_release_gate: None,
+    }).expect("run");
+    let mut run = inner.policy_run.take().expect("run");
+    let mut out = PolicyObservation::default();
+    run.to_observation_into(true, &mut out);
+    let reasons = [Some("MAX_SECONDS".to_string()), Some("LEASE_LOST".to_string()), None, Some("VISION_STALE".to_string()), None];
+    for r in reasons {
+        run.stop_reason = r.clone();
+        let ((), a, f) = counted(|| run.to_observation_into(false, &mut out));
+        assert_eq!((a, f), (0, 0), "stop reason {r:?}");
+        assert_eq!(out.stop_reason.as_deref(), r.as_deref());
+    }
+    // the phase: set, replaced, cleared (the gravity-comp observation without a run clears it)
+    let mut g = GravityCompObservation::default();
+    inner.gravity_comp_observation_into(&mut g);
+    for phase in [Some("ramp_in"), Some("active"), Some("exiting"), None] {
+        let ((), a, f) = counted(|| g.phase = phase.map(HolderLabel::new));
+        assert_eq!((a, f), (0, 0), "phase {phase:?}");
+    }
+    g.phase = Some(HolderLabel::new("active"));
+    let ((), a, f) = counted(|| inner.gravity_comp_observation_into(&mut g));
+    assert_eq!((a, f, g.phase), (0, 0, None), "clearing the phase on the tick");
+}

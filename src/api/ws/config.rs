@@ -1,10 +1,19 @@
 //! Persist-before-commit configuration writes of the WS command path (track B).
 //!
-//! Moved from `api/ws.rs` without changes (armd 1.6 RT-core foundation); moved items, their
-//! fields and inherent methods are `pub(super)` so the connection loop keeps using them.
+//! Moved from `api/ws.rs` (armd 1.6 RT-core foundation); moved items, their fields and
+//! inherent methods are `pub(super)` so the connection loop keeps using them.
+//!
+//! Every write is a versioned change ([`crate::rt_core::config_iface`]): the candidate is
+//! validated under the lock ([`PreparedConfigWrite::prepare`]) and its file staged off the
+//! lock ([`persist_and_activate`]); at the commit boundary (one supervisor write guard) the
+//! connection's authorization, lease and epoch are rechecked, the domain is reserved at the
+//! revision the candidate was built from, the file is renamed into place, the candidate is
+//! applied and the reservation activated (`DurableUnconfirmed` until the directory sync,
+//! which runs after the guard is released and decides `durability_confirmed`).
 
 #[allow(unused_imports)]
 use super::*;
+use crate::rt_core::config_iface::{ConfigDomain, Durability};
 
 /// Atomic persist-before-commit config write (Step 1 prepared under lock, Step 2 staged to
 /// disk without lock under `config_write_lock`, Step 3 prechecked + published + committed under lock).
@@ -54,6 +63,33 @@ impl PreparedConfigWrite {
             Self::Sequences(p) => if p.sequence.is_some() { "/api/v1/sequences/save" } else { "/api/v1/sequences/delete" },
             Self::GraspSetup(_) => "/api/v1/grasp/setup",
             Self::ToolCommissioning(_) => "/api/v1/tool/commissioning/confirm",
+        }
+    }
+
+    /// The configuration domain the write changes.
+    pub(super) fn domain(&self) -> ConfigDomain {
+        match self {
+            Self::Keepout(_) => ConfigDomain::Keepout,
+            Self::Collision(_) => ConfigDomain::Collision,
+            Self::GripperCalib(_) => ConfigDomain::GripperCalibration,
+            Self::PosesSave(_) | Self::PosesDelete(_) | Self::PosesRename(_) => ConfigDomain::Poses,
+            Self::Sequences(_) => ConfigDomain::Sequences,
+            Self::GraspSetup(_) => ConfigDomain::GraspSetup,
+            Self::ToolCommissioning(_) => ConfigDomain::ToolCommissioning,
+        }
+    }
+
+    /// The domain revision the candidate was built from.
+    pub(super) fn base_revision(&self) -> u64 {
+        match self {
+            Self::Keepout(p) => p.base_revision,
+            Self::Collision(p) => p.base_revision,
+            Self::GripperCalib(p) => p.base_revision,
+            Self::PosesSave(p) | Self::PosesRename(p) => p.base_revision,
+            Self::PosesDelete(p) => p.base_revision,
+            Self::Sequences(p) => p.base_revision,
+            Self::GraspSetup(p) => p.base_revision,
+            Self::ToolCommissioning(p) => p.base_revision,
         }
     }
 
@@ -128,7 +164,14 @@ impl PreparedConfigWrite {
         }
     }
 
+    /// Commits a write with nothing to persist: reserve, apply, activate (`Volatile`).
     pub(super) fn commit(self, inner: &mut SupervisorInner) -> Result<Vec<(&'static str, Value)>, ArmError> {
+        inner.commit_config(self.domain(), self.base_revision(), 0, |inner| self.apply(inner)).map(|(fields, _)| fields)
+    }
+
+    /// Applies the candidate (moves its domain to the next revision); called only under a
+    /// held reservation.
+    fn apply(self, inner: &mut SupervisorInner) -> Result<Vec<(&'static str, Value)>, ArmError> {
         match self {
             Self::Keepout(p) => {
                 let state = crate::keepout::commit_update(inner, p)?;
@@ -190,6 +233,145 @@ impl PreparedConfigWrite {
                     ("revision", json!(revision)),
                 ])
             }
+        }
+    }
+}
+
+/// The commit boundary of a staged write, under the supervisor write guard: `Ok` with the
+/// ack and the directory sync to run after the guard is released, `Err` with the reject.
+/// The staged file is renamed into place only after every check and the reservation passed.
+#[allow(clippy::too_many_arguments)]
+fn commit_staged(
+    inner: &mut SupervisorInner,
+    request_id: &Value,
+    mut prepared: PreparedConfigWrite,
+    staged: crate::persist::StagedWrite,
+    generation: u64,
+    epoch: u64,
+    ws_auth: &WsAuth,
+    conn: &str,
+    gen_now: &AtomicU64,
+) -> Result<(Value, crate::persist::PendingDirSync), Value> {
+    let reject = |staged: crate::persist::StagedWrite, reply: Value| {
+        staged.abort();
+        Err(reply)
+    };
+    if !ws_auth.is_operator() {
+        return reject(staged, command_reject(inner, request_id, ApiError::operator_required(prepared.path())));
+    }
+    if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(conn, generation) {
+        let reply = json!({
+            "type": "command_reject",
+            "request_id": request_id,
+            "status": 409,
+            "code": "LEASE_LOST",
+            "message": "This connection lost the lease while persisting configuration",
+            "error": "LEASE_LOST",
+            "epoch_id": inner.safety.epoch_id()
+        });
+        return reject(staged, reply);
+    }
+    if inner.safety.epoch_id() != epoch {
+        let reply = json!({
+            "type": "command_reject",
+            "request_id": request_id,
+            "status": 409,
+            "code": "EPOCH_MISMATCH",
+            "message": "Command epoch is no longer current",
+            "error": "EPOCH_MISMATCH",
+            "epoch_id": inner.safety.epoch_id()
+        });
+        return reject(staged, reply);
+    }
+    if let Some(err) = prepared.precheck(inner) {
+        return reject(staged, command_reject(inner, request_id, err.into()));
+    }
+    let reservation = match inner.reserve_config(prepared.domain(), prepared.base_revision(), generation) {
+        Ok(r) => r,
+        Err(err) => return reject(staged, command_reject(inner, request_id, err.into())),
+    };
+    let dir_sync = match staged.rename_only() {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = crate::rt_core::config_iface::ConfigAuthority::release(inner, reservation);
+            tracing::warn!("State file not published: {e}");
+            return Err(command_reject(inner, request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}"))));
+        }
+    };
+    // renamed; the directory sync runs after the guard (`durability_confirmed` in the ack)
+    let reservation = match inner.config_persisted(reservation, Durability::DurableUnconfirmed) {
+        Ok(r) => r,
+        Err(err) => return Err(command_reject(inner, request_id, err.into())),
+    };
+    match inner.activate_config_candidate(reservation, |inner| prepared.apply(inner)) {
+        Ok((fields, _)) => {
+            let mut ack = command_ack(inner, request_id, None);
+            for (key, field) in fields { ack[key] = field; }
+            ack["persisted"] = json!(true);
+            Ok((ack, dir_sync))
+        }
+        Err(err) => {
+            // The file is in place but the candidate is not active: the hold is Reconciling
+            // (motion inhibited, further changes CONFIG_BUSY) until the next start, whose
+            // loader activates the file.
+            tracing::error!("{} written but not activated: {err}", dir_sync.target().display());
+            Err(command_reject(inner, request_id, err.into()))
+        }
+    }
+}
+
+/// Atomic two-phase persist-before-commit of a staged config write (keepout, collision,
+/// gripper calibration, poses, sequences, grasp setup, tool commissioning). Stage runs off
+/// the supervisor lock; the commit boundary ([`commit_staged`]) under its write guard; the
+/// directory sync after it. Returns the reply to send.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn persist_and_activate(
+    sup: Arc<ArmSupervisor>,
+    request_id: Value,
+    mut prepared: PreparedConfigWrite,
+    generation: u64,
+    epoch: u64,
+    ws_auth: WsAuth,
+    conn: String,
+    gen_now: Arc<AtomicU64>,
+) -> Value {
+    let cw_lock = sup.config_write_lock();
+    let _cw = cw_lock.lock().await;
+    let write = prepared.take_write().expect("checked has_write");
+    let staged_res = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(write.path, write.text)).await;
+    let staged = match staged_res {
+        Err(e) => {
+            tracing::warn!("State file stage task failed: {e}");
+            let inner = sup.inner().read().await;
+            return command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")));
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("State file not staged: {e}");
+            let inner = sup.inner().read().await;
+            return command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")));
+        }
+        Ok(Ok(staged)) => staged,
+    };
+    let committed = {
+        let mut inner = sup.inner().write().await;
+        commit_staged(&mut inner, &request_id, prepared, staged, generation, epoch, &ws_auth, &conn, &gen_now)
+    };
+    match committed {
+        Err(reply) => reply,
+        Ok((mut ack, dir_sync)) => {
+            let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+                .await
+                .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+            match outcome {
+                crate::persist::PublishOutcome::Published => {
+                    ack["durability_confirmed"] = json!(true);
+                }
+                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(warn_msg) => {
+                    ack["durability_confirmed"] = json!(false);
+                    ack["durability_warning"] = json!(warn_msg);
+                }
+            }
+            ack
         }
     }
 }

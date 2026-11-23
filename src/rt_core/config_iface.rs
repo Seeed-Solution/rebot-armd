@@ -31,9 +31,8 @@
 //!
 //! # Production today
 //!
-//! [`super::ops`] implements [`ConfigAuthority`] for the supervisor. The foundation adapter
-//! refuses `activate` with `NOT_WIRED`; track B replaces that body with the existing commit
-//! path. Track C reads the hold at admission and commit through
+//! [`super::ops`] implements [`ConfigAuthority`] for the supervisor: `activate` confirms the
+//! candidate the existing commit path applied (`NOT_APPLIED` when none was). Track C reads the hold at admission and commit through
 //! `ArmCore::motion_inhibited_by_config` (also in `PlanningSnapshot::config_inhibited`).
 
 use super::broker::{Authority, Stamp};

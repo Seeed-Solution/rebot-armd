@@ -26,6 +26,10 @@ mod motion;
 mod streams;
 mod actions;
 
+/// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
+/// and the policy runner submit through it once they route through the mailbox.
+pub use streams::targets;
+
 #[derive(Debug, Error)]
 pub enum ArmError {
     #[error("Safety error: {0}")]
@@ -276,6 +280,8 @@ pub struct SupervisorInner {
     pub commanded_accelerations: Vec<f32>,
     pub following_error_since: Option<Instant>,
     pub disable_pending: bool,
+    /// The torque transition the RT started and serves from `poll_hardware` (None: none).
+    pub(crate) torque_transition: Option<driver_transitions::TorqueTransition>,
     pub last_disable_attempt: Option<Instant>,
     pub output_suspended: bool,
     pub feedback_numeric_valid: bool,
@@ -291,6 +297,9 @@ pub struct SupervisorInner {
     pub temperatures: Vec<f32>,
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
+    /// The buffer `servo_target` reuses while it is None (`release_servo_target`), so a
+    /// stop and the next target neither free nor allocate it.
+    pub(crate) servo_target_spare: Vec<f32>,
     /// True while a servo/policy stream owns output, including its braking tail after
     /// `servo_target` is cleared by stop, timeout, or dirty-jump discard.
     pub servo_stream_active: bool,
@@ -390,6 +399,10 @@ pub struct SupervisorInner {
     /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
     /// profile's camera mount.
     pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// SHA-256 of `calibration` (`active_calibration_digest`), recomputed by `set_calibration`
+    /// so a live policy step compares it without serializing and hashing.
+    #[cfg(feature = "policy-runtime")]
+    pub(crate) calibration_digest: String,
     /// Why the last arm refused MIT tracking (`src/mit.rs` qualification gate); None = passed or
     /// MIT not requested.
     pub mit_gate_error: Option<String>,
@@ -640,6 +653,7 @@ impl SupervisorInner {
             commanded_accelerations: vec![0.0; dof],
             following_error_since: None,
             disable_pending: false,
+            torque_transition: None,
             last_disable_attempt: None,
             output_suspended: false,
             feedback_numeric_valid: true,
@@ -655,6 +669,7 @@ impl SupervisorInner {
             temperatures: vec![25.0; dof],
             target_positions,
             servo_target: None,
+            servo_target_spare: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF.max(dof)),
             servo_stream_active: false,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
@@ -712,6 +727,8 @@ impl SupervisorInner {
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
+            #[cfg(feature = "policy-runtime")]
+            calibration_digest: crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             mit_gate_error: None,
             mit: Default::default(),
             profile_floor_z_m,
@@ -2398,7 +2415,11 @@ impl SupervisorInner {
                         self.pending_normal_unload = false;
                         self.unload_settle = None;
                         self.active_trajectory = None;
-                        self.servo_target = None; self.servo_settled_ticks.fill(0);
+                        // release_servo_target inline (the driver guard borrows self)
+                        if let Some(v) = self.servo_target.take() {
+                            if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
+                        }
+                        self.servo_settled_ticks.fill(0);
                         self.servo_ws_min_depths = None;
                         self.tracking.invalidate();
                         self.target_positions = hold_pos.clone();
@@ -2458,7 +2479,8 @@ impl SupervisorInner {
                 && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
                 self.apply_stop_policy(StopPolicy::ThermalTrip);
             }
-        if self.disable_pending {
+        // (a torque transition in flight confirms its own disable: `service_torque_transition`)
+        if self.disable_pending && self.torque_transition.is_none() {
             let confirmed = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv|
                 drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
             if confirmed {
@@ -2675,7 +2697,7 @@ impl SupervisorInner {
             // Check continuous motion frame timeout:
             // If > 200ms without a new pose frame, clear servo_target to begin controlled smooth deceleration
             if self.last_motion_frame.elapsed() > self.motion_frame_timeout {
-                self.servo_target = None;
+                self.release_servo_target();
                 self.servo_settled_ticks.fill(0);
                 self.fail_live_policy_from_control("TARGET_TIMEOUT",
                     format!("No policy target for {} ms; the control loop dropped the target", self.motion_frame_timeout.as_millis()));
@@ -2700,7 +2722,7 @@ impl SupervisorInner {
                     tracing::warn!(
                         "Discarding dirty servo target frame: instantaneous jump exceeds 0.35 rad relative to commanded_positions"
                     );
-                    self.servo_target = None;
+                    self.release_servo_target();
                     self.servo_settled_ticks.fill(0);
                     self.fail_live_policy_from_control("SERVO_TARGET_DISCARDED",
                         "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
@@ -2838,7 +2860,7 @@ impl SupervisorInner {
 
                         // If all axes have servo_settled_ticks[i] >= 2, mark motion finished
                         if self.servo_settled_ticks.iter().all(|&ticks| ticks >= 2) {
-                            self.servo_target = None;
+                            self.release_servo_target();
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                                 self.servo_ws_min_depths = None;
@@ -2991,7 +3013,9 @@ impl SupervisorInner {
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
         let mut tick_output_accepted = false;
-        if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
+        // a torque transition in flight owns the bus until it ends (the driver refuses targets)
+        let transition_owns_bus = self.torque_transition.is_some();
+        if self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
@@ -3007,7 +3031,7 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if self.is_torqued && !self.disable_pending {
+        } else if self.is_torqued && !self.disable_pending && !transition_owns_bus {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
@@ -3157,7 +3181,7 @@ impl SupervisorInner {
                                 crate::tracking::TrackingReject::Workspace(ws_err) => {
                                     tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
                                     self.hold_measured_pose();
-                                    self.macro_run = None;
+                                    self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
                                     self.safety.trigger_fault_coded(
                                         FaultCode::Other,
                                         FaultReason::Other(format!("Joint tracking output rejected: {ws_err}")),
@@ -3166,7 +3190,7 @@ impl SupervisorInner {
                                 crate::tracking::TrackingReject::JointLimit(msg) => {
                                     tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
                                     self.hold_measured_pose();
-                                    self.macro_run = None;
+                                    self.drop_macro_run("failed", Some("JOINT_LIMIT"));
                                     self.safety.trigger_fault_coded(
                                         FaultCode::JointLimit,
                                         FaultReason::Other(format!("Joint tracking output rejected: {msg}")),

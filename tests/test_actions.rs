@@ -211,6 +211,31 @@ fn busy_and_stale_preconditions() {
     assert!(matches!(inner.plan_input(), Err(ArmError::Motion(MotionError::Unsupported(_)))));
 }
 
+/// The start of a prepared path is stale from a 1e-4 rad change of any commanded joint,
+/// the gripper included; the refused install leaves no motion.
+#[test]
+fn a_gripper_change_of_1e4_rad_makes_a_prepared_path_stale() {
+    let p0 = tcp(&INSPECT).p;
+    let goal = GoalSpec::Absolute { p: [p0[0] + 0.02, p0[1], p0[2]], r: None };
+    let gripper = ArmConfig::rebot_dm().gripper_index().unwrap();
+    for (dq, stale) in [(1e-4f32, true), (5e-5, false)] {
+        let mut inner = sim_at(&INSPECT);
+        let input = inner.plan_input().unwrap();
+        let path = plan_cartesian(&input, resolve_goal(&input, &goal), Speed::default()).unwrap();
+        inner.commanded_positions[gripper] += dq;
+        let r = inner.install_path(&input, path, "move_to", None);
+        if stale {
+            assert!(matches!(r, Err(ArmError::Motion(MotionError::PlanStale(_)))), "{r:?}");
+            assert!(inner.active_trajectory.is_none());
+        } else {
+            assert!(r.is_ok() && inner.active_trajectory.is_some(), "{r:?}");
+        }
+    }
+    assert!(motion::plan_start_moved(&[0.0, 0.0], &[0.0], 1, -1e-4));
+    assert!(!motion::plan_start_moved(&[0.0, 0.0], &[5e-5], 1, 0.0));
+    assert!(motion::plan_start_moved(&[0.0], &[0.0, 0.0], 5, 0.0), "a missing commanded joint counts as moved");
+}
+
 #[test]
 fn joint_move_home_and_park_create_action_records() {
     let mut inner = sim_at(&INSPECT);

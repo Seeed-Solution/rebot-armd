@@ -176,6 +176,8 @@ impl SupervisorInner {
     /// and recompute the effective floor.
     pub fn set_calibration(&mut self, c: Option<crate::calibration::CalibrationFile>) {
         self.calibration = c;
+        #[cfg(feature = "policy-runtime")]
+        { self.calibration_digest = Self::calibration_digest_of(self.calibration.as_ref()); }
         self.refresh_effective_floor();
     }
 
@@ -419,13 +421,165 @@ impl SupervisorInner {
     /// Deterministic SHA-256 digest of the active camera calibration state, or
     /// `EMPTY_CALIBRATION_DIGEST` when uncalibrated.
     #[cfg(feature = "policy-runtime")]
-    pub fn active_calibration_digest(&self) -> String {
-        match &self.calibration {
+    pub fn active_calibration_digest(&self) -> String { self.calibration_digest.clone() }
+
+    /// [`Self::active_calibration_digest`] without a copy (live policy steps).
+    #[cfg(feature = "policy-runtime")]
+    pub fn active_calibration_digest_str(&self) -> &str { &self.calibration_digest }
+
+    #[cfg(feature = "policy-runtime")]
+    fn calibration_digest_of(c: Option<&crate::calibration::CalibrationFile>) -> String {
+        match c {
             None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
             Some(cal) => {
                 let bytes = serde_json::to_vec(cal).unwrap_or_default();
                 crate::gravity::compute_sha256(&bytes)
             }
         }
+    }
+}
+
+/// Candidate ids of configuration changes (increasing within a process run).
+static NEXT_CONFIG_CANDIDATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long a configuration proposal stamped at a safe point stays valid. Reservation and
+/// activation happen under the same supervisor write guard today, so it only bounds a
+/// proposal that is not reserved at once.
+pub const CONFIG_PROPOSAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Boot identity used by the legacy commit boundary for stamps and commit contexts (the
+/// supervisor has no boot id; proposals never leave this process run).
+const LEGACY_BOOT: crate::rt_core::broker::BootId = crate::rt_core::broker::BootId(0);
+
+/// Versioned configuration at the existing commit boundary (track B, [`crate::rt_core::config_iface`]).
+///
+/// The worker holds the candidate payload (keyed by the reservation's `CandidateId`) and the
+/// [`Reservation`](crate::rt_core::config_iface::Reservation) token; it passes the token by
+/// value to exactly one of activate or release.
+impl SupervisorInner {
+    /// The commit context of the legacy boundary at `now` (no urgent-stop generation is
+    /// owned by the supervisor yet: 0).
+    pub fn config_ctx(&self, now: Instant) -> crate::rt_core::ops::CommitCtx {
+        crate::rt_core::ops::CommitCtx { arm: self.core.id(), boot: LEGACY_BOOT, now, stop_generation: 0 }
+    }
+
+    /// A proposal for `domain` built from `expected_revision`, stamped at `ctx` with the
+    /// current epoch and `lease_generation` (0: the change needs no lease, e.g. REST
+    /// commissioning), valid for [`CONFIG_PROPOSAL_BUDGET`] on the same monotonic clock.
+    pub fn config_proposal(&self, domain: crate::rt_core::config_iface::ConfigDomain, expected_revision: u64, lease_generation: u64, ctx: &crate::rt_core::ops::CommitCtx) -> crate::rt_core::config_iface::ConfigProposal {
+        use crate::rt_core::broker::{Authority, ClientId, RequestId, Stamp};
+        let candidate = NEXT_CONFIG_CANDIDATE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let authority = Authority { lease_generation, epoch: self.safety.epoch_id(), stop_generation: ctx.stop_generation, config_revision: self.workspace_revision, ..Authority::default() };
+        crate::rt_core::config_iface::ConfigProposal {
+            domain,
+            expected_revision,
+            candidate: crate::rt_core::config_iface::CandidateId(candidate),
+            stamp: Stamp {
+                arm: ctx.arm,
+                boot: ctx.boot,
+                request: RequestId(candidate),
+                client: ClientId(0),
+                client_seq: candidate,
+                authority,
+                deadline: ctx.now + CONFIG_PROPOSAL_BUDGET,
+            },
+        }
+    }
+
+    /// Reserves `domain` at `expected_revision` now ([`crate::rt_core::config_iface::ConfigAuthority::reserve`]),
+    /// with the refusal as the error the existing commit path reports
+    /// (`REVISION_MISMATCH` -> `POLICY_REVISION_MISMATCH`, others 409 with the code).
+    pub fn reserve_config(&mut self, domain: crate::rt_core::config_iface::ConfigDomain, expected_revision: u64, lease_generation: u64) -> Result<crate::rt_core::config_iface::Reservation, ArmError> {
+        use crate::rt_core::config_iface::{ConfigAuthority, Reserved};
+        let ctx = self.config_ctx(Instant::now());
+        let proposal = self.config_proposal(domain, expected_revision, lease_generation, &ctx);
+        match ConfigAuthority::reserve(self, &proposal, &ctx) {
+            Reserved::Granted(r) => Ok(r),
+            Reserved::Refused { code: "REVISION_MISMATCH", current } => Err(ArmError::PolicyRevisionMismatch { expected: expected_revision, current }),
+            Reserved::Refused { code, .. } => Err(config_refusal(code)),
+        }
+    }
+
+    /// Reports the reservation's candidate renamed into place
+    /// ([`crate::rt_core::config_iface::ConfigAuthority::persisted`]). On refusal the
+    /// reservation is released and the error returned.
+    pub fn config_persisted(&mut self, r: crate::rt_core::config_iface::Reservation, durability: crate::rt_core::config_iface::Durability) -> Result<crate::rt_core::config_iface::Reservation, ArmError> {
+        use crate::rt_core::config_iface::ConfigAuthority;
+        match ConfigAuthority::persisted(self, &r, durability) {
+            Ok(()) => Ok(r),
+            Err(code) => {
+                let domain = r.domain();
+                let _ = ConfigAuthority::release(self, r);
+                Err(ArmError::Internal(format!("{domain:?} configuration persisted outside its reservation: {code}")))
+            }
+        }
+    }
+
+    /// Applies the candidate of the held reservation `r` with `apply` and activates it
+    /// ([`crate::rt_core::config_iface::ConfigAuthority::activate`]): the domain moves from
+    /// `r.from()` to `r.from() + 1` and the hold ends. When `apply` fails the reservation is
+    /// released: the hold ends before persistence and becomes `Reconciling` after it (the
+    /// file on disk is not the active state; motion stays inhibited until a restart loads it).
+    pub fn activate_config_candidate<T>(
+        &mut self,
+        r: crate::rt_core::config_iface::Reservation,
+        apply: impl FnOnce(&mut Self) -> Result<T, ArmError>,
+    ) -> Result<(T, u64), ArmError> {
+        use crate::rt_core::config_iface::{Activated, ConfigAuthority};
+        let (domain, from) = (r.domain(), r.from());
+        if self.core.config_held(domain).is_none_or(|h| h.grant != Some(r.grant())) {
+            let _ = ConfigAuthority::release(self, r);
+            return Err(ArmError::Internal(format!("{domain:?} configuration activated without its reservation")));
+        }
+        let value = match apply(self) {
+            Ok(v) => v,
+            Err(e) => {
+                if ConfigAuthority::revision(self, domain) == from {
+                    let _ = ConfigAuthority::release(self, r);
+                } else {
+                    // partly applied: activation ends the hold (or reconciles) at the revision reached
+                    if let Activated::Refused { reservation, .. } = ConfigAuthority::activate(self, r) { let _ = ConfigAuthority::release(self, reservation); }
+                }
+                return Err(e);
+            }
+        };
+        match ConfigAuthority::activate(self, r) {
+            Activated::Active { revision, .. } => Ok((value, revision)),
+            Activated::Refused { code, reservation } => {
+                let _ = ConfigAuthority::release(self, reservation);
+                Err(ArmError::Internal(format!("{domain:?} configuration not activated: {code}")))
+            }
+            Activated::Reconciling { code } => {
+                tracing::error!("{domain:?} configuration persisted but not activated ({code}); reconciling");
+                Err(ArmError::Internal(format!("{domain:?} configuration persisted but not activated: {code}")))
+            }
+        }
+    }
+
+    /// Reserves `domain` at `expected_revision`, applies the candidate and activates it in
+    /// one step (a change with nothing to persist: `Volatile`).
+    pub fn commit_config<T>(
+        &mut self,
+        domain: crate::rt_core::config_iface::ConfigDomain,
+        expected_revision: u64,
+        lease_generation: u64,
+        apply: impl FnOnce(&mut Self) -> Result<T, ArmError>,
+    ) -> Result<(T, u64), ArmError> {
+        let r = self.reserve_config(domain, expected_revision, lease_generation)?;
+        self.activate_config_candidate(r, apply)
+    }
+}
+
+/// A reservation refusal as the 409 the commit path reports.
+fn config_refusal(code: &'static str) -> ArmError {
+    ArmError::Rejected {
+        status: 409,
+        code: code.into(),
+        message: match code {
+            "CONFIG_BUSY" => "another configuration change is being activated or reconciled".into(),
+            "EPOCH_MISMATCH" => "Command epoch is no longer current".into(),
+            "LEASE_LOST" => "This connection lost the lease while persisting configuration".into(),
+            _ => format!("configuration change refused: {code}"),
+        },
     }
 }

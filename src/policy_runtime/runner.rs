@@ -1,6 +1,7 @@
 //! Async policy runner, prepared policy pipeline, and supervisor `PolicyRun` state.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,12 +99,43 @@ pub struct PolicyRun {
     pub max_input_age_ms: u64,
     /// Per-step timing behind `ActionStatus::policy_stats`.
     pub step_stats: PolicyStepStats,
+    /// Output authorization of targets waiting in the latest-target mailbox (see
+    /// [`PolicyAuthorization`]); a hold or a vision invalidation revokes it.
+    pub authorization: PolicyAuthorization,
+    /// Largest camera-sample age a target may have when the RT consumes it (None: no vision),
+    /// and whether an older one holds the run (`on_stale: hold`) instead of ending it.
+    pub max_vision_age_ms: Option<u64>,
+    pub vision_stale_hold: bool,
+}
+
+/// Output authorization generation of one policy run, shared between the run's state in the
+/// core, the runner and the vision hub. A target is stamped with [`Self::current`] when its
+/// inputs are sampled ([`crate::rt_core::mailbox::TargetFrame::policy_generation`]); the RT
+/// applies it only while the generation is unchanged. [`Self::revoke`] (a vision hold, a
+/// vision invalidation, a model or clock-handshake change) refuses every target stamped
+/// before it. Never 0 (0 marks a frame that is not a policy frame). Lock-free: the RT only
+/// loads it.
+#[derive(Debug, Clone)]
+pub struct PolicyAuthorization(Arc<AtomicU64>);
+
+impl Default for PolicyAuthorization {
+    fn default() -> Self { Self(Arc::new(AtomicU64::new(1))) }
+}
+
+impl PolicyAuthorization {
+    pub fn current(&self) -> u64 { self.0.load(Ordering::Acquire) }
+
+    /// Revokes every target stamped so far; returns the new generation.
+    pub fn revoke(&self) -> u64 {
+        let next = self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        if next == 0 { self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1) } else { next }
+    }
 }
 
 impl PolicyRun {
     /// [`Self::to_observation`] into `out`, reusing its memory.
     pub fn to_observation_into(&self, active: bool, out: &mut PolicyObservation) {
-        use crate::rt_core::scratch::{set_opt, set_opt_str, set_str};
+        use crate::rt_core::scratch::{set_opt, set_str};
         out.active = active;
         out.action_id = self.action_id;
         set_str(&mut out.policy_id, &self.policy_id);
@@ -115,7 +147,7 @@ impl PolicyRun {
         out.last_vision_age_ms = self.last_vision_age_ms;
         out.vision_frame_id = self.vision_frame_id;
         set_opt(&mut out.last_shadow_target, self.last_shadow_target.as_ref());
-        set_opt_str(&mut out.stop_reason, self.stop_reason.as_deref());
+        out.stop_reason = self.stop_reason.as_deref().map(crate::model::HolderLabel::new);
     }
 
     pub fn to_observation(&self, active: bool) -> PolicyObservation {
@@ -131,7 +163,7 @@ impl PolicyRun {
             last_vision_age_ms: self.last_vision_age_ms,
             vision_frame_id: self.vision_frame_id,
             last_shadow_target: self.last_shadow_target.clone(),
-            stop_reason: self.stop_reason.clone(),
+            stop_reason: self.stop_reason.as_deref().map(crate::model::HolderLabel::new),
         }
     }
 }
@@ -1048,12 +1080,20 @@ pub fn spawn_policy_runner(
             }
             inner.set_policy_max_input_age(action_id, max_policy_input_age_ms(clamped_fps));
             inner.set_policy_period_us(action_id, period_us_for_fps(clamped_fps));
+            let (max_vision_age_ms, hold_on_stale) = match (&video_embedding_spec, &vision_spec) {
+                (Some(emb), _) => (Some(emb.effective_staleness_ms_for_fps(clamped_fps)), emb.on_stale == VisionStalePolicy::Hold),
+                (None, Some(spec)) => (Some(spec.max_staleness_ms), spec.on_stale == VisionStalePolicy::Hold),
+                (None, None) => (None, false),
+            };
+            inner.set_policy_max_vision_age(action_id, max_vision_age_ms, hold_on_stale);
+            let authorization = inner.policy_run.as_ref().map(|r| r.authorization.clone());
 
             embedding_hub
                 .as_ref()
                 .zip(video_embedding_spec.as_ref())
                 .map(|(hub, spec)| {
                     hub.bind_policy(action_id, spec.clone(), clamped_fps);
+                    if let Some(a) = authorization { hub.bind_target_authorization(action_id, a); }
                     UnbindGuard {
                         hub: hub.clone(),
                         action_id,

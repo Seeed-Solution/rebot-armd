@@ -596,7 +596,7 @@ impl SupervisorInner {
         obs.tau_ff.clear();
         match &self.gravity_comp {
             Some(run) => {
-                crate::rt_core::scratch::set_opt_str(&mut obs.phase, Some(run.phase.name()));
+                obs.phase = Some(crate::model::HolderLabel::new(run.phase.name()));
                 obs.ramp = run.ramp();
                 obs.scale = run.scale;
                 obs.damping_kd.clear();

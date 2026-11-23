@@ -10,7 +10,7 @@ use armd::rt_core::broker::{
 };
 use armd::rt_core::ids::ArmId;
 use armd::rt_core::mailbox::{StreamId, Submitted, TargetAuthority, TargetFrame, TargetWriter, MAX_DOF};
-use armd::rt_core::ops::{Checkpoint, CoreOps, Primitive, ReleaseFixture, StubCore};
+use armd::rt_core::ops::{Checkpoint, CoreOps, PlanSlot, Primitive, ReleaseFixture, StubCore};
 use armd::rt_core::urgent::StopRequests;
 use armd::{ArmConfig, SupervisorInner};
 
@@ -24,7 +24,7 @@ fn supervisor() -> SupervisorInner {
     inner
 }
 
-type Fx = (ReleaseFixture<SupervisorInner>, Broker<Primitive>, TargetWriter, StopRequests);
+type Fx = (ReleaseFixture<SupervisorInner>, Broker<PlanSlot>, TargetWriter, StopRequests);
 
 fn fixture(caps: Capacities) -> Fx { ReleaseFixture::new(supervisor(), BOOT, caps) }
 
@@ -39,11 +39,11 @@ fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Pr
     Primitive::joint_quintic(&start, &q, duration_s).unwrap()
 }
 
-fn submit_install(b: &mut Broker<Primitive>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
-    b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut Primitive| *slot = p))
+fn submit_install(b: &mut Broker<PlanSlot>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
+    b.submit(ClientId(1), seq, a, deadline, Submit::Install(&move |slot: &mut PlanSlot| slot.set(p)))
 }
 
-fn replies(b: &mut Broker<Primitive>) -> Vec<Reply> {
+fn replies(b: &mut Broker<PlanSlot>) -> Vec<Reply> {
     let mut v = Vec::new();
     b.poll(|_, r| { v.push(r); true });
     v
@@ -218,7 +218,7 @@ fn targets_are_rechecked_at_consumption() {
 fn a_stub_core_never_acknowledges_success() {
     let (mut fx, mut b, mut tw, _stop) = ReleaseFixture::new(StubCore::default(), BOOT, Capacities { commands: 4, plans: 2, replies: 8 });
     let a = Authority::default();
-    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap())).unwrap();
+    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut PlanSlot| p.set(Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap()))).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
     tw.submit(TargetFrame { arm: ArmId::LOCAL, boot: BOOT, stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, vision_frame_id: None, deadline: later(), dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
@@ -462,10 +462,18 @@ fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_end
     assert!(fx.core.planning_snapshot(&ctx).config_inhibited);
     submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("CONFIG_BUSY"));
-    // the foundation adapter does not activate: the reservation comes back and is released
-    let Activated::Refused { code: "NOT_WIRED", reservation } = fx.core.activate(r) else { panic!() };
+    // the legacy admission paths refuse it too: a jog (quintic) and a Cartesian plan input
+    let code = |e: armd::ArmError| armd::api::rest::ApiError::from(e).code;
+    let mut q = fx.core.commanded_positions.clone();
+    q[0] += 0.05;
+    assert_eq!(fx.core.jog_action(q.clone(), Some(0.5), None, "jog").map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert_eq!(fx.core.plan_input_tcp().map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert!(fx.core.active_trajectory.is_none());
+    // nothing was applied for this candidate: activation hands the reservation back, released
+    let Activated::Refused { code: "NOT_APPLIED", reservation } = fx.core.activate(r) else { panic!() };
     assert_eq!(fx.core.release(reservation), Released::Cleared);
     assert!(!fx.core.core.motion_inhibited_by_config());
+    assert!(fx.core.plan_input_tcp().is_ok());
     submit_install(&mut b, 2, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
@@ -503,9 +511,9 @@ fn macro_children_name_their_parent_and_a_macro_terminal_carries_its_child_count
     // a ticket for another parent than the stamp's
     submit_install(&mut b, 2, a, later(), grip(parent.0 + 1)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
-    // well-formed, not wired in the foundation adapter
+    // well-formed, but the parent is a plain joint move, not a macro
     submit_install(&mut b, 3, a, later(), grip(parent.0)).unwrap();
-    assert_eq!(fx.step().command.unwrap().1, Err("UNSUPPORTED"));
+    assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
     assert_eq!(fx.active(), Some(parent));
     // the macro's terminal record (outcome and children) outlives its action record
     fx.core.core.record_macro_terminal(MacroTerminal { action: parent, children: 3, outcome: Outcome::Failed("NOT_HOLDING") });
@@ -537,4 +545,271 @@ fn a_buffered_frame_is_refused_once_its_lease_was_released_and_the_stream_hears_
     let mut got = Vec::new();
     tw.outcomes(|o| got.push(o));
     assert_eq!(got, vec![TargetOutcome { stream: StreamId(1), seq: 1, result: Err(rep.target_refusal.unwrap()) }]);
+}
+
+// ---------------------------------------------------------------------------------------
+// Track C: commit rechecks, stop and leases
+
+use armd::model::{JointLimit, RestingPosePolicy};
+
+const PARK_LEASE_MS: u64 = 1_000;
+
+/// A 2-joint mock arm with a resting pose, torqued, `client-a` holding a lease.
+fn parking_arm() -> (Fx, u64) {
+    let mut config = ArmConfig::default();
+    config.dof = 2;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0), JointLimit::new("j2", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0, 0.0];
+    config.lease_timeout_ms = PARK_LEASE_MS;
+    config.resting_pose = Some(RestingPosePolicy { positions: None, position_tolerances: vec![0.08; 2], max_total_deviation: 0.16,
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100 });
+    let mut inner = SupervisorInner::new(config);
+    inner.tick(0.02);
+    inner.set_torque(true).expect("arm");
+    let generation = inner.acquire_lease("client-a").expect("lease");
+    (ReleaseFixture::new(inner, BOOT, Capacities { commands: 4, plans: 2, replies: 8 }), generation)
+}
+
+/// The holder's heartbeat at the fixture's (virtual) now; the legacy watchdog reads wall time.
+fn renew(fx: &mut ReleaseFixture<SupervisorInner>) {
+    let now = fx.now().max(Instant::now());
+    fx.core.active_lease.as_mut().expect("lease").acquired_at = now;
+    fx.core.last_heartbeat = Instant::now();
+}
+
+/// The lease expired and the watchdog's heartbeat window passed (no sleeping).
+fn expire(fx: &mut ReleaseFixture<SupervisorInner>) {
+    let past = Duration::from_millis(PARK_LEASE_MS + 50);
+    fx.core.active_lease.as_mut().expect("lease").acquired_at = Instant::now().min(fx.now()) - past;
+    fx.core.last_heartbeat = Instant::now() - past;
+}
+
+fn to(fx: &ReleaseFixture<SupervisorInner>, q: [f32; 2], duration_s: f64) -> Primitive {
+    Primitive::joint_quintic(&fx.core.commanded_positions.clone(), &q, duration_s).unwrap()
+}
+
+/// Runs the active action to its end, renewing the lease.
+fn run_out(fx: &mut ReleaseFixture<SupervisorInner>) {
+    for _ in 0..300 { renew(fx); if fx.step().ended.is_some() { return; } }
+    panic!("the action did not end");
+}
+
+#[test]
+fn a_lease_expiring_before_the_commit_leaves_the_watchdog_park_as_the_active_trajectory() {
+    let ((mut fx, mut b, _tw, _stop), generation) = parking_arm();
+    renew(&mut fx);
+    let a = auth(&fx);
+    assert_eq!(a.lease_generation, generation);
+    let r1 = submit_install(&mut b, 1, a, later(), to(&fx, [0.6, 0.3], 0.2)).unwrap();
+    run_out(&mut fx);
+    assert!(fx.core.active_trajectory.is_none());
+    // queued under the lease, committed after it expired: refused, then the watchdog parks
+    let r2 = submit_install(&mut b, 2, a, later(), to(&fx, [-0.4, 0.0], 0.5)).unwrap();
+    expire(&mut fx);
+    let rep = fx.step();
+    assert_eq!(rep.command, Some((r2, Err("LEASE_LOST"))));
+    assert!(fx.core.pending_normal_unload && fx.core.watchdog_park.is_some(), "watchdog park");
+    assert_eq!((fx.core.target_positions.clone(), fx.active()), (vec![0.0, 0.0], None), "the park, not the install");
+    let got = replies(&mut b);
+    assert!(matches!(got[0], Reply::Ack { request, .. } if request == r1), "{got:?}");
+    assert_eq!(got.last(), Some(&Reply::Refused { request: r2, code: "LEASE_LOST" }));
+    assert_eq!((b.reserved(), b.outstanding(), b.stats().retired), (0, 0, 2));
+}
+
+#[test]
+fn a_stop_during_the_watchdog_park_keeps_the_park_until_it_parks() {
+    let ((mut fx, mut b, _tw, _stop), _) = parking_arm();
+    renew(&mut fx);
+    submit_install(&mut b, 1, auth(&fx), later(), to(&fx, [0.6, 0.3], 0.2)).unwrap();
+    run_out(&mut fx);
+    // a stop of client motion ends it
+    renew(&mut fx);
+    submit_install(&mut b, 2, auth(&fx), later(), to(&fx, [0.2, 0.3], 1.0)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert!(fx.core.authorized_stop(), "client motion stops");
+    assert!(fx.core.active_trajectory.is_none());
+    // the lease expires: the watchdog parks; a stop (the expired owner's) keeps the park
+    expire(&mut fx);
+    fx.step();
+    assert!(fx.core.pending_normal_unload && fx.core.watchdog_park.is_some());
+    assert!(!fx.core.authorized_stop(), "the park is not the client's motion");
+    assert!(fx.core.pending_normal_unload && fx.core.active_trajectory.is_some());
+    for _ in 0..300 { fx.step(); if !fx.core.is_torqued { break; } }
+    assert_eq!(*fx.core.safety.state(), armd::SafetyState::Idle, "parked, no watchdog fault");
+    assert!(!fx.core.is_torqued && fx.core.watchdog_park.is_none());
+    assert!(fx.core.commanded_positions.iter().all(|q| q.abs() < 1e-3), "{:?}", fx.core.commanded_positions);
+}
+
+#[test]
+fn an_urgent_stop_through_the_release_keeps_the_watchdog_park() {
+    let ((mut fx, mut b, _tw, stop), _) = parking_arm();
+    renew(&mut fx);
+    submit_install(&mut b, 1, auth(&fx), later(), to(&fx, [0.6, 0.3], 0.2)).unwrap();
+    run_out(&mut fx);
+    expire(&mut fx);
+    fx.step();
+    assert!(fx.core.pending_normal_unload && fx.core.watchdog_park.is_some(), "watchdog park");
+    // CoreOps::apply_stop at the start of the release: the park is not the client's motion
+    stop.request();
+    assert!(fx.step().stopped);
+    assert!(fx.core.pending_normal_unload && fx.core.active_trajectory.is_some(), "the park continues");
+    for _ in 0..300 { fx.step(); if !fx.core.is_torqued { break; } }
+    assert_eq!(*fx.core.safety.state(), armd::SafetyState::Idle, "parked, no watchdog fault");
+    assert!(!fx.core.is_torqued && fx.core.watchdog_park.is_none());
+}
+
+#[test]
+fn saturated_ingress_then_stop_refuses_every_older_command_and_a_fresh_install_commits() {
+    let (mut fx, mut b, _tw, stop) = fixture(Capacities { commands: 3, plans: 3, replies: 12 });
+    let a = auth(&fx);
+    let r1 = submit_install(&mut b, 1, a, later(), quintic(&fx, 0.2, 2.0)).unwrap();
+    fx.step();
+    let action = fx.active().unwrap();
+    let r2 = submit_install(&mut b, 2, a, later(), quintic(&fx, -0.2, 2.0)).unwrap();
+    let r3 = submit_install(&mut b, 3, a, later(), quintic(&fx, 0.1, 2.0)).unwrap();
+    let r4 = b.submit(ClientId(1), 4, a, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+    assert_eq!(submit_install(&mut b, 5, a, later(), quintic(&fx, 0.3, 2.0)), Err(AdmitError::CommandsFull));
+    stop.request();
+    let rep = fx.step();
+    assert!(rep.stopped);
+    assert_eq!((rep.command, rep.ended), (Some((r2, Err("STOPPED"))), Some((action, Outcome::Stopped))));
+    for r in [r3, r4] {
+        assert_eq!(fx.step().command, Some((r, Err("STOPPED"))));
+        assert!(fx.core.active_trajectory.is_none(), "nothing older than the stop runs");
+    }
+    // a command admitted after the stop commits
+    let r6 = submit_install(&mut b, 6, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
+    let rep = fx.step();
+    assert!(matches!(rep.command, Some((r, Ok(2))) if r == r6), "{rep:?}");
+    assert!(fx.core.active_trajectory.is_some());
+    let got = replies(&mut b);
+    assert_eq!(got[0], Reply::Ack { request: r1, commit_seq: 1, action: Some(action) });
+    assert_eq!(&got[1..], &[
+        Reply::Refused { request: r2, code: "STOPPED" },
+        Reply::Terminal { request: r1, action, outcome: Outcome::Stopped, children: 0 },
+        Reply::Refused { request: r3, code: "STOPPED" },
+        Reply::Refused { request: r4, code: "STOPPED" },
+        Reply::Ack { request: r6, commit_seq: 2, action: fx.active() },
+    ]);
+    assert_eq!((b.stats().retired, b.reserved()), (3, 1), "r6's terminal stays reserved");
+}
+
+#[test]
+fn a_motion_between_prepare_and_install_refuses_the_install_and_keeps_the_running_trajectory() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 8 });
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
+    let a = snap.authority;
+    let r1 = submit_install(&mut b, 1, a, later(), quintic(&fx, 0.2, 1.0)).unwrap();
+    fx.step();
+    let first = fx.active().unwrap();
+    for _ in 0..10 { fx.step(); }
+    // prepared from the snapshot, queued now: r1 moved the commanded joints since
+    let mut q2 = snap.commanded.clone();
+    q2[1] += 0.1;
+    let r2 = submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&snap.commanded, &q2, 1.0).unwrap()).unwrap();
+    let before = (target_of(&fx), fx.core.target_positions.clone());
+    let rep = fx.step();
+    assert_eq!(rep.command, Some((r2, Err("PLAN_STALE"))));
+    assert_eq!(fx.active(), Some(first));
+    assert_eq!((target_of(&fx), fx.core.target_positions.clone()), before, "the running trajectory is left");
+    // prepared from the current commanded state, it replaces the running joint move
+    let r3 = submit_install(&mut b, 3, auth(&fx), later(), quintic(&fx, -0.05, 1.0)).unwrap();
+    assert!(matches!(fx.step().command, Some((r, Ok(2))) if r == r3));
+    let got = replies(&mut b);
+    assert!(got.contains(&Reply::Refused { request: r2, code: "PLAN_STALE" }));
+    assert!(got.iter().any(|r| matches!(r, Reply::Terminal { request, outcome: Outcome::Superseded, .. } if *request == r1)), "{got:?}");
+}
+
+#[test]
+fn invalid_feedback_refuses_the_commit_and_leaves_the_motion() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    submit_install(&mut b, 1, a, later(), quintic(&fx, 0.2, 2.0)).unwrap();
+    fx.step();
+    let active = fx.active().unwrap();
+    let before = target_of(&fx);
+    fx.core.feedback_numeric_valid = false;
+    submit_install(&mut b, 2, a, later(), quintic(&fx, -0.1, 1.0)).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("FEEDBACK_STALE"));
+    assert_eq!((fx.active(), target_of(&fx)), (Some(active), before));
+    fx.core.feedback_numeric_valid = true;
+    submit_install(&mut b, 3, a, later(), quintic(&fx, -0.1, 1.0)).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+}
+
+#[test]
+fn a_worker_refuses_a_joint_move_at_admission_while_a_config_hold_inhibits_motion() {
+    use armd::rt_core::broker::{RequestId, Stamp};
+    use armd::rt_core::config_iface::{CandidateId, ConfigAuthority, ConfigDomain, ConfigProposal, Reserved};
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let ctx = fx.ctx(fx.now());
+    let snap = fx.core.planning_snapshot(&ctx);
+    let mut q = snap.commanded.clone();
+    q[0] += 0.05;
+    // free: prepared from the snapshot's commanded joints, admitted and committed
+    let p = armd::motion::prepare_joint_move(&snap, &q, 0.5).unwrap();
+    submit_install(&mut b, 1, snap.authority, later(), p).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert_eq!(armd::motion::prepare_joint_move(&snap, &q[..2], 0.5), Err("INVALID_COMMAND"));
+    // a configuration worker holds a motion domain: the next move is refused before admission
+    let a = auth(&fx);
+    let stamp = Stamp { arm: ArmId::LOCAL, boot: BOOT, request: RequestId(900), client: ClientId(5), client_seq: 1, authority: a, deadline: later() };
+    let proposal = ConfigProposal { domain: ConfigDomain::Keepout, expected_revision: fx.core.revision(ConfigDomain::Keepout), candidate: CandidateId(1), stamp };
+    let ctx = fx.ctx(fx.now());
+    let Reserved::Granted(r) = fx.core.reserve(&proposal, &ctx) else { panic!("not granted") };
+    let snap = fx.core.planning_snapshot(&ctx);
+    assert_eq!(armd::motion::prepare_joint_move(&snap, &snap.commanded.clone(), 0.5), Err("CONFIG_BUSY"));
+    assert_eq!(b.stats().admitted, 1, "nothing queued");
+    fx.core.release(r);
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
+    assert!(armd::motion::prepare_joint_move(&snap, &snap.commanded.clone(), 0.5).is_ok());
+}
+
+#[test]
+fn the_target_port_is_reachable_from_the_supervisor_module() {
+    use armd::supervisor::targets::{policy_stream, servo_stream, SERVO_STREAM_BIT};
+    assert_ne!(servo_stream(7), policy_stream(7));
+    assert_eq!(servo_stream(7).0 & SERVO_STREAM_BIT, SERVO_STREAM_BIT);
+    assert_eq!(policy_stream(7).0 & SERVO_STREAM_BIT, 0);
+}
+
+#[test]
+fn child_primitives_of_a_running_macro_commit_through_the_release() {
+    use armd::rt_core::ops::{ChildSpec, ChildTicket};
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let epoch = fx.core.safety.epoch_id();
+    let id = fx.core.begin_orchestrated_action("sequence", None, epoch).unwrap();
+    let parent = armd::rt_core::broker::ActionId(id);
+    let a = auth(&fx);
+    assert_eq!(a.parent_generation, id);
+    let start = |fx: &ReleaseFixture<SupervisorInner>| { let mut s = [0.0; MAX_DOF]; let c = &fx.core.commanded_positions; s[..c.len()].copy_from_slice(c); s };
+    let spec = |seq| Some(ChildSpec { ticket: ChildTicket { parent, child_seq: seq }, timeout_s: 10.0, timeout_code: "SEQUENCE_TIMEOUT", contact: None });
+    let dof = fx.core.commanded_positions.len() as u8;
+    let mut q = start(&fx);
+    q[0] += 0.05;
+    let joint = Primitive::JointQuinticLimited { child: spec(1), dof, start: start(&fx), q, duration_s: 0.5, max_velocity: [0.0; MAX_DOF], settle_s: 0.0 };
+    let r1 = submit_install(&mut b, 1, a, later(), joint).unwrap();
+    let rep = fx.step();
+    assert!(matches!(rep.command, Some((r, Ok(_))) if r == r1), "{rep:?}");
+    assert_eq!((fx.active(), fx.core.macro_children(id)), (Some(parent), Some(1)));
+    assert!(fx.core.active_trajectory.is_some());
+    // the same ticket again (not the next child) is stale; nothing replaces the running child
+    submit_install(&mut b, 2, a, later(), joint).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
+    let child_done = |fx: &ReleaseFixture<SupervisorInner>| matches!(fx.core.macro_run.as_ref().map(|m| &m.sub), Some(armd::macro_action::SubState::Done(_)));
+    for _ in 0..300 { fx.step(); if child_done(&fx) { break; } }
+    assert!(child_done(&fx));
+    assert!((fx.core.commanded_positions[0] - q[0]).abs() < 1e-3);
+    // a gripper child, then the macro ends: one terminal with both children
+    let grip = Primitive::Gripper { child: spec(2), dof, start: start(&fx), fraction: 0.5, speed: 1.0, grasp: false };
+    submit_install(&mut b, 3, auth(&fx), later(), grip).unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert_eq!(fx.core.macro_children(id), Some(2));
+    for _ in 0..300 { fx.step(); if child_done(&fx) { break; } }
+    assert!(child_done(&fx));
+    fx.core.finish_macro(id, "done", None, None, None, None);
+    assert_eq!(fx.step().ended, Some((parent, Outcome::Completed)));
+    let got = replies(&mut b);
+    assert!(got.iter().any(|r| matches!(r, Reply::Terminal { action, children: 2, outcome: Outcome::Completed, .. } if *action == parent)), "{got:?}");
+    assert_eq!((b.reserved(), b.outstanding()), (0, 0));
 }

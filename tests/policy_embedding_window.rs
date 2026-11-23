@@ -1402,7 +1402,7 @@ async fn run_negative_ticket_case(mutation: MidInferenceMutation) -> (String, us
         "last_shadow_target must remain None on aborted commit"
     );
     (
-        pol.stop_reason.unwrap_or_default(),
+        pol.stop_reason.unwrap_or_default().to_string(),
         total_writes_before_tick,
         non_home_writes.load(Ordering::SeqCst),
         pol.steps,
@@ -2631,7 +2631,7 @@ async fn run_m3_fail_closed_case(case: &str) -> (String, usize, usize, u64) {
     let obs = sup.get_observation().await;
     let pol = obs.policy.expect("policy obs");
     (
-        pol.stop_reason.unwrap_or_default(),
+        pol.stop_reason.unwrap_or_default().to_string(),
         writes.load(Ordering::SeqCst),
         non_home_writes.load(Ordering::SeqCst),
         pol.steps,
@@ -2791,7 +2791,7 @@ async fn run_m4_counter_case(
     let obs = sup.get_observation().await;
     let pol = obs.policy.expect("policy obs");
     (
-        pol.stop_reason.unwrap_or_default(),
+        pol.stop_reason.unwrap_or_default().to_string(),
         writes.load(Ordering::SeqCst),
         non_home_writes.load(Ordering::SeqCst),
         pol.steps,

@@ -165,7 +165,8 @@ mod tests {
             if dts.len() == 5 { stop.store(true, Ordering::Release); }
         });
         assert_eq!(dts.len(), 5);
-        assert!(dts.iter().all(|dt| *dt > 0.0005 && *dt < 0.5), "{dts:?}");
+        // a step after a late one comes early (the grid is absolute): any positive elapsed time
+        assert!(dts.iter().all(|dt| *dt > 0.0 && *dt < 0.5), "{dts:?}");
         assert_eq!(stats.steps.load(Ordering::Relaxed), 5);
     }
 }

@@ -337,6 +337,7 @@ pub async fn load_commissioning_into(
     supervisor: &crate::supervisor::ArmSupervisor,
     path: &std::path::Path,
 ) {
+    crate::persist::remove_staged_leftovers(path);
     let mut inner = supervisor.inner().write().await;
     inner.tool_commissioning_path = Some(path.to_path_buf());
     if inner.config.active_tool.is_stock {

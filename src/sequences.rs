@@ -793,7 +793,7 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
         }
         PinnedStep::Pose { positions, speed_scale, gripper, .. } => {
             recheck(ctx, plan).await?;
-            let limit = {
+            let ticket = {
                 let mut inner = ctx.sup.inner().write().await;
                 if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
                 let gripper_idx = inner.config.gripper_index();
@@ -802,9 +802,10 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
                 if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
                 let mut limits = inner.planning_limits();
                 for (i, l) in limits.iter_mut().enumerate() { if Some(i) != gripper_idx { l.max_velocity *= *speed_scale as f32; } }
-                inner.install_macro_quintic(ctx.id, target, &limits).map_err(arm_fail)?
+                let limit = inner.install_macro_quintic(ctx.id, target, &limits).map_err(arm_fail)?;
+                ctx.arm_child(&mut inner, "pose", limit * 2.0 + 5.0).ok_or(Stop::Cancelled)?
             };
-            ctx.wait_sub("pose", limit * 2.0 + 5.0).await.map(|_| ())
+            ctx.wait_child(ticket).await.map(|_| ())
         }
         PinnedStep::Gripper { action, fraction } => {
             recheck(ctx, plan).await?;
@@ -826,12 +827,13 @@ async fn run_step(ctx: &MacroCtx, plan: &RunPlan, step: &PinnedStep) -> Result<(
                 .map_err(|e| fail("INTERNAL", format!("replay check task failed: {e}")))?
                 .map_err(arm_fail)?;
             recheck(ctx, plan).await?;
-            let limit = {
+            let ticket = {
                 let mut inner = ctx.sup.inner().write().await;
                 if !inner.macro_alive(ctx.id) { return Err(Stop::Cancelled); }
-                inner.install_macro_replay(ctx.id, planned).map_err(arm_fail)?
+                let limit = inner.install_macro_replay(ctx.id, planned).map_err(arm_fail)?;
+                ctx.arm_child(&mut inner, "replay", limit * 2.0 + 5.0).ok_or(Stop::Cancelled)?
             };
-            ctx.wait_sub("replay", limit * 2.0 + 5.0).await.map(|_| ())
+            ctx.wait_child(ticket).await.map(|_| ())
         }
     }
 }
