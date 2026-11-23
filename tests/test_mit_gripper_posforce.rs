@@ -255,6 +255,124 @@ fn every_full_enable_reads_the_mode_back_and_a_motor_reset_is_rewritten() {
 }
 
 #[test]
+fn readback_requires_motor_master_can_id_and_ctrl_mode_rid() {
+    let reg_reply = |can_id: u16, motor_id: u16, op: u8, rid: u8, val: u32| -> CanFrame {
+        let [lo, hi] = motor_id.to_le_bytes();
+        let b = val.to_le_bytes();
+        CanFrame::new_standard(can_id, &[lo, hi, op, rid, b[0], b[1], b[2], b[3]]).unwrap()
+    };
+    // 1. Spoofed CTRL_MODE=4 readback arriving on wrong CAN arbitration IDs (0x16, 0x11, 0x00)
+    //    must be rejected (J7 expects MST_ID 0x17).
+    for wrong_id in [0x16u16, 0x11, 0x00] {
+        let (mut d, bus, clock) = rig(true);
+        bus.with(|s| s.motors[J7].silent_after_mode_ack = true);
+        let mut p = d.begin_torque(true).unwrap();
+        let mut injected = false;
+        let err = loop {
+            match p {
+                armd::driver::TorqueProgress::Done(_) => panic!("accepted spoofed CAN ID 0x{wrong_id:X}"),
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    if !injected && bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+                        injected = true;
+                        bus.with(|s| s.rx.push_back(reg_reply(wrong_id, 7, damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)));
+                    }
+                    clock.advance(Duration::from_micros(500));
+                    match d.poll_torque(clock.now() + Duration::from_millis(5)) {
+                        Ok(next) => p = next,
+                        Err(e) => break e,
+                    }
+                }
+            }
+        };
+        assert!(injected, "read request was never sent");
+        assert!(err.to_string().contains("no fresh reply"), "wrong_id=0x{wrong_id:X}: {err}");
+        assert!(!d.is_enabled());
+        assert!(!d.motor_current_cap().unwrap().active);
+        assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+    }
+
+    // 2. Reply on J7's expected CAN ID 0x17 carrying value 4, but wrong register ID (RID_TIMEOUT)
+    //    or wrong opcode (REG_WRITE) must be rejected.
+    for (op, rid) in [(damiao::REG_READ, damiao::RID_TIMEOUT), (damiao::REG_WRITE, damiao::RID_CTRL_MODE)] {
+        let (mut d, bus, clock) = rig(true);
+        bus.with(|s| s.motors[J7].silent_after_mode_ack = true);
+        let mut p = d.begin_torque(true).unwrap();
+        let mut injected = false;
+        let err = loop {
+            match p {
+                armd::driver::TorqueProgress::Done(_) => panic!("accepted wrong op/rid ({op:#x}, {rid})"),
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    if !injected && bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+                        injected = true;
+                        bus.with(|s| s.rx.push_back(reg_reply(0x17, 7, op, rid, damiao::CTRL_MODE_POS_FORCE)));
+                    }
+                    clock.advance(Duration::from_micros(500));
+                    match d.poll_torque(clock.now() + Duration::from_millis(5)) {
+                        Ok(next) => p = next,
+                        Err(e) => break e,
+                    }
+                }
+            }
+        };
+        assert!(injected);
+        assert!(err.to_string().contains("no fresh reply"), "op={op:#x} rid={rid}: {err}");
+        assert!(!d.is_enabled());
+    }
+
+    // 3. Configured master ID (`with_master_id(0x27)`): keep telemetry and write ack on 0x27,
+    //    vary only the readback reply ID — default 0x17 must time out after the read request,
+    //    while configured 0x27 succeeds.
+    let make_custom = |reply_id: u16| -> (DamiaoArmDriver<FakeBus>, FakeBus, MockClock) {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.0;
+            s.motors[J7].reply_id = reply_id;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_master_id(0x27)
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.clear_log();
+        (d, bus, clock)
+    };
+    let (mut d_bad, bus_bad, clock_bad) = make_custom(0x27);
+    bus_bad.with(|s| s.motors[J7].silent_after_mode_ack = true);
+    let mut p = d_bad.begin_torque(true).unwrap();
+    let mut injected = false;
+    let err = loop {
+        match p {
+            armd::driver::TorqueProgress::Done(_) => panic!("accepted 0x17 readback when master_id is 0x27"),
+            armd::driver::TorqueProgress::Pending { .. } => {
+                if !injected && bus_bad.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+                    injected = true;
+                    bus_bad.with(|s| s.rx.push_back(reg_reply(0x17, 7, damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE)));
+                }
+                clock_bad.advance(Duration::from_micros(500));
+                match d_bad.poll_torque(clock_bad.now() + Duration::from_millis(5)) {
+                    Ok(next) => p = next,
+                    Err(e) => break e,
+                }
+            }
+        }
+    };
+    assert!(injected, "readback request was not sent under configured master_id");
+    assert!(err.to_string().contains("no fresh reply"), "{err}");
+    assert!(j7_commands(&bus_bad.tx_log()).is_empty());
+    assert!(!bus_bad.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+    assert!(!d_bad.is_enabled());
+
+    let (mut d_ok, _, _) = make_custom(0x27);
+    d_ok.set_torque(true).expect("accepted configured master_id 0x27");
+    assert!(d_ok.is_enabled() && d_ok.motor_current_cap().unwrap().active);
+}
+
+#[test]
 fn recovery_hold_of_a_stale_j7_is_capped() {
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();

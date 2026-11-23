@@ -2336,6 +2336,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     motor_ids: Vec<u16>,
     master_id: u32,
+    /// Explicit master CAN ID from [`Self::with_master_id`]; `None` uses Damiao's per-motor `0x10 + motor_id`.
+    configured_master_id: Option<u32>,
     /// MIT / feedback mapping range per joint (must equal each motor's PMAX / VMAX / TMAX).
     limits: Vec<DamiaoLimits>,
     control_mode: DamiaoControlMode,
@@ -2461,6 +2463,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             can,
             motor_ids,
             master_id: 0,
+            configured_master_id: None,
             limits: vec![DamiaoLimits::default(); dof],
             control_mode: DamiaoControlMode::PosVel,
             default_vlim: 2.0,
@@ -2546,7 +2549,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     pub fn with_master_id(mut self, master_id: u32) -> Self {
         self.master_id = master_id;
+        self.configured_master_id = Some(master_id);
         self
+    }
+
+    /// Expected CAN arbitration ID (MST_ID) for replies from joint `i`:
+    /// the configured `master_id` when set, otherwise Damiao's per-motor `0x10 + motor_id`
+    /// (e.g. J7 motor ID 7 -> 0x17 on B601-DM).
+    fn expected_reply_id(&self, i: usize) -> u32 {
+        self.configured_master_id.unwrap_or(0x10 + u32::from(self.motor_ids[i]))
     }
 
     /// Global base mode (POS_VEL or MIT); a position-force gripper keeps its own base mode.
@@ -2839,7 +2850,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     fn mode_write_reply(&self, i: usize) -> Option<damiao::RegisterReply> {
         let id = self.motor_ids[i];
-        self.register_replies.iter().rev().copied().find(|r| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE)
+        if self.base_mode(i) == DamiaoControlMode::PosForce {
+            let expected_id = self.expected_reply_id(i);
+            self.register_reply_log.iter().rev()
+                .find(|(r, fid, ..)| *fid == expected_id && r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE)
+                .map(|(r, ..)| *r)
+        } else {
+            self.register_replies.iter().rev().copied().find(|r| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE)
+        }
     }
 
     /// Every sent mode write has a register reply.
@@ -3324,8 +3342,9 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             None => {}
             Some(b) => {
+                let expected_id = self.expected_reply_id(r.joint);
                 let reply = self.register_reply_log.iter().rev()
-                    .find(|(rep, _, _, seq, _)| rep.motor_id == id && !rep.write && rep.rid == damiao::RID_CTRL_MODE && *seq > b)
+                    .find(|(rep, fid, _, seq, _)| *fid == expected_id && rep.motor_id == id && !rep.write && rep.rid == damiao::RID_CTRL_MODE && *seq > b)
                     .map(|(rep, ..)| rep.as_u32());
                 match reply {
                     Some(v) if v == damiao::CTRL_MODE_POS_FORCE => {
@@ -4175,10 +4194,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             };
             let motor_id = u32::from(self.motor_ids[idx]);
-            let is_valid_feedback_id = frame.id == 0
-                || frame.id == self.master_id
-                || frame.id == motor_id
-                || frame.id == (0x10 + motor_id);
+            let is_valid_feedback_id = match (self.base_mode(idx), self.configured_master_id) {
+                (DamiaoControlMode::PosForce, Some(mid)) => frame.id == mid,
+                _ => frame.id == 0
+                    || frame.id == self.master_id
+                    || frame.id == motor_id
+                    || frame.id == (0x10 + motor_id),
+            };
             if !is_valid_feedback_id {
                 return;
             }
