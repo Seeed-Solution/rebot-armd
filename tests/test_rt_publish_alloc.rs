@@ -70,7 +70,7 @@ fn publish_and_record_push_do_not_touch_the_allocator() {
             let back = core.publish(i, now, now + Duration::from_millis(40), obs, &q, &q);
             let none_back = back.is_none();
             drop(back);
-            (none_back, core.record.push(i, i as f64, &q, &q))
+            (none_back, core.record_sample(i, i as f64, &q, &q))
         });
         assert_eq!((a, f), (0, 0), "publication {i}: {a} allocations, {f} deallocations");
         assert!(none_back, "publication {i}: the tick got an observation back to free");
@@ -81,12 +81,12 @@ fn publish_and_record_push_do_not_touch_the_allocator() {
             assert_eq!(s.obs.timestamp, i as f64);
             assert_eq!(s.meta.seq, i + 1);
         }
-        if i % 100 == 0 { core.record.ring().unwrap().drain(); }
+        if i % 100 == 0 { core.record_ring().unwrap().drain(); }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     dispatcher.thread().unpark();
     dispatcher.join().unwrap();
     assert_eq!(hub.tick_frees(), 0);
-    let done = core.record.finish();
+    let done = core.finish_recording();
     assert_eq!(done.frames.len() as u64 + done.dropped, 1000);
 }

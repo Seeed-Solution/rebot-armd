@@ -225,49 +225,12 @@ impl SupervisorInner {
         self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.feedback_all_within(self.config.dof, max_age)))
     }
 
-    /// Update per-joint feedback instants and monotonic sequence counters from a hardware driver
-    /// (read into `sc`, no allocation).
-    pub(super) fn record_driver_feedback_timing(
-        joint_feedback_instants: &mut Vec<Option<Instant>>,
-        joint_feedback_seqs: &mut Vec<u64>,
-        joint_feedback_queue_bounds: &mut Vec<Option<Instant>>,
-        dof: usize,
-        driver: &dyn ArmDriver,
-        sc: &mut crate::rt_core::scratch::FeedbackScratch,
-    ) {
-        driver.feedback_instants_into(&mut sc.instants);
-        driver.feedback_seqs_into(&mut sc.seqs);
-        driver.feedback_queue_bounds_into(&mut sc.bounds);
-        if sc.bounds.len() == dof {
-            copy_into(joint_feedback_queue_bounds, &sc.bounds);
-        } else {
-            joint_feedback_queue_bounds.clear();
-        }
-        if joint_feedback_seqs.len() != dof {
-            joint_feedback_seqs.resize(dof, 0);
-        }
-        if sc.seqs.len() == dof {
-            copy_into(joint_feedback_seqs, &sc.seqs);
-        } else {
-            for i in 0..dof {
-                let prev = joint_feedback_instants.get(i).copied().flatten();
-                let cur = sc.instants.get(i).copied().flatten();
-                if let Some(t) = cur {
-                    if prev.is_none_or(|p| t > p) {
-                        joint_feedback_seqs[i] = joint_feedback_seqs[i].wrapping_add(1);
-                    }
-                }
-            }
-        }
-        copy_into(joint_feedback_instants, &sc.instants);
-    }
-
     /// Per arm joint, an instant before which its last sample cannot have been enqueued: the
     /// driver's receive-queue bound, or the receive instant for drivers without a receive queue.
     pub fn arm_feedback_queue_bounds(&self) -> Vec<Option<Instant>> {
         self.config.arm_joint_indices().iter().map(|&i| match self.joint_feedback_queue_bounds.get(i) {
             Some(b) => *b,
-            None => self.core.joint_feedback_instants.get(i).copied().flatten(),
+            None => self.core.feedback().instant(i),
         }).collect()
     }
 
@@ -278,11 +241,11 @@ impl SupervisorInner {
         let vels = arm.iter().map(|&i| self.measured_velocities.get(i).copied().unwrap_or(0.0)).collect();
         let instants = arm
             .iter()
-            .map(|&i| self.core.joint_feedback_instants.get(i).copied().flatten())
+            .map(|&i| self.core.feedback().instant(i))
             .collect();
         let seqs = arm
             .iter()
-            .map(|&i| self.core.joint_feedback_seqs.get(i).copied().unwrap_or(0))
+            .map(|&i| self.core.feedback().seq(i))
             .collect();
         (self.measured_positions.clone(), vels, instants, seqs)
     }
@@ -452,14 +415,7 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = driver.feedback_ages().into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                Self::record_driver_feedback_timing(
-                    &mut self.core.joint_feedback_instants,
-                    &mut self.core.joint_feedback_seqs,
-                    &mut self.joint_feedback_queue_bounds,
-                    self.config.dof,
-                    driver.as_ref(),
-                    &mut self.scratch.fb,
-                );
+                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut self.scratch.fb);
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -666,14 +622,7 @@ impl SupervisorInner {
                 self.feedback_numeric_valid = true;
                 self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                     .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-                Self::record_driver_feedback_timing(
-                    &mut self.core.joint_feedback_instants,
-                    &mut self.core.joint_feedback_seqs,
-                    &mut self.joint_feedback_queue_bounds,
-                    self.config.dof,
-                    drv.as_ref(),
-                    &mut self.scratch.fb,
-                );
+                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, drv.as_ref(), &mut self.scratch.fb);
                 Self::apply_feedback(
                     &mut self.measured_positions,
                     &mut self.measured_velocities,
@@ -723,14 +672,7 @@ impl SupervisorInner {
             self.feedback_numeric_valid = true;
             self.last_can_feedback_instant = ages.into_iter().collect::<Option<Vec<_>>>()
                 .and_then(|a| a.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
-            Self::record_driver_feedback_timing(
-                &mut self.core.joint_feedback_instants,
-                &mut self.core.joint_feedback_seqs,
-                &mut self.joint_feedback_queue_bounds,
-                self.config.dof,
-                drv.as_ref(),
-                &mut self.scratch.fb,
-            );
+            self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, drv.as_ref(), &mut self.scratch.fb);
             Self::apply_feedback(
                 &mut self.measured_positions,
                 &mut self.measured_velocities,

@@ -1771,14 +1771,7 @@ impl SupervisorInner {
                                 self.last_can_feedback_instant = None;
                             }
                             if self.feedback_numeric_valid {
-                                Self::record_driver_feedback_timing(
-                                    &mut self.core.joint_feedback_instants,
-                                    &mut self.core.joint_feedback_seqs,
-                                    &mut self.joint_feedback_queue_bounds,
-                                    self.config.dof,
-                                    driver.as_ref(),
-                                    &mut sc.fb,
-                                );
+                                self.core.poll_feedback(&mut self.joint_feedback_queue_bounds, self.config.dof, driver.as_ref(), &mut sc.fb);
                                 Self::apply_feedback(
                                     &mut self.measured_positions,
                                     &mut self.measured_velocities,
@@ -1830,14 +1823,8 @@ impl SupervisorInner {
             }
         } else {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
-            let now = Instant::now();
-            self.core.joint_feedback_instants.resize(self.config.dof, Some(now));
-            self.core.joint_feedback_instants.fill(Some(now));
-            self.core.joint_feedback_seqs.resize(self.config.dof, 0);
+            self.core.simulate_feedback(self.config.dof, Instant::now());
             self.joint_feedback_queue_bounds.clear();
-            for seq in &mut self.core.joint_feedback_seqs {
-                *seq = seq.wrapping_add(1);
-            }
         }
         if let Some(errors) = new_motor_errors {
             self.update_motor_errors(errors);
@@ -3286,9 +3273,9 @@ impl SupervisorInner {
         // preallocated ring (no allocation, `crate::rt_core::record_ring`); a recorder started
         // directly (no session) keeps its frames itself
         if self.recording_frame_room() {
-            if self.core.record.active() {
+            if self.core.recording_active() {
                 let seq = self.core.published_seq() + 1;
-                self.core.record.push(seq, timestamp, &self.measured_positions, &self.commanded_positions);
+                self.core.record_sample(seq, timestamp, &self.measured_positions, &self.commanded_positions);
             } else {
                 self.recorder.append_frame(RecordFrame {
                     timestamp,
@@ -4441,7 +4428,7 @@ mod observation_snapshot_tests {
         let frames = rx.recv().unwrap();
         assert_eq!(frames.len(), expected.len());
         assert_eq!(frames, expected);
-        assert_eq!(sup.inner().read().await.core.record.dropped(), 0);
+        assert_eq!(sup.inner().read().await.core.record_dropped(), 0);
     }
 
     /// The stop path takes the stop fence under the writer and collects the frames after
@@ -4454,7 +4441,7 @@ mod observation_snapshot_tests {
         sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
         sup.start_recording(None, None).await.unwrap();
         for _ in 0..5 { sup.tick(0.02).await; }
-        let ring = sup.inner().read().await.core.record.ring().unwrap().clone();
+        let ring = sup.inner().read().await.core.record_ring().unwrap().clone();
         let (held_tx, held_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let holder = {
@@ -4488,12 +4475,12 @@ mod observation_snapshot_tests {
         assert!(sup.save_recording().await.is_err());
         {
             let inner = sup.inner().read().await;
-            assert!(inner.core.record.active() && inner.recording.is_some());
+            assert!(inner.core.recording_active() && inner.recording.is_some());
         }
         for _ in 0..3 { sup.tick(0.02).await; }
         {
             let inner = sup.inner().read().await;
-            assert_eq!((inner.recorder.frame_count(), inner.core.record.pushed()), (0, 3));
+            assert_eq!((inner.recorder.frame_count(), inner.core.record_pushed()), (0, 3));
         }
         sup.save_recording().await.unwrap();
     }
@@ -4507,7 +4494,7 @@ mod observation_snapshot_tests {
         let n = crate::rt_core::record_ring::RECORD_RING_CAPACITY + 44;
         for _ in 0..n { inner.tick(0.02); }
         assert_eq!(inner.recording_frames(), crate::rt_core::record_ring::RECORD_RING_CAPACITY);
-        let done = inner.core.record.finish();
+        let done = inner.core.finish_recording();
         assert_eq!((done.frames.len(), done.dropped), (crate::rt_core::record_ring::RECORD_RING_CAPACITY, 44));
     }
 

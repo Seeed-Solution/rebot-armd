@@ -130,7 +130,7 @@ impl SupervisorInner {
     /// Frames of the running recording: those the recorder holds and those the ticks put
     /// into the recording ring.
     pub fn recording_frames(&self) -> usize {
-        self.recorder.frame_count() + if self.core.record.active() { self.core.record.pushed() } else { 0 }
+        self.recorder.frame_count() + if self.core.recording_active() { self.core.record_pushed() } else { 0 }
     }
 
     /// `recording` field of `GET /api/v1/episodes` and the recorder status.
@@ -338,7 +338,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 inner.recorder.discard()?;
                 inner.recording = None;
                 // stop fence; the ring's samples are dropped after the guard is released
-                let fence = inner.core.record.end();
+                let fence = inner.core.end_recording();
                 drop(inner);
                 if let Err(e) = collect_fence(fence).await { tracing::warn!("{e}"); }
                 tracing::info!("Recording {} discarded", r.id);
@@ -348,7 +348,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             if inner.recording_frames() == 0 { return Err(crate::recording::RecordingError::EmptyEpisode.into()); }
             let (path, direct) = inner.recorder.begin_finalize()?;
             // stop fence: the ticks up to here; the frames are collected without the guard
-            let fence = inner.core.record.end();
+            let fence = inner.core.end_recording();
             inner.recording = None;
             let base = (
                 inner.joint_names(),

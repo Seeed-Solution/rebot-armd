@@ -313,10 +313,10 @@ fn scenarios(with_driver: bool) {
     warm(&mut inner, 10);
     let counts = count_ticks(&mut inner, 50, |inner, i| {
         // the dispatcher drains the ring off the control thread
-        if i % 20 == 0 { inner.core.record.ring().unwrap().drain(); }
+        if i % 20 == 0 { inner.core.record_ring().unwrap().drain(); }
     });
     assert_zero(&format!("{tag} recording"), &counts);
-    assert!(inner.core.record.pushed() >= 60);
+    assert!(inner.core.record_pushed() >= 60);
 }
 
 #[test]
@@ -364,7 +364,7 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     inner.jog(q, Some(8.0), Some(epoch)).expect("jog");
     warm(&mut inner, 10);
     let hub = inner.core.hub().clone();
-    let ring = inner.core.record.ring().unwrap().clone();
+    let ring = inner.core.record_ring().unwrap().clone();
     let (_reader, _dispatcher) = (hub.reader_guard(), ring.consumer_guard());
     let n = armd::rt_core::record_ring::RECORD_RING_CAPACITY + 2 * armd::rt_core::publish::RETIRE_CAPACITY + 20;
     let counts: Vec<(u64, u64)> = (0..n).map(|_| {
@@ -375,5 +375,5 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     assert_zero("stalled readers and dispatcher", &counts);
     assert!(inner.active_trajectory.is_some(), "still moving");
     assert_eq!(hub.tick_frees(), 0);
-    assert!(inner.core.record.dropped() > 0, "the recording ring overflowed");
+    assert!(inner.core.record_dropped() > 0, "the recording ring overflowed");
 }
