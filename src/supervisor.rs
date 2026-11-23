@@ -97,6 +97,8 @@ impl From<crate::recording::StoreError> for ArmError {
 pub enum PreemptError {
     #[error("Preemption cooldown active: {0}ms remaining")]
     Cooldown(u64),
+    #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
+    OwnerTransferred,
 }
 
 /// J7 stall latch: |τ7| at or above this (N·m) with the jaw still, for 6 ticks.
@@ -4297,42 +4299,67 @@ impl ArmSupervisor {
 
     pub async fn heartbeat(&self, client_id: &str, epoch_id: u64) -> Result<(), SafetyError> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(SafetyError::OwnerTransferred);
+        }
         inner.heartbeat(client_id, epoch_id)
     }
 
     pub async fn acquire_lease(&self, client_id: &str) -> Result<u64, (String, u64)> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(("OWNER_TRANSFERRED".into(), 0));
+        }
         inner.acquire_lease(client_id)
     }
 
     pub async fn preempt_lease(&self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return Err(PreemptError::OwnerTransferred);
+        }
         inner.preempt_lease(conn, label)
     }
 
     pub async fn is_handover_settling(&self) -> bool {
         let inner = self.inner.read().await;
-        inner.handover_settling_since.is_some()
+        self.check_legacy_under_guard(&inner).is_ok() && inner.handover_settling_since.is_some()
     }
 
     pub async fn release_lease(&self, client_id: &str, generation: u64) -> bool {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return false;
+        }
         inner.release_lease(client_id, generation)
     }
 
     pub async fn is_lease_active(&self) -> bool {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            return self.hub.latest().is_some_and(|s| s.obs.lease_holder.is_some());
+        }
         let inner = self.inner.read().await;
-        inner.is_lease_active()
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            return inner.is_lease_active();
+        }
+        drop(inner);
+        self.owner_mode() == OWNER_EXECUTOR
+            && self.hub.latest().is_some_and(|s| s.obs.lease_holder.is_some())
     }
 
     pub async fn validate_servo_lease(&self, client_id: &str, generation: u64) -> bool {
         let mut inner = self.inner.write().await;
+        if self.check_legacy_under_guard(&inner).is_err() {
+            return false;
+        }
         inner.validate_servo_lease(client_id, generation)
     }
 
     pub async fn set_torques(&self, torques: Vec<f32>) {
         let mut inner = self.inner.write().await;
-        inner.torques = torques;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.torques = torques;
+        }
     }
 
     pub async fn is_gripper_stalled(&self) -> bool {
@@ -4352,7 +4379,9 @@ impl ArmSupervisor {
 
     pub async fn set_gravity_compensated(&self, enabled: bool) {
         let mut inner = self.inner.write().await;
-        inner.gravity_compensated = enabled;
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.gravity_compensated = enabled;
+        }
     }
 
     pub async fn get_gravity_scale(&self) -> f32 {
@@ -4362,7 +4391,9 @@ impl ArmSupervisor {
 
     pub async fn set_gravity_scale(&self, scale: f32) {
         let mut inner = self.inner.write().await;
-        inner.gravity_scale = scale.clamp(0.0, 1.0);
+        if self.check_legacy_under_guard(&inner).is_ok() {
+            inner.gravity_scale = scale.clamp(0.0, 1.0);
+        }
     }
 
     pub async fn get_gravity_torques_ramped(&self) -> Vec<f32> {

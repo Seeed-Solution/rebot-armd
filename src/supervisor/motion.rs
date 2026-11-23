@@ -345,6 +345,9 @@ impl SupervisorInner {
     }
 
     pub fn preempt_lease(&mut self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {
+        if self.detached {
+            return Err(PreemptError::OwnerTransferred);
+        }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
             let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
@@ -415,6 +418,9 @@ impl SupervisorInner {
     }
 
     pub fn acquire_lease(&mut self, client_id: &str) -> Result<u64, (String, u64)> {
+        if self.detached {
+            return Err(("OWNER_TRANSFERRED".into(), 0));
+        }
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
             let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
@@ -555,6 +561,9 @@ impl SupervisorInner {
     /// without that, because its expiry may already have started a watchdog park that a
     /// client without a valid lease must not cancel.
     pub fn release_lease(&mut self, client_id: &str, generation: u64) -> bool {
+        if self.detached {
+            return false;
+        }
         if let Some(ref active) = self.active_lease {
             if active.client_id == client_id && active.generation == generation {
                 let valid = active.acquired_at.elapsed() < self.lease_timeout;
@@ -569,6 +578,9 @@ impl SupervisorInner {
 
     /// Records the label a lease holder sent with `acquire_lease` (shown to other clients).
     pub fn set_lease_label(&mut self, client_id: &str, generation: u64, label: &str) {
+        if self.detached {
+            return;
+        }
         if let Some(active) = self.active_lease.as_mut().filter(|a| a.client_id == client_id && a.generation == generation) {
             active.label = label.to_string();
         }
@@ -602,6 +614,9 @@ impl SupervisorInner {
     }
 
     pub fn heartbeat(&mut self, client_id: &str, epoch_id: u64) -> Result<(), SafetyError> {
+        if self.detached {
+            return Err(SafetyError::OwnerTransferred);
+        }
         if epoch_id != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch {
                 expected: self.safety.epoch_id(),

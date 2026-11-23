@@ -772,6 +772,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     if let Some(s) = seq { reply["seq"] = json!(s); }
                                                     response = Some(reply);
                                                 }
+                                                Err(crate::supervisor::PreemptError::OwnerTransferred) => {
+                                                    let mut reply = json!({
+                                                        "type": "lease_rejected",
+                                                        "error": "owner_transferred",
+                                                        "code": "OWNER_TRANSFERRED"
+                                                    });
+                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                    response = Some(reply);
+                                                }
                                             }
                                         }
                                     } else {
@@ -785,6 +794,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     "type": "lease_granted",
                                                     "client_id": label,
                                                     "generation": generation
+                                                });
+                                                if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                response = Some(reply);
+                                            }
+                                            Err((code, 0)) if code == "OWNER_TRANSFERRED" => {
+                                                let mut reply = json!({
+                                                    "type": "lease_rejected",
+                                                    "error": "owner_transferred",
+                                                    "code": "OWNER_TRANSFERRED"
                                                 });
                                                 if let Some(s) = seq { reply["seq"] = json!(s); }
                                                 response = Some(reply);

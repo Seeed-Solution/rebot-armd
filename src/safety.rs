@@ -204,6 +204,9 @@ pub enum SafetyError {
         #[serde(default)]
         detail: Box<crate::kinematics::WorkspaceViolationDetail>,
     },
+
+    #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
+    OwnerTransferred,
 }
 
 impl SafetyError {

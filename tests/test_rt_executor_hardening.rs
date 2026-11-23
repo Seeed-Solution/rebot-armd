@@ -28,7 +28,7 @@ use armd::rt_core::executor::{ExecutorConfig, PanicPolicy, PersistTestHooks, RtE
 use armd::rt_core::urgent::EstopGate;
 use armd::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, RETIRED_STATE_CAPACITY};
 use armd::sim_driver::{SimArmDriver, SimCommand, SimState};
-use armd::supervisor::{ArmSupervisor, PanicDisableOutcome};
+use armd::supervisor::{ArmSupervisor, PanicDisableOutcome, PreemptError};
 use armd::tracking::JointTrackingConfig;
 use armd::transport::{CanFrame, CanTransport, DriverClock, MockCanTransport, MockClock, TransportError};
 use mit_support::FakeBus;
@@ -1116,4 +1116,68 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
     );
 
     h_m.stop_and_join();
+}
+
+// ============================================================================
+// 7. Detached shell lease calls refused after executor transfer
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_shell_lease_calls_refuse_after_executor_transfer_without_shadowing_owner() {
+    let cfg = ArmConfig { lease_timeout_ms: 5_000, ..ArmConfig::rebot_dm() };
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    // Establish an active lease on the real owner BEFORE transferring ownership.
+    let (owner_gen, _) = sup.preempt_lease("owner-conn", "owner-client").await.unwrap();
+    let owner_epoch = sup.get_observation().await.epoch_id;
+    assert!(sup.is_lease_active().await);
+
+    let handle = sup
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+
+    // Every legacy library lease call on the detached shell MUST refuse with an explicit error
+    // (or `false` for boolean release/validate) and NEVER create a shadow lease on the shell!
+    assert_eq!(
+        sup.acquire_lease("shadow-client").await,
+        Err(("OWNER_TRANSFERRED".to_string(), 0)),
+        "acquire_lease on detached shell must refuse with OWNER_TRANSFERRED"
+    );
+    assert_eq!(
+        sup.preempt_lease("shadow-conn", "shadow-client").await,
+        Err(PreemptError::OwnerTransferred),
+        "preempt_lease on detached shell must refuse with OwnerTransferred"
+    );
+    assert_eq!(
+        sup.heartbeat("owner-conn", owner_epoch).await,
+        Err(SafetyError::OwnerTransferred),
+        "heartbeat on detached shell must refuse with OwnerTransferred"
+    );
+    assert!(
+        !sup.release_lease("owner-conn", owner_gen).await,
+        "release_lease on detached shell must return false"
+    );
+    assert!(
+        !sup.validate_servo_lease("owner-conn", owner_gen).await,
+        "validate_servo_lease on detached shell must return false"
+    );
+
+    // Direct `SupervisorInner` calls on the detached shell also refuse and keep shell empty.
+    {
+        let mut shell = sup.inner().write().await;
+        assert_eq!(shell.acquire_lease("direct-shadow"), Err(("OWNER_TRANSFERRED".to_string(), 0)));
+        assert_eq!(shell.preempt_lease("direct-shadow", "direct"), Err(PreemptError::OwnerTransferred));
+        assert_eq!(shell.heartbeat("owner-conn", owner_epoch), Err(SafetyError::OwnerTransferred));
+        assert!(!shell.release_lease("owner-conn", owner_gen));
+        assert!(!shell.validate_servo_lease("owner-conn", owner_gen));
+        assert!(shell.active_lease.is_none(), "detached shell must never acquire a shadow lease");
+    }
+
+    // Meanwhile the real RT owner still holds the original `"owner-client"` lease!
+    let obs = sup.observation().await.expect("live observation from RT owner");
+    assert_eq!(obs.lease_holder.as_deref(), Some("owner-client"));
+    assert!(sup.is_lease_active().await);
+
+    handle.stop_and_join();
 }

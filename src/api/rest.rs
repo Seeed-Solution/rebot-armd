@@ -330,6 +330,9 @@ impl From<ArmError> for ApiError {
                 crate::safety::SafetyError::NotArmed(_) => {
                     ApiError(StatusCode::PRECONDITION_FAILED, safety_err.to_string(), "NOT_ARMED".to_string())
                 }
+                crate::safety::SafetyError::OwnerTransferred => {
+                    ApiError(StatusCode::SERVICE_UNAVAILABLE, safety_err.to_string(), "OWNER_TRANSFERRED".to_string())
+                }
                 _ => ApiError(StatusCode::BAD_REQUEST, safety_err.to_string(), "SAFETY_ERROR".to_string()),
             },
             ArmError::Trajectory(traj_err) => {
