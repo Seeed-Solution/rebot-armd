@@ -206,6 +206,22 @@ async fn reply_for(ws: &mut common::TestSocket, request_id: u64) -> Value {
     .expect("reply")
 }
 
+/// The replies to `ids`, in whatever order they arrive.
+async fn replies_for(ws: &mut common::TestSocket, ids: &[u64]) -> std::collections::HashMap<u64, Value> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut got = std::collections::HashMap::new();
+        while got.len() < ids.len() {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: Value = serde_json::from_str(&text).unwrap();
+            let is_reply = v["type"] == "command_ack" || v["type"] == "command_reject";
+            if let Some(id) = v["request_id"].as_u64().filter(|id| is_reply && ids.contains(id)) { got.insert(id, v); }
+        }
+        got
+    })
+    .await
+    .expect("replies")
+}
+
 fn keepout_cmd(request_id: u64, g: u64, epoch: u64, boxes: Vec<Value>, expected: u64) -> Value {
     json!({"type": "command", "request_id": request_id, "generation": g, "epoch_id": epoch,
         "path": "/api/v1/workspace/keepout", "body": {"boxes": boxes, "expected_revision": expected}})
@@ -244,8 +260,8 @@ async fn competing_updates_activate_once() {
         common::send(&mut ws, keepout_cmd(id_9101, g, epoch, vec![cube("first", 0.3)], 1)).await;
         let id_9102 = next_id();
         common::send(&mut ws, keepout_cmd(id_9102, g, epoch, vec![cube("second", 0.3)], 1)).await;
-        let a = reply_for(&mut ws, id_9101).await;
-        let b = reply_for(&mut ws, id_9102).await;
+        let mut got = replies_for(&mut ws, &[id_9101, id_9102]).await;
+        let (a, b) = (got.remove(&id_9101).unwrap(), got.remove(&id_9102).unwrap());
         assert_eq!((a["type"].as_str(), a["revision"].as_u64()), (Some("command_ack"), Some(2)), "{a}");
         assert_eq!(a["durability_confirmed"], true, "{a}");
         assert_eq!(b["type"], "command_reject", "{b}");
