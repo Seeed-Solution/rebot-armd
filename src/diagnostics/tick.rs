@@ -299,6 +299,9 @@ impl TickStats {
 }
 
 impl TickWindow {
+    /// The samples, oldest first.
+    pub fn samples(&self) -> &[TickSample] { &self.rows }
+
     fn col(&self, f: impl Fn(&TickSample) -> u32) -> Percentiles {
         let mut v: Vec<u32> = self.rows.iter().map(f).collect();
         percentiles(&mut v)

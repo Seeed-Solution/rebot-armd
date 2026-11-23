@@ -489,6 +489,9 @@ pub struct SupervisorInner {
     /// When true (inside ArmSupervisor::tick), zero_check(store_offset=true) defers disk persist
     /// and memory commit until after the lock is released.
     pub defer_zero_check_persist: bool,
+    /// Joint quintics installed from a [`PreparedQuintic`] (planned without the lock).
+    #[doc(hidden)]
+    pub prepared_quintics_used: u64,
     /// Phase marks of the running tick ([`Self::tick_phase`]); µs per phase.
     tick_phase_mark: Option<Instant>,
     tick_phases_us: [u32; 5],
@@ -735,6 +738,7 @@ impl SupervisorInner {
             grasp_setup_revision: 1,
             grasp_setup_needs_camera_sync: false,
             defer_zero_check_persist: false,
+            prepared_quintics_used: 0,
             tick_phase_mark: None,
             tick_phases_us: [0; 5],
             zero_check_persisting: None,
@@ -3374,6 +3378,23 @@ impl SupervisorInner {
         tag: Option<String>,
         limits: &[crate::model::JointLimit],
     ) -> Result<(u64, u64, f64), ArmError> {
+        self.start_quintic_prepared(target_positions, duration_secs, epoch_id, kind, tag, limits, None)
+    }
+
+    /// [`start_quintic`](Self::start_quintic) that installs `prepared` (planned, power-fitted
+    /// and workspace-checked without the lock) when it was made from the same start, target,
+    /// limits, workspace revision, tool offset and power budget; else plans and checks here.
+    /// Every other check runs here either way.
+    pub(crate) fn start_quintic_prepared(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+        kind: &str,
+        tag: Option<String>,
+        limits: &[crate::model::JointLimit],
+        prepared: Option<PreparedQuintic>,
+    ) -> Result<(u64, u64, f64), ArmError> {
         let mut target_positions = target_positions;
         self.gravity_comp_motion_busy()?;
         // jog, home, move_to_pose, backlash approach: MIT must own its joints when requested
@@ -3422,20 +3443,37 @@ impl SupervisorInner {
             }
         }
 
-        // 2. Plan quintic polynomial trajectory from commanded state to target
-        let traj = TrajectoryPlanner::plan(
-            &self.commanded_positions,
-            &self.commanded_velocities,
-            &target_positions,
-            &vec![0.0; self.config.dof],
-            duration_secs,
-            limits,
-        )?;
-        // 2.1 Power budget: slow the move to fit (or refuse with POWER_BUDGET); the workspace
-        // check below runs on the trajectory that will be executed
-        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target_positions, limits, true)?;
-        let samples = self.workspace_samples(&traj)?;
-        self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+        let reuse = prepared.filter(|p| {
+            duration_secs.is_none()
+                && p.start == self.commanded_positions
+                && p.v0 == self.commanded_velocities
+                && p.target == target_positions
+                && p.limits.as_slice() == limits
+                && p.workspace_revision == self.workspace_revision
+                && p.tcp_offset == self.config.tcp_offset
+                && p.power.as_ref() == self.power_budget()
+                && p.checked_workspace == self.workspace_policy().is_some()
+        });
+        let (traj, power_scale) = if let Some(p) = reuse {
+            self.prepared_quintics_used += 1;
+            (p.traj, p.power_scale)
+        } else {
+            // 2. Plan quintic polynomial trajectory from commanded state to target
+            let traj = TrajectoryPlanner::plan(
+                &self.commanded_positions,
+                &self.commanded_velocities,
+                &target_positions,
+                &vec![0.0; self.config.dof],
+                duration_secs,
+                limits,
+            )?;
+            // 2.1 Power budget: slow the move to fit (or refuse with POWER_BUDGET); the workspace
+            // check below runs on the trajectory that will be executed
+            let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target_positions, limits, true)?;
+            let samples = self.workspace_samples(&traj)?;
+            self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
+            (traj, power_scale)
+        };
 
         // 3. Only renew lease AFTER command validation and planning succeed
         self.last_heartbeat = Instant::now();
@@ -3780,14 +3818,33 @@ impl SupervisorInner {
     #[allow(clippy::too_many_arguments)]
     pub fn install_joint_goal(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
         same_side: Option<crate::backlash::Request>) -> Result<(u64, f64), ArmError> {
+        self.install_joint_goal_prepared(input, q, speed_scale, kind, tag, same_side, None)
+    }
+
+    /// [`install_joint_goal`](Self::install_joint_goal) with the quintic prepared without the
+    /// lock ([`prepare_quintic`]); used when its inputs still match.
+    pub fn install_joint_goal_prepared(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+        same_side: Option<crate::backlash::Request>, prepared: Option<PreparedQuintic>) -> Result<(u64, f64), ArmError> {
         self.check_plan_fresh(input)?;
         let target = self.joint_goal_target(q);
         let limits = self.joint_goal_limits(speed_scale);
         let (_, id, duration) = match same_side {
             Some(request) => self.start_quintic_same_side(target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
-            None => self.start_quintic(target, None, Some(input.epoch), kind, tag, &limits)?,
+            None => self.start_quintic_prepared(target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
         };
         Ok((id, duration))
+    }
+
+    /// What [`prepare_quintic`] needs from the supervisor for a `path: "joint"` move: the
+    /// commanded joints and velocities and the quintic's limits (taken under the lock).
+    pub fn joint_goal_snapshot(&self, speed_scale: f64) -> JointGoalSnapshot {
+        JointGoalSnapshot {
+            start: self.commanded_positions.clone(),
+            v0: self.commanded_velocities.clone(),
+            limits: self.joint_goal_limits(speed_scale),
+            arm_dof: self.config.arm_dof(),
+            gripper_index: self.config.gripper_index(),
+        }
     }
 
     /// Whether the joint-space quintic to the arm joints `q` would pass the checks of
@@ -3809,13 +3866,7 @@ impl SupervisorInner {
 
     /// The commanded joints with the arm joints replaced by `q` (gripper and extra joints kept).
     pub(crate) fn joint_goal_target(&self, q: &[f64; 6]) -> Vec<f32> {
-        let arm_dof = self.config.arm_dof();
-        let gripper_idx = self.config.gripper_index();
-        let mut target = self.commanded_positions.clone();
-        for (i, t) in target.iter_mut().enumerate().take(arm_dof.min(6)) {
-            if Some(i) != gripper_idx { *t = q[i] as f32; }
-        }
-        target
+        joint_goal_target_from(&self.commanded_positions, q, self.config.arm_dof(), self.config.gripper_index())
     }
 
     /// `planning_limits()` with the non-gripper velocities times `speed_scale` (as `move_to_pose`).
@@ -7370,6 +7421,72 @@ pub fn keepout_sweep_with(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The commanded joints `start` with the arm joints replaced by `q` (gripper and extra joints kept).
+pub(crate) fn joint_goal_target_from(start: &[f32], q: &[f64; 6], arm_dof: usize, gripper_idx: Option<usize>) -> Vec<f32> {
+    let mut target = start.to_vec();
+    for (i, t) in target.iter_mut().enumerate().take(arm_dof.min(6)) {
+        if Some(i) != gripper_idx { *t = q[i] as f32; }
+    }
+    target
+}
+
+/// Supervisor state a `path: "joint"` quintic is planned from ([`SupervisorInner::joint_goal_snapshot`]).
+#[derive(Debug, Clone)]
+pub struct JointGoalSnapshot {
+    pub start: Vec<f32>,
+    pub v0: Vec<f32>,
+    pub limits: Vec<crate::model::JointLimit>,
+    pub arm_dof: usize,
+    pub gripper_index: Option<usize>,
+}
+
+/// A joint quintic planned, power-fitted and workspace-checked without the supervisor lock
+/// ([`prepare_quintic`]), with the inputs it was made from.
+#[derive(Debug, Clone)]
+pub struct PreparedQuintic {
+    start: Vec<f32>,
+    v0: Vec<f32>,
+    target: Vec<f32>,
+    limits: Vec<crate::model::JointLimit>,
+    workspace_revision: u64,
+    tcp_offset: [f64; 3],
+    power: Option<crate::power::PowerBudget>,
+    checked_workspace: bool,
+    traj: MultiJointQuinticTrajectory,
+    power_scale: Option<f64>,
+}
+
+/// The work of [`SupervisorInner::start_quintic`] that needs no lock, for the joints `q`:
+/// quintic, power fit and swept-workspace check, from `input` and `snap`. None when any of
+/// them fails: the install then repeats them under the lock and returns their error.
+pub fn prepare_quintic(input: &PlanInput, snap: &JointGoalSnapshot, q: &[f64; 6]) -> Option<PreparedQuintic> {
+    let target = joint_goal_target_from(&snap.start, q, snap.arm_dof, snap.gripper_index);
+    let zeros = vec![0.0; target.len()];
+    let traj = TrajectoryPlanner::plan(&snap.start, &snap.v0, &target, &zeros, None, &snap.limits).ok()?;
+    let (traj, power_scale) = crate::power::power_fit_quintic_with(
+        input.power.as_ref(), &input.arm, input.arm.arm_dof(), traj, &snap.start, &snap.v0, &target, &snap.limits, true).ok()?;
+    if let Some(ws) = input.ws.as_ref() {
+        let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
+        let at = |t: f64| traj.sample(t).positions;
+        let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
+        let eps = crate::kinematics::WORKSPACE_EPS;
+        let samples = keepout_sweep_with_tcp_tol(&input.arm, ws, &input.cam, input.tcp_offset, eps, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN).ok()?;
+        check_path_with_tcp_tol(&input.arm, ws, &input.cam, input.tcp_offset, eps, &snap.start, samples.iter().map(Vec::as_slice)).ok()?;
+    }
+    Some(PreparedQuintic {
+        start: snap.start.clone(),
+        v0: snap.v0.clone(),
+        target,
+        limits: snap.limits.clone(),
+        workspace_revision: input.workspace_revision,
+        tcp_offset: input.tcp_offset,
+        power: input.power.clone(),
+        checked_workspace: input.ws.is_some(),
+        traj,
+        power_scale,
+    })
+}
+
 pub fn keepout_sweep_with_tcp_tol(
     model: &crate::chain::ArmModel,
     ws: &crate::model::WorkspacePolicy,
@@ -8082,6 +8199,11 @@ impl ArmSupervisor {
         stats.record(&sample);
         drop(stats);
         obs
+    }
+
+    /// The raw samples of the last ticks, oldest first (tests, diagnostics).
+    pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
+        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
     }
 
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
