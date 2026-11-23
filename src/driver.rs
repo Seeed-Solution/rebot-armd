@@ -2416,6 +2416,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pos_force_verified: bool,
     /// Legacy profile: gripper joint driven in POS_VEL (reported without a motor current cap).
     legacy_gripper: Option<usize>,
+    /// First timely post-boundary 0xCC refresh sample captured while a refresh is active.
+    refresh_capture: Option<RefreshCapture>,
 }
 
 /// Phase of a pending Damiao torque transition.
@@ -2437,12 +2439,31 @@ enum DamiaoTorque {
 }
 
 /// Bounded 0xCC feedback refresh for the position-force gripper during enable: `boundary` is the
-/// RX sequence of the empty queue observed before sending 0xCC (None: waiting for an empty queue).
+/// transmit-time RX sequence barrier established after draining RX right before sending 0xCC
+/// (None: waiting to drain RX and send 0xCC).
 #[derive(Debug)]
 struct FeedbackRefresh { joint: usize, boundary: Option<u64>, deadline: Deadline }
 
+#[derive(Debug, Clone, Copy)]
+struct RefreshSample {
+    position: f32,
+    velocity: f32,
+    motor_status: u8,
+    rx_at: Instant,
+    queue_bound: Option<Instant>,
+    seq: u64,
+}
+
+#[derive(Debug)]
+struct RefreshCapture {
+    joint: usize,
+    boundary: u64,
+    deadline: Deadline,
+    first: Option<RefreshSample>,
+}
+
 enum RefreshStep {
-    Ready(f32),
+    Ready(RefreshSample),
     Pending(FeedbackRefresh),
     TimedOut,
 }
@@ -2528,6 +2549,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pos_force: None,
             pos_force_verified: false,
             legacy_gripper: None,
+            refresh_capture: None,
         }
     }
 
@@ -3442,6 +3464,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.is_enabled = false;
         self.pending_rearm = true;
         self.pos_force_verified = false;
+        self.refresh_capture = None;
     }
 
     /// Enable, first step: fast path, range check, receive boundary, then either the base-mode
@@ -3528,51 +3551,98 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.readback_or_enable()
     }
 
-    /// Start a bounded 0xCC feedback refresh for `joint`. Captures the fixed `REGISTER_REPLY_TIMEOUT`
-    /// (50 ms) deadline before any drain or transmit so slow transport I/O never extends the window.
-    /// Sends immediately only when `drained_now` is true (the caller observed an empty RX queue on
-    /// this call); otherwise leaves `boundary: None` so `poll_feedback_refresh` establishes a fresh
-    /// empty-queue boundary first and never admits pre-request buffered frames.
-    fn start_feedback_refresh(&mut self, joint: usize, drained_now: bool) -> Result<FeedbackRefresh, ArmDriverError> {
-        let start = self.now();
-        let deadline = Deadline::after(start, REGISTER_REPLY_TIMEOUT);
-        let mut refresh = FeedbackRefresh { joint, boundary: None, deadline };
-        if drained_now && !refresh.deadline.passed(self.now()) {
-            let boundary = self.rx_empty_seq;
-            let id = self.motor_ids[joint];
-            self.can.transmit(&damiao::build_refresh_frame(id)).and_then(|()| self.can.flush())?;
-            refresh.boundary = Some(boundary);
+    /// Drain up to 64 RX frames within `rx_over` and `deadline`, stopping on `Timeout` / `WouldBlock`
+    /// and marking the empty-queue boundary.
+    fn drain_rx_for_boundary(&mut self, deadline: Deadline) -> bool {
+        self.last_read_drained = false;
+        let t0 = self.now();
+        for _ in 0..64 {
+            if self.rx_over(t0) || deadline.passed(self.now()) {
+                return false;
+            }
+            let attempt = self.now();
+            match self.can.receive() {
+                Ok(frame) => self.process_rx_frame(&frame, true),
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.mark_rx_empty(attempt);
+                    return true;
+                }
+                Err(_) => return false,
+            }
         }
-        Ok(refresh)
+        false
     }
 
-    /// Serve a bounded 0xCC feedback refresh: accepts only a feedback frame for `r.joint` received
-    /// strictly after `r.boundary`, recorded strictly before `r.deadline`, and satisfying the
-    /// unchanged 100 ms `fresh_measured_position` bound (finite position + decode & queue bounds).
+    /// Establish a tight pre-transmit RX boundary, transmit `0xCC` for `joint`, and arm
+    /// `refresh_capture`. Returns `Ok(None)` if RX cannot be drained before `deadline`.
+    fn send_refresh_with_boundary(&mut self, joint: usize, deadline: Deadline) -> Result<Option<u64>, ArmDriverError> {
+        if !self.drain_rx_for_boundary(deadline) || deadline.passed(self.now()) {
+            return Ok(None);
+        }
+        // Advance RX sequence immediately before transmitting so the refresh request has its own
+        // transmit boundary strictly after every pre-transmit dequeued frame (and distinct from
+        // `rx_empty_seq`). Without transport RX/TX timestamps or a protocol sequence byte in
+        // `0xCC`, this tight pre-transmit drain + transmit boundary matches `poll_readback`/
+        // `begin_disable`/`rx_boundary` and cannot distinguish an asynchronous wire arrival
+        // between the immediate pre-transmit `WouldBlock` and `transmit()`.
+        self.rx_seq += 1;
+        let boundary = self.rx_seq;
+        let id = self.motor_ids[joint];
+        self.can.transmit(&damiao::build_refresh_frame(id)).and_then(|()| self.can.flush())?;
+        self.refresh_capture = Some(RefreshCapture { joint, boundary, deadline, first: None });
+        Ok(Some(boundary))
+    }
+
+    /// Start a bounded 0xCC feedback refresh for `joint`. Captures the fixed `REGISTER_REPLY_TIMEOUT`
+    /// (50 ms) deadline before any drain or transmit so slow transport I/O never extends the window.
+    /// Sends immediately only when `drained_now` is true; otherwise leaves `boundary: None` so
+    /// `poll_feedback_refresh` establishes a fresh boundary first and never admits pre-request frames.
+    fn start_feedback_refresh(&mut self, joint: usize, drained_now: bool) -> Result<FeedbackRefresh, ArmDriverError> {
+        self.refresh_capture = None;
+        let start = self.now();
+        let deadline = Deadline::after(start, REGISTER_REPLY_TIMEOUT);
+        let boundary = if drained_now && !deadline.passed(self.now()) {
+            self.send_refresh_with_boundary(joint, deadline)?
+        } else {
+            None
+        };
+        Ok(FeedbackRefresh { joint, boundary, deadline })
+    }
+
+    /// Serve a bounded 0xCC feedback refresh: accepts only the first feedback frame for `r.joint`
+    /// received strictly after `r.boundary`, recorded strictly before `r.deadline`, and still within
+    /// `POS_FORCE_FEEDBACK_MAX_AGE`. Live telemetry remains updated by any newer frames so callers
+    /// retain live safety-veto authority.
     fn poll_feedback_refresh(&mut self, mut r: FeedbackRefresh) -> Result<RefreshStep, ArmDriverError> {
         let expired_before_read = r.deadline.passed(self.now());
-        if !expired_before_read {
-            let _ = self.read_joint_states();
-        }
-        let id = self.motor_ids[r.joint];
         match r.boundary {
-            None if !expired_before_read && !r.deadline.passed(self.now()) && self.last_read_drained => {
-                let boundary = self.rx_empty_seq;
-                self.can.transmit(&damiao::build_refresh_frame(id)).and_then(|()| self.can.flush())?;
-                r.boundary = Some(boundary);
+            None => {
+                if !expired_before_read {
+                    r.boundary = self.send_refresh_with_boundary(r.joint, r.deadline)?;
+                }
             }
-            None => {}
             Some(b) => {
-                let post_request_timely = self.last_feedback_seq[r.joint] > b
-                    && self.last_feedback_instant[r.joint].is_some_and(|t| !r.deadline.passed(t));
-                if post_request_timely {
-                    if let Some(pos) = self.fresh_measured_position(r.joint, POS_FORCE_FEEDBACK_MAX_AGE) {
-                        return Ok(RefreshStep::Ready(pos));
+                if !expired_before_read {
+                    let _ = self.read_joint_states();
+                }
+                if let Some(sample) = self.refresh_capture.as_ref()
+                    .filter(|c| c.joint == r.joint && c.boundary == b)
+                    .and_then(|c| c.first)
+                {
+                    let fresh_rx = self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE;
+                    let fresh_bound = sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+                    if sample.seq > b && !r.deadline.passed(sample.rx_at) && fresh_rx && fresh_bound && sample.position.is_finite() {
+                        self.refresh_capture = None;
+                        // Do NOT roll back live cached_states/motor_status: return Ready(sample) and let
+                        // callers enforce safety checks on BOTH `sample` and live telemetry so neither
+                        // unsafe-timely/safe-late nor safe-timely/unsafe-late can enable.
+                        return Ok(RefreshStep::Ready(sample));
                     }
                 }
             }
         }
         if r.deadline.passed(self.now()) {
+            self.refresh_capture = None;
             return Ok(RefreshStep::TimedOut);
         }
         Ok(RefreshStep::Pending(r))
@@ -3581,7 +3651,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn poll_refresh_before_restore(&mut self, refresh: FeedbackRefresh, stray: Vec<usize>) -> Result<TorqueProgress, ArmDriverError> {
         let joint = refresh.joint;
         match self.poll_feedback_refresh(refresh) {
-            Ok(RefreshStep::Ready(_)) => {
+            Ok(RefreshStep::Ready(sample)) => {
+                let sample_fresh = sample.position.is_finite()
+                    && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+                    && sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+                if let Some(e) = self.pos_force_sample_refused(
+                    joint,
+                    "position-force mode not written",
+                    sample_fresh,
+                    sample.velocity,
+                    sample.motor_status,
+                ) {
+                    self.enable_failed();
+                    return Err(e);
+                }
                 if let Some(e) = self.pos_force_write_refused(&stray) {
                     self.enable_failed();
                     return Err(e);
@@ -3595,8 +3678,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             Ok(RefreshStep::TimedOut) => {
                 let e = self.pos_force_write_refused(&stray).unwrap_or_else(|| ArmDriverError::HardwareFault(format!(
-                    "joint {} position-force mode not written: needs fresh stationary feedback with torque off (fresh false, still false, torque off false); capped operation unavailable",
-                    joint + 1)));
+                    "joint {} position-force mode not written: no timely post-refresh feedback within {} ms; capped operation unavailable",
+                    joint + 1,
+                    REGISTER_REPLY_TIMEOUT.as_millis()
+                )));
                 self.enable_failed();
                 Err(e)
             }
@@ -3660,17 +3745,26 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.readback_or_enable()
     }
 
+    fn pos_force_sample_refused(&self, joint: usize, label: &str, fresh: bool, velocity: f32, status: u8) -> Option<ArmDriverError> {
+        let still = velocity.is_finite() && velocity.abs() <= 0.05;
+        let off = !self.is_enabled && status == 0;
+        if fresh && still && off {
+            return None;
+        }
+        let fault = damiao_fault_name(status).map_or(String::new(), |name| format!(" ({name})"));
+        Some(ArmDriverError::HardwareFault(format!(
+            "joint {} {label}: needs fresh stationary feedback with torque off (fresh {fresh}, still {still}, torque off {off}, status {status}{fault}); capped operation unavailable",
+            joint + 1
+        )))
+    }
+
     /// With torque off, the position-force gripper's mode is written only on fresh (100 ms),
     /// stationary (|v| <= 0.05 rad/s), state-0 feedback.
     fn pos_force_write_refused(&self, stray: &[usize]) -> Option<ArmDriverError> {
         let j = self.pos_force.as_ref()?.joint;
         if !stray.contains(&j) { return None; }
         let fresh = self.fresh_measured_position(j, POS_FORCE_FEEDBACK_MAX_AGE).is_some();
-        let still = self.cached_states[j].velocity.is_finite() && self.cached_states[j].velocity.abs() <= 0.05;
-        let off = !self.is_enabled && self.motor_status[j] == 0;
-        (!(fresh && still && off)).then(|| ArmDriverError::HardwareFault(format!(
-            "joint {} position-force mode not written: needs fresh stationary feedback with torque off (fresh {fresh}, still {still}, torque off {off}); capped operation unavailable",
-            j + 1)))
+        self.pos_force_sample_refused(j, "position-force mode not written", fresh, self.cached_states[j].velocity, self.motor_status[j])
     }
 
     /// Every full enable of a position-force gripper reads its CTRL_MODE back before the enable
@@ -3717,8 +3811,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     .map(|(rep, ..)| rep.as_u32());
                 match reply {
                     Some(v) if v == damiao::CTRL_MODE_POS_FORCE => {
-                        if let Some(measured_pos) = self.fresh_measured_position(r.joint, POS_FORCE_FEEDBACK_MAX_AGE) {
-                            return self.finish_pos_force_readback(r.joint, measured_pos);
+                        if self.fresh_measured_position(r.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_some() {
+                            return self.finish_pos_force_readback(r.joint, None);
                         }
                         let drained_now = !expired_before_read && self.last_read_drained;
                         let refresh = match self.start_feedback_refresh(r.joint, drained_now) {
@@ -3745,7 +3839,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn poll_pre_enable_refresh(&mut self, refresh: FeedbackRefresh) -> Result<TorqueProgress, ArmDriverError> {
         let joint = refresh.joint;
         match self.poll_feedback_refresh(refresh) {
-            Ok(RefreshStep::Ready(measured_pos)) => self.finish_pos_force_readback(joint, measured_pos),
+            Ok(RefreshStep::Ready(sample)) => self.finish_pos_force_readback(joint, Some(sample)),
             Ok(RefreshStep::Pending(r)) => {
                 let wake = r.deadline.at;
                 self.torque_hs = Some(DamiaoTorque::PreEnableRefresh(r));
@@ -3758,8 +3852,55 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
-    fn finish_pos_force_readback(&mut self, joint: usize, measured_pos: f32) -> Result<TorqueProgress, ArmDriverError> {
-        let Some(hold) = self.pos_force_frame(joint, &JointTarget::position(measured_pos)) else {
+    fn finish_pos_force_readback(&mut self, joint: usize, refresh_sample: Option<RefreshSample>) -> Result<TorqueProgress, ArmDriverError> {
+        let hold_pos = if let Some(sample) = refresh_sample {
+            let sample_fresh = sample.position.is_finite()
+                && self.since(sample.rx_at) <= POS_FORCE_FEEDBACK_MAX_AGE
+                && sample.queue_bound.is_some_and(|qb| self.since(qb) <= POS_FORCE_FEEDBACK_MAX_AGE);
+            if !sample_fresh {
+                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
+            }
+            let sample_still = sample.velocity.is_finite() && sample.velocity.abs() <= 0.05;
+            let sample_off = !self.is_enabled && sample.motor_status == 0;
+            if !(sample_still && sample_off) {
+                let fault = damiao_fault_name(sample.motor_status).map_or(String::new(), |name| format!(" ({name})"));
+                return self.readback_failed(
+                    joint,
+                    format!(
+                        "pre-enable hold refused: needs stationary torque-off feedback (still {sample_still}, torque off {sample_off}, status {}{fault})",
+                        sample.motor_status
+                    ),
+                );
+            }
+            if self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
+            }
+            sample.position
+        } else {
+            let Some(measured_pos) = self.fresh_measured_position(joint, POS_FORCE_FEEDBACK_MAX_AGE) else {
+                return self.readback_failed(joint, "no fresh measured position for pre-enable hold".into());
+            };
+            measured_pos
+        };
+        let still = self.cached_states[joint].velocity.is_finite() && self.cached_states[joint].velocity.abs() <= 0.05;
+        let status = self.motor_status[joint];
+        let off = !self.is_enabled && status == 0;
+        if !(still && off) {
+            let fault = damiao_fault_name(status).map_or(String::new(), |name| format!(" ({name})"));
+            return self.readback_failed(
+                joint,
+                format!("pre-enable hold refused: needs stationary torque-off feedback (still {still}, torque off {off}, status {status}{fault})"),
+            );
+        }
+        let Some(close_speed) = self.pos_force.as_ref().filter(|pf| pf.joint == joint).map(|pf| pf.close_speed_rad_s) else {
+            return self.readback_failed(joint, "pre-enable hold frame unavailable".into());
+        };
+        let hold_target = JointTarget {
+            position: hold_pos,
+            velocity: Some(close_speed),
+            ..JointTarget::position(hold_pos)
+        };
+        let Some(hold) = self.pos_force_frame(joint, &hold_target) else {
             return self.readback_failed(joint, "pre-enable hold frame unavailable".into());
         };
         if let Err(e) = self.can.transmit(&hold).and_then(|()| self.can.flush()) {
@@ -3768,7 +3909,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.last_target_frames[joint] = Some(hold);
         self.joint_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.pos_force_verified = true;
-        tracing::info!("Damiao joint {} confirmed in position-force mode (CTRL_MODE 4); pre-enable hold sent at {:.4} rad", joint + 1, measured_pos);
+        tracing::info!("Damiao joint {} confirmed in position-force mode (CTRL_MODE 4); pre-enable hold sent at {:.4} rad", joint + 1, hold_pos);
         self.send_enable()
     }
 
@@ -3873,6 +4014,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// Disable: frames to every motor at once (a pending enable is abandoned), then the
     /// confirmation window.
     fn begin_disable(&mut self) -> Result<TorqueProgress, ArmDriverError> {
+        self.refresh_capture = None;
         if self.torque_hs.take().is_some_and(|hs| !matches!(hs, DamiaoTorque::Disable { .. })) {
             self.enable_failed();
         }
@@ -3972,6 +4114,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// stationarity, position) reflect the newest bus state; stale register replies are
     /// ignored so they cannot satisfy a subsequent register transaction.
     fn drain_rx_before_command(&mut self) -> bool {
+        self.last_read_drained = false;
         let start = self.now();
         for _ in 0..128 {
             if self.since(start) >= Duration::from_millis(5) { return false; }
@@ -4631,17 +4774,38 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return;
             }
             if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
+                let rx_at = self.now();
+                let queue_bound = self.rx_empty_instant;
+                let seq = self.rx_seq;
                 self.cached_states[idx] = JointState {
                     position: feedback.position,
                     velocity: feedback.velocity,
                     torque: feedback.torque,
                     temperature: feedback.t_mos.max(feedback.t_rotor),
                 };
-                self.last_feedback_instant[idx] = Some(self.now());
+                self.last_feedback_instant[idx] = Some(rx_at);
                 self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
-                self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                self.last_feedback_seq[idx] = self.rx_seq;
+                self.feedback_queue_bound[idx] = queue_bound;
+                self.last_feedback_seq[idx] = seq;
                 self.motor_status[idx] = feedback.state_or_error;
+                if let Some(cap) = self.refresh_capture.as_mut() {
+                    if cap.joint == idx
+                        && cap.first.is_none()
+                        && seq > cap.boundary
+                        && !cap.deadline.passed(rx_at)
+                        && feedback.position.is_finite()
+                        && queue_bound.is_some()
+                    {
+                        cap.first = Some(RefreshSample {
+                            position: feedback.position,
+                            velocity: feedback.velocity,
+                            motor_status: feedback.state_or_error,
+                            rx_at,
+                            queue_bound,
+                            seq,
+                        });
+                    }
+                }
             }
         }
     }

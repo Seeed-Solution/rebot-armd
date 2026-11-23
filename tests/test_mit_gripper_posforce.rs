@@ -1888,6 +1888,317 @@ fn enable_refresh_deadline_boundaries_and_failure_paths() {
 }
 
 #[test]
+fn enable_refresh_transmit_boundary_and_live_safety_veto() {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    #[derive(Clone)]
+    struct RefreshProbeBus {
+        inner: FakeBus,
+        clock: MockClock,
+        inject_on_wouldblock: Arc<Mutex<Option<CanFrame>>>,
+        advance_schedule: Arc<Mutex<VecDeque<Duration>>>,
+    }
+
+    impl RefreshProbeBus {
+        fn new(clock: MockClock) -> Self {
+            Self {
+                inner: FakeBus::with_clock(&b601_limits(), clock.clone()),
+                clock,
+                inject_on_wouldblock: Arc::new(Mutex::new(None)),
+                advance_schedule: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl CanTransport for RefreshProbeBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> { self.inner.transmit(frame) }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            match self.inner.receive() {
+                Ok(frame) => {
+                    if let Some(d) = self.advance_schedule.lock().unwrap().pop_front() {
+                        if !d.is_zero() {
+                            self.clock.advance(d);
+                        }
+                    }
+                    Ok(frame)
+                }
+                Err(e @ (TransportError::Timeout | TransportError::WouldBlock)) => {
+                    if let Some(injected) = self.inject_on_wouldblock.lock().unwrap().take() {
+                        self.inner.with(|s| s.rx.push_back(injected));
+                    }
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+    }
+
+    let make_probe_stale = |already_mode_4: bool| {
+        let clock = MockClock::new();
+        let bus = RefreshProbeBus::new(clock.clone());
+        bus.inner.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.6;
+            if already_mode_4 {
+                s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+            }
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.inner.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.inner.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        clock.advance(Duration::from_millis(120));
+        bus.inner.clear_log();
+        (d, bus, clock)
+    };
+
+    // (a) Pre-transmit reply queued after caller's empty-queue drain and BEFORE 0xCC transmit,
+    //     while J7 is muted so it never answers 0xCC: both RefreshBeforeRestore and
+    //     PreEnableRefresh must reject it and emit neither mode-write nor hold/enable.
+    {
+        // a1. RefreshBeforeRestore
+        let (mut d, bus, clock) = make_probe_stale(false);
+        let pre_tx_j7 = bus.inner.with(|s| {
+            s.motors[J7].mute_feedback = true;
+            s.motors[J7].feedback_frame()
+        });
+        *bus.inject_on_wouldblock.lock().unwrap() = Some(pre_tx_j7);
+        let p = d.begin_torque(true).unwrap();
+        assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        assert!(bus.inner.tx_log().iter().any(is_j7_refresh), "expected 0xCC transmit");
+        let wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+            armd::driver::TorqueProgress::Pending { wake } => wake,
+            other => panic!("expected RefreshBeforeRestore pending wake, got {other:?}"),
+        };
+        assert!(wake > clock.now());
+        clock.advance(wake.saturating_duration_since(clock.now()));
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        assert!(err.contains("no timely post-refresh feedback"), "{err}");
+        let log = bus.inner.tx_log();
+        assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+        assert!(j7_commands(&log).is_empty());
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+
+        // a2. PreEnableRefresh
+        let (mut d, bus, clock) = make_probe_stale(true);
+        bus.inner.with(|s| s.motors[J7].mute_feedback = true);
+        let _ = d.begin_torque(true).unwrap();
+        while !bus.inner.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) {
+            clock.advance(Duration::from_micros(500));
+            let p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+            assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        }
+        let b = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+        let rb = CanFrame::new_standard(0x17, &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap();
+        let pre_tx_j7 = bus.inner.with(|s| {
+            s.rx.push_back(rb);
+            s.motors[J7].feedback_frame()
+        });
+        // Arm injection on the WouldBlock right after poll_readback drains the REG_READ reply,
+        // so the frame sits in RX right before start_feedback_refresh transmits 0xCC.
+        *bus.inject_on_wouldblock.lock().unwrap() = Some(pre_tx_j7);
+        clock.advance(Duration::from_millis(1));
+        assert!(matches!(d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap(), armd::driver::TorqueProgress::Pending { .. }));
+        assert!(bus.inner.tx_log().iter().any(is_j7_refresh), "expected 0xCC transmit");
+        assert!(j7_commands(&bus.inner.tx_log()).is_empty());
+        let ref_wake = match d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap() {
+            armd::driver::TorqueProgress::Pending { wake } => wake,
+            other => panic!("expected PreEnableRefresh pending wake, got {other:?}"),
+        };
+        assert!(ref_wake > clock.now());
+        clock.advance(ref_wake.saturating_duration_since(clock.now()));
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        assert!(err.contains("no fresh measured position for pre-enable hold"), "{err}");
+        let log = bus.inner.tx_log();
+        assert!(j7_commands(&log).is_empty());
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(!d.is_enabled());
+    }
+
+    // Helper to drive `d` into active refresh (`RefreshBeforeRestore` or `PreEnableRefresh`) with `0xCC` sent.
+    let drive_to_refresh = |already_mode_4: bool| {
+        let (mut d, bus, clock) = make_probe_stale(already_mode_4);
+        bus.inner.with(|s| s.motors[J7].mute_feedback = true);
+        let mut p = d.begin_torque(true).unwrap();
+        let wake = loop {
+            match p {
+                armd::driver::TorqueProgress::Pending { wake }
+                    if bus.inner.tx_log().iter().any(is_j7_refresh) && wake > clock.now() => break wake,
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    clock.advance(Duration::from_micros(500));
+                    p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                }
+                armd::driver::TorqueProgress::Done(_) => panic!("finished before refresh"),
+            }
+        };
+        (d, bus, clock, wake)
+    };
+
+    // (b) Timely reply (deadline - 1 ms) followed in the SAME receive_feedback pass by a benign
+    //     late reply (deadline + 1 ms, stationary, state 0): both RefreshBeforeRestore and
+    //     PreEnableRefresh accept and enable, and the 0x307 pre-enable hold uses the timely position.
+    for already_mode_4 in [false, true] {
+        let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
+        clock.advance(wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1)));
+        bus.inner.with(|s| {
+            s.motors[J7].mute_feedback = false;
+            s.motors[J7].q = -1.6;
+            let f1 = s.motors[J7].feedback_frame();
+            s.motors[J7].q = -1.2;
+            let f2 = s.motors[J7].feedback_frame();
+            s.rx.push_back(f1);
+            s.rx.push_back(f2);
+        });
+        *bus.advance_schedule.lock().unwrap() = VecDeque::from([Duration::ZERO, Duration::from_millis(2)]);
+        let mut p = d.poll_torque(clock.now() + Duration::from_millis(10))
+            .unwrap_or_else(|e| panic!("already_mode_4={already_mode_4}: same-pass benign late frame failed: {e}"));
+        while let armd::driver::TorqueProgress::Pending { .. } = p {
+            clock.advance(Duration::from_micros(500));
+            p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+        }
+        assert!(d.is_enabled() && d.motor_current_cap().unwrap().active, "already_mode_4={already_mode_4}");
+        let log = bus.inner.tx_log();
+        let hold = log.iter().position(|f| f.id == 0x307).expect("0x307 hold");
+        let enable = log.iter().position(|f| f.id == 7 && f.data == damiao::CMD_ENABLE).expect("CMD_ENABLE");
+        assert!(hold < enable);
+        if already_mode_4 {
+            let hold_f = log[hold];
+            let hold_pos = f32::from_le_bytes([hold_f.data[0], hold_f.data[1], hold_f.data[2], hold_f.data[3]]);
+            let hold_vel = u16::from_le_bytes([hold_f.data[4], hold_f.data[5]]);
+            assert!((hold_pos - (-1.6)).abs() < 1e-3, "expected timely hold position -1.6, got {hold_pos}");
+            assert!(hold_vel <= damiao::pos_force_vel_raw(0.30), "pre-enable hold exceeded close_speed_rad_s: vel_raw={hold_vel}");
+        }
+    }
+
+    // (b2) Unsafe timely reply (moving v=0.5, enabled state=1, or fault state=0x08) followed in
+    //      the SAME receive_feedback pass by a benign late reply (v=0.0, state=0): both
+    //      RefreshBeforeRestore and PreEnableRefresh must fail closed with NO mode-write, hold, or enable.
+    for already_mode_4 in [false, true] {
+        for (label, v, st_ovr) in [
+            ("moving", 0.5_f32, None),
+            ("state_1", 0.0_f32, Some(1u8)),
+            ("fault_0x08", 0.0_f32, Some(0x08u8)),
+        ] {
+            let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
+            clock.advance(wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1)));
+            bus.inner.with(|s| {
+                s.motors[J7].mute_feedback = false;
+                s.motors[J7].v = v;
+                s.motors[J7].state_override = st_ovr;
+                let unsafe_timely = s.motors[J7].feedback_frame();
+                s.motors[J7].v = 0.0;
+                s.motors[J7].state_override = None;
+                let safe_late = s.motors[J7].feedback_frame();
+                s.rx.push_back(unsafe_timely);
+                s.rx.push_back(safe_late);
+            });
+            bus.inner.clear_log();
+            *bus.advance_schedule.lock().unwrap() = VecDeque::from([Duration::ZERO, Duration::from_millis(2)]);
+            let err = d.poll_torque(clock.now() + Duration::from_millis(10))
+                .expect_err(&format!("already_mode_4={already_mode_4} unsafe-timely/safe-late {label} must veto"))
+                .to_string();
+            assert!(!err.is_empty());
+            let log = bus.inner.tx_log();
+            if !already_mode_4 {
+                assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+                    "{label} wrote CTRL_MODE");
+            }
+            assert!(j7_commands(&log).is_empty(), "already_mode_4={already_mode_4} {label} sent hold: {log:?}");
+            assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE),
+                "already_mode_4={already_mode_4} {label} sent CMD_ENABLE");
+            assert!(!d.is_enabled());
+        }
+    }
+
+    // (c1) Timely reply followed in the SAME receive_feedback pass by an UNSAFE late reply
+    //      (moving v=0.5, enabled state=1, or fault state=0x08): both RefreshBeforeRestore and
+    //      PreEnableRefresh veto and emit neither mode-write nor 0x307 hold nor CMD_ENABLE.
+    for already_mode_4 in [false, true] {
+        for (label, v, st_ovr) in [
+            ("moving", 0.5_f32, None),
+            ("state_1", 0.0_f32, Some(1u8)),
+            ("fault_0x08", 0.0_f32, Some(0x08u8)),
+        ] {
+            let (mut d, bus, clock, wake) = drive_to_refresh(already_mode_4);
+            clock.advance(wake.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1)));
+            bus.inner.with(|s| {
+                s.motors[J7].mute_feedback = false;
+                let safe = s.motors[J7].feedback_frame();
+                s.motors[J7].v = v;
+                s.motors[J7].state_override = st_ovr;
+                let unsafe_f = s.motors[J7].feedback_frame();
+                s.rx.push_back(safe);
+                s.rx.push_back(unsafe_f);
+            });
+            bus.inner.clear_log();
+            *bus.advance_schedule.lock().unwrap() = VecDeque::from([Duration::ZERO, Duration::from_millis(2)]);
+            let err = d.poll_torque(clock.now() + Duration::from_millis(10))
+                .expect_err(&format!("already_mode_4={already_mode_4} {label} should veto enable"))
+                .to_string();
+            assert!(!err.is_empty());
+            let log = bus.inner.tx_log();
+            if !already_mode_4 {
+                assert!(!log.iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE),
+                    "{label} wrote CTRL_MODE");
+            }
+            assert!(j7_commands(&log).is_empty(), "already_mode_4={already_mode_4} {label} sent hold: {log:?}");
+            assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE),
+                "already_mode_4={already_mode_4} {label} sent CMD_ENABLE");
+            assert!(!d.is_enabled());
+        }
+    }
+
+    // (c2) Direct readback path (already_mode_4 = true, fresh J7 feedback, no refresh needed)
+    //      with unsafe live telemetry (moving v=0.5, state 1, or fault 0x08) must veto before
+    //      0x307 hold or CMD_ENABLE.
+    for (label, v, st_ovr, expect_substr) in [
+        ("moving", 0.5_f32, None, "still false"),
+        ("state_1", 0.0_f32, Some(1u8), "torque off false"),
+        ("fault_0x08", 0.0_f32, Some(0x08u8), "status 8"),
+    ] {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+        bus.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.6;
+            s.motors[J7].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        bus.with(|s| {
+            s.motors[J7].v = v;
+            s.motors[J7].state_override = st_ovr;
+            s.push_all_feedback();
+        });
+        d.read_joint_states().unwrap();
+        bus.clear_log();
+        let err = d.set_torque(true).unwrap_err().to_string();
+        assert!(err.contains("pre-enable hold refused: needs stationary torque-off feedback"), "{label}: {err}");
+        assert!(err.contains(expect_substr), "{label}: {err}");
+        let log = bus.tx_log();
+        assert!(j7_commands(&log).is_empty(), "{label} emitted 0x307 hold: {log:?}");
+        assert!(!log.iter().any(|f| f.data == damiao::CMD_ENABLE), "{label} emitted CMD_ENABLE");
+        assert!(!d.is_enabled());
+    }
+}
+
+#[test]
 fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     use std::sync::Arc;
     use armd::motion::{GripperCommand, GripperRequest};
