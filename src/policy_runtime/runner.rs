@@ -2827,6 +2827,9 @@ mod chunking_tests {
             serde_json::json!({"chunk_size": 4, "replan_every": 5}),
             serde_json::json!({"chunk_size": 4, "replan_every": 0}),
             serde_json::json!({"chunk_size": 4, "temporal_ensemble_k": -0.1}),
+            serde_json::json!({"chunk_size": 4, "temporal_ensemble_k": 100.001}),
+            serde_json::json!({"chunk_size": 4, "temporal_ensemble_k": 1.0e300}),
+            serde_json::json!({"chunk_size": 4, "temporal_ensemble_k": "0.1"}),
             serde_json::json!({"chunk_size": 200}), // > MAX_CHUNK_SIZE
         ] {
             let mut pj = base.clone();
@@ -2835,6 +2838,13 @@ mod chunking_tests {
                 StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).is_err(),
                 "expected invalid chunking manifest to fail: {pj}"
             );
+        }
+        // Boundary values 0.0 and 100.0 are accepted for temporal_ensemble_k.
+        for ok_k in [0.0f64, 0.01, 100.0] {
+            let mut pj = base.clone();
+            pj["chunking"] = serde_json::json!({"chunk_size": 4, "replan_every": 2, "temporal_ensemble_k": ok_k});
+            let c = StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).unwrap();
+            assert_eq!(c.chunking.temporal_ensemble_k, Some(ok_k as f32));
         }
         // Mismatched outputs.action.shape when chunk_size=4 (expected 28, given 7)
         let mut pj = base.clone();

@@ -25,6 +25,8 @@ pub const MAX_VISION_STALENESS_MS: u64 = 500;
 pub const MAX_VIDEO_WINDOW_SPAN_MS: u64 = 2000;
 pub const MAX_POLICY_INPUT_WIDTH: usize = 1024;
 pub const MAX_CHUNK_SIZE: usize = 128;
+/// Maximum accepted value of `chunking.temporal_ensemble_k` (`0.0..=100.0`, finite as `f32`).
+pub const MAX_TEMPORAL_ENSEMBLE_K: f32 = 100.0;
 /// Maximum open-loop action-chunk horizon `replan_every * (1000 / fps)` in milliseconds.
 pub const MAX_OPEN_LOOP_HORIZON_MS: f64 = 1000.0;
 pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
@@ -628,15 +630,22 @@ fn parse_chunking_section(val: Option<&Value>, action_dim: usize) -> Result<Chun
     let temporal_ensemble_k = match obj.get("temporal_ensemble_k") {
         None | Some(Value::Null) => None,
         Some(v) => {
-            let k = v
-                .as_f64()
-                .filter(|k| k.is_finite() && *k >= 0.0)
-                .ok_or_else(|| {
-                    PolicyError::InvalidManifest(format!(
-                        "chunking.temporal_ensemble_k must be a finite number >= 0, got {v}"
-                    ))
-                })? as f32;
-            Some(k)
+            let k64 = v.as_f64().ok_or_else(|| {
+                PolicyError::InvalidManifest(format!(
+                    "chunking.temporal_ensemble_k must be a finite number in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
+                ))
+            })?;
+            let k32 = k64 as f32;
+            if !k64.is_finite()
+                || !k32.is_finite()
+                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K as f64).contains(&k64)
+                || !(0.0..=MAX_TEMPORAL_ENSEMBLE_K).contains(&k32)
+            {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "chunking.temporal_ensemble_k must be a finite f32 in 0..={MAX_TEMPORAL_ENSEMBLE_K}, got {v}"
+                )));
+            }
+            Some(k32)
         }
     };
 

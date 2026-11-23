@@ -19,7 +19,7 @@ pub use manifest::{
     NormalizationStats, PolicySnapshot, StrictPolicyContract, UnitMode, VisionFeatureSpec,
     VisionLayout, VisionSourceKind, VisionStalePolicy, VisionTargetLostPolicy,
     DEFAULT_VISION_MIN_SCORE, MAX_CHUNK_SIZE, MAX_MODEL_BYTES, MAX_OPEN_LOOP_HORIZON_MS,
-    MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
+    MAX_POLICY_JSON_BYTES, MAX_TEMPORAL_ENSEMBLE_K, MAX_VISION_STALENESS_MS,
 };
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
