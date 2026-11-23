@@ -42,6 +42,10 @@ struct SessionFrames {
 #[derive(Default)]
 struct Assembly {
     sessions: VecDeque<SessionFrames>,
+    /// Sessions evicted beyond [`MAX_PENDING_SESSIONS`] and how many of their samples were
+    /// discarded (counted as dropped when their fence is collected), the newest
+    /// [`MAX_PENDING_SESSIONS`] of them.
+    evicted: VecDeque<(u64, u64)>,
 }
 
 /// Uncollected sessions kept by the consumer; beyond it the oldest is discarded (a leak bound
@@ -98,9 +102,16 @@ impl RecordRing {
             // SAFETY: tail < head: the producer finished this slot and does not reuse it
             // before `tail` passes it (see the Sync impl).
             let slot = unsafe { &*self.slots[(tail % RECORD_RING_CAPACITY as u64) as usize].get() };
-            if slot.session != 0 {
+            if let Some(e) = asm.evicted.iter_mut().find(|e| e.0 == slot.session) {
+                // a late sample of an evicted session: discarded, counted
+                e.1 += 1;
+            } else if slot.session != 0 {
                 if asm.sessions.back().is_none_or(|s| s.session != slot.session) {
-                    if asm.sessions.len() >= MAX_PENDING_SESSIONS { asm.sessions.pop_front(); }
+                    if asm.sessions.len() >= MAX_PENDING_SESSIONS {
+                        let old = asm.sessions.pop_front().expect("len >= MAX_PENDING_SESSIONS");
+                        if asm.evicted.len() >= MAX_PENDING_SESSIONS { asm.evicted.pop_front(); }
+                        asm.evicted.push_back((old.session, old.frames.len() as u64));
+                    }
                     asm.sessions.push_back(SessionFrames { session: slot.session, frames: Vec::new(), first_tick: None, last_tick: None });
                 }
                 let s = asm.sessions.back_mut().expect("pushed above");
@@ -231,6 +242,9 @@ impl Fence {
             done.frames = s.frames;
             done.first_tick = s.first_tick;
             done.last_tick = s.last_tick;
+        } else if let Some(i) = asm.evicted.iter().position(|e| e.0 == self.session) {
+            // evicted while uncollected: its samples are lost, the session is incomplete
+            done.dropped += asm.evicted.remove(i).expect("position is in range").1;
         }
         done
     }
@@ -344,5 +358,22 @@ mod tests {
         assert_eq!(pushed + done.dropped, 20_000);
         assert!(done.frames.windows(2).all(|w| w[0].timestamp < w[1].timestamp));
         assert!(done.frames.iter().all(|f| f.observation_state.iter().all(|v| *v as f64 == f.timestamp)));
+    }
+
+    #[test]
+    fn a_session_evicted_before_its_fence_is_collected_counts_its_samples_as_dropped() {
+        let mut p = RecordProducer::new(1);
+        let mut fences = Vec::new();
+        for k in 0..=MAX_PENDING_SESSIONS as u64 {
+            p.begin();
+            for i in 0..3 { assert!(p.push(10 * k + i, 0.0, &[0.0], &[0.0])); }
+            fences.push(p.end().unwrap());
+        }
+        // the oldest of five uncollected sessions is evicted when the fifth one is drained
+        let mut done: Vec<Finished> = fences.into_iter().rev().map(Fence::collect).collect();
+        done.reverse();
+        let first = &done[0];
+        assert_eq!((first.frames.len(), first.dropped), (0, 3), "the evicted session is reported incomplete");
+        for d in &done[1..] { assert_eq!((d.frames.len(), d.dropped), (3, 0)); }
     }
 }
