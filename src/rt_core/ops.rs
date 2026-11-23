@@ -15,14 +15,14 @@
 //!
 //! The production adapter (`impl CoreOps for SupervisorInner`) delegates each operation to
 //! the supervisor's existing behaviour, under the legacy write guard that still owns the
-//! single core. Only it can make a [`Committed`] proof, which [`RtIntake::ack`] requires:
+//! single core. Only it can make a [`Committed`] proof, which [`super::broker::Taken::ack`] requires:
 //! a stub or test double ([`StubCore`]) can refuse but never acknowledge success, and has no
 //! way to move hardware.
 
 use std::time::{Duration, Instant};
 
 use super::broker::{
-    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Outcome, RequestId, RtIntake,
+    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, RequestId, RtIntake,
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Reservation, Reserved};
 use super::ids::ArmId;
@@ -31,21 +31,37 @@ use super::urgent::StopRequests;
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
 
-/// Proof that an authorized core operation committed a command; required to acknowledge
-/// success. Only this module's production adapter constructs one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Proof that an authorized core operation committed the command of one request; required
+/// to acknowledge success ([`super::broker::Taken::ack`] consumes it and checks the request).
+/// Only this module's production adapter constructs one. Neither `Clone` nor `Copy`: one
+/// commit acknowledges one descriptor, once.
+///
+/// ```compile_fail
+/// fn copy<T: Copy>() {}
+/// copy::<armd::rt_core::ops::Committed>();
+/// ```
+///
+/// ```compile_fail
+/// fn clone<T: Clone>() {}
+/// clone::<armd::rt_core::ops::Committed>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct Committed {
+    request: RequestId,
     action: Option<ActionId>,
 }
 
 impl Committed {
-    fn authorized(action: Option<ActionId>) -> Self { Self { action } }
+    fn authorized(d: &Descriptor, action: Option<ActionId>) -> Self { Self { request: d.stamp.request, action } }
+
+    /// The request whose command was committed.
+    pub fn request(&self) -> RequestId { self.request }
 
     /// The committed action (None for an immediate command).
     pub fn action(&self) -> Option<ActionId> { self.action }
 
     #[cfg(test)]
-    pub(crate) fn for_tests(action: Option<ActionId>) -> Self { Self { action } }
+    pub(crate) fn for_tests(request: RequestId, action: Option<ActionId>) -> Self { Self { request, action } }
 }
 
 /// A primitive staged in a plan slot. Fixed-size, so a slot is pre-touched at construction;
@@ -166,7 +182,7 @@ impl CoreOps for SupervisorInner {
             Primitive::JointQuintic { dof, q, duration_s } => {
                 let target = q[..usize::from(*dof)].to_vec();
                 self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
-                    .map(|(_, id, _)| Committed::authorized(Some(ActionId(id))))
+                    .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
             }
         }
@@ -179,7 +195,7 @@ impl CoreOps for SupervisorInner {
             ImmediateOp::TorqueOn => self.set_torque(true).map(drop).map_err(ArmError::Safety),
             ImmediateOp::TorqueOff => self.set_torque(false).map(drop).map_err(ArmError::Safety),
         };
-        r.map(|_| Committed::authorized(None)).map_err(static_code)
+        r.map(|_| Committed::authorized(d, None)).map_err(static_code)
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
@@ -294,7 +310,7 @@ pub struct ReleaseFixture<O: CoreOps> {
     targets: TargetReader,
     stop: StopRequests,
     applied_stop: u64,
-    active: Option<(Descriptor, ActionId)>,
+    active: Option<Installed>,
     releases: u64,
     pub dt: f64,
 }
@@ -309,7 +325,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
     }
 
     pub fn releases(&self) -> u64 { self.releases }
-    pub fn active(&self) -> Option<ActionId> { self.active.map(|(_, a)| a) }
+    pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
     pub fn reply_overflow(&self) -> u64 { self.intake.reply_overflow() }
 
     pub fn ctx(&self, now: Instant) -> CommitCtx {
@@ -327,11 +343,12 @@ impl<O: CoreOps> ReleaseFixture<O> {
             self.core.apply_stop();
             report.stopped = true;
         }
-        // 2. one ordinary command
-        self.intake.begin_release();
-        if let Some(d) = self.intake.take() {
+        // 2. one ordinary command (the intake enforces one per release)
+        self.intake.begin_release(self.releases);
+        if let Some(mut t) = self.intake.take() {
+            let d = *t.descriptor();
             let result = match d.kind {
-                CommandKind::Install { plan } => match self.intake.plan(plan).copied() {
+                CommandKind::Install { .. } => match t.plan().copied() {
                     None => Err("PLAN_RETIRED"),
                     Some(p) => self.core.commit_primitive(&d, &p, &ctx),
                 },
@@ -339,14 +356,16 @@ impl<O: CoreOps> ReleaseFixture<O> {
             };
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
-                    if let (Some(action), true) = (c.action(), d.kind.starts_action()) {
-                        if let Some((old, old_action)) = self.active.take() { self.intake.terminal(&old, old_action, Outcome::Superseded); }
-                        self.active = Some((d, action));
+                    if d.kind.starts_action() && c.action().is_some() && c.request() == d.stamp.request {
+                        if let Some(old) = self.active.take() { t.terminal_before(old, Outcome::Superseded); }
                     }
-                    Ok(self.intake.ack(&d, c))
+                    t.ack(c).map(|acked| {
+                        if let Some(i) = acked.installed { self.active = Some(i); }
+                        acked.commit_seq
+                    })
                 }
                 Err(code) => {
-                    self.intake.refuse(&d, code);
+                    t.refuse(code);
                     Err(code)
                 }
             }));
@@ -358,10 +377,10 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // 4. the control tick
         self.core.advance(self.dt, self.releases);
         // 5. terminal of the active action
-        if let Some((d, action)) = self.active {
+        if let Some(action) = self.active() {
             if let Some(outcome) = self.core.action_outcome(action) {
-                self.intake.terminal(&d, action, outcome);
-                self.active = None;
+                let installed = self.active.take().expect("active above");
+                self.intake.terminal(installed, outcome);
                 report.ended = Some((action, outcome));
             }
         }

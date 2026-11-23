@@ -385,6 +385,9 @@ pub struct BrokerStats {
     pub abandoned: u64,
     /// Plan slots reclaimed.
     pub retired: u64,
+    /// Replies without a matching reservation (unknown request, a second ACK, a terminal
+    /// before the ACK or twice): dropped, never delivered. Stays 0.
+    pub unexpected: u64,
 }
 
 struct Pending {
@@ -429,6 +432,11 @@ pub struct Broker<P> {
 }
 
 /// The RT side: one ordinary command per release, replies without waiting.
+///
+/// Replies can only be produced through tokens, so each reserved reply is sent exactly once:
+/// [`Self::take`] returns a [`Taken`] that is answered once ([`Taken::ack`] or
+/// [`Taken::refuse`]; dropping it unanswered refuses with `INTERNAL`), and an acknowledged
+/// install yields an [`Installed`] that [`Self::terminal`] consumes. None of them is `Clone`.
 pub struct RtIntake<P> {
     arm: ArmId,
     boot: BootId,
@@ -436,9 +444,47 @@ pub struct RtIntake<P> {
     replies: rtrb::Producer<Reply>,
     plans: PlanReader<P>,
     commit_seq: u64,
-    taken: bool,
+    /// The current release (0: none started).
+    release: u64,
+    /// The release whose ordinary command was taken.
+    taken_in: u64,
+    /// Acknowledged installs whose terminal is still to come.
+    installed: usize,
     /// Replies the reply ring refused (a reservation bug; must stay 0).
     reply_overflow: u64,
+}
+
+/// One ordinary command taken in the current release. Answer it exactly once: [`Self::ack`]
+/// with the [`super::ops::Committed`] proof made for this very request, or [`Self::refuse`].
+/// Dropping it unanswered refuses the command with `INTERNAL` (no reply is ever missing).
+#[must_use = "answer the command with ack or refuse"]
+pub struct Taken<'a, P> {
+    intake: &'a mut RtIntake<P>,
+    d: Descriptor,
+    answered: bool,
+}
+
+/// An acknowledged install: its terminal is still owed ([`RtIntake::terminal`] consumes it).
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "an acknowledged install owes its terminal reply (RtIntake::terminal)"]
+pub struct Installed {
+    request: RequestId,
+    plan: PlanHandle,
+    action: ActionId,
+}
+
+impl Installed {
+    pub fn request(&self) -> RequestId { self.request }
+    pub fn action(&self) -> ActionId { self.action }
+    pub fn plan(&self) -> PlanHandle { self.plan }
+}
+
+/// Result of [`Taken::ack`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct Acked {
+    pub commit_seq: u64,
+    /// The install's terminal token (None for an immediate command).
+    pub installed: Option<Installed>,
 }
 
 /// A broker and its RT intake with `caps`; plan slots built by `make` (pre-touched).
@@ -449,7 +495,7 @@ pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl F
     (
         Broker { arm, boot, next_request: 0, commands: ctx, replies: rrx, plans: pw, reply_capacity: caps.replies, reserved: 0,
             pending: HashMap::new(), disconnected: Default::default(), stats: BrokerStats::default() },
-        RtIntake { arm, boot, commands: crx, replies: rtx, plans: pr, commit_seq: 0, taken: false, reply_overflow: 0 },
+        RtIntake { arm, boot, commands: crx, replies: rtx, plans: pr, commit_seq: 0, release: 0, taken_in: 0, installed: 0, reply_overflow: 0 },
     )
 }
 
@@ -516,20 +562,30 @@ impl<P> Broker<P> {
         while let Ok(reply) = self.replies.pop() {
             n += 1;
             let request = reply.request();
-            let Some(p) = self.pending.get_mut(&request) else { continue; };
+            // a reply is delivered only against its own reservation: one ACK or refusal per
+            // request, one terminal per acknowledged install (anything else is counted)
+            let Some(p) = self.pending.get_mut(&request) else { self.stats.unexpected += 1; continue; };
+            let expected = match reply {
+                Reply::Ack { .. } | Reply::Refused { .. } => p.ack,
+                Reply::Terminal { .. } => p.terminal && !p.ack,
+            };
+            if !expected { self.stats.unexpected += 1; continue; }
             match reply {
                 Reply::Ack { .. } => {
                     self.stats.acked += 1;
-                    if p.ack { p.ack = false; self.reserved -= 1; }
+                    p.ack = false;
+                    self.reserved -= 1;
                 }
                 Reply::Refused { .. } => {
                     self.stats.refused_by_rt += 1;
-                    if p.ack { p.ack = false; self.reserved -= 1; }
+                    p.ack = false;
+                    self.reserved -= 1;
                     if p.terminal { p.terminal = false; self.reserved -= 1; }
                 }
                 Reply::Terminal { .. } => {
                     self.stats.terminals += 1;
-                    if p.terminal { p.terminal = false; self.reserved -= 1; }
+                    p.terminal = false;
+                    self.reserved -= 1;
                 }
             }
             let client = p.client;
@@ -546,15 +602,25 @@ impl<P> Broker<P> {
 }
 
 impl<P> RtIntake<P> {
-    /// Starts a release: allows the next [`Self::take`].
-    pub fn begin_release(&mut self) { self.taken = false; }
+    /// Starts release `release` (the executor's release count, strictly increasing): allows
+    /// one [`Self::take`] in it. False, and nothing changes, when `release` does not advance:
+    /// calling it again within a release does not grant a second command.
+    pub fn begin_release(&mut self, release: u64) -> bool {
+        if release <= self.release { return false; }
+        self.release = release;
+        true
+    }
 
-    /// The next ordinary command, at most one per release (None after the first).
-    pub fn take(&mut self) -> Option<Descriptor> {
-        if self.taken { return None; }
+    /// The current release (0 before the first [`Self::begin_release`]).
+    pub fn release(&self) -> u64 { self.release }
+
+    /// The next ordinary command, at most one per release (None after the first, and before
+    /// the first [`Self::begin_release`]).
+    pub fn take(&mut self) -> Option<Taken<'_, P>> {
+        if self.release == 0 || self.taken_in == self.release { return None; }
         let d = self.commands.pop().ok()?;
-        self.taken = true;
-        Some(d)
+        self.taken_in = self.release;
+        Some(Taken { intake: self, d, answered: false })
     }
 
     /// Commands waiting.
@@ -563,11 +629,11 @@ impl<P> RtIntake<P> {
     pub fn arm(&self) -> ArmId { self.arm }
     pub fn boot(&self) -> BootId { self.boot }
 
-    /// The plan of an install, None when stale.
-    pub fn plan(&self, h: PlanHandle) -> Option<&P> { self.plans.get(h) }
+    /// Acknowledged installs whose terminal reply is still owed.
+    pub fn installed(&self) -> usize { self.installed }
 
-    /// Ends the RT's use of a plan slot (`&mut self`: no plan reference may outlive it).
-    pub fn retire(&mut self, h: PlanHandle) -> bool { self.plans.retire(h) }
+    /// The plan of a live install, None when stale.
+    pub fn plan(&self, h: PlanHandle) -> Option<&P> { self.plans.get(h) }
 
     /// Replies the reply ring refused (0 unless a reservation is wrong).
     pub fn reply_overflow(&self) -> u64 { self.reply_overflow }
@@ -576,29 +642,68 @@ impl<P> RtIntake<P> {
         if self.replies.push(r).is_err() { self.reply_overflow += 1; }
     }
 
-    /// Acknowledges a commit proven by `committed` (only an authorized core operation makes
-    /// one, see [`super::ops::Committed`]); returns the commit sequence.
-    pub fn ack(&mut self, d: &Descriptor, committed: super::ops::Committed) -> u64 {
-        self.commit_seq += 1;
-        let seq = self.commit_seq;
-        self.reply(Reply::Ack { request: d.stamp.request, commit_seq: seq, action: committed.action() });
-        seq
-    }
-
-    /// Refuses `d` with `code`; retires its plan slot.
-    pub fn refuse(&mut self, d: &Descriptor, code: &'static str) {
-        if let CommandKind::Install { plan } = d.kind { self.plans.retire(plan); }
-        self.reply(Reply::Refused { request: d.stamp.request, code });
-    }
-
-    /// The physical end of an acknowledged install; retires its plan slot.
-    pub fn terminal(&mut self, d: &Descriptor, action: ActionId, outcome: Outcome) {
-        if let CommandKind::Install { plan } = d.kind { self.plans.retire(plan); }
-        self.reply(Reply::Terminal { request: d.stamp.request, action, outcome });
+    /// The physical end of an acknowledged install (consumes its token: one terminal per
+    /// install); retires its plan slot.
+    pub fn terminal(&mut self, i: Installed, outcome: Outcome) {
+        self.plans.retire(i.plan);
+        self.installed -= 1;
+        self.reply(Reply::Terminal { request: i.request, action: i.action, outcome });
     }
 
     /// The broker is gone (dropped): the RT keeps running and drops replies.
     pub fn broker_gone(&self) -> bool { self.commands.is_abandoned() }
+}
+
+impl<P> Taken<'_, P> {
+    pub fn descriptor(&self) -> &Descriptor { &self.d }
+
+    /// The plan of this install (None: not an install, or the slot is stale).
+    pub fn plan(&self) -> Option<&P> {
+        match self.d.kind { CommandKind::Install { plan } => self.intake.plans.get(plan), CommandKind::Immediate(_) => None }
+    }
+
+    /// Sends the terminal of an earlier install before this command's answer (an install
+    /// that supersedes the active one).
+    pub fn terminal_before(&mut self, i: Installed, outcome: Outcome) { self.intake.terminal(i, outcome); }
+
+    /// Acknowledges the commit proven by `committed`, which must have been made for this
+    /// request: a proof of another request refuses the command (`COMMIT_MISMATCH`) instead.
+    /// An install acknowledged without an action is refused too (`COMMIT_MISMATCH`): its
+    /// terminal could never be sent. Returns the commit sequence and the install's token.
+    pub fn ack(mut self, committed: super::ops::Committed) -> Result<Acked, &'static str> {
+        let install = match self.d.kind { CommandKind::Install { plan } => Some(plan), CommandKind::Immediate(_) => None };
+        if committed.request() != self.d.stamp.request || (install.is_some() && committed.action().is_none()) {
+            self.refuse_now("COMMIT_MISMATCH");
+            return Err("COMMIT_MISMATCH");
+        }
+        self.answered = true;
+        let intake = &mut *self.intake;
+        intake.commit_seq += 1;
+        let commit_seq = intake.commit_seq;
+        let request = self.d.stamp.request;
+        intake.reply(Reply::Ack { request, commit_seq, action: committed.action() });
+        let installed = match (install, committed.action()) {
+            (Some(plan), Some(action)) => { intake.installed += 1; Some(Installed { request, plan, action }) }
+            _ => None,
+        };
+        Ok(Acked { commit_seq, installed })
+    }
+
+    /// Refuses the command with `code`; retires its plan slot.
+    pub fn refuse(mut self, code: &'static str) { self.refuse_now(code); }
+
+    fn refuse_now(&mut self, code: &'static str) {
+        self.answered = true;
+        if let CommandKind::Install { plan } = self.d.kind { self.intake.plans.retire(plan); }
+        let request = self.d.stamp.request;
+        self.intake.reply(Reply::Refused { request, code });
+    }
+}
+
+impl<P> Drop for Taken<'_, P> {
+    fn drop(&mut self) {
+        if !self.answered { self.refuse_now("INTERNAL"); }
+    }
 }
 
 #[cfg(test)]
@@ -645,11 +750,18 @@ mod tests {
     fn one_ordinary_command_per_release() {
         let (mut b, mut rt) = tiny(4, 2, 8);
         for k in 0..3 { b.submit(ClientId(1), k, Authority::default(), later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap(); }
-        rt.begin_release();
-        assert!(rt.take().is_some());
+        assert!(rt.take().is_none(), "no release started");
+        assert!(rt.begin_release(1));
+        rt.take().unwrap().refuse("X");
         assert!(rt.take().is_none(), "a second ordinary command in the same release");
-        rt.begin_release();
-        assert_eq!(rt.take().unwrap().stamp.client_seq, 1);
+        // the boundary is the intake's: restarting the same (or an older) release grants nothing
+        assert!(!rt.begin_release(1));
+        assert!(!rt.begin_release(0));
+        assert!(rt.take().is_none(), "begin_release of the same release reset the allowance");
+        assert!(rt.begin_release(2));
+        let t = rt.take().unwrap();
+        assert_eq!(t.descriptor().stamp.client_seq, 1);
+        t.refuse("X");
         assert_eq!(rt.queued(), 1);
     }
 
@@ -666,10 +778,11 @@ mod tests {
         assert_eq!((b.reserved(), b.outstanding()), (3, 2));
         assert_eq!(b.stats().refused_admission, 1);
         // the queued commands are intact and in order
-        rt.begin_release();
-        let d = rt.take().unwrap();
-        let CommandKind::Install { plan: h } = d.kind else { panic!("install first") };
-        assert_eq!(rt.plan(h), Some(&[1.0; 4]));
+        rt.begin_release(1);
+        let t = rt.take().unwrap();
+        assert!(matches!(t.descriptor().kind, CommandKind::Install { .. }), "install first");
+        assert_eq!(t.plan(), Some(&[1.0; 4]));
+        t.refuse("X");
     }
 
     #[test]
@@ -693,14 +806,14 @@ mod tests {
         for k in 0..100u64 {
             let r = b.submit(ClientId(1), k, auth, later(), Submit::Install(&plan(k as f32))).unwrap();
             assert_eq!(r, RequestId(k + 1));
-            rt.begin_release();
-            let d = rt.take().unwrap();
-            let CommandKind::Install { plan: h } = d.kind else { panic!() };
-            assert_eq!(rt.plan(h), Some(&[k as f32; 4]));
+            rt.begin_release(k + 1);
+            let t = rt.take().unwrap();
+            let CommandKind::Install { plan: h } = t.descriptor().kind else { panic!() };
+            assert_eq!(t.plan(), Some(&[k as f32; 4]));
             gens.push(h.generation());
-            let seq = rt.ack(&d, super::super::ops::Committed::for_tests(Some(ActionId(k))));
-            assert_eq!(seq, k + 1);
-            rt.terminal(&d, ActionId(k), Outcome::Completed);
+            let acked = t.ack(super::super::ops::Committed::for_tests(r, Some(ActionId(k)))).unwrap();
+            assert_eq!(acked.commit_seq, k + 1);
+            rt.terminal(acked.installed.unwrap(), Outcome::Completed);
             let mut got = Vec::new();
             assert_eq!(b.poll(|_, r| { got.push(r); true }), 2);
             assert_eq!(got, vec![Reply::Ack { request: r, commit_seq: k + 1, action: Some(ActionId(k)) }, Reply::Terminal { request: r, action: ActionId(k), outcome: Outcome::Completed }]);
@@ -765,19 +878,18 @@ mod tests {
         b.submit(ClientId(2), 0, auth, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
         b.disconnect(ClientId(1));
         assert_eq!(b.submit(ClientId(1), 1, auth, later(), Submit::Immediate(ImmediateOp::Heartbeat)), Err(AdmitError::Disconnected));
-        rt.begin_release();
-        let d1 = rt.take().unwrap();
-        rt.ack(&d1, super::super::ops::Committed::for_tests(Some(ActionId(5))));
-        rt.begin_release();
-        let d2 = rt.take().unwrap();
-        rt.refuse(&d2, "NOT_ARMED");
+        rt.begin_release(1);
+        let t1 = rt.take().unwrap();
+        let i1 = t1.ack(super::super::ops::Committed::for_tests(r1, Some(ActionId(5)))).unwrap().installed.unwrap();
+        rt.begin_release(2);
+        rt.take().unwrap().refuse("NOT_ARMED");
         // client 2's receiver is gone too: deliver says so
         let mut delivered = Vec::new();
         b.poll(|c, r| if c == ClientId(2) { false } else { delivered.push(r); true });
         assert!(delivered.is_empty(), "nothing reaches a disconnected client");
         assert_eq!(b.stats().abandoned, 2);
         assert_eq!(b.reserved(), 1, "the install's terminal is still reserved");
-        rt.terminal(&d1, ActionId(5), Outcome::Stopped);
+        rt.terminal(i1, Outcome::Stopped);
         b.poll(|_, _| true);
         assert_eq!((b.reserved(), b.outstanding(), b.stats().abandoned), (0, 0, 3));
         assert_eq!(r1, RequestId(1));
@@ -790,12 +902,55 @@ mod tests {
         let (mut b, mut rt) = tiny(4, 1, 4);
         b.submit(ClientId(1), 0, Authority::default(), later(), Submit::Install(&plan(1.0))).unwrap();
         assert_eq!(b.reserved(), 2);
-        rt.begin_release();
-        let d = rt.take().unwrap();
-        rt.refuse(&d, "STOPPED");
+        rt.begin_release(1);
+        rt.take().unwrap().refuse("STOPPED");
         assert_eq!(b.poll(|_, r| { assert_eq!(r, Reply::Refused { request: RequestId(1), code: "STOPPED" }); true }), 1);
         assert_eq!((b.reserved(), b.stats().retired), (0, 1));
         assert!(b.submit(ClientId(1), 1, Authority::default(), later(), Submit::Install(&plan(2.0))).is_ok(), "slot reused");
+    }
+
+    #[test]
+    fn a_commit_proof_acks_only_its_own_request_and_only_once() {
+        let (mut b, mut rt) = tiny(4, 2, 8);
+        let auth = Authority::default();
+        let r1 = b.submit(ClientId(1), 0, auth, later(), Submit::Install(&plan(1.0))).unwrap();
+        let r2 = b.submit(ClientId(1), 1, auth, later(), Submit::Immediate(ImmediateOp::Heartbeat)).unwrap();
+        rt.begin_release(1);
+        // a proof made for request 2 cannot acknowledge request 1
+        let t = rt.take().unwrap();
+        assert_eq!(t.ack(super::super::ops::Committed::for_tests(r2, None)), Err("COMMIT_MISMATCH"));
+        // an install acknowledged without an action could never send its terminal
+        rt.begin_release(2);
+        let t = rt.take().unwrap();
+        assert_eq!(t.ack(super::super::ops::Committed::for_tests(r2, Some(ActionId(1)))).unwrap().installed, None);
+        let mut got = Vec::new();
+        b.poll(|_, r| { got.push(r); true });
+        assert_eq!(got, vec![Reply::Refused { request: r1, code: "COMMIT_MISMATCH" }, Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(1)) }]);
+        assert_eq!((b.reserved(), b.outstanding(), b.stats().unexpected, rt.installed()), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn an_unanswered_command_is_refused_and_reservations_match_replies_exactly() {
+        let (mut b, mut rt) = tiny(4, 2, 4);
+        let auth = Authority::default();
+        let r1 = b.submit(ClientId(1), 0, auth, later(), Submit::Install(&plan(1.0))).unwrap();
+        let r2 = b.submit(ClientId(1), 1, auth, later(), Submit::Install(&plan(2.0))).unwrap();
+        assert_eq!(b.reserved(), 4, "ack + terminal per install");
+        rt.begin_release(1);
+        drop(rt.take().unwrap());
+        rt.begin_release(2);
+        let i2 = rt.take().unwrap().ack(super::super::ops::Committed::for_tests(r2, Some(ActionId(9)))).unwrap().installed.unwrap();
+        // the ring holds exactly the reserved replies: never more than were reserved
+        rt.terminal(i2, Outcome::Completed);
+        let mut got = Vec::new();
+        b.poll(|_, r| { got.push(r); true });
+        assert_eq!(got, vec![
+            Reply::Refused { request: r1, code: "INTERNAL" },
+            Reply::Ack { request: r2, commit_seq: 1, action: Some(ActionId(9)) },
+            Reply::Terminal { request: r2, action: ActionId(9), outcome: Outcome::Completed },
+        ]);
+        assert_eq!((b.reserved(), b.outstanding(), b.stats().unexpected, rt.reply_overflow()), (0, 0, 0, 0));
+        assert_eq!(b.stats().retired, 2);
     }
 
     /// Writer and reader on two threads: a plan read through a live handle is always the
