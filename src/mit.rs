@@ -794,7 +794,12 @@ impl crate::supervisor::SupervisorInner {
                         }
                     }
                 }
-                drv.write_joint_targets(targets).map_err(|e| e.to_string())
+                let write_res = if self.safety.state().is_stopped() {
+                    drv.write_estop_hold(targets)
+                } else {
+                    drv.write_joint_targets(targets)
+                };
+                write_res.map_err(|e| e.to_string())
             });
         if let Some(ff) = ff {
             match &res {

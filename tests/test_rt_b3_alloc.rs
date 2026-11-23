@@ -1863,3 +1863,127 @@ async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_relea
     assert_eq!(handle_lim.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
     handle_lim.stop_and_join();
 }
+
+#[test]
+fn arm_driver_error_write_bounded_and_clear_fault_error_cover_all_variants_zero_alloc() {
+    use armd::driver::{MitFenceTripReason, TxFailKind};
+
+    // Compile-time exhaustive witness: adding a variant to `ArmDriverError` updates this list.
+    fn variant_tag(e: &ArmDriverError) -> &'static str {
+        match e {
+            ArmDriverError::Transport(_) => "Transport",
+            ArmDriverError::Protocol(_) => "Protocol",
+            ArmDriverError::JointCountMismatch { .. } => "JointCountMismatch",
+            ArmDriverError::HardwareFault(_) => "HardwareFault",
+            ArmDriverError::Timeout(_) => "Timeout",
+            ArmDriverError::TxDeferred { .. } => "TxDeferred",
+            ArmDriverError::EstopInhibited => "EstopInhibited",
+            ArmDriverError::MitFenceTripped(_) => "MitFenceTripped",
+            ArmDriverError::TorqueTransitionPending => "TorqueTransitionPending",
+            ArmDriverError::PendingTxDisabledUnderMitFence => "PendingTxDisabledUnderMitFence",
+            ArmDriverError::PosForceModeUnconfirmed { .. } => "PosForceModeUnconfirmed",
+            ArmDriverError::PosForceFeedbackStale { .. } => "PosForceFeedbackStale",
+            ArmDriverError::PosForceFeedbackStaleBeforeTransmit { .. } => "PosForceFeedbackStaleBeforeTransmit",
+            ArmDriverError::PosForceTargetUnavailable { .. } => "PosForceTargetUnavailable",
+            ArmDriverError::PosForceTargetNotFinite { .. } => "PosForceTargetNotFinite",
+            ArmDriverError::PosForceSpeedZero { .. } => "PosForceSpeedZero",
+            ArmDriverError::PosForceReadbackTxFailed { .. } => "PosForceReadbackTxFailed",
+            ArmDriverError::PosForcePreEnableHoldBudgetExhausted { .. } => "PosForcePreEnableHoldBudgetExhausted",
+            ArmDriverError::PosForcePreEnableHoldTxFailed { .. } => "PosForcePreEnableHoldTxFailed",
+            ArmDriverError::TxQueueFull { .. } => "TxQueueFull",
+        }
+    }
+
+    let mut samples: Vec<ArmDriverError> = vec![
+        ArmDriverError::Transport(TransportError::Timeout),
+        ArmDriverError::Transport(TransportError::WouldBlock),
+        ArmDriverError::Transport(TransportError::NoBufferSpace),
+        ArmDriverError::Transport(TransportError::NotOpen),
+        ArmDriverError::Transport(TransportError::ChecksumMismatch { expected: 0xAA, actual: 0x55 }),
+        ArmDriverError::Transport(TransportError::FrameTooShort { expected: 8, actual: 3 }),
+        ArmDriverError::Transport(TransportError::InvalidCanFrame { reason: "dlc > 8", id: 0x101 }),
+        ArmDriverError::Transport(TransportError::CanBusErrorFrame { id: 0x2000_0004 }),
+        ArmDriverError::Transport(TransportError::SocketCanOs {
+            op: "send",
+            errno: None,
+            kind: std::io::ErrorKind::BrokenPipe,
+        }),
+        ArmDriverError::Protocol("bad register reply".into()),
+        ArmDriverError::JointCountMismatch { expected: 7, actual: 6 },
+        ArmDriverError::HardwareFault("motor 2 overvoltage".into()),
+        ArmDriverError::Timeout(4),
+        ArmDriverError::TxDeferred { pending: 5 },
+        ArmDriverError::EstopInhibited,
+        ArmDriverError::MitFenceTripped(MitFenceTripReason::FeedbackStale {
+            joint: 2,
+            age: Some(Duration::from_millis(50)),
+            deadline: Duration::from_millis(45),
+        }),
+        ArmDriverError::MitFenceTripped(MitFenceTripReason::TransmitFailed {
+            joint: 3,
+            completed_joints: 2,
+            total_joints: 7,
+            kind: TxFailKind::Enobufs,
+        }),
+        ArmDriverError::MitFenceTripped(MitFenceTripReason::TxBudgetExceededPreflight {
+            needed: 7,
+            remaining: 4,
+            max: 16,
+        }),
+        ArmDriverError::TorqueTransitionPending,
+        ArmDriverError::PendingTxDisabledUnderMitFence,
+        ArmDriverError::PosForceModeUnconfirmed { joint: 6 },
+        ArmDriverError::PosForceFeedbackStale { joint: 6 },
+        ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: 6 },
+        ArmDriverError::PosForceTargetUnavailable { joint: 6 },
+        ArmDriverError::PosForceTargetNotFinite { joint: 6 },
+        ArmDriverError::PosForceSpeedZero { joint: 6 },
+        ArmDriverError::PosForceReadbackTxFailed { joint: 6, kind: TxFailKind::WouldBlock },
+        ArmDriverError::PosForcePreEnableHoldBudgetExhausted { joint: 6 },
+        ArmDriverError::PosForcePreEnableHoldTxFailed { joint: 6, kind: TxFailKind::Enobufs },
+        ArmDriverError::TxQueueFull { queued: 30, new: 7, capacity: 32 },
+    ];
+    #[cfg(unix)]
+    {
+        samples.push(ArmDriverError::Transport(TransportError::SocketCanOs {
+            op: "send",
+            errno: Some(libc::ENETDOWN),
+            kind: std::io::ErrorKind::Other,
+        }));
+        samples.push(ArmDriverError::Transport(TransportError::Io(
+            std::io::Error::from_raw_os_error(libc::ENETDOWN),
+        )));
+    }
+
+    alloc::time_this_thread();
+    for err in &samples {
+        let tag = variant_tag(err);
+        let _ = alloc::take();
+        let mut buf = BoundedText::<256>::empty();
+        err.write_bounded(&mut buf);
+        let wb_allocs = alloc::take();
+        assert_eq!(wb_allocs.calls, 0, "write_bounded allocated for {tag}: {wb_allocs:?}");
+
+        let _ = alloc::take();
+        let cf = err.to_clear_fault_error();
+        let cf_allocs = alloc::take();
+        assert_eq!(cf_allocs.calls, 0, "to_clear_fault_error allocated for {tag}: {cf_allocs:?}");
+
+        let expected = err.to_string();
+        assert_eq!(buf.to_string(), expected, "write_bounded text mismatch for {tag}");
+        assert_eq!(cf.to_string(), expected, "ClearFaultDriverError text mismatch for {tag}");
+    }
+
+    #[cfg(unix)]
+    {
+        let os_err = ArmDriverError::Transport(TransportError::SocketCanOs {
+            op: "send",
+            errno: Some(libc::ENETDOWN),
+            kind: std::io::ErrorKind::Other,
+        });
+        assert_eq!(
+            os_err.to_string(),
+            format!("Transport error: SocketCAN send failed: {}", std::io::Error::from_raw_os_error(libc::ENETDOWN))
+        );
+    }
+}

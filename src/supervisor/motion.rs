@@ -176,9 +176,9 @@ impl SupervisorInner {
         if exited_gravity_comp && !driver_contended && self.is_torqued && !self.disable_pending {
             if let (Some(targets), Some(d)) = (self.gravity_comp_targets_array(), driver) {
                 if let Ok(mut drv) = d.try_lock() {
-                    if let Err(e) = drv.write_joint_targets(&targets) {
+                    if let Err(e) = drv.write_estop_hold(&targets) {
                         let mut msg = crate::safety::BoundedText::<160>::empty();
-                        let _ = core::fmt::write(&mut msg, format_args!("{e}"));
+                        e.write_bounded(&mut msg);
                         self.safety.log_gravity_comp_hold_write_failed(msg);
                     }
                 }

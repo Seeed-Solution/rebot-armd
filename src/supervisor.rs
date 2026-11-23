@@ -3431,7 +3431,12 @@ impl SupervisorInner {
             } else if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
                 if let Ok(mut driver) = d.lock() {
                     if driver.enable_state() != EnableState::Disabled {
-                        match driver.write_joint_targets(&targets) {
+                        let write_res = if self.safety.state().is_stopped() {
+                            driver.write_estop_hold(&targets)
+                        } else {
+                            driver.write_joint_targets(&targets)
+                        };
+                        match write_res {
                             Ok(()) => tick_output_accepted = true,
                             Err(e) => output_error = Some(e.to_string()),
                         }

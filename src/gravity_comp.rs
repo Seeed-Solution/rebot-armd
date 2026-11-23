@@ -375,7 +375,12 @@ impl SupervisorInner {
         let Some(targets) = self.gravity_comp_targets_array() else { return; };
         if let Some(d) = &self.driver {
             if let Ok(mut drv) = d.lock() {
-                if let Err(e) = drv.write_joint_targets(&targets) { tracing::error!("Gravity comp hold write failed: {e}"); }
+                let r = if self.safety.state().is_stopped() {
+                    drv.write_estop_hold(&targets)
+                } else {
+                    drv.write_joint_targets(&targets)
+                };
+                if let Err(e) = r { tracing::error!("Gravity comp hold write failed: {e}"); }
             }
         }
     }

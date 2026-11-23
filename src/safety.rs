@@ -885,6 +885,7 @@ pub enum ClearFaultDriverError {
     Protocol(BoundedText<256>),
     HardwareFault(BoundedText<256>),
     TransportFormatted(BoundedText<256>),
+    Formatted(BoundedText<256>),
 }
 
 impl std::fmt::Display for ClearFaultDriverError {
@@ -904,6 +905,7 @@ impl std::fmt::Display for ClearFaultDriverError {
             Self::Protocol(msg) => write!(f, "Protocol error: {msg}"),
             Self::HardwareFault(msg) => write!(f, "Hardware fault: {msg}"),
             Self::TransportFormatted(msg) => write!(f, "Transport error: {msg}"),
+            Self::Formatted(msg) => write!(f, "{msg}"),
         }
     }
 }

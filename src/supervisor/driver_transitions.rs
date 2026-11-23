@@ -1432,7 +1432,8 @@ impl SupervisorInner {
     /// (as in `torque_off`).
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
         let detail = crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
-            let _ = core::fmt::write(buf, format_args!("Torque disable transmission failed: {e}"));
+            buf.push_str("Torque disable transmission failed: ");
+            e.write_bounded(buf);
         });
         let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
         self.safety.latch(crate::safety::FaultKind::Other, detail);
@@ -2227,26 +2228,7 @@ impl SupervisorInner {
 }
 
 fn clear_fault_driver_error(e: &crate::driver::ArmDriverError) -> crate::safety::ClearFaultDriverError {
-    use crate::driver::ArmDriverError as E;
-    use crate::safety::{BoundedText, ClearFaultDriverError as C};
-    use crate::transport::TransportError as T;
-    match e {
-        E::Transport(T::Timeout) => C::TransportTimeout,
-        E::Transport(T::WouldBlock) => C::TransportWouldBlock,
-        E::Transport(T::NotOpen) => C::TransportNotOpen,
-        E::Transport(T::ChecksumMismatch { expected, actual }) => C::TransportChecksumMismatch { expected: *expected, actual: *actual },
-        E::Transport(T::FrameTooShort { expected, actual }) => C::TransportFrameTooShort { expected: *expected, actual: *actual },
-        E::Transport(other) => {
-            let mut buf = BoundedText::empty();
-            let _ = core::fmt::write(&mut buf, format_args!("{other}"));
-            C::TransportFormatted(buf)
-        }
-        E::Protocol(s) => C::Protocol(BoundedText::new(s)),
-        E::JointCountMismatch { expected, actual } => C::JointCountMismatch { expected: *expected, actual: *actual },
-        E::HardwareFault(s) => C::HardwareFault(BoundedText::new(s)),
-        E::Timeout(id) => C::JointTimeout(*id),
-        E::EstopInhibited => C::EstopInhibited,
-    }
+    e.to_clear_fault_error()
 }
 
 fn describe_workspace_slot_bounded(

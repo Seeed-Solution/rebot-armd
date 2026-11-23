@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 
 use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
 use armd::protocol::damiao::{self, DamiaoLimits};
-use armd::transport::{CanFrame, CanTransport, TransportError};
+use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
 use armd::model::JointState;
 use armd::motion::{GripperCommand, GripperRequest};
 use armd::{ArmConfig, SupervisorInner};
@@ -137,11 +137,16 @@ const DEVICE_PROFILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera
 struct FakeDamiaoBus {
     motors: Vec<(u16, DamiaoLimits, f32, bool)>,
     rx: VecDeque<CanFrame>,
+    clock: std::sync::Arc<MockClock>,
 }
 
 impl FakeDamiaoBus {
     fn new(limits: &[DamiaoLimits]) -> Self {
-        Self { motors: limits.iter().enumerate().map(|(i, l)| (i as u16 + 1, *l, 0.0, false)).collect(), rx: VecDeque::with_capacity(1024) }
+        Self {
+            motors: limits.iter().enumerate().map(|(i, l)| (i as u16 + 1, *l, 0.0, false)).collect(),
+            rx: VecDeque::with_capacity(1024),
+            clock: std::sync::Arc::new(MockClock::new()),
+        }
     }
 
     fn reply(&mut self, k: usize) {
@@ -156,6 +161,7 @@ impl FakeDamiaoBus {
 }
 
 impl CanTransport for FakeDamiaoBus {
+    fn clock(&self) -> Option<std::sync::Arc<dyn DriverClock>> { Some(self.clock.clone()) }
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let id = frame.id as u16;
         let find = |m: &[(u16, DamiaoLimits, f32, bool)], id: u16| m.iter().position(|x| x.0 == id);
@@ -502,7 +508,12 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
             let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
             let p = r0.pin(h).unwrap();
             assert_eq!(p.path.len(), 1);
+            assert_eq!(p.path.capacity(), 1);
+            assert!(p.payload_bytes() > 0);
+            assert_eq!(p.path.samples()[0][0], 0.25);
             drop(p);
+            assert_eq!(w0.free(), 0);
+            assert!(w0.stage(|_| {}).is_none());
             assert!(r0.retire(h));
             assert_eq!(w0.reclaim(), 1);
         });

@@ -291,17 +291,31 @@ fn mit_watchdog_tx_loss() {
     assert!(last_at < lost_at + FENCE, "the fence stopped the batches within 45 ms of the last feedback");
     assert_eq!(expired, Some(last_at + Duration::from_millis(100)));
 
-    // the same RX-only loss without the fence (the pre-Phase-2 gravity-compensation path):
-    // driver recovery replays the cached MIT frame and keeps feeding the motor watchdog
+    // the same RX-only loss without the fence (gravity-compensation path):
+    // driver recovery rebuilds fresh MIT hold frames while feedback stays <= 100 ms old
+    // (extending last_cmd_at past the 45 ms fence limit, which is why MIT tracking arms the fence),
+    // then stops transmitting once feedback ages past 100 ms so no cached frame is ever replayed
+    // and the motor watchdog expires 100 ms after the last fresh rebuild.
     let (mut d, bus, clock) = rig(2000);
     let hold = hold_at(&mut d);
     d.set_joint_modes(&modes_j4(JointMode::Mit), &hold).unwrap();
     clock.advance(Duration::from_millis(20));
     let t = targets(&mut d, 0.0);
     d.write_joint_targets(&t).unwrap();
+    let _ = d.read_joint_states();
+    let lost_at = clock.now();
     bus.with(|s| for m in s.motors.iter_mut() { m.silent = true; });
     for _ in 0..30 { clock.advance(Duration::from_millis(10)); let _ = d.read_joint_states(); }
-    assert_eq!(bus.with(|s| s.motors[J4].watchdog_expired_at), None, "replays feed the watchdog (why MIT tracking arms the fence)");
+    let (last_at, expired) = bus.with(|s| (s.motors[J4].last_cmd_at.unwrap(), s.motors[J4].watchdog_expired_at));
+    assert!(
+        last_at >= lost_at + FENCE,
+        "unfenced gravity-comp recovery rebuilds MIT hold frames past the 45 ms fence while feedback is still <= 100 ms fresh"
+    );
+    assert_eq!(
+        expired,
+        Some(last_at + Duration::from_millis(100)),
+        "once feedback ages > 100 ms, recovery must stop sending (no cached replay) and let motor TIMEOUT expire"
+    );
 
     // TIMEOUT 0 (power-up default): no motor-side protection at all; the gate refuses it
     let (mut d, bus, clock) = rig(0);
@@ -511,7 +525,13 @@ fn mit_staggered_switch_holds_do_not_extend_the_deadline() {
     let clock = MockClock::new();
     let lim = b601_limits();
     let bus = FakeBus::with_clock(&lim[3..5], clock.clone());
-    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2]).with_joint_limits(lim[3..5].to_vec()).unwrap();
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2])
+        .with_joint_limits(lim[3..5].to_vec())
+        .unwrap()
+        .with_tx_budget(armd::driver::TxBudget {
+            max_duration: FENCE,
+            ..armd::driver::TxBudget::default()
+        });
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
     d.check_mapping_ranges(); // ranges verified: the switch sends only mode writes and holds
