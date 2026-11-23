@@ -1057,6 +1057,8 @@ pub const SETTLE_POS_RAD: f64 = 0.05;
 pub const SETTLE_VEL: f64 = 0.05;
 /// An open / move gripper action that stops within this distance of its target counts as done.
 pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
+/// A calibration stroke must end within this distance of its target (rad).
+pub const CALIBRATION_END_TOL_RAD: f32 = 0.03;
 pub const SETTLE_HOLD_S: f64 = 0.2;
 /// Grasp contact: consecutive ticks of torque rise or following error.
 pub const GRIPPER_CONTACT_TICKS: u32 = 2;
@@ -1360,7 +1362,8 @@ impl GripperMotion {
     /// A Done move: keep it for learning when unloaded.
     fn finish_learning(&mut self, m_g: f32, holding: Option<bool>) {
         if self.learn == LearnMode::Off || self.loaded || holding == Some(true) || !m_g.is_finite() { return; }
-        if (self.target - m_g).abs() > self.policy.holding_gap_rad.max(GRIPPER_STOP_SHORT_RAD) { return; }
+        let tol = if self.learn == LearnMode::Calibration { CALIBRATION_END_TOL_RAD } else { self.policy.holding_gap_rad.max(GRIPPER_STOP_SHORT_RAD) };
+        if (self.target - m_g).abs() > tol { return; }
         let Some(samples) = self.samples.take() else { return };
         let direction = if (self.target - self.start) * self.close_dir() > 0.0 { Direction::Close } else { Direction::Open };
         self.learned = Some(MoveRecord { direction, start_rad: self.start, end_rad: m_g, samples, calibration: self.learn == LearnMode::Calibration });
@@ -1550,6 +1553,8 @@ impl GripperMotion {
         }
         if stalled { self.note_load(m_g); }
         if ctx.gripper_force_capped { self.loaded = true; }
+        // a calibration stroke must not stall anywhere (near the target included)
+        if self.learn == LearnMode::Calibration && (stalled || (ctx.gripper_force_capped && !clear)) { self.loaded = true; }
         if ctx.feedback_fresh && ctx.torque_feedback {
             if let Some(s) = self.samples.as_mut() { s.push(m_g, tau_g.abs(), mv_g.abs()); }
         }

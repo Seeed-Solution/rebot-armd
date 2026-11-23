@@ -381,25 +381,33 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
 
 /// WS command path of the empty-gripper calibration action.
 pub const CALIBRATE_PATH: &str = "/api/v1/action/gripper_calibrate";
-/// A stroke must end within this distance of its target (rad; the real gripper opens to about
-/// -5.61 against a -5.70 command).
-pub const CALIBRATION_TARGET_TOL_RAD: f32 = crate::motion::GRIPPER_STOP_SHORT_RAD;
+/// A stroke must end within this distance of its target (rad). The strokes stay off both
+/// mechanical stops (5 % and 95 % open; the real gripper opens to about -5.61 against a -5.70
+/// command), so a free jaw reaches them.
+pub const CALIBRATION_TARGET_TOL_RAD: f32 = crate::motion::CALIBRATION_END_TOL_RAD;
+/// Calibration strokes run between these opening fractions.
+pub const CALIBRATION_CLOSED_FRACTION: f64 = 0.05;
+pub const CALIBRATION_OPEN_FRACTION: f64 = 0.95;
+/// Free motion: away from the start and the end (LEARN_*_GUARD_RAD), at most this share of a
+/// stroke's samples may move slower than CALIBRATION_MIN_SPEED_FRACTION of the stroke speed.
+pub const CALIBRATION_SLOW_SHARE_MAX: f32 = 0.1;
+pub const CALIBRATION_MIN_SPEED_FRACTION: f32 = 0.5;
 /// |τ| p95 of a stroke above this fraction of `max_close_torque_nm` is not free motion.
 pub const CALIBRATION_MAX_TORQUE_FRACTION: f32 = 0.85;
 /// Without a torque cap: |τ| p95 limit of a stroke (N·m).
 pub const CALIBRATION_MAX_TORQUE_NM: f32 = 0.85;
 
-/// One calibration stroke: `fraction` None = open, else move to that fraction (closing).
+/// One calibration stroke: move to opening `fraction` at `speed` (rad/s).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Stroke { pub fraction: Option<f64>, pub speed: f64 }
+pub struct Stroke { pub fraction: f64, pub speed: f64 }
 
-/// The strokes: close to 5 %, then 4 x (open at 1.0 rad/s, close to 5 %), 2 x (open at
+/// The strokes: close to 5 %, then 4 x (open to 95 % at 1.0 rad/s, close to 5 %), 2 x (open at
 /// 0.3 rad/s, close to 5 %), and a final open at 1.0 rad/s. Every close runs at `close_speed`
 /// (`gripper_policy.close_speed_rad_s`, 0.3 rad/s by default), the first one included: the fast
 /// closing band is not learned (closes at speed fall back on the slow band).
 pub fn strokes(close_speed: f64) -> Vec<Stroke> {
-    let close = Stroke { fraction: Some(0.05), speed: close_speed };
-    let open = |speed| Stroke { fraction: None, speed };
+    let close = Stroke { fraction: CALIBRATION_CLOSED_FRACTION, speed: close_speed };
+    let open = |speed| Stroke { fraction: CALIBRATION_OPEN_FRACTION, speed };
     let mut v = vec![close];
     for _ in 0..4 { v.push(open(1.0)); v.push(close); }
     for _ in 0..2 { v.push(open(0.3)); v.push(close); }
@@ -502,9 +510,8 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         let n = i + 1;
         let phase = format!("stroke:{n}/{}", list.len());
         ctx.phase(&phase, i as f32 / list.len() as f32).await?;
-        let command = if st.fraction.is_some() { crate::motion::GripperCommand::Move } else { crate::motion::GripperCommand::Open };
-        let request = crate::motion::GripperRequest { command, fraction: st.fraction, grasp: false, speed: st.speed, timeout_s: None, tag: None };
-        let target = st.fraction.map_or(policy.open_rad, |f| policy.closed_rad + f as f32 * (policy.open_rad - policy.closed_rad));
+        let request = crate::motion::GripperRequest { command: crate::motion::GripperCommand::Move, fraction: Some(st.fraction), grasp: false, speed: st.speed, timeout_s: None, tag: None };
+        let target = policy.closed_rad + st.fraction as f32 * (policy.open_rad - policy.closed_rad);
         let (limit_s, before) = {
             let mut inner = ctx.sup.inner().write().await;
             if !inner.macro_alive(ctx.id) { return Err(crate::macro_action::Stop::Cancelled); }
@@ -522,8 +529,20 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
             return Err(obstructed(format!("stroke {n}: the jaw stopped at {at:.3} rad, {:.3} rad short of {target:.3} rad; check that nothing is in or against the jaws", (at - target).abs())));
         }
         let Some(rec) = rec else {
-            return Err(obstructed(format!("stroke {n}: a contact, stall or torque cap trip on the way; check that nothing is in or against the jaws")));
+            return Err(obstructed(format!("stroke {n}: a stall or torque cap trip on the way; check that nothing is in or against the jaws")));
         };
+        // free motion: the jaw kept up with the stroke speed away from its ends
+        let sign = if rec.end_rad >= rec.start_rad { 1.0 } else { -1.0 };
+        let (mut mid, mut slow) = (0usize, 0usize);
+        for &(q, _, v) in rec.samples.iter() {
+            let (from_start, to_end) = ((q - rec.start_rad) * sign, (rec.end_rad - q) * sign);
+            if from_start < crate::gripper_baseline::LEARN_START_GUARD_RAD || to_end < crate::gripper_baseline::LEARN_END_GUARD_RAD { continue; }
+            mid += 1;
+            if v < CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32 { slow += 1; }
+        }
+        if mid > 0 && slow as f32 > CALIBRATION_SLOW_SHARE_MAX * mid as f32 {
+            return Err(obstructed(format!("stroke {n}: the jaw moved slower than {:.2} rad/s for {slow} of {mid} samples", CALIBRATION_MIN_SPEED_FRACTION * st.speed as f32)));
+        }
         let p95 = torque_quantile(&rec, 0.95);
         if p95 > limit_nm {
             return Err(obstructed(format!("stroke {n}: |torque| p95 {p95:.2} N·m above {limit_nm:.2} N·m")));

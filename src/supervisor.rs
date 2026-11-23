@@ -94,6 +94,10 @@ pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
 pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
+/// The torque stall latch needs the J7 command at least this far from the measured jaw (rad):
+/// a blocked jaw falls behind its command, a free jaw settling onto its target does not (it
+/// reads 0.5-0.7 N·m of friction at low speed near open on the B601-DM new finger).
+pub const GRIPPER_STALL_MIN_LEAD_RAD: f32 = 0.05;
 /// Gripper torque cap: consecutive ticks with |τ| above `gripper_policy.max_close_torque_nm`
 /// (fresh feedback, jaw driven closed; or the torque pushing open above it while driven open)
 /// that latch the stall regardless of the jaw speed. One: the first sample over the cap latches
@@ -5844,8 +5848,10 @@ impl SupervisorInner {
                     // the measured jaw (which reads ~0 N·m on a rigid object and re-squeezes);
                     // the threshold is raised to the learned free-motion torque + margin where
                     // the jaw needs more than GRIPPER_STALL_LATCH_NM to move
+                    // the command must lead the jaw: a free jaw settling onto its target reads its
+                    // friction torque at low speed with the command next to it
                     self.gripper_stream_contact.is_none()
-                        && tau_g.abs() >= stall_nm && v_g.abs() < 0.10
+                        && tau_g.abs() >= stall_nm && v_g.abs() < 0.10 && gap.abs() > GRIPPER_STALL_MIN_LEAD_RAD
                 } else {
                     let stall_load_thresh = self.config.gripper_policy.as_ref()
                         .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)

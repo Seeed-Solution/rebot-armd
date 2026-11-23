@@ -83,6 +83,8 @@ enum Load {
     OpenBlock(f32, f32),
     /// Something dragging on the jaw between `.0` and `.1` (rad): `.2` N·m more while moving.
     Drag(f32, f32, f32),
+    /// A thin rigid obstruction at `.0` while closing (stiffness `.1` N·m/rad on the command past it).
+    CloseBlock(f32, f32),
     /// Soft object from `.0` (k 1.5 N·m/rad) that slips out of the jaws after being pressed for
     /// `.1` ticks (counted in `Rig::pressed`).
     SlipAfter(f32, u32),
@@ -144,6 +146,8 @@ impl ArmDriver for RigDriver {
                     if r.pressed > n { r.load = Load::Free; free } else { free + 1.5 * (q - at) }
                 }
                 Load::SlipAfter(..) => free,
+                Load::CloseBlock(at, k) if q >= at => { q = at; v = 0.0; (k * (t.position - at)).max(0.0) }
+                Load::CloseBlock(..) => free,
             };
             r.q[6] = q;
             r.v[6] = v;
@@ -703,4 +707,29 @@ fn gripper_zero_change_invalidates_the_baseline() {
     p.open_rad += 0.02;
     inner.gripper_baseline_for_motion();
     assert_eq!(baseline_obs(&inner).state, "unlearned");
+}
+
+/// A thin obstruction 0.10 rad before the closing stroke's target (5 % open): whether the jaw
+/// stops on it below the stall threshold (3 N·m/rad: 0.3 N·m) or stalls / trips the cap on it
+/// (20 N·m/rad), the first close fails CALIBRATION_OBSTRUCTED, no further stroke runs and nothing
+/// is learned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() {
+    let p = GripperPolicy::rebot_dm();
+    let target = p.closed_rad + 0.05 * (p.open_rad - p.closed_rad);
+    for k in [3.0f32, 20.0] {
+        let (sup, rig) = calib_rig(Finger::New).await;
+        let before = { let mut inner = sup.inner().write().await; inner.gripper_baseline_for_motion(); inner.gripper_baseline.clone() };
+        rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
+        let (id, _) = armd::gripper_calib::start_calibration(&sup).await.unwrap();
+        let a = calib_wait(&sup, id, |_| {}).await;
+        for _ in 0..200 {
+            if sup.inner().read().await.gripper_calibration.is_none() { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let inner = sup.inner().read().await;
+        eprintln!("thin obstruction k {k}: {} {:?} {:?} (phase {:?})", a.state, a.code, a.message, a.phase);
+        assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("CALIBRATION_OBSTRUCTED"), Some("stroke:1/14")), "k {k}: {a:?}");
+        assert_eq!(inner.gripper_baseline, before, "k {k}: baseline changed");
+    }
 }
