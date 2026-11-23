@@ -4357,7 +4357,12 @@ impl Orchestrator {
         // the TCP never rises to the object from below; the envelope keeps the table clearance
         let rules = crate::backlash::DescentRules { table: Some((self.envelope.clone(), s.table_z_m + TABLE_CLEARANCE_M)), ..crate::backlash::DescentRules::tcp_at(self.tcp_offset) };
         let final_approach = crate::macro_action::FinalApproach { use_: "grasp_final", request: ins.approach, rules };
-        let guard = ContactGuard { stop_nm: s.descend_contact_stop_nm, table_z_m: s.table_z_m };
+        // J2 / J3 bounded by descend_contact_stop_nm (none: peaks only); a contact ends the descent done
+        let lim = s.descend_contact_stop_nm.map_or(0.0, |l| l as f32);
+        let mut max_residual_nm = [0.0; crate::rt_core::mailbox::MAX_DOF];
+        max_residual_nm[1] = lim;
+        max_residual_nm[2] = lim;
+        let guard = ContactGuard { max_residual_nm, stop_code: None };
         self.sup.inner().write().await.guard_next_macro_child(self.id, Some(guard));
         let result = self.move_arm_final_in(GoalFrame::Tcp, "descend", GoalSpec::Absolute { p: ins.goal_tcp, r: None }, ins.speed_mps, Some(final_approach)).await;
         {
@@ -4366,12 +4371,13 @@ impl Orchestrator {
             inner.guard_next_macro_child(self.id, None);
             let watch = inner.macro_run.as_ref().filter(|m| m.id == self.id && m.child.guard == Some(guard)).and_then(|m| m.ticket())
                 .and_then(|t| inner.macro_child_watch(t)).unwrap_or_default();
+            let contact_h = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
             inner.update_action(self.id, |a| {
                 a.descend_peak_residual_nm = watch.peak_residual_nm;
                 a.descend_peak_tracking_rad = watch.peak_tracking_rad;
-                if let Some(h) = watch.contact_height_m { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
+                if let Some(h) = contact_h { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
             });
-            if let Some(h) = watch.contact_height_m {
+            if let Some(h) = contact_h {
                 tracing::info!("Grasp {}: contact during the descent at {h:.3} m above the table", self.id);
                 // a contact stop ends the descent before the short segment
                 inner.approach_interrupted(self.id, "contact");

@@ -19,8 +19,13 @@
 //!
 //! The control tick (`reconcile_action`) decides what must be decided before further
 //! movement, without the worker taking the write lock: it ends the child at its deadline
-//! (`Failed` with the macro's timeout code, the motion stopped) and, with a [`ContactGuard`],
+//! (`Failed` with the macro's timeout code, the motion stopped) and, with a [`ContactGuard`]
 //! stops a descent at the measured position on contact ([`ContactWatch`]).
+//!
+//! The broker's child primitives (`rt_core::ops::Primitive::{CartesianPath, Gripper,
+//! JointQuinticLimited, Replay}`, each with a [`ChildSpec`]) install through
+//! `SupervisorInner::commit_macro_child` with the same record; a macro that ends leaves a
+//! `rt_core::MacroTerminal` (outcome with its code, child count) in the core.
 //!
 //! [`SupervisorInner::install_macro_path`]: crate::supervisor::SupervisorInner::install_macro_path
 //! [`SupervisorInner::start_macro_gripper`]: crate::supervisor::SupervisorInner::start_macro_gripper
@@ -31,6 +36,9 @@ use crate::api::rest::ApiError;
 use crate::kinematics::Pose;
 use crate::motion::{self, GoalFrame, GoalSpec, GripperCommand, GripperRequest, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+pub use crate::rt_core::broker::ActionId;
+/// The child identity and contact guard of the RT contract (`rt_core::ops`).
+pub use crate::rt_core::ops::{ChildSpec, ChildTicket, ContactGuard};
 
 /// Poll period of the orchestrator while a sub-motion runs.
 pub const POLL: Duration = Duration::from_millis(20);
@@ -105,15 +113,8 @@ impl MacroRun {
 
     /// The ticket of the current child (None before the first).
     pub fn ticket(&self) -> Option<ChildTicket> {
-        (self.children > 0).then_some(ChildTicket { parent: self.id, seq: self.child.seq })
+        (self.children > 0).then_some(ChildTicket { parent: ActionId(self.id), child_seq: self.child.seq })
     }
-}
-
-/// Identity of one child primitive: its parent action and its sequence number in that parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChildTicket {
-    pub parent: u64,
-    pub seq: u32,
 }
 
 /// RT record of a macro's current child.
@@ -128,23 +129,17 @@ pub struct ChildRecord {
     pub watch: ContactWatch,
 }
 
-/// Contact evaluation of a child, run by the control tick while the child's motion runs:
-/// peak |residual| of J2 / J3 and peak J1..J(arm) tracking error; with `stop_nm`, a J2 or J3
-/// residual above it ends the child at the measured position.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ContactGuard {
-    pub stop_nm: Option<f64>,
-    /// Table height (m, base frame) the contact height is reported from.
-    pub table_z_m: f64,
-}
-
-/// What the contact guard saw.
+/// What the contact guard ([`ContactGuard`]) of a child saw, evaluated by the control tick
+/// while the child's motion runs: peak |residual| of J2 / J3 (grasp diagnostics), peak
+/// J1..J(arm) tracking error, and where a residual above its bound ended the child.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ContactWatch {
     pub peak_residual_nm: Option<[f32; 2]>,
     pub peak_tracking_rad: Option<f32>,
-    /// TCP height above the table where the contact stop ended the child.
-    pub contact_height_m: Option<f64>,
+    /// Base-frame TCP height (m) where the contact stop ended the child.
+    pub contact_tcp_z_m: Option<f64>,
+    /// The joint whose residual exceeded its bound.
+    pub contact_joint: Option<usize>,
 }
 
 /// Same-side final approach of a macro sub-motion ([`MacroCtx::move_arm_with`]).
