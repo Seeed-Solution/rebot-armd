@@ -1106,9 +1106,9 @@ fn closing_onto_a_stop_saturates_at_the_current_ceiling() {
 fn profile_selects_the_gripper_drive() {
     let cfg = ArmConfig::rebot_dm();
     let g = cfg.damiao_gripper.clone().unwrap();
-    assert_eq!((g.mode, g.current_ceiling_raw, g.calibrated), (DamiaoGripperMode::PosForce, 220, false));
+    assert_eq!((g.mode, g.current_ceiling_raw, g.calibrated), (DamiaoGripperMode::PosForce, 460, false));
     match gripper_drive_from_profile(&cfg).unwrap() {
-        Some(GripperDrive::PosForce(p)) => assert_eq!((p.joint, p.current_raw, p.close_speed_rad_s, p.closed_rad), (6, 220, 0.30, cfg.gripper_policy.as_ref().unwrap().closed_rad)),
+        Some(GripperDrive::PosForce(p)) => assert_eq!((p.joint, p.current_raw, p.close_speed_rad_s, p.closed_rad), (6, 460, 0.30, cfg.gripper_policy.as_ref().unwrap().closed_rad)),
         other => panic!("{other:?}"),
     }
     let legacy = ArmConfig { damiao_gripper: Some(DamiaoGripperDrive::legacy_pos_vel()), ..ArmConfig::rebot_dm() };
@@ -1127,7 +1127,7 @@ fn safety_describe_reports_the_gripper_current_cap() {
     let inner = SupervisorInner::new(ArmConfig::rebot_dm());
     let cap = &inner.safety_describe()["hardware"]["gripper_current_cap"];
     assert_eq!(cap["mode"], "pos_force");
-    assert_eq!(cap["current_raw"], 220);
+    assert_eq!(cap["current_raw"], 460);
     assert_eq!(cap["calibrated"], false);
     assert_eq!(cap["active"], false);
     // with the pos-force driver after a confirmed enable

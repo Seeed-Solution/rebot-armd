@@ -591,7 +591,7 @@
   ],
   "damiao_gripper": {
     "mode": "pos_force",
-    "current_ceiling_raw": 220,
+    "current_ceiling_raw": 460,
     "close_speed_rad_s": 0.3,
     "calibrated": false
   },

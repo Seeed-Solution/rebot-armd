@@ -2279,7 +2279,7 @@ pub struct GripperPosForce {
     /// Jaw positions (rad): a frame closes when it moves from the measured position toward `closed_rad`.
     pub closed_rad: f32,
     pub open_rad: f32,
-    /// The ceiling's torque equivalent was measured (commissioning); false: placeholder.
+    /// The ceiling's torque equivalent was measured (commissioning); false: uncalibrated.
     pub calibrated: bool,
     /// Torque equivalent of the ceiling (N·m), when commissioned.
     pub ceiling_torque_nm: Option<f32>,
@@ -4407,7 +4407,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 calibrated: pf.calibrated, ceiling_torque_nm: pf.ceiling_torque_nm, torque_reference: pf.torque_reference.clone(),
                 close_speed_rad_s: Some(pf.close_speed_rad_s),
                 note: if pf.calibrated { "motor current ceiling on every gripper frame (commissioned)" }
-                    else { "motor current ceiling on every gripper frame; its torque equivalent is an uncalibrated placeholder" },
+                    else { "motor current ceiling on every gripper frame; its torque equivalent is uncalibrated" },
             });
         }
         self.legacy_gripper.map(|joint| MotorCurrentCap {

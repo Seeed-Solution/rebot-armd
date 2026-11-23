@@ -1197,7 +1197,8 @@ pub struct DamiaoGripperDrive {
     pub current_ceiling_raw: u16,
     /// Speed limit of closing frames (rad/s).
     pub close_speed_rad_s: f32,
-    /// The ceiling's torque equivalent was measured; false: `current_ceiling_raw` is a placeholder.
+    /// The ceiling's torque equivalent was measured (commissioning); false: uncalibrated
+    /// (estimate or default, not externally commissioned).
     #[serde(default)]
     pub calibrated: bool,
     /// Measured torque equivalent of the ceiling (N·m), from commissioning.
@@ -1210,12 +1211,13 @@ pub struct DamiaoGripperDrive {
 }
 
 impl DamiaoGripperDrive {
-    /// B601-DM J7 default: position-force with raw 220, the value armd sent this gripper before
-    /// 2026-11-06 (2.2 % of the maximum phase current). UNCALIBRATED placeholder: its torque
-    /// equivalent was never measured (2.2 % of the DM-J4310-2EC datasheet peak of 7 N·m would
-    /// be about 0.15 N·m; datasheet value, not verified on this unit).
+    /// B601-DM J7 default: position-force with raw 460 (4.6 % of maximum phase current),
+    /// `calibrated: false`. On 2026-11-23 (office B601-DM, build 1.6.0-dev8j7 / 027e46c),
+    /// stalled feedback-torque plateaus measured 0.42 N·m at raw 220 and 0.55-0.57 N·m at raw 300
+    /// (~0.0019 N·m/raw, no external reference), making raw 460 a feedback-equivalent ~0.87 N·m
+    /// estimate above the 0.79 N·m free-motion peak near full open, not an external calibration.
     pub fn rebot_dm() -> Self {
-        Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 220, close_speed_rad_s: 0.30,
+        Self { mode: DamiaoGripperMode::PosForce, current_ceiling_raw: 460, close_speed_rad_s: 0.30,
             calibrated: false, ceiling_torque_nm: None, torque_reference: None }
     }
 
