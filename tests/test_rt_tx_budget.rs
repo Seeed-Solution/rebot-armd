@@ -20,8 +20,8 @@ use armd::api::{create_router_full, proxy::DetectorUpstream};
 use armd::diagnostics::tick::{reset_tx_metrics, take_tx_metrics};
 use armd::diagnostics::DiagnosticsState;
 use armd::driver::{
-    is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, JointMode, JointTarget,
-    TxBatchOutcome, TxBudget,
+    is_estop_inhibited, ArmDriver, ArmDriverError, DamiaoArmDriver, GripperPosForce, JointMode,
+    JointTarget, TxBatchOutcome, TxBudget,
 };
 use armd::motion::{GripperCommand, GripperRequest};
 use armd::protocol::damiao::{self, DamiaoLimits};
@@ -1603,5 +1603,155 @@ fn merge_check_production_supervisor_estop_gate_with_stops_via_zero_offset_drive
     assert!(bus2.with(|s| s.tx_log.is_empty()), "no target frame may reach the bus on drain");
     assert_eq!(shared2.lock().unwrap().pending_tx_len(), 0);
     let m2 = take_tx_metrics();
+    assert_eq!(m2.frames, 0);
     assert_eq!((m2.frames, m2.dropped_stopped, m2.pending), (0, 3, 0));
+}
+
+#[test]
+fn j7_pos_force_autonomous_recovery_obeys_estop_and_handshake_obeys_tx_budget() {
+    fn pf_cfg() -> GripperPosForce {
+        GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        }
+    }
+
+    fn enabled_pos_force_driver() -> (DamiaoArmDriver<VirtualBus>, VirtualBus, MockClock) {
+        let limits = b601_limits();
+        let (bus, clock) = VirtualBus::new(&limits);
+        bus.with(|s| {
+            s.motors[6].2 = -1.0;
+        });
+        let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap()
+            .with_gripper_pos_force(pf_cfg())
+            .unwrap();
+        // Establish empty-queue boundary, then fresh J7 feedback so feedback_queue_bound[6] is fresh.
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.set_torque(true).expect("enable pos-force driver");
+        // Establish fresh post-enable feedback within the 100 ms pos-force bound.
+        d.read_joint_states().unwrap();
+        bus.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        bus.clear();
+        reset_tx_metrics();
+        (d, bus, clock)
+    }
+
+    // Part A1 (positive control): at 55 ms (>= 45 ms recovery, <= 100 ms pos-force freshness),
+    // autonomous recovery emits a capped 0x307 J7 recovery hold.
+    let (mut d, bus, clock) = enabled_pos_force_driver();
+    clock.advance(ms(55));
+    d.read_joint_states().unwrap();
+    let j7_holds: Vec<_> = bus.with(|s| s.tx_accepted.iter().filter(|f| f.id == 0x307).copied().collect());
+    assert_eq!(j7_holds.len(), 1, "positive control must emit capped J7 0x307 recovery hold: {j7_holds:?}");
+
+    // Part A2 (pending E-stop and pending ordinary stop via SupervisorInner::estop_gate()):
+    // autonomous recovery MUST emit zero 0x307 (and zero 0x101..0x106) recovery frames.
+    for trigger_estop in [true, false] {
+        let (mut d, bus, clock) = enabled_pos_force_driver();
+        let stops = StopRequests::new();
+        let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+        inner.attach_stop_requests(stops.clone());
+        d.set_estop_gate(inner.estop_gate());
+        if trigger_estop {
+            inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let _ = stops.request();
+        }
+        assert!(inner.estop_gate().pending());
+        clock.advance(ms(55));
+        bus.clear();
+        d.read_joint_states().unwrap();
+        let sent = bus.with(|s| s.tx_log.clone());
+        assert!(
+            sent.is_empty(),
+            "trigger_estop={trigger_estop}: pending stop must inhibit ALL recovery frames including J7 0x307: {sent:?}"
+        );
+    }
+
+    // Part A3 (mid-recovery stop raised AND applied on J1 recovery TX before reaching J7):
+    // stop-stamp change breaks the recovery loop before J7 so zero 0x307 reaches the bus.
+    let (mut d, bus, clock) = enabled_pos_force_driver();
+    let stops = StopRequests::new();
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
+    inner.attach_stop_requests(stops.clone());
+    d.set_estop_gate(inner.estop_gate());
+    let stops_hook = stops.clone();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move |idx, _| {
+            if idx == 0 {
+                let g = stops_hook.request();
+                stops_hook.mark_applied(g);
+            }
+        }));
+    });
+    clock.advance(ms(55));
+    d.read_joint_states().unwrap();
+    let sent = bus.with(|s| s.tx_log.clone());
+    assert_eq!(sent.len(), 1, "applied stop during J1 recovery must stop J2..J7 immediately: {sent:?}");
+    assert_eq!(sent[0].id, 0x101);
+    assert!(!sent.iter().any(|f| f.id == 0x307), "J7 0x307 recovery hold must not be sent after mid-recovery stop");
+
+    // Part B: TX budget bounds J7 handshake frames (`0xCC` refresh, `CTRL_MODE=4` restore, readback,
+    // and pre-enable `0x307` hold). Under `max_frames = 0`, zero J7 handshake frames are sent; once
+    // budget is restored, `set_torque(true)` completes cleanly.
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(pf_cfg())
+        .unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    // Age J7 past 100 ms so enable requires a J7 0xCC refresh handshake before CTRL_MODE=4 write.
+    clock.advance(ms(120));
+    d.set_tx_budget(TxBudget { max_frames: 0, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let p = d.begin_torque(true).expect("begin_torque enters RefreshBeforeRestore pending");
+    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "max_frames = 0 must bound J7 0xCC handshake refresh to 0 frames"
+    );
+    // Poll once still under max_frames = 0: still 0 frames sent.
+    clock.advance(ms(10));
+    let p2 = d.poll_torque(clock.now() + ms(5)).expect("still pending within 50 ms refresh deadline");
+    assert!(matches!(p2, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(
+        bus.with(|s| s.tx_log.is_empty()),
+        "max_frames = 0 must keep J7 handshake frames bounded across polls"
+    );
+    // Restore budget within the refresh deadline -> handshake sends 0xCC, restores CTRL_MODE=4,
+    // reads back, sends 0x307 pre-enable hold, and confirms enable.
+    d.set_tx_budget(TxBudget::default());
+    let mut confirmed = false;
+    for _ in 0..20 {
+        clock.advance(ms(2));
+        match d.poll_torque(clock.now() + ms(5)).expect("poll_torque with restored budget") {
+            armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
+                confirmed = true;
+                break;
+            }
+            armd::driver::TorqueProgress::Pending { .. } => {}
+            other => panic!("unexpected torque outcome: {other:?}"),
+        }
+    }
+    assert!(confirmed, "J7 handshake should complete once TX budget is restored");
+    assert!(bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC)));
+    assert!(bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)));
 }

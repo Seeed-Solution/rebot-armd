@@ -6666,7 +6666,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     Ok(()) => true,
                     Err(e) if e.is_tx_backpressure() => {
                         self.mark_tx_pass_backpressured();
-                        if self.estop_check().is_err() {
+                        if self.estop_check().is_err() || self.current_stop_stamp() != rx_stop_stamp {
                             self.discard_pending_tx_stopped();
                         }
                         break;
