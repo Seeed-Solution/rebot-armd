@@ -2908,7 +2908,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // Build hold frames before writing CTRL_MODE so an enabled position-force joint
             // never switches mode without a valid capped hold frame. A position-force restore
             // (torque off, before the enable) sends no hold here.
-            let frames = if restoring_pos_force(self, i, modes[i]) {
+            let restoring_pf = restoring_pos_force(self, i, modes[i]);
+            let frames = if restoring_pf {
+                if self.pos_force_write_refused(&[i]).is_some() {
+                    unsent.push(i);
+                    continue;
+                }
                 Vec::new()
             } else {
                 let Some(frames) = self.mode_frames(i, modes[i], &hold[i], dual_hold) else {
@@ -2918,7 +2923,22 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 frames
             };
             let id = self.motor_ids[i];
-            if self.transmit_with_retry(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
+            let pf_id = u32::from(damiao::POS_FORCE_BASE_ID + id);
+            let needs_pf_hold = !restoring_pf
+                && (modes[i] == DamiaoControlMode::PosForce
+                    || (dual_hold && self.base_mode(i) == DamiaoControlMode::PosForce));
+            let ctrl_frame = damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]));
+            if self.transmit_checked(false, |d| {
+                if restoring_pf {
+                    if let Some(e) = d.pos_force_write_refused(&[i]) {
+                        return Err(e);
+                    }
+                } else if needs_pf_hold && d.pos_force_frame(i, &hold[i]).is_none() {
+                    return Err(ArmDriverError::HardwareFault(format!(
+                        "joint {} position-force feedback stale before mode write", i + 1)));
+                }
+                Ok(ctrl_frame)
+            }).is_err() {
                 unsent.push(i);
                 continue;
             }
@@ -2926,14 +2946,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             // joint spends in the new mode without a target is one frame (about 0.13 ms).
             let mut all_holds_ok = true;
             for frame in frames {
-                let sent = self.transmit_with_retry(&frame).is_ok();
-                if sent || !strict {
-                    self.last_target_frames[i] = Some(frame);
+                let is_pf_hold = self.base_mode(i) == DamiaoControlMode::PosForce && frame.id == pf_id;
+                if is_pf_hold {
+                    match self.transmit_checked(false, |d| {
+                        d.pos_force_frame(i, &hold[i]).ok_or_else(|| ArmDriverError::HardwareFault(format!(
+                            "joint {} position-force hold feedback stale before transmit", i + 1)))
+                    }) {
+                        Ok(sent_frame) => {
+                            self.last_target_frames[i] = Some(sent_frame);
+                        }
+                        Err(_) => {
+                            all_holds_ok = false;
+                        }
+                    }
+                } else {
+                    let sent = self.transmit_with_retry(&frame).is_ok();
+                    if sent || !strict {
+                        self.last_target_frames[i] = Some(frame);
+                    }
+                    all_holds_ok &= sent;
                 }
-                all_holds_ok &= sent;
             }
             if !all_holds_ok && (strict || self.base_mode(i) == DamiaoControlMode::PosForce) {
                 hold_failed.push(i);
+                if self.base_mode(i) == DamiaoControlMode::PosForce {
+                    self.joint_modes[i] = None;
+                    self.last_target_frames[i] = None;
+                }
             }
         }
         let flush_ok = self.can.flush().is_ok() || !strict;
@@ -3075,6 +3114,29 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
+    /// Transmit a frame with up to 3 WouldBlock retries 100 µs apart, running `build_frame`
+    /// (and the MIT fence when `fenced`) before every attempt so a stalled retry never sends
+    /// a frame after authorization or feedback freshness expired.
+    fn transmit_checked(
+        &mut self,
+        fenced: bool,
+        mut build_frame: impl FnMut(&mut Self) -> Result<CanFrame, ArmDriverError>,
+    ) -> Result<CanFrame, ArmDriverError> {
+        let mut retries = 0;
+        loop {
+            if fenced { self.fence_check()?; }
+            let frame = build_frame(self)?;
+            match self.can.transmit(&frame) {
+                Ok(()) => return Ok(frame),
+                Err(TransportError::WouldBlock) if retries < 3 => {
+                    retries += 1;
+                    self.pause(Duration::from_micros(100));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Target-frame transmit: up to 3 WouldBlock retries 100 µs apart, and before every attempt
     /// the MIT fence (`fenced`, deadline inclusive), the E-stop gate, and (for position-force
     /// joints) feedback freshness: a stop or expiry between two attempts sends nothing more.
@@ -3151,19 +3213,48 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.register_reply_log.clear();
         let mut failed: Vec<usize> = Vec::new();
         let mut hold_started: Vec<(usize, Instant)> = Vec::new();
+        let fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
         for &i in joints {
             let Some(frames) = self.mode_frames(i, modes[i], &hold[i], dual_hold) else {
                 failed.push(i);
                 continue;
             };
             let id = self.motor_ids[i];
-            if self.tx_mit(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
+            let pf_id = u32::from(damiao::POS_FORCE_BASE_ID + id);
+            let needs_pf_hold = modes[i] == DamiaoControlMode::PosForce
+                || (dual_hold && self.base_mode(i) == DamiaoControlMode::PosForce);
+            let ctrl_frame = damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]));
+            if self.transmit_checked(fenced, |d| {
+                if needs_pf_hold && d.pos_force_frame(i, &hold[i]).is_none() {
+                    return Err(ArmDriverError::HardwareFault(format!(
+                        "joint {} position-force feedback stale before mode write", i + 1)));
+                }
+                Ok(ctrl_frame)
+            }).is_err() {
                 failed.push(i);
                 continue;
             }
             hold_started.push((i, self.now()));
             for frame in frames {
-                if self.tx_mit(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
+                let is_pf_hold = self.base_mode(i) == DamiaoControlMode::PosForce && frame.id == pf_id;
+                let res = if is_pf_hold {
+                    self.transmit_checked(fenced, |d| {
+                        d.pos_force_frame(i, &hold[i]).ok_or_else(|| ArmDriverError::HardwareFault(format!(
+                            "joint {} position-force hold feedback stale before transmit", i + 1)))
+                    })
+                } else {
+                    self.tx_mit(&frame).map(|()| frame)
+                };
+                match res {
+                    Ok(sent_frame) => self.last_target_frames[i] = Some(sent_frame),
+                    Err(_) => {
+                        if !failed.contains(&i) { failed.push(i); }
+                        if self.base_mode(i) == DamiaoControlMode::PosForce {
+                            self.joint_modes[i] = None;
+                            self.last_target_frames[i] = None;
+                        }
+                    }
+                }
             }
         }
         let mut why = "mode write, hold or flush";

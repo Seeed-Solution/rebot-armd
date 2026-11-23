@@ -798,6 +798,156 @@ fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
 }
 
 #[test]
+fn mode_handover_hold_backpressure_past_100ms_sends_no_stale_hold() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use armd::driver::JointMode;
+    use armd::transport::{CanTransport, DriverClock, TransportError};
+
+    /// Injects SocketCAN-like WouldBlock backpressure on selected CAN IDs without forwarding
+    /// blocked frames to `inner`, advancing the shared clock on each blocked attempt.
+    #[derive(Clone)]
+    struct BackpressureBus {
+        inner: FakeBus,
+        clock: MockClock,
+        target_id: u32,
+        target_op: Option<u8>,
+        stall_remaining: Arc<Mutex<usize>>,
+        stall_step: Duration,
+        target_attempts: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl CanTransport for BackpressureBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.inner.clock()
+        }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if frame.id == self.target_id && self.target_op.is_none_or(|op| frame.data[2] == op) {
+                self.target_attempts.lock().unwrap().push(self.clock.now());
+                let mut rem = self.stall_remaining.lock().unwrap();
+                if *rem > 0 {
+                    *rem -= 1;
+                    self.clock.advance(self.stall_step);
+                    return Err(TransportError::WouldBlock);
+                }
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+    }
+
+    let make_mit_ready = |target_id: u32, target_op: Option<u8>, stall_remaining: usize, stall_step: Duration| {
+        let clock = MockClock::new();
+        let inner = FakeBus::with_clock(&b601_limits(), clock.clone());
+        inner.with(|s| {
+            for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; }
+            s.motors[J7].q = -1.0;
+        });
+        let wrapper = BackpressureBus {
+            inner: inner.clone(),
+            clock: clock.clone(),
+            target_id,
+            target_op,
+            stall_remaining: Arc::new(Mutex::new(0)),
+            stall_step,
+            target_attempts: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut d = DamiaoArmDriver::new(wrapper.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(b601_limits()).unwrap()
+            .with_gripper_pos_force(pf()).unwrap();
+        d.read_joint_states().unwrap();
+        inner.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.check_mapping_ranges();
+        d.set_torque(true).unwrap();
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        let mut mit_modes = vec![JointMode::Position; 7];
+        mit_modes[J7] = JointMode::Mit;
+        d.set_joint_modes(&mit_modes, &targets(-1.0)).unwrap();
+        assert_eq!(d.joint_control_modes()[J7], Some(DamiaoControlMode::Mit));
+        // Refresh J7 feedback at a clean t0 so age is exact, then arm backpressure.
+        inner.with(|s| s.push_all_feedback());
+        d.read_joint_states().unwrap();
+        d.read_joint_states().unwrap();
+        inner.with(|s| s.motors[J7].mute_feedback = true);
+        inner.clear_log();
+        *wrapper.stall_remaining.lock().unwrap() = stall_remaining;
+        wrapper.target_attempts.lock().unwrap().clear();
+        (d, inner, wrapper, clock)
+    };
+
+    let pos_modes = vec![JointMode::Position; 7];
+    let hold = targets(-1.0);
+
+    // 1. Both set_joint_modes and set_joint_modes_confirmed: 0x307 hold hits WouldBlock at 99 ms,
+    //    advancing the clock to 101 ms (> 100 ms bound). Even though the bus would accept retry #1,
+    //    the driver must recheck freshness, refuse to retry, emit ZERO 0x307 frames onto the bus,
+    //    and leave J7 unconfirmed (fail closed).
+    for confirmed in [false, true] {
+        let (mut d, inner, wrapper, clock) = make_mit_ready(0x307, None, 1, Duration::from_millis(2));
+        let t0 = clock.now();
+        clock.advance(Duration::from_millis(99));
+        let res = if confirmed {
+            d.set_joint_modes_confirmed(&pos_modes, &hold)
+        } else {
+            d.set_joint_modes(&pos_modes, &hold)
+        };
+        assert!(res.is_err(), "confirmed={confirmed}: expected failure when hold retry crosses 100 ms");
+        let attempts = wrapper.target_attempts.lock().unwrap().clone();
+        assert_eq!(attempts.len(), 1, "confirmed={confirmed}: retried 0x307 past 100 ms: {attempts:?}");
+        assert!(attempts[0].saturating_duration_since(t0) <= Duration::from_millis(100));
+        let log = inner.tx_log();
+        assert!(!log.iter().any(|f| f.id == 0x307 || f.id == 0x107),
+            "confirmed={confirmed}: stale 0x307/0x107 hold reached the bus: {log:?}");
+        if let Some(ctrl_idx) = log.iter().position(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE) {
+            assert!(j7_commands(&log[ctrl_idx + 1..]).is_empty(),
+                "confirmed={confirmed}: J7 command sent after CTRL_MODE=4 write: {:?}", j7_commands(&log[ctrl_idx + 1..]));
+        }
+        assert_eq!(d.joint_control_modes()[J7], None, "confirmed={confirmed}: J7 must be unconfirmed");
+    }
+
+    // 2. Positive control: when WouldBlock at 90 ms advances only 500 µs (retry at 90.6 ms <= 100 ms),
+    //    both paths retry and deliver exactly one fresh capped 0x307 hold frame.
+    for confirmed in [false, true] {
+        let (mut d, inner, wrapper, clock) = make_mit_ready(0x307, None, 1, Duration::from_micros(500));
+        inner.with(|s| s.motors[J7].mute_feedback = false);
+        clock.advance(Duration::from_millis(90));
+        let res = if confirmed {
+            d.set_joint_modes_confirmed(&pos_modes, &hold)
+        } else {
+            d.set_joint_modes(&pos_modes, &hold)
+        };
+        res.unwrap_or_else(|e| panic!("confirmed={confirmed}: fresh retry should succeed: {e}"));
+        assert_eq!(wrapper.target_attempts.lock().unwrap().len(), 2, "confirmed={confirmed}: expected 1 blocked + 1 succeeded attempt");
+        let pf_holds: Vec<_> = inner.tx_log().into_iter().filter(|f| f.id == 0x307).collect();
+        assert_eq!(pf_holds.len(), 1, "confirmed={confirmed}: {pf_holds:?}");
+        assert_eq!(d.joint_control_modes()[J7], Some(DamiaoControlMode::PosForce));
+    }
+
+    // 3. WouldBlock on CTRL_MODE=4 write (0x7FF) crossing 100 ms must refuse to retry CTRL_MODE
+    //    and send zero 0x307 hold frames.
+    for confirmed in [false, true] {
+        let (mut d, inner, wrapper, clock) = make_mit_ready(0x7FF, Some(damiao::REG_WRITE), 1, Duration::from_millis(2));
+        clock.advance(Duration::from_millis(99));
+        let res = if confirmed {
+            d.set_joint_modes_confirmed(&pos_modes, &hold)
+        } else {
+            d.set_joint_modes(&pos_modes, &hold)
+        };
+        assert!(res.is_err(), "confirmed={confirmed}: expected failure when CTRL_MODE retry crosses 100 ms");
+        assert_eq!(wrapper.target_attempts.lock().unwrap().len(), 1, "confirmed={confirmed}: retried CTRL_MODE past 100 ms");
+        assert!(!inner.tx_log().iter().any(|f| f.id == 0x307 || f.id == 0x107),
+            "confirmed={confirmed}: emitted 0x307/0x107 after expired CTRL_MODE write: {:?}", inner.tx_log());
+    }
+}
+
+#[test]
 fn legacy_pos_vel_profile_reports_no_current_cap() {
     let (mut d, bus, _) = rig(false);
     d.set_torque(true).unwrap();
