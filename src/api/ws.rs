@@ -31,7 +31,9 @@ pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>
 static CONNECTION_REGISTRY: LazyLock<ConnectionRegistry> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-static CONNECTION_CLOSERS: LazyLock<Mutex<HashMap<String, mpsc::Sender<FatalClose>>>> =
+type FatalCloserEntry = (mpsc::Sender<FatalClose>, Arc<AtomicBool>);
+
+static CONNECTION_CLOSERS: LazyLock<Mutex<HashMap<String, FatalCloserEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn connection_registry() -> ConnectionRegistry {
@@ -277,16 +279,18 @@ const ORDINARY_OUT_CAPACITY: usize = 64;
 const URGENT_OUT_CAPACITY: usize = 64;
 /// Bounded revocation/preemption notice capacity per WS connection.
 const REVOCATION_OUT_CAPACITY: usize = 8;
+/// Bounded reserved outbound capacity for `auth_ack` replies (isolated from ordinary backlog).
+const AUTH_OUT_CAPACITY: usize = 16;
 /// Default bounded per-write timeout on a WS socket; on timeout, the connection closes.
 const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Maximum time to let the writer flush an explicit fatal error + Close frame on overflow.
-const WS_FATAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum bounded grace (<= 1 s) to let the writer flush an explicit fatal error + Close frame.
+const WS_FATAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Handled by the ordinary worker while a [`MacroCheck`] runs; motion commands stay queued in
-/// order within the bounded ordinary queue. (E-stop and `/api/v1/motion/stop` never enter the
-/// ordinary queue.)
+/// order within the bounded ordinary queue. (E-stop, `/api/v1/motion/stop`, `auth`, and
+/// `heartbeat` never enter the ordinary queue.)
 fn runs_during_macro_check(kind: &str) -> bool {
-    matches!(kind, "heartbeat" | "acquire_lease" | "release_lease" | "auth")
+    matches!(kind, "acquire_lease" | "release_lease")
 }
 
 /// The reply to a message cancelled by a stop / e-stop before it ran (`code` STOPPED /
@@ -394,6 +398,7 @@ impl FatalClose {
 struct WsWriterHandle {
     estop_tx: mpsc::Sender<Value>,
     stop_tx: mpsc::Sender<Value>,
+    auth_tx: mpsc::Sender<Value>,
     ordinary_tx: mpsc::Sender<Value>,
     fatal_tx: mpsc::Sender<FatalClose>,
     fatal_triggered: Arc<AtomicBool>,
@@ -407,6 +412,21 @@ impl WsWriterHandle {
 
     fn is_fatal(&self) -> bool {
         self.fatal_triggered.load(Ordering::Acquire)
+    }
+
+    /// Non-blocking `auth_ack` send via its dedicated reserved queue (isolated from ordinary backlog).
+    fn try_send_auth(&self, reply: Value) -> bool {
+        if self.is_fatal() {
+            return false;
+        }
+        match self.auth_tx.try_send(reply) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.trigger_fatal(FatalClose::outbound_queue_full());
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     /// Non-blocking ordinary control reply send (reader / immediate reject). Never drops
@@ -584,6 +604,66 @@ async fn write_ws_frame(
     .await
     .map_err(|_| ())?
     .map_err(|_| ())
+}
+
+async fn write_fatal_and_close(
+    connection_id: &str,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    fatal: &FatalClose,
+) {
+    let grace = ws_write_timeout(connection_id).min(WS_FATAL_FLUSH_TIMEOUT);
+    let deadline = tokio::time::Instant::now() + grace;
+    let rem = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let r1 = rem();
+    if !r1.is_zero() {
+        let _ = write_ws_frame(connection_id, sender, Message::Text(fatal.error_value().to_string().into()), r1).await;
+    }
+    let r2 = rem();
+    if !r2.is_zero() {
+        let _ = write_ws_frame(connection_id, sender, Message::Close(Some(fatal.close_frame())), r2).await;
+    }
+}
+
+/// Dedicated latest-wins heartbeat handoff isolated from the bounded ordinary queue and slow worker tasks.
+#[derive(Clone, Default)]
+struct HeartbeatSlot {
+    latest: Arc<Mutex<(Option<Value>, bool)>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl HeartbeatSlot {
+    fn push_latest(&self, value: Value) {
+        {
+            let mut g = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+            if g.1 { return; }
+            g.0 = Some(value);
+        }
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> Option<Value> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let mut g = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(v) = g.0.take() {
+                    return Some(v);
+                }
+                if g.1 {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn close(&self) {
+        {
+            let mut g = self.latest.lock().unwrap_or_else(|e| e.into_inner());
+            g.1 = true;
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 struct QueuedOrdinary {
@@ -1173,17 +1253,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     };
 
     // Two-tier writer queues:
-    // - Urgent: revocation/preemption notices, E-stop replies, urgent Stop replies (reserved at admission).
-    // - Ordinary: control replies (never dropped silently; overflow closes connection with error) + latest-wins telemetry.
+    // - Urgent: revocation/preemption notices, E-stop replies, urgent Stop replies (reserved at admission),
+    //   plus dedicated reserved `auth_ack` capacity isolated from ordinary backlog.
+    // - Ordinary: control replies + action terminals (never dropped silently; overflow closes connection with error)
+    //   and latest-wins non-terminal telemetry.
     let (revocation_tx, mut revocation_rx) = mpsc::channel::<Message>(REVOCATION_OUT_CAPACITY);
     let (estop_out_tx, mut estop_out_rx) = mpsc::channel::<Value>(URGENT_OUT_CAPACITY);
     let (stop_out_tx, mut stop_out_rx) = mpsc::channel::<Value>(URGENT_OUT_CAPACITY);
+    let (auth_out_tx, mut auth_out_rx) = mpsc::channel::<Value>(AUTH_OUT_CAPACITY);
     let (ordinary_out_tx, mut ordinary_out_rx) = mpsc::channel::<Value>(ORDINARY_OUT_CAPACITY);
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<FatalClose>(1);
     let fatal_triggered = Arc::new(AtomicBool::new(false));
     let writer = WsWriterHandle {
         estop_tx: estop_out_tx,
         stop_tx: stop_out_tx,
+        auth_tx: auth_out_tx,
         ordinary_tx: ordinary_out_tx,
         fatal_tx: fatal_tx.clone(),
         fatal_triggered: fatal_triggered.clone(),
@@ -1199,6 +1283,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let conn_stop_gen = Arc::new(AtomicU64::new(0));
     let in_flight_stop = Arc::new(Mutex::new(InFlightStopState::default()));
     let ordinary_queue = OrdinaryQueue::new();
+    let heartbeat_slot = HeartbeatSlot::default();
+    let ws_auth = WsAuth::new(auth, ws_token, explicit_auth);
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel::<Option<CancelSignal>>(None);
 
     #[cfg(feature = "policy-runtime")]
@@ -1222,7 +1308,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     {
         let mut closers = CONNECTION_CLOSERS.lock().unwrap_or_else(|e| e.into_inner());
-        closers.insert(connection.clone(), fatal_tx);
+        closers.insert(connection.clone(), (fatal_tx, fatal_triggered.clone()));
     }
 
     struct ConnectionGuard(String);
@@ -1238,7 +1324,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
     // Task 3: Writer task with urgent-first priority, causal grant-before-loss ordering, monotonic
     // wire epoch guard, action-terminal preservation (never skipped by latest-wins telemetry),
-    // explicit error close on control queue saturation, and bounded write timeout.
+    // explicit error close on control queue saturation (<= 1 s grace), and bounded write timeout.
     let writer_connection = connection.clone();
     let mut writer_task = tokio::spawn(async move {
         let mut last_sent: Option<f64> = None;
@@ -1248,10 +1334,19 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let mut terminal_tracker = ActionTerminalTracker::new();
         let mut pending_terminals: VecDeque<crate::model::ArmObservation> = VecDeque::new();
         let mut pending_latest_telemetry: Option<crate::model::ArmObservation> = None;
+        let (mut rev_closed, mut estop_closed, mut stop_closed, mut auth_closed, mut ord_closed) =
+            (false, false, false, false, false);
         loop {
+            if let Ok(fatal) = fatal_rx.try_recv() {
+                write_fatal_and_close(&writer_connection, &mut sender, &fatal).await;
+                break;
+            }
+            if rev_closed && estop_closed && stop_closed && auth_closed && ord_closed {
+                break;
+            }
             tokio::select! {
                 biased;
-                msg = revocation_rx.recv() => match msg {
+                msg = revocation_rx.recv(), if !rev_closed => match msg {
                     Some(msg) => {
                         if let Some(loss_gen) = extract_lease_loss_gen(&msg).filter(|&g| g > max_granted_gen) {
                             // Causal order: hold a preemption loss until its lease_granted is written.
@@ -1260,32 +1355,36 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             break;
                         }
                     }
-                    None => break,
+                    None => { rev_closed = true; }
                 },
-                reply = estop_out_rx.recv() => match reply {
+                reply = estop_out_rx.recv(), if !estop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
                         if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
-                    None => break,
+                    None => { estop_closed = true; }
                 },
-                reply = stop_out_rx.recv() => match reply {
+                reply = stop_out_rx.recv(), if !stop_closed => match reply {
                     Some(mut val) => {
                         enforce_monotonic_epoch(&mut last_wire_epoch, &mut val);
                         if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
                     }
-                    None => break,
+                    None => { stop_closed = true; }
                 },
                 fatal = fatal_rx.recv() => match fatal {
                     Some(fatal) => {
-                        let flush_timeout = ws_write_timeout(&writer_connection).min(WS_FATAL_FLUSH_TIMEOUT);
-                        let _ = write_ws_frame(&writer_connection, &mut sender, Message::Text(fatal.error_value().to_string().into()), flush_timeout).await;
-                        let _ = write_ws_frame(&writer_connection, &mut sender, Message::Close(Some(fatal.close_frame())), flush_timeout).await;
+                        write_fatal_and_close(&writer_connection, &mut sender, &fatal).await;
                         break;
                     }
                     None => break,
                 },
-                reply = ordinary_out_rx.recv() => match reply {
+                reply = auth_out_rx.recv(), if !auth_closed => match reply {
+                    Some(val) => {
+                        if write_ws_frame(&writer_connection, &mut sender, Message::Text(val.to_string().into()), ws_write_timeout(&writer_connection)).await.is_err() { break; }
+                    }
+                    None => { auth_closed = true; }
+                },
+                reply = ordinary_out_rx.recv(), if !ord_closed => match reply {
                     Some(mut val) => {
                         let granted_gen = if val.get("type").and_then(Value::as_str) == Some("lease_granted") {
                             val.get("generation").and_then(Value::as_u64)
@@ -1313,7 +1412,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if write_failed { break; }
                         }
                     }
-                    None => break,
+                    None => { ord_closed = true; }
                 },
                 _ = std::future::ready(()), if !pending_terminals.is_empty() => {
                     if let Some(obs) = pending_terminals.pop_front() {
@@ -1356,15 +1455,63 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                         }
                         if overflowed {
-                            let fatal = FatalClose::outbound_queue_full();
-                            let flush_timeout = ws_write_timeout(&writer_connection).min(WS_FATAL_FLUSH_TIMEOUT);
-                            let _ = write_ws_frame(&writer_connection, &mut sender, Message::Text(fatal.error_value().to_string().into()), flush_timeout).await;
-                            let _ = write_ws_frame(&writer_connection, &mut sender, Message::Close(Some(fatal.close_frame())), flush_timeout).await;
+                            write_fatal_and_close(&writer_connection, &mut sender, &FatalClose::outbound_queue_full()).await;
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
                     Err(_) => break,
+                }
+            }
+        }
+    });
+
+    // Dedicated latest-wins heartbeat processor isolated from ordinary backlog and slow worker IO.
+    let hb_supervisor = supervisor.clone();
+    let hb_connection = connection.clone();
+    let hb_generation = connection_generation.clone();
+    let hb_client_label = client_label.clone();
+    let hb_slot = heartbeat_slot.clone();
+    let hb_writer = writer.clone();
+    let mut heartbeat_task = tokio::spawn(async move {
+        while let Some(value) = hb_slot.pop().await {
+            if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
+                continue;
+            }
+            let reply = {
+                let mut inner = hb_supervisor.inner().write().await;
+                if inner.detached {
+                    None
+                } else {
+                    let local_generation = hb_generation.load(Ordering::SeqCst);
+                    let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+                    let label_matches = {
+                        let lbl = hb_client_label.lock().unwrap_or_else(|e| e.into_inner());
+                        value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
+                    };
+                    let supplied_generation_ok = generation == local_generation || generation == 0;
+                    let authorized = local_generation != 0 && supplied_generation_ok && label_matches
+                        && inner.validate_servo_lease(&hb_connection, local_generation);
+                    if !authorized {
+                        Some(if local_generation == 0 {
+                            json!({"type":"lease_lost", "generation":0})
+                        } else {
+                            json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&hb_connection, local_generation)})
+                        })
+                    } else {
+                        let epoch = inner.safety.epoch_id();
+                        if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+                            Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}))
+                        } else {
+                            let _ = inner.heartbeat(&hb_connection, epoch);
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(reply) = reply {
+                if !hb_writer.send_ordinary_control(reply).await {
+                    break;
                 }
             }
         }
@@ -1380,6 +1527,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let reader_stop_gen = conn_stop_gen.clone();
     let reader_in_flight_stop = in_flight_stop.clone();
     let reader_ordinary_queue = ordinary_queue.clone();
+    let reader_heartbeat_slot = heartbeat_slot.clone();
+    let reader_ws_auth = ws_auth.clone();
     let reader_cancel_tx = cancel_tx.clone();
     let reader_writer = writer.clone();
     #[cfg(feature = "policy-runtime")]
@@ -1393,6 +1542,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+
+            // `auth` is handled directly in the reader (O(1) sync RwLock) with reserved outbound
+            // capacity so an ordinary backlog never drops operator unlock updates.
+            if kind == "auth" {
+                let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
+                let status = reader_ws_auth.update_token(next_token);
+                let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
+                    "role":status.role, "expires_in_s":status.expires_in_s});
+                if !reader_writer.try_send_auth(reply) { break; }
+                continue;
+            }
+
+            // `heartbeat` uses its own latest-wins slot so an ordinary backlog or slow worker
+            // task never drops lease renewals.
+            if kind == "heartbeat" {
+                reader_heartbeat_slot.push_latest(value);
+                continue;
+            }
 
             // Urgent E-stop (both aliases): reserve urgent reply capacity BEFORE latching, ALWAYS
             // latch immediately in O(1) via the atomic checked path, and never drop the reply even
@@ -1627,9 +1794,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let ws_closed = ws_closed.clone();
     #[cfg(feature = "policy-runtime")]
     let policy_stop_gen = policy_stop_gen.clone();
+    let worker_ws_auth = ws_auth.clone();
     let mut worker_task = tokio::spawn(async move {
-        // the operator session of this connection: from the upgrade request, replaced by `auth` messages
-        let ws_auth = WsAuth::new(auth, ws_token, explicit_auth);
+        // the operator session of this connection: from the upgrade request, updated by `auth` messages in reader
+        let ws_auth = worker_ws_auth;
         let mut last_sequence: Option<u64> = None;
         let mut last_ordinary_request: Option<u64> = None;
         // Delayed acks (sent after a state-file write) come back here and are stamped with
@@ -1731,17 +1899,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             };
             let QueuedOrdinary { value, enqueued_stop_gen } = queued;
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-            // `{"type":"auth","token":<unlock token|null>}`: use this operator session on the open socket
-            // (a browser unlocks over REST; reconnecting would drop the lease and park a torqued arm).
-            // The token is checked on every privileged use, as from the upgrade request.
-            if kind == "auth" {
-                let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
-                let status = ws_auth.update_token(next_token);
-                let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
-                    "role":status.role, "expires_in_s":status.expires_in_s});
-                if !worker_writer.send_ordinary_control(reply).await { break; }
-                continue;
-            }
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
             let owner_mode = recv_supervisor.owner_mode();
@@ -2538,7 +2695,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 tracing::warn!("Urgent revocation queue full for {}; closing evicted connection", evicted_conn);
-                                if let Some(closer) = closer_opt {
+                                if let Some((closer, fatal_flag)) = closer_opt {
+                                    fatal_flag.store(true, Ordering::Release);
                                     let _ = closer.try_send(FatalClose::urgent_queue_full());
                                 }
                             }
@@ -2556,10 +2714,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut writer_task => {
             reader_task.abort();
             worker_task.abort();
+            heartbeat_slot.close();
+            heartbeat_task.abort();
         }
         _ = &mut reader_task => {
             ordinary_queue.close();
+            heartbeat_slot.close();
             worker_task.abort();
+            heartbeat_task.abort();
             if fatal_triggered.load(Ordering::Acquire) {
                 let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
             }
@@ -2568,6 +2730,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut worker_task => {
             reader_task.abort();
             ordinary_queue.close();
+            heartbeat_slot.close();
+            heartbeat_task.abort();
+            if fatal_triggered.load(Ordering::Acquire) {
+                let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
+            }
+            writer_task.abort();
+        }
+        _ = &mut heartbeat_task => {
+            reader_task.abort();
+            ordinary_queue.close();
+            worker_task.abort();
             if fatal_triggered.load(Ordering::Acquire) {
                 let _ = tokio::time::timeout(ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT), &mut writer_task).await;
             }

@@ -1317,3 +1317,96 @@ async fn writer_delivers_lease_grant_before_preemption_loss_and_never_skips_acti
     }
     assert!(saw_id1_done && saw_id2_superseded, "action terminal skipped (id1={id1} done={saw_id1_done}, id2={id2} sup={saw_id2_superseded}, id3={id3})");
 }
+
+// 15. Round 3 Item 5 (Major): auth and heartbeat are never dropped when the ordinary backlog is
+//     full, and fatal outbound overflow from reader/worker flushes the explicit error frame within <= 1 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_and_heartbeat_bypass_full_ordinary_backlog_and_fatal_overflow_flushes_error() {
+    use futures_util::StreamExt;
+
+    // (a) Full 64-frame ordinary backlog + worker blocked in slow detector: auth & heartbeat still succeed!
+    let det = SlowDetector::new();
+    let mut cfg = config_with_slow_task();
+    cfg.lease_timeout_ms = 250;
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    let addr = serve_with_slow_detector(sup.clone(), det.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws, gen, ep, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep = sup.get_observation().await.epoch_id;
+
+    // Block worker inside slow dry-run, then saturate OrdinaryQueue (64 frames) + verify frame #65 hits BACKLOG_FULL.
+    send(&mut ws, json!({"type": "command", "request_id": 100, "generation": gen, "epoch_id": ep, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
+    for k in 0..65u64 {
+        send(&mut ws, json!({"type": "command", "request_id": 101 + k, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/home", "body": {}})).await;
+    }
+    let bf = next_of(&mut ws, &["command_reject"]).await;
+    assert_eq!((bf["request_id"].as_u64(), bf["code"].as_str()), (Some(165), Some("BACKLOG_FULL")), "{bf}");
+
+    // `auth` must still be handled immediately despite full ordinary backlog.
+    send(&mut ws, json!({"type": "auth", "seq": 42, "token": null})).await;
+    let auth_ack = next_of(&mut ws, &["auth_ack"]).await;
+    assert_eq!(auth_ack["seq"].as_u64(), Some(42), "{auth_ack}");
+
+    // `heartbeat` must keep renewing the 250ms lease across 360ms while ordinary backlog stays 64/64 full!
+    for _ in 0..8 {
+        send(&mut ws, json!({"type": "heartbeat", "generation": gen, "epoch_id": ep})).await;
+        tokio::time::sleep(Duration::from_millis(45)).await;
+        sup.tick(0.02).await;
+    }
+    {
+        let inner = sup.inner().read().await;
+        assert!(inner.active_lease.is_some(), "lease expired while heartbeats were sent past full ordinary backlog");
+        assert!(inner.watchdog_park.is_none(), "watchdog parked despite live heartbeats");
+    }
+    det.release_now();
+
+    // (b) Reader-triggered fatal overflow (inbound backlog full + outbound queue full): writer flushes
+    //     explicit OUTBOUND_QUEUE_FULL error frame + Close(1013) within <= 1 s grace before teardown.
+    let det2 = SlowDetector::new();
+    let sup2 = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    let addr2 = serve_with_slow_detector(sup2.clone(), det2.clone()).await;
+    let (mut ws2, gen2) = controller(addr2).await;
+    let conn2 = sup2.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _guard2 = WriteHookGuard(conn2.clone());
+    let ep2 = sup2.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws2, gen2, ep2, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep2 = sup2.get_observation().await.epoch_id;
+
+    send(&mut ws2, json!({"type": "command", "request_id": 200, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || det2.entered.load(Ordering::SeqCst)).await;
+    // Pause writer and push 64 ordinary frames (fill inbound) + 66 overflow frames (1 enters writer, 64 fill outbound, #66 overflows outbound in READER!).
+    armd::api::ws::set_test_ws_write_paused(&conn2, true);
+    for k in 0..130u64 {
+        send(&mut ws2, json!({"type": "command", "request_id": 201 + k, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/motion/home", "body": {}})).await;
+    }
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn2) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Unpause writer well within the <= 1 s fatal flush grace: reader already exited, writer MUST flush error + Close!
+    let t_unpause = Instant::now();
+    armd::api::ws::set_test_ws_write_paused(&conn2, false);
+    let mut saw_err = false;
+    let mut saw_close = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), ws2.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v["type"] == "error" && v["code"] == "OUTBOUND_QUEUE_FULL" { saw_err = true; }
+                }
+            }
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(f)))) => {
+                saw_close = true;
+                if let Some(cf) = f { assert_eq!(u16::from(cf.code), 1013); }
+                break;
+            }
+            Ok(None) | Ok(Some(Err(_))) => { saw_close = true; break; }
+            _ => {}
+        }
+    }
+    assert!(saw_err, "writer was aborted before flushing OUTBOUND_QUEUE_FULL error frame");
+    assert!(saw_close, "connection must close after flushing fatal error frame");
+    assert!(t_unpause.elapsed() < Duration::from_secs(1), "fatal flush exceeded 1 s grace");
+    det2.release_now();
+}
