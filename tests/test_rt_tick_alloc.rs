@@ -490,12 +490,27 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
     assert_eq!(PLAN_SLOT_PAYLOAD_BYTES, 81_920);
     assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
 
-    let (mut writer, mut reader) = plan_slots(PLAN_SLOTS, PlanSlot::default);
-    assert_eq!((writer.capacity(), reader.capacity()), (PLAN_SLOTS, PLAN_SLOTS));
-
     let sample = [0.25f32; MAX_DOF];
     let mut handles = [None; PLAN_SLOTS];
     let mut total_payload_bytes = 0usize;
+
+    // Warm up the staging/pin/retire/reclaim code pages on a 1-slot scratch pool so first-call
+    // `.text` / stack page faults are settled before we construct and measure the 8-slot pool.
+    {
+        let (mut w0, mut r0) = plan_slots(1, || PlanSlot::with_path_capacity(1));
+        let ((), a0, f0) = counted(|| {
+            let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
+            let p = r0.pin(h).unwrap();
+            assert_eq!(p.path.len(), 1);
+            drop(p);
+            assert!(r0.retire(h));
+            assert_eq!(w0.reclaim(), 1);
+        });
+        assert_eq!((a0, f0), (0, 0));
+    }
+
+    let (mut writer, mut reader) = plan_slots(PLAN_SLOTS, PlanSlot::default);
+    assert_eq!((writer.capacity(), reader.capacity()), (PLAN_SLOTS, PLAN_SLOTS));
 
     #[cfg(target_os = "linux")]
     let thread_faults = || -> (i64, i64) {
@@ -504,7 +519,6 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
         assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD) failed");
         (ru.ru_minflt, ru.ru_majflt)
     };
-    // Warm up the call itself once so any lazy PLT/stack page is resolved before measurement.
     #[cfg(target_os = "linux")]
     let (min_before, maj_before) = {
         let _ = thread_faults();
