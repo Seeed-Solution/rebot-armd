@@ -122,7 +122,7 @@ fn activation_moves_the_revision_by_one_and_a_failed_apply_changes_nothing() {
     assert_eq!(inner.keepout.revision, 2);
     assert_eq!(runtime_boxes(&inner), ["a"]);
     assert!(inner.core.config_hold().is_none() && !inner.core.motion_inhibited_by_config());
-    inner.jog_action({ let mut q = INSPECT.to_vec(); q[0] += 0.05; q }, Some(0.3), None, "joint_move").expect("motion admitted");
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, { let mut q = INSPECT.to_vec(); q[0] += 0.05; q }, Some(0.3), None, "joint_move") }.expect("motion admitted");
 }
 
 /// The candidate was renamed into place, then failed to apply: active (revision 1, no

@@ -1186,7 +1186,7 @@ async fn repeated_rpc_is_rejected_and_lease_handover_cancels_old_trajectory() {
     let duplicate=ws_reply(&mut ws,command,&["command_reject"]).await;
     assert_eq!(duplicate["request_id"],1);
     assert_eq!(duplicate["code"],"INVALID_COMMAND");
-    supervisor.jog(vec![0.5,-0.5],Some(1.0),Some(1)).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5,-0.5],Some(1.0),Some(1)).await.unwrap();
     let mut inner=supervisor.inner().write().await;
     assert!(inner.active_trajectory.is_some());
     inner.active_lease.as_mut().unwrap().acquired_at=std::time::Instant::now()-Duration::from_secs(2);

@@ -2867,8 +2867,9 @@ mod tests {
         core.lease_enabled = false;
         core.set_torque(true).unwrap();
         let epoch = core.safety.epoch_id();
+        let stamp = core.current_admission_stamp();
         let (action_id, _) = core
-            .start_gripper_zero_check(&serde_json::json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
+            .start_gripper_zero_check(stamp, &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
             .unwrap();
         core.zero_check_persisting = Some(action_id);
         let action_before = core.last_action.clone().expect("running zero_check action");

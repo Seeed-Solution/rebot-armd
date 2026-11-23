@@ -466,7 +466,7 @@ fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_end
     let code = |e: armd::ArmError| armd::api::rest::ApiError::from(e).code;
     let mut q = fx.core.commanded_positions.clone();
     q[0] += 0.05;
-    assert_eq!(fx.core.jog_action(q.clone(), Some(0.5), None, "jog").map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert_eq!(fx.core.jog_action(fx.core.current_admission_stamp(), q.clone(), Some(0.5), None, "jog").map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
     assert_eq!(fx.core.plan_input_tcp().map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
     assert!(fx.core.active_trajectory.is_none());
     // nothing was applied for this candidate: activation hands the reservation back, released
@@ -778,7 +778,7 @@ fn child_primitives_of_a_running_macro_commit_through_the_release() {
     use armd::rt_core::ops::{ChildSpec, ChildTicket};
     let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
     let epoch = fx.core.safety.epoch_id();
-    let id = fx.core.begin_orchestrated_action("sequence", None, epoch).unwrap();
+    let id = fx.core.begin_orchestrated_action(fx.core.current_admission_stamp(), "sequence", None, epoch).unwrap();
     let parent = armd::rt_core::broker::ActionId(id);
     let a = auth(&fx);
     assert_eq!(a.parent_generation, id);

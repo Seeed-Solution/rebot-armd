@@ -215,7 +215,7 @@ async fn settle_time_is_bounded_under_quantization_noise() {
 async fn link_loss_during_jog_parks_to_idle_with_noise() {
     let home = ArmConfig::rebot_dm().home_positions;
     let mut rig = Rig::new(&home, noise(1.0), 7).await;
-    rig.sup.jog(INSPECT.to_vec(), None, None).await.unwrap();
+    rig.sup.jog(rig.sup.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
     for _ in 0..100 { rig.tick().await; } // 2 s into the jog
     {
         let inner = rig.sup.inner().read().await;
@@ -350,7 +350,7 @@ async fn watchdog_budget_mid_jog_covers_deceleration_travel_and_settle() {
     use armd::supervisor::{UNLOAD_SETTLE_HOLD, WATCHDOG_PARK_MARGIN};
     let home = ArmConfig::rebot_dm().home_positions;
     let mut rig = Rig::new(&home, noise(1.0), 17).await;
-    rig.sup.jog(INSPECT.to_vec(), None, None).await.unwrap();
+    rig.sup.jog(rig.sup.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
     for _ in 0..150 { rig.tick().await; }
     rig.sup.set_lease_enabled(true).await;
     tokio::time::sleep(Duration::from_millis(80)).await;

@@ -543,11 +543,11 @@ async fn single_bus_writer_no_tokio_entry_and_handoff_gates() {
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
     assert!(matches!(
-        sup.servo(vec![0.0; 7], 0).await,
+        sup.servo(sup.capture_admission_stamp(), vec![0.0; 7], 0).await,
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
     assert!(matches!(
-        sup.jog(vec![0.0; 7], Some(1.0), None).await,
+        sup.jog(sup.capture_admission_stamp(), vec![0.0; 7], Some(1.0), None).await,
         Err(ArmError::Rejected { status: 503, ref code, .. }) if code == "OWNER_TRANSFERRED"
     ));
 
@@ -1728,8 +1728,7 @@ async fn prepare_zero_check_supervisor(path: std::path::PathBuf) -> (Arc<ArmSupe
         inner.gripper_calib_path = Some(path);
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner
-            .start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": true}), epoch)
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.10, "store_offset": true}), epoch) }
             .unwrap();
         id
     };
@@ -2000,8 +1999,7 @@ async fn two_phase_persistence_b1_race_persistence5_and_saturation() {
     inner.persist_capacity_available = false;
     let rev_before = ConfigAuthority::revision(&inner, ConfigDomain::GripperCalibration);
     let ep = inner.safety.epoch_id();
-    let (sat_id, _) = inner
-        .start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": true}), ep)
+    let (sat_id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.10, "store_offset": true}), ep) }
         .unwrap();
     for _ in 0..200 {
         inner.tick(0.02);
@@ -2464,12 +2462,11 @@ async fn two_phase_persistence_rechecks_operator_auth_before_rename_and_drops_pa
         inner.gripper_calib_path = Some(path_a.clone());
         inner.set_mock_gripper_stall_offset(Some(0.05));
         let epoch = inner.safety.epoch_id();
-        let (id, _) = inner
-            .start_gripper_zero_check_with_auth(
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check_with_auth(s,
                 &json!({"threshold_rad": 0.10, "store_offset": true}),
                 epoch,
                 Some((auth.clone(), Some(token.clone()))),
-            )
+            ) }
             .unwrap();
         id
     };

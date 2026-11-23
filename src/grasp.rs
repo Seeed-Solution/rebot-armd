@@ -3235,33 +3235,34 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, O
 
 /// Begin a planned grasp under the write lock: the action record (with its `task`) and the
 /// orchestrator. Returns (action id, expected duration).
-pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
-    let id = inner.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
+pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
+    let id = inner.begin_macro(stamp, "grasp", &planned.input, planned.request.tag.clone())?;
     if let Some(task) = &planned.request.task {
         inner.update_action(id, |a| a.task = Some(task.clone()));
     }
     let duration = expected_duration(&planned) + inner.approach_estimate_s("grasp_final", planned.request.approach);
-    spawn(supervisor.clone(), source, id, planned);
+    spawn(supervisor.clone(), source, id, planned, stamp);
     Ok((id, duration))
 }
 
 /// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, task
 /// check, begin and spawn the orchestrator. Returns (action id, expected duration).
 pub async fn start(supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, body: &Value) -> Result<(u64, f64), ApiError> {
+    let stamp = supervisor.capture_admission_stamp();
     let pending = {
         let inner = supervisor.inner().read().await;
-        prepare(&inner, body, inner.safety.epoch_id())?
+        prepare(&inner, body, stamp.estop_epoch)?
     };
     let mut planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
     preflight(source.as_ref(), &mut planned).await?;
     let mut inner = supervisor.inner().write().await;
-    Ok(begin(&mut inner, supervisor, source, planned)?)
+    Ok(begin(&mut inner, supervisor, source, planned, stamp)?)
 }
 
-/// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro("grasp", ..)`.
-pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
-    tokio::spawn(run(supervisor, source, id, planned));
+/// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
+pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) {
+    tokio::spawn(run(supervisor, source, id, planned, stamp));
 }
 
 // ---- orchestrator ----
@@ -4769,7 +4770,7 @@ pub fn roll_across_long_side(jaw: Vec3, long: Vec3) -> f64 {
     (t + pi / 2.0).rem_euclid(pi) - pi / 2.0
 }
 
-async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, mut planned: PlannedGrasp) {
+async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, mut planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) {
     let setup = planned.request.setup.clone();
     let cam = CamModel::assumed(&planned.input.arm, &setup, &planned.input.cam);
     let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
@@ -4784,7 +4785,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     let generation = mode.as_ref().ok().and_then(|m| m.models.as_ref()).map(|pm| pm.generation);
     let vision = mode.map_or(Ok(None), |m| m.vision);
     let ctx = MacroCtx {
-        sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
+        sup: sup.clone(), id, stamp, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
     };
     let contact_end_m = sup.inner().read().await.config.effective_physical_contact_end_m();
@@ -6097,15 +6098,16 @@ mod tests {
         setup.post_lift_settle_ms = 10;
 
         let sup = Arc::new(ArmSupervisor::new(config));
-        let id = {
+        let (id, stamp) = {
             let mut inner = sup.inner().write().await;
             inner.lease_enabled = false;
             inner.set_torque(true).unwrap();
             inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
             inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];
+            let stamp = inner.current_admission_stamp();
             let plan_in = inner.plan_input().unwrap();
-            inner.begin_macro("grasp", &plan_in, None).unwrap()
+            (inner.begin_macro(stamp, "grasp", &plan_in, None).unwrap(), stamp)
         };
 
         let source = Arc::new(DummyDetectionSource);
@@ -6113,6 +6115,7 @@ mod tests {
         let ctx = MacroCtx {
             sup: sup.clone(),
             id,
+            stamp,
             deadline: Instant::now() + Duration::from_secs(10),
             phase_timeout_s: setup.phase_timeout_s,
             timeout_code: "GRASP_TIMEOUT",

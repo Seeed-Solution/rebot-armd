@@ -2678,7 +2678,7 @@ async fn test_supervisor_pending_estop_count_rejects_clear_fault_set_torque_and_
     assert!(matches!(torque_res, Err(ArmError::Safety(SafetyError::EStopActive))));
 
     // 3. servo fails with EStopActive
-    let servo_res = supervisor.servo(vec![0.0], 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), vec![0.0], 1).await;
     assert!(matches!(servo_res, Err(ArmError::Safety(SafetyError::EStopActive))));
 }
 
@@ -2946,7 +2946,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 
     // Reverse servo command (moving towards open_rad=0.0, delta is negative)
     let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3];
-    let servo_res = supervisor.servo(rev_targets, 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), rev_targets, 1).await;
     assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
     assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
 
@@ -2962,7 +2962,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 
     // Now send squeeze command (towards closed_rad=1.5, delta is positive)
     let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
-    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    let sq_res = supervisor.servo(supervisor.capture_admission_stamp(), squeeze_targets, 1).await;
     assert!(sq_res.is_ok(), "Squeeze command accepted");
 
     // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!

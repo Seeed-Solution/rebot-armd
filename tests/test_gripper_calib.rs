@@ -78,7 +78,7 @@ fn test_zero_check_mock_stall_pass_and_fail() {
     // 1. Mock stall at +0.05 -> offset 0.05, pass: true (threshold 0.10)
     inner.set_mock_gripper_stall_offset(Some(0.05));
     let epoch = inner.safety.epoch_id();
-    let (id, _duration) = inner.start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": false}), epoch).unwrap();
+    let (id, _duration) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.10, "store_offset": false}), epoch) }.unwrap();
     let a = run_ticks(&mut inner, id, 5.0);
     assert_eq!(a.state, "done");
     assert!((a.stop_rad.unwrap() - 0.05).abs() < 1e-3, "stop_rad was {:?}", a.stop_rad);
@@ -96,7 +96,7 @@ fn test_zero_check_mock_stall_pass_and_fail() {
     inner.target_positions[6] = -0.50;
     inner.gripper_zero_checked = false;
     inner.set_mock_gripper_stall_offset(Some(-0.30));
-    let (id2, _) = inner.start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": false}), epoch).unwrap();
+    let (id2, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.10, "store_offset": false}), epoch) }.unwrap();
     let a2 = run_ticks(&mut inner, id2, 5.0);
     assert_eq!(a2.state, "done");
     assert!((a2.stop_rad.unwrap() - (-0.30)).abs() < 1e-3);
@@ -113,7 +113,7 @@ fn test_sim_follower_stops_at_closed_rad() {
     inner.set_mock_gripper_stall_offset(None); // Sim follower default: stops at closed_rad (0.0)
 
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_zero_check(&json!({}), epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap();
     let a = run_ticks(&mut inner, id, 5.0);
     assert_eq!(a.state, "done");
     assert!((a.stop_rad.unwrap() - 0.0).abs() < 1e-3);
@@ -128,14 +128,14 @@ fn test_zero_check_refuses_when_held_or_not_torqued() {
 
     // 1. Refuse while torque is off
     inner.is_torqued = false;
-    let err = inner.start_gripper_zero_check(&json!({}), epoch).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap_err();
     assert!(matches!(err, ArmError::Safety(_)));
 
     inner.is_torqued = true;
 
     // 2. Refuse while an object is held
     inner.held = Some(SupHeldObject { label: "cube".into(), spill_safe: false });
-    let err = inner.start_gripper_zero_check(&json!({}), epoch).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap_err();
     match err {
         ArmError::Rejected { status, code, message } => {
             assert_eq!(status, 409);
@@ -167,7 +167,7 @@ async fn test_zero_check_store_and_reload_shifts_policy() {
     }
 
     let epoch = supervisor.inner().read().await.safety.epoch_id();
-    let (id, _) = supervisor.inner().write().await.start_gripper_zero_check(
+    let (id, _) = supervisor.inner().write().await.start_gripper_zero_check(supervisor.capture_admission_stamp(),
         &json!({"threshold_rad": 0.10, "store_offset": true}),
         epoch,
     ).unwrap();
@@ -236,7 +236,7 @@ async fn test_zero_check_large_offset_refused_store() {
     inner.set_mock_gripper_stall_offset(Some(-0.60)); // |-0.60| > 0.5 rad
 
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_zero_check(&json!({"threshold_rad": 0.10, "store_offset": true}), epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.10, "store_offset": true}), epoch) }.unwrap();
     let a = run_ticks(&mut inner, id, 5.0);
     assert_eq!(a.state, "done");
     assert!((a.offset_rad.unwrap() - (-0.60)).abs() < 1e-3);
@@ -400,7 +400,7 @@ fn test_zero_check_from_fully_open_finishes_before_its_deadline() {
     inner.target_positions[6] = -5.7;
     inner.set_mock_gripper_stall_offset(Some(0.0));
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_zero_check(&json!({}), epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap();
     let a = run_ticks(&mut inner, id, 40.0);
     assert_eq!(a.state, "done", "{:?} {:?}", a.code, a.message);
     assert!(a.offset_rad.unwrap().abs() < 1e-2, "offset_rad was {:?}", a.offset_rad);
@@ -415,16 +415,16 @@ fn test_interrupted_release_still_counts_as_holding() {
     inner.held = Some(SupHeldObject { label: "cube".into(), spill_safe: false });
 
     // an Open stopped halfway keeps the object held: the zero check is refused
-    let (_id, _) = inner.start_gripper(open(), epoch).unwrap();
+    let (_id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s, open(), epoch) }.unwrap();
     for _ in 0..10 { inner.tick(DT); }
     inner.stop_motion();
     inner.commanded_velocities.fill(0.0);
     assert!(inner.held.is_some(), "held cleared by an unfinished release");
-    let err = inner.start_gripper_zero_check(&json!({}), epoch).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap_err();
     assert!(matches!(err, ArmError::Rejected { ref code, .. } if code == "OBJECT_HELD"), "{err:?}");
 
     // a completed Open clears it
-    let (id, _) = inner.start_gripper(open(), epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s, open(), epoch) }.unwrap();
     let a = run_ticks(&mut inner, id, 12.0);
     assert_eq!(a.state, "done");
     assert!(inner.held.is_none(), "held kept after a completed release");
@@ -439,10 +439,10 @@ fn test_gripper_moves_after_a_zero_check() {
     let mut inner = sim_at(&INSPECT);
     inner.set_mock_gripper_stall_offset(Some(0.0));
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_gripper_zero_check(&json!({}), epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({}), epoch) }.unwrap();
     assert_eq!(run_ticks(&mut inner, id, 30.0).state, "done");
     for f in [1.0, 0.5, 0.0] {
-        let (id, _) = inner.start_gripper(mv(f), epoch).unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s, mv(f), epoch) }.unwrap();
         assert_eq!(run_ticks(&mut inner, id, 15.0).state, "done");
         let target = -5.7 * f as f32;
         assert!((inner.measured_positions[6] - target).abs() < 0.15, "fraction {f}: j7 {} vs {target}", inner.measured_positions[6]);

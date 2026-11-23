@@ -382,7 +382,7 @@ fn mit_frame_fields_and_effort() {
         let mut goal = [0.0_f64; 6];
         for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
         goal[3] += f64::from(leg);
-        inner.install_joint_goal(&inp, &goal, 0.3, "joint_move", None, None).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.3, "joint_move", None, None) }.unwrap();
         for _ in 0..200 {
             inner.tick(DT);
             nominal.push((inner.commanded_positions[3], inner.commanded_velocities[3], inner.commanded_accelerations[3]));
@@ -493,7 +493,7 @@ fn mit_owner_handover() {
 
     // gravity compensation entry hands back first (POS_VEL, confirmed), exit, then a fresh handover
     bus.clear_log();
-    inner.enter_gravity_comp(Default::default()).expect("gravity comp entry");
+    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.expect("gravity comp entry");
     assert!(!inner.mit_active() && inner.mit.owner == mit::MitOwner::Off);
     let log = bus.tx_log();
     let back = log.iter().position(|f| f.id == 0x7FF && f.data == damiao::build_set_control_mode_frame(4, damiao::CTRL_MODE_POS_VEL).data).expect("J4 back to POS_VEL");
@@ -742,7 +742,7 @@ fn mit_effort_bound_holds_on_decoded_wire_fields() {
                 let mut goal = [0.0_f64; 6];
                 for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
                 goal[3] += f64::from(leg);
-                inner.install_joint_goal(&inp, &goal, 0.3, "joint_move", None, None).unwrap();
+                { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.3, "joint_move", None, None) }.unwrap();
                 for _ in 0..150 {
                     // the joint lags its command by a varying amount: pd is nonzero
                     bus.with(|s| s.follow_commands = false);
@@ -791,7 +791,7 @@ fn mit_gravity_entry_validates_before_the_hand_back() {
     let bad = [armd::gravity_comp::GravityCompRequest { scale: Some(9.0), damping_kd: None },
         armd::gravity_comp::GravityCompRequest { scale: None, damping_kd: Some(vec![99.0; 6]) }];
     for req in bad {
-        assert!(inner.enter_gravity_comp(req).is_err());
+        assert!({ let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, req) }.is_err());
         assert!(inner.mit_active(), "a refused request changed the owner");
     }
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0x55), "mode write for a refused request");
@@ -816,7 +816,7 @@ fn mit_collision_trip_holds_through_the_tick() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    inner.install_joint_goal(&inp, &goal, 0.3, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.3, "joint_move", None, None) }.unwrap();
     for _ in 0..25 { inner.tick(DT); feed(&inner, 0.0); }
     let moving_tau = mit_frames(&bus.tx_log(), 4).last().unwrap().4;
     assert!(inner.active_trajectory.is_some(), "{:?}", inner.current_observation().action.map(|a| a.message));
@@ -890,10 +890,10 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     let epoch = inner.safety.epoch_id();
     let mut target = inner.commanded_positions.clone();
     target[3] += 0.05;
-    let e = inner.jog_action(target, None, Some(epoch), "joint_move").unwrap_err();
+    let e = { let s = inner.current_admission_stamp(); inner.jog_action(s, target, None, Some(epoch), "joint_move") }.unwrap_err();
     assert!(e.to_string().contains("MIT tracking is not active"), "jog: {e}");
     let home = inner.config.home_positions.clone();
-    let e = inner.jog_action(home, None, Some(epoch), "home").unwrap_err();
+    let e = { let s = inner.current_admission_stamp(); inner.jog_action(s, home, None, Some(epoch), "home") }.unwrap_err();
     assert!(e.to_string().contains("MIT tracking is not active"), "home: {e}");
     #[cfg(feature = "policy-runtime")]
     {
@@ -909,7 +909,7 @@ fn mit_jog_home_and_live_policy_check_the_mit_precondition() {
     let mut target = inner.commanded_positions.clone();
     target[3] += 0.05;
     let epoch = inner.safety.epoch_id();
-    inner.jog_action(target, None, Some(epoch), "joint_move").expect("jog once MIT owns J4");
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, target, None, Some(epoch), "joint_move") }.expect("jog once MIT owns J4");
 }
 
 /// Review #12: a park requested while MIT moves the arm brakes to rest first, hands back through
@@ -922,7 +922,7 @@ fn mit_moving_park_brakes_hands_back_then_parks() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.5, "joint_move", None, None) }.unwrap();
     for _ in 0..15 { inner.tick(DT); }
     assert!(inner.commanded_velocities[3].abs() > 0.01, "moving");
     bus.clear_log();
@@ -1089,13 +1089,13 @@ fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
         let mut goal = [0.0_f64; 6];
         for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
         goal[3] -= 0.3;
-        inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.5, "joint_move", None, None) }.unwrap();
         for _ in 0..15 { inner.tick(DT); }
     };
     // park deferred, then STOP
     let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
     moving(&mut inner);
-    let id = inner.unload_action().unwrap().expect("the deferred park has an action id");
+    let id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().expect("the deferred park has an action id");
     inner.stop_motion();
     for _ in 0..60 { inner.tick(DT); assert!(!inner.pending_normal_unload, "park launched after a STOP"); }
     let a = inner.current_observation().action.unwrap();
@@ -1103,7 +1103,7 @@ fn mit_deferred_park_has_an_action_and_stop_cancels_it() {
     // park deferred, no STOP: the same action carries the park
     let (mut inner, _bus) = active_rig(mit_config_j4(), 0.0);
     moving(&mut inner);
-    let id = inner.unload_action().unwrap().expect("action id");
+    let id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().expect("action id");
     let mut parked = false;
     for _ in 0..30 { inner.tick(DT); if inner.pending_normal_unload { parked = true; break; } }
     assert!(parked);
@@ -1121,7 +1121,7 @@ fn mit_rearm_while_moving_brakes_refuses_motion_and_hands_back() {
     let mut goal = [0.0_f64; 6];
     for i in 0..6 { goal[i] = f64::from(inner.commanded_positions[i]); }
     goal[3] -= 0.3;
-    inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.5, "joint_move", None, None) }.unwrap();
     for _ in 0..15 { inner.tick(DT); }
     assert!(inner.commanded_velocities[3].abs() > 0.01);
     assert!(inner.set_torque(true).is_err(), "rearm accepted while MIT moves the arm");

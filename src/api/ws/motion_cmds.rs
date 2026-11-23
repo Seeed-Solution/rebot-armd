@@ -7,7 +7,7 @@
 use super::*;
 
 // The caller holds the same write lock used to verify lease and epoch.
-pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
+pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervisor::AdmissionStamp, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
     validate_command_body_common(body).map_err(invalid_command)?;
     match path {
         "/api/v1/torque" | "/api/v1/arm" => {
@@ -25,10 +25,11 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Va
             };
             inner.clear_fault_confirmed(mit_recovery)?;
         }
-        "/api/v1/motion/servo" => { inner.servo(positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
+        "/api/v1/motion/servo" => { inner.servo(stamp, positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
         "/api/v1/motion/jog" => {
             let speed_scale = motion::num(body, "speed_scale").map_err(ArmError::from)?;
             let (_, id, duration) = inner.jog_action_with_speed_scale(
+                stamp,
                 positions(body.get("target_positions"))?,
                 body.get("duration_secs").and_then(Value::as_f64),
                 Some(epoch),
@@ -38,11 +39,13 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Va
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/home" => {
+            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
             inner.check_commissioning_for_ordinary_motion("home")?;
-            let (_, id, duration) = inner.jog_action(inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
+            let (_, id, duration) = inner.jog_action(stamp, inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/unload" => {
+            inner.check_admission_stamp(stamp).map_err(ArmError::from)?;
             inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
             inner.collision_hold_check().map_err(ArmError::from)?;
             if inner.handover_settling_since.is_some() {
@@ -54,7 +57,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Va
             if !inner.safety.state().is_operational() && !inner.holding_after_clear() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
-            let id = inner.unload_action()?;
+            let id = inner.unload_action(stamp)?;
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }
@@ -62,7 +65,7 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Va
             let enable = body.get("enable").and_then(Value::as_bool)
                 .ok_or_else(|| invalid_command("enable must be boolean"))?;
             if enable {
-                inner.enter_gravity_comp(gravity_comp_request(body)?)?;
+                inner.enter_gravity_comp(stamp, gravity_comp_request(body)?)?;
             } else {
                 inner.exit_gravity_comp("REQUESTED", "Exit requested");
             }
@@ -132,18 +135,18 @@ impl PendingMacro {
 
 impl PlannedMacro {
     /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
-    pub(super) fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
+    pub(super) fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64), ArmError> {
         match self {
-            Self::Grasp(planned) => crate::grasp::begin(inner, supervisor, deps.source.clone(), planned),
+            Self::Grasp(planned) => crate::grasp::begin(inner, supervisor, deps.source.clone(), planned, stamp),
             Self::Place(planned) => {
-                let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
+                let id = inner.begin_macro(stamp, "place", &planned.input, planned.request.tag.clone())?;
                 if planned.orientation_levelled {
                     inner.update_action(id, |a| {
                         a.orientation = Some("levelled".into());
                     });
                 }
                 let duration = crate::place::expected_duration(&planned) + inner.approach_estimate_s("place_final", planned.request.approach);
-                crate::place::spawn(supervisor.clone(), id, planned);
+                crate::place::spawn(supervisor.clone(), id, planned, stamp);
                 Ok((id, duration))
             }
         }
@@ -164,7 +167,7 @@ impl Drop for AbortOnDrop {
 pub(super) struct MacroCheck {
     pub(super) request_id: Value,
     pub(super) generation: u64,
-    pub(super) enqueued_stop_gen: u64,
+    pub(super) stamp: crate::supervisor::AdmissionStamp,
     pub(super) abort: AbortOnDrop,
     pub(super) rx: tokio::sync::oneshot::Receiver<Result<PlannedMacro, ArmError>>,
 }

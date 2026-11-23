@@ -318,8 +318,8 @@ pub fn jobs_dir(calibration_path: &Path) -> PathBuf { calibration_path.with_file
 
 /// Begin the run (parent action `calib_hover`, tag = job id) and spawn its orchestrator.
 /// Returns (action id, deadline bound s, job id).
-pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, mut plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf) -> Result<(u64, f64, String), ArmError> {
-    let id = inner.begin_orchestrated_action("calib_hover", Some(plan.job.id.clone()), plan.epoch)?;
+pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, mut plan: HoverPlan, upstream: crate::api::proxy::DetectorUpstream, dir: PathBuf, stamp: crate::supervisor::AdmissionStamp) -> Result<(u64, f64, String), ArmError> {
+    let id = inner.begin_orchestrated_action(stamp, "calib_hover", Some(plan.job.id.clone()), plan.epoch)?;
     plan.job.state = "running".into();
     plan.job.code = None; plan.job.message = None; plan.job.end = None;
     plan.job.action_id = Some(id);
@@ -332,7 +332,7 @@ pub fn begin(inner: &mut SupervisorInner, sup: &Arc<ArmSupervisor>, mut plan: Ho
         plan.job.runs, plan.job.points.iter().filter(|p| p.state == "pending").count());
     let sup = sup.clone();
     tokio::spawn(async move {
-        let worker = { let sup = sup.clone(); let dir = dir.clone(); tokio::spawn(async move { run(sup, id, plan, upstream, dir).await }) };
+        let worker = { let sup = sup.clone(); let dir = dir.clone(); tokio::spawn(async move { run(sup, id, plan, upstream, dir, stamp).await }) };
         if let Err(e) = worker.await {
             tracing::error!("Calibration hover {id} orchestrator failed: {e}");
             let mut inner = sup.inner().write().await;
@@ -494,9 +494,9 @@ async fn run_point(ctx: &MacroCtx, plan: &HoverPlan, point: &mut HoverPoint, up:
     Ok(())
 }
 
-async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::api::proxy::DetectorUpstream, dir: PathBuf) {
+async fn run(sup: Arc<ArmSupervisor>, id: u64, mut plan: HoverPlan, up: crate::api::proxy::DetectorUpstream, dir: PathBuf, stamp: crate::supervisor::AdmissionStamp) {
     let ctx = MacroCtx {
-        sup: sup.clone(), id,
+        sup: sup.clone(), id, stamp,
         deadline: Instant::now() + Duration::from_secs_f64(plan.deadline_s),
         phase_timeout_s: plan.deadline_s,
         timeout_code: "HOVER_TIMEOUT",

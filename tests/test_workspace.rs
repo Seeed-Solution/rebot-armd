@@ -94,7 +94,7 @@ fn servo_frame_into_the_floor_is_rejected_and_moving_up_is_accepted() {
     let (ok, bad) = floor_edge();
     let mut inner = armed(ArmConfig::rebot_dm(), &ok);
     let epoch = inner.safety.epoch_id();
-    let err = inner.servo(bad.clone(), epoch).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.servo(s, bad.clone(), epoch) }.unwrap_err();
     let SafetyError::WorkspaceViolation { limit, value, bound, point, detail } = &err else { panic!("{err:?}") };
     assert_eq!(limit, "floor");
     assert!(*value < *bound && (1..=8).contains(point), "{err}");
@@ -107,31 +107,31 @@ fn servo_frame_into_the_floor_is_rejected_and_moving_up_is_accepted() {
     let mut inner = armed(ArmConfig::rebot_dm(), &deeper);
     let up = lerp(&DIP_A, &DIP_B, 0.30);
     assert!(total(&up) < total(&deeper));
-    inner.servo(up, epoch).expect("moving out of the violation is allowed");
+    { let s = inner.current_admission_stamp(); inner.servo(s, up, epoch) }.expect("moving out of the violation is allowed");
     // ... and one that makes it worse is not
     let mut inner = armed(ArmConfig::rebot_dm(), &lerp(&DIP_A, &DIP_B, 0.30));
-    assert!(matches!(inner.servo(deeper, epoch), Err(SafetyError::WorkspaceViolation { .. })));
+    assert!(matches!({ let s = inner.current_admission_stamp(); inner.servo(s, deeper, epoch) }, Err(SafetyError::WorkspaceViolation { .. })));
 }
 
 #[test]
 fn jog_whose_path_dips_below_the_floor_is_rejected() {
     let mut inner = armed(ArmConfig::rebot_dm(), &DIP_A);
-    let err = inner.jog(DIP_B.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, DIP_B.to_vec(), None, None) }.unwrap_err();
     assert!(matches!(err, ArmError::Safety(SafetyError::WorkspaceViolation { .. })), "{err:?}");
     assert!(inner.active_trajectory.is_none());
     // the same jog without a workspace policy is accepted
     let mut config = ArmConfig::rebot_dm();
     config.workspace = None;
     let mut inner = armed(config, &DIP_A);
-    inner.jog(DIP_B.to_vec(), None, None).expect("no workspace, no check");
+    { let s = inner.current_admission_stamp(); inner.jog(s, DIP_B.to_vec(), None, None) }.expect("no workspace, no check");
 }
 
 #[test]
 fn home_from_inspect_is_accepted() {
     let mut inner = armed(ArmConfig::rebot_dm(), &INSPECT);
-    inner.jog(HOME.to_vec(), None, None).expect("home from inspect");
+    { let s = inner.current_admission_stamp(); inner.jog(s, HOME.to_vec(), None, None) }.expect("home from inspect");
     let mut inner = armed(ArmConfig::rebot_dm(), &HOME);
-    inner.jog(INSPECT.to_vec(), None, None).expect("inspect from home");
+    { let s = inner.current_admission_stamp(); inner.jog(s, INSPECT.to_vec(), None, None) }.expect("inspect from home");
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn no_kinematics_workspace_or_wrong_dof_means_no_check() {
     let mut inner = armed(config, &DIP_A);
     assert!(inner.workspace_policy().is_none());
     let epoch = inner.safety.epoch_id();
-    inner.servo(lerp(&DIP_A, &DIP_B, 0.05), epoch).unwrap();
+    { let s = inner.current_admission_stamp(); inner.servo(s, lerp(&DIP_A, &DIP_B, 0.05), epoch) }.unwrap();
     inner.check_workspace_path(&DIP_A, [deeper.as_slice()]).unwrap();
     // 6-DOF default profile: no workspace configured
     assert!(SupervisorInner::new(ArmConfig::default()).workspace_policy().is_none());
@@ -266,7 +266,7 @@ fn per_constraint_rule_rejects_new_keepout_even_when_retreating_from_floor_or_re
 
     let mut inner = armed(cfg, &INSPECT);
     let epoch = inner.safety.epoch_id();
-    let err = inner.servo(q_up.to_vec(), epoch).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.servo(s, q_up.to_vec(), epoch) }.unwrap_err();
     let SafetyError::WorkspaceViolation { detail, .. } = &err else { panic!("expected WORKSPACE_VIOLATION, got {err:?}") };
     assert_eq!(detail.constraint_id.as_deref(), Some("keepout:wall"));
     assert_eq!(detail.violation_phase.as_deref(), Some("servo_target"));
@@ -387,7 +387,7 @@ fn servo_mid_step_dip_below_floor_with_empty_keepouts_is_caught_and_held() {
 
     let mut inner = armed(cfg, &q_start);
     let epoch = inner.safety.epoch_id();
-    inner.servo(q_target.to_vec(), epoch).expect("target itself is above floor_z");
+    { let s = inner.current_admission_stamp(); inner.servo(s, q_target.to_vec(), epoch) }.expect("target itself is above floor_z");
     for _ in 0..40 {
         inner.tick(0.02);
         if inner.servo_blocked_hold { break; }
@@ -485,7 +485,7 @@ fn link_capsules_reject_upper_arm_intrusion_and_validate_frames() {
     cfg_box.workspace.as_mut().unwrap().keepout_boxes.push(box_on_arm);
     // Move from HOME (safe) to INSPECT (end_link safe, upper_arm capsule inside arm_obstacle)
     let mut inner = armed(cfg_box, &HOME);
-    let err = inner.jog(INSPECT.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, INSPECT.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else { panic!("expected WorkspaceViolation, got {err:?}") };
     assert_eq!(detail.geometry_id.as_deref(), Some("capsule:upper_arm"));
     assert_eq!(detail.constraint_id.as_deref(), Some("keepout:arm_obstacle"));
@@ -504,12 +504,12 @@ fn park_from_violating_outer_boundary_allowed_but_crossing_keepout_rejected() {
     let cfg = ArmConfig::rebot_dm();
     let deeper = lerp(&DIP_A, &DIP_B, 0.5);
     let mut inner = armed(cfg.clone(), &deeper);
-    assert!(inner.unload_action().unwrap().is_some(), "park retreating from floor_z to legal HOME must succeed");
+    assert!({ let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().is_some(), "park retreating from floor_z to legal HOME must succeed");
 
     let mut cfg_reach = cfg.clone();
     cfg_reach.workspace.as_mut().unwrap().max_reach_m = Some(0.15); // HOME also violates max_reach
     let mut inner = armed(cfg_reach, &deeper);
-    let err = inner.unload_action().unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else { panic!("expected WorkspaceViolation, got {err:?}") };
     assert_eq!(detail.constraint_id.as_deref(), Some("reach"));
     assert_eq!(detail.violation_phase.as_deref(), Some("park"));
@@ -524,7 +524,7 @@ fn park_from_violating_outer_boundary_allowed_but_crossing_keepout_rejected() {
         max_m: p_mid.map(|v| (v + 0.04) as f32),
     });
     let mut inner = armed(cfg_keepout, &deeper);
-    let err = inner.unload_action().unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else { panic!("expected WorkspaceViolation, got {err:?}") };
     assert_eq!(detail.constraint_id.as_deref(), Some("keepout:park_wall"));
     assert_eq!(detail.violation_phase.as_deref(), Some("park"));
@@ -679,7 +679,7 @@ fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
     for k in 1..=10 {
         let mut q_next = q_start;
         q_next[1] += (k as f32) * dq_step;
-        let _ = inner.servo(q_next.to_vec(), epoch);
+        let _ = { let s = inner.current_admission_stamp(); inner.servo(s, q_next.to_vec(), epoch) };
         inner.tick(0.02);
         let depth_now = floor_z - min_z_at(&inner.commanded_positions);
         assert!(
@@ -974,11 +974,11 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws, cam, &INSPECT, "B601-DM INSPECT");
 
     let mut inner = armed(kit.clone(), &INSPECT);
-    let park_id = inner.unload_action().expect("park from INSPECT succeeds");
+    let park_id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.expect("park from INSPECT succeeds");
     assert!(park_id.is_some());
 
     let mut inner = armed(kit.clone(), &HOME);
-    inner.jog(INSPECT.to_vec(), None, None).expect("HOME -> INSPECT jog passes");
+    { let s = inner.current_admission_stamp(); inner.jog(s, INSPECT.to_vec(), None, None) }.expect("HOME -> INSPECT jog passes");
 
     // Positive 2: typical grasp approach -> descend -> lift -> retreat Cartesian moves pass without proximal capsule false trigger
     let mut inner = armed(kit.clone(), &INSPECT);
@@ -994,7 +994,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         let path = armd::motion::plan_cartesian_ex(&input, goal, armd::motion::Speed::default(), false)
             .unwrap_or_else(|e| panic!("B601-DM grasp waypoint {wp:?} failed: {e:?}"));
         let q_end = path.last_slice().to_vec();
-        inner.install_path(&input, path, "move_to", None).expect("install_path succeeds");
+        { let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }.expect("install_path succeeds");
         inner.stop_motion();
         inner.commanded_positions = q_end.clone();
         inner.measured_positions = q_end;
@@ -1023,7 +1023,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         "B601-DM side start",
     );
     let mut inner = armed(cfg_mid_keepout, &q_side);
-    let err = inner.jog(q_l3_target.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, q_l3_target.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on link3 keepout hit, got {err:?}");
     };
@@ -1065,7 +1065,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         "B601-DM sweep end",
     );
     let mut inner = armed(cfg_sweep, &q_left);
-    let err = inner.jog(q_right.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, q_right.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on link sweep, got {err:?}");
     };
@@ -1172,9 +1172,9 @@ fn so101_profile_link_capsules_positive_and_negative() {
         "SO-101 park",
     );
     let mut inner = armed(config.clone(), &q_home);
-    assert!(inner.unload_action().expect("home -> park passes").is_some());
+    assert!({ let s = inner.current_admission_stamp(); inner.unload_action(s) }.expect("home -> park passes").is_some());
     let mut inner = armed(config.clone(), &q_park);
-    inner.jog(q_home.clone(), None, None).expect("park -> home passes");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q_home.clone(), None, None) }.expect("park -> home passes");
 
     // Positive 2: start from actual home pose -> jog to approach -> descend -> lift -> retreat
     let setup = config.grasp.as_ref().unwrap().clone();
@@ -1187,7 +1187,7 @@ fn so101_profile_link_capsules_positive_and_negative() {
     assert!(sol.ok, "approach IK succeeds");
     let q_app: Vec<f32> = sol.q.iter().map(|v| *v as f32).collect();
     let mut inner = armed(config.clone(), &q_home);
-    inner.jog(q_app.clone(), None, None).expect("SO-101 home -> approach passes");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q_app.clone(), None, None) }.expect("SO-101 home -> approach passes");
     inner.stop_motion();
     inner.commanded_positions = q_app.clone();
     inner.measured_positions = q_app;
@@ -1197,7 +1197,7 @@ fn so101_profile_link_capsules_positive_and_negative() {
         let path = armd::motion::plan_cartesian_ex(&input, goal, armd::motion::Speed::default(), true)
             .unwrap_or_else(|e| panic!("SO-101 grasp z={z} failed: {e:?}"));
         let q_end = path.last_slice().to_vec();
-        inner.install_path(&input, path, "move_to", None).expect("SO-101 install_path succeeds");
+        { let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }.expect("SO-101 install_path succeeds");
         inner.stop_motion();
         inner.commanded_positions = q_end.clone();
         inner.measured_positions = q_end;
@@ -1222,7 +1222,7 @@ fn so101_profile_link_capsules_positive_and_negative() {
         max_m: [lower_mid_pt[0] as f32 + 0.012, lower_mid_pt[1] as f32 + 0.012, lower_mid_pt[2] as f32 + 0.012],
     });
     let mut inner = armed(cfg_mid_box, &q_home);
-    let err = inner.jog(q_low, None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, q_low, None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on SO-101 link keepout hit, got {err:?}");
     };
@@ -1263,7 +1263,7 @@ fn so101_profile_link_capsules_positive_and_negative() {
         "SO-101 sweep end",
     );
     let mut inner = armed(cfg_sweep, &q_left);
-    let err = inner.jog(q_right, None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, q_right, None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on SO-101 link sweep, got {err:?}");
     };
@@ -1361,7 +1361,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     assert_eq!(fail.detail.geometry_id.as_deref(), Some("capsule:base_link"));
 
     let mut inner = armed(dm.clone(), &HOME);
-    let err = inner.jog(q_fold_dm.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.jog(s, q_fold_dm.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on B601-DM self-fold, got {err:?}");
     };
@@ -1375,7 +1375,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_a, "DM sweep start");
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_b, "DM sweep end");
     let mut inner_sw = armed(dm.clone(), &q_sw_a);
-    let err = inner_sw.jog(q_sw_b.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner_sw.current_admission_stamp(); inner_sw.jog(s, q_sw_b.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on swept self-collision, got {err:?}");
     };
@@ -1398,7 +1398,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     }
     let mut inner_sv = armed(dm.clone(), &prev_ok);
     let epoch = inner_sv.safety.epoch_id();
-    let err = inner_sv.servo(first_bad, epoch).unwrap_err();
+    let err = { let s = inner_sv.current_admission_stamp(); inner_sv.servo(s, first_bad, epoch) }.unwrap_err();
     let SafetyError::WorkspaceViolation { detail, .. } = &err else { panic!("{err:?}") };
     assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
     assert_eq!(detail.violation_phase.as_deref(), Some("servo_target"), "{detail:?}");
@@ -1407,14 +1407,14 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     q_retreat[2] -= 0.15;
     let mut inner_esc = armed(dm.clone(), &q_fold_dm);
     let epoch_esc = inner_esc.safety.epoch_id();
-    inner_esc.servo(q_retreat.to_vec(), epoch_esc).expect("retreating out of self-collision must be allowed");
+    { let s = inner_esc.current_admission_stamp(); inner_esc.servo(s, q_retreat.to_vec(), epoch_esc) }.expect("retreating out of self-collision must be allowed");
 
     // 6. self_collision_min_clearance_m margin shifts clearance and triggers when gap < min_clearance_m
     let mut dm_margin = dm;
     dm_margin.workspace.as_mut().unwrap().self_collision_min_clearance_m = 0.08;
     dm_margin.validate().unwrap();
     let mut inner_margin = armed(dm_margin, &INSPECT);
-    let err = inner_margin.jog(HOME.to_vec(), None, None).unwrap_err();
+    let err = { let s = inner_margin.current_admission_stamp(); inner_margin.jog(s, HOME.to_vec(), None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation when min_clearance_m=0.08 > HOME clearance, got {err:?}");
     };
@@ -1431,7 +1431,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
 
     let q_fold_so = vec![0.0f32, -1.65, 1.55, 1.60, 0.0, 0.0];
     let mut inner_so = armed(so.clone(), so.resting_positions());
-    let err = inner_so.jog(q_fold_so, None, None).unwrap_err();
+    let err = { let s = inner_so.current_admission_stamp(); inner_so.jog(s, q_fold_so, None, None) }.unwrap_err();
     let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
         panic!("expected WorkspaceViolation on SO-101 self-fold, got {err:?}");
     };
@@ -1535,7 +1535,7 @@ fn rest_pose_neighbourhood_clears_self_collision_nominal_and_corrected() {
     let mut inner = armed(dm.clone(), &HOME);
     inner.set_kinematics_correction(Some(&corr)).unwrap();
     let near: Vec<f32> = HOME.iter().enumerate().map(|(j, _)| if j < 5 { step } else { 0.0 }).collect();
-    inner.jog(near, None, None).expect("jog within 2 deg of rest");
+    { let s = inner.current_admission_stamp(); inner.jog(s, near, None, None) }.expect("jog within 2 deg of rest");
 }
 
 #[test]
@@ -1566,7 +1566,7 @@ fn base_link_link5_contact_is_still_refused() {
     let mut inner = armed(dm.clone(), &HOME);
     inner.set_kinematics_correction(Some(&corr)).unwrap();
     for j4 in [1.0f32, 1.6] {
-        let err = inner.jog(vec![0.0, 0.0, 0.0, j4, 0.0, 0.0, 0.0], None, None).unwrap_err();
+        let err = { let s = inner.current_admission_stamp(); inner.jog(s, vec![0.0, 0.0, 0.0, j4, 0.0, 0.0, 0.0], None, None) }.unwrap_err();
         let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
             panic!("J4 {j4}: expected WorkspaceViolation, got {err:?}");
         };

@@ -644,7 +644,7 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
-        "MOTION_FORBIDDEN_IN_FAULT_STATE",
+        "MOTION_FORBIDDEN_IN_FAULT_STATE", "STOPPED",
     ];
     match &e {
         ArmError::Motion(m) => m.code(),
@@ -659,6 +659,8 @@ pub(crate) fn static_code(e: ArmError) -> &'static str {
             S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
             S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            S::Stopped => "STOPPED",
+            S::LeaseLost => "LEASE_LOST",
             _ => "REJECTED",
         },
         ArmError::Unsupported(_) => "UNSUPPORTED",
@@ -730,6 +732,12 @@ impl CoreOps for SupervisorInner {
 
     fn commit_primitive(&mut self, d: &Descriptor, primitive: &Primitive, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.check_motion_commit(d, primitive, ctx)?;
+        self.sync_stop_generation(ctx.stop_generation);
+        let stamp = crate::supervisor::AdmissionStamp {
+            stop_gen: d.stamp.authority.stop_generation,
+            estop_epoch: d.stamp.authority.epoch,
+            lease_gen: d.stamp.authority.lease_generation,
+        };
         match primitive {
             // a prepared path is installed with its slot's samples (`commit_prepared`)
             Primitive::None | Primitive::Prepared { .. } => Err("INVALID_COMMAND"),
@@ -737,7 +745,7 @@ impl CoreOps for SupervisorInner {
             // the committed action is the parent (its terminal carries the child count)
             Primitive::CartesianPath { .. } | Primitive::Gripper { .. } | Primitive::JointQuinticLimited { .. } | Primitive::Replay { .. } => {
                 if primitive.child().is_none() { return Err("UNSUPPORTED"); }
-                self.commit_macro_child(primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
+                self.commit_macro_child(stamp, primitive, ctx.now).map(|parent| Committed::authorized(d, Some(parent)))
             }
             Primitive::JointQuintic { dof, start, q, duration_s } => {
                 // the fields are public: a hand-built primitive may name more joints than it holds
@@ -745,7 +753,7 @@ impl CoreOps for SupervisorInner {
                 if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
                 self.jog_precheck_static()?;
-                self.jog_action_slice(&q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
+                self.jog_action_slice(stamp, &q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
             }
@@ -754,6 +762,12 @@ impl CoreOps for SupervisorInner {
 
     fn commit_prepared(&mut self, d: &Descriptor, primitive: &Primitive, path: &PreparedPath, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         self.check_motion_commit(d, primitive, ctx)?;
+        self.sync_stop_generation(ctx.stop_generation);
+        let stamp = crate::supervisor::AdmissionStamp {
+            stop_gen: d.stamp.authority.stop_generation,
+            estop_epoch: d.stamp.authority.epoch,
+            lease_gen: d.stamp.authority.lease_generation,
+        };
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = *primitive else { return Err("INVALID_COMMAND"); };
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
@@ -764,9 +778,9 @@ impl CoreOps for SupervisorInner {
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
                 let joint_path = self.prepared_joint_path(n, path, duration_s, power_scale)?;
                 match child {
-                    None => committed(self.install_prepared_path(epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
+                    None => committed(self.install_prepared_path(stamp, epoch, joint_path, power_scale.is_some()).map(|(id, _)| id)),
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        this.install_macro_prepared_path(id, joint_path, power_scale.is_some()).map(drop)
+                        this.install_macro_prepared_path(stamp, id, joint_path, power_scale.is_some()).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
@@ -775,11 +789,11 @@ impl CoreOps for SupervisorInner {
                 match child {
                     None => {
                         let prepared = self.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch).map_err(static_code)?;
-                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                        committed(self.install_prepared_replay(stamp, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
                         let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
-                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                        this.install_macro_prepared_replay(stamp, id, prepared).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
@@ -789,6 +803,12 @@ impl CoreOps for SupervisorInner {
     fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
         let primitive = slot.primitive;
         self.check_motion_commit(d, &primitive, ctx)?;
+        self.sync_stop_generation(ctx.stop_generation);
+        let stamp = crate::supervisor::AdmissionStamp {
+            stop_gen: d.stamp.authority.stop_generation,
+            estop_epoch: d.stamp.authority.epoch,
+            lease_gen: d.stamp.authority.lease_generation,
+        };
         let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else { return Err("INVALID_COMMAND"); };
         let n = usize::from(dof);
         if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
@@ -799,10 +819,10 @@ impl CoreOps for SupervisorInner {
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
                 match child {
                     None => self
-                        .install_prepared_path_slot(epoch, n, slot, duration_s, power_scale)
+                        .install_prepared_path_slot(stamp, epoch, n, slot, duration_s, power_scale)
                         .map(|(id, _)| Committed::authorized(d, Some(ActionId(id)))),
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
-                        this.install_macro_prepared_path_slot(id, n, slot, duration_s, power_scale).map(drop)
+                        this.install_macro_prepared_path_slot(stamp, id, n, slot, duration_s, power_scale).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
@@ -812,11 +832,11 @@ impl CoreOps for SupervisorInner {
                     None => {
                         let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
                         let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
-                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                        committed(self.install_prepared_replay(stamp, prepared).map(|(id, _)| id))
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
                         let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
-                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                        this.install_macro_prepared_replay(stamp, id, prepared).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
             }
@@ -900,6 +920,7 @@ impl CoreOps for SupervisorInner {
         }
         let stop_generation = stops.request();
         let applied_to_motion = self.authorized_stop();
+        self.sync_stop_generation(stop_generation);
         stops.mark_applied(stop_generation);
         UrgentStopOutcome::Applied {
             stop_generation,

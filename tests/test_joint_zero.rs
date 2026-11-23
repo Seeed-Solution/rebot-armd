@@ -99,7 +99,7 @@ async fn nonzero_offsets_shift_park_limits_and_fk_consistently() {
     let mut target = vec![0.0f32; 7];
     target[0] = 0.05;
     for _ in 0..60 {
-        let _ = sup.servo(target.clone(), epoch).await;
+        let _ = sup.servo(sup.capture_admission_stamp(), target.clone(), epoch).await;
         sup.tick(0.02).await;
         tokio::time::sleep(Duration::from_millis(2)).await;
     }

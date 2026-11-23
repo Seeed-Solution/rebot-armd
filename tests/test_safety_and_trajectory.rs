@@ -217,7 +217,7 @@ async fn test_supervisor_stop_policies() {
     // 4. NormalUnload policy
     supervisor.set_torque(true).await.unwrap();
     // Jog somewhere
-    supervisor.jog(vec![1.0, 1.0], Some(0.5), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 1.0], Some(0.5), None).await.unwrap();
     for _ in 0..10 { supervisor.tick(0.02).await; }
     supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
     // Step until trajectory finishes
@@ -241,7 +241,7 @@ async fn test_supervisor_watchdog_lease_timeout() {
 
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![1.0], Some(1.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0], Some(1.0), None).await.unwrap();
 
     // Sleep longer than lease_timeout
     tokio::time::sleep(Duration::from_millis(70)).await;
@@ -336,7 +336,7 @@ async fn test_supervisor_torque_disable_and_estop_state_clearing() {
     supervisor.set_torque(true).await.unwrap();
 
     // 1. Jog to start trajectory
-    supervisor.jog(vec![2.0], Some(1.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![2.0], Some(1.0), None).await.unwrap();
     for _ in 0..5 { supervisor.tick(0.02).await; }
 
     // Disabling torque while moving / mid-air must be rejected with ArmNotAtRestingPose
@@ -369,21 +369,21 @@ async fn test_supervisor_servo_high_frequency_teleop() {
 
     // Rejection with mismatched epoch_id
     assert!(matches!(
-        supervisor.servo(vec![0.5], 999).await,
+        supervisor.servo(supervisor.capture_admission_stamp(), vec![0.5], 999).await,
         Err(ArmError::Safety(SafetyError::EpochMismatch { .. }))
     ));
 
     // High frequency teleop target to 0.10 (current is 0.0) with valid epoch_id = 1 (within 0.15 rad jump limit)
     // Acceleration is bounded at 5 rad/s², so the first 20ms step is 0.002 rad
     // at 0.1 rad/s rather than an instantaneous 2 rad/s velocity jump.
-    supervisor.servo(vec![0.10], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.10], 1).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert!(obs.safety_state.is_operational());
     assert!((obs.positions[0] - 0.002).abs() < 1e-4);
     assert!((obs.velocities[0] - 0.1).abs() < 1e-3);
 
     // Dirty frame with instantaneous jump > 0.15 rad must be dropped
-    supervisor.servo(vec![0.5], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.5], 1).await.unwrap();
     let obs_dirty = supervisor.tick(0.02).await;
     assert!(obs_dirty.positions[0] < 0.15, "Dirty frame > 0.15 rad must be discarded");
 }
@@ -481,7 +481,7 @@ async fn test_supervisor_hardware_driver_mounting_and_anti_gravity_holding() {
     assert_eq!(obs.temperatures[0], 32.0);
 
     // Plan motion to 2.0 rad
-    supervisor.jog(vec![2.0], None, Some(1)).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![2.0], None, Some(1)).await.unwrap();
 
     // Advance 1 tick (20ms) - should interpolate smoothly
     let _ = supervisor.tick(0.02).await;
@@ -527,7 +527,7 @@ async fn test_supervisor_watchdog_not_renewed_on_invalid_command() {
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     // Send invalid jog command (epoch mismatch)
-    let bad_res = supervisor.jog(vec![0.5], Some(1.0), Some(999)).await;
+    let bad_res = supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5], Some(1.0), Some(999)).await;
     assert!(bad_res.is_err());
 
     // Sleep another 50ms (total elapsed > 100ms lease timeout)

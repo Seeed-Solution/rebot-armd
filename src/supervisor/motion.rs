@@ -518,6 +518,7 @@ impl SupervisorInner {
             acquired_at: now,
             last_valid_motion_instant: None,
         });
+        self.sync_lease_gen_mirror();
         self.last_heartbeat = now;
         if evicted.is_some() {
             self.last_preemption = Some(now);
@@ -555,6 +556,7 @@ impl SupervisorInner {
             acquired_at: now,
             last_valid_motion_instant: None,
         });
+        self.sync_lease_gen_mirror();
         Ok(gen)
     }
 
@@ -677,6 +679,7 @@ impl SupervisorInner {
             if active.client_id == client_id && active.generation == generation {
                 let valid = active.acquired_at.elapsed() < self.lease_timeout;
                 self.active_lease = None;
+                self.sync_lease_gen_mirror();
                 #[cfg(feature = "policy-runtime")]
                 self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
                 return valid;
@@ -861,21 +864,23 @@ impl SupervisorInner {
     /// allocation, no `workspace_samples` `Vec`, no `target_positions` replacement free).
     pub(crate) fn jog_action_slice(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: &[f32],
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         use crate::rt_core::mailbox::MAX_DOF;
         if self.config.active_tool.commissioning_required {
             return Err(SafetyError::CommissioningRequired(format!("{kind} (requires speed_scale <= 0.2)")).into());
         }
         let n = target_positions.len();
         if n > MAX_DOF {
-            return self.jog_action(target_positions.to_vec(), duration_secs, epoch_id, kind);
+            return self.jog_action(stamp, target_positions.to_vec(), duration_secs, epoch_id, kind);
         }
         let Some((limits_buf, lim_n)) = self.planning_limits_inline(None) else {
-            return self.jog_action(target_positions.to_vec(), duration_secs, epoch_id, kind);
+            return self.jog_action(stamp, target_positions.to_vec(), duration_secs, epoch_id, kind);
         };
         let limits = &limits_buf[..lim_n];
         let mut target = [0.0f32; MAX_DOF];
@@ -953,33 +958,37 @@ impl SupervisorInner {
 
     pub fn jog(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
-        self.jog_action(target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
+        self.jog_action(stamp, target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
     }
 
     /// Jog that records an action of `kind` (`joint_move` or `home`).
     /// Returns (epoch, action id, planned duration).
     pub fn jog_action(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
-        self.jog_action_with_speed_scale(target_positions, duration_secs, epoch_id, kind, None)
+        self.jog_action_with_speed_scale(stamp, target_positions, duration_secs, epoch_id, kind, None)
     }
 
     pub fn jog_action_with_speed_scale(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
         kind: &str,
         speed_scale: Option<f64>,
     ) -> Result<(u64, u64, f64), ArmError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         if let Some(s) = speed_scale {
             if !s.is_finite() || !(0.05..=1.0).contains(&s) {
                 return Err(MotionError::InvalidCommand("speed_scale must be in [0.05, 1.0]".into()).into());
@@ -1018,13 +1027,15 @@ impl SupervisorInner {
                 }
             }
         }
-        self.start_quintic(target_positions, duration_secs, epoch_id, kind, None, &limits)
+        self.start_quintic(stamp, target_positions, duration_secs, epoch_id, kind, None, &limits)
     }
 
     /// Joint-space quintic to `target_positions` planned with `limits`, recorded as an
     /// action of `kind`. Returns (epoch, action id, planned duration).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_quintic(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
@@ -1032,15 +1043,17 @@ impl SupervisorInner {
         tag: Option<String>,
         limits: &[crate::model::JointLimit],
     ) -> Result<(u64, u64, f64), ArmError> {
-        self.start_quintic_prepared(target_positions, duration_secs, epoch_id, kind, tag, limits, None)
+        self.start_quintic_prepared(stamp, target_positions, duration_secs, epoch_id, kind, tag, limits, None)
     }
 
     /// [`start_quintic`](Self::start_quintic) that installs `prepared` (planned, power-fitted
     /// and workspace-checked without the lock) when it was made from the same start, target,
     /// limits, workspace revision, tool offset and power budget; else plans and checks here.
     /// Every other check runs here either way.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_quintic_prepared(
         &mut self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
@@ -1049,6 +1062,7 @@ impl SupervisorInner {
         limits: &[crate::model::JointLimit],
         prepared: Option<PreparedQuintic>,
     ) -> Result<(u64, u64, f64), ArmError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         let mut target_positions = target_positions;
         self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
@@ -1214,9 +1228,10 @@ impl SupervisorInner {
 
     /// Install a planned path if nothing changed since `input` was taken.
     /// Returns (action id, expected duration).
-    pub fn install_path(&mut self, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+    pub fn install_path(&mut self, stamp: AdmissionStamp, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+        let admitted = self.check_admission_stamp(stamp)?;
         self.check_plan_fresh(input)?;
-        let duration = self.start_path_motion(input, &path)?;
+        let duration = self.start_path_motion(admitted, input, &path)?;
         let id = self.begin_action(kind, tag);
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
@@ -1285,17 +1300,21 @@ impl SupervisorInner {
     /// zero frees on both accepted and refused commits). Returns `(action id, expected duration)`.
     pub(crate) fn install_prepared_path_slot(
         &mut self,
+        stamp: AdmissionStamp,
         epoch: u64,
         dof: usize,
         slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
         duration_s: f64,
         power_scale: Option<f64>,
     ) -> Result<(u64, f64), &'static str> {
+        let admitted = self
+            .check_admission_stamp(stamp)
+            .map_err(|e| crate::rt_core::ops::static_code(e.into()))?;
         self.validate_prepared_joint_path(dof, &slot.path, duration_s)?;
         self.check_prepared_fresh_static(epoch)?;
         let last = &slot.path.samples()[slot.path.len() - 1][..dof];
         let duration = self
-            .start_path_motion_slice(epoch, last, duration_s)
+            .start_path_motion_slice(admitted, epoch, last, duration_s)
             .map_err(crate::rt_core::ops::static_code)?;
         let id = self.begin_action_rt("move_to");
         let scale = power_scale.unwrap_or(1.0);
@@ -1322,9 +1341,10 @@ impl SupervisorInner {
 
     /// Installs a prepared Cartesian path as a `move_to` action (the RT commit: no IK).
     /// Returns (action id, expected duration).
-    pub(crate) fn install_prepared_path(&mut self, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
+    pub(crate) fn install_prepared_path(&mut self, stamp: AdmissionStamp, epoch: u64, path: JointPath, power_noted: bool) -> Result<(u64, f64), ArmError> {
+        let admitted = self.check_admission_stamp(stamp)?;
         self.check_prepared_fresh(epoch)?;
-        let duration = self.start_path_motion_at(epoch, &path)?;
+        let duration = self.start_path_motion_at(admitted, epoch, &path)?;
         let id = self.begin_action("move_to", None);
         if power_noted { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
@@ -1349,21 +1369,23 @@ impl SupervisorInner {
     /// holds). `same_side`: end with the same-side approach of `move_to_precise`.
     /// Returns (action id, expected duration).
     #[allow(clippy::too_many_arguments)]
-    pub fn install_joint_goal(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+    pub fn install_joint_goal(&mut self, stamp: AdmissionStamp, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
         same_side: Option<crate::backlash::Request>) -> Result<(u64, f64), ArmError> {
-        self.install_joint_goal_prepared(input, q, speed_scale, kind, tag, same_side, None)
+        self.install_joint_goal_prepared(stamp, input, q, speed_scale, kind, tag, same_side, None)
     }
 
     /// [`install_joint_goal`](Self::install_joint_goal) with the quintic prepared without the
     /// lock ([`prepare_quintic`]); used when its inputs still match.
-    pub fn install_joint_goal_prepared(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_joint_goal_prepared(&mut self, stamp: AdmissionStamp, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
         same_side: Option<crate::backlash::Request>, prepared: Option<PreparedQuintic>) -> Result<(u64, f64), ArmError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         self.check_plan_fresh(input)?;
         let target = self.joint_goal_target(q);
         let limits = self.joint_goal_limits(speed_scale);
         let (_, id, duration) = match same_side {
-            Some(request) => self.start_quintic_same_side(target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
-            None => self.start_quintic_prepared(target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
+            Some(request) => self.start_quintic_same_side(stamp, target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
+            None => self.start_quintic_prepared(stamp, target, None, Some(input.epoch), kind, tag, &limits, prepared)?,
         };
         Ok((id, duration))
     }
@@ -1484,16 +1506,18 @@ impl SupervisorInner {
         if self.macro_run.is_some() {
             self.request_macro_stop();
         }
+        self.advance_stop_generation();
         true
     }
 
-    pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
-        self.start_path_motion_at(input.epoch, path)
+    pub(super) fn start_path_motion(&mut self, admitted: AdmittedMotion, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
+        self.start_path_motion_at(admitted, input.epoch, path)
     }
 
     /// Validates `last` under safety epoch `epoch` and activates path motion without allocating
     /// or freeing (`target_positions` is updated in place via `copy_into`).
-    pub fn start_path_motion_slice(&mut self, epoch: u64, last: &[f32], duration: f64) -> Result<f64, ArmError> {
+    #[doc(hidden)]
+    pub fn start_path_motion_slice(&mut self, _admitted: AdmittedMotion, epoch: u64, last: &[f32], duration: f64) -> Result<f64, ArmError> {
         self.safety.validate_motion_command(Some(epoch), last, &self.config.limits)?;
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
@@ -1505,7 +1529,7 @@ impl SupervisorInner {
     }
 
     /// [`Self::start_path_motion`] for a path planned under safety epoch `epoch`.
-    pub(crate) fn start_path_motion_at(&mut self, epoch: u64, path: &JointPath) -> Result<f64, ArmError> {
-        self.start_path_motion_slice(epoch, path.last_slice(), path.duration)
+    pub(crate) fn start_path_motion_at(&mut self, admitted: AdmittedMotion, epoch: u64, path: &JointPath) -> Result<f64, ArmError> {
+        self.start_path_motion_slice(admitted, epoch, path.last_slice(), path.duration)
     }
 }

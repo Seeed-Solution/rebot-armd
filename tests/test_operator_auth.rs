@@ -1809,7 +1809,7 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
         inner.set_mock_gripper_stall_offset(Some(0.05));
         inner.acquire_lease("conn_exp").unwrap();
         let ep = inner.safety.epoch_id();
-        let (id, _) = inner.start_gripper_zero_check(&json!({"threshold_rad": 0.1, "store_offset": true}), ep).unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper_zero_check(s, &json!({"threshold_rad": 0.1, "store_offset": true}), ep) }.unwrap();
         id
     };
     // Tick until zero_check reaches persisting, then wait past 200ms lease_timeout without renewing lease

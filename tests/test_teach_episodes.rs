@@ -203,7 +203,7 @@ async fn new_store_episode_replays_by_id_and_stale_needs_allow_stale() {
     let epoch = sup.get_observation().await.epoch_id;
     let mut target = common::INSPECT.to_vec();
     target[0] += 0.1;
-    sup.inner().write().await.jog_action(target, Some(1.0), Some(epoch), "joint_move").unwrap();
+    sup.inner().write().await.jog_action(sup.capture_admission_stamp(), target, Some(1.0), Some(epoch), "joint_move").unwrap();
     for _ in 0..70 {
         sup.tick(0.02).await;
         let mut i = sup.inner().write().await;
@@ -217,7 +217,7 @@ async fn new_store_episode_replays_by_id_and_stale_needs_allow_stale() {
     let id = path.file_stem().unwrap().to_string_lossy().into_owned();
     assert!(armd::recording::is_ulid(&id));
     let req = |allow_stale| armd::replay::ReplayRequest { episode: id.clone(), speed: 1.0, gripper: false, tag: None, allow_stale };
-    let (aid, _) = sup.inner().write().await.start_replay(req(false), epoch).unwrap();
+    let (aid, _) = sup.inner().write().await.start_replay(sup.capture_admission_stamp(), req(false), epoch).unwrap();
     let mut done = None;
     for _ in 0..400 {
         sup.tick(0.02).await;
@@ -233,12 +233,12 @@ async fn new_store_episode_replays_by_id_and_stale_needs_allow_stale() {
         let mut i = sup.inner().write().await;
         i.joint_zero_offsets[0] = 1f32.to_radians();
     }
-    let err = sup.inner().write().await.start_replay(req(false), epoch).unwrap_err();
+    let err = sup.inner().write().await.start_replay(sup.capture_admission_stamp(), req(false), epoch).unwrap_err();
     let api = armd::api::rest::ApiError::from(err);
     assert_eq!(api.code.as_deref(), Some("DATA_STALE"));
     let st = sup.episode_store().await;
     assert!(st.view(&id, &sup.inner().read().await.joint_zero_offsets).unwrap().stale);
-    sup.inner().write().await.start_replay(req(true), epoch).unwrap();
+    sup.inner().write().await.start_replay(sup.capture_admission_stamp(), req(true), epoch).unwrap();
 }
 
 /// The control tick with a recording running does what it did before teach v1 (append one

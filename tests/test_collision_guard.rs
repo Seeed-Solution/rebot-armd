@@ -55,7 +55,7 @@ fn start_move(inner: &mut SupervisorInner) -> u64 {
     let spec = GoalSpec::Absolute { p: [p0[0] + 0.06, p0[1], p0[2]], r: None };
     let goal = resolve_goal(&input, &spec);
     let path = plan_cartesian(&input, goal, Speed { linear: 0.05, angular: 0.5 }).unwrap();
-    inner.install_path(&input, path, "move_to", None).unwrap().0
+    { let s = inner.current_admission_stamp(); inner.install_path(s, &input, path, "move_to", None) }.unwrap().0
 }
 
 fn code_of(e: ArmError) -> (u16, String) {
@@ -116,9 +116,9 @@ fn trip_cancels_a_running_move_to_holds_rejects_motion_and_auto_resumes() {
 
     // motion is refused with COLLISION_HOLD (409)
     assert_eq!(code_of(inner.plan_input().unwrap_err()), (409, "COLLISION_HOLD".into()));
-    assert_eq!(code_of(inner.jog_action(INSPECT.to_vec(), None, None, "joint_move").unwrap_err()), (409, "COLLISION_HOLD".into()));
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); inner.jog_action(s, INSPECT.to_vec(), None, None, "joint_move") }.unwrap_err()), (409, "COLLISION_HOLD".into()));
     let epoch = inner.safety.epoch_id();
-    assert_eq!(code_of(inner.servo(INSPECT.to_vec(), epoch).unwrap_err().into()), (409, "COLLISION_HOLD".into()));
+    assert_eq!(code_of({ let s = inner.current_admission_stamp(); inner.servo(s, INSPECT.to_vec(), epoch) }.unwrap_err().into()), (409, "COLLISION_HOLD".into()));
 
     // residual still high: the hold stays
     let obs = ticks(&mut inner, 30);
@@ -147,7 +147,7 @@ fn gravity_comp_entry_ends_a_collision_hold() {
     arm.set_residual(2, -8.0);
     ticks(&mut inner, 5);
     assert!(inner.collision.hold.is_some(), "tripped");
-    inner.enter_gravity_comp(Default::default()).unwrap();
+    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
     assert!(inner.collision.hold.is_none(), "entry ends the hold");
     let obs = ticks(&mut inner, 5);
     assert!(inner.gravity_comp.is_some());
@@ -162,7 +162,7 @@ fn no_detection_in_gravity_comp_mode() {
         eprintln!("skipped: gravity model URDF not found ({:?})", inner.gravity_comp_support());
         return;
     }
-    inner.enter_gravity_comp(Default::default()).unwrap();
+    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.gravity_comp.is_some());
     arm.set_residual(1, 12.0);
@@ -350,8 +350,8 @@ fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
     let p0 = kinematics::fk(&kinematics::q6(&INSPECT)).p;
     let goal = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.06, p0[1], p0[2]], r: None });
     let path = plan_cartesian(&input, goal, Speed { linear: 0.05, angular: 0.5 }).unwrap();
-    let id = inner.begin_macro("grasp", &input, None).unwrap();
-    inner.install_macro_path(id, &input, path).unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.begin_macro(s, "grasp", &input, None) }.unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_macro_path(s, id, &input, path) }.unwrap();
     ticks(&mut inner, 10);
     arm.set_residual(1, 9.0);
     let obs = ticks(&mut inner, 4);
@@ -359,7 +359,7 @@ fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
     assert_eq!((a.id, a.kind.as_str(), a.state.as_str(), a.code.as_deref()), (id, "grasp", "failed", Some("COLLISION")), "{a:?}");
     assert!(inner.macro_run.is_none() && inner.active_trajectory.is_none());
     let close = armd::motion::GripperRequest { command: armd::motion::GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: Some(8.0), tag: None };
-    assert!(inner.start_macro_gripper(id, close).is_err());
+    assert!({ let s = inner.current_admission_stamp(); inner.start_macro_gripper(s, id, close) }.is_err());
 }
 
 /// Full place orchestrator on the 50 Hz ticker: a trip during the approach ends it with

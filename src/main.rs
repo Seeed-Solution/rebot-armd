@@ -774,19 +774,19 @@ mod shutdown_tests {
     fn refused_shutdown_latches_stop_until_explicit_recovery_and_rearm() {
         let mut inner = physical(EnableState::Enabled);
         let old_epoch = inner.safety.epoch_id();
-        inner.servo(vec![0.1; 6], old_epoch).unwrap();
+        inner.servo(inner.current_admission_stamp(), vec![0.1; 6], old_epoch).unwrap();
         assert!(!request_shutdown(&mut inner));
         assert_eq!(inner.safety.state(), &SafetyState::EStop);
         let new_epoch = inner.safety.epoch_id();
         assert_ne!(new_epoch, old_epoch);
-        assert!(inner.servo(vec![0.1; 6], old_epoch).is_err());
-        assert!(inner.servo(vec![0.1; 6], new_epoch).is_err());
+        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], old_epoch).is_err());
+        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], new_epoch).is_err());
         assert!(inner.set_torque(true).is_err());
         inner.clear_fault().unwrap();
         assert_eq!(inner.safety.state(), &SafetyState::Idle);
-        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_err());
+        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_err());
         inner.set_torque(true).unwrap();
-        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_ok());
+        assert!(inner.servo(inner.current_admission_stamp(), vec![0.1; 6], inner.safety.epoch_id()).is_ok());
     }
 
     #[test]

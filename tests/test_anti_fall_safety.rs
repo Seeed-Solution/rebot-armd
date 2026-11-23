@@ -423,13 +423,13 @@ async fn test_servo_target_dirty_jump_and_step_rate_limit() {
     supervisor.set_torque(true).await.unwrap();
 
     // 1. Dirty jump > 0.35 rad: must be dropped immediately
-    supervisor.servo(vec![0.40], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.40], 1).await.unwrap();
     let obs1 = supervisor.tick(0.02).await;
     assert_eq!(obs1.positions[0], 0.0, "Dirty target with jump > 0.35 rad must be dropped");
 
     // 2. Normal jump <= 0.35 rad (e.g. 0.10 rad): accepted
     // Acceleration-bounded first step: 20ms * (5 rad/s² * 20ms) = 0.002 rad
-    supervisor.servo(vec![0.10], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.10], 1).await.unwrap();
     let obs2 = supervisor.tick(0.02).await;
     assert!((obs2.positions[0] - 0.002).abs() < 1e-4, "Position step must be acceleration bounded");
     assert!((obs2.velocities[0] - 0.1).abs() < 1e-3, "Velocity must be acceleration bounded");
@@ -549,7 +549,7 @@ async fn test_normal_unload_settle_and_power_off_closed_loop() {
     supervisor.set_torque(true).await.unwrap();
 
     // 1. Arm is torqued, jog to an extended pose
-    supervisor.jog(vec![0.5, 0.5], Some(0.3), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5, 0.5], Some(0.3), None).await.unwrap();
     for _ in 0..10 {
         supervisor.tick(0.02).await;
     }
@@ -741,14 +741,14 @@ async fn test_gripper_far_target_is_rate_limited_not_dropped() {
     let epoch = supervisor.inner().read().await.safety.epoch_id();
     let mut target = vec![0.0; 7];
     target[6] = -0.8;
-    supervisor.servo(target.clone(), epoch).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), target.clone(), epoch).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert!(obs.positions[6] < 0.0, "gripper must start moving toward a far target");
     assert!(obs.positions[6] > -0.01, "gripper step must stay acceleration bounded");
 
     target[6] = obs.positions[6];
     target[0] = 0.40;
-    supervisor.servo(target, epoch).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), target, epoch).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert_eq!(obs.positions[0], 0.0, "arm joint jump > 0.35 rad must still be dropped");
 }

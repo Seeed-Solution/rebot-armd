@@ -536,17 +536,18 @@ mod runtime {
         /// (reason in the action record) when the pre-target or the segment fails a check.
         /// Returns (epoch, action id, planned duration of both legs).
         #[allow(clippy::too_many_arguments)]
-        pub(crate) fn start_quintic_same_side(&mut self, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
+        pub(crate) fn start_quintic_same_side(&mut self, stamp: crate::supervisor::AdmissionStamp, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
             limits: &[JointLimit], use_: &str, request: Request) -> Result<(u64, u64, f64), ArmError> {
+            let _admitted = self.check_admission_stamp(stamp)?;
             let plan = match self.approach_plan(use_, request) {
                 Ok(p) => p,
-                Err(None) => return self.start_quintic(target, None, epoch_id, kind, tag, limits),
-                Err(Some(r)) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, r.to_string()),
+                Err(None) => return self.start_quintic(stamp, target, None, epoch_id, kind, tag, limits),
+                Err(Some(r)) => return self.start_quintic_direct(stamp, target, epoch_id, kind, tag, limits, r.to_string()),
             };
             let delta = plan.policy.delta_rad();
             let (pre, signs) = match pre_target(&target, &plan.joints, delta, &self.config.limits) {
                 Ok(x) => x,
-                Err(r) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, format!("pre_target: {r}")),
+                Err(r) => return self.start_quintic_direct(stamp, target, epoch_id, kind, tag, limits, format!("pre_target: {r}")),
             };
             let mut seg_limits = plan.seg_limits.clone();
             for (seg, lim) in seg_limits.iter_mut().zip(limits) {
@@ -554,11 +555,11 @@ mod runtime {
             }
             let (seg, seg_scale) = match self.approach_segment(&pre, &target, &seg_limits) {
                 Ok(x) => x,
-                Err(r) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, r),
+                Err(r) => return self.start_quintic_direct(stamp, target, epoch_id, kind, tag, limits, r),
             };
-            let (epoch, id, d1) = match self.start_quintic(pre, None, epoch_id, kind, tag.clone(), limits) {
+            let (epoch, id, d1) = match self.start_quintic(stamp, pre, None, epoch_id, kind, tag.clone(), limits) {
                 Ok(x) => x,
-                Err(e) => return self.start_quintic_direct(target, epoch_id, kind, tag, limits, format!("pre_target: {}", code(e))),
+                Err(e) => return self.start_quintic_direct(stamp, target, epoch_id, kind, tag, limits, format!("pre_target: {}", code(e))),
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
@@ -573,9 +574,10 @@ mod runtime {
             Ok((epoch, id, d1 + d2))
         }
 
-        fn start_quintic_direct(&mut self, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
+        #[allow(clippy::too_many_arguments)]
+        fn start_quintic_direct(&mut self, stamp: crate::supervisor::AdmissionStamp, target: Vec<f32>, epoch_id: Option<u64>, kind: &str, tag: Option<String>,
             limits: &[JointLimit], reason: String) -> Result<(u64, u64, f64), ArmError> {
-            let started = self.start_quintic(target, None, epoch_id, kind, tag, limits)?;
+            let started = self.start_quintic(stamp, target, None, epoch_id, kind, tag, limits)?;
             self.record_approach(started.1, &Outcome::direct(reason));
             Ok(started)
         }
@@ -583,16 +585,18 @@ mod runtime {
         /// [`install_path`](Self::install_path) with the same-side approach: `pre` from
         /// [`plan_cartesian_pre`]; the direct path when it is not ready or the short segment
         /// fails a check. Returns (action id, expected duration).
-        pub fn install_path_same_side(&mut self, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
+        #[allow(clippy::too_many_arguments)]
+        pub fn install_path_same_side(&mut self, stamp: crate::supervisor::AdmissionStamp, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
             kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
-            self.install_path_same_side_with_rules(input, direct, pre, plan, None, kind, tag)
+            self.install_path_same_side_with_rules(stamp, input, direct, pre, plan, None, kind, tag)
         }
 
         /// [`install_path_same_side`](Self::install_path_same_side) with `rules` enforced on the
         /// actually selected path (`cp.path` + `seg`, or `direct` on any fallback).
         #[allow(clippy::too_many_arguments)]
-        pub fn install_path_same_side_with_rules(&mut self, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
+        pub fn install_path_same_side_with_rules(&mut self, stamp: crate::supervisor::AdmissionStamp, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre, plan: Option<&Plan>,
             rules: Option<&DescentRules>, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+            let _admitted = self.check_admission_stamp(stamp)?;
             let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
                 if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
                     check_table_clear(&input.arm, points, *bound, path.q.iter().map(|q| q.as_slice()))
@@ -604,32 +608,32 @@ mod runtime {
                 (Pre::Ready(cp), Some(plan)) => (cp, plan),
                 (Pre::Direct(r), _) => {
                     check_direct_table(&direct)?;
-                    let started = self.install_path(input, direct, kind, tag)?;
+                    let started = self.install_path(stamp, input, direct, kind, tag)?;
                     self.record_approach(started.0, &Outcome::direct(r));
                     return Ok(started);
                 }
                 _ => {
                     check_direct_table(&direct)?;
-                    return self.install_path(input, direct, kind, tag);
+                    return self.install_path(stamp, input, direct, kind, tag);
                 }
             };
             let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
                 Ok(x) => x,
-                Err(r) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(r), None, rules, kind, tag),
+                Err(r) => return self.install_path_same_side_with_rules(stamp, input, direct, Pre::Direct(r), None, rules, kind, tag),
             };
             if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
                 let seg_qs = match self.workspace_samples(&seg) {
                     Ok(s) => s,
-                    Err(e) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules, kind, tag),
+                    Err(e) => return self.install_path_same_side_with_rules(stamp, input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules, kind, tag),
                 };
                 if let Err(r) = table_clear_iter(&input.arm, points, *bound, cp.path.q.iter().map(|q| q.as_slice()).chain(seg_qs.iter().map(Vec::as_slice))) {
-                    return self.install_path_same_side_with_rules(input, direct, Pre::Direct(r), None, rules, kind, tag);
+                    return self.install_path_same_side_with_rules(stamp, input, direct, Pre::Direct(r), None, rules, kind, tag);
                 }
             }
             let target = cp.target.clone();
-            let (id, d1) = match self.install_path(input, cp.path, kind, tag.clone()) {
+            let (id, d1) = match self.install_path(stamp, input, cp.path, kind, tag.clone()) {
                 Ok(x) => x,
-                Err(e) => return self.install_path_same_side_with_rules(input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules, kind, tag),
+                Err(e) => return self.install_path_same_side_with_rules(stamp, input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules, kind, tag),
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {
@@ -646,15 +650,18 @@ mod runtime {
 
         /// [`install_macro_path`](Self::install_macro_path) with the same-side approach (grasp /
         /// place final descent). Records the outcome on action `id`. Returns the expected duration.
-        pub fn install_macro_path_same_side(&mut self, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
+        #[allow(clippy::too_many_arguments)]
+        pub fn install_macro_path_same_side(&mut self, stamp: crate::supervisor::AdmissionStamp, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
             plan: Option<&Plan>) -> Result<f64, ArmError> {
-            self.install_macro_path_same_side_with_rules(id, input, direct, pre, plan, None)
+            self.install_macro_path_same_side_with_rules(stamp, id, input, direct, pre, plan, None)
         }
 
         /// [`install_macro_path_same_side`](Self::install_macro_path_same_side) with `rules`
         /// enforced on the actually selected path (`cp.path` + `seg`, or `direct` on any fallback).
-        pub fn install_macro_path_same_side_with_rules(&mut self, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
+        #[allow(clippy::too_many_arguments)]
+        pub fn install_macro_path_same_side_with_rules(&mut self, stamp: crate::supervisor::AdmissionStamp, id: u64, input: &crate::motion::PlanInput, direct: JointPath, pre: Pre,
             plan: Option<&Plan>, rules: Option<&DescentRules>) -> Result<f64, ArmError> {
+            let _admitted = self.check_admission_stamp(stamp)?;
             let check_direct_table = |path: &JointPath| -> Result<(), ArmError> {
                 if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
                     check_table_clear(&input.arm, points, *bound, path.q.iter().map(|q| q.as_slice()))
@@ -666,32 +673,32 @@ mod runtime {
                 (Pre::Ready(cp), Some(plan)) => (cp, plan),
                 (Pre::Direct(r), _) => {
                     check_direct_table(&direct)?;
-                    let d = self.install_macro_path(id, input, direct)?;
+                    let d = self.install_macro_path(stamp, id, input, direct)?;
                     self.record_approach(id, &Outcome::direct(r));
                     return Ok(d);
                 }
                 _ => {
                     check_direct_table(&direct)?;
-                    return self.install_macro_path(id, input, direct);
+                    return self.install_macro_path(stamp, id, input, direct);
                 }
             };
             let (seg, seg_scale) = match self.approach_segment(cp.path.last_slice(), &cp.target, &plan.seg_limits) {
                 Ok(x) => x,
-                Err(r) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(r), None, rules),
+                Err(r) => return self.install_macro_path_same_side_with_rules(stamp, id, input, direct, Pre::Direct(r), None, rules),
             };
             if let Some((points, bound)) = rules.and_then(|r| r.table.as_ref()) {
                 let seg_qs = match self.workspace_samples(&seg) {
                     Ok(s) => s,
-                    Err(e) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules),
+                    Err(e) => return self.install_macro_path_same_side_with_rules(stamp, id, input, direct, Pre::Direct(format!("segment: {}", code(e.into()))), None, rules),
                 };
                 if let Err(r) = table_clear_iter(&input.arm, points, *bound, cp.path.q.iter().map(|q| q.as_slice()).chain(seg_qs.iter().map(Vec::as_slice))) {
-                    return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(r), None, rules);
+                    return self.install_macro_path_same_side_with_rules(stamp, id, input, direct, Pre::Direct(r), None, rules);
                 }
             }
             let target = cp.target.clone();
-            let d1 = match self.install_macro_path(id, input, cp.path) {
+            let d1 = match self.install_macro_path(stamp, id, input, cp.path) {
                 Ok(d) => d,
-                Err(e) => return self.install_macro_path_same_side_with_rules(id, input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules),
+                Err(e) => return self.install_macro_path_same_side_with_rules(stamp, id, input, direct, Pre::Direct(format!("pre_target: {}", code(e))), None, rules),
             };
             let d2 = seg.duration;
             if let Some(active) = self.active_trajectory.take() {

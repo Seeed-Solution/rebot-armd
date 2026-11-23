@@ -274,11 +274,11 @@ async fn test_handover_settling_motion_gate_locks_actuation() {
     assert_eq!(torque_err, SafetyError::HandoverSettling);
 
     // 2. jog must be rejected
-    let jog_err = inner.jog(vec![0.1, 0.1], Some(1.0), Some(epoch)).unwrap_err();
+    let jog_err = { let s = inner.current_admission_stamp(); inner.jog(s, vec![0.1, 0.1], Some(1.0), Some(epoch)) }.unwrap_err();
     assert!(matches!(jog_err, ArmError::Safety(SafetyError::HandoverSettling)));
 
     // 3. servo must be rejected
-    let servo_err = inner.servo(vec![0.1, 0.1], epoch).unwrap_err();
+    let servo_err = { let s = inner.current_admission_stamp(); inner.servo(s, vec![0.1, 0.1], epoch) }.unwrap_err();
     assert_eq!(servo_err, SafetyError::HandoverSettling);
 
     // 4. NormalUnload must not start motion
@@ -311,7 +311,7 @@ async fn test_handover_settling_tick_convergence_to_cat3() {
 
     // Motion command should now succeed
     let epoch = inner.safety.epoch_id();
-    assert!(inner.jog(vec![0.1, 0.1], Some(1.0), Some(epoch)).is_ok());
+    assert!({ let s = inner.current_admission_stamp(); inner.jog(s, vec![0.1, 0.1], Some(1.0), Some(epoch)) }.is_ok());
 }
 
 #[tokio::test]
@@ -573,7 +573,7 @@ async fn test_websocket_handover_settling_rejection_409() {
     ws_reply(&mut ws1, json!({"type":"command", "request_id":REQ.fetch_add(1, Ordering::Relaxed), "generation":g1, "epoch_id":1, "path":"/api/v1/torque", "body":{"enable":true}}), &["command_ack"]).await;
 
     // Set arm in motion
-    supervisor.jog(vec![0.5, -0.5], Some(1.0), Some(1)).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.5, -0.5], Some(1.0), Some(1)).await.unwrap();
 
     // Client 2 preempts while arm is moving -> enters Cat 4 settling gate!
     let g2 = ws_reply(&mut ws2, json!({"type":"acquire_lease", "client_id":"c2", "force":true}), &["lease_granted"]).await["generation"].as_u64().unwrap();

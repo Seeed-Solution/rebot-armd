@@ -28,7 +28,7 @@ fn sim_config(resting_pose: bool) -> ArmConfig {
 async fn sim_torqued_away_from_home(resting_pose: bool) -> ArmSupervisor {
     let supervisor = ArmSupervisor::new(sim_config(resting_pose));
     supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![1.0, 0.5], Some(0.3), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 0.5], Some(0.3), None).await.unwrap();
     for _ in 0..80 { supervisor.tick(0.05).await; }
     let obs = supervisor.get_observation().await;
     assert!((obs.positions[0] - 1.0).abs() < 1e-3 && obs.is_torqued);
@@ -94,7 +94,7 @@ async fn new_lease_during_park_takes_over_and_can_move() {
     }
     let obs = supervisor.get_observation().await;
     assert!(obs.is_torqued && !obs.safety_state.is_stopped(), "takeover holds torque: {:?}", obs.safety_state);
-    supervisor.jog(vec![0.8, 0.4], Some(0.3), None).await.expect("new owner commands are accepted");
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.8, 0.4], Some(0.3), None).await.expect("new owner commands are accepted");
 }
 
 #[tokio::test]
@@ -267,7 +267,7 @@ async fn closing_socket_with_valid_lease_still_stops_motion() {
     supervisor.set_torque(true).await.unwrap();
     let addr = serve(supervisor.clone()).await;
     let ws = ws_lease(addr).await;
-    supervisor.jog(vec![1.0, 0.5], Some(2.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![1.0, 0.5], Some(2.0), None).await.unwrap();
     supervisor.tick(0.02).await;
     assert!(supervisor.inner().read().await.active_trajectory.is_some());
     drop(ws);
@@ -289,7 +289,7 @@ async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
     {
         let mut inner = supervisor.inner().write().await;
         let epoch = inner.safety.epoch_id();
-        inner.jog_action(vec![1.0, 0.5], Some(2.0), Some(epoch), "joint_move").unwrap();
+        { let s = inner.current_admission_stamp(); inner.jog_action(s, vec![1.0, 0.5], Some(2.0), Some(epoch), "joint_move") }.unwrap();
     }
     for _ in 0..5 { supervisor.tick(0.02).await; }
     let obs = expire_lease(&supervisor).await;

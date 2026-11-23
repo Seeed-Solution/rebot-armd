@@ -255,7 +255,7 @@ fn scenarios(with_driver: bool) {
     q[0] += 0.4;
     q[2] -= 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     assert!(inner.active_trajectory.is_some());
     assert_zero(&format!("{tag} quintic"), &count_ticks(&mut inner, 50, |_, _| {}));
@@ -268,14 +268,14 @@ fn scenarios(with_driver: bool) {
     for i in 0..10 {
         let mut t = base.clone();
         t[0] += 0.002 * i as f32;
-        inner.servo(t, epoch).unwrap();
+        { let s = inner.current_admission_stamp(); inner.servo(s, t, epoch) }.unwrap();
         warm(&mut inner, 1);
     }
     let targets: Vec<Vec<f32>> = (10..60).map(|i| { let mut t = base.clone(); t[0] += 0.002 * i as f32; t }).collect();
     let mut targets = targets.into_iter();
     let mut servo_counts = Vec::new();
     for _ in 0..50 {
-        inner.servo(targets.next().unwrap(), epoch).unwrap();
+        { let s = inner.current_admission_stamp(); inner.servo(s, targets.next().unwrap(), epoch) }.unwrap();
         servo_counts.push(tick_counted(&mut inner));
     }
     assert_zero(&format!("{tag} servo stream"), &servo_counts);
@@ -283,11 +283,11 @@ fn scenarios(with_driver: bool) {
     // gripper close (from fully open, slowly)
     let mut inner = supervisor(with_driver);
     let epoch = inner.safety.epoch_id();
-    inner.start_gripper(GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch)
+    { let s = inner.current_admission_stamp(); inner.start_gripper(s, GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 2.0, timeout_s: None, tag: None }, epoch) }
         .expect("gripper open");
     for _ in 0..200 { if inner.active_trajectory.is_none() { break; } warm(&mut inner, 1); }
     assert!(inner.active_trajectory.is_none(), "gripper open finished");
-    inner.start_gripper(GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch)
+    { let s = inner.current_admission_stamp(); inner.start_gripper(s, GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: 0.3, timeout_s: None, tag: None }, epoch) }
         .expect("gripper close");
     warm(&mut inner, 5);
     assert!(inner.active_trajectory.is_some());
@@ -309,7 +309,7 @@ fn scenarios(with_driver: bool) {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q, Some(2.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let counts = count_ticks(&mut inner, 50, |inner, i| {
         // the dispatcher drains the ring off the control thread
@@ -361,7 +361,7 @@ fn ticks_do_not_touch_the_allocator_with_stalled_readers_and_dispatcher() {
     let mut q = inner.commanded_positions.clone();
     q[1] += 0.3;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(8.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q, Some(8.0), Some(epoch)) }.expect("jog");
     warm(&mut inner, 10);
     let hub = inner.core.hub().clone();
     let ring = inner.core.record_ring().unwrap().clone();
@@ -446,11 +446,11 @@ fn observation_stop_reason_and_phase_transitions_do_not_touch_the_allocator() {
     let mut inner = supervisor(false);
     let gen = inner.acquire_lease("alloc").expect("lease");
     let epoch = inner.safety.epoch_id();
-    inner.begin_policy_run(PolicyRunStart {
+    { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
         epoch_id: epoch, connection_id: "alloc".into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
         backend: "mlp".into(), mode: PolicyMode::Shadow, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
         i_am_at_the_arm: false, verified_release_gate: None,
-    }).expect("run");
+    }) }.expect("run");
     let mut run = inner.policy_run.take().expect("run");
     let mut out = PolicyObservation::default();
     run.to_observation_into(true, &mut out);
@@ -491,26 +491,63 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
     assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
 
     let sample = [0.25f32; MAX_DOF];
-    let mut handles = [None; PLAN_SLOTS];
-    let mut total_payload_bytes = 0usize;
+
+    // Shared cycle helper so the warmup on a 1-slot scratch pool executes the exact same
+    // monomorphized `.text` and stack pages as the 8-slot measurement below.
+    fn run_cycle(
+        writer: &mut armd::rt_core::broker::PlanWriter<PlanSlot>,
+        reader: &mut armd::rt_core::broker::PlanReader<PlanSlot>,
+        handles: &mut [Option<armd::rt_core::broker::PlanHandle>],
+        sample: &[f32; MAX_DOF],
+        n_samples: usize,
+        expected_slot_bytes: usize,
+    ) -> ((bool, usize), u64, u64) {
+        let cap = handles.len();
+        counted(|| {
+            let mut total_payload_bytes = 0usize;
+            for (idx, slot_h) in handles.iter_mut().enumerate() {
+                let h = writer
+                    .stage(|slot| {
+                        slot.path.clear();
+                        let denom = n_samples.saturating_sub(1).max(1) as f64;
+                        for k in 0..n_samples {
+                            slot.path.push(sample, k as f64 / denom).unwrap();
+                        }
+                    })
+                    .expect("slot available");
+                let pinned = reader.pin(h).expect("slot live");
+                assert_eq!(pinned.path.len(), n_samples);
+                assert_eq!(pinned.path.capacity(), n_samples);
+                assert_eq!(pinned.payload_bytes(), expected_slot_bytes);
+                assert_eq!(pinned.path.samples()[0][0], 0.25);
+                assert_eq!(pinned.path.samples()[n_samples - 1][MAX_DOF - 1], 0.25);
+                total_payload_bytes += pinned.payload_bytes();
+                drop(pinned);
+                *slot_h = Some(h);
+                assert_eq!(writer.free(), cap - 1 - idx);
+            }
+            let exhausted = writer.stage(|_| {}).is_none();
+            for h in handles.iter().flatten().copied() {
+                assert!(reader.retire(h));
+            }
+            assert_eq!(writer.reclaim(), cap);
+            (exhausted, total_payload_bytes)
+        })
+    }
 
     // Warm up the staging/pin/retire/reclaim code pages on a 1-slot scratch pool so first-call
     // `.text` / stack page faults are settled before we construct and measure the 8-slot pool.
     {
         let (mut w0, mut r0) = plan_slots(1, || PlanSlot::with_path_capacity(1));
-        let ((), a0, f0) = counted(|| {
-            let h = w0.stage(|s| { s.path.clear(); s.path.push(&sample, 0.0).unwrap(); }).unwrap();
-            let p = r0.pin(h).unwrap();
-            assert_eq!(p.path.len(), 1);
-            drop(p);
-            assert!(r0.retire(h));
-            assert_eq!(w0.reclaim(), 1);
-        });
+        let mut h0 = [None; 1];
+        let ((ex0, _), a0, f0) = run_cycle(&mut w0, &mut r0, &mut h0, &sample, 1, PlanSlot::with_path_capacity(1).payload_bytes());
+        assert!(ex0);
         assert_eq!((a0, f0), (0, 0));
     }
 
     let (mut writer, mut reader) = plan_slots(PLAN_SLOTS, PlanSlot::default);
     assert_eq!((writer.capacity(), reader.capacity()), (PLAN_SLOTS, PLAN_SLOTS));
+    let mut handles = [None; PLAN_SLOTS];
 
     #[cfg(target_os = "linux")]
     let thread_faults = || -> (i64, i64) {
@@ -527,34 +564,14 @@ fn plan_slots_are_pre_faulted_and_reserve_655360_payload_bytes() {
 
     // Filling all 8 pre-faulted slots to MAX_PATH_SAMPLES, pinning, reading, retiring and
     // reclaiming must perform zero allocations, zero frees, and zero page faults.
-    let (exhausted_none, allocs, frees) = counted(|| {
-        for (idx, slot_h) in handles.iter_mut().enumerate() {
-            let h = writer
-                .stage(|slot| {
-                    slot.path.clear();
-                    for k in 0..MAX_PATH_SAMPLES {
-                        slot.path.push(&sample, k as f64 / (MAX_PATH_SAMPLES - 1) as f64).unwrap();
-                    }
-                })
-                .expect("slot available");
-            let pinned = reader.pin(h).expect("slot live");
-            assert_eq!(pinned.path.len(), MAX_PATH_SAMPLES);
-            assert_eq!(pinned.path.capacity(), MAX_PATH_SAMPLES);
-            assert_eq!(pinned.payload_bytes(), PLAN_SLOT_PAYLOAD_BYTES);
-            assert_eq!(pinned.path.samples()[0][0], 0.25);
-            assert_eq!(pinned.path.samples()[MAX_PATH_SAMPLES - 1][MAX_DOF - 1], 0.25);
-            total_payload_bytes += pinned.payload_bytes();
-            drop(pinned);
-            *slot_h = Some(h);
-            assert_eq!(writer.free(), PLAN_SLOTS - 1 - idx);
-        }
-        let exhausted = writer.stage(|_| {}).is_none();
-        for h in handles.iter().flatten().copied() {
-            assert!(reader.retire(h));
-        }
-        assert_eq!(writer.reclaim(), PLAN_SLOTS);
-        exhausted
-    });
+    let ((exhausted_none, total_payload_bytes), allocs, frees) = run_cycle(
+        &mut writer,
+        &mut reader,
+        &mut handles,
+        &sample,
+        MAX_PATH_SAMPLES,
+        PLAN_SLOT_PAYLOAD_BYTES,
+    );
 
     #[cfg(target_os = "linux")]
     {
@@ -594,7 +611,7 @@ fn watchdog_park_supervisor() -> SupervisorInner {
     inner.set_torque(true).expect("arm");
     let _gen = inner.acquire_lease("client").expect("lease");
     let epoch = inner.safety.epoch_id();
-    inner.jog(vec![0.5, 0.2], Some(0.2), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); inner.jog(s, vec![0.5, 0.2], Some(0.2), Some(epoch)) }.expect("jog");
     for _ in 0..40 {
         inner.active_lease.as_mut().unwrap().acquired_at = Instant::now();
         inner.last_heartbeat = Instant::now();
@@ -635,7 +652,7 @@ fn authorized_stop_during_watchdog_park_does_not_allocate_or_free() {
     let mut idle = supervisor(false);
     let q = idle.commanded_positions.clone();
     let ep = idle.safety.epoch_id();
-    idle.servo(q, ep).expect("servo");
+    { let s = idle.current_admission_stamp(); idle.servo(s, q, ep) }.expect("servo");
     let (stopped_idle, a2, f2) = counted(|| idle.authorized_stop());
     assert!(stopped_idle);
     assert_eq!((a2, f2), (0, 0), "idle/servo authorized_stop touched allocator");
@@ -868,9 +885,12 @@ fn commit_boundaries_for_path_replay_jog_and_config_do_not_allocate_or_free() {
 
     // 3. In-place path and replay target activation perform (0, 0) allocs/frees.
     let epoch = fx.core.safety.epoch_id();
+    let stamp = fx.core.current_admission_stamp();
     let (res, a_act, f_act) = counted(|| {
-        let d1 = fx.core.start_path_motion_slice(epoch, &goal[..dof], 0.5).unwrap();
-        fx.core.start_replay_motion(&start[..dof]).unwrap();
+        let admitted1 = fx.core.check_admission_stamp(stamp).unwrap();
+        let d1 = fx.core.start_path_motion_slice(admitted1, epoch, &goal[..dof], 0.5).unwrap();
+        let admitted2 = fx.core.check_admission_stamp(stamp).unwrap();
+        fx.core.start_replay_motion(admitted2, &start[..dof]).unwrap();
         d1
     });
     assert_eq!(res, 0.5);

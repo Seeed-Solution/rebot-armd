@@ -115,11 +115,11 @@ fn consuming_live_policy_targets_does_not_allocate_in_steady_streaming() {
     use armd::policy_runtime::{PolicyMode, PolicyRunStart};
     let (mut inner, gen) = supervisor();
     let epoch = inner.safety.epoch_id();
-    let action_id = inner.begin_policy_run(PolicyRunStart {
+    let action_id = { let s = inner.current_admission_stamp(); inner.begin_policy_run(s, PolicyRunStart {
         epoch_id: epoch, connection_id: CONN.into(), lease_generation: gen, policy_id: "p".into(), artifact_digest: "d".into(),
         backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false, max_first_step_rad: None, max_step_rad: None, tag: None,
         i_am_at_the_arm: false, verified_release_gate: None,
-    }).expect("run");
+    }) }.expect("run");
     let stamp = inner.policy_target_stamp(action_id, 0).expect("stamp");
     let stream = inner.core.target_authority().stream.expect("policy stream authorized");
     let base = inner.measured_positions.clone();

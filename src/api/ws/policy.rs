@@ -11,6 +11,7 @@ pub(super) struct PendingPolicyStart {
     pub(super) request: crate::policy_runtime::PolicyStartRequest,
     pub(super) config: crate::model::ArmConfig,
     pub(super) epoch: u64,
+    pub(super) stamp: crate::supervisor::AdmissionStamp,
     pub(super) policy_live_allowed: bool,
 }
 

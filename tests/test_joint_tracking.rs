@@ -364,7 +364,7 @@ fn tracking_off_wire_equivalence() {
             goal[i] = f64::from(q0[i]);
         }
         goal[0] += 0.12;
-        inner.install_joint_goal(&inp, &goal, 0.5, "joint_move", None, None).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.5, "joint_move", None, None) }.unwrap();
         step(&mut inner, 120);
 
         // 2. Cartesian path move
@@ -372,7 +372,7 @@ fn tracking_off_wire_equivalence() {
         let mut pose = inner.config.arm_model.fk_f32(&inner.commanded_positions).unwrap();
         pose.p[1] += 0.03;
         let path = plan_cartesian(&inp, pose, Speed::default()).unwrap();
-        inner.install_path(&inp, path, "move_to", None).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_path(s, &inp, path, "move_to", None) }.unwrap();
         step(&mut inner, 120);
 
         // 3. Replay move
@@ -394,7 +394,7 @@ fn tracking_off_wire_equivalence() {
             )
             .unwrap();
         let r_plan = plan_frames(r_in, &replay_frames).unwrap();
-        inner.install_replay(r_plan).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_replay(s, r_plan) }.unwrap();
         step(&mut inner, 120);
 
         // 4. Servo streaming + 5. Braking (dropping servo target mid-motion)
@@ -402,7 +402,7 @@ fn tracking_off_wire_equivalence() {
         let mut target = inner.commanded_positions.clone();
         for _ in 0..20 {
             target[0] += 0.004;
-            inner.servo(target.clone(), epoch).unwrap();
+            { let s = inner.current_admission_stamp(); inner.servo(s, target.clone(), epoch) }.unwrap();
             step(&mut inner, 1);
         }
         inner.servo_target = None; // begin controlled braking
@@ -411,8 +411,7 @@ fn tracking_off_wire_equivalence() {
         // 6. Jaw contact (rigid object at -1.75 rad)
         drv.with(|s| s.gripper_block = Some((6, -1.75, 25.0)));
         let epoch = inner.safety.epoch_id();
-        inner
-            .start_gripper(
+        { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                 GripperRequest {
                     command: GripperCommand::Close,
                     fraction: None,
@@ -422,7 +421,7 @@ fn tracking_off_wire_equivalence() {
                     tag: None,
                 },
                 epoch,
-            )
+            ) }
             .unwrap();
         step(&mut inner, 150);
 
@@ -1090,7 +1089,7 @@ fn tracking_safety_references() {
         let mut goal = inner.config.arm_model.fk_f32(&q0).unwrap();
         goal.p[1] += 0.12;
         let path = plan_cartesian(&inp, goal, Speed::default()).unwrap();
-        let (id, _) = inner.install_path(&inp, path, "move_to", None).unwrap();
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.install_path(s, &inp, path, "move_to", None) }.unwrap();
 
         // Pin J1 0.50 rad away (> LAG_STOP 0.45 rad) so path rate drops to 0 and stalls after 1.0 s.
         drv.with(|s| s.pinned[0] = Some(q0[0] - 0.50));
@@ -1217,8 +1216,7 @@ fn tracking_safety_references() {
             let (mut inner, drv) = rig_at(cfg, &q0, vec![0.68, 0.0, 0.0, 0.0, 0.0, 0.0, 0.22]);
             drv.with(|s| s.gripper_block = Some((6, -1.75, 25.0)));
             let epoch = inner.safety.epoch_id();
-            inner
-                .start_gripper(
+            { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                     GripperRequest {
                         command: GripperCommand::Close,
                         fraction: None,
@@ -1228,7 +1226,7 @@ fn tracking_safety_references() {
                         tag: None,
                     },
                     epoch,
-                )
+                ) }
                 .unwrap();
             let mut trace = Vec::new();
             for _ in 0..160 {
@@ -1277,8 +1275,7 @@ fn tracking_safety_references() {
             let (mut inner, drv) = rig_at(cfg, &q0, vec![0.40, 0.0, 0.0, 0.0, 0.0, 0.15]);
             drv.with(|s| s.include_gravity_torque = false);
             let epoch = inner.safety.epoch_id();
-            inner
-                .start_gripper(
+            { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                     GripperRequest {
                         command: GripperCommand::Close,
                         fraction: None,
@@ -1288,7 +1285,7 @@ fn tracking_safety_references() {
                         tag: None,
                     },
                     epoch,
-                )
+                ) }
                 .unwrap();
             let mut cmds = Vec::new();
             for _ in 0..80 {
@@ -1414,7 +1411,7 @@ fn tracking_stream_braking_enforces_measured_lead_allowance() {
         for _ in 0..80 {
             let mut tgt = inner.commanded_positions.clone();
             tgt[0] = (tgt[0] + 0.05).min(0.25);
-            inner.servo(tgt, epoch).unwrap();
+            { let s = inner.current_admission_stamp(); inner.servo(s, tgt, epoch) }.unwrap();
             let obs = inner.tick(DT);
             let q_out = drv.with(|s| s.written.last().unwrap()[0].position);
             assert!(
@@ -2092,7 +2089,7 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         };
         let q0 = [0.0, -0.5, -0.5, 0.5, 0.0, 0.0, -2.0];
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        inner.enter_gravity_comp(Default::default()).unwrap();
+        { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
         assert!(inner.gravity_comp.is_some());
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "test");
@@ -2138,8 +2135,7 @@ fn tracking_defers_action_done_until_final_output_accepted() {
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         let epoch = inner.safety.epoch_id();
         let cur_frac = cur_gripper_frac(&inner, q0[6]);
-        let (id, _) = inner
-            .start_gripper(
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                 GripperRequest {
                     command: GripperCommand::Move,
                     fraction: Some(cur_frac),
@@ -2149,7 +2145,7 @@ fn tracking_defers_action_done_until_final_output_accepted() {
                     tag: None,
                 },
                 epoch,
-            )
+            ) }
             .unwrap();
         (inner, drv, id, q0)
     };
@@ -2498,7 +2494,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         for _ in 0..80 {
             let epoch = inner.safety.epoch_id();
             inner.heartbeat(CLIENT_A, epoch).unwrap();
-            let _ = inner.servo(retreat.clone(), epoch);
+            let _ = { let s = inner.current_admission_stamp(); inner.servo(s, retreat.clone(), epoch) };
             inner.tick(DT);
             if inner.torque_guard.hold.is_none() {
                 break;
@@ -2726,7 +2722,7 @@ fn tracking_active_lead_transitions_with_leases_and_faulty_driver() {
         hb(&mut inner, CLIENT_A);
         inner.tick(DT);
 
-        inner.enter_gravity_comp(Default::default()).unwrap();
+        { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
         let enter_switches = drv.with(|s| s.mode_hold_frames.len());
         assert_eq!(enter_switches, 1, "entering gravity comp must send MIT mode-switch hold frame");
         assert_eq!(drv.with(|s| s.mode_hold_frames[0].0[0]), JointMode::Mit);
@@ -2780,7 +2776,7 @@ fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
             ..ArmConfig::rebot_dm()
         };
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        inner.enter_gravity_comp(Default::default()).unwrap();
+        { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "t1_off");
         drv.with(|s| s.feedback_age = Duration::from_millis(150));
@@ -2807,7 +2803,7 @@ fn tracking_off_gravity_comp_exit_restores_pre_change_stale_rx_behavior() {
             ..ArmConfig::rebot_dm()
         };
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
-        inner.enter_gravity_comp(Default::default()).unwrap();
+        { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
         inner.tick(DT);
         inner.exit_gravity_comp("REQUESTED", "t1_on");
         drv.with(|s| s.feedback_age = Duration::from_millis(150));
@@ -3360,7 +3356,7 @@ fn tracking_final_braking_tick_keeps_stream_ownership_through_residual_ramp() {
     let epoch = inner.safety.epoch_id();
     let mut tgt = q0.to_vec();
     tgt[0] += 0.05;
-    inner.servo(tgt, epoch).unwrap();
+    { let s = inner.current_admission_stamp(); inner.servo(s, tgt, epoch) }.unwrap();
     let obs = inner.tick(DT);
     assert!(obs.safety_state.is_operational(), "stream start faulted: {:?}", obs.fault);
     assert!(inner.servo_stream_active);
@@ -3540,7 +3536,7 @@ fn tracking_speed_scale_limits_and_torque_hold_ramp_accel_recheck() {
             goal[i] = f64::from(q0[i]);
         }
         goal[0] += 0.20;
-        inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+        { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.25, "joint_move", None, None) }.unwrap();
         let active = inner.active_tracking_limits(DT, 1.0);
         assert!(
             (active[0].max_velocity - base_v * 0.25).abs() < 1e-4,
@@ -3623,7 +3619,7 @@ fn tracking_failed_gravity_comp_entry_rollback_invalidates_old_baseline() {
     inner.tracking.record_issued(old_issued, vec![0.0; 7]);
 
     drv.with(|s| s.fail_mode_switch = true);
-    let err = inner.enter_gravity_comp(Default::default());
+    let err = { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) };
     assert!(err.is_err(), "simulated mode-switch failure must reject entry");
     assert!(inner.gravity_comp.is_none());
     assert!(inner.safety.state().is_operational(), "clean rollback leaves arm operational");
@@ -3657,8 +3653,7 @@ fn tracking_action_done_not_published_when_output_skipped_by_disable_or_torque_o
         let (mut inner, drv) = rig_at(cfg, &q0, vec![0.0; 7]);
         let epoch = inner.safety.epoch_id();
         let cur_frac = cur_gripper_frac(&inner, q0[6]);
-        let (id, _) = inner
-            .start_gripper(
+        let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                 GripperRequest {
                     command: GripperCommand::Move,
                     fraction: Some(cur_frac),
@@ -3668,7 +3663,7 @@ fn tracking_action_done_not_published_when_output_skipped_by_disable_or_torque_o
                     tag: None,
                 },
                 epoch,
-            )
+            ) }
             .unwrap();
         (inner, drv, id)
     };
@@ -4061,7 +4056,7 @@ fn tracking_keeps_motion_caps_through_final_tick_and_settling() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.25, "joint_move", None, None) }.unwrap();
 
     let mut finished_at = None;
     for k in 0..800 {
@@ -4111,7 +4106,7 @@ fn tracking_braking_fallback_keeps_rejected_motion_caps() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.25, "joint_move", None, None) }.unwrap();
     for _ in 0..60 {
         let obs = inner.tick(DT);
         assert!(obs.safety_state.is_operational());
@@ -4201,8 +4196,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
             let epoch = inner.safety.epoch_id();
             let policy = inner.config.gripper_policy.clone().unwrap();
             let frac = f64::from(((q0[6] - policy.closed_rad) / (policy.open_rad - policy.closed_rad)).clamp(0.0, 1.0));
-            let (id, _) = inner
-                .start_gripper(
+            let (id, _) = { let s = inner.current_admission_stamp(); inner.start_gripper(s,
                     GripperRequest {
                         command: GripperCommand::Move,
                         fraction: Some(frac),
@@ -4212,7 +4206,7 @@ fn tracking_off_action_done_precedes_final_tick_write_like_e4f72b6() {
                         tag: None,
                     },
                     epoch,
-                )
+                ) }
                 .unwrap();
             (inner, drv, id)
         };
@@ -4303,7 +4297,7 @@ fn tracking_braking_fallback_follows_governor_scale_drop() {
         goal[i] = f64::from(q0[i]);
     }
     goal[0] += 0.20;
-    inner.install_joint_goal(&inp, &goal, 0.25, "joint_move", None, None).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &inp, &goal, 0.25, "joint_move", None, None) }.unwrap();
     for _ in 0..60 {
         assert!(inner.tick(DT).safety_state.is_operational());
     }
@@ -4572,7 +4566,7 @@ fn b601_joint_move(inner: &mut SupervisorInner, xyz: [f64; 3]) -> u64 {
     let (goal, opts) = armd::motion::resolve_goal_opts(&input, &spec);
     let seeds = armd::motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
     let q = armd::motion::solve_goal_joints(&input, &goal, opts, &seeds).unwrap();
-    inner.install_joint_goal(&input, &q, 0.3, "move_to", tag, None).unwrap().0
+    { let s = inner.current_admission_stamp(); inner.install_joint_goal(s, &input, &q, 0.3, "move_to", tag, None) }.unwrap().0
 }
 
 /// home -> A, then A -> B -> A three times with 3 s holds, on the lag plant, through

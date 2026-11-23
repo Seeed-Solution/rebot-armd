@@ -197,7 +197,7 @@ async fn driver_speed_limit_and_explicit_gravity_model_are_enforced() {
 async fn control_loop_stall_latches_instead_of_advancing_old_trajectory() {
     let supervisor = ArmSupervisor::new(ArmConfig::default());
     supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.3; 6], Some(1.0), None).await.unwrap();
     let obs = supervisor.tick(0.300).await;
     assert!(obs.safety_state.is_stopped());
     assert_eq!(obs.positions, vec![0.0; 6]);
@@ -209,7 +209,7 @@ async fn single_late_tick_below_stall_bound_keeps_arm_operational() {
     // One 100 ms scheduling hiccup on a loaded single-core host must not fault the arm.
     let supervisor = ArmSupervisor::new(ArmConfig::default());
     supervisor.set_torque(true).await.unwrap();
-    supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), vec![0.3; 6], Some(1.0), None).await.unwrap();
     let obs = supervisor.tick(0.100).await;
     assert!(!obs.safety_state.is_stopped(), "state: {:?}", obs.safety_state);
 }
@@ -242,7 +242,7 @@ async fn jerk_enabled_servo_settles_after_small_target() {
     supervisor.set_lease_enabled(false).await;
     supervisor.set_torque(true).await.unwrap();
     supervisor.inner().write().await.motion_frame_timeout = Duration::from_secs(60);
-    supervisor.servo(vec![0.1; 6], 1).await.unwrap();
+    supervisor.servo(supervisor.capture_admission_stamp(), vec![0.1; 6], 1).await.unwrap();
     for _ in 0..300 { supervisor.tick(0.02).await; }
     let obs = supervisor.get_observation().await;
     assert!(!obs.safety_state.is_stopped());

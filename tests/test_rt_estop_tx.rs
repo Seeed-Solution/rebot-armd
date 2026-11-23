@@ -117,7 +117,7 @@ fn rig() -> (SupervisorInner, Arc<Mutex<Shared>>) {
     let mut q = inner.commanded_positions.clone();
     q[0] += 0.5;
     let epoch = inner.safety.epoch_id();
-    inner.jog(q, Some(2.0), Some(epoch)).expect("jog");
+    { let s = inner.current_admission_stamp(); inner.jog(s, q, Some(2.0), Some(epoch)) }.expect("jog");
     for _ in 0..10 { inner.tick(0.02); }
     assert!(inner.active_trajectory.is_some());
     (inner, shared)

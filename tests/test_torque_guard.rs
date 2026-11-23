@@ -134,7 +134,7 @@ fn servo_j4(inner: &mut SupervisorInner, q4: f32) {
     let mut t = inner.commanded_positions.clone();
     t[J4] = q4;
     let epoch = inner.safety.epoch_id();
-    inner.servo(t, epoch).unwrap();
+    { let s = inner.current_admission_stamp(); inner.servo(s, t, epoch) }.unwrap();
 }
 
 /// Stream J4 upward into a stop at `stop`; returns (tick of the first |τ4| >= THR_WRIST, tick of
@@ -240,7 +240,7 @@ fn backing_out_is_allowed_pushing_in_stays_held() {
         t[J4] = hold_q + 0.1;
         t[0] += 0.005;
         let epoch = inner.safety.epoch_id();
-        inner.servo(t, epoch).unwrap();
+        { let s = inner.current_admission_stamp(); inner.servo(s, t, epoch) }.unwrap();
         let obs = inner.tick(DT);
         assert!(obs.commanded_positions[J4] <= hold_q + 1e-5, "J4 pushed in: {}", obs.commanded_positions[J4]);
         assert!(obs.torques[J4].abs() < THR_WRIST, "no torque build-up {}", obs.torques[J4]);
@@ -250,7 +250,7 @@ fn backing_out_is_allowed_pushing_in_stays_held() {
     // push in by jog (cockpit joint jog): the J4 target is clamped
     let mut t = inner.commanded_positions.clone();
     t[J4] = hold_q + 0.3;
-    inner.jog_action(t, None, None, "joint_move").unwrap();
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     let obs = ticks(&mut inner, 60);
     assert!(obs.commanded_positions[J4] <= hold_q + 1e-5 && torque_limit(&obs) == Some(J4));
     assert!(inner.torque_guard.hold.is_some());
@@ -274,7 +274,7 @@ fn backing_out_is_allowed_pushing_in_stays_held() {
     push_j4_into_stop(&mut inner, &arm, stop);
     let mut t = inner.commanded_positions.clone();
     t[J4] -= 0.3;
-    inner.jog_action(t, None, None, "joint_move").unwrap();
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     let obs = ticks(&mut inner, 100);
     assert!((obs.commanded_positions[J4] - (stop - TORQUE_HOLD_BACKOFF_RAD - 0.3)).abs() < 1e-3, "jogged out to {}", obs.commanded_positions[J4]);
     assert!(inner.torque_guard.hold.is_none());
@@ -287,7 +287,7 @@ fn running_action_and_replay_fail_with_torque_limit() {
     arm.with(|s| s.stop_hi[J4] = Some(INSPECT[J4] + 0.1));
     let mut t = INSPECT.to_vec();
     t[J4] += 0.5;
-    let (_, id, _) = inner.jog_action(t, None, None, "joint_move").unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     let mut obs = ticks(&mut inner, 1);
     for _ in 0..200 {
         if obs.action.as_ref().is_some_and(|a| a.state != "running") { break; }
@@ -311,7 +311,7 @@ fn running_action_and_replay_fail_with_torque_limit() {
     let (mut inner, arm) = rig();
     inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_replay(ReplayRequest { episode: "j4".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_replay(s, ReplayRequest { episode: "j4".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch) }.unwrap();
     arm.with(|s| s.stop_hi[J4] = Some(INSPECT[J4] + 0.2));
     let mut obs = ticks(&mut inner, 1);
     for _ in 0..1000 {
@@ -365,7 +365,7 @@ fn brief_peaks_and_gravity_hold_do_not_trip() {
     let mut t = q.to_vec();
     t[2] = INSPECT[2];
     t[1] = INSPECT[1];
-    inner.jog_action(t, None, None, "joint_move").unwrap();
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     let obs = ticks(&mut inner, 400);
     assert_eq!(obs.action.as_ref().unwrap().state, "done", "{:?}", obs.action);
     assert!(inner.torque_guard.trips_total == 0 && inner.torque_guard.hold.is_none());
@@ -379,7 +379,7 @@ fn gravity_comp_does_not_trip() {
         eprintln!("skipped: gravity model URDF not found ({:?})", inner.gravity_comp_support());
         return;
     }
-    inner.enter_gravity_comp(Default::default()).unwrap();
+    { let s = inner.current_admission_stamp(); inner.enter_gravity_comp(s, Default::default()) }.unwrap();
     ticks(&mut inner, 5);
     assert!(inner.gravity_comp.is_some());
     arm.with(|s| s.forced[1] = Some(27.0));
@@ -494,7 +494,7 @@ fn elastic_incident() -> (SupervisorInner, StopArm) {
     arm.with(|s| { s.stop_hi[J2] = Some(J2_BLOCK); s.elastic[J2] = Some((0.0, J2_CONTACT_K)); });
     let mut t = vec![0.0; 7];
     t[J2] = 0.12;
-    let (_, id, _) = inner.jog_action(t, None, None, "joint_move").unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     for _ in 0..200 {
         let obs = inner.tick(DT);
         if obs.action.as_ref().is_some_and(|a| a.id == id && a.state != "running") {
@@ -532,7 +532,7 @@ fn elastic_incident_park_retreats_and_ends_with_torque_off() {
     assert!(obs.torques[J2] > THR_BIG, "the elastic obstacle keeps the held joint pressing: {}", obs.torques[J2]);
     assert!(obs.torques[J2] < h.torque_nm, "the back-off lowers the torque: {} vs {}", obs.torques[J2], h.torque_nm);
     let trips = inner.torque_guard.trips_total;
-    let id = inner.unload_action().unwrap().expect("park started");
+    let id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().expect("park started");
     let mut below = None;
     let mut k_end = 0;
     for k in 0..800 {
@@ -563,7 +563,7 @@ fn replay_j2_in(inner: &mut SupervisorInner) -> (ArmObservation, f32) {
     write_frames_to_parquet(&tmp.path().join("j2.parquet"), &frames).unwrap();
     inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_replay(ReplayRequest { episode: "j2".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch).unwrap();
+    let (id, _) = { let s = inner.current_admission_stamp(); inner.start_replay(s, ReplayRequest { episode: "j2".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch) }.unwrap();
     let mut max_cmd = f32::MIN;
     for _ in 0..300 {
         let o = inner.tick(DT);
@@ -583,7 +583,7 @@ fn elastic_incident_push_further_in_is_refused_or_trips() {
     let hold_q = inner.torque_guard.hold.unwrap().hold_q;
     let mut t = inner.commanded_positions.clone();
     t[J2] = 0.2;
-    inner.jog_action(t, None, None, "joint_move").unwrap();
+    { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     for _ in 0..60 {
         let obs = inner.tick(DT);
         assert!(obs.commanded_positions[J2] <= hold_q + 1e-5, "J2 pushed in: {}", obs.commanded_positions[J2]);
@@ -612,7 +612,7 @@ fn elastic_incident_push_further_in_is_refused_or_trips() {
 #[test]
 fn elastic_incident_other_joint_still_trips_during_the_retreat() {
     let (mut inner, arm) = elastic_incident();
-    let id = inner.unload_action().unwrap().unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().unwrap();
     ticks(&mut inner, 5);
     arm.with(|s| s.forced[J4] = Some(9.5));
     let (obs, k) = run_until_done(&mut inner, id, 50);
@@ -632,7 +632,7 @@ fn elastic_incident_retreat_allowance_is_bounded() {
     // rise
     let (mut inner, arm) = elastic_incident();
     let trip = inner.torque_guard.hold.unwrap().torque_nm;
-    let id = inner.unload_action().unwrap().unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.unload_action(s) }.unwrap().unwrap();
     ticks(&mut inner, 3);
     arm.with(|s| s.forced[J2] = Some(trip + TORQUE_RETREAT_MARGIN_RATIO * THR_BIG + 0.5));
     let (obs, k) = run_until_done(&mut inner, id, 20);
@@ -645,7 +645,7 @@ fn elastic_incident_retreat_allowance_is_bounded() {
     arm.with(|s| s.forced[J2] = Some(THR_BIG + 1.0));
     let mut t = inner.commanded_positions.clone();
     t[J2] = -0.2;
-    let (_, id, _) = inner.jog_action(t, Some(3.0), None, "joint_move").unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, t, Some(3.0), None, "joint_move") }.unwrap();
     let (obs, k) = run_until_done(&mut inner, id, 200);
     let t = k as f64 * DT;
     println!("SIM constant {:.1} N·m during the retreat: {:?} after {t:.2} s", THR_BIG + 1.0, obs.action.as_ref().unwrap().code);
@@ -688,7 +688,7 @@ fn lease_loss_with_the_rest_pose_behind_the_load_holds_and_latches() {
     arm.with(|s| { s.stop_hi[J2] = Some(-0.1); s.elastic[J2] = Some((-0.133, J2_CONTACT_K)); });
     let mut t = q.to_vec();
     t[J2] = 0.0;
-    let (_, id, _) = inner.jog_action(t, None, None, "joint_move").unwrap();
+    let (_, id, _) = { let s = inner.current_admission_stamp(); inner.jog_action(s, t, None, None, "joint_move") }.unwrap();
     let (obs, _) = run_until_done(&mut inner, id, 200);
     assert_eq!(obs.action.as_ref().unwrap().code.as_deref(), Some("TORQUE_LIMIT"));
     let hold_q = inner.torque_guard.hold.unwrap().hold_q;
@@ -712,11 +712,11 @@ fn a_macro_child_into_a_stop_records_the_macro_terminal() {
     let (mut inner, arm) = rig();
     arm.with(|s| s.stop_hi[J4] = Some(INSPECT[J4] + 0.1));
     let epoch = inner.safety.epoch_id();
-    let id = inner.begin_orchestrated_action("sequence", None, epoch).unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.begin_orchestrated_action(s, "sequence", None, epoch) }.unwrap();
     let mut t = INSPECT.to_vec();
     t[J4] += 0.5;
     let limits = inner.planning_limits();
-    inner.install_macro_quintic(id, t, &limits).unwrap();
+    { let s = inner.current_admission_stamp(); inner.install_macro_quintic(s, id, t, &limits) }.unwrap();
     for _ in 0..200 { inner.tick(DT); if inner.macro_run.is_none() { break; } }
     assert!(inner.macro_run.is_none(), "the guard ended the macro");
     let rec = inner.core.last_macro().expect("terminal record");

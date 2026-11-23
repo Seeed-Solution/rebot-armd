@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -207,6 +208,12 @@ pub enum SafetyError {
 
     #[error("OWNER_TRANSFERRED: control ownership transferred to RT executor; shell lease calls are refused")]
     OwnerTransferred,
+
+    #[error("Stopped before motion began")]
+    Stopped,
+
+    #[error("Control lease is no longer current")]
+    LeaseLost,
 }
 
 impl SafetyError {
@@ -239,7 +246,7 @@ impl SafetyError {
 pub const RETIRED_STATE_CAPACITY: usize = 16;
 
 /// Safety Manager tracking safety state machine and command generation ID
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SafetyManager {
     state_arc: Arc<SafetyState>,
     idle_arc: Arc<SafetyState>,
@@ -251,8 +258,28 @@ pub struct SafetyManager {
     retired_len: usize,
     off_thread_reclaim: bool,
     epoch_id: u64,
+    epoch_mirror: Arc<AtomicU64>,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
+}
+
+impl Clone for SafetyManager {
+    fn clone(&self) -> Self {
+        Self {
+            state_arc: Arc::clone(&self.state_arc),
+            idle_arc: Arc::clone(&self.idle_arc),
+            armed_arc: Arc::clone(&self.armed_arc),
+            moving_arc: Arc::clone(&self.moving_arc),
+            estop_arc: Arc::clone(&self.estop_arc),
+            retired_state_arcs: self.retired_state_arcs.clone(),
+            retired_head: self.retired_head,
+            retired_len: self.retired_len,
+            off_thread_reclaim: self.off_thread_reclaim,
+            epoch_id: self.epoch_id,
+            epoch_mirror: Arc::new(AtomicU64::new(self.epoch_id)),
+            fault_code: self.fault_code,
+        }
+    }
 }
 
 impl Default for SafetyManager {
@@ -269,6 +296,7 @@ impl Default for SafetyManager {
             retired_len: 0,
             off_thread_reclaim: false,
             epoch_id: 1,
+            epoch_mirror: Arc::new(AtomicU64::new(1)),
             fault_code: None,
         }
     }
@@ -343,14 +371,25 @@ impl SafetyManager {
         self.epoch_id
     }
 
+    /// Lock-free atomic mirror of [`Self::epoch_id`], kept in sync on every epoch bump.
+    pub fn epoch_mirror(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.epoch_mirror)
+    }
+
+    #[inline]
+    fn bump_epoch(&mut self) -> u64 {
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        self.epoch_mirror.store(self.epoch_id, Ordering::SeqCst);
+        self.epoch_id
+    }
+
     /// Advance epoch and latch E-Stop immediately
     pub fn trigger_e_stop(&mut self) -> u64 {
         if *self.state_arc != SafetyState::EStop {
             tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
         }
         let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        self.epoch_id
+        self.bump_epoch()
     }
 
     /// Structured cause of the current Fault / EStop; None in any other state.
@@ -394,8 +433,7 @@ impl SafetyManager {
         make_reason: impl FnOnce() -> FaultReason,
     ) -> u64 {
         if !self.can_accept_fault_transition() {
-            self.epoch_id = self.epoch_id.wrapping_add(1);
-            return self.epoch_id;
+            return self.bump_epoch();
         }
         self.trigger_fault_coded(code, make_reason())
     }
@@ -408,15 +446,14 @@ impl SafetyManager {
         reason: FaultReason,
     ) -> Result<u64, (u64, FaultReason)> {
         if !self.can_accept_fault_transition() {
-            self.epoch_id = self.epoch_id.wrapping_add(1);
-            return Err((self.epoch_id, reason));
+            let ep = self.bump_epoch();
+            return Err((ep, reason));
         }
         tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, reason);
         self.fault_code = Some(code);
         let replaced = self.try_replace_state_arc(Arc::new(SafetyState::Fault(reason)));
         debug_assert!(replaced);
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        Ok(self.epoch_id)
+        Ok(self.bump_epoch())
     }
 
     /// [`Self::trigger_fault`] with the code recorded by the trigger site.
@@ -439,7 +476,7 @@ impl SafetyManager {
                 }
                 tracing::info!("Safety: cleared -> Idle");
                 self.fault_code = None;
-                self.epoch_id = self.epoch_id.wrapping_add(1);
+                self.bump_epoch();
                 Ok(SafetyState::Idle)
             }
             other => Ok(other.clone()),

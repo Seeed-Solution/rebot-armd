@@ -66,7 +66,10 @@ pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, Join
     EpisodeState, RecordFrame,
 };
 pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
-#[cfg(not(target_arch = "wasm32"))] pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
+#[cfg(not(target_arch = "wasm32"))] pub use supervisor::{
+    AdmissionStamp, AdmittedMotion, ArmError, ArmSupervisor, MotionStartKind, MotionStartOp,
+    PreemptError, SupervisorInner,
+};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
     TrajectoryPoint,

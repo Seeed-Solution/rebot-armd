@@ -341,13 +341,14 @@ impl SupervisorInner {
         }
     }
 
-    pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
-        self.servo_slice(&targets, epoch_id)
+    pub fn servo(&mut self, stamp: AdmissionStamp, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        self.servo_slice(stamp, &targets, epoch_id)
     }
 
     /// [`Self::servo`] from a slice: no allocation once the servo buffers hold a target
     /// (the latest-target path consumes through it).
-    pub fn servo_slice(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+    pub fn servo_slice(&mut self, stamp: AdmissionStamp, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+        let _admitted = self.check_admission_stamp(stamp)?;
         if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
         let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
         let targets = &mut buf[..targets_in.len()];
@@ -776,13 +777,15 @@ impl SupervisorInner {
         Ok(())
     }
 
-    /// Install an exclusive streaming `PolicyRun` after lease, epoch, driver gate, and mutual exclusion checks.
+    /// Install an exclusive streaming `PolicyRun` after stamp, lease, epoch, driver gate, and mutual exclusion checks.
     pub fn begin_policy_run(
         &mut self,
+        stamp: AdmissionStamp,
         req: crate::policy_runtime::PolicyRunStart,
     ) -> Result<u64, ArmError> {
         use crate::policy_runtime::{PolicyMode, PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
 
+        let _admitted = self.check_admission_stamp(stamp)?;
         self.check_policy_start_preconditions_with(
             req.mode,
             req.sim_only,
@@ -1466,6 +1469,8 @@ pub mod targets {
             SafetyError::FaultActive(_) => "FAULT_ACTIVE",
             SafetyError::NotArmed(_) => "NOT_ARMED",
             SafetyError::OwnerTransferred => "OWNER_TRANSFERRED",
+            SafetyError::Stopped => "STOPPED",
+            SafetyError::LeaseLost => "LEASE_LOST",
             _ => "SAFETY_ERROR",
         }
     }
@@ -1742,7 +1747,13 @@ pub mod targets {
             if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
             if policy { return self.consume_policy_target(frame, ctx.now); }
             if self.calibration_busy { return Err(Refusal::code("CALIBRATION_BUSY")); }
-            self.servo_slice(frame.positions(), frame.authority.epoch).map_err(|e| {
+            self.sync_stop_generation(ctx.stop_generation);
+            let stamp = crate::supervisor::AdmissionStamp {
+                stop_gen: frame.authority.stop_generation,
+                estop_epoch: frame.authority.epoch,
+                lease_gen: frame.authority.lease_generation,
+            };
+            self.servo_slice(stamp, frame.positions(), frame.authority.epoch).map_err(|e| {
                 let joint = match &e {
                     SafetyError::SoftLimitExceeded { joint, .. } => self.config.limits.iter().position(|l| &l.name == joint).map(|i| i as u8),
                     _ => None,

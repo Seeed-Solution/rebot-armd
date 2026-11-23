@@ -22,7 +22,7 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
     rt.block_on(async {
         supervisor.set_lease_enabled(false).await;
         supervisor.set_torque(true).await.unwrap();
-        supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
+        supervisor.jog(supervisor.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
         let duration = supervisor.inner().read().await.active_trajectory.as_ref().unwrap().duration();
         assert!((duration - 1.875 * 1.565 / 0.45).abs() < 0.01, "duration {duration}");
         let mut peak = [0.0f32; 7];
@@ -145,7 +145,7 @@ async fn run(supervisor: &ArmSupervisor, sim_seconds: f64) -> (armd::ArmObservat
 #[tokio::test]
 async fn lag_model_inspect_then_park_has_no_tracking_fault_with_cap() {
     let (supervisor, arm) = lag_arm(Some(0.45)).await;
-    supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
     let (obs, err_inspect) = run(&supervisor, 9.0).await;
     assert!(!obs.safety_state.is_stopped(), "inspect faulted: {:?}", obs.safety_state);
     assert!(err_inspect.iter().all(|e| *e < 0.4), "lag {err_inspect:?}");
@@ -162,7 +162,7 @@ async fn lag_model_inspect_then_park_has_no_tracking_fault_with_cap() {
 #[tokio::test]
 async fn lag_model_without_cap_reproduces_the_tracking_fault_and_names_the_joint() {
     let (supervisor, _arm) = lag_arm(None).await;
-    supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), INSPECT.to_vec(), None, None).await.unwrap();
     let (obs, err) = run(&supervisor, 6.0).await;
     let SafetyState::Fault(FaultReason::Other(msg)) = &obs.safety_state else {
         panic!("expected tracking fault, got {:?} (lag {err:?})", obs.safety_state);
@@ -183,7 +183,7 @@ async fn watchdog_park_from_far_j6_gets_an_extended_deadline_and_completes() {
     supervisor.set_torque(true).await.unwrap();
     let mut far = ArmConfig::rebot_dm().home_positions;
     far[5] -= 4.7;
-    supervisor.jog(far.clone(), None, None).await.unwrap();
+    supervisor.jog(supervisor.capture_admission_stamp(), far.clone(), None, None).await.unwrap();
     for _ in 0..800 { supervisor.tick(0.05).await; }
     assert!((supervisor.get_observation().await.positions[5] - far[5]).abs() < 1e-3);
 

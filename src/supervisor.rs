@@ -31,6 +31,108 @@ mod actions;
 pub use streams::targets;
 pub use driver_transitions::{run_with_panic_deadline_observer, PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
 
+/// Generation snapshot captured ONCE at request admission (lock-free in the WS reader
+/// before queuing, or at REST/caller entry) and required by every supervisor/owner function
+/// that starts motion or output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionStamp {
+    pub stop_gen: u64,
+    pub estop_epoch: u64,
+    pub lease_gen: u64,
+}
+
+/// Proof token produced ONLY by [`SupervisorInner::check_admission_stamp`] under the owner lock.
+///
+/// Its inner field is private, so callers outside the supervisor gate cannot construct it:
+///
+/// ```compile_fail
+/// use armd::{AdmissionStamp, AdmittedMotion};
+/// let _forged = AdmittedMotion(AdmissionStamp { stop_gen: 0, estop_epoch: 1, lease_gen: 0 });
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedMotion(AdmissionStamp);
+
+impl AdmittedMotion {
+    /// The validated stamp captured at request admission.
+    pub fn stamp(self) -> AdmissionStamp {
+        self.0
+    }
+}
+
+/// Complete catalog of motion/output start entry points gated by [`AdmissionStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MotionStartKind {
+    Jog,
+    Home,
+    Park,
+    Preset,
+    MoveTo,
+    MoveRelative,
+    MoveToPose,
+    Place,
+    Grasp,
+    Replay,
+    Sequence,
+    CalibHover,
+    MeasureMultiview,
+    MacroStart,
+    MacroChildPath,
+    MacroChildQuintic,
+    MacroChildGripper,
+    MacroChildReplay,
+    Servo,
+    PolicyShadow,
+    PolicyLive,
+    GravityComp,
+    Gripper,
+    GripperZeroCheck,
+}
+
+impl MotionStartKind {
+    pub const ALL: &'static [MotionStartKind] = &[
+        Self::Jog,
+        Self::Home,
+        Self::Park,
+        Self::Preset,
+        Self::MoveTo,
+        Self::MoveRelative,
+        Self::MoveToPose,
+        Self::Place,
+        Self::Grasp,
+        Self::Replay,
+        Self::Sequence,
+        Self::CalibHover,
+        Self::MeasureMultiview,
+        Self::MacroStart,
+        Self::MacroChildPath,
+        Self::MacroChildQuintic,
+        Self::MacroChildGripper,
+        Self::MacroChildReplay,
+        Self::Servo,
+        Self::PolicyShadow,
+        Self::PolicyLive,
+        Self::GravityComp,
+        Self::Gripper,
+        Self::GripperZeroCheck,
+    ];
+}
+
+/// Single sealed execution contract for [`SupervisorInner::start_motion`]: an operation can only
+/// receive [`AdmittedMotion`] after [`SupervisorInner::check_admission_stamp`] succeeds under
+/// the owner lock.
+///
+/// ```compile_fail
+/// use armd::{ArmConfig, SupervisorInner};
+/// let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+/// // Calling start_motion without an AdmissionStamp fails to compile:
+/// let _ = inner.start_motion(());
+/// ```
+pub trait MotionStartOp {
+    type Output;
+    fn kind(&self) -> MotionStartKind;
+    fn execute(self, inner: &mut SupervisorInner, admitted: AdmittedMotion) -> Result<Self::Output, ArmError>;
+}
+
 #[derive(Debug, Error)]
 pub enum ArmError {
     #[error("Safety error: {0}")]
@@ -478,6 +580,11 @@ pub struct SupervisorInner {
     pub applied_estop_count: u64,
     /// `applied_estop_count` for the bus driver's E-stop gate (`crate::rt_core::urgent`).
     pub estop_applied: Arc<AtomicU64>,
+    /// Monotonic stop generation incremented under the owner lock whenever a Stop applies.
+    /// Shared lock-free with [`ArmSupervisor`] so WS/REST admission can capture [`AdmissionStamp`].
+    pub stop_gen: Arc<AtomicU64>,
+    /// Lock-free mirror of the active lease generation (`0` when no lease is held).
+    pub lease_gen_mirror: Arc<AtomicU64>,
     pub last_preemption: Option<Instant>,
     /// Connection and generation most recently evicted by a forced acquire.
     pub last_evicted: Option<(String, u64)>,
@@ -815,6 +922,8 @@ impl SupervisorInner {
             requested_estop_count: Arc::new(AtomicU64::new(0)),
             applied_estop_count: 0,
             estop_applied: Arc::new(AtomicU64::new(0)),
+            stop_gen: Arc::new(AtomicU64::new(0)),
+            lease_gen_mirror: Arc::new(AtomicU64::new(0)),
             last_preemption: None,
             last_evicted: None,
             handover_settling_since: None,
@@ -878,12 +987,94 @@ impl SupervisorInner {
         config: &ArmConfig,
         e_stop_latched: Arc<AtomicBool>,
         requested_estop_count: Arc<AtomicU64>,
+        stop_gen: Arc<AtomicU64>,
+        lease_gen_mirror: Arc<AtomicU64>,
     ) -> Self {
         let mut shell = Self::new(config.clone());
         shell.e_stop_latched = e_stop_latched;
         shell.requested_estop_count = requested_estop_count;
+        shell.stop_gen = stop_gen;
+        shell.lease_gen_mirror = lease_gen_mirror;
         shell.detached = true;
         shell
+    }
+
+    /// Current owner-serialized stop generation.
+    pub fn current_stop_gen(&self) -> u64 {
+        let local = self.stop_gen.load(Ordering::SeqCst);
+        match self.stop_requests.as_ref() {
+            Some(stops) => local.max(stops.current()),
+            None => local,
+        }
+    }
+
+    /// Current valid (unexpired) active lease generation, or `0` when no valid lease is held.
+    pub fn current_active_lease_gen(&self) -> u64 {
+        self.active_lease
+            .as_ref()
+            .filter(|a| a.acquired_at.elapsed() < self.lease_timeout)
+            .map_or(0, |a| a.generation)
+    }
+
+    /// Capture an [`AdmissionStamp`] from the current owner state (for tests and in-process
+    /// request entry before mutating/stopping; never called inside motion-start functions).
+    pub fn current_admission_stamp(&self) -> AdmissionStamp {
+        AdmissionStamp {
+            stop_gen: self.current_stop_gen(),
+            estop_epoch: self.safety.epoch_id(),
+            lease_gen: self.current_active_lease_gen(),
+        }
+    }
+
+    /// Advance the stop generation under the owner lock whenever a Stop applies.
+    pub fn advance_stop_generation(&mut self) -> u64 {
+        self.stop_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Monotonically synchronize `stop_gen` with an RT executor's `CommitCtx::stop_generation`.
+    pub(crate) fn sync_stop_generation(&mut self, gen: u64) {
+        let _ = self.stop_gen.fetch_max(gen, Ordering::SeqCst);
+    }
+
+    /// Keep `lease_gen_mirror` synchronized with `active_lease` under the owner lock.
+    pub(crate) fn sync_lease_gen_mirror(&self) {
+        self.lease_gen_mirror.store(self.current_active_lease_gen(), Ordering::SeqCst);
+    }
+
+    /// Single owner-lock motion-start gate checked as the FIRST step of every function that
+    /// starts motion or output. Compares the caller's admission-captured [`AdmissionStamp`]
+    /// against the current `(stop_gen, estop_epoch, lease_gen)` without re-sampling.
+    pub fn check_admission_stamp(&self, stamp: AdmissionStamp) -> Result<AdmittedMotion, SafetyError> {
+        if stamp.stop_gen != self.current_stop_gen() {
+            return Err(SafetyError::Stopped);
+        }
+        let active_gen = self.current_active_lease_gen();
+        if stamp.lease_gen != active_gen {
+            return Err(SafetyError::LeaseLost);
+        }
+        let current_epoch = self.safety.epoch_id();
+        if stamp.estop_epoch != current_epoch {
+            if self.e_stop_latched.load(Ordering::SeqCst)
+                || matches!(self.safety.state(), SafetyState::EStop)
+            {
+                return Err(SafetyError::EStopActive);
+            }
+            return Err(SafetyError::EpochMismatch {
+                expected: current_epoch,
+                received: stamp.estop_epoch,
+            });
+        }
+        Ok(AdmittedMotion(stamp))
+    }
+
+    /// Unified motion-start wrapper: validates `stamp` under the owner lock before executing `op`.
+    pub fn start_motion<Op: MotionStartOp>(
+        &mut self,
+        stamp: AdmissionStamp,
+        op: Op,
+    ) -> Result<Op::Output, ArmError> {
+        let admitted = self.check_admission_stamp(stamp)?;
+        op.execute(self, admitted)
     }
 
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
@@ -3892,6 +4083,9 @@ pub struct ArmSupervisor {
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
+    stop_gen: Arc<AtomicU64>,
+    estop_epoch: Arc<AtomicU64>,
+    lease_gen_mirror: Arc<AtomicU64>,
     tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
     /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
     tick_stats_wait_us: AtomicU64,
@@ -3984,9 +4178,14 @@ impl ArmSupervisor {
         let (tx, _) = broadcast::channel(128);
         let e_stop_latched = Arc::new(AtomicBool::new(false));
         let requested_estop_count = Arc::new(AtomicU64::new(0));
+        let stop_gen = Arc::new(AtomicU64::new(0));
+        let lease_gen_mirror = Arc::new(AtomicU64::new(0));
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
+        inner.stop_gen = stop_gen.clone();
+        inner.lease_gen_mirror = lease_gen_mirror.clone();
+        let estop_epoch = inner.safety.epoch_mirror();
         let hub = inner.core.hub().clone();
         let control_frequency_hz = inner.config.control_frequency_hz.max(1);
         let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
@@ -3995,6 +4194,9 @@ impl ArmSupervisor {
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
+            stop_gen,
+            estop_epoch,
+            lease_gen_mirror,
             tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
             tick_stats_wait_us: AtomicU64::new(0),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
@@ -4023,6 +4225,30 @@ impl ArmSupervisor {
     /// Configured control frequency (Hz, immutable after startup, lock-free).
     pub fn control_frequency_hz(&self) -> u32 {
         self.control_frequency_hz
+    }
+
+    /// Lock-free current stop generation (bumped under the owner lock on Stop).
+    pub fn stop_generation(&self) -> u64 {
+        self.stop_gen.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free current E-stop / safety epoch id.
+    pub fn estop_epoch(&self) -> u64 {
+        self.estop_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free mirror of the active lease generation (`0` when no lease is held).
+    pub fn lease_generation(&self) -> u64 {
+        self.lease_gen_mirror.load(Ordering::SeqCst)
+    }
+
+    /// Lock-free admission stamp captured ONCE at request entry (WS reader or REST entry).
+    pub fn capture_admission_stamp(&self) -> AdmissionStamp {
+        AdmissionStamp {
+            stop_gen: self.stop_generation(),
+            estop_epoch: self.estop_epoch(),
+            lease_gen: self.lease_generation(),
+        }
     }
 
     /// Handle to the synchronous RT executor when ownership has transferred.
@@ -4153,6 +4379,8 @@ impl ArmSupervisor {
             &guard.config,
             self.e_stop_latched.clone(),
             self.requested_estop_count.clone(),
+            self.stop_gen.clone(),
+            self.lease_gen_mirror.clone(),
         );
         let real = std::mem::replace(&mut *guard, shell);
 
@@ -4636,7 +4864,7 @@ impl ArmSupervisor {
         inner.gravity_torques_ramped.clone()
     }
 
-    pub async fn servo(&self, targets: Vec<f32>, epoch_id: u64) -> Result<(), ArmError> {
+    pub async fn servo(&self, stamp: AdmissionStamp, targets: Vec<f32>, epoch_id: u64) -> Result<(), ArmError> {
         if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
@@ -4645,7 +4873,7 @@ impl ArmSupervisor {
         if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        inner.servo(targets, epoch_id)?;
+        inner.servo(stamp, targets, epoch_id)?;
         Ok(())
     }
 
@@ -4672,24 +4900,26 @@ impl ArmSupervisor {
 
     pub async fn jog(
         &self,
+        stamp: AdmissionStamp,
         target_positions: Vec<f32>,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
-        inner.jog(target_positions, duration_secs, epoch_id)
+        inner.jog(stamp, target_positions, duration_secs, epoch_id)
     }
 
     pub async fn home(
         &self,
+        stamp: AdmissionStamp,
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
         let home_pos = inner.config.home_positions.clone();
-        inner.jog_action(home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
+        inner.jog_action(stamp, home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
     pub async fn stop_motion(&self) {
@@ -4990,16 +5220,15 @@ impl ArmSupervisor {
         &self,
         stop: crate::rt_core::urgent::UrgentStop,
     ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
-        self.urgent_stop_with_legacy_hook(stop, |_| {}).await
+        self.urgent_stop_with_legacy_hook(stop, |_, _| {}).await
     }
 
-    /// Like [`Self::urgent_stop`], running `on_legacy_applied(epoch)` strictly inside the legacy
-    /// `inner.write()` critical section alongside the stop mutation (so `conn_stop_gen`,
-    /// `policy_stop_gen`, and ordinary queue drain happen atomically before releasing the lock).
+    /// Like [`Self::urgent_stop`], running `on_legacy_applied(epoch, stop_gen)` strictly inside
+    /// the legacy `inner.write()` critical section alongside the stop mutation.
     pub(crate) async fn urgent_stop_with_legacy_hook(
         &self,
         stop: crate::rt_core::urgent::UrgentStop,
-        on_legacy_applied: impl FnOnce(u64),
+        on_legacy_applied: impl FnOnce(u64, u64),
     ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
         use crate::rt_core::urgent::UrgentStopOutcome;
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::urgent_stop");
@@ -5031,10 +5260,11 @@ impl ArmSupervisor {
                     guard.exit_gravity_comp("STOPPED", "Stop command");
                     guard.stop_motion();
                     guard.request_macro_stop();
+                    let stop_gen = guard.advance_stop_generation();
                     let applied_epoch = guard.safety.epoch_id();
-                    on_legacy_applied(applied_epoch);
+                    on_legacy_applied(applied_epoch, stop_gen);
                     return Ok(UrgentStopOutcome::Applied {
-                        stop_generation: 0,
+                        stop_generation: stop_gen,
                         applied_to_motion: true,
                         epoch: applied_epoch,
                         safety_state: guard.safety.state_arc(),
@@ -5829,19 +6059,20 @@ mod observation_snapshot_tests {
             request_id_valid: true,
             body_error: None,
         };
-        // Refused stop (wrong epoch / wrong lease) must NOT advance policy_stop_gen.
-        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), |_| { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
+        // Refused stop (wrong epoch / wrong lease) must NOT advance stop_gen or invoke the hook.
+        let r_refused = sup.urgent_stop_with_legacy_hook(mk(gen, ep + 1), |_, _| { policy_stop_gen.fetch_add(1, Ordering::SeqCst); }).await.unwrap();
         assert!(matches!(r_refused, crate::rt_core::urgent::UrgentStopOutcome::EpochMismatch { .. }));
         assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 0);
+        assert_eq!(sup.stop_generation(), 0);
 
-        // Authorized stop must advance policy_stop_gen BEFORE releasing `inner.write()`, so a
-        // concurrent policy-load installer queued on `inner.write()` observes the bump immediately.
+        // Authorized stop must advance stop_gen BEFORE releasing `inner.write()`, so a
+        // concurrent motion-start installer queued on `inner.write()` observes the bump immediately.
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let (s1, p1, e1, r1) = (sup.clone(), policy_stop_gen.clone(), entered.clone(), release.clone());
         let stop_task = tokio::spawn(async move {
-            s1.urgent_stop_with_legacy_hook(mk(gen, ep), |_| {
-                p1.fetch_add(1, Ordering::SeqCst);
+            s1.urgent_stop_with_legacy_hook(mk(gen, ep), |_, stop_gen| {
+                p1.store(stop_gen, Ordering::SeqCst);
                 e1.notify_one();
                 // Yield briefly while still holding `inner.write()` so the installer task queues on the lock.
                 std::thread::sleep(Duration::from_millis(15));
@@ -5850,11 +6081,12 @@ mod observation_snapshot_tests {
         });
         entered.notified().await;
         // Now acquire `inner.write()` just like policy-load completion does: as soon as the lock
-        // is granted, `policy_stop_gen` MUST already be 1 (zero race window after Stop applies).
-        let _guard = sup.inner().write().await;
+        // is granted, `stop_gen` MUST already be 1 (zero race window after Stop applies).
+        let guard = sup.inner().write().await;
         assert_eq!(policy_stop_gen.load(Ordering::SeqCst), 1);
-        drop(_guard);
+        assert_eq!(guard.current_stop_gen(), 1);
+        drop(guard);
         let outcome = stop_task.await.unwrap();
-        assert!(matches!(outcome, crate::rt_core::urgent::UrgentStopOutcome::Applied { .. }));
+        assert!(matches!(outcome, crate::rt_core::urgent::UrgentStopOutcome::Applied { stop_generation: 1, .. }));
     }
 }

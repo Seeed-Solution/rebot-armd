@@ -141,9 +141,10 @@ fn armed(config: ArmConfig, rig: Rig) -> (SupervisorInner, Arc<Mutex<Rig>>) {
 
 fn send(inner: &mut SupervisorInner, order: Order, targets: Vec<f32>) -> Result<(), String> {
     let epoch = inner.safety.epoch_id();
+    let stamp = inner.current_admission_stamp();
     let r = match order {
         Order::Old => inner.servo_pre_6967c0a(targets, epoch),
-        Order::New => inner.servo(targets, epoch),
+        Order::New => inner.servo(stamp, targets, epoch),
     };
     r.map_err(|e| format!("{e:?}").split(['(', ' ', '{']).next().unwrap_or_default().to_string())
 }
@@ -568,7 +569,8 @@ fn policy_stream_30fps() {
         inner.lease_enabled = true;
         let gen = inner.acquire_lease("policy-rig").unwrap();
         let epoch = inner.safety.epoch_id();
-        let id = inner.begin_policy_run(PolicyRunStart {
+        let stamp = inner.current_admission_stamp();
+        let id = inner.begin_policy_run(stamp, PolicyRunStart {
             epoch_id: epoch, connection_id: "policy-rig".into(), lease_generation: gen, policy_id: "rig".into(),
             artifact_digest: "0".repeat(64), backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false,
             max_first_step_rad: None, max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,

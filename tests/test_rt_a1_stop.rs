@@ -467,7 +467,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         let lg = c.acquire_lease(conn).unwrap();
         c.set_torque(true).unwrap();
         let e = c.safety.epoch_id();
-        c.jog_action_with_speed_scale(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)).unwrap();
+        { let s = c.current_admission_stamp(); c.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         for k in 1..=4 { let _ = c.tick_publish(0.005, k, false); let _ = c.core.hub().latest(); }
         let stops = armd::rt_core::urgent::StopRequests::new();
         let _ = armd::diagnostics::alloc::take();
@@ -489,7 +489,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         let g = inner.acquire_lease(conn).unwrap();
         inner.set_torque(true).unwrap();
         let ep = inner.safety.epoch_id();
-        inner.jog_action_with_speed_scale(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)).unwrap();
+        { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
         assert!(inner.active_trajectory.as_ref().unwrap().has_heap_storage(), "test requires heap trajectory");
         g
     };
@@ -527,7 +527,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         let _lg = ce.acquire_lease(conn).unwrap();
         ce.set_torque(true).unwrap();
         let e = ce.safety.epoch_id();
-        ce.jog_action_with_speed_scale(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)).unwrap();
+        { let s = ce.current_admission_stamp(); ce.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(e), "joint_move", Some(0.5)) }.unwrap();
         assert!(ce.active_trajectory.as_ref().unwrap().has_heap_storage());
         for k in 1..=4 { let _ = ce.tick_publish(0.005, k, false); let _ = ce.core.hub().latest(); }
         ce.requested_estop_count.fetch_add(1, Ordering::SeqCst);
@@ -545,7 +545,7 @@ async fn zero_alloc_rt_stop_refusal_wake_park_preservation_and_panic_safety() {
         let _g = inner.acquire_lease(conn).unwrap();
         inner.set_torque(true).unwrap();
         let ep = inner.safety.epoch_id();
-        inner.jog_action_with_speed_scale(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)).unwrap();
+        { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "joint_move", Some(0.5)) }.unwrap();
     }
     let h_e = sup_e.start_executor(ecfg_alloc).await.unwrap();
     wait_until(Duration::from_secs(1), || sup_e.tick_samples().len() >= 3).await;
@@ -823,7 +823,7 @@ async fn stalled_writer_and_full_ordinary_queue_still_latches_estop_and_reaches_
     // Block worker inside `dry_run_task` (`mode_info().await`), start active motion, stall writer, and fill inbound ordinary queue (64/64) + 1 BACKLOG_FULL.
     send(&mut ws_l, json!({"type": "command", "request_id": 300, "generation": gen_l, "epoch_id": ep_l, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
     wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
-    sup_l.inner().write().await.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_l), "legacy_jog").unwrap();
+    sup_l.inner().write().await.jog_action(sup_l.capture_admission_stamp(), vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep_l), "legacy_jog").unwrap();
     assert!(sup_l.inner().read().await.active_trajectory.is_some());
     armd::api::ws::set_test_ws_write_paused(&conn_l, true);
     for k in 0..65u64 {
@@ -871,7 +871,7 @@ async fn slow_dry_run_detector_does_not_block_estop_or_stop_on_same_socket() {
     send(&mut ws, json!({"type": "command", "request_id": 500, "generation": gen, "epoch_id": ep1, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
     wait_until(Duration::from_secs(1), || det.entered.load(Ordering::SeqCst)).await;
     // Start active motion while worker is blocked on the detector so Stop has live motion to halt.
-    sup.inner().write().await.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep1), "slow_dry_run_jog").unwrap();
+    sup.inner().write().await.jog_action(sup.capture_admission_stamp(), vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(2.0), Some(ep1), "slow_dry_run_jog").unwrap();
     assert!(sup.inner().read().await.active_trajectory.is_some());
 
     // While worker is blocked on the detector, Stop on the SAME socket applies immediately and stops motion.
@@ -976,7 +976,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
         // Preempt Client 1 BEFORE its queued Stop acquires `inner.write()`, and start new motion for Client 2.
         let (gen2, evicted) = inner.preempt_lease("connection:takeover", "client-2").unwrap();
         assert!(gen2 > gen1 && evicted.is_some());
-        inner.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "client2_jog").unwrap();
+        { let s = inner.current_admission_stamp(); inner.jog_action(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep), "client2_jog") }.unwrap();
     }
     let r1 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
     let r2 = next_of(&mut ws1, &["command_ack", "command_reject"]).await;
@@ -989,7 +989,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
     let g1 = core.acquire_lease("connection:owner1").unwrap();
     core.set_torque(true).unwrap();
     let ep_e = core.safety.epoch_id();
-    core.jog_action(vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog").unwrap();
+    { let s = core.current_admission_stamp(); core.jog_action(s, vec![0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner1_jog") }.unwrap();
     let (mut engine, _broker, _tw, stops) = ReleaseEngine::new(BootId::fresh(), Capacities::default());
     let (client, intake) = urgent_stop_channel(4, Arc::new(AtomicBool::new(false)));
     engine.attach_urgent_stops(intake);
@@ -1005,7 +1005,7 @@ async fn preempted_owner_queued_stop_is_rejected_by_authorization_rules() {
     let (g2, _) = core.preempt_lease("connection:owner2", "owner2").unwrap();
     assert!(g2 > g1);
     core.handover_settling_since = None;
-    core.jog_action(vec![0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner2_jog").unwrap();
+    { let s = core.current_admission_stamp(); core.jog_action(s, vec![0.35, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], Some(1.0), Some(ep_e), "owner2_jog") }.unwrap();
     let _rep = engine.step(&mut core, Instant::now, 0.005, Instant::now() + Duration::from_millis(5), 1);
     client.drain_replies();
     assert_eq!(rx.try_recv().unwrap().unwrap(), UrgentStopOutcome::LeaseLost { epoch: ep_e });
@@ -1522,4 +1522,688 @@ async fn connection_teardown_joins_spawned_tasks_and_releases_late_acquire_under
     assert!(!core.release_lease_for_connection("connection:other"));
     assert!(core.release_lease_for_connection("connection:late"));
     assert!(core.active_lease.is_none());
+}
+
+// 15. Table over EVERY motion-start entry point: admit -> Stop -> deliver -> refused (STOPPED) + zero motion.
+//     Also covers WS end-to-end policy/start & preset stop-vs-motion races and lease/epoch mismatches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn motion_start_gate_table_refuses_every_entry_point_after_stop() {
+    use armd::api::rest::ApiError;
+    use armd::backlash::{Pre, Request as BacklashRequest};
+    use armd::gravity_comp::GravityCompRequest;
+    use armd::motion::{GripperCommand, GripperRequest, JointPath};
+    use armd::recording::{EpisodeSidecar, RecordFrame};
+    use armd::replay::ReplayRequest;
+    use armd::{AdmissionStamp, MotionStartKind};
+    use std::collections::HashSet;
+
+    let assert_stopped = |err: ArmError, label: &str| {
+        let api: ApiError = err.into();
+        assert_eq!(api.code.as_deref(), Some("STOPPED"), "{label}: expected STOPPED, got {api:?}");
+        assert_eq!(api.status.as_u16(), 409, "{label}: expected 409, got {api:?}");
+    };
+
+    let assert_no_motion = |inner: &SupervisorInner, prev_action_id: Option<u64>, label: &str| {
+        assert!(inner.active_trajectory.is_none(), "{label}: active_trajectory must remain None");
+        assert!(inner.servo_target.is_none(), "{label}: servo_target must remain None");
+        assert!(!inner.gravity_comp_active(), "{label}: gravity_comp must remain inactive");
+        assert_eq!(
+            inner.last_action.as_ref().map(|a| a.id),
+            prev_action_id,
+            "{label}: no new action may start"
+        );
+        #[cfg(feature = "policy-runtime")]
+        assert!(inner.policy_run.is_none(), "{label}: policy_run must remain None");
+    };
+
+    let dummy_path = || JointPath {
+        dof: 7,
+        arm_dof: 6,
+        q: vec![INSPECT, INSPECT],
+        s: vec![0.0, 1.0],
+        duration: 0.4,
+        power_scale: 1.0,
+    };
+
+    let make_armed = || async {
+        let mut cfg = ArmConfig::rebot_dm();
+        cfg.lease_timeout_ms = 30_000;
+        let arm = TestArm::new();
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(arm)));
+        let gen = sup.acquire_lease("conn:gate").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        {
+            let mut inner = sup.inner().write().await;
+            inner.commanded_positions = INSPECT.to_vec();
+            inner.measured_positions = INSPECT.to_vec();
+            inner.target_positions = INSPECT.to_vec();
+        }
+        let ep = sup.get_observation().await.epoch_id;
+        (sup, gen, ep)
+    };
+
+    let mut covered = HashSet::new();
+    for &kind in MotionStartKind::ALL {
+        covered.insert(kind);
+        match kind {
+            MotionStartKind::Jog => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                let mut goal = INSPECT.to_vec();
+                goal[0] += 0.2;
+                assert_stopped(inner.jog(stamp, goal.clone(), Some(0.5), Some(ep)).unwrap_err(), "jog");
+                assert_stopped(
+                    inner.jog_action_with_speed_scale(stamp, goal, Some(0.5), Some(ep), "joint_move", None).unwrap_err(),
+                    "jog_action_with_speed_scale",
+                );
+                assert_no_motion(&inner, None, "Jog");
+            }
+            MotionStartKind::Home => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                {
+                    let mut inner = sup.inner().write().await;
+                    assert!(inner.authorized_stop());
+                    let home = inner.config.home_positions.clone();
+                    assert_stopped(inner.jog_action(stamp, home, Some(0.5), Some(ep), "home").unwrap_err(), "home_inner");
+                    assert_no_motion(&inner, None, "Home(inner)");
+                }
+                assert_stopped(sup.home(stamp, Some(0.5), Some(ep)).await.unwrap_err(), "sup.home");
+                let inner = sup.inner().read().await;
+                assert_no_motion(&inner, None, "Home(sup)");
+            }
+            MotionStartKind::Park => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.unload_action(stamp).unwrap_err(), "unload_action");
+                assert_no_motion(&inner, None, "Park");
+            }
+            MotionStartKind::Preset => {
+                let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }));
+                let addr = serve(sup.clone()).await;
+                let (mut ws, gen) = controller(addr).await;
+                let ep0 = sup.get_observation().await.epoch_id;
+                assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+                let ep = sup.get_observation().await.epoch_id;
+                let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+
+                // Pause worker right after popping the preset (so Stop cannot drain it from the queue),
+                // deliver urgent Stop, then resume worker: preset must still be refused via AdmissionStamp.
+                armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+                send(&mut ws, json!({"type": "preset", "generation": gen, "epoch_id": ep, "name": "home"})).await;
+                wait_until(Duration::from_secs(1), || {
+                    armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1
+                }).await;
+                let stop_ack = rpc(&mut ws, gen, ep, "/api/v1/motion/stop", json!({})).await;
+                assert_eq!(stop_ack["type"], "command_ack", "{stop_ack}");
+                armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+
+                let reply = next_of(&mut ws, &["preset_ack", "preset_reject"]).await;
+                assert_eq!(reply["type"], "preset_reject", "{reply}");
+                assert_eq!(reply["code"], "STOPPED", "{reply}");
+                let inner = sup.inner().read().await;
+                assert_no_motion(&inner, None, "Preset");
+            }
+            MotionStartKind::MoveTo => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                let path = dummy_path();
+                let goal: [f64; 6] = std::array::from_fn(|i| f64::from(INSPECT[i]));
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.install_path(stamp, &input, path, "move_to", None).unwrap_err(), "install_path");
+                assert_stopped(
+                    inner.install_joint_goal(stamp, &input, &goal, 0.5, "move_to", None, None).unwrap_err(),
+                    "install_joint_goal",
+                );
+                assert_no_motion(&inner, None, "MoveTo");
+            }
+            MotionStartKind::MoveRelative => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                let path = dummy_path();
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.install_path_same_side(stamp, &input, path, Pre::Off, None, "move_relative", None).unwrap_err(),
+                    "install_path_same_side",
+                );
+                assert_no_motion(&inner, None, "MoveRelative");
+            }
+            MotionStartKind::MoveToPose => {
+                let (sup, _, ep) = make_armed().await;
+                {
+                    let mut inner = sup.inner().write().await;
+                    let mut p = INSPECT.to_vec();
+                    p[0] += 0.15;
+                    armd::poses::save(&mut inner, &json!({"name": "gate_pose", "positions": p})).unwrap();
+                }
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.move_to_pose(stamp, "gate_pose", false, 0.5, None, ep).unwrap_err(),
+                    "move_to_pose",
+                );
+                assert_stopped(
+                    armd::poses::start_action(&mut inner, stamp, &json!({"name": "gate_pose"}), ep).unwrap_err(),
+                    "poses::start_action",
+                );
+                assert_no_motion(&inner, None, "MoveToPose");
+            }
+            MotionStartKind::Place => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.begin_macro(stamp, "place", &input, None).unwrap_err(), "begin_macro(place)");
+                assert_no_motion(&inner, None, "Place");
+            }
+            MotionStartKind::Grasp => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.begin_macro(stamp, "grasp", &input, None).unwrap_err(), "begin_macro(grasp)");
+                assert_no_motion(&inner, None, "Grasp");
+            }
+            MotionStartKind::Replay => {
+                let (sup, _, ep) = make_armed().await;
+                let dir = tempfile::tempdir().unwrap();
+                let (plan, req) = {
+                    let mut inner = sup.inner().write().await;
+                    inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+                    let frames = vec![
+                        RecordFrame { timestamp: 0.0, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                        RecordFrame { timestamp: 0.1, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                    ];
+                    let sidecar = EpisodeSidecar {
+                        id: "gate_ep".into(),
+                        dataset: "gate".into(),
+                        task: "gate".into(),
+                        source: "sdk".into(),
+                        sequence_id: None,
+                        repeat_index: None,
+                        outcome: "ok".into(),
+                        recorded_at: "2026-11-24T00:00:00Z".into(),
+                        duration_s: 0.1,
+                        frames: frames.len(),
+                        joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+                        units: "rad".into(),
+                        joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
+                        profile_id: inner.config.profile_id.clone(),
+                        armd_version: "test".into(),
+                        fps_nominal: 10.0,
+                        truncated: false,
+                        stopped_by: None,
+                        arm_dof: Some(6),
+                        gripper_joint: Some(6),
+                        tool_id: Some(inner.config.active_tool.id.clone()),
+                        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+                        has_gripper_motion: Some(false),
+                        recovered: None,
+                        frames_dropped: None,
+                        first_state: Some(INSPECT.to_vec()),
+                        last_state: Some(INSPECT.to_vec()),
+                    };
+                    inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
+                    let req = ReplayRequest { episode: "gate_ep".into(), speed: 1.0, gripper: false, tag: None, allow_stale: true };
+                    let inp = inner.replay_input(req.clone(), ep).unwrap();
+                    (armd::replay::plan(inp).unwrap(), req)
+                };
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.install_replay(stamp, plan).unwrap_err(), "install_replay");
+                assert_stopped(inner.start_replay(stamp, req, ep).unwrap_err(), "start_replay");
+                assert_no_motion(&inner, None, "Replay");
+            }
+            MotionStartKind::Sequence => {
+                let (sup, _, ep) = make_armed().await;
+                let run_plan = {
+                    let mut inner = sup.inner().write().await;
+                    let (saved_pose, _) = armd::poses::save(&mut inner, &json!({"name": "seq_p", "positions": INSPECT.to_vec()})).unwrap();
+                    let (seq, _) = armd::sequences::save(&mut inner, &json!({
+                        "name": "gate_seq",
+                        "steps": [{"type": "pose", "pose_id": saved_pose.id}]
+                    })).unwrap();
+                    armd::sequences::prepare_run(&inner, &json!({"id": seq.id}), ep).unwrap()
+                };
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.begin_sequence_action(stamp, None, ep).unwrap_err(), "begin_sequence_action");
+                assert_stopped(armd::sequences::begin(&mut inner, &sup, run_plan, stamp).unwrap_err(), "sequences::begin");
+                assert_no_motion(&inner, None, "Sequence");
+            }
+            MotionStartKind::CalibHover => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.begin_orchestrated_action(stamp, "calib_hover", None, ep).unwrap_err(),
+                    "begin_orchestrated_action(calib_hover)",
+                );
+                assert_no_motion(&inner, None, "CalibHover");
+            }
+            MotionStartKind::MeasureMultiview => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.begin_orchestrated_action(stamp, "measure_multiview", None, ep).unwrap_err(),
+                    "begin_orchestrated_action(measure_multiview)",
+                );
+                assert_no_motion(&inner, None, "MeasureMultiview");
+            }
+            MotionStartKind::MacroStart => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.begin_macro(stamp, "grasp", &input, None).unwrap_err(), "MacroStart");
+                assert_no_motion(&inner, None, "MacroStart");
+            }
+            MotionStartKind::MacroChildPath => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                let macro_id = inner.begin_macro(stamp, "grasp", &input, None).unwrap();
+                let path = dummy_path();
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.install_macro_path(stamp, macro_id, &input, path.clone()).unwrap_err(),
+                    "install_macro_path",
+                );
+                assert_stopped(
+                    inner.install_macro_path_same_side(stamp, macro_id, &input, path, Pre::Off, None).unwrap_err(),
+                    "install_macro_path_same_side",
+                );
+                assert_no_motion(&inner, Some(macro_id), "MacroChildPath");
+            }
+            MotionStartKind::MacroChildQuintic => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                let macro_id = inner.begin_macro(stamp, "grasp", &input, None).unwrap();
+                let limits = inner.config.limits.clone();
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.install_macro_quintic(stamp, macro_id, INSPECT.to_vec(), &limits).unwrap_err(),
+                    "install_macro_quintic",
+                );
+                assert_no_motion(&inner, Some(macro_id), "MacroChildQuintic");
+            }
+            MotionStartKind::MacroChildGripper => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let input = inner.plan_input().unwrap();
+                let macro_id = inner.begin_macro(stamp, "grasp", &input, None).unwrap();
+                let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.start_macro_gripper(stamp, macro_id, greq.clone()).unwrap_err(),
+                    "start_macro_gripper",
+                );
+                assert_stopped(
+                    inner.start_macro_gripper_within(stamp, macro_id, greq, Some(5.0), true).unwrap_err(),
+                    "start_macro_gripper_within",
+                );
+                assert_no_motion(&inner, Some(macro_id), "MacroChildGripper");
+            }
+            MotionStartKind::MacroChildReplay => {
+                let (sup, _, ep) = make_armed().await;
+                let dir = tempfile::tempdir().unwrap();
+                let (macro_id, plan, stamp) = {
+                    let mut inner = sup.inner().write().await;
+                    inner.episodes = armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf()));
+                    let frames = vec![
+                        RecordFrame { timestamp: 0.0, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                        RecordFrame { timestamp: 0.1, observation_state: INSPECT.to_vec(), action: INSPECT.to_vec() },
+                    ];
+                    let sidecar = EpisodeSidecar {
+                        id: "gate_ep_child".into(),
+                        dataset: "gate".into(),
+                        task: "gate".into(),
+                        source: "sdk".into(),
+                        sequence_id: None,
+                        repeat_index: None,
+                        outcome: "ok".into(),
+                        recorded_at: "2026-11-24T00:00:00Z".into(),
+                        duration_s: 0.1,
+                        frames: frames.len(),
+                        joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
+                        units: "rad".into(),
+                        joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets),
+                        profile_id: inner.config.profile_id.clone(),
+                        armd_version: "test".into(),
+                        fps_nominal: 10.0,
+                        truncated: false,
+                        stopped_by: None,
+                        arm_dof: Some(6),
+                        gripper_joint: Some(6),
+                        tool_id: Some(inner.config.active_tool.id.clone()),
+                        tool_config_digest: Some(inner.config.active_tool.config_digest.clone()),
+                        has_gripper_motion: Some(false),
+                        recovered: None,
+                        frames_dropped: None,
+                        first_state: Some(INSPECT.to_vec()),
+                        last_state: Some(INSPECT.to_vec()),
+                    };
+                    inner.episodes.write_episode(&sidecar, &frames, None).unwrap();
+                    let stamp = inner.current_admission_stamp();
+                    let id = inner.begin_sequence_action(stamp, None, ep).unwrap();
+                    let req = ReplayRequest { episode: "gate_ep_child".into(), speed: 1.0, gripper: false, tag: None, allow_stale: true };
+                    let inp = inner.replay_input(req, ep).unwrap();
+                    (id, armd::replay::plan(inp).unwrap(), stamp)
+                };
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.install_macro_replay(stamp, macro_id, plan).unwrap_err(), "install_macro_replay");
+                assert_no_motion(&inner, Some(macro_id), "MacroChildReplay");
+            }
+            MotionStartKind::Servo => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.servo(stamp, INSPECT.to_vec(), ep).unwrap_err().into(), "servo");
+                assert_stopped(inner.servo_slice(stamp, &INSPECT, ep).unwrap_err().into(), "servo_slice");
+                assert_no_motion(&inner, None, "Servo");
+            }
+            MotionStartKind::PolicyShadow => {
+                #[cfg(feature = "policy-runtime")]
+                {
+                    let (sup, gen, ep) = make_armed().await;
+                    let stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    assert!(inner.authorized_stop());
+                    let err = inner.begin_policy_run(stamp, armd::policy_runtime::PolicyRunStart {
+                        epoch_id: ep,
+                        connection_id: "conn:gate".into(),
+                        lease_generation: gen,
+                        policy_id: "p_shadow".into(),
+                        artifact_digest: "sha256:0000".into(),
+                        backend: "mlp".into(),
+                        mode: armd::policy_runtime::PolicyMode::Shadow,
+                        sim_only: false,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
+                    }).unwrap_err();
+                    assert_stopped(err, "begin_policy_run(Shadow)");
+                    assert_no_motion(&inner, None, "PolicyShadow");
+                }
+            }
+            MotionStartKind::PolicyLive => {
+                #[cfg(feature = "policy-runtime")]
+                {
+                    let (sup, gen, ep) = make_armed().await;
+                    let stamp = sup.capture_admission_stamp();
+                    let mut inner = sup.inner().write().await;
+                    assert!(inner.authorized_stop());
+                    let err = inner.begin_policy_run(stamp, armd::policy_runtime::PolicyRunStart {
+                        epoch_id: ep,
+                        connection_id: "conn:gate".into(),
+                        lease_generation: gen,
+                        policy_id: "p_live".into(),
+                        artifact_digest: "sha256:0000".into(),
+                        backend: "mlp".into(),
+                        mode: armd::policy_runtime::PolicyMode::Live,
+                        sim_only: false,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                        i_am_at_the_arm: true,
+                        verified_release_gate: None,
+                    }).unwrap_err();
+                    assert_stopped(err, "begin_policy_run(Live)");
+                    assert_no_motion(&inner, None, "PolicyLive");
+                }
+            }
+            MotionStartKind::GravityComp => {
+                let (sup, _, _) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.enter_gravity_comp(stamp, GravityCompRequest { scale: None, damping_kd: None }).unwrap_err(),
+                    "enter_gravity_comp",
+                );
+                assert_no_motion(&inner, None, "GravityComp");
+            }
+            MotionStartKind::Gripper => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                let greq = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(2.0), tag: None };
+                assert!(inner.authorized_stop());
+                assert_stopped(inner.start_gripper(stamp, greq, ep).unwrap_err(), "start_gripper");
+                assert_no_motion(&inner, None, "Gripper");
+            }
+            MotionStartKind::GripperZeroCheck => {
+                let (sup, _, ep) = make_armed().await;
+                let stamp = sup.capture_admission_stamp();
+                let mut inner = sup.inner().write().await;
+                assert!(inner.authorized_stop());
+                assert_stopped(
+                    inner.start_gripper_zero_check(stamp, &json!({}), ep).unwrap_err(),
+                    "start_gripper_zero_check",
+                );
+                assert_no_motion(&inner, None, "GripperZeroCheck");
+            }
+        }
+    }
+    assert_eq!(covered.len(), MotionStartKind::ALL.len(), "every MotionStartKind must be tested");
+
+    // End-to-end WS policy/start race (round-3 finding): admit policy/start, apply urgent Stop
+    // while worker is loading (and also when paused before inner.write), verify STOPPED & no policy run.
+    #[cfg(feature = "policy-runtime")]
+    {
+        use armd::api::create_router_with_sandbox;
+        use armd::api::sandbox::SandboxState;
+        use armd::policy_runtime::{encode_rmlp_bytes, Activation, MlpLayerSpec};
+
+        let mut cfg = ArmConfig::default();
+        cfg.lease_timeout_ms = 15_000;
+        let jnames: Vec<&str> = cfg.limits.iter().map(|l| l.name.as_str()).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("policies").join("gate_pol");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        std::fs::write(pack_dir.join("model.rmlp"), encode_rmlp_bytes(&layers).unwrap()).unwrap();
+        std::fs::write(
+            pack_dir.join("policy.json"),
+            serde_json::to_vec(&json!({
+                "format": "rebot-onnx-policy/v1",
+                "id": "gate_pol",
+                "name": "gate_pol",
+                "unit_mode": "rad",
+                "action_dim": 6,
+                "action_space": "joint_positions",
+                "joint_names": jnames,
+                "inputs": {"state": {"shape": [1, 6], "joint_names": jnames}},
+                "outputs": {"action": {"shape": [1, 6], "space": "joint_positions"}},
+                "model_file": "model.rmlp"
+            })).unwrap(),
+        ).unwrap();
+
+        let sandbox = Arc::new(SandboxState::new(dir.path().to_path_buf()));
+        sandbox.set_policy_load_delay_ms(120);
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+        let (mut ws, gen) = controller(addr).await;
+        let ep = sup.get_observation().await.epoch_id;
+        // Send policy/start (admitted at stop_gen=0), wait until loading starts, then send urgent Stop.
+        send(&mut ws, json!({
+            "type": "command", "request_id": 1001, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/action/policy/start",
+            "body": {"policy_id": "gate_pol", "mode": "shadow"}
+        })).await;
+        wait_until(Duration::from_secs(2), || {
+            sup.inner().try_read().is_ok_and(|g| g.policy_loading)
+        }).await;
+        send(&mut ws, json!({
+            "type": "command", "request_id": 1002, "generation": gen, "epoch_id": ep,
+            "path": "/api/v1/motion/stop", "body": {}
+        })).await;
+
+        let mut saw_stop_ack = false;
+        let mut saw_policy_stopped = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !(saw_stop_ack && saw_policy_stopped) && Instant::now() < deadline {
+            let msg = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+            if msg["request_id"] == 1002 {
+                assert_eq!(msg["type"], "command_ack", "{msg}");
+                assert!(msg["stop_generation"].as_u64().unwrap_or(0) >= 1, "{msg}");
+                saw_stop_ack = true;
+            } else if msg["request_id"] == 1001 {
+                assert_eq!(msg["type"], "command_reject", "{msg}");
+                assert_eq!(msg["code"], "STOPPED", "{msg}");
+                saw_policy_stopped = true;
+            }
+        }
+        assert!(saw_stop_ack && saw_policy_stopped, "stop={saw_stop_ack} policy={saw_policy_stopped}");
+        assert!(sup.inner().read().await.policy_run.is_none(), "policy must NOT start after Stop");
+    }
+
+    // Also verify lease_gen mismatch -> LEASE_LOST and estop_epoch mismatch -> ESTOP_ACTIVE / EPOCH_MISMATCH.
+    {
+        let (sup, gen, ep) = make_armed().await;
+        let inner = sup.inner().read().await;
+        let sg = inner.current_stop_gen();
+        let err_lease = inner.check_admission_stamp(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen + 1 }).unwrap_err();
+        assert_eq!(ApiError::from(ArmError::from(err_lease)).code.as_deref(), Some("LEASE_LOST"));
+        let err_ep = inner.check_admission_stamp(AdmissionStamp { stop_gen: sg, estop_epoch: ep + 9, lease_gen: gen }).unwrap_err();
+        assert_eq!(ApiError::from(ArmError::from(err_ep)).code.as_deref(), Some("EPOCH_MISMATCH"));
+        drop(inner);
+        let _ = sup.trigger_e_stop_checked().await.unwrap();
+        let inner = sup.inner().read().await;
+        let err_estop = inner.check_admission_stamp(AdmissionStamp { stop_gen: sg, estop_epoch: ep, lease_gen: gen }).unwrap_err();
+        assert_eq!(ApiError::from(ArmError::from(err_estop)).code.as_deref(), Some("ESTOP_ACTIVE"));
+    }
+    let _ = BacklashRequest::Profile;
+}
+
+// 16. Single start_motion(stamp, op) wrapper contract & static non-resampling / signature audit.
+#[test]
+fn start_motion_wrapper_enforces_stamp_and_no_motion_entry_point_resamples() {
+    use armd::api::rest::ApiError;
+    use armd::{AdmissionStamp, AdmittedMotion, MotionStartKind, MotionStartOp};
+
+    struct CountedOp {
+        kind: MotionStartKind,
+        executed: Arc<AtomicBool>,
+    }
+
+    impl MotionStartOp for CountedOp {
+        type Output = AdmissionStamp;
+        fn kind(&self) -> MotionStartKind { self.kind }
+        fn execute(self, _inner: &mut SupervisorInner, admitted: AdmittedMotion) -> Result<Self::Output, ArmError> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(admitted.stamp())
+        }
+    }
+
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+    let gen = inner.acquire_lease("conn:op").unwrap();
+    let stamp = inner.current_admission_stamp();
+    assert_eq!(stamp.lease_gen, gen);
+
+    // Valid stamp runs `execute` and returns the validated stamp inside `AdmittedMotion`.
+    let ran = Arc::new(AtomicBool::new(false));
+    let out = inner.start_motion(stamp, CountedOp { kind: MotionStartKind::Jog, executed: ran.clone() }).unwrap();
+    assert!(ran.load(Ordering::SeqCst));
+    assert_eq!(out, stamp);
+
+    // Stale stop_gen refuses with STOPPED and NEVER invokes `execute`.
+    assert!(inner.authorized_stop());
+    let ran_stop = Arc::new(AtomicBool::new(false));
+    let err = inner.start_motion(stamp, CountedOp { kind: MotionStartKind::PolicyLive, executed: ran_stop.clone() }).unwrap_err();
+    assert!(!ran_stop.load(Ordering::SeqCst), "execute must NOT run on stale stop_gen");
+    assert_eq!(ApiError::from(err).code.as_deref(), Some("STOPPED"));
+
+    // Stale lease_gen refuses with LEASE_LOST and NEVER invokes `execute`.
+    let fresh = inner.current_admission_stamp();
+    let ran_lease = Arc::new(AtomicBool::new(false));
+    let err = inner.start_motion(
+        AdmissionStamp { lease_gen: fresh.lease_gen + 1, ..fresh },
+        CountedOp { kind: MotionStartKind::Servo, executed: ran_lease.clone() },
+    ).unwrap_err();
+    assert!(!ran_lease.load(Ordering::SeqCst), "execute must NOT run on stale lease_gen");
+    assert_eq!(ApiError::from(err).code.as_deref(), Some("LEASE_LOST"));
+
+    // Static audit: production supervisor motion-start modules must never re-sample
+    // `current_admission_stamp` or `capture_admission_stamp`, and every motion-start function
+    // must require `AdmissionStamp` or `AdmittedMotion` in its signature.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for rel in [
+        "src/supervisor/motion.rs",
+        "src/supervisor/actions.rs",
+        "src/supervisor/streams.rs",
+        "src/gravity_comp.rs",
+        "src/poses.rs",
+        "src/backlash.rs",
+    ] {
+        let src = std::fs::read_to_string(manifest_dir.join(rel)).unwrap();
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            !prod.contains("current_admission_stamp") && !prod.contains("capture_admission_stamp"),
+            "{rel} must never re-sample an admission stamp in production code"
+        );
+    }
+    let required_signatures = [
+        ("src/supervisor/motion.rs", "pub fn jog("),
+        ("src/supervisor/motion.rs", "pub fn jog_action("),
+        ("src/supervisor/motion.rs", "pub fn jog_action_with_speed_scale("),
+        ("src/supervisor/motion.rs", "pub(crate) fn start_quintic("),
+        ("src/supervisor/motion.rs", "pub fn install_path("),
+        ("src/supervisor/motion.rs", "pub fn install_joint_goal("),
+        ("src/supervisor/actions.rs", "pub fn unload_action("),
+        ("src/supervisor/actions.rs", "pub fn begin_macro("),
+        ("src/supervisor/actions.rs", "pub fn begin_sequence_action("),
+        ("src/supervisor/actions.rs", "pub fn begin_orchestrated_action("),
+        ("src/supervisor/actions.rs", "pub fn install_macro_path("),
+        ("src/supervisor/actions.rs", "pub fn start_macro_gripper("),
+        ("src/supervisor/actions.rs", "pub fn install_macro_quintic("),
+        ("src/supervisor/actions.rs", "pub fn start_gripper("),
+        ("src/supervisor/actions.rs", "pub fn start_gripper_zero_check("),
+        ("src/supervisor/streams.rs", "pub fn servo("),
+        ("src/supervisor/streams.rs", "pub fn begin_policy_run("),
+        ("src/gravity_comp.rs", "pub fn enter_gravity_comp("),
+        ("src/poses.rs", "pub fn move_to_pose("),
+        ("src/poses.rs", "pub fn start_action("),
+        ("src/replay.rs", "pub fn install_replay("),
+        ("src/replay.rs", "pub fn install_macro_replay("),
+        ("src/replay.rs", "pub fn start_replay("),
+    ];
+    for (rel, sig_prefix) in required_signatures {
+        let src = std::fs::read_to_string(manifest_dir.join(rel)).unwrap();
+        let idx = src.find(sig_prefix).unwrap_or_else(|| panic!("missing {sig_prefix} in {rel}"));
+        let sig_slice = &src[idx..src[idx..].find('{').map_or(src.len(), |o| idx + o)];
+        assert!(
+            sig_slice.contains("AdmissionStamp") || sig_slice.contains("AdmittedMotion"),
+            "{rel}::{sig_prefix} lacks AdmissionStamp/AdmittedMotion parameter: {sig_slice}"
+        );
+    }
 }

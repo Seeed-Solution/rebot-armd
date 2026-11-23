@@ -261,7 +261,8 @@ fn a_refused_servo_target_gets_the_legacy_reply_fields() {
     // joint 1 far outside its soft limit
     assert_eq!(r.servo(Some(1), 100.0), None);
     let (refusal, reply) = r.step_reply();
-    let legacy = crate::api::rest::ApiError::from(ArmError::from(twin.fx.core.servo(twin.pose(100.0), twin.epoch()).unwrap_err()));
+    let twin_stamp = twin.fx.core.current_admission_stamp();
+    let legacy = crate::api::rest::ApiError::from(ArmError::from(twin.fx.core.servo(twin_stamp, twin.pose(100.0), twin.epoch()).unwrap_err()));
     let reply = reply.unwrap();
     assert_eq!(refusal, Some(Refusal { code: "SOFT_LIMIT_EXCEEDED", detail: RefusalDetail::Limit { joint: Some(0) } }));
     assert_eq!(
@@ -288,7 +289,8 @@ mod policy {
     use crate::policy_runtime::{PolicyMode, PolicyRunStart};
 
     fn begin(r: &mut Rig, mode: PolicyMode) -> u64 {
-        r.fx.core.begin_policy_run(PolicyRunStart {
+        let stamp = r.fx.core.current_admission_stamp();
+        r.fx.core.begin_policy_run(stamp, PolicyRunStart {
             epoch_id: r.epoch(), connection_id: CONN.into(), lease_generation: r.gen, policy_id: "p".into(),
             artifact_digest: "d".into(), backend: "mlp".into(), mode, sim_only: false, max_first_step_rad: None,
             max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,

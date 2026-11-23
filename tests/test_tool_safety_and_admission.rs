@@ -310,9 +310,9 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     let ep0 = inner.safety.epoch_id();
 
     let close_req = GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: Some(5.0), tag: None };
-    assert!(inner.start_gripper(close_req.clone(), ep0).is_err(), "closing must reject without torque_feedback");
+    assert!({ let s = inner.current_admission_stamp(); inner.start_gripper(s, close_req.clone(), ep0) }.is_err(), "closing must reject without torque_feedback");
     let open_req = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(5.0), tag: None };
-    assert!(inner.start_gripper(open_req, ep0).is_ok(), "opening remains allowed");
+    assert!({ let s = inner.current_admission_stamp(); inner.start_gripper(s, open_req, ep0) }.is_ok(), "opening remains allowed");
 
     // 2. GripperMotion::step stops immediately on !feedback_fresh when max_close_torque_nm is set
     let mut policy = GripperPolicy::rebot_dm();
@@ -357,7 +357,7 @@ fn b3_close_torque_cap_refuses_missing_torque_feedback_and_stops_on_stale_feedba
     let mut tgt = q0.to_vec();
     tgt[6] = -0.2;
     let ep = inner2.safety.epoch_id();
-    inner2.servo(tgt, ep).unwrap();
+    { let s = inner2.current_admission_stamp(); inner2.servo(s, tgt, ep) }.unwrap();
     drv2.state.lock().unwrap().feedback_age = Duration::from_millis(500);
     inner2.tick(0.02);
     assert!(inner2.gripper_force_capped);
@@ -630,7 +630,8 @@ async fn b5_b6_replay_checks_tool_provenance_and_tcp_reach_envelope() {
         assert!(matches!(seq_res, Err(ArmError::WorkspaceRejected { .. })), "got {seq_res:?}");
 
         let run_plan = armd::sequences::prepare_run(&inner, &json!({"id": save_far.0.id}), epoch).unwrap();
-        let (id, _) = armd::sequences::begin(&mut inner, &seq_sup_arc, run_plan).unwrap();
+        let stamp = inner.current_admission_stamp();
+        let (id, _) = armd::sequences::begin(&mut inner, &seq_sup_arc, run_plan, stamp).unwrap();
         (id, epoch)
     };
     let mut seq_done = None;
@@ -660,7 +661,7 @@ fn b7_install_macro_path_and_place_plan_reject_table_intrusion_without_unchecked
     let goal = armd::motion::resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0], p0[1], p0[2] - 0.04], r: None });
     let speed = Speed { linear: 0.03, angular: armd::motion::DEFAULT_ANGULAR_RPS };
     let direct = armd::motion::plan_cartesian(&input, goal, speed).unwrap();
-    let id = inner.begin_macro("grasp", &input, None).unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.begin_macro(s, "grasp", &input, None) }.unwrap();
 
     // Extended corner at [0.032, 0.082, -0.022] dips below tight table bound -> must fail WORKSPACE_VIOLATION, not install direct
     let end_pose = input.arm.fk_f32(direct.last_slice()).unwrap();
@@ -672,7 +673,7 @@ fn b7_install_macro_path_and_place_plan_reject_table_intrusion_without_unchecked
     let plan = inner.approach_plan("grasp_final", backlash::Request::Profile).unwrap();
     let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&rules), speed, false);
     assert!(matches!(pre, Pre::Direct(_)));
-    let err = inner.install_macro_path_same_side_with_rules(id, &input, direct, pre, Some(&plan), Some(&rules)).unwrap_err();
+    let err = { let s = inner.current_admission_stamp(); inner.install_macro_path_same_side_with_rules(s, id, &input, direct, pre, Some(&plan), Some(&rules)) }.unwrap_err();
     assert!(matches!(err, ArmError::Motion(armd::motion::MotionError::WorkspaceViolation { .. })), "{err:?}");
     assert!(inner.active_trajectory.is_none(), "rejected fallback must not install trajectory");
 
@@ -1074,14 +1075,14 @@ fn r2_b07_commissioning_jog_scales_j7_velocity_and_requires_torque_feedback_on_c
     q_close[6] = -0.2;
     let ep = inner.safety.epoch_id();
     assert!(
-        inner.jog_action_with_speed_scale(q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)).is_err(),
+        { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)) }.is_err(),
         "closing J7 jog during commissioning must require torque_feedback when max_close_torque_nm is configured"
     );
 
     let drv_tq = MockFbArm::new(q_open, true);
     inner.driver = Some(Mutex::new(Box::new(drv_tq)));
     let max_j7_vel = cfg.limits[6].max_velocity * 0.2;
-    let (_ep, _id, dur) = inner.jog_action_with_speed_scale(q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)).unwrap();
+    let (_ep, _id, dur) = { let s = inner.current_admission_stamp(); inner.jog_action_with_speed_scale(s, q_close.to_vec(), None, Some(ep), "joint_move", Some(0.2)) }.unwrap();
     let dq7 = (q_close[6] - q_open[6]).abs() as f64;
     // Quintic peak velocity = 1.875 * |dq| / T <= max_j7_vel
     let peak_v7 = 1.875 * dq7 / dur;
@@ -1221,7 +1222,7 @@ fn r2_b11_read_joint_states_error_clears_freshness_and_freezes_streaming_close()
     let mut tgt = q0.to_vec();
     tgt[6] = -0.2;
     let ep = inner.safety.epoch_id();
-    inner.servo(tgt, ep).unwrap();
+    { let s = inner.current_admission_stamp(); inner.servo(s, tgt, ep) }.unwrap();
     // Single bus read failure must clear last_can_feedback_instant immediately and trip force-cap hold
     drv.state.lock().unwrap().fail_read = true;
     inner.tick(0.02);
@@ -1537,15 +1538,14 @@ fn r4_m1_commissioning_caps_joint_path_same_side_final_approach_velocity() {
         .map(|l| l.max_velocity * 0.2)
         .collect();
 
-    let (_id, _dur) = inner
-        .install_joint_goal(
+    let (_id, _dur) = { let s = inner.current_admission_stamp(); inner.install_joint_goal(s,
             &input,
             &q_goal,
             0.2,
             "move_to",
             None,
             Some(backlash::Request::Profile),
-        )
+        ) }
         .unwrap();
 
     let active = inner.active_trajectory.as_ref().expect("active trajectory");
@@ -2199,8 +2199,8 @@ fn r7_m5_calib_hover_backlash_quintic_segment_respects_commissioning_caps() {
     let direct = armd::motion::plan_cartesian_opts(&input, goal, speed, opts).unwrap();
     let plan = inner.approach_plan("move_to_precise", backlash::Request::Profile).unwrap();
     let pre = backlash::plan_cartesian_pre(&input, &direct, &plan, Some(&DescentRules::tcp()), speed, opts);
-    let id = inner.begin_orchestrated_action("calib_hover", None, inner.safety.epoch_id()).unwrap();
-    let _dur = inner.install_macro_path_same_side_with_rules(id, &input, direct, pre, Some(&plan), Some(&DescentRules::tcp())).unwrap();
+    let id = { let s = inner.current_admission_stamp(); inner.begin_orchestrated_action(s, "calib_hover", None, inner.safety.epoch_id()) }.unwrap();
+    let _dur = { let s = inner.current_admission_stamp(); inner.install_macro_path_same_side_with_rules(s, id, &input, direct, pre, Some(&plan), Some(&DescentRules::tcp())) }.unwrap();
 
     let active = inner.active_trajectory.as_ref().expect("active trajectory");
     let seg = active.then.as_ref().expect("backlash quintic segment");

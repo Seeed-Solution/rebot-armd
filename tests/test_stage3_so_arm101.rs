@@ -917,6 +917,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
     let ctx = armd::macro_action::MacroCtx {
         sup: supervisor.clone(),
         id: 1,
+        stamp: supervisor.capture_admission_stamp(),
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         phase_timeout_s: setup.phase_timeout_s,
         timeout_code: "GRASP_TIMEOUT",
@@ -1434,7 +1435,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
 
     // Reverse servo command (opening jaw towards open_rad=1.5)
     let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
-    let servo_res = supervisor.servo(rev_targets, 1).await;
+    let servo_res = supervisor.servo(supervisor.capture_admission_stamp(), rev_targets, 1).await;
     assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
     assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
 
@@ -1450,7 +1451,7 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
 
     // Squeeze command towards closed_rad=0.0
     let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.2];
-    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    let sq_res = supervisor.servo(supervisor.capture_admission_stamp(), squeeze_targets, 1).await;
     assert!(sq_res.is_ok(), "Squeeze command accepted");
 
     // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!
