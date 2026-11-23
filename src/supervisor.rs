@@ -21,6 +21,7 @@ use crate::motion::{
 
 // supervisor leaf modules (armd 1.6 RT-core foundation)
 mod driver_transitions;
+mod config;
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -772,23 +773,6 @@ impl SupervisorInner {
         }
     }
 
-    /// Reject ordinary motion/action dispatch while a newly installed non-stock tool awaits commissioning.
-    pub fn check_commissioning_for_ordinary_motion(&self, op: &str) -> Result<(), ArmError> {
-        if self.config.active_tool.commissioning_required {
-            return Err(SafetyError::CommissioningRequired(op.to_string()).into());
-        }
-        Ok(())
-    }
-
-    pub fn tool_commissioning_response(&self) -> serde_json::Value {
-        serde_json::json!({
-            "active_tool": self.config.active_tool,
-            "commissioning_required": self.config.active_tool.commissioning_required,
-            "confirmed_at": self.tool_commissioning_confirmed_at,
-            "revision": self.tool_commissioning_revision,
-        })
-    }
-
     /// Observation schema: profile capabilities plus the parts that depend on the driver.
     pub fn schema(&self) -> ObservationSchema {
         let mut schema = ObservationSchema::from_config(&self.config);
@@ -814,140 +798,6 @@ impl SupervisorInner {
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
         schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
         schema
-    }
-
-    /// `capabilities.calibration_tools`: the profile's camera / kinematics / gripper support
-    /// and the driver's motor zero support.
-    pub fn calibration_tools(&self) -> crate::model::CalibrationTools {
-        self.calibration_tools_with(&crate::model::Capabilities::from_config(&self.config))
-    }
-
-    fn calibration_tools_with(&self, caps: &crate::model::Capabilities) -> crate::model::CalibrationTools {
-        use crate::model::{CalibrationToolInfo, GripperCalibrationTool, MotorZeroTool};
-        let no_grasp = "this profile has no grasp setup (the camera calibration needs one)";
-        let kin_reason = if self.config.arm_model.chain().is_some() {
-            "this profile uses a URDF chain; the kinematic correction applies to the built-in model only"
-        } else { no_grasp };
-        let mut support = self.motor_zero_support();
-        let (motor, software) = (support.supported, self.config.zero_reference.is_some());
-        let methods: Vec<String> = [(software, "software"), (motor, "motor")].into_iter().filter(|(ok, _)| *ok).map(|(_, m)| m.to_string()).collect();
-        if software && !motor {
-            support = crate::model::MotorZeroSupport { supported: true, notes: support.reason.take().map(|r| vec![format!("motor zero: {r}")]).unwrap_or_default(), ..Default::default() };
-        }
-        let any = motor || software;
-        let motor_zero = MotorZeroTool {
-            joints: if any { (1..=self.config.dof).collect() } else { Vec::new() },
-            requires: if any { ["lease", "torque_off", "no_action", "no_fault"].map(String::from).to_vec() } else { Vec::new() },
-            max_offset_deg: crate::model::MOTOR_ZERO_MAX_OFFSET_DEG,
-            verify_mrad: crate::model::MOTOR_ZERO_VERIFY_MRAD,
-            invalidates: if any { ["kinematics", "camera", "poses", "gripper_calibration"].map(String::from).to_vec() } else { Vec::new() },
-            zero_pose: self.config.zero_pose.clone(),
-            motor, software, methods,
-            support,
-        };
-        let policy = self.config.gripper_policy.as_ref().filter(|_| self.config.gripper_index().is_some());
-        let gripper = GripperCalibrationTool {
-            supported: policy.is_some(),
-            zero_check: policy.is_some_and(|p| p.zero_check_supported),
-            calibration: policy.is_some(),
-            reason: policy.is_none().then(|| "this profile has no gripper joint with a gripper policy".to_string()),
-        };
-        crate::model::CalibrationTools {
-            camera: CalibrationToolInfo::new(caps.calibration_apply, Vec::new(), no_grasp),
-            kinematics: CalibrationToolInfo::new(caps.calibration_kinematics, vec![2, 3, 4, 5], kin_reason),
-            motor_zero,
-            gripper,
-        }
-    }
-
-    /// The driver's motor zero support; the mock follower (no driver) zeroes its readings.
-    pub fn motor_zero_support(&self) -> crate::model::MotorZeroSupport {
-        match self.driver.as_ref() {
-            Some(d) => d.lock().map_or_else(|_| crate::model::MotorZeroSupport::unsupported("driver unavailable"), |drv| drv.motor_zero_support()),
-            None => crate::model::MotorZeroSupport::set_current("process", true,
-                vec!["mock follower: the readings of the zeroed joints become 0 (the simulated arm has no encoder offset)".into()]),
-        }
-    }
-
-    /// Install joint zero offsets (motor - joint, rad, one per joint) at the driver boundary.
-    /// The current readings, commanded and target positions move by old - new, so nothing jumps;
-    /// the mock follower (no driver) moves its simulated readings the same way. Needs torque
-    /// off; the caller checks the rest.
-    pub fn set_joint_zero_offsets(&mut self, offsets: &[f32]) -> Result<(), String> {
-        if self.is_torqued || self.disable_pending { return Err("torque is on".into()); }
-        if offsets.len() != self.config.dof || !offsets.iter().all(|o| o.is_finite()) {
-            return Err(format!("joint zero needs {} finite offsets", self.config.dof));
-        }
-        let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
-        self.tracking.invalidate();
-        if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
-        if let Some(d) = self.driver.as_ref() {
-            let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
-            drv.set_joint_zero_offsets(offsets);
-            let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
-            drop(drv);
-            if pos.iter().any(Option::is_some) { self.reapply_driver_limits(); }
-        }
-        for (i, (o, n)) in old.iter().zip(offsets).enumerate() {
-            let d = o - n;
-            if d == 0.0 { continue; }
-            for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
-                if let Some(p) = v.get_mut(i) { *p += d; }
-            }
-        }
-        if old.len() > 5 && offsets.len() > 5 && old[5] != offsets[5] {
-            self.zero_convention = Default::default();
-        }
-        self.zero_check_pending = true;
-        Ok(())
-    }
-
-    /// The reference pose in joint angles (`home_positions` derived from `zero_reference`).
-    pub fn zero_reference_joints(&self) -> Option<Vec<f32>> {
-        self.config.zero_reference.as_ref().map(|_| self.config.home_positions.clone())
-    }
-
-    /// The zero check (`zero_convention`) at startup and each time torque goes off: with torque
-    /// off and fresh feedback, an arm in the rest pose with J6 about +-90 deg from the reference is
-    /// reported as `legacy_j6`. Never moves the arm. A `legacy_j6` verdict stays until a zero of J6.
-    fn step_zero_convention(&mut self) {
-        if self.zero_check_prev_torqued && !self.is_torqued { self.zero_check_pending = true; }
-        self.zero_check_prev_torqued = self.is_torqued;
-        if !self.zero_check_pending || self.is_torqued || self.calibration_busy { return; }
-        let Some(rest) = self.zero_reference_joints() else { self.zero_check_pending = false; return; };
-        if let Some(d) = self.driver.as_ref() {
-            if !d.lock().is_ok_and(|drv| drv.is_feedback_valid()) { return; }
-        }
-        let tol = self.resting_policy().map(|p| p.position_tolerances).unwrap_or_else(|| vec![0.08; 6]);
-        self.zero_check_pending = false;
-        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &rest, &tol) else { return; };
-        if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
-        if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
-            tracing::warn!("Joint zero check: {}", v.message.as_deref().unwrap_or(""));
-        }
-        self.zero_convention = v;
-    }
-
-    /// Make the current position of `joint` (0-based) its zero: the driver's
-    /// [`ArmDriver::set_zero_position`], or for the mock follower the joint's reading (and
-    /// commanded / target value) becomes 0. Needs torque off; the caller checks the rest.
-    pub fn set_motor_zero(&mut self, joint: usize) -> Result<(), String> {
-        if self.is_torqued || self.disable_pending { return Err("torque is on".into()); }
-        if joint >= self.config.dof { return Err(format!("joint {} does not exist", joint + 1)); }
-        // a new J6 zero ends a legacy_j6 verdict; the next check decides again
-        if joint == 5 { self.zero_convention = Default::default(); }
-        self.zero_check_pending = true;
-        match self.driver.as_ref() {
-            Some(d) => d.lock().map_err(|_| "driver unavailable".to_string())?.set_zero_position(joint).map_err(|e| e.to_string()),
-            None => {
-                // the simulated motor reads 0: the joint reads 0 - its joint zero offset
-                let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);
-                for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
-                    if let Some(p) = v.get_mut(joint) { *p = r; }
-                }
-                Ok(())
-            }
-        }
     }
 
     /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick.
@@ -3242,97 +3092,6 @@ impl SupervisorInner {
 
     // ---- grasp ----
 
-    /// Runtime grasp setup (`config.grasp`, with the camera tilt taken from `camera_mount`).
-    /// None when the profile cannot grasp (no kinematics, gripper policy or grasp section).
-    pub fn grasp_setup(&self) -> Option<crate::grasp::GraspSetup> {
-        if !self.config.has_cartesian_with_gripper() || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
-        let mut s = self.config.grasp.clone()?;
-        s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
-        Some(s)
-    }
-
-    /// The camera mount is calibrated (`calibration.json` with `q_end_cam` in effect).
-    pub fn camera_calibrated(&self) -> bool {
-        self.calibration.as_ref().is_some_and(|c| c.camera_mount.q_end_cam.is_some())
-    }
-
-    /// Install the calibration in effect (load / apply / revert / restore / zero invalidation)
-    /// and recompute the effective floor.
-    pub fn set_calibration(&mut self, c: Option<crate::calibration::CalibrationFile>) {
-        self.calibration = c;
-        self.refresh_effective_floor();
-    }
-
-    /// Recompute `config.workspace.floor_z_m` = max(profile floor, valid calibrated table
-    /// height - 3 mm) (src/calibration.rs `effective_floor`). Every floor check (end points,
-    /// link capsules, swept paths, servo steps) reads that field. A change bumps the workspace
-    /// revision (plans made with the old floor fail PLAN_STALE).
-    pub fn refresh_effective_floor(&mut self) {
-        let Some(profile) = self.profile_floor_z_m else { return; };
-        let (_, fp) = crate::calibration::live_fingerprints(self);
-        let legacy_fp = crate::calibration::legacy_file_fingerprint(
-            self.calibration.as_ref(),
-            &self.config.camera_mount,
-            &self.joint_zero_offsets,
-        );
-        let (floor, source, _) = crate::calibration::effective_floor_for_with_legacy(
-            profile,
-            self.calibration.as_ref(),
-            &fp,
-            Some(&legacy_fp),
-            &self.config.active_tool,
-        );
-        self.floor_source = source;
-        let Some(ws) = self.config.workspace.as_mut() else { return; };
-        if ws.floor_z_m != floor {
-            tracing::info!("Effective floor {:.4} m (was {:.4} m, profile {profile:.4} m, source {source})", floor, ws.floor_z_m);
-            ws.floor_z_m = floor;
-            self.workspace_revision += 1;
-            self.servo_ws_min_depths = None;
-        }
-    }
-
-    /// Install a camera mount (calibration apply / restore / startup): bumps the workspace
-    /// revision when it changes and keeps the grasp setup's tilt in sync with the mount's.
-    pub fn set_camera_mount(&mut self, mount: crate::model::CameraMount) {
-        if self.config.camera_mount != mount {
-            self.workspace_revision += 1;
-            self.servo_ws_min_depths = None;
-        }
-        self.config.camera_mount = mount;
-        let tilt = f64::from(self.config.camera_mount.tilt_deg);
-        if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
-        self.refresh_effective_floor();
-    }
-
-    /// Install the kinematic correction of the built-in model (calibration apply / restore /
-    /// startup; None = uncorrected): the live swap of `config.arm_model`, which every FK / IK /
-    /// workspace / keep-out / grasp path reads under this lock. Bumps the workspace revision when
-    /// it changes (plans made with the old model fail PLAN_STALE) and recomputes the stored
-    /// poses' TCPs. Err (nothing changed): a URDF chain profile or values outside the bounds.
-    pub fn set_kinematics_correction(&mut self, corr: Option<&crate::kinematics::Correction>) -> Result<(), String> {
-        let model = self.config.arm_model.with_correction(corr)?;
-        if model.correction() == self.config.arm_model.correction() { return Ok(()); }
-        self.config.arm_model = model;
-        // the servo escape baseline was measured with the old model
-        self.workspace_revision += 1;
-        self.servo_ws_min_depths = None;
-        self.calibration_revision += 1;
-        self.refresh_pose_tcps();
-        self.refresh_effective_floor();
-        Ok(())
-    }
-
-    /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
-    pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
-        if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 {
-            self.workspace_revision += 1;
-            self.servo_ws_min_depths = None;
-        }
-        self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
-        self.config.grasp = Some(setup);
-    }
-
     // ---- macro actions (crate::macro_action) ----
 
     /// Begin a macro action (`grasp`, `place`) after its first motion was planned from
@@ -3711,90 +3470,6 @@ impl SupervisorInner {
         Ok((id, duration))
     }
 
-    /// Apply gripper calibration: offset shifts closed_rad, open_rad and jaw points.
-    pub fn apply_gripper_calibration(
-        &mut self,
-        offset_rad: Option<f32>,
-        jaw_opening: Option<crate::model::JawOpening>,
-    ) -> Result<(), String> {
-        if self.base_gripper_policy.is_none() {
-            self.base_gripper_policy = self.config.gripper_policy.clone();
-        }
-        let Some(base) = self.base_gripper_policy.clone() else {
-            return Err("No base gripper policy available".into());
-        };
-        let mut policy = base.clone();
-        let offset = offset_rad.unwrap_or(0.0);
-        if !offset.is_finite() {
-            return Err("offset_rad must be finite".into());
-        }
-        let closed_rad = base.closed_rad + offset;
-        let mut open_rad = base.open_rad + offset;
-        if !closed_rad.is_finite() || !open_rad.is_finite() {
-            return Err("Computed closed_rad or open_rad is not finite".into());
-        }
-        let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
-        // The measured stop must lie inside the limits; the open end may be shifted past one
-        // (the base open_rad sits close to it), so it is held at the limit.
-        if let Some(lim) = lim {
-            if closed_rad < lim.min_position || closed_rad > lim.max_position {
-                return Err(format!(
-                    "Calibrated closed_rad {closed_rad:.4} exceeds joint limits [{}, {}]",
-                    lim.min_position, lim.max_position
-                ));
-            }
-            open_rad = open_rad.clamp(lim.min_position, lim.max_position);
-        }
-        if (closed_rad - open_rad).abs() < 0.1 {
-            return Err(format!(
-                "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
-            ));
-        }
-        policy.closed_rad = closed_rad;
-        policy.open_rad = open_rad;
-
-        let candidate_jo = jaw_opening.clone()
-            .or_else(|| self.gripper_calib_jaw_opening.clone())
-            .or_else(|| base.jaw_opening.clone());
-        // The table is checked against the limits before the offset shift: the shift can move
-        // its open end past a limit, like open_rad, and those points are never reached.
-        let mut jo = match candidate_jo {
-            Some(jo) => jo,
-            None if self.config.active_tool.is_stock => crate::model::JawOpening::sim_default(),
-            None => return Err("Non-stock tool requires an explicit jaw_opening calibration curve".into()),
-        };
-        jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
-        for pt in &mut jo.points {
-            pt[0] += offset;
-        }
-        jo.validate(None).map_err(|e| format!("Invalid jaw_opening calibration: {e}"))?;
-        policy.jaw_opening = Some(jo);
-        #[cfg(not(target_arch = "wasm32"))]
-        let max_w = self.config.grasp.as_ref().map(|g| g.max_grasp_width_m);
-        #[cfg(target_arch = "wasm32")]
-        let max_w: Option<f64> = None;
-        // the jaw curve is not checked against max_grasp_width_m: a narrower curve keeps the
-        // calibration and clamps the grasp width (`grasp_width_check`)
-        crate::model::validate_effective_gripper_policy_ex(&policy, lim, None, false)?;
-        if let Some(max_w) = max_w {
-            if let crate::model::GraspWidthCheck::Clamped { curve_max_m } =
-                crate::model::check_grasp_width(&policy, max_w, false)
-            {
-                tracing::warn!(
-                    "Gripper jaw curve opens {curve_max_m:.4} m, less than max_grasp_width_m {max_w:.4} m; grasps use {curve_max_m:.4} m"
-                );
-            }
-        }
-
-        self.config.gripper_policy = Some(policy);
-        self.gripper_calib_offset = offset_rad;
-        if jaw_opening.is_some() {
-            self.gripper_calib_jaw_opening = jaw_opening;
-        }
-        self.gripper_calib_invalid = false;
-        Ok(())
-    }
-
     pub fn gripper_zero_observation(&self) -> Option<crate::model::GripperZeroObservation> {
         let mut out = None;
         self.gripper_zero_observation_into(&mut out);
@@ -3825,89 +3500,6 @@ impl SupervisorInner {
                 o.offset_rad = offset_rad;
             }
             None => *out = Some(crate::model::GripperZeroObservation { state: state.to_string(), j7, offset_rad }),
-        }
-    }
-
-    /// Validate a candidate gripper calibration (including hardware driver limits) without
-    /// leaving `self` mutated. Returns the resulting effective GripperPolicy on success.
-    /// Build and validate a complete gripper calibration candidate (including driver limit
-    /// re-application) without leaving `SupervisorInner` mutated.
-    pub fn build_gripper_calibration_candidate(
-        &mut self,
-        offset_rad: Option<f32>,
-        jaw_opening: Option<crate::model::JawOpening>,
-    ) -> Result<(GripperCalibrationCandidate, crate::model::GripperPolicy), String> {
-        let prev_config = self.config.clone();
-        let prev_base = self.base_gripper_policy.clone();
-        let prev_offset = self.gripper_calib_offset;
-        let prev_jaw = self.gripper_calib_jaw_opening.clone();
-        let prev_invalid = self.gripper_calib_invalid;
-        let prev_err = self.driver_config_error.clone();
-
-        let res = (|| {
-            self.apply_gripper_calibration(offset_rad, jaw_opening)?;
-            if self.driver.is_some() || self.driver_config_error.is_some() {
-                let ok = self.reapply_driver_limits();
-                if !ok || self.gripper_calib_invalid || self.driver_config_error.is_some() {
-                    return Err(self.driver_config_error.clone().unwrap_or_else(|| {
-                        "Gripper calibration rejected by driver hardware limits".to_string()
-                    }));
-                }
-            }
-            let policy = self.config.gripper_policy.clone().ok_or_else(|| {
-                "Gripper calibration requires a gripper policy".to_string()
-            })?;
-            let cand = GripperCalibrationCandidate {
-                config: self.config.clone(),
-                base_gripper_policy: self.base_gripper_policy.clone(),
-                gripper_calib_offset: self.gripper_calib_offset,
-                gripper_calib_jaw_opening: self.gripper_calib_jaw_opening.clone(),
-                gripper_calib_invalid: self.gripper_calib_invalid,
-                driver_config_error: self.driver_config_error.clone(),
-            };
-            Ok((cand, policy))
-        })();
-
-        self.config = prev_config;
-        self.base_gripper_policy = prev_base;
-        self.gripper_calib_offset = prev_offset;
-        self.gripper_calib_jaw_opening = prev_jaw;
-        self.gripper_calib_invalid = prev_invalid;
-        self.driver_config_error = prev_err;
-
-        res
-    }
-
-    /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
-    pub fn commit_gripper_calibration_candidate(&mut self, cand: GripperCalibrationCandidate) {
-        self.config = cand.config;
-        self.base_gripper_policy = cand.base_gripper_policy;
-        self.gripper_calib_offset = cand.gripper_calib_offset;
-        self.gripper_calib_jaw_opening = cand.gripper_calib_jaw_opening;
-        self.gripper_calib_invalid = cand.gripper_calib_invalid;
-        self.driver_config_error = cand.driver_config_error;
-    }
-
-    pub fn validate_gripper_calibration_with_driver(
-        &mut self,
-        offset_rad: Option<f32>,
-        jaw_opening: Option<crate::model::JawOpening>,
-    ) -> Result<crate::model::GripperPolicy, String> {
-        self.build_gripper_calibration_candidate(offset_rad, jaw_opening).map(|(_, p)| p)
-    }
-
-    pub fn gripper_calibration_response(&self) -> crate::gripper_calib::GripperCalibrationResponse {
-        let policy = self.config.gripper_policy.clone();
-        let calibrated = policy.as_ref().is_some_and(|p| p.is_calibrated());
-        let jaw_opening = policy.as_ref().and_then(|p| p.jaw_opening.clone());
-        crate::gripper_calib::GripperCalibrationResponse {
-            offset_rad: self.gripper_calib_offset,
-            jaw_opening,
-            calibrated,
-            policy,
-            ts: None,
-            stale: self.gripper_calib_stale.clone(),
-            revision: self.gripper_calib_revision,
         }
     }
 
@@ -6085,18 +5677,6 @@ impl SupervisorInner {
             (self.driver.is_some(), self.follower.as_deref()),
             (false, None) | (false, Some("mock")) | (_, Some("sim"))
         )
-    }
-
-    /// Deterministic SHA-256 digest of the active camera calibration state, or
-    /// `EMPTY_CALIBRATION_DIGEST` when uncalibrated.
-    pub fn active_calibration_digest(&self) -> String {
-        match &self.calibration {
-            None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
-            Some(cal) => {
-                let bytes = serde_json::to_vec(cal).unwrap_or_default();
-                crate::gravity::compute_sha256(&bytes)
-            }
-        }
     }
 
     pub fn policy_run_active(&self) -> bool {
