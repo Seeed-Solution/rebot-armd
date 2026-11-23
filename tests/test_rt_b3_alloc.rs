@@ -50,7 +50,7 @@ impl Write for GatedSink {
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
-struct GlobalLog { writer: NonBlocking, buf: Arc<Mutex<Vec<u8>>>, guard: Mutex<()> }
+struct GlobalLog { writer: NonBlocking, buf: Arc<Mutex<Vec<u8>>>, guard: tokio::sync::Mutex<()> }
 
 fn global_log() -> &'static GlobalLog {
     static LOG: OnceLock<GlobalLog> = OnceLock::new();
@@ -62,7 +62,7 @@ fn global_log() -> &'static GlobalLog {
             .with(tracing_subscriber::EnvFilter::new("armd=info"))
             .with(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(writer.clone()))
             .try_init();
-        GlobalLog { writer, buf, guard: Mutex::new(()) }
+        GlobalLog { writer, buf, guard: tokio::sync::Mutex::new(()) }
     })
 }
 
@@ -194,7 +194,7 @@ fn logwriter_zero_alloc_inline_and_zero_copy_on_reject() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and_same_text() {
     let log = global_log();
-    let _serial = log.guard.lock().unwrap();
+    let _serial = log.guard.lock().await;
     let _ = take_global_logs(log);
 
     for st in [
@@ -293,7 +293,7 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_text() {
-    let _serial = global_log().guard.lock().unwrap();
+    let _serial = global_log().guard.lock().await;
     assert_eq!(ClearFaultDriverError::EstopInhibited.to_string(), armd::driver::ESTOP_INHIBITED);
 
     // 1. Real DamiaoArmDriver<FakeBus>: missing feedback, expired budget, and reset sent.
