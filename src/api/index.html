@@ -446,6 +446,7 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
+.cwiz-fail ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .cwiz-grip { display: grid; gap: 8px; justify-items: start; }
 .cwiz-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -3161,7 +3162,14 @@ Object.assign(I18N.zh, {
   'cw.f.kept': '已保留 {n} 个视图，点「继续」接着采集', 'cw.f.moving': '关节空间移动到位姿 {i}（预位姿 → 目标）…', 'cw.f.unsettled': '未静止',
   'cw.f.solving': '正在求解：{s} s，阶段 {stage}', 'cw.f.solving.hint': '求解在浏览器的后台线程（Web Worker）中运行，期间页面可以继续使用。',
   'cw.f.solve.hint': '在位置 A 拟合、预测位置 B（以及反过来）得到留出误差；应用的是 A + B 一起拟合的结果。每项检查都通过后才能应用。',
-  'cw.f.fail': '有检查未通过，不能应用。留出误差偏大：检查标定板是否平整、采集中是否被碰动；参数超出范围：先用官方工具重新校准电机零位。',
+  'cw.f.fail': '有检查未通过，没有应用：机械臂上现有的标定保持不变，没有任何改动。', 'cw.f.sep': '、', 'cw.f.colon': '：',
+  'cw.f.h.img': '图像噪声偏大。标定板要平整、无反光，画面清晰不模糊；检查是否有误识别的标记 ID。',
+  'cw.f.h.views': '有效视图不够。多采集一些位姿，让标定板出现在画面各处。',
+  'cw.f.h.heldout': '一个位置的结果预测另一个位置的误差偏大。两次摆放要覆盖重叠的关节范围（位置 B 约向前 0.40 m、向侧面 0.20 m），避免需要 J5 超过 60° 的姿态；两次摆放之间和采集中标定板不能被碰动。',
+  'cw.f.h.bounds': '参数超出范围。先用官方工具重新校准电机零位，再重新标定。',
+  'cw.f.h.he': '手眼结果不稳定。采集时让相机姿态变化更大（多转动腕部）。',
+  'cw.f.h.plane': '桌面拟合不一致。标定板要平放在桌面上，采集中不能被碰动。',
+  'cw.f.h.other': '按上表的数值检查后重新采集。',
   'cw.f.acc': '预计定位精度约 {mm} mm（超过 {lim} mm）：可以应用，但视觉抓取可能偏差这么多。常见原因：减速器间隙、支架松动、零点没在收起姿态设置。', 'cw.f.zero': '关节 J{j} 的零位看起来偏了 {d}°：建议用官方工具（reBotArm_control_py example/2_zero_and_read.py / MotorBridge）重新校准该电机零位，再重新运行标定。检查都通过时仍可应用。',
   'cw.f.ho.title': '留出检验', 'cw.f.ho.dir': '方向', 'cw.f.ho.before': '未修正', 'cw.f.ho.after': '修正后', 'cw.f.ho.imp': '降低',
   'cw.f.lv.title': '修正模型级别（留出误差）', 'cw.f.lv.level': '级别', 'cw.f.lv.mean': '平均', 'cw.f.lv.pick': '选择',
@@ -3224,7 +3232,14 @@ Object.assign(I18N.en, {
   'cw.f.kept': '{n} views kept; tap Continue to resume', 'cw.f.moving': 'Joint-space move to pose {i} (pre-pose, then target)…', 'cw.f.unsettled': 'not settled',
   'cw.f.solving': 'Solving: {s} s, stage {stage}', 'cw.f.solving.hint': 'The solve runs in a background thread of the browser (Web Worker); the page stays usable.',
   'cw.f.solve.hint': 'Held-out errors: fitted on placement A, predicting B (and the other way). The fit on A + B together is what gets applied. Every check must pass before Apply.',
-  'cw.f.fail': 'Some checks failed; Apply is not possible. High held-out error: check that the board is flat and was not bumped during capture. Parameter out of range: re-zero the motors with the official tool first.',
+  'cw.f.fail': 'Some checks failed; nothing was applied: the calibration on the arm stays as it was.', 'cw.f.sep': ', ', 'cw.f.colon': ': ',
+  'cw.f.h.img': 'image noise too high. Keep the board flat, without glare, and the image sharp; check for falsely detected marker IDs.',
+  'cw.f.h.views': 'not enough usable views. Capture more poses, with the board in every part of the image.',
+  'cw.f.h.heldout': 'one placement predicts the other badly. The two placements must cover overlapping joint ranges (placement B about 0.40 m forward and 0.20 m sideways); avoid poses that need J5 above 60°; the board must not be bumped between or during the placements.',
+  'cw.f.h.bounds': 'parameters out of range. Re-zero the motors with the official tool first, then calibrate again.',
+  'cw.f.h.he': 'hand-eye result unstable. Vary the camera orientation more while capturing (turn the wrist).',
+  'cw.f.h.plane': 'table fit inconsistent. Lay the board flat on the table; it must not be bumped during capture.',
+  'cw.f.h.other': 'check the values in the table above, then capture again.',
   'cw.f.acc': 'Expected positioning accuracy about {mm} mm (more than {lim} mm): the calibration can be applied, but camera-guided grasps may be off by this much. Usual causes: gear backlash, a loose mount, or a joint zero set off the rest pose.', 'cw.f.zero': 'Joint J{j} zero looks off by {d}°: re-zero the motor with the official tool (reBotArm_control_py example/2_zero_and_read.py / MotorBridge) and run the calibration again. Apply stays possible when the checks pass.',
   'cw.f.ho.title': 'Held-out check', 'cw.f.ho.dir': 'Direction', 'cw.f.ho.before': 'Uncorrected', 'cw.f.ho.after': 'Corrected', 'cw.f.ho.imp': 'Reduction',
   'cw.f.lv.title': 'Correction model level (held-out error)', 'cw.f.lv.level': 'Level', 'cw.f.lv.mean': 'Mean', 'cw.f.lv.pick': 'Choice',
@@ -7258,6 +7273,25 @@ function cwV3Sync() {
 function cwEl(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 function cwBtn(label, fn, { cls = '', disabled = false, id = '', op = '', opMode = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; if (op) { b.dataset.op = op; if (opMode) b.dataset.opMode = opMode; } b.addEventListener('click', fn); return b; }
 const cwFmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '--');
+/* Failed checks of a solve: what stays as it was, then one line per cause with the failed checks and what to change. */
+const CW_GATE_HINT = { rms: 'img', view_rms: 'img', sigma: 'img', views: 'views', markers: 'views', coverage: 'views', kin_views: 'views',
+  kin_heldout_ab: 'heldout', kin_heldout_ba: 'heldout', kin_improve: 'heldout', held_out: 'heldout', kin_bounds: 'bounds',
+  he_pos: 'he', he_rot: 'he', rot_diversity: 'he', plane_spread: 'plane', plane_tilt: 'plane' };
+function cwFailBox(gates) {
+  const box = cwEl('div', 'cwiz-msg cwiz-fail');
+  box.appendChild(cwEl('b', '', t('cw.f.fail')));
+  const by = new Map();
+  for (const g of gates || []) {
+    if (g.ok || g.blocking === false) continue;
+    const h = CW_GATE_HINT[g.key] || 'other';
+    if (!by.has(h)) by.set(h, []);
+    by.get(h).push(t('cw.g.' + g.key));
+  }
+  const ul = cwEl('ul', '');
+  for (const [h, names] of by) ul.appendChild(cwEl('li', '', names.join(t('cw.f.sep')) + t('cw.f.colon') + t('cw.f.h.' + h)));
+  box.appendChild(ul);
+  return box;
+}
 function cwGateRow(g) {
   const tr = document.createElement('tr');
   const unit = { px: ' px', m: ' mm', mm: ' mm', deg: '°', rel: ' %', frac: ' %', cells: '', count: '' }[g.unit] ?? '';
@@ -7414,8 +7448,12 @@ function cwRenderFineSolve(body, p, acts) {
     tb.classList.add('cwiz-par');
     body.appendChild(tb);
   }
-  for (const wn of kin.warnings || []) body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
-  if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.fail')));
+  // the accuracy note says the result can be applied: only for a result that passed every check
+  for (const wn of kin.warnings || []) {
+    if (wn.key === 'accuracy' && !r.ok) continue;
+    body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
+  }
+  if (!r.ok) body.appendChild(cwFailBox(r.gates));
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwVerifyOn() ? cwBtn(t('cw.f.toTip'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-totip' })
       : cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
