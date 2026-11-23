@@ -173,15 +173,20 @@ pub struct Descriptor {
     pub kind: CommandKind,
 }
 
-/// How an action ended physically.
+/// How an action ended physically. Codes are the action's own `code` (`ActionStatus::code`),
+/// never a generic placeholder when the action named one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Completed,
-    /// Ended with a failure code (the action's `code`).
+    /// Ended with a failure code (the action's `code`; `FAILED` only when it named none or
+    /// one outside [`super::ops::TERMINAL_CODES`]).
     Failed(&'static str),
-    /// Replaced by a later commit before it completed.
+    /// Replaced by a later commit before it completed (`SUPERSEDED`).
     Superseded,
+    /// Ended by an authorized stop (`STOPPED`, or cancelled without a code).
     Stopped,
+    /// Cancelled for another cause (`LEASE_LOST`, `ESTOP`, `COLLISION_HOLD`, ...).
+    Cancelled(&'static str),
 }
 
 /// RT -> broker.

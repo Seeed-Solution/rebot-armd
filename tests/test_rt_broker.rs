@@ -35,7 +35,7 @@ fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Pr
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] += d0;
-    Primitive::joint_quintic(&start, &q, duration_s)
+    Primitive::joint_quintic(&start, &q, duration_s).unwrap()
 }
 
 fn submit_install(b: &mut Broker<Primitive>, seq: u64, a: Authority, deadline: Instant, p: Primitive) -> Result<RequestId, AdmitError> {
@@ -198,7 +198,7 @@ fn targets_are_rechecked_at_consumption() {
 fn a_stub_core_never_acknowledges_success() {
     let (mut fx, mut b, mut tw, _stop) = ReleaseFixture::new(StubCore::default(), BOOT, Capacities { commands: 4, plans: 2, replies: 8 });
     let a = Authority::default();
-    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0))).unwrap();
+    let r1 = b.submit(ClientId(1), 1, a, later(), Submit::Install(&|p: &mut Primitive| *p = Primitive::joint_quintic(&[0.0; 7], &[0.1; 7], 1.0).unwrap())).unwrap();
     let r2 = b.submit(ClientId(1), 2, a, later(), Submit::Immediate(ImmediateOp::TorqueOn)).unwrap();
     tw.submit(TargetFrame { stream: StreamId(9), seq: 1, authority: a, policy_generation: 0, input_at: Instant::now(), vision_at: None, dof: 1, q: [0.0; MAX_DOF], replaceable: true });
     for _ in 0..3 { fx.step(); }
@@ -282,14 +282,14 @@ fn a_child_commits_only_while_its_parent_is_the_running_action() {
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] -= 0.05;
-    submit_install(&mut b, 2, stale, later(), Primitive::joint_quintic(&start, &q, 1.0)).unwrap();
+    submit_install(&mut b, 2, stale, later(), Primitive::joint_quintic(&start, &q, 1.0).unwrap()).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PARENT_REPLACED"));
     assert_eq!(fx.active(), Some(parent));
     // a child of the running parent, prepared from the current commanded position
     let start = fx.core.commanded_positions.clone();
     let mut q = start.clone();
     q[0] -= 0.05;
-    submit_install(&mut b, 3, a, later(), Primitive::joint_quintic(&start, &q, 1.0)).unwrap();
+    submit_install(&mut b, 3, a, later(), Primitive::joint_quintic(&start, &q, 1.0).unwrap()).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }
 
@@ -304,12 +304,34 @@ fn a_primitive_prepared_from_another_start_is_refused_including_the_gripper() {
     // the gripper moved by 2e-4 since the plan: stale
     let mut moved = start.clone();
     moved[gripper] += 2e-4;
-    submit_install(&mut b, 1, a, later(), Primitive::joint_quintic(&moved, &q, 0.5)).unwrap();
+    submit_install(&mut b, 1, a, later(), Primitive::joint_quintic(&moved, &q, 0.5).unwrap()).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
     assert!(fx.active().is_none() && fx.core.active_trajectory.is_none());
     // below the 1e-4 threshold it is the same start
     let mut close = start.clone();
     close[gripper] += 5e-5;
-    submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&close, &q, 0.5)).unwrap();
+    submit_install(&mut b, 2, a, later(), Primitive::joint_quintic(&close, &q, 0.5).unwrap()).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
+}
+
+#[test]
+fn a_hand_built_oversized_primitive_is_refused_without_a_panic() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 2, plans: 1, replies: 4 });
+    let a = auth(&fx);
+    let bad = Primitive::JointQuintic { dof: MAX_DOF as u8 + 1, start: [0.0; MAX_DOF], q: [0.0; MAX_DOF], duration_s: 1.0 };
+    submit_install(&mut b, 1, a, later(), bad).unwrap();
+    assert_eq!(fx.step().command.unwrap().1, Err("INVALID_COMMAND"));
+    assert!(fx.active().is_none());
+}
+
+#[test]
+fn a_terminal_keeps_the_cause_of_a_lease_loss() {
+    let ((mut fx, mut b, _tw, _stop), generation) = leased(600_000);
+    submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.2, 2.0)).unwrap();
+    fx.step();
+    let action = fx.active().unwrap();
+    assert!(fx.core.release_lease("client", generation));
+    let mut ended = None;
+    for _ in 0..10 { if let Some(e) = fx.step().ended { ended = Some(e); break; } }
+    assert_eq!(ended, Some((action, Outcome::Cancelled("LEASE_LOST"))));
 }

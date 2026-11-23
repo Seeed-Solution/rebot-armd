@@ -83,14 +83,53 @@ pub const START_TOLERANCE: f32 = 1e-4;
 
 impl Primitive {
     /// A joint quintic prepared from `start` (the planning snapshot's commanded positions).
-    pub fn joint_quintic(start: &[f32], q: &[f32], duration_s: f64) -> Self {
+    /// `INVALID_COMMAND` when `q` is empty or longer than [`MAX_DOF`], or `start` has
+    /// another length: nothing is truncated.
+    pub fn joint_quintic(start: &[f32], q: &[f32], duration_s: f64) -> Result<Self, &'static str> {
+        let n = q.len();
+        if n == 0 || n > MAX_DOF || start.len() != n { return Err("INVALID_COMMAND"); }
         let (mut a, mut s0) = ([0.0; MAX_DOF], [0.0; MAX_DOF]);
-        let n = q.len().min(MAX_DOF);
-        a[..n].copy_from_slice(&q[..n]);
-        let m = start.len().min(n);
-        s0[..m].copy_from_slice(&start[..m]);
-        Self::JointQuintic { dof: n as u8, start: s0, q: a, duration_s }
+        a[..n].copy_from_slice(q);
+        s0[..n].copy_from_slice(start);
+        Ok(Self::JointQuintic { dof: n as u8, start: s0, q: a, duration_s })
     }
+}
+
+/// Codes an action can end with ([`Outcome`] carries them as `&'static str`).
+pub const TERMINAL_CODES: &[&str] = &[
+    // stop / ownership / epoch
+    "STOPPED", "CANCELLED", "SUPERSEDED", "LEASE_LOST", "EPOCH_MISMATCH", "PLAN_STALE", "CALIBRATION_CHANGED", "CONFIG_BUSY",
+    "DEPLOYMENT_CHANGED", "TOOL_MISMATCH", "DATA_STALE", "NOT_ARMED", "MOTION_BUSY", "INTERNAL", "UNSUPPORTED",
+    // faults and holds (FaultCode, SCREAMING_SNAKE_CASE)
+    "ESTOP", "ESTOP_ACTIVE", "FAULT", "FAULT_ACTIVE", "BUS_LOSS", "THERMAL_TRIP", "JOINT_LIMIT", "WATCHDOG", "WATCHDOG_TIMEOUT",
+    "FOLLOWING_ERROR", "CONTROL_DEADLINE", "INVALID_TELEMETRY", "DRIVER_WRITE_FAILED", "HARDWARE_FAULT", "ENABLE_FAILED",
+    "SERVO_NO_BRAKE", "HANDOVER_UNSETTLED", "GRAVITY_COMP_FAILED", "COLLISION", "COLLISION_HOLD", "BLOCKED_HOLD", "WORKSPACE_HOLD",
+    "TORQUE_LIMIT", "TRACKING_STALL", "SAFETY_ERROR", "SAFETY_REJECTED", "SOFT_LIMIT_EXCEEDED", "FEEDBACK_UNAVAILABLE",
+    "FEEDBACK_UNCONFIRMED", "INVALID_FEEDBACK", "UNLOAD_FAILED",
+    // motion and action failures
+    "IK_UNREACHABLE", "IK_BRANCH_FLIP", "WORKSPACE_VIOLATION", "INVALID_COMMAND", "INVALID_TARGET", "JUMP_LIMIT", "STEP_LIMIT",
+    "SERVO_INFEASIBLE", "SERVO_TARGET_DISCARDED", "STALE_INPUT", "MOTION_TIMEOUT", "GRIPPER_TIMEOUT", "GRASP_TIMEOUT",
+    "PLACE_TIMEOUT", "TARGET_TIMEOUT", "SEQUENCE_TIMEOUT", "MAX_SECONDS", "NOT_HOLDING", "TARGET_LOST", "TARGET_DISPLACED",
+    "DROPPED", "OBJECT_HELD", "OBJECT_TOO_TALL", "TOO_WIDE", "CENTRING_FAILED", "DETECTION_UNAVAILABLE", "TASK_UNSUPPORTED",
+    "OBSERVATION_UNAVAILABLE", "PERSIST_FAILED", "POLICY_NOT_ACTIVE",
+];
+
+/// The static form of an action's code (None: it named none or an unlisted one).
+fn terminal_code(code: Option<&str>) -> Option<&'static str> {
+    let code = code?;
+    TERMINAL_CODES.iter().find(|k| **k == code).copied()
+}
+
+/// How an ended action translates to an [`Outcome`] (state `running`: None).
+pub fn outcome_of(state: &str, code: Option<&str>) -> Option<Outcome> {
+    Some(match (state, terminal_code(code)) {
+        ("running", _) => return None,
+        ("done", _) => Outcome::Completed,
+        ("cancelled", None | Some("STOPPED" | "CANCELLED")) => Outcome::Stopped,
+        ("cancelled", Some("SUPERSEDED")) => Outcome::Superseded,
+        ("cancelled", Some(c)) => Outcome::Cancelled(c),
+        (_, c) => Outcome::Failed(c.unwrap_or("FAILED")),
+    })
 }
 
 /// The prepared start of a primitive matches `commanded` (every joint, gripper included).
@@ -213,7 +252,9 @@ impl CoreOps for SupervisorInner {
         match primitive {
             Primitive::None => Err("INVALID_COMMAND"),
             Primitive::JointQuintic { dof, start, q, duration_s } => {
+                // the fields are public: a hand-built primitive may name more joints than it holds
                 let n = usize::from(*dof);
+                if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
                 let target = q[..n].to_vec();
                 self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
@@ -246,6 +287,7 @@ impl CoreOps for SupervisorInner {
     }
 
     fn consume_target(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), &'static str> {
+        if usize::from(frame.dof) > MAX_DOF { return Err("INVALID_COMMAND"); }
         if let Some(code) = frame.authority.admits(&self.authority(ctx)) { return Err(code); }
         self.servo(frame.positions().to_vec(), frame.authority.epoch).map_err(|e| static_code(ArmError::Safety(e)))
     }
@@ -254,12 +296,7 @@ impl CoreOps for SupervisorInner {
 
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
         let Some(a) = self.last_action.as_ref().filter(|a| a.id == action.0) else { return Some(Outcome::Superseded); };
-        match a.state.as_str() {
-            "running" => None,
-            "done" => Some(Outcome::Completed),
-            "cancelled" => Some(Outcome::Stopped),
-            _ => Some(Outcome::Failed("FAILED")),
-        }
+        outcome_of(&a.state, a.code.as_deref())
     }
 
     fn poll_hardware(&self) -> HardwarePoll {
@@ -432,5 +469,41 @@ impl<O: CoreOps> ReleaseFixture<O> {
             }
         }
         report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_or_mismatched_primitive_is_refused_not_truncated() {
+        let q9 = [0.1f32; MAX_DOF + 1];
+        assert_eq!(Primitive::joint_quintic(&q9, &q9, 1.0), Err("INVALID_COMMAND"));
+        assert_eq!(Primitive::joint_quintic(&[0.0; 3], &[0.1; 2], 1.0), Err("INVALID_COMMAND"));
+        assert_eq!(Primitive::joint_quintic(&[], &[], 1.0), Err("INVALID_COMMAND"));
+        let Ok(Primitive::JointQuintic { dof, q, .. }) = Primitive::joint_quintic(&[0.0; MAX_DOF], &[0.2; MAX_DOF], 1.0) else { panic!() };
+        assert_eq!((dof, q), (MAX_DOF as u8, [0.2; MAX_DOF]));
+    }
+
+    #[test]
+    fn terminal_outcomes_keep_their_cause() {
+        assert_eq!(outcome_of("running", None), None);
+        assert_eq!(outcome_of("done", None), Some(Outcome::Completed));
+        assert_eq!(outcome_of("cancelled", Some("STOPPED")), Some(Outcome::Stopped));
+        assert_eq!(outcome_of("cancelled", None), Some(Outcome::Stopped));
+        assert_eq!(outcome_of("cancelled", Some("SUPERSEDED")), Some(Outcome::Superseded));
+        assert_eq!(outcome_of("cancelled", Some("LEASE_LOST")), Some(Outcome::Cancelled("LEASE_LOST")));
+        assert_eq!(outcome_of("cancelled", Some("COLLISION_HOLD")), Some(Outcome::Cancelled("COLLISION_HOLD")));
+        assert_eq!(outcome_of("failed", Some("TRACKING_STALL")), Some(Outcome::Failed("TRACKING_STALL")));
+        assert_eq!(outcome_of("failed", Some("FOLLOWING_ERROR")), Some(Outcome::Failed("FOLLOWING_ERROR")));
+        assert_eq!(outcome_of("failed", Some("SOMETHING_NEW")), Some(Outcome::Failed("FAILED")));
+        assert_eq!(outcome_of("failed", None), Some(Outcome::Failed("FAILED")));
+        // every fault code is listed
+        for c in crate::safety::FaultCode::ALL {
+            let name = serde_json::to_value(c).unwrap();
+            let name = name.as_str().unwrap();
+            if name != "OTHER" { assert!(TERMINAL_CODES.contains(&name), "{name}"); }
+        }
     }
 }
