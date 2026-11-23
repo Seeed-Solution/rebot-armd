@@ -79,6 +79,8 @@ pub struct FakeMotor {
     pub stop_stiffness: f32,
     /// Last position-force frame: (position, speed raw, current raw).
     pub last_pos_force: Option<(f32, u16, u16)>,
+    /// Reported motor temperature (°C) carried in feedback bytes 6-7 (default 30).
+    pub temperature_c: u8,
 }
 
 impl FakeMotor {
@@ -96,7 +98,7 @@ impl FakeMotor {
             silent: false, ignore_reg_writes: false, ack_value_override: None, no_write_ack: false, ack_value_override_once: None, silent_after_mode_ack: false,
             mute_feedback_after_mode_ack: false, mute_feedback: false, no_feedback: false, last_cmd: None, last_cmd_at: None, watchdog_expired_at: None, commands: 0,
             drop_torque_frames: 0, torque_reply_delay: Duration::ZERO,
-            stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None }
+            stop_at: None, nm_per_raw: 0.0007, stop_stiffness: 250.0, last_pos_force: None, temperature_c: 30 }
     }
 
     pub fn reg_u32(&self, rid: u8) -> u32 { u32::from_le_bytes(self.regs[&rid]) }
@@ -110,7 +112,7 @@ impl FakeMotor {
         let t = damiao::float_to_uint(self.tau, l.t_min, l.t_max, 12);
         let state = self.state_override.unwrap_or(u8::from(self.enabled));
         let data = [(state << 4) | (self.id as u8 & 0x0f), (p >> 8) as u8, p as u8, (v >> 4) as u8,
-            (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8, t as u8, 30, 30];
+            (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8, t as u8, self.temperature_c, self.temperature_c];
         CanFrame::new_standard(self.reply_id, &data).unwrap()
     }
 

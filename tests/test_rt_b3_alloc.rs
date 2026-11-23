@@ -17,18 +17,23 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use armd::api::rest::ApiError;
 use armd::diagnostics::alloc;
 use armd::diagnostics::logwriter::{NonBlocking, INLINE_LINE_BYTES};
+use armd::diagnostics::tick::{
+    TickSample, RELEASE_FLAG_CLEAR_OK, RELEASE_FLAG_CLEAR_REFUSED, RELEASE_FLAG_ESTOP_APPLIED,
+    RELEASE_FLAG_INJECT_ALLOC, RELEASE_FLAG_THERMAL_TRIP, RELEASE_FLAG_WATCHDOG_LATCH,
+};
 use armd::driver::{ArmDriver, ArmDriverError, DamiaoArmDriver, DriverCapabilities, EnableState, JointTarget};
 use armd::model::JointState;
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::executor::{ExecutorConfig, PersistTestHooks};
 use armd::rt_core::ops::{CoreOps, ServiceBudget};
 use armd::safety::{
-    BoundedFaultReason, BoundedSafetyState, BoundedText, ClearFaultDriverError, ClearFaultError,
-    ClearFaultRefusal, FaultCode, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState,
-    StaticFault, DETAIL_UNAVAILABLE, MAX_RESTING_SUPPORT_ITEMS, SAFETY_LOG_CAPACITY,
+    BoundedFaultReason, BoundedSafetyState, BoundedText, ClearContext, ClearFaultDriverError,
+    ClearFaultError, ClearFaultRefusal, ClearRefusal, FaultCode, FaultDetail, FaultKind,
+    FaultReason, SafetyError, SafetyManager, SafetyState, StaticFault, DETAIL_UNAVAILABLE,
+    MAX_RESTING_SUPPORT_ITEMS, SAFETY_LOG_CAPACITY,
 };
 use armd::transport::{MockClock, TransportError};
-use armd::{ArmConfig, ArmError, ArmSupervisor, StopPolicy, SupervisorInner};
+use armd::{ArmConfig, ArmError, ArmSupervisor, OperatorAuth, StopPolicy, SupervisorInner};
 use mit_support::FakeBus;
 
 #[derive(Clone, Default)]
@@ -108,6 +113,23 @@ async fn wait_until_async(timeout: Duration, mut pred: impl FnMut() -> bool) {
     let start = Instant::now();
     while !pred() {
         assert!(start.elapsed() < timeout, "timed out waiting for async condition");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Waits for and returns the SPECIFIC [`TickSample`] tagged with `release_seq`.
+/// Fails explicitly if `release_seq == 0` or if that tagged sample is missing from `tick_samples()`.
+async fn expect_release_sample(sup: &ArmSupervisor, release_seq: u64, label: &str) -> TickSample {
+    assert!(release_seq > 0, "{label}: expected non-zero tagged release_seq");
+    let start = Instant::now();
+    loop {
+        if let Some(sample) = sup.tick_samples().into_iter().find(|s| s.release_seq == release_seq) {
+            return sample;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{label}: tagged release_seq={release_seq} sample missing from tick_samples()"
+        );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
@@ -270,12 +292,13 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
         sm.trigger_fault(FaultReason::BusLoss);
         assert_eq!(sm.clear_fault_bounded().unwrap(), SafetyState::Idle);
         sm.trigger_fault(FaultReason::WatchdogTimeout);
+        sm.trigger_e_stop();
         assert_eq!(sm.clear_fault_bounded().unwrap(), SafetyState::Idle);
+        sm.trigger_e_stop();
         sm.try_trigger_fault_coded(
             FaultCode::ThermalTrip,
             FaultReason::ThermalTrip { joint_idx: 1, temperature: 92.5, limit: 85.0 },
         ).unwrap();
-        sm.trigger_e_stop();
         assert_eq!(sm.clear_fault_bounded().unwrap(), SafetyState::Idle);
         let a = alloc::take();
         assert_eq!(a.calls, 0, "deferred E-stop/fault/clear + owned fault construction allocated: {a:?}");
@@ -290,8 +313,8 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
         "Safety: Idle -> EStop", "Safety: cleared -> Idle",
         "Safety: Idle -> Fault(BusLoss) [BusLoss]",
         "Safety: Idle -> Fault(WatchdogTimeout) [WatchdogTimeout]",
-        "Safety: Idle -> Fault(ThermalTrip { joint_idx: 1, temperature: 92.5, limit: 85.0 }) [ThermalTrip]",
-        "Safety: Fault(ThermalTrip { joint_idx: 1, temperature: 92.5, limit: 85.0 }) -> EStop",
+        "Safety: Fault(WatchdogTimeout) -> EStop",
+        "Safety: EStop -> Fault(ThermalTrip { joint_idx: 1, temperature: 92.5, limit: 85.0 }) [ThermalTrip]",
     ] {
         assert!(deferred_text.contains(expected), "missing `{expected}` in:\n{deferred_text}");
     }
@@ -362,55 +385,59 @@ async fn safety_logging_estop_fault_clear_zero_alloc_with_subscriber_enabled_and
     wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= 8).await;
     let _ = take_global_logs(log);
 
-    // Measure over a non-empty window covering a real ThermalTrip fault, hot refusal, cooldown clear,
-    // E-stop latch, and E-stop clear.
-    let before_safety = sup.tick_samples().len();
+    // Measure SPECIFIC tagged safety releases covering a real ThermalTrip fault, hot refusal,
+    // cooldown clear, E-stop latch, and E-stop clear (failing explicitly if any sample is missing).
     *temp_ctl.lock().unwrap() = 85.0;
     wait_until_async(Duration::from_secs(2), || {
         sup.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })))
     }).await;
+    let thermal_seq = handle.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
+    let thermal_sample = expect_release_sample(&sup, thermal_seq, "ThermalTrip latch").await;
+    assert_ne!(thermal_sample.release_flags & RELEASE_FLAG_THERMAL_TRIP, 0, "expected THERMAL_TRIP flag on release {thermal_seq}");
+    assert_eq!(thermal_sample.usage.lock_alloc_calls, 0, "ThermalTrip latch release allocated: {thermal_sample:?}");
+
     let hot_err = ApiError::from(sup.clear_fault().await.unwrap_err());
     assert_eq!((hot_err.status, hot_err.code.as_deref()), (StatusCode::CONFLICT, Some("CLEAR_FAULT_REJECTED")));
+    let hot_refuse_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    let hot_refuse_sample = expect_release_sample(&sup, hot_refuse_seq, "hot clear refusal").await;
+    assert_ne!(hot_refuse_sample.release_flags & RELEASE_FLAG_CLEAR_REFUSED, 0, "expected CLEAR_REFUSED flag on release {hot_refuse_seq}");
+    assert_eq!(hot_refuse_sample.usage.lock_alloc_calls, 0, "hot clear refusal release allocated: {hot_refuse_sample:?}");
 
     *temp_ctl.lock().unwrap() = 50.0;
     let cool_step = handle.stats().steps.load(Ordering::Relaxed);
     wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= cool_step + 4).await;
     assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
+    let cool_clear_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    assert!(cool_clear_seq > hot_refuse_seq);
+    let cool_clear_sample = expect_release_sample(&sup, cool_clear_seq, "cooldown clear").await;
+    assert_ne!(cool_clear_sample.release_flags & RELEASE_FLAG_CLEAR_OK, 0, "expected CLEAR_OK flag on release {cool_clear_seq}");
+    assert_eq!(cool_clear_sample.usage.lock_alloc_calls, 0, "cooldown clear release allocated: {cool_clear_sample:?}");
 
     assert_eq!(sup.trigger_e_stop_checked().await.unwrap().0, SafetyState::EStop);
-    let estop_step = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= estop_step + 4).await;
-    assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
-    let done_step = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= done_step + 4).await;
+    let estop_seq = handle.stats().last_estop_release_seq.load(Ordering::Acquire);
+    let estop_sample = expect_release_sample(&sup, estop_seq, "E-stop latch").await;
+    assert_ne!(estop_sample.release_flags & RELEASE_FLAG_ESTOP_APPLIED, 0, "expected ESTOP_APPLIED flag on release {estop_seq}");
+    assert_eq!(estop_sample.usage.lock_alloc_calls, 0, "E-stop latch release allocated: {estop_sample:?}");
 
-    let safety_samples = sup.tick_samples();
-    let safety_window = &safety_samples[before_safety..];
-    assert!(!safety_window.is_empty(), "executor safety sample window must be non-empty");
-    assert_eq!(
-        safety_window.iter().map(|s| s.usage.lock_alloc_calls).max(),
-        Some(0),
-        "live executor real ThermalTrip + E-stop + clear must do 0 heap ops; max={:?}",
-        safety_window.iter().map(|s| s.usage.lock_alloc_calls).collect::<Vec<_>>()
-    );
+    assert_eq!(sup.clear_fault().await.unwrap(), SafetyState::Idle);
+    let estop_clear_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
+    assert!(estop_clear_seq > cool_clear_seq);
+    let estop_clear_sample = expect_release_sample(&sup, estop_clear_seq, "E-stop clear").await;
+    assert_ne!(estop_clear_sample.release_flags & RELEASE_FLAG_CLEAR_OK, 0, "expected CLEAR_OK flag on release {estop_clear_seq}");
+    assert_eq!(estop_clear_sample.usage.lock_alloc_calls, 0, "E-stop clear release allocated: {estop_clear_sample:?}");
     assert_eq!(handle.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
 
-    // Positive control in live RtExecutor: inject exactly 1 allocation and verify count == 1.
-    let before_pos = sup.tick_samples().len();
+    // Positive control in live RtExecutor: inject exactly 1 allocation and verify exact tagged release has count == 1.
     inject_once.0.store(true, Ordering::Release);
     wait_until_async(Duration::from_secs(2), || !inject_once.0.load(Ordering::Acquire)).await;
-    let pos_step = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= pos_step + 3).await;
-    let pos_samples = sup.tick_samples();
-    let pos_window = &pos_samples[before_pos..];
-    assert!(!pos_window.is_empty(), "positive control sample window must be non-empty");
+    let inject_seq = handle.stats().last_inject_alloc_release_seq.load(Ordering::Acquire);
+    let inject_sample = expect_release_sample(&sup, inject_seq, "injected alloc positive control").await;
+    assert_ne!(inject_sample.release_flags & RELEASE_FLAG_INJECT_ALLOC, 0, "expected INJECT_ALLOC flag on release {inject_seq}");
     assert_eq!(
-        pos_window.iter().map(|s| s.usage.lock_alloc_calls).max(),
-        Some(1),
-        "positive control: 1 injected release alloc must measure lock_alloc_calls == 1; got {:?}",
-        pos_window.iter().map(|s| s.usage.lock_alloc_calls).collect::<Vec<_>>()
+        inject_sample.usage.lock_alloc_calls,
+        1,
+        "positive control: 1 injected release alloc must measure lock_alloc_calls == 1 on tagged release {inject_seq}: {inject_sample:?}"
     );
-    assert_eq!(pos_window.iter().filter(|s| s.usage.lock_alloc_calls == 1).count(), 1);
     let leaked_ptr = inject_once.1.swap(std::ptr::null_mut(), Ordering::AcqRel);
     assert!(!leaked_ptr.is_null(), "injected allocation pointer must be stored for reclamation");
     // SAFETY: pointer was produced once by `Box::into_raw(Box::new(0xB3_u64))` and reclaimed once here.
@@ -538,6 +565,7 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
         positions: cfg.resting_positions().to_vec(), temperature: Arc::new(Mutex::new(30.0)), clock: MockClock::new(),
     };
     let mut to = SupervisorInner::new(cfg.clone()).with_driver(Box::new(to_drv));
+    to.feedback_numeric_valid = true;
     to.safety.set_off_thread_reclaim(true);
     to.safety.trigger_fault(FaultReason::BusLoss);
     let _ = alloc::take();
@@ -583,18 +611,15 @@ async fn clear_fault_refusals_zero_alloc_unchanged_outcome_and_identical_api_tex
     exec_cfg.alloc_timing = true;
     let handle = sup.start_executor(exec_cfg).await.unwrap();
     wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 8).await;
-    let before = sup.tick_samples().len();
     let res = sup.clear_fault().await;
-    let after_step = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= after_step + 3).await;
+    let refuse_seq = handle.stats().last_clear_release_seq.load(Ordering::Acquire);
     let api = ApiError::from(res.unwrap_err());
     assert_eq!((api.status, api.code.as_deref()), (StatusCode::CONFLICT, Some("CLEAR_FAULT_REJECTED")));
     assert!(api.message.starts_with("Cannot disable faulted supporting arm joint away from resting pose ("), "{}", api.message);
     assert!(api.message.ends_with("); support the arm at rest first"), "{}", api.message);
-    let samples = sup.tick_samples();
-    let window = &samples[before..];
-    assert!(!window.is_empty(), "clear-refusal executor sample window must be non-empty");
-    assert_eq!(window.iter().map(|s| s.usage.lock_alloc_calls).max(), Some(0));
+    let refuse_sample = expect_release_sample(&sup, refuse_seq, "resting-pose clear refusal").await;
+    assert_ne!(refuse_sample.release_flags & RELEASE_FLAG_CLEAR_REFUSED, 0);
+    assert_eq!(refuse_sample.usage.lock_alloc_calls, 0, "resting-pose clear refusal release allocated: {refuse_sample:?}");
     assert_eq!(handle.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
     handle.stop_and_join();
 }
@@ -650,11 +675,13 @@ async fn exhausted_pool_still_latches_thermal_trip_during_bus_loss_and_watchdog_
                 assert_eq!(trip_allocs.calls, 0, "ThermalTrip while pool exhausted must do 0 heap ops: {trip_allocs:?}");
             }
 
-            // Current Arc stays the existing fault (no Arc::new), while BOTH kinds are recorded
-            // and `recoverable` reflects the non-recoverable ThermalTrip.
+            // Current Arc stays the existing fault (no Arc::new), while BOTH kinds are recorded,
+            // reported fault code reflects the higher-severity ThermalTrip, and `recoverable()` is false.
             assert_eq!(*inner.safety.state(), SafetyState::Fault(initial_reason.clone()));
             assert!(inner.safety.has_latched_fault_kind(initial_kind));
             assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+            assert_eq!(inner.safety.fault_code(), Some(FaultCode::ThermalTrip));
+            assert!(!inner.safety.recoverable());
             assert!(!inner.safety.fault().unwrap().recoverable);
 
             // A second thermal trip does not churn epoch_id once ThermalTrip is already recorded.
@@ -747,13 +774,13 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     assert_eq!(first_allocs.calls, 0, "first fault with empty pool must never allocate: {first_allocs:?}");
     assert_eq!(*sm.state(), SafetyState::Fault(FaultReason::Other(DETAIL_UNAVAILABLE.into())));
     assert_eq!(sm.fault_code(), Some(FaultCode::JointLimit));
-    assert!(sm.has_latched_fault_kind(FaultKind::JointLimitExceeded));
+    assert!(sm.has_latched_fault_kind(FaultKind::JointLimit));
     assert!(matches!(
-        sm.latched_fault_detail(FaultKind::JointLimitExceeded).map(|d| d.reason),
+        sm.latched_fault_detail(FaultKind::JointLimit).map(|d| d.reason),
         Some(BoundedFaultReason::JointLimitExceeded { joint_idx: 2, .. })
     ));
 
-    // 2. Latch every remaining FaultKind while the pool stays completely empty (0 heap ops).
+    // 2. Latch EVERY remaining FaultKind via `latch` while all pools stay completely empty (0 heap ops).
     let _ = alloc::take();
     let res_th = sm.try_trigger_fault_coded(
         FaultCode::ThermalTrip,
@@ -762,6 +789,11 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
     let res_bus = sm.try_trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
     let res_wd = sm.try_trigger_fault_coded(FaultCode::WatchdogTimeout, FaultReason::WatchdogTimeout);
     let res_other = sm.try_trigger_fault_coded(FaultCode::HardwareFault, other);
+    sm.latch(
+        FaultKind::CollisionLatched,
+        FaultDetail::formatted(FaultCode::Collision, |b| b.push_str("collision escalated")),
+    );
+    sm.latch(FaultKind::Estop, FaultDetail::Estop);
     let rest_allocs = alloc::take();
     assert_eq!(rest_allocs.calls, 0, "latching all fault kinds with empty pool must do 0 heap ops: {rest_allocs:?}");
 
@@ -774,6 +806,8 @@ fn every_fault_kind_latches_with_zero_alloc_while_pool_is_exhausted() {
         assert!(sm.has_latched_fault_kind(kind), "missing latched kind {kind:?}");
         assert!(sm.latched_fault_detail(kind).is_some(), "missing detail for {kind:?}");
     }
+    assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip), "most severe recorded kind must win reported code");
+    assert!(!sm.recoverable());
 
     // 3. Lazy fault when pool is empty skips closure (0 alloc) and records kind with "detail unavailable".
     let mut sm_lazy = SafetyManager::new();
@@ -1105,4 +1139,727 @@ fn api_clear_fault_messages_mark_resting_overflow_and_utf8_driver_truncation() {
     let cfg_err = cfg_err_inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)).unwrap_err();
     assert_eq!(alloc::take().calls, 0);
     assert_api_clear_fault_text(cfg_err, &format!("Driver limit configuration error: {}…", "z".repeat(254)));
+}
+
+// ============================================================================
+// B3 round 3: one latch, one clear_check, one recoverability rule, inline allocs
+// ============================================================================
+
+#[test]
+fn clear_check_table_over_every_fault_kind_and_unknown_bit_fail_closed() {
+    let base_met = ClearContext::all_conditions_met();
+    let driver_met = ClearContext { has_driver: true, ..base_met };
+
+    // 1. Exhaustive table covering EVERY FaultKind variant: condition unmet -> refused; met -> cleared.
+    let table: Vec<(
+        FaultKind,
+        FaultDetail,
+        ClearContext,
+        ClearRefusal,
+        ClearContext,
+    )> = vec![
+        // ThermalTrip: above threshold
+        (
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 86.0, limit: 75.0 },
+            ClearContext { thermal_below_threshold: false, ..driver_met },
+            ClearRefusal::TemperatureConfirmationRequired,
+            driver_met,
+        ),
+        // ThermalTrip: below threshold, but cooldown dwell time not elapsed
+        (
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 86.0, limit: 75.0 },
+            ClearContext {
+                thermal_below_threshold: true,
+                thermal_cooldown_elapsed_ms: 400,
+                thermal_cooldown_required_ms: 1000,
+                ..driver_met
+            },
+            ClearRefusal::ThermalCooldownNotElapsed { elapsed_ms: 400, required_ms: 1000 },
+            ClearContext {
+                thermal_below_threshold: true,
+                thermal_cooldown_elapsed_ms: 1000,
+                thermal_cooldown_required_ms: 1000,
+                ..driver_met
+            },
+        ),
+        // BusLoss: stale/missing feedback
+        (
+            FaultKind::BusLoss,
+            FaultDetail::BusLoss,
+            ClearContext { feedback_fresh: false, ..driver_met },
+            ClearRefusal::FreshFeedbackRequired,
+            driver_met,
+        ),
+        // WatchdogTimeout: active lease with stale heartbeat -> refused; fresh heartbeat -> cleared
+        (
+            FaultKind::WatchdogTimeout,
+            FaultDetail::WatchdogTimeout,
+            ClearContext { has_active_lease: true, lease_heartbeat_fresh: false, ..base_met },
+            ClearRefusal::WatchdogHeartbeatRequired,
+            ClearContext { has_active_lease: true, lease_heartbeat_fresh: true, ..base_met },
+        ),
+        // WatchdogTimeout: no active lease -> cleared
+        (
+            FaultKind::WatchdogTimeout,
+            FaultDetail::WatchdogTimeout,
+            ClearContext { has_active_lease: true, lease_heartbeat_fresh: false, ..base_met },
+            ClearRefusal::WatchdogHeartbeatRequired,
+            ClearContext { has_active_lease: false, lease_heartbeat_fresh: false, ..base_met },
+        ),
+        // JointLimit: measured joints outside limits (plus margin) -> refused; back within limits -> cleared
+        (
+            FaultKind::JointLimit,
+            FaultDetail::JointLimitExceeded {
+                joint_idx: 1,
+                joint_name: BoundedText::new("joint_2"),
+                value: 3.5,
+                min: -2.0,
+                max: 2.0,
+            },
+            ClearContext { joints_within_limits: false, ..base_met },
+            ClearRefusal::JointLimitsNotSatisfied,
+            ClearContext { joints_within_limits: true, ..base_met },
+        ),
+        // CollisionLatched: keeps existing rule (enable state unknown / hw fault / stale feedback)
+        (
+            FaultKind::CollisionLatched,
+            FaultDetail::formatted(FaultCode::Collision, |b| b.push_str("COLLISION: escalated")),
+            ClearContext { enable_state_known: false, ..driver_met },
+            ClearRefusal::EnableStateUnknown,
+            driver_met,
+        ),
+        // ESTOP: keeps existing rule (fresh feedback / enable state known)
+        (
+            FaultKind::Estop,
+            FaultDetail::Estop,
+            ClearContext { feedback_fresh: false, ..driver_met },
+            ClearRefusal::FreshFeedbackRequired,
+            driver_met,
+        ),
+        // Other: keeps existing rule (active hardware error)
+        (
+            FaultKind::Other,
+            FaultDetail::Static(StaticFault::InvalidTelemetry),
+            ClearContext {
+                hardware_error: Some(ClearFaultDriverError::JointTimeout(1)),
+                ..driver_met
+            },
+            ClearRefusal::DriverError(ClearFaultDriverError::JointTimeout(1)),
+            driver_met,
+        ),
+    ];
+
+    // Confirm EVERY FaultKind::ALL variant appears in the table.
+    for kind in FaultKind::ALL {
+        assert!(
+            table.iter().any(|(k, ..)| *k == kind),
+            "clear_check table missing FaultKind::{kind:?}"
+        );
+    }
+
+    for (kind, detail, unmet, expected_refusal, met) in table {
+        let mut sm = SafetyManager::new();
+        sm.latch(kind, detail);
+        assert!(sm.has_latched_fault_kind(kind));
+        assert_eq!(sm.clear_check(&unmet), Err(expected_refusal), "kind={kind:?} unmet must refuse");
+        assert_eq!(
+            sm.clear_with_check(&unmet),
+            Err(expected_refusal),
+            "kind={kind:?} clear_with_check unmet must not reset record"
+        );
+        assert!(sm.has_latched_fault_kind(kind), "kind={kind:?} must remain latched after refusal");
+        assert_eq!(sm.clear_check(&met), Ok(()), "kind={kind:?} met must pass clear_check");
+        assert_eq!(sm.clear_with_check(&met), Ok(SafetyState::Idle), "kind={kind:?} met must clear");
+        assert_eq!(sm.latched_fault_kinds(), 0, "kind={kind:?} record must be fully reset");
+    }
+
+    // 2. Fail closed on any unknown kind bit without an explicit rule.
+    let mut sm_unknown = SafetyManager::new();
+    sm_unknown.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    sm_unknown.record_unknown_kind_bit_for_test(1u8 << 7);
+    assert!(!sm_unknown.recoverable(), "unknown kind bit must be non-recoverable (fail closed)");
+    assert_eq!(sm_unknown.clear_check(&base_met), Err(ClearRefusal::UnknownFaultKind));
+    assert_eq!(sm_unknown.clear_with_check(&base_met), Err(ClearRefusal::UnknownFaultKind));
+
+    // 3. Supervisor end-to-end checks for JointLimit, WatchdogTimeout heartbeat, and ThermalTrip cooldown dwell.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.max_temperature = 75.0;
+    cfg.lease_timeout_ms = 30;
+    let mut inner = SupervisorInner::new(cfg.clone());
+    inner.thermal_cooldown_duration = Duration::from_millis(40);
+    inner.temperatures = vec![30.0; cfg.dof];
+    // JointLimit: out of bounds -> refused; back within limits + margin -> cleared.
+    inner.measured_positions[0] = inner.config.limits[0].max_position + 0.2;
+    inner.safety.latch(
+        FaultKind::JointLimit,
+        FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("joint 1 out of bounds")),
+    );
+    assert!(inner.clear_fault().unwrap_err().to_string().contains("within limits"));
+    assert_eq!(
+        inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
+        Err(ClearFaultError::Rejected(ClearRefusal::JointLimitsNotSatisfied))
+    );
+    // Just inside outward margin (0.005 < JOINT_LIMIT_CLEAR_MARGIN_RAD = 0.01) -> clears.
+    inner.measured_positions[0] = inner.config.limits[0].max_position + 0.005;
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+
+    // WatchdogTimeout: active lease with stale heartbeat -> refused; fresh heartbeat or release -> cleared.
+    let gen = inner.acquire_lease("client-w").unwrap();
+    inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    std::thread::sleep(Duration::from_millis(45));
+    assert_eq!(
+        inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
+        Err(ClearFaultError::Rejected(ClearRefusal::WatchdogHeartbeatRequired))
+    );
+    assert!(inner.clear_fault().unwrap_err().to_string().contains("Fresh heartbeat"));
+    // Re-acquiring lease refreshes heartbeat -> clears cleanly.
+    let _ = inner.release_lease("client-w", gen);
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+
+    // ThermalTrip with non-zero cooldown dwell: hot -> refused, cool < 40 ms -> refused, cool >= 40 ms -> cleared.
+    inner.temperatures[0] = 85.0;
+    inner.apply_stop_policy(StopPolicy::ThermalTrip);
+    assert!(inner.clear_fault().is_err());
+    inner.temperatures[0] = 50.0;
+    assert_eq!(
+        inner.clear_fault_executor_bounded(Instant::now() + Duration::from_millis(50)),
+        Err(ClearFaultError::Rejected(ClearRefusal::ThermalCooldownNotElapsed {
+            elapsed_ms: 0,
+            required_ms: 40,
+        }))
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(inner.clear_fault().unwrap(), SafetyState::Idle);
+}
+
+#[test]
+fn paired_fault_kinds_refuse_clear_until_both_conditions_hold_and_report_most_severe() {
+    let driver_met = ClearContext { has_driver: true, ..ClearContext::all_conditions_met() };
+
+    // Pair 1: ThermalTrip + BusLoss (both latch orders, unit clear_check + live detector without skip!)
+    for thermal_first in [true, false] {
+        let mut sm = SafetyManager::new();
+        if thermal_first {
+            sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 88.0, limit: 75.0 });
+            sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+        } else {
+            sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+            sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 88.0, limit: 75.0 });
+        }
+        assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip), "ThermalTrip outranks BusLoss");
+        assert!(!sm.recoverable());
+        // Only bus fresh (still hot) -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext { thermal_below_threshold: false, ..driver_met }),
+            Err(ClearRefusal::TemperatureConfirmationRequired)
+        );
+        // Only cooled (bus stale) -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext { feedback_fresh: false, ..driver_met }),
+            Err(ClearRefusal::FreshFeedbackRequired)
+        );
+        // Both hold -> cleared
+        assert_eq!(sm.clear_with_check(&driver_met), Ok(SafetyState::Idle));
+    }
+
+    // Real supervisor detector check: BusLoss detector does NOT skip when ThermalTrip is already active!
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.max_temperature = 75.0;
+    let temp = Arc::new(Mutex::new(85.0f32));
+    let bus_age = Arc::new(Mutex::new(Some(Duration::from_millis(10))));
+    struct AgeTempDriver {
+        dof: usize,
+        temp: Arc<Mutex<f32>>,
+        age: Arc<Mutex<Option<Duration>>>,
+    }
+    impl ArmDriver for AgeTempDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true, torque_feedback: false, temperature_feedback: true,
+                torque_feedforward: false, enable_feedback: true, load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { self.age.lock().unwrap().is_some_and(|a| a <= Duration::from_millis(250)) }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![*self.age.lock().unwrap(); self.dof] }
+        fn feedback_all_within(&self, dof: usize, max_age: Duration) -> bool {
+            self.dof == dof && self.age.lock().unwrap().is_some_and(|a| a <= max_age)
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            let t = *self.temp.lock().unwrap();
+            Ok((0..self.dof).map(|_| JointState { temperature: t, ..JointState::default() }).collect())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+    let mut sup_inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(AgeTempDriver {
+        dof: cfg.dof,
+        temp: Arc::clone(&temp),
+        age: Arc::clone(&bus_age),
+    }));
+    sup_inner.lease_enabled = false;
+    sup_inner.is_torqued = true;
+    sup_inner.feedback_numeric_valid = true;
+    let _ = sup_inner.safety.set_torque(true).unwrap();
+    sup_inner.tick(0.02); // latches ThermalTrip
+    assert!(sup_inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+    // Now bus drops while ThermalTrip is already active -> BusLoss detector MUST still latch BusLoss!
+    *bus_age.lock().unwrap() = Some(Duration::from_millis(700));
+    sup_inner.tick(0.02);
+    assert!(sup_inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+    assert!(sup_inner.safety.has_latched_fault_kind(FaultKind::BusLoss), "bus-loss detector must not skip when ThermalTrip is active");
+    assert_eq!(sup_inner.safety.fault_code(), Some(FaultCode::ThermalTrip));
+    // Clear disable_pending for clear_fault test (driver stayed enabled in mock)
+    sup_inner.disable_pending = false;
+    // Cool temperature while bus still stale -> refused!
+    *temp.lock().unwrap() = 50.0;
+    assert!(sup_inner.clear_fault().is_err(), "ThermalTrip+BusLoss must stay refused while bus stale");
+    // Restore bus while hot -> refused!
+    *bus_age.lock().unwrap() = Some(Duration::from_millis(10));
+    *temp.lock().unwrap() = 85.0;
+    assert!(sup_inner.clear_fault().is_err(), "ThermalTrip+BusLoss must stay refused while hot");
+    // Both cooled and fresh -> clears!
+    *temp.lock().unwrap() = 50.0;
+    assert_eq!(sup_inner.clear_fault().unwrap(), SafetyState::Idle);
+
+    // Pair 2: ThermalTrip + WatchdogTimeout (both latch orders)
+    for thermal_first in [true, false] {
+        let mut sm = SafetyManager::new();
+        if thermal_first {
+            sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 });
+            sm.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        } else {
+            sm.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+            sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 });
+        }
+        assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip));
+        assert!(!sm.recoverable());
+        // Cooled, but active lease heartbeat stale -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext { has_active_lease: true, lease_heartbeat_fresh: false, ..driver_met }),
+            Err(ClearRefusal::WatchdogHeartbeatRequired)
+        );
+        // Fresh heartbeat, but still hot -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext {
+                has_active_lease: true,
+                lease_heartbeat_fresh: true,
+                thermal_below_threshold: false,
+                ..driver_met
+            }),
+            Err(ClearRefusal::TemperatureConfirmationRequired)
+        );
+        // Both hold -> cleared
+        assert_eq!(
+            sm.clear_with_check(&ClearContext { has_active_lease: true, lease_heartbeat_fresh: true, ..driver_met }),
+            Ok(SafetyState::Idle)
+        );
+    }
+
+    // Pair 3: JointLimit + BusLoss (both latch orders)
+    for jl_first in [true, false] {
+        let mut sm = SafetyManager::new();
+        let jl_detail = FaultDetail::JointLimitExceeded {
+            joint_idx: 2,
+            joint_name: BoundedText::new("joint_3"),
+            value: 4.0,
+            min: -2.0,
+            max: 2.0,
+        };
+        if jl_first {
+            sm.latch(FaultKind::JointLimit, jl_detail);
+            sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+        } else {
+            sm.latch(FaultKind::BusLoss, FaultDetail::BusLoss);
+            sm.latch(FaultKind::JointLimit, jl_detail);
+        }
+        assert_eq!(sm.fault_code(), Some(FaultCode::BusLoss), "BusLoss outranks JointLimit");
+        assert!(!sm.recoverable());
+        // Bus fresh, joints still outside limits -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext { joints_within_limits: false, ..driver_met }),
+            Err(ClearRefusal::JointLimitsNotSatisfied)
+        );
+        // Joints back within limits, bus still stale -> refused
+        assert_eq!(
+            sm.clear_check(&ClearContext { feedback_fresh: false, ..driver_met }),
+            Err(ClearRefusal::FreshFeedbackRequired)
+        );
+        // Both hold -> cleared
+        assert_eq!(sm.clear_with_check(&driver_met), Ok(SafetyState::Idle));
+    }
+
+    // Pair 4: ThermalTrip + JointLimit
+    let mut sm = SafetyManager::new();
+    sm.latch(FaultKind::JointLimit, FaultDetail::formatted(FaultCode::JointLimit, |b| b.push_str("jl")));
+    sm.latch(FaultKind::ThermalTrip, FaultDetail::ThermalTrip { joint_idx: 0, temperature: 90.0, limit: 75.0 });
+    assert_eq!(sm.fault_code(), Some(FaultCode::ThermalTrip));
+    assert_eq!(
+        sm.clear_check(&ClearContext { joints_within_limits: false, ..driver_met }),
+        Err(ClearRefusal::JointLimitsNotSatisfied)
+    );
+    assert_eq!(
+        sm.clear_check(&ClearContext { thermal_below_threshold: false, ..driver_met }),
+        Err(ClearRefusal::TemperatureConfirmationRequired)
+    );
+    assert_eq!(sm.clear_with_check(&driver_met), Ok(SafetyState::Idle));
+}
+
+#[test]
+fn mit_expiry_recovery_with_thermal_trip_recorded_is_refused_until_cooldown() {
+    use armd::mit::{self, MitJointQualification, MitQualificationFile};
+    use armd::protocol::damiao;
+    use armd::tracking::{JointTrackingConfig, TrackingStrategy};
+
+    const DT: f64 = 0.02;
+    let clock = MockClock::new();
+    let limits = dm_limits();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.motors[3].set_reg_u32(damiao::RID_TIMEOUT, 2000);
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+
+    let mut jt = JointTrackingConfig::rebot_dm();
+    jt.enabled = true;
+    for j in &mut jt.joints { j.strategy = TrackingStrategy::Position; }
+    let j4 = &mut jt.joints[3];
+    j4.strategy = TrackingStrategy::Mit;
+    j4.kp = 10.0;
+    j4.kd = 0.3;
+    j4.hold_kp = Some(12.0);
+    j4.hold_kd = Some(0.4);
+    j4.effort_limit_nm = 3.0;
+    j4.gravity_scale = 1.0;
+    let mut cfg = ArmConfig {
+        lease_timeout_ms: 600_000,
+        workspace: None,
+        joint_tracking: Some(jt),
+        max_temperature: 75.0,
+        ..ArmConfig::rebot_dm()
+    };
+    cfg.max_temperature = 75.0;
+
+    let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(drv));
+    let l4 = limits[3];
+    let rec = MitQualificationFile {
+        version: mit::QUALIFICATION_VERSION,
+        joints: vec![MitJointQualification {
+            profile_id: "rebot_b601dm".into(),
+            joint: 4,
+            joint_name: ArmConfig::rebot_dm().joint_names[3].clone(),
+            zero_fingerprint: mit::zero_fingerprint(0.0),
+            motor_id: 4,
+            reply_id: 0x14,
+            esc_id: 4,
+            mst_id: 0x14,
+            sw_ver: mit_support::SW_VER,
+            pmax: l4.p_max,
+            vmax: l4.v_max,
+            tmax: l4.t_max,
+            timeout_raw: 2000,
+            timeout_unit_us: damiao::TIMEOUT_UNIT_US_DOCUMENTED,
+            timeout_unit_verified: true,
+            tested_response: "disabled".into(),
+            measured_expiry_ms: 101.0,
+            worst_latency_ms: 8.0,
+            load_envelope: "unloaded, supported".into(),
+            max_kp: 15.0,
+            max_kd: 0.5,
+            effort_ceiling_nm: 4.0,
+            date: "2026-11-22T00:00:00Z".into(),
+            trace_id: "b3-fix3-test".into(),
+        }],
+        invalidated: None,
+    };
+    inner.set_calibration(Some(armd::calibration::CalibrationFile {
+        mit_qualification: serde_json::to_value(&rec).ok(),
+        ..Default::default()
+    }));
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    for _ in 0..3 { inner.tick(DT); }
+    assert!(inner.mit_active(), "MIT should be active before injected TX failure");
+
+    // Inject partial TX failure -> MIT enters MitOwner::Lost (BusLoss) and J4 command watchdog expires (0x0D).
+    bus.with(|s| s.fail_tx_after = Some(3));
+    inner.tick(DT);
+    assert_eq!(inner.mit.owner, mit::MitOwner::Lost);
+    bus.with(|s| s.fail_tx_after = None);
+    for _ in 0..8 {
+        clock.advance(Duration::from_millis(50));
+        inner.tick(DT);
+    }
+    assert!(bus.with(|s| s.motors[3].state_override == Some(0xD) && !s.motors[3].enabled));
+
+    // Now motor 0 overheats -> ThermalTrip is ALSO recorded while MitOwner::Lost!
+    bus.with(|s| s.motors[0].temperature_c = 85);
+    inner.temperatures[0] = 85.0;
+    inner.safety.latch(
+        FaultKind::ThermalTrip,
+        FaultDetail::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 75.0 },
+    );
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::BusLoss));
+    assert_eq!(inner.safety.fault_code(), Some(FaultCode::ThermalTrip));
+
+    // Attempt confirmed MIT recovery while motor 0 is STILL 85°C -> MUST be refused with ZERO recovery commands!
+    bus.clear_log();
+    let hot_err = inner.clear_fault_confirmed(true).unwrap_err();
+    assert!(
+        hot_err.to_string().contains("Temperature must be confirmed below the reset threshold"),
+        "MIT recovery with hot ThermalTrip must be refused by clear_check, got: {hot_err}"
+    );
+    let recovery_frames = bus
+        .tx_log()
+        .iter()
+        .filter(|f| (1..=7).contains(&f.id) && [damiao::CMD_DISABLE, damiao::CMD_CLEAR_FAULTS].contains(&f.data))
+        .count();
+    assert_eq!(recovery_frames, 0, "hot ThermalTrip must block MIT recovery before any motor commands are sent");
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::ThermalTrip));
+    assert!(inner.safety.has_latched_fault_kind(FaultKind::BusLoss));
+
+    // Cool motor 0 below reset threshold -> confirmed MIT recovery now passes clear_check and clears all at once!
+    bus.with(|s| s.motors[0].temperature_c = 35);
+    let mut cleared = false;
+    for _ in 0..6 {
+        match inner.clear_fault_confirmed(true) {
+            Ok(SafetyState::Idle) => { cleared = true; break; }
+            Ok(other) => panic!("unexpected state after MIT recovery: {other:?}"),
+            Err(_) => { clock.advance(Duration::from_millis(120)); inner.tick(DT); }
+        }
+    }
+    assert!(cleared, "MIT recovery must succeed once ThermalTrip cooled down: {:?}", inner.clear_fault_confirmed(true));
+    assert_eq!(inner.safety.latched_fault_kinds(), 0);
+    assert!(!inner.is_torqued);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_worst_of_across_record_other_details_observation_and_ws_api() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    // 1. Unit tests for worst-of recoverability across kinds AND across two `Other` details in BOTH orders.
+    let mut sm = SafetyManager::new();
+    sm.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+    assert!(sm.recoverable());
+    assert!(sm.fault().unwrap().recoverable);
+
+    // ControlDeadline (recoverable Other) alone -> recoverable == true.
+    let mut sm_cd = SafetyManager::new();
+    sm_cd.latch(FaultKind::Other, FaultDetail::Static(StaticFault::ControlDeadline));
+    assert!(sm_cd.recoverable());
+    assert_eq!(sm_cd.fault_code(), Some(FaultCode::ControlDeadline));
+
+    // ControlDeadline (recoverable) THEN HardwareFault (non-recoverable) -> recoverable == false!
+    sm_cd.latch(
+        FaultKind::Other,
+        FaultDetail::formatted(FaultCode::HardwareFault, |b| b.push_str("motor fault 0x0A")),
+    );
+    assert!(!sm_cd.recoverable());
+    assert!(!sm_cd.fault().unwrap().recoverable);
+    assert_eq!(sm_cd.fault_code(), Some(FaultCode::HardwareFault));
+
+    // HardwareFault (non-recoverable) THEN ControlDeadline (recoverable) -> MUST STAY recoverable == false!
+    let mut sm_rev = SafetyManager::new();
+    sm_rev.latch(
+        FaultKind::Other,
+        FaultDetail::formatted(FaultCode::HardwareFault, |b| b.push_str("motor fault 0x0B")),
+    );
+    assert!(!sm_rev.recoverable());
+    sm_rev.latch(FaultKind::Other, FaultDetail::Static(StaticFault::ControlDeadline));
+    assert!(!sm_rev.recoverable(), "recoverable Other after non-recoverable Other must keep recoverable == false");
+    assert!(!sm_rev.fault().unwrap().recoverable);
+    assert_eq!(sm_rev.fault_code(), Some(FaultCode::HardwareFault));
+
+    // Pool exhausted + WatchdogTimeout -> ThermalTrip: observation.fault.recoverable MUST be false.
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    {
+        let mut inner = sup.inner().write().await;
+        let _held = inner.safety.drain_fault_arc_pool_for_test();
+        inner.safety.latch(FaultKind::WatchdogTimeout, FaultDetail::WatchdogTimeout);
+        assert!(inner.safety.recoverable());
+        inner.safety.latch(
+            FaultKind::ThermalTrip,
+            FaultDetail::ThermalTrip { joint_idx: 0, temperature: 88.0, limit: 75.0 },
+        );
+        assert!(!inner.safety.recoverable());
+        drop(_held);
+    }
+    let obs = sup.get_observation().await;
+    let fi = obs.fault.expect("observation.fault must be present");
+    assert_eq!(fi.code, FaultCode::ThermalTrip);
+    assert!(!fi.recoverable, "observation.fault.recoverable must match SafetyManager::recoverable()");
+
+    // 2. WebSocket operator-auth API uses SafetyManager::recoverable() (two Other faults in reverse order!).
+    let sup_ws = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let router = armd::api::create_router(sup_ws.clone(), OperatorAuth::enforced("123456", 1800));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    ws.send(Message::Text(serde_json::json!({"type":"acquire_lease","seq":1,"client_id":"prog"}).to_string().into())).await.unwrap();
+    let lease_gen = loop {
+        let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        if v["type"] == "lease_granted" { break v["generation"].as_u64().unwrap(); }
+    };
+
+    // Latch non-recoverable HardwareFault, THEN recoverable ControlDeadline under FaultKind::Other.
+    {
+        let mut inner = sup_ws.inner().write().await;
+        inner.safety.latch(
+            FaultKind::Other,
+            FaultDetail::formatted(FaultCode::HardwareFault, |b| b.push_str("motor overcurrent")),
+        );
+        inner.safety.latch(FaultKind::Other, FaultDetail::Static(StaticFault::ControlDeadline));
+        assert!(!inner.safety.recoverable());
+    }
+    let ep = sup_ws.get_observation().await.epoch_id;
+    let cmd = serde_json::json!({
+        "type": "command", "request_id": 1, "path": "/api/v1/safety/clear_fault",
+        "body": {}, "generation": lease_gen, "epoch_id": ep, "client_id": "prog"
+    });
+    ws.send(Message::Text(cmd.to_string().into())).await.unwrap();
+    let reply = loop {
+        let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+        if v["type"] == "command_reject" || v["type"] == "command_ack" { break v; }
+    };
+    assert_eq!(reply["type"], "command_reject", "{reply}");
+    assert_eq!(reply["code"], "OPERATOR_REQUIRED", "WS API must use SafetyManager::recoverable(): {reply}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_latch_and_executor_clear_retry_zero_alloc_on_tagged_live_releases() {
+    let _serial = global_log().guard.lock().await;
+
+    // Part A: Live RtExecutor watchdog latching (`latch_watchdog_fault`) -> 0 heap ops on the SPECIFIC tagged release.
+    let mut wd_cfg = ArmConfig::rebot_dm();
+    wd_cfg.resting_pose = None;
+    wd_cfg.joint_tracking = None;
+    wd_cfg.lease_timeout_ms = 25;
+    let sup_wd = Arc::new(ArmSupervisor::new(wd_cfg.clone()));
+    {
+        let mut g = sup_wd.inner().write().await;
+        g.lease_enabled = true;
+        g.is_torqued = true;
+        g.feedback_numeric_valid = true;
+        g.measured_positions = wd_cfg.home_positions.clone();
+        g.commanded_positions = wd_cfg.home_positions.clone();
+        g.target_positions = wd_cfg.home_positions.clone();
+        g.measured_velocities = vec![0.0; g.config.dof];
+        g.temperatures = vec![30.0; g.config.dof];
+        let _ = g.safety.set_torque(true).unwrap();
+        g.last_heartbeat = Instant::now();
+    }
+    let mut exec_cfg = ExecutorConfig::for_tests(Duration::from_millis(4));
+    exec_cfg.alloc_timing = true;
+    let handle_wd = sup_wd.start_executor(exec_cfg.clone()).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || {
+        sup_wd.hub().latest().is_some_and(|s| matches!(s.obs.safety_state, SafetyState::Fault(FaultReason::WatchdogTimeout)))
+    }).await;
+    let wd_seq = handle_wd.stats().last_fault_latch_release_seq.load(Ordering::Acquire);
+    let wd_sample = expect_release_sample(&sup_wd, wd_seq, "watchdog latch").await;
+    assert_ne!(wd_sample.release_flags & RELEASE_FLAG_WATCHDOG_LATCH, 0, "expected WATCHDOG_LATCH flag on release {wd_seq}");
+    assert_eq!(wd_sample.usage.lock_alloc_calls, 0, "watchdog latch release allocated: {wd_sample:?}");
+    assert_eq!(handle_wd.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
+    handle_wd.stop_and_join();
+
+    // Part B: Live RtExecutor clear retry with `driver_config_error` (`reapply_driver_limits_bounded`)
+    // -> 0 heap ops on BOTH the refused retry release AND the resolved clear release!
+    struct DynamicRtLimitsDriver {
+        dof: usize,
+        pos_limits: Arc<Mutex<Vec<Option<(f32, f32)>>>>,
+        clock: MockClock,
+    }
+    impl ArmDriver for DynamicRtLimitsDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true, torque_feedback: false, temperature_feedback: false,
+                torque_feedforward: false, enable_feedback: true, load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); self.dof] }
+        fn feedback_ages_into(&self, out: &mut Vec<Option<Duration>>) {
+            out.clear(); for _ in 0..self.dof { out.push(Some(Duration::ZERO)); }
+        }
+        fn feedback_all_within(&self, dof: usize, _: Duration) -> bool { self.dof == dof }
+        fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
+            out.clear(); for _ in 0..self.dof { out.push(Some(0)); }
+        }
+        fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
+            let now = Instant::now();
+            out.clear(); for _ in 0..self.dof { out.push(Some(now)); }
+        }
+        fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
+            self.pos_limits.lock().unwrap().get(joint).copied().flatten()
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); self.dof])
+        }
+        fn read_joint_states_into(&mut self, out: &mut Vec<JointState>) -> Result<(), ArmDriverError> {
+            out.clear(); for _ in 0..self.dof { out.push(JointState::default()); } Ok(())
+        }
+        fn read_joint_states_budgeted(&mut self, out: &mut Vec<JointState>, _: Instant, _: u16) -> Result<(u16, bool), ArmDriverError> {
+            self.read_joint_states_into(out)?; Ok((self.dof as u16, false))
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+        fn clear_fault_disables_arm_joint(&self, _: usize) -> bool { false }
+        fn clock_now(&self) -> Instant { self.clock.now() }
+    }
+
+    let mut cfg = ArmConfig::default();
+    cfg.dof = 1;
+    cfg.joint_names = vec!["j1".into()];
+    cfg.limits = vec![armd::model::JointLimit::new("j1", -2.0, 2.0, 2.0, 5.0)];
+    cfg.home_positions = vec![0.0];
+    cfg.resting_pose = None;
+    let lim_ctl = Arc::new(Mutex::new(vec![Some((0.5, 1.5))])); // conflicts with home_positions [0.0]
+    let sup_lim = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(DynamicRtLimitsDriver {
+        dof: 1,
+        pos_limits: Arc::clone(&lim_ctl),
+        clock: MockClock::new(),
+    })));
+    {
+        let mut g = sup_lim.inner().write().await;
+        g.lease_enabled = false;
+        g.feedback_numeric_valid = true;
+        assert!(g.driver_config_error.is_some());
+        assert!(g.safety.has_latched_fault_kind(FaultKind::JointLimit));
+    }
+    let handle_lim = sup_lim.start_executor(exec_cfg).await.unwrap();
+    wait_until_async(Duration::from_secs(1), || handle_lim.stats().steps.load(Ordering::Relaxed) >= 6).await;
+
+    // Refused retry while limits still conflict -> 0 alloc on the EXACT tagged release!
+    let err = sup_lim.clear_fault().await.unwrap_err();
+    assert!(err.to_string().contains("Driver limit configuration error"), "{err}");
+    let retry_refuse_seq = handle_lim.stats().last_clear_release_seq.load(Ordering::Acquire);
+    let retry_refuse_sample = expect_release_sample(&sup_lim, retry_refuse_seq, "executor clear retry refusal").await;
+    assert_ne!(retry_refuse_sample.release_flags & RELEASE_FLAG_CLEAR_REFUSED, 0);
+    assert_eq!(retry_refuse_sample.usage.lock_alloc_calls, 0, "executor clear retry refusal allocated: {retry_refuse_sample:?}");
+
+    // Resolve driver limits -> retry applies limits inline, retires error off-thread, clears with 0 alloc!
+    *lim_ctl.lock().unwrap() = vec![Some((-1.0, 1.0))];
+    assert_eq!(sup_lim.clear_fault().await.unwrap(), SafetyState::Idle);
+    let retry_ok_seq = handle_lim.stats().last_clear_release_seq.load(Ordering::Acquire);
+    assert!(retry_ok_seq > retry_refuse_seq);
+    let retry_ok_sample = expect_release_sample(&sup_lim, retry_ok_seq, "executor clear retry resolved").await;
+    assert_ne!(retry_ok_sample.release_flags & RELEASE_FLAG_CLEAR_OK, 0);
+    assert_eq!(retry_ok_sample.usage.lock_alloc_calls, 0, "executor clear retry resolved allocated: {retry_ok_sample:?}");
+    assert_eq!(handle_lim.stats().wake_alloc_calls.load(Ordering::Relaxed), 0);
+    handle_lim.stop_and_join();
 }
