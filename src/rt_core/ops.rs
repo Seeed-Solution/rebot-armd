@@ -143,8 +143,9 @@ impl EpisodeRef {
 }
 
 /// A prepared start differs from the commanded position when a joint (gripper included)
-/// moved by at least this much (rad; `SupervisorInner::check_plan_fresh`).
-pub const START_TOLERANCE: f32 = 1e-4;
+/// moved by at least this much (rad): the threshold of `SupervisorInner::check_plan_fresh`
+/// ([`crate::motion::PLAN_START_TOL_RAD`]).
+pub const START_TOLERANCE: f32 = crate::motion::PLAN_START_TOL_RAD as f32;
 
 impl Primitive {
     /// The child ticket of a macro child (None: a plain primitive).
@@ -796,6 +797,14 @@ mod tests {
         assert_eq!(Primitive::joint_quintic(&[], &[], 1.0), Err("INVALID_COMMAND"));
         let Ok(Primitive::JointQuintic { dof, q, .. }) = Primitive::joint_quintic(&[0.0; MAX_DOF], &[0.2; MAX_DOF], 1.0) else { panic!() };
         assert_eq!((dof, q), (MAX_DOF as u8, [0.2; MAX_DOF]));
+    }
+
+    #[test]
+    fn the_commit_start_check_uses_the_plan_start_threshold() {
+        assert_eq!(START_TOLERANCE, crate::motion::PLAN_START_TOL_RAD as f32);
+        let t = START_TOLERANCE;
+        assert!(start_matches(&[0.0, 0.0], &[t * 0.5, 0.0]));
+        assert!(!start_matches(&[0.0, 0.0], &[0.0, t]));
     }
 
     #[test]
