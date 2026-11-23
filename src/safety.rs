@@ -292,6 +292,7 @@ impl<const N: usize> core::fmt::Write for BoundedText<N> {
 
 /// Stack-allocated mirror of [`FaultReason`] for zero-alloc deferred safety logging.
 #[derive(Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum BoundedFaultReason {
     JointLimitExceeded { joint_idx: usize, joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>, value: f32, min: f32, max: f32 },
     ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
@@ -334,6 +335,7 @@ impl std::fmt::Debug for BoundedFaultReason {
 
 /// Stack-allocated mirror of [`SafetyState`] for zero-alloc deferred safety logging.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum BoundedSafetyState {
     Booting, Idle, Armed, Moving, EStop, Fault(BoundedFaultReason),
 }
@@ -353,6 +355,7 @@ impl BoundedSafetyState {
 
 /// Bounded, heap-free safety log event deferred from the control thread to an off-thread consumer.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
 pub enum SafetyLogEvent {
     EStop { from: BoundedSafetyState },
     Fault { from: BoundedSafetyState, reason: BoundedFaultReason, code: FaultCode },
@@ -1008,6 +1011,7 @@ impl SafetyManager {
 
     /// Attempt to clear E-Stop or Fault back to Idle without heap allocation.
     /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     pub fn clear_fault_bounded(&mut self) -> Result<SafetyState, ClearFaultRefusal> {
         match &*self.state_arc {
             SafetyState::EStop | SafetyState::Fault(_) => {

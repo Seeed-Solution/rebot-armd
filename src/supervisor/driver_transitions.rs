@@ -1542,6 +1542,7 @@ impl SupervisorInner {
         self.clear_fault_finish_bounded().map_err(SafetyError::from)
     }
 
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     fn clear_fault_finish_bounded(
         &mut self,
     ) -> Result<SafetyState, crate::safety::ClearFaultError> {
@@ -1692,6 +1693,7 @@ impl SupervisorInner {
     }
 
     /// Bounded, allocation-free fault clearing for the RT executor; refusal text is rendered off-thread.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
     pub fn clear_fault_executor_bounded(&mut self, deadline: Instant) -> Result<SafetyState, crate::safety::ClearFaultError> {
         use crate::safety::{BoundedText, ClearFaultError as E, ClearFaultRefusal as R};
         if self.shutdown_committed { return Err(E::Rejected(R::ShutdownCommitted)); }

@@ -22,6 +22,7 @@ pub const INLINE_LINE_BYTES: usize = 512;
 /// Extra channel slots reserved for [`NonBlocking::flush`] tokens so flushes do not steal line slots.
 const FLUSH_HEADROOM: usize = 8;
 
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids heap allocation on log writes
 enum LinePayload {
     Inline {
         buf: [u8; INLINE_LINE_BYTES],
@@ -54,6 +55,7 @@ impl LinePayload {
     }
 }
 
+#[allow(clippy::large_enum_variant)] // inline LinePayload avoids heap allocation on log writes
 enum Msg {
     Line(LinePayload),
     Flush(SyncSender<()>),
