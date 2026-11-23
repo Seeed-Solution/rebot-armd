@@ -606,6 +606,7 @@ pub(crate) struct PendingRxPoll {
     pub active: bool,
     pub invalid_feedback: bool,
     pub driver_torque_lost: bool,
+    pub bus_feedback_fresh: bool,
     pub recovery_ages: bool,
     pub hw_rx: bool,
     pub reset_stillness_on_read_err: bool,
@@ -2188,6 +2189,8 @@ impl SupervisorInner {
                             out.reset_stillness_on_read_err = true;
                         }
                     }
+                    out.bus_feedback_fresh = self.feedback_numeric_valid
+                        && driver.feedback_all_within(self.config.dof, BUS_LOSS_TIMEOUT);
                     if driver.motor_status_into(&mut sc.status) {
                         let changed = sc.status.len() != self.motor_errors.len()
                             || sc.status.iter().zip(&self.motor_errors).any(|(code, e)| {
@@ -2228,6 +2231,7 @@ impl SupervisorInner {
             // Driverless simulation mode: each control tick produces a fresh joint sample.
             self.core.simulate_feedback(self.config.dof, Instant::now());
             self.joint_feedback_queue_bounds.clear();
+            out.bus_feedback_fresh = true;
         }
         self.scratch = sc;
         if let Some(errors) = new_motor_errors {
@@ -2263,6 +2267,7 @@ impl SupervisorInner {
         };
         let invalid_feedback = rx.invalid_feedback;
         let driver_torque_lost = rx.driver_torque_lost;
+        let bus_feedback_fresh = rx.bus_feedback_fresh;
         let recovery_ages = rx.recovery_ages;
         let hw_rx = rx.hw_rx;
         let mut sc = std::mem::take(&mut self.scratch);
@@ -2779,10 +2784,12 @@ impl SupervisorInner {
             self.gravity_torques_ramped[i] = if ramped.is_finite() { ramped } else { 0.0 };
         }
 
-        // Bus loss: no fresh feedback from every joint within BUS_LOSS_TIMEOUT.
+        // Bus loss: no fresh feedback from every joint within BUS_LOSS_TIMEOUT as observed
+        // on this release's RX poll (avoids falsely latching BusLoss when an in-release
+        // Step-3 `send_enable` resets post-enable feedback timestamps before aborting on E-stop).
         if self.is_torqued
             && self.driver.is_some()
-            && !self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
+            && !(self.feedback_numeric_valid && bus_feedback_fresh)
         {
             self.execute_stop(StopPolicy::BusLossFallback);
         }
@@ -3356,7 +3363,7 @@ impl SupervisorInner {
         }
         copy_into(&mut self.last_commanded_velocities, &self.commanded_velocities);
 
-        let feedback_fresh = self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
+        let feedback_fresh = self.feedback_numeric_valid && bus_feedback_fresh;
         if self.driver.is_some() && self.is_torqued {
             if !feedback_fresh {
                 self.output_suspended = true;
