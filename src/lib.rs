@@ -12,6 +12,7 @@ pub mod collision;
 pub mod dynamics;
 #[cfg(not(target_arch = "wasm32"))] pub mod estimate;
 #[cfg(not(target_arch = "wasm32"))] pub mod grasp;
+#[cfg(not(target_arch = "wasm32"))] pub mod grasp_select;
 pub mod gravity;
 #[cfg(not(target_arch = "wasm32"))] pub mod gravity_comp;
 pub mod gripper_baseline;

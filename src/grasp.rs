@@ -2949,8 +2949,15 @@ pub struct PlannedGrasp {
     pub mode: Option<Result<ModeInfo, String>>,
 }
 
-/// Under the lock: parse and check preconditions.
+/// Under the lock: parse and check preconditions. `strategy: "adaptive"` is refused: it is a
+/// dry-run strategy ([`crate::grasp_select`]).
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingGrasp, ArmError> {
+    if body.is_object() { crate::grasp_select::refuse_execution(body)?; }
+    prepare_any(inner, body, epoch)
+}
+
+/// [`prepare`] for any strategy (the dry run).
+fn prepare_any(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingGrasp, ArmError> {
     if !body.is_object() { return Err(MotionError::InvalidCommand("Command body must be an object".into()).into()); }
     inner.check_commissioning_for_ordinary_motion("grasp")?;
     let Some(base) = inner.grasp_setup() else {
@@ -3162,6 +3169,9 @@ pub struct DryRun {
     /// none or the provider cannot be read) and why not (`needs model switch`, supported, when
     /// the task's models differ from the resident ones).
     pub task: Option<(bool, Option<String>)>,
+    /// `strategy: "adaptive"`: the selection reply ([`crate::grasp_select::Selection::to_json`])
+    /// plus `legacy` (the legacy verdict on the same request).
+    pub adaptive: Option<Value>,
 }
 
 impl DryRun {
@@ -3176,6 +3186,9 @@ impl DryRun {
             m.insert("task_supported".into(), serde_json::json!(supported));
             m.insert("task_reason".into(), serde_json::json!(reason));
         }
+        if let Some(Value::Object(a)) = &self.adaptive {
+            for (k, v) in a { m.insert(k.clone(), v.clone()); }
+        }
         m
     }
 }
@@ -3184,7 +3197,7 @@ impl DryRun {
 /// Returns (reachable, code, message). The task requirements are not checked (see
 /// [`dry_run_task`]).
 pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>) {
-    let (reachable, code, message, _) = dry_run_plan(supervisor, body).await;
+    let (reachable, code, message, _, _) = dry_run_plan(supervisor, body).await;
     (reachable, code, message)
 }
 
@@ -3192,7 +3205,7 @@ pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Op
 /// request's task has requirements or models, none otherwise; never a model switch. The task
 /// result does not change `reachable`.
 pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> DryRun {
-    let (reachable, code, message, request) = dry_run_plan(supervisor, body).await;
+    let (reachable, code, message, request, adaptive) = dry_run_plan(supervisor, body).await;
     let task = match request {
         Some((Some(name), requires, models)) => Some(if requires.is_empty() && models.is_none() {
             (true, None)
@@ -3204,32 +3217,56 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
         }),
         _ => None,
     };
-    DryRun { reachable, code, message, task }
+    DryRun { reachable, code, message, task, adaptive }
 }
 
-/// (reachable, code, message, (task, requires, models) when the request parsed).
-async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>) {
-    let pending_res = {
-        let inner = supervisor.inner().read().await;
-        prepare(&inner, body, inner.safety.epoch_id())
-    };
+/// Dry-run verdict: (reachable, code, message, (task, requires, models) when the request parsed,
+/// the adaptive selection reply when `strategy` is `"adaptive"`).
+type DryRunPlan = (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>, Option<Value>);
+
+async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> DryRunPlan {
     let rejected = |e: ArmError| {
         let api = ApiError::from(e);
         (false, api.code.or(Some(api.error)), Some(api.message))
     };
-    match pending_res {
-        Ok(pending) => {
-            let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
-            let (reachable, code, message) = match tokio::task::spawn_blocking(move || plan(pending)).await {
-                Ok(Ok(_planned)) => (true, None, None),
-                Ok(Err(e)) => rejected(e),
-                Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}"))),
+    let strategy = match crate::grasp_select::parse_strategy(body) {
+        Ok(s) => s,
+        Err(e) => { let (r, c, m) = rejected(e.into()); return (r, c, m, None, None); }
+    };
+    let pending_res = {
+        let inner = supervisor.inner().read().await;
+        prepare_any(&inner, body, inner.safety.epoch_id()).and_then(|p| {
+            let snap = match strategy {
+                crate::grasp_select::Strategy::Adaptive => Some(crate::grasp_select::capture(&inner, &p, body)?),
+                crate::grasp_select::Strategy::Legacy => None,
             };
-            (reachable, code, message, task)
+            Ok((p, snap))
+        })
+    };
+    match pending_res {
+        Ok((pending, snap)) => {
+            let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
+            let joined = tokio::task::spawn_blocking(move || {
+                let legacy = plan(pending).map(|_| ());
+                let selection = snap.map(|s| { let sel = crate::grasp_select::select(&s); let v = sel.to_json(&s); (sel.reachable(), sel.code, sel.message, v) });
+                (legacy, selection)
+            }).await;
+            match joined {
+                Ok((legacy, None)) => {
+                    let (reachable, code, message) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
+                    (reachable, code, message, task, None)
+                }
+                Ok((legacy, Some((reachable, code, message, mut v)))) => {
+                    let (lr, lc, lm) = match legacy { Ok(()) => (true, None, None), Err(e) => rejected(e) };
+                    v["legacy"] = serde_json::json!({"reachable": lr, "code": lc, "message": lm});
+                    (reachable, code, message, task, Some(v))
+                }
+                Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}")), task, None),
+            }
         }
         Err(e) => {
             let (reachable, code, message) = rejected(e);
-            (reachable, code, message, None)
+            (reachable, code, message, None, None)
         }
     }
 }

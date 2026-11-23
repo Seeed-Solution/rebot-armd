@@ -245,7 +245,29 @@ pub fn start_pose(input: &PlanInput) -> Pose {
     end_to_frame(&input.arm.fk(&input.q0), input)
 }
 
+thread_local! {
+    /// DLS iterations of the Cartesian planners on this thread (see [`ik_iterations`]).
+    static IK_ITERATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Total DLS iterations run by [`plan_cartesian_opts`] and [`solve_goal_joints`] on the calling
+/// thread since it started; callers take differences to count the work of one plan.
+pub fn ik_iterations() -> u64 { IK_ITERATIONS.with(std::cell::Cell::get) }
+
 fn solve_ik_in_frame(
+    input: &PlanInput,
+    goal_in_frame: &Pose,
+    q_seed: &[f64; 6],
+    lo: &[f64; 6],
+    hi: &[f64; 6],
+    yaw_free: bool,
+) -> kinematics::IkResult {
+    let sol = solve_ik_in_frame_uncounted(input, goal_in_frame, q_seed, lo, hi, yaw_free);
+    IK_ITERATIONS.with(|c| c.set(c.get() + sol.iterations as u64));
+    sol
+}
+
+fn solve_ik_in_frame_uncounted(
     input: &PlanInput,
     goal_in_frame: &Pose,
     q_seed: &[f64; 6],
