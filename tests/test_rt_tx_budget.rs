@@ -52,6 +52,7 @@ enum TxRule {
 
 struct VirtualBusState {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>, // (id, limits, q, enabled, ctrl_mode)
+    motor_faults: Vec<u8>, // non-zero overrides feedback state nibble (e.g. 0x0A overcurrent)
     rx: VecDeque<CanFrame>,
     tx_log: Vec<CanFrame>,
     tx_accepted: Vec<CanFrame>,
@@ -74,8 +75,10 @@ impl VirtualBusState {
             .enumerate()
             .map(|(i, l)| (i as u16 + 1, *l, 0.0, false, damiao::CTRL_MODE_POS_VEL))
             .collect();
+        let motor_faults = vec![0u8; limits.len()];
         Self {
             motors,
+            motor_faults,
             rx: VecDeque::new(),
             tx_log: Vec::new(),
             tx_accepted: Vec::new(),
@@ -93,11 +96,16 @@ impl VirtualBusState {
 
     fn push_feedback(&mut self, idx: usize) {
         let (id, l, q, enabled, _) = self.motors[idx];
+        let state = if self.motor_faults[idx] != 0 {
+            self.motor_faults[idx]
+        } else {
+            u8::from(enabled)
+        };
         let p = damiao::float_to_uint(q, l.p_min, l.p_max, 16);
         let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
         let t = damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
         let data = [
-            (u8::from(enabled) << 4) | (id as u8 & 0x0f),
+            ((state & 0x0f) << 4) | (id as u8 & 0x0f),
             (p >> 8) as u8,
             p as u8,
             (v >> 4) as u8,
@@ -163,6 +171,8 @@ impl VirtualBusState {
                 self.motors[k].3 = true;
             } else if frame.data == damiao::CMD_DISABLE {
                 self.motors[k].3 = false;
+            } else if frame.data == damiao::CMD_CLEAR_FAULTS {
+                self.motor_faults[k] = 0;
             }
             self.push_feedback(k);
         } else if let Some(k) = self
@@ -202,6 +212,14 @@ impl VirtualBus {
 impl CanTransport for VirtualBus {
     fn clock(&self) -> Option<Arc<dyn DriverClock>> {
         Some(Arc::new(self.0.lock().unwrap().clock.clone()))
+    }
+
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
+
+    fn supports_bounded_flush(&self) -> bool {
+        true
     }
 
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
@@ -2244,6 +2262,147 @@ fn gravity_comp_recovery_rebuilds_mit_frame_fresh_and_refuses_stale() {
         j4_stale_mit.is_empty(),
         "stale (> 100 ms) gravity-comp recovery must send 0 MIT frames for J4: {j4_stale_mit:?}"
     );
+}
+
+#[test]
+fn motor_fault_plus_latched_estop_clears_via_operator_clear_fault_and_refuses_pending_stop() {
+    // Helper to build a SupervisorInner + DamiaoArmDriver in SafetyState::EStop (latched, !pending)
+    // with a live hardware motor fault (0x0A overcurrent) on J3.
+    let make_faulted_estop_supervisor = || {
+        let limits = b601_limits();
+        let (bus, clock) = VirtualBus::new(&limits);
+        bus.with(|s| s.push_all_feedback());
+        let mut driver = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        driver.read_joint_states().unwrap();
+        let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
+        let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(driver));
+        inner.lease_enabled = false;
+        // Initial healthy idle tick, then inject J3 fault 0x0A + latch an E-stop and apply it.
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        bus.with(|s| {
+            s.motor_faults[2] = 0x0A; // J3 overcurrent fault
+            s.push_all_feedback();
+        });
+        inner.e_stop_latched.store(true, Ordering::SeqCst);
+        inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        inner.tick(0.02);
+        assert_eq!(*inner.safety.state(), SafetyState::EStop);
+        assert!(inner.e_stop_latched.load(Ordering::SeqCst));
+        assert!(!inner.estop_gate().pending(), "E-stop must be applied (latched, not pending)");
+        // Ensure J3 fault feedback is freshly ingested in the driver.
+        bus.with(|s| s.push_all_feedback());
+        inner.tick(0.02);
+        (inner, bus, clock)
+    };
+
+    // Case A: Legacy `SupervisorInner::clear_fault()` resets motor fault while latched, then clears latch.
+    let (mut inner, bus, _clock) = make_faulted_estop_supervisor();
+    // Negative check: while a NEW stop is PENDING (requested > applied), clear_fault MUST refuse
+    // and emit 0 CMD_CLEAR_FAULTS frames.
+    bus.clear();
+    inner.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+    assert!(inner.estop_gate().pending());
+    let pending_err = inner.clear_fault().unwrap_err();
+    assert!(
+        bus.with(|s| !s.tx_log.iter().any(|f| f.data == damiao::CMD_CLEAR_FAULTS)),
+        "pending stop must refuse CMD_CLEAR_FAULTS: err={pending_err:?}, tx={:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+    // Apply the pending E-stop so gate is latched & !pending again.
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
+    assert!(!inner.estop_gate().pending());
+    assert!(inner.e_stop_latched.load(Ordering::SeqCst));
+
+    // Step 1: operator clear_fault while latched sends CMD_CLEAR_FAULTS to motors (including J3)
+    // and keeps the fault/E-stop latched until fresh fault-free feedback is observed.
+    bus.clear();
+    let step1_err = inner.clear_fault().unwrap_err();
+    assert!(
+        step1_err.to_string().contains("Hardware reset sent"),
+        "expected first clear_fault to send hardware reset and require fresh feedback, got {step1_err:?}"
+    );
+    let clear_frames: Vec<_> = bus.with(|s| {
+        s.tx_accepted
+            .iter()
+            .filter(|f| f.data == damiao::CMD_CLEAR_FAULTS)
+            .copied()
+            .collect()
+    });
+    assert_eq!(
+        clear_frames.len(),
+        7,
+        "operator clear_fault while latched must transmit CMD_CLEAR_FAULTS to all 7 motors: {clear_frames:?}"
+    );
+    assert!(
+        bus.with(|s| s.motor_faults[2] == 0),
+        "motor J3 fault must be cleared by CMD_CLEAR_FAULTS"
+    );
+    assert!(
+        inner.e_stop_latched.load(Ordering::SeqCst),
+        "latch must remain set until fresh fault-free feedback is verified on retry"
+    );
+
+    // Next supervisor tick ingests the fault-free feedback replies from the reset while E-stop remains latched.
+    inner.tick(0.02);
+    assert_eq!(*inner.safety.state(), SafetyState::EStop);
+    assert!(inner.e_stop_latched.load(Ordering::SeqCst));
+
+    // Step 2: retry operator clear_fault now that fresh fault-free feedback arrived -> Idle & unlatched!
+    let final_state = inner.clear_fault().expect("second clear_fault after reset must clear E-stop latch");
+    assert_eq!(final_state, SafetyState::Idle);
+    assert_eq!(*inner.safety.state(), SafetyState::Idle);
+    assert!(
+        !inner.e_stop_latched.load(Ordering::SeqCst),
+        "E-stop latch must be cleared after operator clear_fault succeeds"
+    );
+
+    // Case B: RT Executor `SupervisorInner::clear_fault_executor(deadline)` resets motor fault while
+    // latched via `clear_fault_budgeted`, then clears the latch on the next call after Step 2 feedback.
+    let (mut inner_rt, bus_rt, _clock_rt) = make_faulted_estop_supervisor();
+    bus_rt.clear();
+    let step1_rt = inner_rt
+        .clear_fault_executor(std::time::Instant::now() + ms(50))
+        .unwrap_err();
+    assert!(
+        step1_rt.to_string().contains("Hardware reset sent"),
+        "expected clear_fault_executor to send budgeted hardware reset while latched, got {step1_rt:?}"
+    );
+    let clear_frames_rt: Vec<_> = bus_rt.with(|s| {
+        s.tx_accepted
+            .iter()
+            .filter(|f| f.data == damiao::CMD_CLEAR_FAULTS)
+            .copied()
+            .collect()
+    });
+    assert_eq!(
+        clear_frames_rt.len(),
+        7,
+        "clear_fault_executor while latched must transmit CMD_CLEAR_FAULTS to all 7 motors: {clear_frames_rt:?}"
+    );
+    assert!(inner_rt.e_stop_latched.load(Ordering::SeqCst));
+    // Step 2 tick ingests fresh fault-free feedback from all 7 motors.
+    inner_rt.tick(0.02);
+    let final_rt = inner_rt
+        .clear_fault_executor(std::time::Instant::now() + ms(50))
+        .expect("second clear_fault_executor after fresh feedback must clear E-stop latch");
+    assert_eq!(final_rt, SafetyState::Idle);
+    assert_eq!(*inner_rt.safety.state(), SafetyState::Idle);
+    assert!(!inner_rt.e_stop_latched.load(Ordering::SeqCst));
+
+    // Direct driver negative check: `clear_fault_budgeted` refuses while a stop is PENDING (0 TX).
+    let (mut drv, bus_d, clock_d) = enabled_driver();
+    let req = Arc::new(AtomicU64::new(1));
+    let app = Arc::new(AtomicU64::new(0));
+    drv.set_estop_gate(EstopGate::new(req, app));
+    drv.set_abort_flag(Arc::new(AtomicBool::new(true)));
+    bus_d.clear();
+    let err = drv.clear_fault_budgeted(clock_d.now() + ms(10)).unwrap_err();
+    assert!(is_estop_inhibited(&err), "pending stop must refuse clear_fault_budgeted: {err:?}");
+    assert!(bus_d.with(|s| s.tx_log.is_empty()), "pending stop must emit 0 clear-fault frames");
 }
 
 #[test]

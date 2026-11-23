@@ -2842,7 +2842,8 @@ enum TxKind {
     Refresh,
     /// Autonomous stale-feedback recovery hold in `receive_feedback`.
     Recovery,
-    /// Hardware fault-clear frame (`CMD_CLEAR_FAULTS`).
+    /// Hardware fault-clear frame (`CMD_CLEAR_FAULTS`): refused while a stop or E-stop is
+    /// pending, allowed while latched (part of operator-authorized fault clearance).
     ClearFault,
     /// Torque-enable handshake frame (`CMD_ENABLE`, enable-time restore/readback/refresh/hold).
     Handshake,
@@ -3386,7 +3387,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let latched = self.is_stop_latched();
         match kind {
             TxKind::Disable => {}
-            TxKind::Refresh | TxKind::RollbackHold(_) => {
+            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => {
                 if pending {
                     return Err(TxRefusal::StopInhibited);
                 }
@@ -3395,7 +3396,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             | TxKind::Hold
             | TxKind::ModeWrite
             | TxKind::Recovery
-            | TxKind::ClearFault
             | TxKind::Handshake => {
                 if pending || latched {
                     return Err(TxRefusal::StopInhibited);
@@ -3412,8 +3412,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// 2. Tick TX budget check (`Disable` exempt): exhaustion returns `Deferred`, not failure.
     /// 3. Stop gate by `TxKind`:
     ///    - `Disable`: never gated.
-    ///    - `Refresh` / `RollbackHold`: refused while pending; allowed while latched
-    ///      (`RollbackHold` additionally requires fresh `<= 100 ms` feedback in step 4).
+    ///    - `Refresh` / `RollbackHold` / `ClearFault`: refused while pending; allowed while
+    ///      latched (`RollbackHold` additionally requires fresh `<= 100 ms` feedback in step 4).
     ///    - All other kinds: refused while pending OR latched.
     /// 4. Optional MIT deadline fence + build frame at send time via `build` (`None` fails closed).
     /// 5. Post-build re-read of the physical stop latch, pending gate, and stop-generation stamp
@@ -6609,7 +6609,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         if !faulted.is_empty() {
-            self.strict_stop_check(Some(start_stamp)).map_err(|e| format!("clear-error flush inhibited: {e}"))?;
+            self.pending_stop_check(Some(start_stamp)).map_err(|e| format!("clear-error flush inhibited: {e}"))?;
             self.can.flush().map_err(|e| format!("flush: {e}"))?;
         }
         // 2. no cached frame may ever be replayed; then the disable of every motor
@@ -6796,7 +6796,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        self.strict_stop_check(Some(start_stamp))?;
+        self.pending_stop_check(Some(start_stamp))?;
         if sent_any {
             if let Err(e) = self.can.flush() {
                 if err.is_none() {
@@ -6850,7 +6850,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if dl.passed(self.now()) {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
-        self.strict_stop_check(Some(start_stamp))?;
+        self.pending_stop_check(Some(start_stamp))?;
         if sent_any {
             if let Err(e) = self.can.flush() {
                 if err.is_none() {
@@ -8434,7 +8434,7 @@ mod tx_chokepoint_tests {
         // Step 3: Stop gate by TxKind.
         match kind {
             TxKind::Disable => Expected::Sent,
-            TxKind::Refresh | TxKind::RollbackHold(_) => match stop {
+            TxKind::Refresh | TxKind::RollbackHold(_) | TxKind::ClearFault => match stop {
                 StopCase::Pending => Expected::RefusedStop,
                 StopCase::NoStop | StopCase::Latched => Expected::Sent,
             },
@@ -8442,7 +8442,6 @@ mod tx_chokepoint_tests {
             | TxKind::Hold
             | TxKind::ModeWrite
             | TxKind::Recovery
-            | TxKind::ClearFault
             | TxKind::Handshake => match stop {
                 StopCase::NoStop => Expected::Sent,
                 StopCase::Pending | StopCase::Latched => Expected::RefusedStop,
@@ -8726,8 +8725,8 @@ mod tx_chokepoint_tests {
 
         // B. Flip pending stop (`req > app`) INSIDE `build` with `expected_stamp = None` so only
         //    the post-build `stop_gate_for_kind` re-read catches it: even latch-allowed kinds
-        //    (`Refresh`, latched `RollbackHold`) must refuse with `StopInhibited` and 0 TX.
-        for &kind in &[TxKind::Refresh, TxKind::RollbackHold(0)] {
+        //    (`Refresh`, latched `RollbackHold`, `ClearFault`) must refuse with `StopInhibited` and 0 TX.
+        for &kind in &[TxKind::Refresh, TxKind::RollbackHold(0), TxKind::ClearFault] {
             let (bus, _clock) = TestBus::new();
             let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1]).with_limits(limits);
             drv.read_joint_states().unwrap();
