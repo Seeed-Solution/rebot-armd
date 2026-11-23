@@ -3041,26 +3041,36 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
     {
         // Grasp close (grasp: true) through contact and squeeze against a stop at -2.0 rad:
         // every 0x307 frame (accel, cruise, contact, squeeze entry, and squeeze hold) respects
-        // the wire-encoded speed limit without jumping past raw * 0.01 * DT on squeeze.
+        // the wire-encoded speed limit, AND the holding decision waits until the wire-stepped
+        // squeeze command actually reaches the full -1.85 rad (-2.0 + 0.15) target (>= 0.52 s)
+        // plus the 0.30 s settle window instead of deciding after 0.30 s short of target.
         let (mut sup_g, inner_g, clock_g) = make_sup(Some(0.299), -5.7);
         inner_g.with(|s| s.motors[J7].stop_at = Some(-2.0));
         inner_g.clear_log();
         let ep_g = sup_g.safety.epoch_id();
-        let (id_g, _) = sup_g.start_gripper(
+        let (id_g, expected_g) = sup_g.start_gripper(
             GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
             ep_g,
         ).unwrap();
+        // expected_duration includes travel (5.7 / 0.29) + squeeze advance (0.15 / 0.29) + 0.5 + settle (0.3).
+        assert!(
+            expected_g >= 5.7 / 0.29 + 0.15 / 0.29 + 0.79,
+            "expected_duration {expected_g:.3} s missing squeeze advance time"
+        );
         let mut frames_checked = 0usize;
-        let mut saw_squeeze = false;
+        let mut squeeze_start_tick: Option<usize> = None;
+        let mut done_tick: Option<usize> = None;
+        let mut max_cmd_q = f32::NEG_INFINITY;
         let mut done_action = None;
-        for _ in 0..(25.0 / DT) as usize {
+        for tick in 0..(25.0 / DT) as usize {
             let q_prev = sup_g.commanded_positions[J7];
             inner_g.clear_log();
             clock_g.advance(Duration::from_millis(20));
             sup_g.tick(DT);
             let q_curr = sup_g.commanded_positions[J7];
-            if q_curr > -2.0 && sup_g.measured_positions[J7] <= -1.99 {
-                saw_squeeze = true;
+            max_cmd_q = max_cmd_q.max(q_curr);
+            if squeeze_start_tick.is_none() && q_curr > -2.0 && sup_g.measured_positions[J7] <= -1.99 {
+                squeeze_start_tick = Some(tick);
             }
             for f in j7_commands(&inner_g.tx_log()) {
                 assert_eq!(f.id, 0x307);
@@ -3083,13 +3093,34 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
             let a = sup_g.last_action.clone().unwrap();
             assert_eq!(a.id, id_g);
             if !a.is_running() {
+                done_tick = Some(tick);
                 done_action = Some(a);
                 break;
             }
         }
         let a = done_action.expect("grasp close at 0.299 did not finish within 25s");
         assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
-        assert!(frames_checked > 0 && saw_squeeze, "frames_checked={frames_checked} saw_squeeze={saw_squeeze}");
+        let sq_start = squeeze_start_tick.expect("never entered squeeze");
+        let sq_dur_s = (done_tick.unwrap() - sq_start) as f64 * DT;
+        assert!(
+            max_cmd_q >= -1.855,
+            "squeeze ended short of full -1.85 target: max_cmd_q={max_cmd_q:.4}, sq_dur_s={sq_dur_s:.2}"
+        );
+        assert!(
+            sq_dur_s >= 0.78,
+            "squeeze holding decided too early ({sq_dur_s:.2} s < ~0.52 s advance + 0.30 s settle)"
+        );
+        assert!(frames_checked > 0, "frames_checked={frames_checked}");
+
+        // Pos-force opening keeps previous opening behaviour (no new wire stepping or rounding).
+        let policy = ArmConfig::rebot_dm().gripper_policy.unwrap();
+        let lim = ArmConfig::rebot_dm().limits[J7].clone();
+        let open_gm = armd::motion::GripperMotion::try_with_close_speed_limit(
+            GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 0.299, timeout_s: None, tag: None },
+            policy, lim, 0.0, J7, Some(0.30),
+        ).unwrap();
+        assert_eq!(open_gm.planned_vel_raw, None, "opening should not enable close wire stepping");
+        assert_eq!(open_gm.planned_speed, 0.299, "opening should keep requested speed without close rounding");
     }
 }
 
