@@ -1113,3 +1113,66 @@ async fn popped_motion_command_held_at_lock_is_refused_after_legacy_stop() {
     assert_eq!((ok_jog["type"].as_str(), ok_jog["request_id"].as_u64()), (Some("command_ack"), Some(12)), "{ok_jog}");
     assert!(sup.inner().read().await.active_trajectory.is_some());
 }
+
+// 12. Round 3 Item 2 (Major): urgent Stop request_id does not advance ordinary `last_request`, so
+//     send-order allocation (ordinary 5, Stop 6, ordinary 7) never fails INVALID_COMMAND.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn urgent_stop_does_not_reject_earlier_or_later_ordinary_request_ids() {
+    let det = SlowDetector::new();
+    let sup = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    let addr = serve_with_slow_detector(sup.clone(), det.clone()).await;
+    let (mut ws, gen) = controller(addr).await;
+    let ep = sup.get_observation().await.epoch_id;
+    let conn_id = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+    let _worker_guard = WorkerLockHookGuard(conn_id.clone());
+
+    // (a) Ordinary 5 (read-only dry-run) held before lock while Stop 6 ACKs; releasing 5 + sending 7 both ACK.
+    det.release_now();
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, true);
+    send(&mut ws, json!({"type": "command", "request_id": 5, "generation": gen, "epoch_id": ep, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_worker_before_lock_blocked_count(&conn_id) >= 1).await;
+
+    send(&mut ws, json!({"type": "command", "request_id": 6, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/stop", "body": {}})).await;
+    let stop6 = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((stop6["type"].as_str(), stop6["request_id"].as_u64()), (Some("command_ack"), Some(6)), "{stop6}");
+
+    armd::api::ws::set_test_ws_worker_before_lock_paused(&conn_id, false);
+    send(&mut ws, json!({"type": "command", "request_id": 7, "generation": gen, "epoch_id": ep, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    let r5 = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    let r7 = next_of(&mut ws, &["command_ack", "command_reject"]).await;
+    assert_eq!((r5["type"].as_str(), r5["request_id"].as_u64()), (Some("command_ack"), Some(5)), "{r5}");
+    assert_eq!((r7["type"].as_str(), r7["request_id"].as_u64()), (Some("command_ack"), Some(7)), "{r7}");
+
+    // (b) Ordinary 5 queued behind slow dry-run + Stop 6 -> 5 is cancelled STOPPED (not INVALID_COMMAND), ordinary 7 ACKs.
+    let det2 = SlowDetector::new();
+    let sup2 = Arc::new(ArmSupervisor::new(config_with_slow_task()));
+    let addr2 = serve_with_slow_detector(sup2.clone(), det2.clone()).await;
+    let (mut ws2, gen2) = controller(addr2).await;
+    let ep2 = sup2.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws2, gen2, ep2, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+    let ep2 = sup2.get_observation().await.epoch_id;
+    send(&mut ws2, json!({"type": "command", "request_id": 4, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/action/grasp", "body": slow_dry_run_body()})).await;
+    wait_until(Duration::from_secs(1), || det2.entered.load(Ordering::SeqCst)).await;
+    send(&mut ws2, json!({"type": "command", "request_id": 5, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    send(&mut ws2, json!({"type": "command", "request_id": 6, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/motion/stop", "body": {}})).await;
+    let mut got_5 = None;
+    let mut got_6 = None;
+    while got_5.is_none() || got_6.is_none() {
+        let m = next_of(&mut ws2, &["command_ack", "command_reject"]).await;
+        match m["request_id"].as_u64() {
+            Some(5) => got_5 = Some(m),
+            Some(6) => got_6 = Some(m),
+            _ => {}
+        }
+    }
+    let m5 = got_5.unwrap();
+    let m6 = got_6.unwrap();
+    assert_eq!(m6["type"], "command_ack", "{m6}");
+    assert_eq!((m5["type"].as_str(), m5["code"].as_str()), (Some("command_reject"), Some("STOPPED")), "{m5}");
+    det2.release_now();
+    let m4 = next_of(&mut ws2, &["command_ack", "command_reject"]).await;
+    assert_eq!((m4["type"].as_str(), m4["request_id"].as_u64()), (Some("command_ack"), Some(4)), "{m4}");
+    send(&mut ws2, json!({"type": "command", "request_id": 7, "generation": gen2, "epoch_id": ep2, "path": "/api/v1/torque", "body": {"enable": true}})).await;
+    let m7 = next_of(&mut ws2, &["command_ack", "command_reject"]).await;
+    assert_eq!((m7["type"].as_str(), m7["request_id"].as_u64()), (Some("command_ack"), Some(7)), "{m7}");
+}

@@ -1139,7 +1139,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let connection = format!("connection:{}", NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed));
     let connection_generation = Arc::new(AtomicU64::new(0));
     let client_label: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let last_request: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    // Urgent Stop request_id ordering is tracked independently of ordinary RPCs so an urgent Stop
+    // overtaking queued ordinary requests never causes earlier ordinary IDs to fail INVALID_COMMAND.
+    let last_urgent_stop_request: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
     let conn_stop_gen = Arc::new(AtomicU64::new(0));
     let in_flight_stop = Arc::new(Mutex::new(InFlightStopState::default()));
     let ordinary_queue = OrdinaryQueue::new();
@@ -1255,7 +1257,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let reader_connection = connection.clone();
     let reader_generation = connection_generation.clone();
     let reader_client_label = client_label.clone();
-    let reader_last_request = last_request.clone();
+    let reader_last_request = last_urgent_stop_request.clone();
     let reader_stop_gen = conn_stop_gen.clone();
     let reader_in_flight_stop = in_flight_stop.clone();
     let reader_ordinary_queue = ordinary_queue.clone();
@@ -1495,7 +1497,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
     let recv_client_label = client_label.clone();
-    let recv_last_request = last_request.clone();
     let recv_stop_gen = conn_stop_gen.clone();
     let worker_ordinary_queue = ordinary_queue.clone();
     let worker_writer = writer.clone();
@@ -1511,6 +1512,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         // the operator session of this connection: from the upgrade request, replaced by `auth` messages
         let ws_auth = WsAuth::new(auth, ws_token, explicit_auth);
         let mut last_sequence: Option<u64> = None;
+        let mut last_ordinary_request: Option<u64> = None;
         // Delayed acks (sent after a state-file write) come back here and are stamped with
         // the current epoch and enqueued; the writer task enforces wire epoch monotonicity.
         let (ack_tx, mut ack_rx) = mpsc::channel::<Value>(64);
@@ -1633,12 +1635,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // depth measurement: read-only, no motion, no lease
             if kind == "command" && value.get("path").and_then(Value::as_str) == Some(crate::depth_measure::PATH) {
                 let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_request_get(&recv_last_request).is_some_and(|last| request_id.unwrap() <= last) {
+                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
                     let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                     continue;
                 }
-                last_request_advance(&recv_last_request, request_id);
+                last_ordinary_request = request_id;
                 if let Some(e) = lease_free_operator_check(&ws_auth, crate::depth_measure::PATH, &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
@@ -1655,12 +1657,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // teach commands without a motion lease (episode store; recorder ownership)
             if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
                 let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_request_get(&recv_last_request).is_some_and(|last| request_id.unwrap() <= last) {
+                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
                     let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                     continue;
                 }
-                last_request_advance(&recv_last_request, request_id);
+                last_ordinary_request = request_id;
                 if let Some(e) = lease_free_operator_check(&ws_auth, value["path"].as_str().unwrap_or(""), &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
@@ -1846,10 +1848,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 response = cancelled_reply(&value, "STOPPED", Some(epoch));
                             } else if kind == "command" {
                                 let request_id = value.get("request_id").and_then(Value::as_u64);
-                                if request_id.is_none() || last_request_get(&recv_last_request).is_some_and(|last| request_id.unwrap() <= last) {
+                                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
                                     response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
                                 } else {
-                                    last_request_advance(&recv_last_request, request_id);
+                                    last_ordinary_request = request_id;
                                     let path = value.get("path").and_then(Value::as_str).unwrap_or("");
                                     if let Some(auth_err) = check_operator_privilege(&ws_auth, &mut inner, path, &value["body"], epoch) {
                                         response = Some(command_reject(&inner, &value["request_id"], auth_err));
