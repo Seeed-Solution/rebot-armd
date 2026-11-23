@@ -36,12 +36,17 @@ struct SessionFrames {
     last_tick: Option<u64>,
 }
 
-/// Consumer state: sessions in start order (normally one; two when a new session starts
-/// before the previous one is collected).
+/// Consumer state: sessions in start order (normally one; more when a new session starts
+/// before the previous one is collected). Each [`Fence::collect`] removes only its own
+/// session, so fences can be collected in any order.
 #[derive(Default)]
 struct Assembly {
     sessions: VecDeque<SessionFrames>,
 }
+
+/// Uncollected sessions kept by the consumer; beyond it the oldest is discarded (a leak bound
+/// for fences dropped without [`Fence::collect`]; every armd path collects its fence).
+pub const MAX_PENDING_SESSIONS: usize = 4;
 
 /// Ring storage shared by the producer (the tick) and the consumer side.
 pub struct RecordRing {
@@ -95,6 +100,7 @@ impl RecordRing {
             let slot = unsafe { &*self.slots[(tail % RECORD_RING_CAPACITY as u64) as usize].get() };
             if slot.session != 0 {
                 if asm.sessions.back().is_none_or(|s| s.session != slot.session) {
+                    if asm.sessions.len() >= MAX_PENDING_SESSIONS { asm.sessions.pop_front(); }
                     asm.sessions.push_back(SessionFrames { session: slot.session, frames: Vec::new(), first_tick: None, last_tick: None });
                 }
                 let s = asm.sessions.back_mut().expect("pushed above");
@@ -201,6 +207,7 @@ impl RecordProducer {
 }
 
 /// A session ended by [`RecordProducer::end`]: the samples its ticks pushed.
+#[must_use = "collect the fence (off the tick, without the supervisor lock) or its frames stay in the ring's consumer"]
 pub struct Fence {
     ring: Arc<RecordRing>,
     session: u64,
@@ -210,20 +217,20 @@ pub struct Fence {
 }
 
 impl Fence {
-    /// The session's frames (drains the ring up to the fence and beyond; allocates; call it
-    /// without the supervisor lock). Frames of older uncollected sessions are discarded.
+    /// The session's frames (drains the ring up to the fence and beyond; allocates and takes
+    /// the consumer mutex, which a preempted dispatcher can hold: call it on a blocking thread,
+    /// never on an async worker or the tick, and without the supervisor lock). Removes only
+    /// this session's frames: other sessions' fences can be collected before or after it.
     pub fn collect(self) -> Finished {
         let mut asm = self.ring.assembly.lock().unwrap_or_else(|e| e.into_inner());
         self.ring.drain_locked(&mut asm);
         debug_assert!(self.ring.tail.load(Ordering::Relaxed) >= self.head);
         let mut done = Finished { dropped: self.dropped, ..Finished::default() };
-        while asm.sessions.front().is_some_and(|s| s.session <= self.session) {
-            let s = asm.sessions.pop_front().expect("checked");
-            if s.session == self.session {
-                done.frames = s.frames;
-                done.first_tick = s.first_tick;
-                done.last_tick = s.last_tick;
-            }
+        if let Some(i) = asm.sessions.iter().position(|s| s.session == self.session) {
+            let s = asm.sessions.remove(i).expect("position is in range");
+            done.frames = s.frames;
+            done.first_tick = s.first_tick;
+            done.last_tick = s.last_tick;
         }
         done
     }
@@ -267,6 +274,39 @@ mod tests {
         let second = p.finish();
         assert_eq!((second.frames.len(), second.first_tick), (1, Some(2)));
         assert!(p.end().is_none());
+    }
+
+    #[test]
+    fn fences_are_collected_in_any_order() {
+        let mut p = RecordProducer::new(1);
+        p.begin();
+        p.push(1, 1.0, &[1.0], &[1.0]);
+        p.push(2, 1.1, &[1.0], &[1.0]);
+        let a = p.end().unwrap();
+        p.begin();
+        p.push(3, 2.0, &[2.0], &[2.0]);
+        let b = p.end().unwrap();
+        // B first: A's frames stay with the consumer
+        let second = b.collect();
+        assert_eq!((second.frames.len(), second.first_tick, second.last_tick), (1, Some(3), Some(3)));
+        let first = a.collect();
+        assert_eq!((first.frames.len(), first.first_tick, first.last_tick), (2, Some(1), Some(2)));
+    }
+
+    #[test]
+    fn uncollected_sessions_are_bounded() {
+        let mut p = RecordProducer::new(1);
+        let mut kept = Vec::new();
+        for k in 0..(MAX_PENDING_SESSIONS as u64 + 2) {
+            p.begin();
+            p.push(k + 1, k as f64, &[0.0], &[0.0]);
+            kept.push(p.end().unwrap());
+            p.ring().unwrap().drain();
+        }
+        // the two oldest were discarded; the newest four are intact
+        let mut sizes: Vec<usize> = kept.into_iter().map(|f| f.collect().frames.len()).collect();
+        sizes.reverse();
+        assert_eq!(sizes, vec![1, 1, 1, 1, 0, 0]);
     }
 
     #[test]
