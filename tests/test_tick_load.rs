@@ -126,7 +126,7 @@ fn run_load(with_writer: bool) {
             let dt = last.elapsed().as_secs_f64();
             last = now;
             let t = Instant::now();
-            handle.block_on(control_sup.tick(dt));
+            handle.block_on(control_sup.control_tick(dt));
             walls.push(t.elapsed().as_micros() as u64);
         }
         walls
