@@ -170,6 +170,19 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .ui-switch { margin: 0 auto; }
 .ui-switch button { min-width: 112px; }
 .ui-switch .short { display: none; }
+/* the title never runs under the mode switch: it does not shrink below its text; it drops the subtitle, then the
+   text, as the header narrows (header probe at 360-1440 px, zh / en, simple / expert) */
+.brand { flex: none; }
+@media (max-width: 1279px) { .brand-text .full { display: none; } }
+@media (max-width: 999px) { .brand-text { display: none; } }
+@media (max-width: 1279px) { .ui-switch button { min-width: 88px; } }
+@media (max-width: 899px) {
+  .topbar { gap: 8px; }
+  .head-stats #link-badge { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { min-width: 0; padding: 0 10px; }
+}
 .head-stats { display: flex; align-items: center; gap: 8px; }
 .speed-pill {
   width: 52px; height: 26px; border-radius: 13px; padding: 0; margin: 0;
@@ -446,8 +459,8 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
-/* phones: the stock tool's name gives way to the header controls (the language switch went off screen) */
-@media (max-width: 600px) { #tool-badge.is-stock { display: none; } }
+/* phones and tablets: the stock tool's name gives way to the header controls (the language switch went off screen) */
+@media (max-width: 999px) { #tool-badge.is-stock { display: none; } }
 .cwiz-fail ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
 .cwiz-grip { display: grid; gap: 8px; justify-items: start; }
@@ -629,7 +642,7 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
   #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
 }
 /* the full name ("点位与动作" / "Positions & motions") where the header has room for it */
-@media (min-width: 1000px) {
+@media (min-width: 1180px) {
   #btn-pset .hd-lbl { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
   #btn-pset .hd-lbl-s { display: none; }
 }
