@@ -1266,3 +1266,109 @@ fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_he
         });
     });
 }
+
+#[test]
+fn production_executor_mock_positive_control_counts_and_catches_try_read_on_armd_control() {
+    run_bounded_fixture(Duration::from_secs(15), "mock-positive-control", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            validate_startup_owner(RtOwner::Executor, "mock").expect("--follower mock owner allowed");
+
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+            sup.set_lease_enabled(false).await;
+            sup.set_torque(true).await.expect("enable torque on mock arm");
+
+            let inner_lock = Arc::clone(sup.inner());
+            let probe_armed = Arc::new(AtomicBool::new(false));
+            let probe_done = Arc::new(AtomicBool::new(false));
+            let probe_record: Arc<Mutex<Option<(ThreadId, bool, u64, u64, String)>>> =
+                Arc::new(Mutex::new(None));
+
+            let armed_h = Arc::clone(&probe_armed);
+            let done_h = Arc::clone(&probe_done);
+            let rec_h = Arc::clone(&probe_record);
+            let hooks = PersistTestHooks {
+                before_publish: Some(Arc::new(move || {
+                    if !armed_h.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    // Assert the production control-thread mark directly inside the hook on armd-control.
+                    assert!(
+                        on_rt_control_thread(),
+                        "before_publish hook must execute on the marked armd-control thread"
+                    );
+                    let before = inner_lock.control_thread_attempts();
+                    let panic_msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = inner_lock.try_read();
+                    }))
+                    .expect_err("SupervisorLock::try_read must panic on armd-control");
+                    let after = inner_lock.control_thread_attempts();
+                    *rec_h.lock().unwrap() = Some((
+                        thread::current().id(),
+                        on_rt_control_thread(),
+                        before,
+                        after,
+                        panic_payload_to_string(panic_msg),
+                    ));
+                    done_h.store(true, Ordering::Release);
+                })),
+                ..Default::default()
+            };
+
+            let handle = sup
+                .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+                .await
+                .expect("start production executor for mock positive control");
+            assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            let exec_tid = handle.executor_thread_id();
+
+            // Hold the same detached `sup.inner()` lock as the contention fixture and confirm 0
+            // attempts across baseline releases before arming the one-shot probe.
+            let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup), deadline);
+            let seq_before = sup.hub().published_seq();
+            wait_until_deadline(deadline, ">= 2 baseline releases before positive control", || {
+                sup.hub().published_seq() >= seq_before + 2
+            });
+            assert_eq!(sup.inner().control_thread_attempts(), 0);
+
+            // Trigger exactly one `try_read()` from `before_publish` on `armd-control`.
+            probe_armed.store(true, Ordering::Release);
+            wait_until_deadline(deadline, "positive-control probe executed on armd-control", || {
+                probe_done.load(Ordering::Acquire)
+            });
+
+            // Executor must keep running and advancing publications after catching the panic.
+            let seq_after_probe = sup.hub().published_seq();
+            wait_until_deadline(deadline, ">= 3 releases after caught positive-control panic", || {
+                sup.hub().published_seq() >= seq_after_probe + 3
+            });
+            assert!(!handle.is_exited(), "executor must keep running after catching probe panic");
+
+            let (hook_tid, marked, before, after, msg) = probe_record
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("probe record populated on armd-control");
+            assert_eq!(hook_tid, exec_tid, "probe must run on armd-control thread");
+            assert!(marked, "armd-control thread must be marked inside before_publish");
+            assert_eq!((before, after), (0, 1), "control_thread_attempts must advance 0 -> 1");
+            assert!(
+                msg.contains("RT control thread") && msg.contains("SupervisorLock::try_read"),
+                "unexpected positive-control panic message: {msg:?}"
+            );
+            assert_eq!(
+                sup.inner().control_thread_attempts(),
+                1,
+                "control_thread_attempts must stay at exactly 1 after single probe"
+            );
+
+            writer_hold.release();
+            handle.stop_and_join();
+            assert_eq!(sup.inner().control_thread_attempts(), 1);
+        });
+    });
+}
