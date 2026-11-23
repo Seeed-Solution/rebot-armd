@@ -255,3 +255,4 @@ fn default_timeout_covers_a_full_stroke() {
     let a = run(&mut inner, id, 5.0);
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
 }
+

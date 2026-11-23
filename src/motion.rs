@@ -1157,6 +1157,72 @@ impl PathTrajectory {
     }
 }
 
+/// Contact stiffness bounds for [`CapRamp`] (N·m/rad).
+pub const CAP_RAMP_K_MIN: f32 = 2.0;
+pub const CAP_RAMP_K_MAX: f32 = 5000.0;
+/// Stiffness assumed when a ramp starts without a measured trip (N·m/rad).
+pub const CAP_RAMP_K_UNKNOWN: f32 = 300.0;
+/// The ramp steps only while |τ| is below the hold torque minus this (N·m).
+pub const CAP_RAMP_MARGIN_NM: f32 = 0.05;
+/// Torque-cap trips on one contact after which the grip is no longer ramped back in.
+pub const CAP_RAMP_MAX_TRIPS: u32 = 3;
+
+/// Grip ramp after a torque-cap latch (servo streams, grasp squeeze): presses back in from
+/// the measured jaw toward a hold torque below the cap, with steps sized from the contact
+/// stiffness so the predicted torque after a step stays at or below the hold torque.
+///
+/// The stiffness estimate starts from the trip (|τ| over the command's lead on the jaw at the
+/// over-cap sample) and only grows with each step's observed torque change (Δτ / Δq), so a
+/// stiff contact is never stepped into with a soft estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapRamp {
+    /// Contact stiffness estimate (N·m/rad).
+    pub k_est: f32,
+    /// Torque-cap trips on this contact.
+    pub trips: u32,
+    last_step: f32,
+    last_tau: f32,
+}
+
+impl CapRamp {
+    /// A ramp after a trip at |τ| `tau_abs` with the command `lead` rad ahead of the jaw.
+    pub fn from_trip(tau_abs: f32, lead: f32) -> Self {
+        let k = if lead > 1e-3 && tau_abs.is_finite() { tau_abs / lead } else { CAP_RAMP_K_UNKNOWN };
+        Self { k_est: k.clamp(CAP_RAMP_K_MIN, CAP_RAMP_K_MAX), trips: 1, last_step: 0.0, last_tau: 0.0 }
+    }
+
+    /// A ramp without a measured trip (stiffness unknown).
+    pub fn unknown() -> Self { Self { k_est: CAP_RAMP_K_UNKNOWN, trips: 0, last_step: 0.0, last_tau: 0.0 } }
+
+    /// A ramp continuing a supervisor latch with stiffness estimate `k` (one trip so far).
+    pub fn with_k(k: f32) -> Self { Self { k_est: k.clamp(CAP_RAMP_K_MIN, CAP_RAMP_K_MAX), trips: 1, last_step: 0.0, last_tau: 0.0 } }
+
+    /// Another trip on the same contact.
+    pub fn trip(&mut self, tau_abs: f32, lead: f32) {
+        let k = Self::from_trip(tau_abs, lead).k_est;
+        self.k_est = self.k_est.max(k);
+        self.trips = self.trips.saturating_add(1);
+        self.last_step = 0.0;
+    }
+
+    /// No more ramping on this contact (too many trips).
+    pub fn exhausted(&self) -> bool { self.trips >= CAP_RAMP_MAX_TRIPS }
+
+    /// Step (rad, >= 0, in the closing direction) for the current |τ| toward `hold_nm`, at most
+    /// `max_step`; 0 at or above `hold_nm - CAP_RAMP_MARGIN_NM` or once exhausted.
+    pub fn step(&mut self, tau_abs: f32, hold_nm: f32, max_step: f32) -> f32 {
+        if self.last_step > 1e-6 && tau_abs.is_finite() {
+            let k_obs = (tau_abs - self.last_tau) / self.last_step;
+            if k_obs.is_finite() { self.k_est = self.k_est.max(k_obs.min(CAP_RAMP_K_MAX)); }
+        }
+        self.last_tau = tau_abs;
+        let room = hold_nm - tau_abs;
+        let dq = if self.exhausted() || !tau_abs.is_finite() || room <= CAP_RAMP_MARGIN_NM { 0.0 } else { (room / self.k_est).min(max_step).max(0.0) };
+        self.last_step = dq;
+        dq
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
 enum GripPhase {
@@ -1164,7 +1230,7 @@ enum GripPhase {
     /// Squeezing an object: hold target, samples of |τ_gripper| and |load_gripper|.
     /// `ramp`: the squeeze started at the measured position after a torque cap trip and
     /// presses in (squeeze_rad over half the window) until the torque reaches SQUEEZE_RAMP_FRACTION of the cap.
-    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32>, ramp: bool },
+    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32>, ramp: bool, cap_ramp: CapRamp },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1204,6 +1270,8 @@ pub struct GripperMotion {
     progress_ref: (f64, f32),
     /// Every tick of the current progress window moved within the learned free-motion threshold.
     window_unloaded: bool,
+    /// Stiffness estimate of the supervisor's torque-cap latch ([`Self::set_cap_stiffness`]).
+    cap_k: Option<f32>,
 }
 
 /// Which finished gripper moves are offered to the free-motion baseline.
@@ -1236,7 +1304,7 @@ impl GripperMotion {
             phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0,
             baseline: None, learn: LearnMode::Off, samples: None,
             last_contact: None, loaded: false, learned: None, extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
-            window_unloaded: true,
+            window_unloaded: true, cap_k: None,
         };
         m.extendable = m.request.timeout_s.is_none();
         m.timeout_s = m.request.timeout_s
@@ -1264,6 +1332,10 @@ impl GripperMotion {
     /// The finished move when it was unloaded (no contact, stall or torque cap trip away from
     /// the target, no object held): offered to the baseline once.
     pub fn take_learning(&mut self) -> Option<MoveRecord> { self.learned.take() }
+
+    /// Stiffness estimate of the supervisor's torque-cap latch (set each tick by the supervisor;
+    /// None without a latch): a squeeze that starts after a cap trip ramps with it.
+    pub fn set_cap_stiffness(&mut self, k: Option<f32>) { self.cap_k = k; }
 
     /// Upper bound of the deadline (s): the explicit `timeout_s`, else the derived bound.
     pub fn hard_timeout_s(&self) -> f64 { self.hard_timeout_s }
@@ -1368,7 +1440,7 @@ impl GripperMotion {
         let contact_stop = self.contact_stop();
         let yielded = self.contact_yielded(m_g, tau_g, ctx.torque_feedback);
         let mut rearm = false;
-        if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp } = &mut self.phase {
+        if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp, cap_ramp } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
             loads.push(ctx.loads.get(idx).copied().unwrap_or(0.0).abs());
@@ -1377,12 +1449,14 @@ impl GripperMotion {
                 let press = (*hold - m_g) * dir;
                 if tau_g.abs() > cap {
                     // over the cap: hold the measured jaw (no press), like the supervisor's latch,
-                    // then press in again on the ramp up to SQUEEZE_RAMP_FRACTION of the cap (a
-                    // proportional back-off kept pressing and overshot the cap on stiff objects)
+                    // then press in again on the stiffness-sized ramp (CapRamp) up to
+                    // SQUEEZE_RAMP_FRACTION of the cap; after CAP_RAMP_MAX_TRIPS trips it holds
+                    if *ramp { cap_ramp.trip(tau_g.abs(), press.max(0.0)); } else { *cap_ramp = CapRamp::from_trip(tau_g.abs(), press.max(0.0)); }
                     if press > 0.0 { *hold = m_g; }
                     *ramp = true;
-                } else if *ramp && tau_g.abs() < SQUEEZE_RAMP_FRACTION * cap && press < squeeze_rad {
-                    *hold += dir * ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
+                } else if *ramp && press < squeeze_rad {
+                    let max_step = ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
+                    *hold += dir * cap_ramp.step(tau_g.abs(), SQUEEZE_RAMP_FRACTION * cap, max_step);
                 }
             }
             if idx < positions.len() { positions[idx] = *hold; }
@@ -1531,7 +1605,8 @@ impl GripperMotion {
                 if idx < positions.len() { positions[idx] = hold; }
                 if idx < velocities.len() { velocities[idx] = 0.0; }
                 let ramp = capped && self.policy.max_close_torque_nm.is_some();
-                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp };
+                let cap_ramp = self.cap_k.map_or_else(CapRamp::unknown, CapRamp::with_k);
+                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp, cap_ramp };
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {
