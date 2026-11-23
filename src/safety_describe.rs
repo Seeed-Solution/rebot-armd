@@ -403,6 +403,8 @@ impl SupervisorInner {
                     "squeeze_rad": g.squeeze_rad,
                     "contact_speed_rad_s": crate::motion::GRIPPER_CONTACT_SPEED,
                     "stream_contact_speed_rad_s": g.stream_contact_speed_rad_s,
+                    // closing speed of grasp / place / sequence closes and calibration strokes
+                    "close_speed_rad_s": g.close_speed(),
                     // grasp contact relative to the learned free-motion torque (crate::gripper_baseline)
                     "contact_baseline": {
                         "rule": "contact when |torque| >= baseline(position, direction, speed band) + max(margin_floor_nm, margin_spreads x spread), at least min_contact_nm, below cap_fraction x max_close_torque_nm, for 3 ticks; where no baseline is learned, contact_torque_nm for 2 ticks; the torque cap does not depend on it",

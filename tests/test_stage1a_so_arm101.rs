@@ -67,6 +67,7 @@ fn so_arm101_config() -> ArmConfig {
         contact_torque_nm: None,
         max_lead_rad: None,
         stream_contact_speed_rad_s: None,
+        close_speed_rad_s: None,
     });
     c.grasp = Some(dm.grasp.unwrap());
     c.gravity_comp = None;

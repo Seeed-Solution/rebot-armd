@@ -280,30 +280,37 @@ impl MacroCtx {
         sub_res.map_err(|s| (s, true))
     }
 
-    /// Run a gripper open / close sub-motion and wait for it.
+    /// Run a gripper open / close sub-motion and wait for it. Opens at 1 rad/s within 8 s; a
+    /// close at `gripper_policy.close_speed_rad_s` with the derived deadline.
     pub async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
-        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: Some(8.0), tag: None };
         let limit = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            let close_speed = inner.config.gripper_policy.as_ref().map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+            let (speed, timeout_s) = if command == GripperCommand::Close { (close_speed, None) } else { (1.0, Some(8.0)) };
+            let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed, timeout_s, tag: None };
             inner.start_macro_gripper(self.id, request).map_err(arm_fail)?
         };
         self.wait_sub(phase, limit + 10.0).await
     }
 
-    /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it.
+    /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it: at
+    /// `gripper_policy.close_speed_rad_s` when it closes the jaw, else 1 rad/s within 8 s.
     pub async fn gripper_move(&self, phase: &str, fraction: f64) -> Result<SubDone, Stop> {
-        let request = GripperRequest {
-            command: GripperCommand::Move,
-            fraction: Some(fraction),
-            grasp: false,
-            speed: 1.0,
-            timeout_s: Some(8.0),
-            tag: None,
-        };
         let limit = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            let closes = match (inner.config.gripper_policy.as_ref(), inner.config.gripper_index()) {
+                (Some(p), Some(g)) => {
+                    let target = p.closed_rad + fraction as f32 * (p.open_rad - p.closed_rad);
+                    let dir = if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 };
+                    (target - inner.commanded_positions.get(g).copied().unwrap_or(target)) * dir > 1e-3
+                }
+                _ => true,
+            };
+            let close_speed = inner.config.gripper_policy.as_ref().map_or(f64::from(crate::model::DEFAULT_CLOSE_SPEED_RAD_S), |p| p.close_speed());
+            let (speed, timeout_s) = if closes { (close_speed, None) } else { (1.0, Some(8.0)) };
+            let request = GripperRequest { command: GripperCommand::Move, fraction: Some(fraction), grasp: false, speed, timeout_s, tag: None };
             inner.start_macro_gripper(self.id, request).map_err(arm_fail)?
         };
         self.wait_sub(phase, limit + 10.0).await

@@ -393,14 +393,16 @@ pub const CALIBRATION_MAX_TORQUE_NM: f32 = 0.85;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stroke { pub fraction: Option<f64>, pub speed: f64 }
 
-/// The strokes: close to 5 %, then 4 x (open, close to 5 %) at 1.0 rad/s, 2 x at 0.3 rad/s
-/// (slow band), and a final open.
-pub fn strokes() -> Vec<Stroke> {
-    let close = |speed| Stroke { fraction: Some(0.05), speed };
+/// The strokes: close to 5 %, then 4 x (open at 1.0 rad/s, close to 5 %), 2 x (open at
+/// 0.3 rad/s, close to 5 %), and a final open at 1.0 rad/s. Every close runs at `close_speed`
+/// (`gripper_policy.close_speed_rad_s`, 0.3 rad/s by default), the first one included: the fast
+/// closing band is not learned (closes at speed fall back on the slow band).
+pub fn strokes(close_speed: f64) -> Vec<Stroke> {
+    let close = Stroke { fraction: Some(0.05), speed: close_speed };
     let open = |speed| Stroke { fraction: None, speed };
-    let mut v = vec![close(1.0)];
-    for _ in 0..4 { v.push(open(1.0)); v.push(close(1.0)); }
-    for _ in 0..2 { v.push(open(0.3)); v.push(close(0.3)); }
+    let mut v = vec![close];
+    for _ in 0..4 { v.push(open(1.0)); v.push(close); }
+    for _ in 0..2 { v.push(open(0.3)); v.push(close); }
     v.push(open(1.0));
     v
 }
@@ -420,7 +422,7 @@ pub fn begin_calibration(inner: &mut SupervisorInner, sup: &std::sync::Arc<ArmSu
         return Err(MotionError::Unsupported("Gripper calibration needs torque feedback".into()).into());
     }
     let id = inner.begin_orchestrated_action("gripper_calibrate", tag, epoch)?;
-    let list = strokes();
+    let list = strokes(policy.close_speed());
     inner.gripper_calibration = Some(crate::supervisor::GripperCalibrationRun { id, records: Vec::with_capacity(list.len() + 2) });
     let span = f64::from((policy.open_rad - policy.closed_rad).abs());
     let expected: f64 = list.iter().map(|s| span * 0.95 / s.speed + 1.5).sum();
@@ -463,7 +465,7 @@ async fn run_calibration(sup: std::sync::Arc<ArmSupervisor>, id: u64) {
             inner.gripper_baseline_generation += 1;
             inner.gripper_baseline_dirty = true;
             inner.gripper_last_contact = None;
-            tracing::info!("Gripper calibration {id}: baseline learned from {} strokes", strokes().len());
+            tracing::info!("Gripper calibration {id}: baseline learned");
             inner.finish_macro(id, "done", None, None, None, None);
         }
         Err(Stop::Fail(code, message)) => {
@@ -495,7 +497,7 @@ async fn calibration_strokes(ctx: &crate::macro_action::MacroCtx) -> Result<crat
         let limit = policy.max_close_torque_nm.map_or(CALIBRATION_MAX_TORQUE_NM, |c| CALIBRATION_MAX_TORQUE_FRACTION * c);
         (policy, g, scratch, limit)
     };
-    let list = strokes();
+    let list = strokes(policy.close_speed());
     for (i, st) in list.iter().enumerate() {
         let n = i + 1;
         let phase = format!("stroke:{n}/{}", list.len());

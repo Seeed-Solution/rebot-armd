@@ -674,9 +674,21 @@ pub struct GripperPolicy {
     /// when the stream ends. Gripper actions (grasp) keep their own contact handling. Absent: off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_contact_speed_rad_s: Option<f32>,
+    /// J7 speed (rad/s) of closing gripper steps that armd plans itself: grasp, place and
+    /// sequence closes and moves, and every closing stroke of `gripper_calibrate`. Absent:
+    /// [`DEFAULT_CLOSE_SPEED_RAD_S`]. A gripper action keeps its own `speed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_speed_rad_s: Option<f32>,
 }
 
+/// Default `gripper_policy.close_speed_rad_s` (rad/s): the grasp contact speed
+/// (`motion::GRIPPER_CONTACT_SPEED`).
+pub const DEFAULT_CLOSE_SPEED_RAD_S: f32 = 0.3;
+
 impl GripperPolicy {
+    /// `close_speed_rad_s` or [`DEFAULT_CLOSE_SPEED_RAD_S`] (rad/s).
+    pub fn close_speed(&self) -> f64 { f64::from(self.close_speed_rad_s.unwrap_or(DEFAULT_CLOSE_SPEED_RAD_S)) }
+
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
@@ -704,6 +716,7 @@ impl GripperPolicy {
             // the grasp contact speed (motion::GRIPPER_CONTACT_SPEED): one 20 ms tick adds
             // 0.006 rad of lead, 0.18 N·m on a 30 N·m/rad contact
             stream_contact_speed_rad_s: Some(0.3),
+            close_speed_rad_s: None,
         }
     }
 
@@ -790,6 +803,9 @@ pub fn validate_effective_gripper_policy_with_mode(
         || !positive(g.stream_contact_speed_rad_s)
     {
         return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm, max_lead_rad and stream_contact_speed_rad_s must be positive".into());
+    }
+    if g.close_speed_rad_s.is_some_and(|v| !(v.is_finite() && v > 0.0 && v <= 2.0)) {
+        return Err("Invalid gripper policy: close_speed_rad_s must be in (0, 2] rad/s".into());
     }
     if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
         if contact >= cap {
