@@ -453,10 +453,10 @@ fn check_operator_privilege(
             if inner.e_stop_latched.load(Ordering::SeqCst) {
                 return Some(ApiError::operator_required("clear_fault (EStop latched)"));
             }
-            if let Some(fault) = inner.safety.fault() {
-                if !fault.recoverable || fault.code == crate::safety::FaultCode::Collision {
-                    return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
-                }
+            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
+                && !inner.safety.recoverable()
+            {
+                return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
             }
             None
         }

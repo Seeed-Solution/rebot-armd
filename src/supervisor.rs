@@ -154,6 +154,9 @@ pub const PREEMPT_COOLDOWN: Duration = Duration::from_secs(3);
 /// A ThermalTrip can be cleared only once every joint reports a temperature at or below
 /// `max_temperature` minus this margin (°C).
 pub const THERMAL_CLEAR_MARGIN_C: f32 = 5.0;
+/// Outward tolerance (rad) when checking whether measured joint positions are back within
+/// configured limits before clearing [`crate::safety::FaultKind::JointLimit`].
+pub const JOINT_LIMIT_CLEAR_MARGIN_RAD: f32 = 0.01;
 /// Lower bound for the automatic park started by an expired lease (trajectory + settle).
 /// The actual budget is `max(WATCHDOG_PARK_TIMEOUT, deceleration + planned duration +
 /// UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN)`, counted in control-loop time.
@@ -528,6 +531,14 @@ pub struct SupervisorInner {
     pub mock_gripper_object: Option<(f32, bool)>,
     /// Active driver limit configuration error; prevents clearing faults and enabling torque until resolved.
     pub driver_config_error: Option<String>,
+    /// Previous `driver_config_error` string retired on the RT thread for off-thread deallocation.
+    pub(crate) retired_driver_config_error: Option<String>,
+    /// Required continuous duration below `max_temperature - THERMAL_CLEAR_MARGIN_C` before
+    /// `ThermalTrip` may clear (default `Duration::ZERO`).
+    pub thermal_cooldown_duration: Duration,
+    /// Instant since which all joint temperatures have continuously remained at or below the
+    /// thermal reset threshold (`None` while any joint is above threshold or non-finite).
+    pub(crate) thermal_below_since: Option<Instant>,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
     /// Monotonic revision for gripper calibration (starts at 1).
@@ -840,6 +851,9 @@ impl SupervisorInner {
             mock_gripper_stall_torque: false,
             mock_gripper_object: None,
             driver_config_error: None,
+            retired_driver_config_error: None,
+            thermal_cooldown_duration: Duration::ZERO,
+            thermal_below_since: None,
             zero_check_params: None,
             gripper_calib_revision: 1,
             grasp_setup_revision: 1,
@@ -1302,13 +1316,13 @@ impl SupervisorInner {
         out.torques.clone_from(&self.torques);
         out.temperatures.clone_from(&self.temperatures);
         out.is_torqued = self.is_torqued;
-        // `fault` is a function of the safety state and its code: rebuilt (a String) only
-        // when either changed
+        // `fault` reflects the most severe recorded kind and worst-of recoverability
+        // (`FaultInfo` is stack-allocated `Copy`, 0 heap ops).
         let state = self.safety.state();
-        if out.safety_state != *state || out.fault.as_ref().map(|f| f.code) != self.safety.fault_code() {
+        if state.is_stopped() || self.safety.has_latched_fault() || out.fault.is_some() {
             out.fault = self.safety.fault();
         }
-        if out.safety_state != *state { out.safety_state = state.clone(); }
+        out.set_safety_state(state);
         out.epoch_id = self.safety.epoch_id();
         out.gravity_compensated = self.gravity_output_enabled();
         out.gravity_torques.clone_from(&self.gravity_torques);
@@ -1638,9 +1652,7 @@ impl SupervisorInner {
                     }
                 }
             }
-            if !matches!(self.safety.state(), SafetyState::Fault(_)) {
-                self.apply_stop_policy(StopPolicy::EStopLatch);
-            }
+            self.apply_stop_policy(StopPolicy::EStopLatch);
             self.applied_estop_count = req;
             self.estop_applied.store(req, Ordering::SeqCst);
             if self.pending_estop_acks.len() < crate::rt_core::executor::ESTOP_ACK_CAPACITY {
@@ -1666,6 +1678,28 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Updates continuous cooldown tracking from `temps` against `max_temperature - THERMAL_CLEAR_MARGIN_C`.
+    pub(crate) fn update_thermal_cooldown_from_temps(&mut self, temps: &[f32]) {
+        let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+        if !temps.is_empty() && temps.iter().all(|t| t.is_finite() && *t <= threshold) {
+            self.thermal_below_since.get_or_insert_with(Instant::now);
+        } else {
+            self.thermal_below_since = None;
+        }
+    }
+
+    /// True when every measured joint position is finite and within configured limits plus
+    /// [`JOINT_LIMIT_CLEAR_MARGIN_RAD`].
+    pub(crate) fn joints_within_clear_limits(&self) -> bool {
+        self.measured_positions.len() == self.config.dof
+            && self.config.limits.len() == self.config.dof
+            && self.measured_positions.iter().zip(&self.config.limits).all(|(&q, l)| {
+                q.is_finite()
+                    && q >= l.min_position - JOINT_LIMIT_CLEAR_MARGIN_RAD
+                    && q <= l.max_position + JOINT_LIMIT_CLEAR_MARGIN_RAD
+            })
+    }
+
     /// Thermal protection remains active while torqued or while torque disable is unconfirmed.
     /// `was_active` preserves thermal protection when a torque transition confirmed disable on
     /// the exact same Step 2 poll that delivered an over-temperature sample.
@@ -1674,13 +1708,24 @@ impl SupervisorInner {
             .driver
             .as_ref()
             .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+        if temperature_available {
+            let threshold = self.config.max_temperature - THERMAL_CLEAR_MARGIN_C;
+            if !self.temperatures.is_empty()
+                && self.temperatures.iter().all(|t| t.is_finite() && *t <= threshold)
+            {
+                self.thermal_below_since.get_or_insert_with(Instant::now);
+            } else {
+                self.thermal_below_since = None;
+            }
+        } else {
+            self.thermal_below_since = None;
+        }
         if (self.is_torqued || self.disable_pending || was_active)
             && temperature_available
             && self
                 .temperatures
                 .iter()
                 .any(|t| t.is_finite() && *t > self.config.max_temperature)
-            && !self.safety.has_latched_fault_kind(crate::safety::FaultKind::ThermalTrip)
         {
             self.apply_stop_policy(StopPolicy::ThermalTrip);
         }
@@ -2201,8 +2246,12 @@ impl SupervisorInner {
     pub fn tick_control(&mut self, dt: f64) -> f64 {
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
-            self.apply_stop_policy(StopPolicy::EStopLatch);
+        if self.e_stop_latched.load(Ordering::SeqCst) {
+            if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Estop) {
+                self.apply_stop_policy(StopPolicy::EStopLatch);
+            } else {
+                self.safety.latch(crate::safety::FaultKind::Estop, crate::safety::FaultDetail::Estop);
+            }
         }
 
         // Reuse Step 2's single budgeted hardware poll when present; legacy callers without
@@ -2266,12 +2315,16 @@ impl SupervisorInner {
                 }
             }
         }
-        if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
+        if invalid_feedback && self.is_torqued {
             self.stop_motion();
             self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
-            self.safety.trigger_static_fault(crate::safety::StaticFault::InvalidTelemetry);
-        } else if driver_torque_lost && self.is_torqued && !self.safety.state().is_stopped() {
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::Static(crate::safety::StaticFault::InvalidTelemetry),
+            );
+        }
+        if driver_torque_lost && self.is_torqued && !self.disable_pending {
             self.stop_motion();
             self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
@@ -2280,14 +2333,19 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_static_fault(crate::safety::StaticFault::UnexpectedTorqueLoss);
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::Static(crate::safety::StaticFault::UnexpectedTorqueLoss),
+            );
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors
         // keep holding their last POS_VEL target meanwhile. Fault on a real stall, using
         // CONTROL_DEADLINE (the same 250 ms bound as the hardware feedback deadline).
         if (!dt.is_finite() || dt <= 0.0 || dt > CONTROL_DEADLINE.as_secs_f64())
-            && self.is_torqued && self.safety.state().is_operational() {
+            && self.is_torqued
+            && !matches!(self.safety.state(), SafetyState::Booting | SafetyState::Idle)
+        {
             self.stop_motion();
             self.tracking.invalidate();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
@@ -2296,7 +2354,10 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_static_fault(crate::safety::StaticFault::ControlDeadline);
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::Static(crate::safety::StaticFault::ControlDeadline),
+            );
         }
         self.step_zero_convention();
         let dt_raw = dt;
@@ -2720,7 +2781,6 @@ impl SupervisorInner {
 
         // Bus loss: no fresh feedback from every joint within BUS_LOSS_TIMEOUT.
         if self.is_torqued
-            && !self.safety.state().is_stopped()
             && self.driver.is_some()
             && !self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
         {
@@ -2729,11 +2789,13 @@ impl SupervisorInner {
         self.sync_torque_state_after_stop();
 
         // Check hardware motor faults / error flags from feedback
-        if self.is_torqued && !self.safety.state().is_stopped() {
+        if self.is_torqued {
             if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
                     if let Err(e) = driver.check_hardware_status() {
-                        tracing::error!("Hardware fault detected on driver: {}", e);
+                        if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::Other) {
+                            tracing::error!("Hardware fault detected on driver: {}", e);
+                        }
                         if self.measured_positions.iter().all(|p| p.is_finite())
                             && self.measured_positions.len() == self.config.dof
                         {
@@ -2751,10 +2813,11 @@ impl SupervisorInner {
                         self.tracking.invalidate();
                         copy_into(&mut self.target_positions, &self.commanded_positions);
                         self.commanded_velocities.fill(0.0);
-                        self.safety.trigger_fault_formatted(
-                            FaultCode::HardwareFault,
+                        self.safety.latch(
                             crate::safety::FaultKind::Other,
-                            |buf| { let _ = core::fmt::write(buf, format_args!("{e}")); },
+                            crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                                let _ = core::fmt::write(buf, format_args!("{e}"));
+                            }),
                         );
                     }
                 }
@@ -2765,20 +2828,22 @@ impl SupervisorInner {
         // watchdog below may start a park, which then runs from position mode.
         self.gravity_comp_tick(dt);
 
-        // 1. Check lease watchdog (skip during autonomous stow/unload)
+        // 1. Check lease watchdog (skip during autonomous stow/unload or un-armed Idle/Booting)
         if self.lease_enabled
             && self.gravity_comp.is_none()
             && self.is_torqued
-            && self.safety.state().is_operational()
+            && !matches!(self.safety.state(), SafetyState::Booting | SafetyState::Idle)
             && !self.pending_normal_unload
             && self.last_heartbeat.elapsed() > self.lease_timeout
         {
             #[cfg(feature = "policy-runtime")]
-            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+            if self.policy_run.is_some() {
+                self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
+            }
             // Watchdog expired with torque on. When the arm is healthy and has a resting
             // pose, run the normal unload (park at home, settle, torque off). Otherwise
             // rigid lock at the current position and latch the fault, keeping torque on.
-            match self.watchdog_park_blocker() {
+            match self.watchdog_park_blocker_bounded() {
                 None => {
                     tracing::warn!("Watchdog: lease expired while torqued, parking");
                     self.apply_stop_policy(StopPolicy::NormalUnload);
@@ -2787,12 +2852,14 @@ impl SupervisorInner {
                         tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
                         self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
                     } else {
-                        tracing::warn!("Watchdog park could not be planned; holding torque and latching WatchdogTimeout");
+                        self.safety.log_watchdog_park_blocked(crate::safety::BoundedText::new("watchdog park could not be planned"));
                         self.latch_watchdog_fault();
                     }
                 }
                 Some(reason) => {
-                    tracing::warn!("Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout");
+                    if !self.safety.has_latched_fault_kind(crate::safety::FaultKind::WatchdogTimeout) {
+                        self.safety.log_watchdog_park_blocked(reason);
+                    }
                     self.latch_watchdog_fault();
                 }
             }
@@ -2813,8 +2880,12 @@ impl SupervisorInner {
             }
         }
         // Detect sustained physical tracking error, never compare against stale samples.
-        if self.driver.is_some() && self.is_torqued && self.safety.state().is_operational()
-            && self.hardware_feedback_fresh(Duration::from_millis(100)) {
+        if self.driver.is_some()
+            && self.is_torqued
+            && !self.disable_pending
+            && !matches!(self.safety.state(), SafetyState::Booting | SafetyState::Idle)
+            && self.hardware_feedback_fresh(Duration::from_millis(100))
+        {
             let threshold = self.config.following_error.max_error_rad;
             // The 7-DOF gripper is excluded: Damiao POS_VEL trails its command by about
             // v / 2.2 rad (0.9 rad at 2 rad/s), and gripping an object leaves a lasting
@@ -2837,10 +2908,9 @@ impl SupervisorInner {
                     copy_into(&mut self.target_positions, &self.measured_positions);
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault_formatted(
-                        FaultCode::FollowingError,
+                    self.safety.latch(
                         crate::safety::FaultKind::Other,
-                        |buf| {
+                        crate::safety::FaultDetail::formatted(FaultCode::FollowingError, |buf| {
                             let _ = core::fmt::write(
                                 buf,
                                 format_args!(
@@ -2848,7 +2918,7 @@ impl SupervisorInner {
                                     joint + 1
                                 ),
                             );
-                        },
+                        }),
                     );
                 }
             } else { self.following_error_since = None; }
@@ -3294,14 +3364,12 @@ impl SupervisorInner {
             } else if self.output_suspended {
                 self.stop_motion();
                 self.tracking.invalidate();
-                self.commanded_positions = self.measured_positions.clone();
-                self.target_positions = self.measured_positions.clone();
+                copy_into(&mut self.commanded_positions, &self.measured_positions);
+                copy_into(&mut self.target_positions, &self.measured_positions);
                 self.commanded_velocities.fill(0.0);
                 self.commanded_accelerations.fill(0.0);
                 self.output_suspended = false;
-                if !self.safety.state().is_stopped() {
-                    self.safety.trigger_fault(FaultReason::BusLoss);
-                }
+                self.safety.latch(crate::safety::FaultKind::BusLoss, crate::safety::FaultDetail::BusLoss);
             }
         }
         // MIT tracking (Phase 2): deadline supervision, park hand back at rest, handover at rest.
@@ -3514,20 +3582,22 @@ impl SupervisorInner {
                                     tracing::warn!("Joint tracking output violated workspace ({ws_err}): terminating motion");
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("WORKSPACE_VIOLATION"));
-                                    self.safety.trigger_fault_formatted(
-                                        FaultCode::Other,
+                                    self.safety.latch(
                                         crate::safety::FaultKind::Other,
-                                        |buf| { let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}")); },
+                                        crate::safety::FaultDetail::formatted(FaultCode::Other, |buf| {
+                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {ws_err}"));
+                                        }),
                                     );
                                 }
                                 crate::tracking::TrackingReject::JointLimit(msg) => {
                                     tracing::warn!("Joint tracking output exceeded limits ({msg}): terminating motion");
                                     self.hold_measured_pose();
                                     self.drop_macro_run("failed", Some("JOINT_LIMIT"));
-                                    self.safety.trigger_fault_formatted(
-                                        FaultCode::JointLimit,
-                                        crate::safety::FaultKind::JointLimitExceeded,
-                                        |buf| { let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {msg}")); },
+                                    self.safety.latch(
+                                        crate::safety::FaultKind::JointLimit,
+                                        crate::safety::FaultDetail::formatted(FaultCode::JointLimit, |buf| {
+                                            let _ = core::fmt::write(buf, format_args!("Joint tracking output rejected: {msg}"));
+                                        }),
                                     );
                                 }
                             }
@@ -3615,13 +3685,12 @@ impl SupervisorInner {
                 copy_into(&mut self.commanded_positions, &self.measured_positions);
                 copy_into(&mut self.target_positions, &self.measured_positions);
             }
-            if !self.safety.state().is_stopped() {
-                self.safety.trigger_fault_formatted(
-                    FaultCode::DriverWriteFailed,
-                    crate::safety::FaultKind::Other,
-                    |buf| { let _ = core::fmt::write(buf, format_args!("Control output failed: {error}")); },
-                );
-            }
+            self.safety.latch(
+                crate::safety::FaultKind::Other,
+                crate::safety::FaultDetail::formatted(FaultCode::DriverWriteFailed, |buf| {
+                    let _ = core::fmt::write(buf, format_args!("Control output failed: {error}"));
+                }),
+            );
             tracing::error!("Control output failed: {error}");
         }
 
@@ -3728,7 +3797,10 @@ impl SupervisorInner {
             } else if settling_since.elapsed() > Duration::from_millis(1500) {
                 self.stop_motion();
                 self.commanded_velocities.fill(0.0);
-                self.safety.trigger_static_fault(crate::safety::StaticFault::HandoverSettlingTimeout);
+                self.safety.latch(
+                    crate::safety::FaultKind::Other,
+                    crate::safety::FaultDetail::Static(crate::safety::StaticFault::HandoverSettlingTimeout),
+                );
                 self.handover_settling_since = None;
             }
         }
@@ -5299,6 +5371,10 @@ impl ArmSupervisor {
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),
             late,
+            release_seq: 0,
+            safety_epoch: obs.as_ref().map_or(0, |o| o.epoch_id),
+            maint_req_id: 0,
+            release_flags: 0,
         };
         let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
         self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);

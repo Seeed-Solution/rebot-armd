@@ -2487,6 +2487,23 @@ impl<'de> Deserialize<'de> for HolderLabel {
     }
 }
 
+/// Reusable heap `String` buffer parked on an [`ArmObservation`] slot while `safety_state`
+/// does not own a string (`Idle`, `Armed`, `EStop`, `ThermalTrip`, `BusLoss`, `WatchdogTimeout`).
+/// Ignored by `PartialEq` and `serde`; cloned empty for off-thread snapshots so only RT
+/// triple-buffer slots carry preallocated capacity.
+#[derive(Debug, Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) struct SafetyTextSpare(String);
+
+impl PartialEq for SafetyTextSpare {
+    fn eq(&self, _other: &Self) -> bool { true }
+}
+
+impl Clone for SafetyTextSpare {
+    fn clone(&self) -> Self { Self(String::new()) }
+    fn clone_from(&mut self, _source: &Self) {}
+}
+
 /// Full arm telemetry / observation
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct ArmObservation {
@@ -2578,6 +2595,10 @@ pub struct ArmObservation {
     /// Monotonic count of deferred safety log events dropped on overflow (never reset); omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub safety_log_dropped: u64,
+    /// Preallocated string buffer moved into/out of `safety_state` (`FaultReason::Other` /
+    /// `JointLimitExceeded`) so RT `fill_observation` transitions perform 0 heap allocations or drops.
+    #[serde(skip)]
+    pub(crate) safety_text_spare: SafetyTextSpare,
 }
 
 fn is_zero_u64(v: &u64) -> bool { *v == 0 }
@@ -2594,11 +2615,81 @@ impl ArmObservation {
             driver_range_check: None, lease_holder: None, motion_limit: None, workspace_violation: None, motor_errors: Vec::new(),
             fault: None, residual_torques: None, collision: None, power: None, gripper_zero: None, tcp: None, gripper: None,
             loads: None, policy: None, safety_log_dropped: 0,
+            safety_text_spare: SafetyTextSpare(String::new()),
+        }
+    }
+
+    /// Blank observation for an RT triple-buffer slot with preallocated `safety_state` text capacity.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn blank_rt() -> Self {
+        let mut obs = Self::blank();
+        obs.safety_text_spare = SafetyTextSpare(String::with_capacity(crate::safety::SAFETY_LOG_TEXT_CAPACITY));
+        obs
+    }
+
+    /// Updates `self.safety_state` to match `next`, recycling any owned `String` buffer between
+    /// `self.safety_state` and `self.safety_text_spare` so transitions perform 0 heap ops on RT slots.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_safety_state(&mut self, next: &SafetyState) {
+        use crate::safety::FaultReason;
+        if self.safety_state == *next {
+            return;
+        }
+        let prev = std::mem::replace(&mut self.safety_state, SafetyState::Idle);
+        let existing_buf = match prev {
+            SafetyState::Fault(FaultReason::Other(s)) => Some(s),
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_name, .. }) => Some(joint_name),
+            _ => None,
+        };
+        match next {
+            SafetyState::Fault(FaultReason::Other(src)) => {
+                let mut buf = existing_buf.unwrap_or_else(|| std::mem::take(&mut self.safety_text_spare.0));
+                buf.clear();
+                buf.push_str(src);
+                self.safety_state = SafetyState::Fault(FaultReason::Other(buf));
+            }
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max }) => {
+                let mut buf = existing_buf.unwrap_or_else(|| std::mem::take(&mut self.safety_text_spare.0));
+                buf.clear();
+                buf.push_str(joint_name);
+                self.safety_state = SafetyState::Fault(FaultReason::JointLimitExceeded {
+                    joint_idx: *joint_idx,
+                    joint_name: buf,
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                });
+            }
+            other => {
+                if let Some(mut buf) = existing_buf {
+                    buf.clear();
+                    if self.safety_text_spare.0.capacity() == 0 {
+                        self.safety_text_spare.0 = buf;
+                    }
+                }
+                self.safety_state = match other {
+                    SafetyState::Booting => SafetyState::Booting,
+                    SafetyState::Idle => SafetyState::Idle,
+                    SafetyState::Armed => SafetyState::Armed,
+                    SafetyState::Moving => SafetyState::Moving,
+                    SafetyState::EStop => SafetyState::EStop,
+                    SafetyState::Fault(FaultReason::BusLoss) => SafetyState::Fault(FaultReason::BusLoss),
+                    SafetyState::Fault(FaultReason::WatchdogTimeout) => SafetyState::Fault(FaultReason::WatchdogTimeout),
+                    SafetyState::Fault(FaultReason::ThermalTrip { joint_idx, temperature, limit }) => {
+                        SafetyState::Fault(FaultReason::ThermalTrip {
+                            joint_idx: *joint_idx,
+                            temperature: *temperature,
+                            limit: *limit,
+                        })
+                    }
+                    SafetyState::Fault(FaultReason::Other(_) | FaultReason::JointLimitExceeded { .. }) => unreachable!(),
+                };
+            }
         }
     }
 }
 
-crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped });
+crate::fieldwise_clone!(ArmObservation { timestamp, positions, velocities, torques, temperatures, is_torqued, safety_state, epoch_id, gravity_compensated, gravity_torques, driver_capabilities, enable_state, feedback_age_ms, disable_pending, feedback_valid, commanded_positions, action, previous_action, control_mode, gravity_comp, driver_range_check, lease_holder, motion_limit, workspace_violation, motor_errors, fault, residual_torques, collision, power, gripper_zero, tcp, gripper, loads, policy, safety_log_dropped, safety_text_spare });
 
 /// Policy runtime execution state published in `observation.policy`.
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -2706,14 +2797,12 @@ pub enum ControlMode {
 }
 
 /// A code with a human-readable message (entry blocker or exit reason).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+/// Inline storage keeps observation publishing (`fill_observation`) allocation-free on the control thread.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ModeReason {
-    /// Static text in every case but formatted messages: building one does not allocate.
-    pub code: std::borrow::Cow<'static, str>,
-    pub message: std::borrow::Cow<'static, str>,
+    pub code: crate::safety::BoundedText<48>,
+    pub message: crate::safety::BoundedText<256>,
 }
-
-crate::fieldwise_clone!(ModeReason { code, message });
 
 /// Why the last gravity-compensation session ended.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

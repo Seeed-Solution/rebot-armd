@@ -420,15 +420,14 @@ impl SupervisorInner {
         self.safety.mark_motion_finished();
         if escalated {
             tracing::error!("Collision guard: {trips} trips within {:.0} s; latching Fault COLLISION", p.escalate_window_s);
-            self.safety.trigger_fault_formatted(
-                FaultCode::Collision,
-                crate::safety::FaultKind::Other,
-                |buf| {
+            self.safety.latch(
+                crate::safety::FaultKind::CollisionLatched,
+                crate::safety::FaultDetail::formatted(FaultCode::Collision, |buf| {
                     let _ = core::fmt::write(
                         buf,
                         format_args!("COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s),
                     );
-                },
+                }),
             );
         }
         // Pure step has already installed the hold state.

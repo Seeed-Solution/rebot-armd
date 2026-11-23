@@ -819,16 +819,22 @@ impl crate::supervisor::SupervisorInner {
         self.servo_stream_active = false;
         self.tracking.invalidate();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
-        // latched also over another fault (an E-stop stays the stronger state)
-        if *self.safety.state() != crate::safety::SafetyState::EStop {
-            self.safety.trigger_fault_coded(code, crate::safety::FaultReason::Other(format!(
-                "MIT_LOST: {reason}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
-        }
+        self.safety.latch(
+            crate::safety::FaultKind::from_code(code),
+            crate::safety::FaultDetail::formatted(code, |buf| {
+                let _ = core::fmt::write(
+                    buf,
+                    format_args!(
+                        "MIT_LOST: {reason}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
+                    ),
+                );
+            }),
+        );
     }
 
     /// Deadline supervision while MIT owns joints: the driver fence, every joint's feedback age
@@ -850,13 +856,18 @@ impl crate::supervisor::SupervisorInner {
         if self.mit.owner == MitOwner::Lost {
             // a trip seen after the group was cancelled for another reason is still a loss
             let tripped = self.driver.as_ref().and_then(|d| d.lock().ok()).and_then(|drv| drv.mit_fence_trip());
-            let code = self.safety.fault().map(|f| f.code);
             if let Some(t) = tripped {
-                if code != Some(crate::safety::FaultCode::BusLoss) && code != Some(crate::safety::FaultCode::Estop) {
-                    self.safety.trigger_fault_coded(crate::safety::FaultCode::BusLoss,
-                        crate::safety::FaultReason::Other(format!("MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, \
-                            clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)")));
-                }
+                self.safety.latch(
+                    crate::safety::FaultKind::BusLoss,
+                    crate::safety::FaultDetail::formatted(crate::safety::FaultCode::BusLoss, |buf| {
+                        let _ = core::fmt::write(
+                            buf,
+                            format_args!(
+                                "MIT_LOST: driver deadline fence: {t}; if a motor's command timeout expired, clear_fault recovers by turning torque off on every joint (the arm drops like a park torque-off: support it)"
+                            ),
+                        );
+                    }),
+                );
             }
             return;
         }
@@ -1034,7 +1045,12 @@ impl crate::supervisor::SupervisorInner {
                         if let (Some(t), Some(slot)) = (hold[j].torque, self.mit.last_ff.get_mut(j)) { *slot = t; }
                     }
                     self.mit.last_output = Some(self.mit_now());
-                    self.safety.trigger_fault_coded(crate::safety::FaultCode::HardwareFault, crate::safety::FaultReason::Other(msg.clone()));
+                    self.safety.latch(
+                        crate::safety::FaultKind::Other,
+                        crate::safety::FaultDetail::formatted(crate::safety::FaultCode::HardwareFault, |buf| {
+                            let _ = core::fmt::write(buf, format_args!("{msg}"));
+                        }),
+                    );
                 }
                 self.mit.handover_error = Some(msg.clone());
                 Err(msg)
@@ -1079,6 +1095,11 @@ impl crate::supervisor::SupervisorInner {
     /// and the next arm reads the TIMEOUT again). A motor that does not confirm keeps the fault.
     pub(crate) fn mit_expiry_recovery(&mut self) -> Result<crate::safety::SafetyState, crate::safety::SafetyError> {
         use crate::safety::SafetyError;
+        // Single authoritative clear_check FIRST before issuing any recovery disable/reset commands.
+        let pre_ctx = self.build_mit_recovery_clear_context();
+        self.safety
+            .clear_check(&pre_ctx)
+            .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
         let res = match self.driver.as_ref().and_then(|d| d.lock().ok()) {
             Some(mut drv) => drv.mit_expiry_recover(),
             None => Err("no driver".into()),
@@ -1101,22 +1122,27 @@ impl crate::supervisor::SupervisorInner {
         self.mit.armed_ok = false;
         self.mit.revoke_pending = false;
         if self.measured_positions.iter().all(|q| q.is_finite()) {
-            self.commanded_positions = self.measured_positions.clone();
-            self.target_positions = self.measured_positions.clone();
+            crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+            crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.measured_positions);
         }
         self.commanded_velocities.fill(0.0);
         self.commanded_accelerations.fill(0.0);
         self.is_torqued = false;
         self.disable_pending = false;
         self.pending_rearm = false;
-        // an E-stop that arrived while the disables were confirmed wins: never end in Idle
+        // an E-stop that arrived while the disables were confirmed wins: never end in Idle.
+        // Clear the resolved MIT fault once clear_check passes, then latch EStop.
         self.consume_pending_estop();
+        let post_ctx = self.build_mit_recovery_clear_context();
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = self.safety.clear_with_check(&post_ctx);
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);
             return Err(SafetyError::EStopActive);
         }
         crate::supervisor::SupervisorInner::check_concurrent_estop(self)?;
-        self.safety.clear_fault()?;
+        self.safety
+            .clear_with_check(&post_ctx)
+            .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))?;
         let _ = self.safety.set_torque(false);
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) {
             self.apply_stop_policy(crate::safety::StopPolicy::EStopLatch);

@@ -260,7 +260,9 @@ pub const RETIRED_STATE_CAPACITY: usize = 16;
 /// Capacity of [`SafetyManager`]'s preallocated `Arc<SafetyState>` fault slot pool.
 pub const FAULT_ARC_POOL_CAPACITY: usize = 32;
 /// Capacity of [`SafetyManager`]'s preallocated formatted-message `Arc<SafetyState>` fault slot pool.
-pub const FORMATTED_FAULT_ARC_POOL_CAPACITY: usize = 16;
+pub const FORMATTED_FAULT_ARC_POOL_CAPACITY: usize = 32;
+/// Capacity of [`SafetyManager`]'s preallocated `JointLimitExceeded` `Arc<SafetyState>` fault slot pool.
+pub const JOINT_LIMIT_ARC_POOL_CAPACITY: usize = 8;
 /// Capacity of [`SafetyManager`]'s bounded deferred safety log event ring.
 pub const SAFETY_LOG_CAPACITY: usize = 64;
 /// Maximum inline text bytes stored in a deferred safety log event's `FaultReason::Other`.
@@ -312,26 +314,37 @@ impl StaticFault {
     }
 }
 
-/// Discriminant of [`FaultReason`] tracked in [`SafetyManager`]'s fixed-size latched-kind bitmask.
+/// Fault kind tracked in [`SafetyManager`]'s fixed-size latched-kind bitmask.
+///
+/// Severity order (highest to lowest, used for reported `fault.code` and displayed state):
+/// `ThermalTrip` > `BusLoss` > `CollisionLatched` > `JointLimit` > `Other` (non-recoverable)
+/// > `Estop` > `Other` (recoverable) > `WatchdogTimeout`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FaultKind {
-    JointLimitExceeded = 0,
-    ThermalTrip = 1,
-    BusLoss = 2,
-    WatchdogTimeout = 3,
+    ThermalTrip = 0,
+    BusLoss = 1,
+    CollisionLatched = 2,
+    JointLimit = 3,
     Other = 4,
+    WatchdogTimeout = 5,
+    Estop = 6,
 }
 
 impl FaultKind {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 7;
+    /// All known kinds in strict descending severity order.
     pub const ALL: [Self; Self::COUNT] = [
-        Self::JointLimitExceeded,
         Self::ThermalTrip,
         Self::BusLoss,
-        Self::WatchdogTimeout,
+        Self::CollisionLatched,
+        Self::JointLimit,
         Self::Other,
+        Self::WatchdogTimeout,
+        Self::Estop,
     ];
+    /// Bitmask covering every known [`FaultKind`]; any bit outside this mask fails closed.
+    pub const ALL_MASK: u8 = (1u8 << Self::COUNT) - 1;
 
     #[inline]
     pub const fn bit(self) -> u8 {
@@ -339,9 +352,70 @@ impl FaultKind {
     }
 
     #[inline]
+    pub const fn from_bit_index(idx: u8) -> Option<Self> {
+        match idx {
+            0 => Some(Self::ThermalTrip),
+            1 => Some(Self::BusLoss),
+            2 => Some(Self::CollisionLatched),
+            3 => Some(Self::JointLimit),
+            4 => Some(Self::Other),
+            5 => Some(Self::WatchdogTimeout),
+            6 => Some(Self::Estop),
+            _ => None,
+        }
+    }
+
+    /// Default [`FaultCode`] associated with this kind.
+    #[inline]
+    pub const fn default_code(self) -> FaultCode {
+        match self {
+            Self::ThermalTrip => FaultCode::ThermalTrip,
+            Self::BusLoss => FaultCode::BusLoss,
+            Self::CollisionLatched => FaultCode::Collision,
+            Self::JointLimit => FaultCode::JointLimit,
+            Self::Other => FaultCode::Other,
+            Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            Self::Estop => FaultCode::Estop,
+        }
+    }
+
+    /// Severity rank for `(kind, code)` (higher wins reported `fault.code` and displayed state).
+    #[inline]
+    pub const fn severity(self, code: FaultCode) -> u8 {
+        match self {
+            Self::ThermalTrip => 7,
+            Self::BusLoss => 6,
+            Self::CollisionLatched => 5,
+            Self::JointLimit => 4,
+            Self::Other => {
+                if matches!(code, FaultCode::ControlDeadline | FaultCode::HandoverUnsettled) {
+                    1
+                } else {
+                    3
+                }
+            }
+            Self::Estop => 2,
+            Self::WatchdogTimeout => 0,
+        }
+    }
+
+    /// True if this kind is inherently non-recoverable regardless of detail code.
+    #[inline]
+    pub const fn always_non_recoverable(self) -> bool {
+        matches!(
+            self,
+            Self::ThermalTrip
+                | Self::BusLoss
+                | Self::CollisionLatched
+                | Self::JointLimit
+                | Self::Estop
+        )
+    }
+
+    #[inline]
     pub const fn from_reason(reason: &FaultReason) -> Self {
         match reason {
-            FaultReason::JointLimitExceeded { .. } => Self::JointLimitExceeded,
+            FaultReason::JointLimitExceeded { .. } => Self::JointLimit,
             FaultReason::ThermalTrip { .. } => Self::ThermalTrip,
             FaultReason::BusLoss => Self::BusLoss,
             FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
@@ -352,11 +426,111 @@ impl FaultKind {
     #[inline]
     pub const fn from_code(code: FaultCode) -> Self {
         match code {
-            FaultCode::JointLimit => Self::JointLimitExceeded,
             FaultCode::ThermalTrip => Self::ThermalTrip,
             FaultCode::BusLoss => Self::BusLoss,
+            FaultCode::Collision => Self::CollisionLatched,
+            FaultCode::JointLimit => Self::JointLimit,
             FaultCode::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultCode::Estop => Self::Estop,
             _ => Self::Other,
+        }
+    }
+}
+
+/// Zero-allocation fault payload passed to [`SafetyManager::latch`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub enum FaultDetail {
+    /// Hardware or operator emergency stop.
+    Estop,
+    /// CAN / actuator feedback lost on one or more joints.
+    BusLoss,
+    /// Control lease expired while torqued.
+    WatchdogTimeout,
+    /// Joint temperature exceeded `max_temperature`.
+    ThermalTrip { joint_idx: usize, temperature: f32, limit: f32 },
+    /// Joint position exceeded configured/driver limits.
+    JointLimitExceeded {
+        joint_idx: usize,
+        joint_name: BoundedText<SAFETY_JOINT_NAME_CAPACITY>,
+        value: f32,
+        min: f32,
+        max: f32,
+    },
+    /// Preallocated static fault (0 pool consumption, 0 heap ops).
+    Static(StaticFault),
+    /// Dynamically formatted message stored inline (uses formatted slot pool when available).
+    Formatted {
+        code: FaultCode,
+        message: BoundedText<SAFETY_LOG_TEXT_CAPACITY>,
+    },
+    /// Fallback when detail storage is unavailable.
+    DetailUnavailable(FaultCode),
+}
+
+impl FaultDetail {
+    /// Formats a dynamic fault message inline into a [`BoundedText`] without heap allocation.
+    pub fn formatted(
+        code: FaultCode,
+        fmt_msg: impl FnOnce(&mut BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
+    ) -> Self {
+        let mut message = BoundedText::<SAFETY_LOG_TEXT_CAPACITY>::empty();
+        fmt_msg(&mut message);
+        Self::Formatted { code, message }
+    }
+
+    /// Converts a `(FaultCode, &FaultReason)` pair into a bounded, heap-free [`FaultDetail`].
+    pub fn from_reason(code: FaultCode, reason: &FaultReason) -> Self {
+        match reason {
+            FaultReason::ThermalTrip { joint_idx, temperature, limit } => {
+                Self::ThermalTrip { joint_idx: *joint_idx, temperature: *temperature, limit: *limit }
+            }
+            FaultReason::BusLoss => Self::BusLoss,
+            FaultReason::WatchdogTimeout => Self::WatchdogTimeout,
+            FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max } => {
+                Self::JointLimitExceeded {
+                    joint_idx: *joint_idx,
+                    joint_name: BoundedText::new(joint_name),
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                }
+            }
+            FaultReason::Other(msg) => Self::Formatted { code, message: BoundedText::new(msg) },
+        }
+    }
+
+    /// Machine-readable [`FaultCode`] carried by this detail.
+    pub const fn code(self, kind: FaultKind) -> FaultCode {
+        match self {
+            Self::Estop => FaultCode::Estop,
+            Self::BusLoss => FaultCode::BusLoss,
+            Self::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            Self::ThermalTrip { .. } => FaultCode::ThermalTrip,
+            Self::JointLimitExceeded { .. } => FaultCode::JointLimit,
+            Self::Static(sf) => sf.code(),
+            Self::Formatted { code, .. } => code,
+            Self::DetailUnavailable(code) => {
+                if matches!(kind, FaultKind::Other) { code } else { kind.default_code() }
+            }
+        }
+    }
+
+    /// Stack-allocated [`BoundedFaultReason`] corresponding to this detail.
+    pub fn bounded_reason(self, _kind: FaultKind) -> BoundedFaultReason {
+        match self {
+            Self::Estop => BoundedFaultReason::Other(BoundedText::new("E-stop latched")),
+            Self::BusLoss => BoundedFaultReason::BusLoss,
+            Self::WatchdogTimeout => BoundedFaultReason::WatchdogTimeout,
+            Self::ThermalTrip { joint_idx, temperature, limit } => {
+                BoundedFaultReason::ThermalTrip { joint_idx, temperature, limit }
+            }
+            Self::JointLimitExceeded { joint_idx, joint_name, value, min, max } => {
+                BoundedFaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max }
+            }
+            Self::Static(sf) => BoundedFaultReason::Other(BoundedText::new(sf.message())),
+            Self::Formatted { message, .. } => BoundedFaultReason::Other(message),
+            Self::DetailUnavailable(_) => BoundedFaultReason::Other(BoundedText::new(DETAIL_UNAVAILABLE)),
         }
     }
 }
@@ -491,6 +665,27 @@ impl BoundedFaultReason {
             FaultReason::Other(m) => Self::Other(BoundedText::new(m)),
         }
     }
+
+    /// Writes the human-readable fault message into `w` without heap allocation.
+    pub fn write_message_into(&self, w: &mut impl core::fmt::Write) {
+        match self {
+            Self::JointLimitExceeded { joint_name, value, min, max, .. } => {
+                let _ = write!(w, "Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]");
+            }
+            Self::ThermalTrip { joint_idx, temperature, limit } => {
+                let _ = write!(w, "Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1);
+            }
+            Self::BusLoss => {
+                let _ = w.write_str("No fresh feedback from every joint (bus loss)");
+            }
+            Self::WatchdogTimeout => {
+                let _ = w.write_str("Control lease expired while torqued");
+            }
+            Self::Other(m) => {
+                let _ = write!(w, "{m}");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for BoundedFaultReason {
@@ -539,6 +734,7 @@ pub enum SafetyLogEvent {
     Cleared,
     GravityCompEstopExit,
     GravityCompHoldWriteFailed(BoundedText<160>),
+    WatchdogParkBlocked(BoundedText<160>),
 }
 
 impl SafetyLogEvent {
@@ -551,6 +747,7 @@ impl SafetyLogEvent {
             Self::Cleared => tracing::info!(target: "armd::safety", "Safety: cleared -> Idle"),
             Self::GravityCompEstopExit => tracing::warn!(target: "armd::supervisor::motion", "Gravity compensation exit: ESTOP E-stop"),
             Self::GravityCompHoldWriteFailed(err) => tracing::error!(target: "armd::supervisor::motion", "Gravity comp hold write failed: {err}"),
+            Self::WatchdogParkBlocked(reason) => tracing::warn!(target: "armd::supervisor", "Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout"),
         }
     }
 }
@@ -711,34 +908,42 @@ impl std::fmt::Display for ClearFaultDriverError {
     }
 }
 
-/// Typed, bounded RT `clear_fault` refusal carrying zero heap allocations on the control thread;
-/// rendered off-thread to the exact existing `SafetyError::ClearFaultRejected(String)` text.
+/// Typed, bounded `clear_fault` refusal carrying zero heap allocations on the control thread;
+/// rendered off-thread to the exact `SafetyError::ClearFaultRejected(String)` text.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
-pub enum ClearFaultRefusal {
+pub enum ClearRefusal {
     ShutdownCommitted,
     DriverConfigError(BoundedText<256>),
     GravityCompUnconfirmed,
     DisablePending,
     MitLostUnsupported,
+    MitModesUncertain,
     FreshFeedbackRequiredForRestingSupport,
     RestingPoseSupport(RestingSupportViolation),
     BudgetExpired,
     HardwareResetSent,
     FreshFeedbackRequired,
     TemperatureConfirmationRequired,
-    EnableStateUnknown,
     TemperatureAboveThreshold,
+    ThermalCooldownNotElapsed { elapsed_ms: u64, required_ms: u64 },
+    WatchdogHeartbeatRequired,
+    JointLimitsNotSatisfied,
+    EnableStateUnknown,
     ReclaimQueueFull,
+    UnknownFaultKind,
     DriverError(ClearFaultDriverError),
 }
 
-impl ClearFaultRefusal {
+/// Alias retained for compatibility with callers referencing [`ClearRefusal`] as `ClearFaultRefusal`.
+pub type ClearFaultRefusal = ClearRefusal;
+
+impl ClearRefusal {
     /// Renders the exact API error text off the RT control thread.
     pub fn render_message(&self) -> String { self.to_string() }
 }
 
-impl std::fmt::Display for ClearFaultRefusal {
+impl std::fmt::Display for ClearRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShutdownCommitted => f.write_str("Daemon shutdown is committed"),
@@ -746,6 +951,7 @@ impl std::fmt::Display for ClearFaultRefusal {
             Self::GravityCompUnconfirmed => f.write_str("Gravity compensation: the switch back to POS_VEL is not confirmed yet"),
             Self::DisablePending => f.write_str("Torque disable is still unconfirmed"),
             Self::MitLostUnsupported => f.write_str("UNSUPPORTED: MIT lost recovery requires legacy path"),
+            Self::MitModesUncertain => f.write_str("MIT tracking: the control mode of a joint is uncertain after a failed switch; check the arm and power-cycle the motors"),
             Self::FreshFeedbackRequiredForRestingSupport => f.write_str("Fresh feedback is required before checking resting pose support"),
             Self::RestingPoseSupport(violation) =>
                 write!(f, "Cannot disable faulted supporting arm joint away from resting pose ({violation}); support the arm at rest first"),
@@ -753,10 +959,67 @@ impl std::fmt::Display for ClearFaultRefusal {
             Self::HardwareResetSent => f.write_str("Hardware reset sent; wait for fresh fault-free feedback before retrying"),
             Self::FreshFeedbackRequired => f.write_str("Fresh feedback is required before resetting a fault"),
             Self::TemperatureConfirmationRequired => f.write_str("Temperature must be confirmed below the reset threshold"),
-            Self::EnableStateUnknown => f.write_str("Hardware enable state is unknown; reset remains latched"),
             Self::TemperatureAboveThreshold => f.write_str("Temperature is above the reset threshold"),
+            Self::ThermalCooldownNotElapsed { elapsed_ms, required_ms } =>
+                write!(f, "Thermal cooldown period not elapsed ({elapsed_ms} ms of {required_ms} ms required below threshold)"),
+            Self::WatchdogHeartbeatRequired => f.write_str("Fresh heartbeat from the active lease holder is required before clearing WatchdogTimeout"),
+            Self::JointLimitsNotSatisfied => f.write_str("Measured joint positions must be back within limits before clearing JointLimit"),
+            Self::EnableStateUnknown => f.write_str("Hardware enable state is unknown; reset remains latched"),
             Self::ReclaimQueueFull => f.write_str("Fault state reclamation queue is full; retry after off-thread drain"),
+            Self::UnknownFaultKind => f.write_str("Unknown latched fault kind cannot be cleared (fail closed)"),
             Self::DriverError(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Snapshot of live supervisor and hardware readiness evaluated by [`SafetyManager::clear_check`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::large_enum_variant)] // inline stack storage avoids RT heap allocation
+pub struct ClearContext {
+    pub shutdown_committed: bool,
+    pub driver_config_error: Option<BoundedText<256>>,
+    pub gravity_comp_unconfirmed: bool,
+    pub disable_pending: bool,
+    pub has_driver: bool,
+    pub feedback_fresh: bool,
+    pub thermal_sensor_available: bool,
+    pub thermal_below_threshold: bool,
+    pub thermal_cooldown_elapsed_ms: u64,
+    pub thermal_cooldown_required_ms: u64,
+    pub has_active_lease: bool,
+    pub lease_heartbeat_fresh: bool,
+    pub joints_within_limits: bool,
+    pub enable_state_known: bool,
+    pub hardware_error: Option<ClearFaultDriverError>,
+    pub resting_pose_violation: Option<RestingSupportViolation>,
+    pub resting_feedback_missing: bool,
+    pub mit_modes_uncertain: bool,
+    pub mit_lost_unsupported: bool,
+}
+
+impl ClearContext {
+    /// Context with every clear precondition satisfied (no driver, cool, within limits, no lease).
+    pub const fn all_conditions_met() -> Self {
+        Self {
+            shutdown_committed: false,
+            driver_config_error: None,
+            gravity_comp_unconfirmed: false,
+            disable_pending: false,
+            has_driver: false,
+            feedback_fresh: true,
+            thermal_sensor_available: true,
+            thermal_below_threshold: true,
+            thermal_cooldown_elapsed_ms: 0,
+            thermal_cooldown_required_ms: 0,
+            has_active_lease: false,
+            lease_heartbeat_fresh: true,
+            joints_within_limits: true,
+            enable_state_known: true,
+            hardware_error: None,
+            resting_pose_violation: None,
+            resting_feedback_missing: false,
+            mit_modes_uncertain: false,
+            mit_lost_unsupported: false,
         }
     }
 }
@@ -831,6 +1094,8 @@ pub struct SafetyManager {
     fault_arc_pool_len: usize,
     formatted_fault_arc_pool: [Option<Arc<SafetyState>>; FORMATTED_FAULT_ARC_POOL_CAPACITY],
     formatted_fault_arc_pool_len: usize,
+    joint_limit_arc_pool: [Option<Arc<SafetyState>>; JOINT_LIMIT_ARC_POOL_CAPACITY],
+    joint_limit_arc_pool_len: usize,
     retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
     retired_head: usize,
     retired_len: usize,
@@ -844,11 +1109,16 @@ pub struct SafetyManager {
     log_dropped: u64,
     log_dropped_forwarded: u64,
     epoch_id: u64,
-    /// Code recorded by the trigger site of the current Fault.
+    /// Monotonic counter incremented when `latch` records a new kind or distinct fault code.
+    latch_count: u64,
+    /// Code recorded by the trigger site of the current shown Fault.
     fault_code: Option<FaultCode>,
     /// Bitmask of every [`FaultKind`] latched since the last clear to `Idle`.
     latched_fault_kinds: u8,
-    /// Fixed-size preallocated record of the last detail per latched [`FaultKind`]
+    /// Sticky worst-of recoverability flag: set whenever ANY latched detail is non-recoverable,
+    /// cleared only when the record is reset on clear.
+    has_non_recoverable: bool,
+    /// Fixed-size preallocated record of the representative detail per latched [`FaultKind`]
     /// (`FaultKind::COUNT` slots, allocated once at startup; zero RT heap ops).
     latched_fault_details: Box<[Option<LatchedFaultDetail>]>,
 }
@@ -874,6 +1144,16 @@ impl Clone for SafetyManager {
                 ))))
             }),
             formatted_fault_arc_pool_len: FORMATTED_FAULT_ARC_POOL_CAPACITY,
+            joint_limit_arc_pool: std::array::from_fn(|_| {
+                Some(Arc::new(SafetyState::Fault(FaultReason::JointLimitExceeded {
+                    joint_idx: 0,
+                    joint_name: String::with_capacity(SAFETY_JOINT_NAME_CAPACITY),
+                    value: 0.0,
+                    min: 0.0,
+                    max: 0.0,
+                })))
+            }),
+            joint_limit_arc_pool_len: JOINT_LIMIT_ARC_POOL_CAPACITY,
             retired_state_arcs: self.retired_state_arcs.clone(),
             retired_head: self.retired_head,
             retired_len: self.retired_len,
@@ -885,8 +1165,10 @@ impl Clone for SafetyManager {
             log_dropped: self.log_dropped,
             log_dropped_forwarded: self.log_dropped_forwarded,
             epoch_id: self.epoch_id,
+            latch_count: self.latch_count,
             fault_code: self.fault_code,
             latched_fault_kinds: self.latched_fault_kinds,
+            has_non_recoverable: self.has_non_recoverable,
             latched_fault_details: self.latched_fault_details.clone(),
         }
     }
@@ -919,6 +1201,16 @@ impl Default for SafetyManager {
                 ))))
             }),
             formatted_fault_arc_pool_len: FORMATTED_FAULT_ARC_POOL_CAPACITY,
+            joint_limit_arc_pool: std::array::from_fn(|_| {
+                Some(Arc::new(SafetyState::Fault(FaultReason::JointLimitExceeded {
+                    joint_idx: 0,
+                    joint_name: String::with_capacity(SAFETY_JOINT_NAME_CAPACITY),
+                    value: 0.0,
+                    min: 0.0,
+                    max: 0.0,
+                })))
+            }),
+            joint_limit_arc_pool_len: JOINT_LIMIT_ARC_POOL_CAPACITY,
             retired_state_arcs: std::array::from_fn(|_| None),
             retired_head: 0,
             retired_len: 0,
@@ -930,8 +1222,10 @@ impl Default for SafetyManager {
             log_dropped: 0,
             log_dropped_forwarded: 0,
             epoch_id: 1,
+            latch_count: 0,
             fault_code: None,
             latched_fault_kinds: 0,
+            has_non_recoverable: false,
             latched_fault_details: vec![None; FaultKind::COUNT].into_boxed_slice(),
         }
     }
@@ -1028,18 +1322,51 @@ impl SafetyManager {
         self.formatted_fault_arc_pool_len
     }
 
+    /// Number of preallocated `JointLimitExceeded` `Arc<SafetyState>` fault slots currently available.
+    pub fn joint_limit_arc_pool_len(&self) -> usize {
+        self.joint_limit_arc_pool_len
+    }
+
+    /// Monotonic count of new/upgraded latches recorded by [`Self::latch`].
+    #[inline]
+    pub fn latch_count(&self) -> u64 {
+        self.latch_count
+    }
+
     /// Resets a uniquely-owned retired `SafetyState` off-thread for recycling into either the
-    /// formatted-message pool (`Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY))`) or the
-    /// general pool (`Idle`).
+    /// formatted-message pool (`Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY))`), the
+    /// joint-limit pool (`JointLimitExceeded`), or the general pool (`Idle`).
     pub fn reset_recycled_fault_arc(slot: &mut SafetyState) {
-        if let SafetyState::Fault(FaultReason::Other(s)) = slot {
-            if s.capacity() >= SAFETY_LOG_TEXT_CAPACITY && s.capacity() <= SAFETY_LOG_TEXT_CAPACITY * 2 {
-                s.clear();
-                return;
+        match slot {
+            SafetyState::Fault(FaultReason::Other(s)) => {
+                if s.capacity() >= SAFETY_LOG_TEXT_CAPACITY && s.capacity() <= SAFETY_LOG_TEXT_CAPACITY * 2 {
+                    s.clear();
+                    return;
+                }
+                *slot = SafetyState::Fault(FaultReason::Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY)));
             }
-            *slot = SafetyState::Fault(FaultReason::Other(String::with_capacity(SAFETY_LOG_TEXT_CAPACITY)));
-        } else {
-            *slot = SafetyState::Idle;
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_idx, joint_name, value, min, max }) => {
+                if joint_name.capacity() >= SAFETY_JOINT_NAME_CAPACITY
+                    && joint_name.capacity() <= SAFETY_JOINT_NAME_CAPACITY * 2
+                {
+                    joint_name.clear();
+                    *joint_idx = 0;
+                    *value = 0.0;
+                    *min = 0.0;
+                    *max = 0.0;
+                    return;
+                }
+                *slot = SafetyState::Fault(FaultReason::JointLimitExceeded {
+                    joint_idx: 0,
+                    joint_name: String::with_capacity(SAFETY_JOINT_NAME_CAPACITY),
+                    value: 0.0,
+                    min: 0.0,
+                    max: 0.0,
+                });
+            }
+            _ => {
+                *slot = SafetyState::Idle;
+            }
         }
     }
 
@@ -1061,6 +1388,18 @@ impl SafetyManager {
         }
     }
 
+    /// Emits or defers the watchdog-park-blocked warning without RT heap allocation.
+    pub fn log_watchdog_park_blocked(&mut self, reason: BoundedText<160>) {
+        if self.deferred_logging {
+            self.queue_log_event(SafetyLogEvent::WatchdogParkBlocked(reason));
+        } else {
+            tracing::warn!(
+                target: "armd::supervisor",
+                "Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout"
+            );
+        }
+    }
+
     /// True when `kind` has been latched since the last successful clear to `Idle`.
     #[inline]
     pub fn has_latched_fault_kind(&self, kind: FaultKind) -> bool {
@@ -1079,35 +1418,93 @@ impl SafetyManager {
         self.latched_fault_kinds
     }
 
-    /// Last inline detail recorded for `kind` since the last clear, if any.
+    /// Representative inline detail recorded for `kind` since the last clear, if any.
     #[inline]
     pub fn latched_fault_detail(&self, kind: FaultKind) -> Option<&LatchedFaultDetail> {
         self.latched_fault_details[kind as usize].as_ref()
     }
 
-    /// Empties the preallocated fault-slot pool for deterministic exhaustion tests.
+    /// Sets an arbitrary bit in the latched-kind bitmask for fail-closed unknown-kind tests.
+    #[doc(hidden)]
+    pub fn record_unknown_kind_bit_for_test(&mut self, bit: u8) {
+        self.latched_fault_kinds |= bit;
+    }
+
+    /// Empties every preallocated fault-slot pool for deterministic exhaustion tests.
     #[doc(hidden)]
     pub fn drain_fault_arc_pool_for_test(&mut self) -> Vec<Arc<SafetyState>> {
-        let mut drained = Vec::with_capacity(self.fault_arc_pool_len);
+        let mut drained = Vec::with_capacity(
+            self.fault_arc_pool_len + self.formatted_fault_arc_pool_len + self.joint_limit_arc_pool_len,
+        );
         while self.fault_arc_pool_len > 0 {
             self.fault_arc_pool_len -= 1;
             if let Some(arc) = self.fault_arc_pool[self.fault_arc_pool_len].take() {
                 drained.push(arc);
             }
         }
+        while self.formatted_fault_arc_pool_len > 0 {
+            self.formatted_fault_arc_pool_len -= 1;
+            if let Some(arc) = self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len].take() {
+                drained.push(arc);
+            }
+        }
+        while self.joint_limit_arc_pool_len > 0 {
+            self.joint_limit_arc_pool_len -= 1;
+            if let Some(arc) = self.joint_limit_arc_pool[self.joint_limit_arc_pool_len].take() {
+                drained.push(arc);
+            }
+        }
         drained
     }
 
-    fn record_latched_fault(&mut self, kind: FaultKind, detail: LatchedFaultDetail) {
-        self.latched_fault_kinds |= kind.bit();
-        self.latched_fault_details[kind as usize] = Some(detail);
+    /// Most severe recorded [`FaultKind`] according to [`FaultKind::severity`].
+    pub fn highest_severity_kind(&self) -> Option<FaultKind> {
+        let mut best: Option<(FaultKind, u8)> = None;
+        for kind in FaultKind::ALL {
+            if self.has_latched_fault_kind(kind) {
+                let code = self.detail_code_for(kind);
+                let rank = kind.severity(code);
+                if best.is_none_or(|(_, r)| rank > r) {
+                    best = Some((kind, rank));
+                }
+            }
+        }
+        best.map(|(k, _)| k)
     }
 
-    fn any_latched_non_recoverable(&self) -> bool {
-        self.latched_fault_details
-            .iter()
-            .flatten()
-            .any(|d| !d.code.recoverable())
+    #[inline]
+    fn detail_code_for(&self, kind: FaultKind) -> FaultCode {
+        self.latched_fault_details[kind as usize]
+            .map_or_else(|| kind.default_code(), |d| d.code)
+    }
+
+    /// Single recoverability rule: true ONLY when EVERY recorded fault kind and detail in the
+    /// fixed-size record is recoverable (worst-of across the record, fail-closed on unknown bits).
+    pub fn recoverable(&self) -> bool {
+        if (self.latched_fault_kinds & !FaultKind::ALL_MASK) != 0 {
+            return false;
+        }
+        if self.has_non_recoverable {
+            return false;
+        }
+        for bit in 0..8u8 {
+            if (self.latched_fault_kinds & (1u8 << bit)) != 0 {
+                let Some(kind) = FaultKind::from_bit_index(bit) else {
+                    return false;
+                };
+                if kind.always_non_recoverable() || !self.detail_code_for(kind).recoverable() {
+                    return false;
+                }
+            }
+        }
+        match &*self.state_arc {
+            SafetyState::EStop => false,
+            SafetyState::Fault(reason) => {
+                let code = self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason));
+                code.recoverable()
+            }
+            _ => true,
+        }
     }
 
     fn emit_or_queue_fault_log(&mut self, reason: &BoundedFaultReason, code: FaultCode) {
@@ -1119,9 +1516,9 @@ impl SafetyManager {
         }
     }
 
-    /// Returns a clean, uniquely owned `SafetyState::Idle` or pre-sized empty `Other(String)`
-    /// `Arc` recycled off-thread back into the matching bounded fault slot pool; returns
-    /// `Err(arc)` without dropping if rejected.
+    /// Returns a clean, uniquely owned `SafetyState::Idle`, pre-sized empty `Other(String)`, or
+    /// pre-sized `JointLimitExceeded` `Arc` recycled off-thread back into the matching bounded
+    /// fault slot pool; returns `Err(arc)` without dropping if rejected.
     pub fn return_fault_arc(&mut self, arc: Arc<SafetyState>) -> Result<(), Arc<SafetyState>> {
         if Arc::strong_count(&arc) != 1 || Arc::weak_count(&arc) != 0 {
             return Err(arc);
@@ -1139,6 +1536,15 @@ impl SafetyManager {
             {
                 self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len] = Some(arc);
                 self.formatted_fault_arc_pool_len += 1;
+                Ok(())
+            }
+            SafetyState::Fault(FaultReason::JointLimitExceeded { joint_name, .. })
+                if joint_name.is_empty()
+                    && joint_name.capacity() >= SAFETY_JOINT_NAME_CAPACITY
+                    && self.joint_limit_arc_pool_len < JOINT_LIMIT_ARC_POOL_CAPACITY =>
+            {
+                self.joint_limit_arc_pool[self.joint_limit_arc_pool_len] = Some(arc);
+                self.joint_limit_arc_pool_len += 1;
                 Ok(())
             }
             _ => Err(arc),
@@ -1188,21 +1594,76 @@ impl SafetyManager {
             || self.static_fault_arcs.iter().any(|a| Arc::ptr_eq(arc, a))
     }
 
-    fn allocate_fault_arc(&mut self, reason: FaultReason) -> Result<Arc<SafetyState>, FaultReason> {
-        match reason {
-            FaultReason::BusLoss => Ok(Arc::clone(&self.bus_loss_arc)),
-            FaultReason::WatchdogTimeout => Ok(Arc::clone(&self.watchdog_timeout_arc)),
-            other => {
+    /// Acquires a preallocated or cached `Arc<SafetyState>` for `detail` with zero heap allocation.
+    fn acquire_state_arc(&mut self, kind: FaultKind, detail: FaultDetail) -> Option<Arc<SafetyState>> {
+        match detail {
+            FaultDetail::Estop => Some(Arc::clone(&self.estop_arc)),
+            FaultDetail::BusLoss => Some(Arc::clone(&self.bus_loss_arc)),
+            FaultDetail::WatchdogTimeout => Some(Arc::clone(&self.watchdog_timeout_arc)),
+            FaultDetail::Static(sf) => Some(Arc::clone(&self.static_fault_arcs[sf as usize])),
+            FaultDetail::DetailUnavailable(_) => {
+                if kind == FaultKind::Estop {
+                    Some(Arc::clone(&self.estop_arc))
+                } else {
+                    Some(Arc::clone(&self.detail_unavailable_arc))
+                }
+            }
+            FaultDetail::ThermalTrip { joint_idx, temperature, limit } => {
                 while self.fault_arc_pool_len > 0 {
                     self.fault_arc_pool_len -= 1;
                     if let Some(mut arc) = self.fault_arc_pool[self.fault_arc_pool_len].take() {
                         if let Some(slot) = Arc::get_mut(&mut arc) {
-                            *slot = SafetyState::Fault(other);
-                            return Ok(arc);
+                            *slot = SafetyState::Fault(FaultReason::ThermalTrip {
+                                joint_idx,
+                                temperature,
+                                limit,
+                            });
+                            return Some(arc);
                         }
                     }
                 }
-                Err(other)
+                None
+            }
+            FaultDetail::JointLimitExceeded { joint_idx, joint_name, value, min, max } => {
+                while self.joint_limit_arc_pool_len > 0 {
+                    self.joint_limit_arc_pool_len -= 1;
+                    if let Some(mut arc) = self.joint_limit_arc_pool[self.joint_limit_arc_pool_len].take() {
+                        if let Some(SafetyState::Fault(FaultReason::JointLimitExceeded {
+                            joint_idx: dst_idx,
+                            joint_name: dst_name,
+                            value: dst_val,
+                            min: dst_min,
+                            max: dst_max,
+                        })) = Arc::get_mut(&mut arc)
+                        {
+                            if dst_name.capacity() >= joint_name.as_str().len() {
+                                dst_name.clear();
+                                dst_name.push_str(joint_name.as_str());
+                                *dst_idx = joint_idx;
+                                *dst_val = value;
+                                *dst_min = min;
+                                *dst_max = max;
+                                return Some(arc);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            FaultDetail::Formatted { message, .. } => {
+                while self.formatted_fault_arc_pool_len > 0 {
+                    self.formatted_fault_arc_pool_len -= 1;
+                    if let Some(mut arc) = self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len].take() {
+                        if let Some(SafetyState::Fault(FaultReason::Other(s))) = Arc::get_mut(&mut arc) {
+                            if s.capacity() >= message.as_str().len() {
+                                s.clear();
+                                s.push_str(message.as_str());
+                                return Some(arc);
+                            }
+                        }
+                    }
+                }
+                None
             }
         }
     }
@@ -1238,30 +1699,271 @@ impl SafetyManager {
         self.epoch_id
     }
 
-    /// Advance epoch and latch E-Stop immediately
-    pub fn trigger_e_stop(&mut self) -> u64 {
-        let prev_not_estop = *self.state_arc != SafetyState::EStop;
-        if !self.deferred_logging {
-            if prev_not_estop {
-                tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
-            }
-            let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
-        } else {
-            let prev = prev_not_estop.then(|| BoundedSafetyState::from_state(&self.state_arc));
-            let replaced = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
-            if replaced {
-                if let Some(from) = prev {
+    /// Single authoritative fault/E-stop latch used by every detector.
+    ///
+    /// Always records `kind`, its bounded inline detail, and worst-of recoverability in the
+    /// fixed-size record — even when another fault is already active and even when every
+    /// preallocated `Arc<SafetyState>` pool slot is exhausted — and never allocates on the heap.
+    /// Decides the shown state by strict severity precedence without epoch churn or log spam on
+    /// repeated detection of an already-latched kind.
+    pub fn latch(&mut self, kind: FaultKind, detail: FaultDetail) -> u64 {
+        let code = detail.code(kind);
+        let bounded_reason = detail.bounded_reason(kind);
+        let already_latched = self.has_latched_fault_kind(kind);
+        let prev_detail = self.latched_fault_details[kind as usize];
+        let prev_highest = self.highest_severity_kind();
+        let prev_highest_rank = prev_highest.map_or(0, |k| k.severity(self.detail_code_for(k)));
+
+        // 1. Always record kind, worst-of recoverability, and inline detail (0 heap ops).
+        self.latched_fault_kinds |= kind.bit();
+        if kind.always_non_recoverable() || !code.recoverable() {
+            self.has_non_recoverable = true;
+        }
+        let keep_prev_other_detail = kind == FaultKind::Other
+            && prev_detail.is_some_and(|d| !d.code.recoverable() && code.recoverable());
+        if !keep_prev_other_detail {
+            self.latched_fault_details[kind as usize] = Some(LatchedFaultDetail {
+                code,
+                reason: bounded_reason,
+            });
+        }
+
+        // 2. Repeat detection of an already-recorded kind with the same code is idempotent.
+        if already_latched && prev_detail.is_some_and(|d| d.code == code) {
+            return self.epoch_id;
+        }
+
+        // 3. Determine whether this latch upgrades the displayed state by severity precedence.
+        let new_rank = kind.severity(code);
+        let upgrades_shown = prev_highest.is_none()
+            || new_rank > prev_highest_rank
+            || (prev_highest == Some(kind) && kind == FaultKind::Other && !keep_prev_other_detail);
+
+        self.latch_count = self.latch_count.wrapping_add(1);
+        if kind == FaultKind::Estop {
+            if upgrades_shown && *self.state_arc != SafetyState::EStop {
+                if self.deferred_logging {
+                    let from = BoundedSafetyState::from_state(&self.state_arc);
                     self.queue_log_event(SafetyLogEvent::EStop { from });
+                } else {
+                    tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
                 }
             }
+        } else {
+            self.emit_or_queue_fault_log(&bounded_reason, code);
         }
-        self.epoch_id = self.epoch_id.wrapping_add(1);
+
+        if upgrades_shown {
+            if self.can_accept_fault_transition() {
+                if let Some(next_arc) = self.acquire_state_arc(kind, detail) {
+                    self.fault_code = Some(code);
+                    let replaced = self.try_replace_state_arc(next_arc);
+                    debug_assert!(replaced);
+                } else if !self.state_arc.is_stopped() {
+                    self.fault_code = Some(code);
+                    let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
+                    debug_assert!(replaced);
+                }
+            }
+            // E-stop latching while already stopped records EStop without churning the active fault epoch.
+            let estop_over_stopped = kind == FaultKind::Estop && prev_highest.is_some();
+            if !estop_over_stopped {
+                self.epoch_id = self.epoch_id.wrapping_add(1);
+            }
+        }
+
         self.epoch_id
     }
 
-    /// Structured cause of the current Fault / EStop; None in any other state.
-    /// The `code` of [`Self::fault`] without building its message.
+    /// Single authoritative clear check evaluated BEFORE any clear path resets the fault record.
+    ///
+    /// Evaluates common supervisor blockers and the explicit per-kind condition table over EVERY
+    /// recorded bit in `latched_fault_kinds`. Any bit without an explicit rule refuses to clear
+    /// (fail closed). Performs zero heap allocations.
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub fn clear_check(&self, ctx: &ClearContext) -> Result<(), ClearRefusal> {
+        if ctx.shutdown_committed {
+            return Err(ClearRefusal::ShutdownCommitted);
+        }
+        if let Some(err) = ctx.driver_config_error {
+            return Err(ClearRefusal::DriverConfigError(err));
+        }
+        if ctx.gravity_comp_unconfirmed {
+            return Err(ClearRefusal::GravityCompUnconfirmed);
+        }
+        if ctx.disable_pending {
+            return Err(ClearRefusal::DisablePending);
+        }
+        if ctx.mit_lost_unsupported {
+            return Err(ClearRefusal::MitLostUnsupported);
+        }
+        if ctx.mit_modes_uncertain {
+            return Err(ClearRefusal::MitModesUncertain);
+        }
+        if ctx.resting_feedback_missing {
+            return Err(ClearRefusal::FreshFeedbackRequiredForRestingSupport);
+        }
+        if let Some(violation) = ctx.resting_pose_violation {
+            return Err(ClearRefusal::RestingPoseSupport(violation));
+        }
+        if !self.can_accept_fault_transition() {
+            return Err(ClearRefusal::ReclaimQueueFull);
+        }
+        if (self.latched_fault_kinds & !FaultKind::ALL_MASK) != 0 {
+            return Err(ClearRefusal::UnknownFaultKind);
+        }
+
+        // Per-kind condition table evaluated over EVERY recorded kind.
+        // Order: BusLoss (fresh feedback) -> hardware/enable -> ThermalTrip -> WatchdogTimeout -> JointLimit -> remaining kinds.
+        const CHECK_ORDER: [FaultKind; FaultKind::COUNT] = [
+            FaultKind::BusLoss,
+            FaultKind::ThermalTrip,
+            FaultKind::WatchdogTimeout,
+            FaultKind::JointLimit,
+            FaultKind::CollisionLatched,
+            FaultKind::Estop,
+            FaultKind::Other,
+        ];
+        let mut checked_any = false;
+        for kind in CHECK_ORDER {
+            if !self.has_latched_fault_kind(kind) {
+                continue;
+            }
+            checked_any = true;
+            match kind {
+                FaultKind::BusLoss => {
+                    if !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if let Some(err) = ctx.hardware_error {
+                        return Err(ClearRefusal::DriverError(err));
+                    }
+                    if ctx.has_driver && !ctx.enable_state_known {
+                        return Err(ClearRefusal::EnableStateUnknown);
+                    }
+                }
+                FaultKind::ThermalTrip => {
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if let Some(err) = ctx.hardware_error {
+                        return Err(ClearRefusal::DriverError(err));
+                    }
+                    if !ctx.thermal_sensor_available || !ctx.thermal_below_threshold {
+                        return Err(if ctx.has_driver {
+                            ClearRefusal::TemperatureConfirmationRequired
+                        } else {
+                            ClearRefusal::TemperatureAboveThreshold
+                        });
+                    }
+                    if ctx.thermal_cooldown_elapsed_ms < ctx.thermal_cooldown_required_ms {
+                        return Err(ClearRefusal::ThermalCooldownNotElapsed {
+                            elapsed_ms: ctx.thermal_cooldown_elapsed_ms,
+                            required_ms: ctx.thermal_cooldown_required_ms,
+                        });
+                    }
+                    if ctx.has_driver && !ctx.enable_state_known {
+                        return Err(ClearRefusal::EnableStateUnknown);
+                    }
+                }
+                FaultKind::WatchdogTimeout => {
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if let Some(err) = ctx.hardware_error {
+                        return Err(ClearRefusal::DriverError(err));
+                    }
+                    if ctx.has_active_lease && !ctx.lease_heartbeat_fresh {
+                        return Err(ClearRefusal::WatchdogHeartbeatRequired);
+                    }
+                    if ctx.has_driver && !ctx.enable_state_known {
+                        return Err(ClearRefusal::EnableStateUnknown);
+                    }
+                }
+                FaultKind::JointLimit => {
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if let Some(err) = ctx.hardware_error {
+                        return Err(ClearRefusal::DriverError(err));
+                    }
+                    if !ctx.joints_within_limits {
+                        return Err(ClearRefusal::JointLimitsNotSatisfied);
+                    }
+                    if ctx.has_driver && !ctx.enable_state_known {
+                        return Err(ClearRefusal::EnableStateUnknown);
+                    }
+                }
+                FaultKind::CollisionLatched | FaultKind::Estop | FaultKind::Other => {
+                    if ctx.has_driver && !ctx.feedback_fresh {
+                        return Err(ClearRefusal::FreshFeedbackRequired);
+                    }
+                    if let Some(err) = ctx.hardware_error {
+                        return Err(ClearRefusal::DriverError(err));
+                    }
+                    if ctx.has_driver && !ctx.enable_state_known {
+                        return Err(ClearRefusal::EnableStateUnknown);
+                    }
+                }
+            }
+        }
+        // Exhaustive bit-level fail-closed guard over all 8 bits.
+        for bit in 0..8u8 {
+            if (self.latched_fault_kinds & (1u8 << bit)) != 0
+                && FaultKind::from_bit_index(bit).is_none()
+            {
+                return Err(ClearRefusal::UnknownFaultKind);
+            }
+        }
+        if !checked_any && self.state_arc.is_stopped() {
+            if ctx.has_driver && !ctx.feedback_fresh {
+                return Err(ClearRefusal::FreshFeedbackRequired);
+            }
+            if let Some(err) = ctx.hardware_error {
+                return Err(ClearRefusal::DriverError(err));
+            }
+            if ctx.has_driver && !ctx.enable_state_known {
+                return Err(ClearRefusal::EnableStateUnknown);
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluates [`Self::clear_check`] FIRST and, only after it passes, resets the entire fault
+    /// record and transitions back to `Idle` all at once (0 heap allocations).
+    #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
+    pub fn clear_with_check(&mut self, ctx: &ClearContext) -> Result<SafetyState, ClearRefusal> {
+        self.clear_check(ctx)?;
+        if self.state_arc.is_stopped() || self.has_latched_fault() {
+            if !self.try_replace_state_arc(Arc::clone(&self.idle_arc)) {
+                return Err(ClearRefusal::ReclaimQueueFull);
+            }
+            if self.deferred_logging {
+                self.queue_log_event(SafetyLogEvent::Cleared);
+            } else {
+                tracing::info!("Safety: cleared -> Idle");
+            }
+            self.fault_code = None;
+            self.latched_fault_kinds = 0;
+            self.has_non_recoverable = false;
+            self.latched_fault_details.fill(None);
+            self.epoch_id = self.epoch_id.wrapping_add(1);
+            Ok(SafetyState::Idle)
+        } else {
+            Ok((*self.state_arc).clone())
+        }
+    }
+
+    /// Advance epoch and latch E-Stop immediately (compatibility wrapper over [`Self::latch`]).
+    pub fn trigger_e_stop(&mut self) -> u64 {
+        self.latch(FaultKind::Estop, FaultDetail::Estop)
+    }
+
+    /// Machine-readable cause of the most severe recorded Fault / EStop; `None` when healthy.
     pub fn fault_code(&self) -> Option<FaultCode> {
+        if let Some(kind) = self.highest_severity_kind() {
+            return Some(self.detail_code_for(kind));
+        }
         match &*self.state_arc {
             SafetyState::EStop => Some(FaultCode::Estop),
             SafetyState::Fault(reason) => Some(self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))),
@@ -1269,85 +1971,54 @@ impl SafetyManager {
         }
     }
 
+    /// Structured `observation.fault` for the most severe recorded kind, with `recoverable`
+    /// computed by [`Self::recoverable`] (0 heap allocations).
     pub fn fault(&self) -> Option<FaultInfo> {
         let mut message = BoundedText::empty();
-        let code = match &*self.state_arc {
-            SafetyState::EStop => {
-                message.push_str("E-stop latched");
-                FaultCode::Estop
+        let code = if let Some(kind) = self.highest_severity_kind() {
+            if let Some(detail) = self.latched_fault_details[kind as usize] {
+                detail.reason.write_message_into(&mut message);
+                detail.code
+            } else {
+                message.push_str(DETAIL_UNAVAILABLE);
+                kind.default_code()
             }
-            SafetyState::Fault(reason) => {
-                reason.write_message_into(&mut message);
-                self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))
+        } else {
+            match &*self.state_arc {
+                SafetyState::EStop => {
+                    message.push_str("E-stop latched");
+                    FaultCode::Estop
+                }
+                SafetyState::Fault(reason) => {
+                    reason.write_message_into(&mut message);
+                    self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))
+                }
+                _ => return None,
             }
-            _ => return None,
         };
         Some(FaultInfo {
             code,
             message,
-            recoverable: code.recoverable() && !self.any_latched_non_recoverable(),
+            recoverable: self.recoverable(),
         })
     }
 
-    /// Advance epoch and latch a preallocated static fault with zero heap allocations and zero
-    /// pool consumption.
+    /// Compatibility wrapper over [`Self::latch`] for preallocated static faults.
     pub fn trigger_static_fault(&mut self, fault: StaticFault) -> u64 {
-        let code = fault.code();
-        let bounded = BoundedFaultReason::Other(BoundedText::new(fault.message()));
-        self.record_latched_fault(FaultKind::Other, LatchedFaultDetail { code, reason: bounded });
-        self.emit_or_queue_fault_log(&bounded, code);
-        if self.can_accept_fault_transition() {
-            self.fault_code = Some(code);
-            let replaced = self.try_replace_state_arc(Arc::clone(&self.static_fault_arcs[fault as usize]));
-            debug_assert!(replaced);
-        }
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        self.epoch_id
+        self.latch(FaultKind::Other, FaultDetail::Static(fault))
     }
 
-    /// Advance epoch and latch a dynamically formatted fault message completely inline on the RT
-    /// thread (0 heap alloc, 0 heap free) using the pre-sized formatted-message slot pool.
+    /// Compatibility wrapper over [`Self::latch`] for dynamically formatted faults.
     pub fn trigger_fault_formatted(
         &mut self,
         code: FaultCode,
         kind: FaultKind,
         fmt_msg: impl FnOnce(&mut BoundedText<SAFETY_LOG_TEXT_CAPACITY>),
     ) -> u64 {
-        let mut msg = BoundedText::<SAFETY_LOG_TEXT_CAPACITY>::empty();
-        fmt_msg(&mut msg);
-        let bounded = BoundedFaultReason::Other(msg);
-        self.record_latched_fault(kind, LatchedFaultDetail { code, reason: bounded });
-        self.emit_or_queue_fault_log(&bounded, code);
-        if self.can_accept_fault_transition() {
-            let mut next_arc = None;
-            while self.formatted_fault_arc_pool_len > 0 {
-                self.formatted_fault_arc_pool_len -= 1;
-                if let Some(mut arc) = self.formatted_fault_arc_pool[self.formatted_fault_arc_pool_len].take() {
-                    if let Some(SafetyState::Fault(FaultReason::Other(s))) = Arc::get_mut(&mut arc) {
-                        if s.capacity() >= msg.as_str().len() {
-                            s.clear();
-                            s.push_str(msg.as_str());
-                            next_arc = Some(arc);
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some(arc) = next_arc {
-                self.fault_code = Some(code);
-                let replaced = self.try_replace_state_arc(arc);
-                debug_assert!(replaced);
-            } else if !matches!(*self.state_arc, SafetyState::Fault(_)) {
-                self.fault_code = Some(code);
-                let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
-                debug_assert!(replaced);
-            }
-        }
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        self.epoch_id
+        self.latch(kind, FaultDetail::formatted(code, fmt_msg))
     }
 
-    /// Advance epoch and latch Fault immediately; the code follows from the reason.
+    /// Compatibility wrapper over [`Self::latch`]; the code follows from the reason.
     pub fn trigger_fault(&mut self, reason: FaultReason) -> u64 {
         let code = FaultCode::from_reason(&reason);
         self.trigger_fault_coded(code, reason)
@@ -1362,104 +2033,71 @@ impl SafetyManager {
             && self.retired_len >= RETIRED_STATE_CAPACITY)
     }
 
-    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated or the
-    /// bounded fault slot pool is empty, skips `make_reason` (0 heap alloc / 0 drop on RT) while
-    /// STILL latching the fault kind with `"detail unavailable"` (and moving a non-faulted state
-    /// to the preallocated `"detail unavailable"` fault Arc without calling `Arc::new`).
+    /// Compatibility wrapper over [`Self::latch`]: skips `make_reason` when reclamation is full or
+    /// the pool is empty while still recording the fault kind via [`Self::latch`].
     pub fn trigger_fault_coded_lazy(
         &mut self,
         code: FaultCode,
         make_reason: impl FnOnce() -> FaultReason,
     ) -> u64 {
+        let kind = FaultKind::from_code(code);
         if !self.can_accept_fault_transition() || self.fault_arc_pool_len == 0 {
-            let kind = FaultKind::from_code(code);
-            let reason = BoundedFaultReason::Other(BoundedText::new(DETAIL_UNAVAILABLE));
-            self.record_latched_fault(kind, LatchedFaultDetail { code, reason });
-            self.emit_or_queue_fault_log(&reason, code);
-            if !matches!(*self.state_arc, SafetyState::Fault(_)) {
-                self.fault_code = Some(code);
-                let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
-                debug_assert!(replaced);
+            let before = self.epoch_id;
+            let ep = self.latch(kind, FaultDetail::DetailUnavailable(code));
+            if !self.can_accept_fault_transition() && ep == before {
+                self.epoch_id = self.epoch_id.wrapping_add(1);
             }
-            self.epoch_id = self.epoch_id.wrapping_add(1);
             return self.epoch_id;
         }
         self.trigger_fault_coded(code, make_reason())
     }
 
-    /// Fallible fault latch that ALWAYS records the fault kind in the fixed-size latched record
-    /// (and never falls back to `Arc::new`). When off-thread reclamation is saturated or the
-    /// preallocated fault-slot pool is empty, keeps the current `Fault` Arc (or switches a
-    /// non-faulted state to the preallocated `"detail unavailable"` fault Arc) and returns
-    /// `Err((epoch, reason))` so the caller does not drop heap-bearing `reason` on the RT thread.
+    /// Fallible compatibility wrapper over [`Self::latch`] returning `Err((epoch, reason))` when
+    /// off-thread reclamation is full or the matching preallocated pool is empty so callers can
+    /// drop heap-bearing `reason` off the RT thread.
     pub fn try_trigger_fault_coded(
         &mut self,
         code: FaultCode,
         reason: FaultReason,
     ) -> Result<u64, (u64, FaultReason)> {
-        let kind = FaultKind::from_reason(&reason);
-        let bounded_reason = BoundedFaultReason::from_reason(&reason);
-        self.record_latched_fault(kind, LatchedFaultDetail { code, reason: bounded_reason });
-        if !self.can_accept_fault_transition() {
-            self.emit_or_queue_fault_log(&bounded_reason, code);
-            self.epoch_id = self.epoch_id.wrapping_add(1);
-            return Err((self.epoch_id, reason));
-        }
-        let next_arc = match self.allocate_fault_arc(reason) {
-            Ok(arc) => arc,
-            Err(reason) => {
-                self.emit_or_queue_fault_log(&bounded_reason, code);
-                if !matches!(*self.state_arc, SafetyState::Fault(_)) {
-                    self.fault_code = Some(code);
-                    let replaced = self.try_replace_state_arc(Arc::clone(&self.detail_unavailable_arc));
-                    debug_assert!(replaced);
-                }
-                self.epoch_id = self.epoch_id.wrapping_add(1);
-                return Err((self.epoch_id, reason));
-            }
+        let kind = match FaultKind::from_code(code) {
+            FaultKind::Other => FaultKind::from_reason(&reason),
+            specific => specific,
         };
-        self.emit_or_queue_fault_log(&bounded_reason, code);
-        self.fault_code = Some(code);
-        let replaced = self.try_replace_state_arc(next_arc);
-        debug_assert!(replaced);
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        Ok(self.epoch_id)
+        let detail = FaultDetail::from_reason(code, &reason);
+        let needs_pool = match detail {
+            FaultDetail::ThermalTrip { .. } => self.fault_arc_pool_len == 0,
+            FaultDetail::JointLimitExceeded { .. } => self.joint_limit_arc_pool_len == 0,
+            FaultDetail::Formatted { .. } => self.formatted_fault_arc_pool_len == 0,
+            _ => false,
+        };
+        let reclaim_full = !self.can_accept_fault_transition();
+        let ep = self.latch(kind, detail);
+        if reclaim_full || needs_pool {
+            return Err((ep, reason));
+        }
+        Ok(ep)
     }
 
-    /// [`Self::trigger_fault`] with the code recorded by the trigger site.
+    /// Compatibility wrapper over [`Self::latch`] with an explicit [`FaultCode`].
     pub fn trigger_fault_coded(&mut self, code: FaultCode, reason: FaultReason) -> u64 {
-        match self.try_trigger_fault_coded(code, reason) {
-            Ok(ep) => ep,
-            Err((ep, _)) => ep,
-        }
+        let kind = match FaultKind::from_code(code) {
+            FaultKind::Other => FaultKind::from_reason(&reason),
+            specific => specific,
+        };
+        let detail = FaultDetail::from_reason(code, &reason);
+        self.latch(kind, detail)
     }
 
-    /// Attempt to clear E-Stop or Fault back to Idle without heap allocation.
-    /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
+    /// Attempt to clear E-Stop or Fault back to Idle without heap allocation (evaluating
+    /// [`Self::clear_check`] with all external conditions met).
     #[allow(clippy::result_large_err)] // inline refusal keeps RT clear_fault zero-alloc
-    pub fn clear_fault_bounded(&mut self) -> Result<SafetyState, ClearFaultRefusal> {
-        match &*self.state_arc {
-            SafetyState::EStop | SafetyState::Fault(_) => {
-                if !self.try_replace_state_arc(Arc::clone(&self.idle_arc)) {
-                    return Err(ClearFaultRefusal::ReclaimQueueFull);
-                }
-                if self.deferred_logging {
-                    self.queue_log_event(SafetyLogEvent::Cleared);
-                } else {
-                    tracing::info!("Safety: cleared -> Idle");
-                }
-                self.fault_code = None;
-                self.latched_fault_kinds = 0;
-                self.latched_fault_details.fill(None);
-                self.epoch_id = self.epoch_id.wrapping_add(1);
-                Ok(SafetyState::Idle)
-            }
-            other => Ok(other.clone()),
-        }
+    pub fn clear_fault_bounded(&mut self) -> Result<SafetyState, ClearRefusal> {
+        let ctx = ClearContext::all_conditions_met();
+        self.clear_with_check(&ctx)
     }
 
     /// Attempt to clear E-Stop or Fault back to Idle.
-    /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         self.clear_fault_bounded()
             .map_err(|r| SafetyError::ClearFaultRejected(r.render_message()))
