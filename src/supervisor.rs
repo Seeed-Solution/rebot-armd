@@ -7921,10 +7921,11 @@ impl ArmSupervisor {
         use crate::diagnostics::tick::{us, UsageMark};
         let started = Instant::now();
         let usage_start = UsageMark::now();
-        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot, pre, publish) = {
+        let (obs, wait, lock_held, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot, pre, publish, allocs) = {
             let (mut inner, generation) = self.inner.write_tick().await;
             let locked = Instant::now();
             let usage_locked = UsageMark::now();
+            let _ = crate::diagnostics::alloc::take();
             // No other guard exists now: the log is complete up to the guard waited for.
             let log = self.inner.take_log();
             inner.defer_zero_check_persist = true;
@@ -7943,8 +7944,9 @@ impl ArmSupervisor {
                 .min(inner.observation_valid_for(&obs));
             let old_snapshot = self.publish_observation(ObservationSnapshot { generation, at: Instant::now(), max_age, obs: Arc::clone(&obs) });
             let lock_end = Instant::now();
+            let allocs = crate::diagnostics::alloc::take();
             (obs, locked - started, lock_end - locked, control_hz, pending_zc, phases, log, locked, usage_locked, old_snapshot,
-                body_start - locked, lock_end - body_end)
+                body_start - locked, lock_end - body_end, allocs)
         };
         let released = Instant::now();
         let usage_released = UsageMark::now();
@@ -8196,7 +8198,12 @@ impl ArmSupervisor {
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
                 publish_us: us(publish),
             },
-            usage: crate::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released),
+            usage: crate::diagnostics::tick::ThreadUsage {
+                lock_alloc_calls: allocs.calls.min(u64::from(u32::MAX)) as u32,
+                lock_alloc_us: (allocs.total_ns / 1000).min(u64::from(u32::MAX)) as u32,
+                lock_alloc_max_us: (allocs.max_ns / 1000).min(u64::from(u32::MAX)) as u32,
+                ..crate::diagnostics::tick::thread_usage(&usage_start, &usage_locked, &usage_released)
+            },
             waited_for: log.last_release.map(holder),
             longest_hold: log.longest.map(holder),
             late,

@@ -320,6 +320,11 @@ fn run_tool_info(path: &str, robot: Option<&str>) -> Result<String, String> {
     serde_json::to_string(&summary).map_err(|e| format!("serialize tool info: {e}"))
 }
 
+/// The system allocator, timed on the control thread with `ARMD_ALLOC_TIMING=1`
+/// (src/diagnostics/alloc.rs).
+#[global_allocator]
+static GLOBAL: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::TimedAlloc;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -499,6 +504,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new().name("armd-control".into()).spawn(move || {
         if let Some(sched) = set_realtime_priority() {
             control_supervisor.set_control_thread_sched(sched);
+        }
+        if std::env::var("ARMD_ALLOC_TIMING").is_ok_and(|v| v == "1") {
+            armd::diagnostics::alloc::time_this_thread();
+            info!("Control loop allocator timing on (ARMD_ALLOC_TIMING=1)");
         }
         let mut next = std::time::Instant::now() + period;
         let mut last_tick = std::time::Instant::now();

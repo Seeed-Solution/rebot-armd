@@ -45,6 +45,11 @@ pub struct ThreadUsage {
     pub wait_majflt: u32,
     pub lock_majflt: u32,
     pub lock_minflt: u32,
+    /// Allocator calls while holding the lock, their total and longest time (µs); zero
+    /// unless armd runs with `ARMD_ALLOC_TIMING=1` (src/diagnostics/alloc.rs).
+    pub lock_alloc_calls: u32,
+    pub lock_alloc_us: u32,
+    pub lock_alloc_max_us: u32,
 }
 
 /// The guard of another task the tick waited for: the last one released before the tick
@@ -263,6 +268,7 @@ pub fn thread_usage(start: &UsageMark, locked: &UsageMark, released: &UsageMark)
         wait_majflt: n(start.majflt, locked.majflt),
         lock_majflt: n(locked.majflt, released.majflt),
         lock_minflt: n(locked.minflt, released.minflt),
+        ..ThreadUsage::default()
     }
 }
 
