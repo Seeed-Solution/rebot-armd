@@ -6,6 +6,34 @@
 #[allow(unused_imports)]
 use super::*;
 
+use crate::driver::handshake::Deadline;
+
+/// Supervisor-side disable confirmation after the driver's own window: fresh valid feedback
+/// and `EnableState::Disabled`, within this time.
+pub const DISABLE_CONFIRM_WINDOW: Duration = Duration::from_millis(25);
+/// Interval between services of [`DisableConfirm`] in the blocking `request_disable`.
+pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
+
+/// The supervisor's disable confirmation as an absolute-deadline wait (no sleep inside): served
+/// once per call, it reads feedback once and reports `Some(confirmed)` when finished.
+#[derive(Clone, Copy, Debug)]
+pub struct DisableConfirm { deadline: Deadline }
+
+impl DisableConfirm {
+    pub fn start(now: Instant) -> Self { Self { deadline: Deadline::after(now, DISABLE_CONFIRM_WINDOW) } }
+
+    /// Fresh valid feedback reports every motor disabled.
+    pub fn confirmed(drv: &dyn ArmDriver) -> bool { drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled }
+
+    /// One service: past the deadline -> `Some(false)` without a read (unless already confirmed);
+    /// else one receive pass, `Some(true)` once confirmed, `None` to serve again.
+    pub fn serve(&mut self, drv: &mut dyn ArmDriver) -> Option<bool> {
+        if self.deadline.passed(drv.clock_now()) { return Some(Self::confirmed(drv)); }
+        let _ = drv.read_joint_states();
+        Self::confirmed(drv).then_some(true)
+    }
+}
+
 impl SupervisorInner {
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_estop_gate(self.estop_gate());
@@ -260,15 +288,11 @@ impl SupervisorInner {
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
             drv.set_torque(false).map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
-            let poll_start = Instant::now();
-            while poll_start.elapsed() < Duration::from_millis(25) {
-                let _ = drv.read_joint_states();
-                if drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
+            let mut confirm = DisableConfirm::start(drv.clock_now());
+            while confirm.serve(&mut **drv).is_none() {
+                drv.clock_pause(DISABLE_CONFIRM_SERVICE);
             }
-            if !drv.is_feedback_valid() || drv.enable_state() != EnableState::Disabled {
+            if !DisableConfirm::confirmed(&**drv) {
                 return Err(SafetyError::ClearFaultRejected("Torque disable has not been confirmed by fresh hardware feedback".into()));
             }
         }
