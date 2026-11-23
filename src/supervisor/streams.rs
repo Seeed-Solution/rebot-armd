@@ -6,6 +6,23 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// Copies `src` into `dst`, reusing its memory when it holds a vector.
+fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
+    match dst {
+        Some(v) => copy_into(v, src),
+        None => *dst = Some(src.to_vec()),
+    }
+}
+
+/// The run's observation into `dst`, reusing its memory.
+#[cfg(feature = "policy-runtime")]
+fn set_policy_obs(dst: &mut Option<crate::model::PolicyObservation>, run: &crate::policy_runtime::PolicyRun) {
+    match dst {
+        Some(o) => run.to_observation_into(true, o),
+        None => *dst = Some(run.to_observation(true)),
+    }
+}
+
 impl SupervisorInner {
     /// Joint limits used for servo stepping: `config.limits` with `max_velocity` capped
     /// at `config.servo_max_velocity` per joint, except the 7-DOF gripper (index 6).
@@ -104,6 +121,29 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// `check_workspace_path(commanded, [target])` with the evaluator's reused vectors (no
+    /// allocation): the servo / policy target check.
+    pub(super) fn servo_target_workspace(&mut self, target: &[f32]) -> Result<(), SafetyError> {
+        let mut bufs = std::mem::take(&mut self.ws_eval_bufs);
+        let result = (|| {
+            let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+            let eval = crate::chain::WorkspaceEvaluator::new_with_tcp_in(&self.config.arm_model, ws, cam, self.config.tcp_offset, &mut bufs)
+                .with_escape_tol(crate::kinematics::WORKSPACE_EPS);
+            let checked = (|| {
+                let mut c0 = eval.alloc_buf();
+                eval.eval_into(&self.commanded_positions, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+                let mut min_depths = eval.init_min_depths(&c0);
+                let mut clr = eval.alloc_buf();
+                eval.eval_into(target, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
+                eval.check_and_advance(&clr, &mut min_depths, "plan").map_err(SafetyError::from_workspace)
+            })();
+            eval.recycle(&mut bufs);
+            checked
+        })();
+        self.ws_eval_bufs = bufs;
+        result
+    }
+
     /// [`Self::servo_step_workspace`]'s check; the new minimum depths (None: no workspace).
     pub(super) fn servo_step_workspace_in(&self, next: &[f32], phase: &str, bufs: &mut crate::chain::EvalBufs)
         -> Result<Option<crate::kinematics::SlotBuf>, SafetyError> {
@@ -161,6 +201,21 @@ impl SupervisorInner {
         }
     }
 
+    /// [`Self::validate_servo_lease`] for the connection of policy run `action_id`, without
+    /// copying its connection id.
+    #[cfg(feature = "policy-runtime")]
+    fn validate_policy_lease(&mut self, action_id: u64, generation: u64) -> bool {
+        let timeout = self.lease_timeout;
+        let Some(conn) = self.policy_run.as_ref().filter(|r| r.action_id == action_id).map(|r| r.connection_id.as_str()) else { return false; };
+        match self.active_lease.as_mut() {
+            Some(active) if active.acquired_at.elapsed() < timeout && active.generation == generation && !conn.is_empty() && active.client_id == conn => {
+                active.last_valid_motion_instant = Some(Instant::now());
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn validate_and_filter_servo_targets(
         &mut self,
         targets: &mut [f32],
@@ -203,7 +258,7 @@ impl SupervisorInner {
         }
 
         // 1b. Cartesian workspace: the target may not leave the box further than now.
-        if let Err(e) = self.check_workspace_path(&self.commanded_positions, [&*targets]) {
+        if let Err(e) = self.servo_target_workspace(targets) {
             let e = e.with_workspace_phase("servo_target");
             self.workspace_violation = e.workspace_detail();
             self.note_motion_limit(MotionLimitReason::Workspace, None);
@@ -237,13 +292,23 @@ impl SupervisorInner {
         }
     }
 
-    pub fn servo(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+    pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        self.servo_slice(&targets, epoch_id)
+    }
+
+    /// [`Self::servo`] from a slice: no allocation once the servo buffers hold a target
+    /// (the latest-target path consumes through it).
+    pub fn servo_slice(&mut self, targets_in: &[f32], epoch_id: u64) -> Result<(), SafetyError> {
+        if targets_in.len() > crate::rt_core::mailbox::MAX_DOF { return self.servo_slice_oversized(targets_in.to_vec(), epoch_id); }
+        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let targets = &mut buf[..targets_in.len()];
+        targets.copy_from_slice(targets_in);
         #[cfg(feature = "policy-runtime")]
         if self.policy_run.is_some() || self.policy_loading {
             return Err(SafetyError::MotionBusy);
         }
         if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
-        self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
+        self.validate_and_filter_servo_targets(targets, epoch_id)?;
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
@@ -254,17 +319,28 @@ impl SupervisorInner {
         }
 
         // Gripper stall release check on reverse command
-        self.release_gripper_stall_on_reverse(&targets);
+        self.release_gripper_stall_on_reverse(targets);
 
         let _ = self.safety.mark_motion_started();
 
         // 2. Store servo target for tick(dt) to step with actual dt and velocity limits
-        self.target_positions = targets.clone();
-        self.servo_target = Some(targets);
+        copy_into(&mut self.target_positions, targets);
+        set_vec(&mut self.servo_target, targets);
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
         Ok(())
+    }
+
+    /// More joints than a target frame carries: the same checks refuse it (dimension).
+    fn servo_slice_oversized(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() || self.policy_loading {
+            return Err(SafetyError::MotionBusy);
+        }
+        if self.mit_motion_blocker().is_some() { return Err(SafetyError::MotionBusy); }
+        self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
+        Err(SafetyError::DimensionMismatch { expected: self.config.dof, received: targets.len() })
     }
 
     /// Semi-implicit reference step: q_next = q + v_next * dt. All constraint
@@ -761,10 +837,19 @@ impl SupervisorInner {
             stop_reason: None,
             max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
             step_stats: crate::policy_runtime::PolicyStepStats::default(),
+            authorization: crate::policy_runtime::PolicyAuthorization::default(),
+            max_vision_age_ms: None,
+            vision_stale_hold: false,
         };
         self.last_policy_obs = Some(run.to_observation(true));
         self.set_action_policy_stats(action_id, run.step_stats.report());
         self.policy_run = Some(run);
+        // the run's targets are the ones consumed from the latest-target mailbox now
+        self.core.authorize_stream(crate::rt_core::mailbox::TargetAuthority {
+            stream: Some(targets::policy_stream(action_id)),
+            policy_generation: 1,
+            ..Default::default()
+        });
         Ok(action_id)
     }
 
@@ -785,14 +870,32 @@ impl SupervisorInner {
     pub fn policy_step_with_vision(
         &mut self,
         action_id: u64,
-        mut targets: Vec<f32>,
+        targets: Vec<f32>,
+        input_age_ms: Option<u64>,
+        vision_age_ms: Option<u64>,
+        vision_frame_id: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.policy_step_slice(action_id, &targets, input_age_ms, vision_age_ms, vision_frame_id)
+    }
+
+    /// [`Self::policy_step_with_vision`] from a slice: no allocation on an accepted step once
+    /// the run's buffers hold a target (the latest-target path consumes through it).
+    pub fn policy_step_slice(
+        &mut self,
+        action_id: u64,
+        targets_in: &[f32],
         input_age_ms: Option<u64>,
         vision_age_ms: Option<u64>,
         vision_frame_id: Option<u64>,
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
-        let (epoch_id, conn_id, lease_gen, mode, max_first, max_step, prev_live, max_input_age_ms) = {
+        let mut buf = [0.0f32; crate::rt_core::mailbox::MAX_DOF];
+        let n = targets_in.len().min(crate::rt_core::mailbox::MAX_DOF);
+        buf[..n].copy_from_slice(&targets_in[..n]);
+        let targets = &mut buf[..n];
+
+        let (epoch_id, lease_gen, mode, max_first, max_step, has_prev_live, max_input_age_ms) = {
             let Some(active) = self.policy_run.as_ref() else {
                 return Err(ArmError::Rejected {
                     status: 409,
@@ -809,12 +912,11 @@ impl SupervisorInner {
             }
             (
                 active.epoch_id,
-                active.connection_id.clone(),
                 active.lease_generation,
                 active.mode,
                 active.max_first_step_rad,
                 active.max_step_rad,
-                active.last_live_target.clone(),
+                active.last_live_target.is_some(),
                 active.max_input_age_ms,
             )
         };
@@ -852,7 +954,7 @@ impl SupervisorInner {
             return Err(SafetyError::FaultActive(r).into());
         }
 
-        if !self.validate_servo_lease(&conn_id, lease_gen) {
+        if !self.validate_policy_lease(action_id, lease_gen) {
             self.terminate_policy_run(
                 "LEASE_LOST",
                 "cancelled",
@@ -880,7 +982,7 @@ impl SupervisorInner {
             });
         }
 
-        if targets.len() != self.config.dof || targets.iter().any(|v| !v.is_finite()) {
+        if targets_in.len() != self.config.dof || targets.iter().any(|v| !v.is_finite()) {
             self.terminate_policy_run(
                 "INVALID_TARGET",
                 "failed",
@@ -896,8 +998,8 @@ impl SupervisorInner {
                 run.last_input_age_ms = input_age_ms;
                 run.last_vision_age_ms = vision_age_ms;
                 run.vision_frame_id = vision_frame_id;
-                run.last_shadow_target = Some(targets);
-                self.last_policy_obs = Some(run.to_observation(true));
+                set_vec(&mut run.last_shadow_target, targets);
+                set_policy_obs(&mut self.last_policy_obs, run);
             }
             return Ok(());
         }
@@ -996,7 +1098,7 @@ impl SupervisorInner {
             return Err(ArmError::Rejected { status: 409, code: "STALE_INPUT".into(), message: msg });
         }
 
-        if prev_live.is_none() {
+        if !has_prev_live {
             if self.measured_positions.len() != self.config.dof
                 || self.measured_positions.iter().any(|m| !m.is_finite())
             {
@@ -1023,10 +1125,13 @@ impl SupervisorInner {
                     });
                 }
             }
-        } else if let (Some(prev), Some(step_cap)) = (prev_live.as_ref(), max_step) {
-            for i in 0..self.config.dof {
-                let delta = (targets[i] - prev[i]).abs();
-                if delta > step_cap {
+        } else if let Some(step_cap) = max_step {
+            let dof = self.config.dof;
+            let violation = self.policy_run.as_ref().and_then(|r| r.last_live_target.as_ref()).and_then(|prev| {
+                (0..dof).find_map(|i| { let delta = (targets[i] - prev[i]).abs(); (delta > step_cap).then_some((i, delta)) })
+            });
+            if let Some((i, delta)) = violation {
+                {
                     let msg = format!(
                         "Live policy step on joint {} exceeds max_step_rad ({delta:.4} > {step_cap:.4})",
                         i + 1
@@ -1041,7 +1146,7 @@ impl SupervisorInner {
             }
         }
 
-        if let Err(e) = self.validate_and_filter_servo_targets(&mut targets, epoch_id) {
+        if let Err(e) = self.validate_and_filter_servo_targets(targets, epoch_id) {
             let (reason, state, code) = match &e {
                 SafetyError::EStopActive => ("ESTOP", "failed", "ESTOP_ACTIVE"),
                 SafetyError::FaultActive(_) => ("FAULT", "failed", "FAULT_ACTIVE"),
@@ -1058,11 +1163,11 @@ impl SupervisorInner {
         // CRITICAL 1: NEVER touch self.last_heartbeat here!
         // CRITICAL 2: NEVER clear self.servo_blocked_hold here!
         self.last_motion_frame = Instant::now();
-        self.release_gripper_stall_on_reverse(&targets);
+        self.release_gripper_stall_on_reverse(targets);
         let _ = self.safety.mark_motion_started();
 
-        self.target_positions = targets.clone();
-        self.servo_target = Some(targets.clone());
+        copy_into(&mut self.target_positions, targets);
+        set_vec(&mut self.servo_target, targets);
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
@@ -1071,9 +1176,9 @@ impl SupervisorInner {
             run.last_input_age_ms = input_age_ms;
             run.last_vision_age_ms = vision_age_ms;
             run.vision_frame_id = vision_frame_id;
-            run.last_shadow_target = Some(targets.clone());
-            run.last_live_target = Some(targets);
-            self.last_policy_obs = Some(run.to_observation(true));
+            set_vec(&mut run.last_shadow_target, targets);
+            set_vec(&mut run.last_live_target, targets);
+            set_policy_obs(&mut self.last_policy_obs, run);
         }
 
         Ok(())
@@ -1084,6 +1189,8 @@ impl SupervisorInner {
     /// is checked against the measured pose with the first-step limit.
     pub fn hold_policy_run(&mut self, action_id: u64) {
         let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live) else { return; };
+        // a target computed before the hold and still waiting in the mailbox is not applied
+        run.authorization.revoke();
         run.last_live_target = None;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
@@ -1095,6 +1202,15 @@ impl SupervisorInner {
     pub fn set_policy_max_input_age(&mut self, action_id: u64, max_ms: u64) {
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
             run.max_input_age_ms = max_ms;
+        }
+    }
+
+    /// Set the camera-sample age bound the RT applies when it consumes a target of the run
+    /// (the vision spec's staleness), and whether an older target holds the run.
+    pub fn set_policy_max_vision_age(&mut self, action_id: u64, max_ms: Option<u64>, hold_on_stale: bool) {
+        if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+            run.max_vision_age_ms = max_ms;
+            run.vision_stale_hold = hold_on_stale;
         }
     }
 
@@ -1197,6 +1313,7 @@ impl SupervisorInner {
         let Some(mut run) = self.policy_run.take() else {
             return;
         };
+        self.end_policy_stream(run.action_id);
         run.stop_reason = Some(stop_reason.to_string());
         self.set_action_policy_stats(run.action_id, run.step_stats.report());
         self.record_policy_qualification(&run, stop_reason, action_state);
@@ -1218,3 +1335,422 @@ impl SupervisorInner {
         );
     }
 }
+
+// The broker-side items have no production caller until the integrator routes the WS loop
+// and the policy runner through the mailbox (and re-exports this module).
+#[allow(dead_code)]
+pub mod targets {
+    //! Latest-target path of servo, teleop and policy streams (armd 1.6 RT core, track D).
+    //!
+    //! **Broker side** ([`TargetPort`], normal priority): applies the WS servo sequence rules
+    //! of both servo forms (`servo` and `cartesian_joint_stream`) per connection
+    //! ([`ServoStream`]), stamps each target with the arm and boot, its stream, the authority
+    //! it was received under, its original input / camera times and frame id and a deadline,
+    //! and submits it under the port's strictly increasing sequence (a client sequence that
+    //! wraps stays valid). Servo frames are replaceable (a burst coalesces to the newest);
+    //! policy frames are not (each live step is checked against the step before it). The
+    //! RT's outcomes come back through [`TargetPort::outcomes`]; [`servo_outcome_reply`] turns
+    //! a refusal into the WS reply the legacy loop sends for the same condition.
+    //!
+    //! **RT side** ([`SupervisorInner::consume_target_frame`], the body of
+    //! `CoreOps::consume_target`): [`TargetFrame::check`] (dof, identity, deadline, stop,
+    //! epoch, lease valid now, the authorized stream, policy generation, input and camera
+    //! ages), then a lease when leases are enforced, the config hold, and the existing servo /
+    //! policy step checks (lead, braking, workspace, jump caps). Streams are authorized by
+    //! the core: [`SupervisorInner::authorize_servo_stream`] when a connection holds the lease,
+    //! the policy stream while a run is active (its generation follows the run's
+    //! [`crate::policy_runtime::PolicyAuthorization`], so a vision hold or invalidation
+    //! refuses its buffered targets). A refused policy target holds or ends the run where the
+    //! legacy commit holds or ends it. Shadow runs keep no output authority. Accepted targets
+    //! are applied without allocating once the servo buffers hold a target.
+    //!
+    //! Targets carry no plan revision: they are checked against the active workspace when
+    //! applied, so a workspace change does not refuse a buffered target as `PLAN_STALE`.
+
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+
+    use crate::rt_core::broker::{Authority, BootId};
+    use crate::rt_core::ids::ArmId;
+    use crate::rt_core::mailbox::{
+        Refusal, RefusalDetail, StreamId, Submitted, TargetAuthority, TargetFrame, TargetOutcome, TargetWriter, MAX_DOF,
+    };
+    use crate::rt_core::ops::{CommitCtx, CoreOps};
+    use crate::safety::SafetyError;
+    #[cfg(feature = "policy-runtime")]
+    use crate::safety::SafetyState;
+    use crate::supervisor::{ArmError, SupervisorInner};
+
+    /// Servo stream ids carry this bit; policy stream ids are action ids (without it).
+    pub const SERVO_STREAM_BIT: u64 = 1 << 63;
+    /// A servo frame not applied within this time is refused (`DEADLINE_EXPIRED`): the servo
+    /// motion-frame timeout.
+    pub const SERVO_TARGET_TTL: Duration = Duration::from_millis(200);
+
+    /// The stream of WS servo frames under lease `lease_generation`.
+    pub fn servo_stream(lease_generation: u64) -> StreamId { StreamId(SERVO_STREAM_BIT | lease_generation) }
+
+    /// The stream of policy run `action_id`.
+    pub fn policy_stream(action_id: u64) -> StreamId { StreamId(action_id & !SERVO_STREAM_BIT) }
+
+    /// Codes of the policy step that a refusal carries as they are (others: `REJECTED`).
+    const POLICY_CODES: &[&str] = &[
+        "POLICY_NOT_ACTIVE", "LEASE_LOST", "BLOCKED_HOLD", "DEPLOYMENT_CHANGED", "OPERATOR_CONFIRMATION_REQUIRED",
+        "RELEASE_GATE_REQUIRED", "FEEDBACK_UNCONFIRMED", "STALE_INPUT", "JUMP_LIMIT", "STEP_LIMIT", "QUALIFICATION_REQUIRED",
+    ];
+
+    /// The protocol code of a servo error, as `ApiError::from` gives it (no allocation).
+    pub fn safety_code(e: &SafetyError) -> &'static str {
+        match e {
+            SafetyError::HandoverSettling => "HANDOVER_SETTLING",
+            SafetyError::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
+            SafetyError::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            SafetyError::ClearFaultRejected(_) => "CLEAR_FAULT_REJECTED",
+            SafetyError::EStopActive => "ESTOP_ACTIVE",
+            SafetyError::CollisionHold(_) => "COLLISION_HOLD",
+            SafetyError::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
+            SafetyError::MotionBusy => "MOTION_BUSY",
+            SafetyError::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+            SafetyError::EpochMismatch { .. } => "EPOCH_MISMATCH",
+            SafetyError::SoftLimitExceeded { .. } => "SOFT_LIMIT_EXCEEDED",
+            SafetyError::FaultActive(_) => "FAULT_ACTIVE",
+            SafetyError::NotArmed(_) => "NOT_ARMED",
+            _ => "SAFETY_ERROR",
+        }
+    }
+
+    /// The protocol code of a policy step error (no allocation).
+    pub fn policy_code(e: &ArmError) -> &'static str {
+        match e {
+            ArmError::Safety(s) => safety_code(s),
+            ArmError::Rejected { code, .. } => POLICY_CODES.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED"),
+            ArmError::Internal(_) => "INTERNAL_ERROR",
+            _ => "REJECTED",
+        }
+    }
+
+    /// Status, `error` and `safety_state` of a refusal code, as `ApiError::from` gives them.
+    fn reject_fields(code: &str) -> (u16, &str, Option<&'static str>) {
+        match code {
+            "ESTOP_ACTIVE" => (409, code, Some("EStop")),
+            "FAULT_ACTIVE" => (409, code, Some("Fault")),
+            "ARM_NOT_AT_RESTING_POSE" => (409, "ArmNotAtRestingPose", Some("Armed")),
+            "MOTION_FORBIDDEN_IN_FAULT_STATE" => (409, "MotionForbiddenInFaultState", Some("Fault")),
+            "CLEAR_FAULT_REJECTED" => (409, "ClearFaultRejected", Some("Fault")),
+            "WORKSPACE_VIOLATION" | "JUMP_LIMIT" | "STEP_LIMIT" => (422, code, None),
+            "SOFT_LIMIT_EXCEEDED" | "SAFETY_ERROR" | "INVALID_COMMAND" => (400, code, None),
+            "NOT_ARMED" => (412, code, None),
+            "OPERATOR_CONFIRMATION_REQUIRED" | "RELEASE_GATE_REQUIRED" => (403, code, None),
+            "INTERNAL_ERROR" => (500, code, None),
+            _ => (409, code, None),
+        }
+    }
+
+    /// What a WS reply needs from the state at reply time.
+    #[derive(Debug, Clone)]
+    pub struct ReplyCtx {
+        pub epoch_id: u64,
+        pub safety_state: Value,
+        /// The connection's lease generation.
+        pub lease_generation: u64,
+    }
+
+    /// `servo_reject` with the legacy fields (`status`, `code`, `error`, `message`, `safety_state`, `epoch_id`).
+    pub fn servo_reject(code: &str, message: &str, epoch_id: u64) -> Value {
+        let (status, error, safety_state) = reject_fields(code);
+        json!({"type":"servo_reject", "status":status, "code":code, "error":error, "message":message,
+            "safety_state":safety_state, "epoch_id":epoch_id})
+    }
+
+    /// The WS reply to a servo target the RT refused (None: no reply).
+    ///
+    /// As the legacy loop answers the same conditions: an unauthorized frame (lease lost,
+    /// stream not authorized, no lease) with `lease_lost` (with the loss reason when known),
+    /// a stale epoch with `epoch_sync`, a calibration with `servo_reject`
+    /// `reason: calibration_busy`, other refusals with `servo_reject` (and `current_revision`
+    /// when known). A frame refused because a stop overtook it gets no reply (legacy applied
+    /// it before the stop, which has its own reply). Messages are generic.
+    pub fn servo_outcome_reply(refusal: &Refusal, ctx: &ReplyCtx) -> Option<Value> {
+        Some(match refusal.code {
+            "STOPPED" => return None,
+            "LEASE_LOST" | "NO_LEASE" | "STREAM_NOT_AUTHORIZED" => {
+                let mut v = json!({"type":"lease_lost", "generation":ctx.lease_generation});
+                if let (RefusalDetail::LeaseLoss { reason }, true) = (refusal.detail, ctx.lease_generation != 0) { v["reason"] = json!(reason); }
+                v
+            }
+            "EPOCH_MISMATCH" => json!({"type":"epoch_sync", "epoch_id":ctx.epoch_id, "safety_state":ctx.safety_state}),
+            "CALIBRATION_BUSY" => json!({"type":"servo_reject", "reason":"calibration_busy"}),
+            code => {
+                let mut v = servo_reject(code, "servo target refused when the control loop applied it", ctx.epoch_id);
+                if let RefusalDetail::CurrentRevision(rev) = refusal.detail { v["current_revision"] = json!(rev); }
+                v
+            }
+        })
+    }
+
+    /// Per-connection servo stream state (the WS loop's `last_sequence`).
+    #[derive(Debug, Default)]
+    pub struct ServoStream {
+        last_sequence: Option<u64>,
+        lease_generation: u64,
+    }
+
+    impl ServoStream {
+        pub fn new() -> Self { Self::default() }
+
+        /// The connection got lease `generation`: a new lease starts a new sequence.
+        pub fn lease_granted(&mut self, generation: u64) {
+            if self.lease_generation != generation { self.last_sequence = None; }
+            self.lease_generation = generation;
+        }
+
+        pub fn last_sequence(&self) -> Option<u64> { self.last_sequence }
+    }
+
+    /// One WS servo message (either form), already authorized and epoch-checked by the loop.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ServoMessage<'a> {
+        pub sequence_id: Option<u64>,
+        pub positions: &'a [f32],
+        /// Lease generation, the message's epoch and the stop generation at receipt.
+        pub authority: Authority,
+        pub received_at: Instant,
+        /// A calibration apply / restore runs (the loop's snapshot; the RT checks again).
+        pub calibration_busy: bool,
+    }
+
+    /// One policy target, stamped when its inputs were sampled.
+    #[derive(Debug, Clone, Copy)]
+    pub struct PolicyTarget<'a> {
+        pub action_id: u64,
+        pub stamp: PolicyStamp,
+        pub targets: &'a [f32],
+        /// Capture time of the oldest joint sample the target was computed from.
+        pub input_at: Instant,
+        /// Capture time and frame id of the camera sample behind the target.
+        pub vision_at: Option<Instant>,
+        pub vision_frame_id: Option<u64>,
+    }
+
+    /// The broker's side of the latest-target mailbox.
+    pub struct TargetPort {
+        writer: TargetWriter,
+        arm: ArmId,
+        boot: BootId,
+        seq: u64,
+    }
+
+    impl TargetPort {
+        pub fn new(writer: TargetWriter, arm: ArmId, boot: BootId) -> Self { Self { writer, arm, boot, seq: 0 } }
+
+        /// Frames replaced before consumption.
+        pub fn coalesced(&self) -> u64 { self.writer.coalesced() }
+
+        /// Drains the RT's outcomes of consumed frames.
+        pub fn outcomes(&mut self, each: impl FnMut(TargetOutcome)) -> usize { self.writer.outcomes(each) }
+
+        /// The connection holding lease `lease_generation` closed: forget its stream.
+        pub fn close_servo(&mut self, lease_generation: u64) { self.writer.close_stream(servo_stream(lease_generation)); }
+
+        /// Policy run `action_id` ended: forget its stream.
+        pub fn close_policy(&mut self, action_id: u64) { self.writer.close_stream(policy_stream(action_id)); }
+
+        #[allow(clippy::too_many_arguments)]
+        fn frame(&mut self, stream: StreamId, authority: Authority, policy_generation: u64, q: &[f32], input_at: Instant,
+            vision_at: Option<Instant>, vision_frame_id: Option<u64>, deadline: Instant, replaceable: bool) -> Option<TargetFrame> {
+            if q.is_empty() || q.len() > MAX_DOF || q.iter().any(|v| !v.is_finite()) { return None; }
+            let mut a = [0.0; MAX_DOF];
+            a[..q.len()].copy_from_slice(q);
+            self.seq += 1;
+            Some(TargetFrame { arm: self.arm, boot: self.boot, stream, seq: self.seq, authority, policy_generation, input_at, vision_at,
+                vision_frame_id, deadline, dof: q.len() as u8, q: a, replaceable })
+        }
+
+        /// Submits one WS servo message; returns the WS reply (None: queued, no reply).
+        /// Sequence rules as the legacy loop: a missing `sequence_id`, a repeat or a jump of
+        /// more than 1000 (wrapping) is refused; the sequence advances once it passes them.
+        pub fn submit_servo(&mut self, stream: &mut ServoStream, msg: &ServoMessage<'_>) -> Option<Value> {
+            if msg.calibration_busy { return Some(json!({"type":"servo_reject", "reason":"calibration_busy"})); }
+            let Some(sequence) = msg.sequence_id else { return Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})); };
+            if stream.last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) {
+                return Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}));
+            }
+            stream.last_sequence = Some(sequence);
+            let epoch = msg.authority.epoch;
+            let stream_id = servo_stream(msg.authority.lease_generation);
+            let Some(frame) = self.frame(stream_id, msg.authority, 0, msg.positions, msg.received_at, None, None,
+                msg.received_at + SERVO_TARGET_TTL, true) else {
+                return Some(servo_reject("SAFETY_ERROR", "servo target is empty, has non-finite values or more joints than the arm", epoch));
+            };
+            match self.writer.submit(frame) {
+                Submitted::Accepted | Submitted::Coalesced { .. } => None,
+                Submitted::Busy => Some(servo_reject("MOTION_BUSY", "a policy target is waiting to be applied", epoch)),
+                Submitted::StreamsFull => Some(servo_reject("STREAMS_FULL", "too many open target streams", epoch)),
+                Submitted::OutOfOrder => Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"})),
+            }
+        }
+
+        /// Submits one policy target (not replaceable; deadline: input time + twice the run's
+        /// input age bound). `Busy`: the previous target was not consumed yet; the runner counts the
+        /// step as skipped.
+        pub fn submit_policy(&mut self, t: &PolicyTarget<'_>) -> Submitted {
+            // after the input age bound, so an aged input ends the run as `STALE_INPUT`
+            let deadline = t.input_at + 2 * t.stamp.max_input_age;
+            match self.frame(policy_stream(t.action_id), t.stamp.authority, t.stamp.authorization.max(1), t.targets, t.input_at,
+                t.vision_at, t.vision_frame_id, deadline, false) {
+                Some(frame) => self.writer.submit(frame),
+                None => Submitted::Busy,
+            }
+        }
+    }
+
+    /// What the runner stamps a policy target with, read when it samples the inputs.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PolicyStamp {
+        pub authority: Authority,
+        pub authorization: u64,
+        pub max_input_age: Duration,
+    }
+
+    impl SupervisorInner {
+        /// Consume the servo frames of the connection holding lease `lease_generation`
+        /// (replaces the authorized stream; called when a connection gets the lease).
+        pub fn authorize_servo_stream(&mut self, lease_generation: u64) {
+            self.core.authorize_stream(TargetAuthority { stream: Some(servo_stream(lease_generation)), ..TargetAuthority::default() });
+        }
+
+        /// After a policy run of `action_id`: hand the targets back to the lease holder's
+        /// servo stream (none without a lease) when the run's stream was authorized.
+        #[cfg(feature = "policy-runtime")]
+        pub(in crate::supervisor) fn end_policy_stream(&mut self, action_id: u64) {
+            if self.core.target_authority().stream != Some(policy_stream(action_id)) { return; }
+            match self.active_lease.as_ref().map(|l| l.generation) {
+                Some(g) => self.authorize_servo_stream(g),
+                None => self.core.revoke_stream(),
+            }
+        }
+
+        /// The stamp of run `action_id`'s next target (None: no such run).
+        #[cfg(feature = "policy-runtime")]
+        pub fn policy_target_stamp(&self, action_id: u64, stop_generation: u64) -> Option<PolicyStamp> {
+            let run = self.policy_run.as_ref().filter(|r| r.action_id == action_id)?;
+            let authority = Authority { lease_generation: run.lease_generation, epoch: run.epoch_id, stop_generation,
+                config_revision: self.workspace_revision, ..Authority::default() };
+            Some(PolicyStamp { authority, authorization: run.authorization.current(), max_input_age: Duration::from_millis(run.max_input_age_ms) })
+        }
+
+        /// The authorized policy stream follows its run: authorization generation and age
+        /// bounds (the input age is unbounded when the driver reports none, as in the legacy
+        /// runner; the step then decides).
+        #[cfg(feature = "policy-runtime")]
+        fn sync_policy_target_authority(&mut self) {
+            let Some(run) = self.policy_run.as_ref() else { return; };
+            let stream = policy_stream(run.action_id);
+            if self.core.target_authority().stream != Some(stream) { return; }
+            let input_known = self.policy_input_age_range_ms().is_some();
+            let run = self.policy_run.as_ref().expect("checked");
+            let a = TargetAuthority {
+                stream: Some(stream),
+                policy_generation: run.authorization.current(),
+                max_input_age: input_known.then(|| Duration::from_millis(run.max_input_age_ms)),
+                max_vision_age: run.max_vision_age_ms.map(Duration::from_millis),
+            };
+            if a != self.core.target_authority() { self.core.authorize_stream(a); }
+        }
+
+        fn target_refusal(&self, code: &'static str, frame: &TargetFrame) -> Refusal {
+            let detail = match code {
+                "LEASE_LOST" => {
+                    let preempted = self.last_evicted.as_ref().is_some_and(|(_, g)| *g == frame.authority.lease_generation);
+                    RefusalDetail::LeaseLoss { reason: if preempted { "preempted" } else { "expired" } }
+                }
+                "PLAN_STALE" => RefusalDetail::CurrentRevision(self.workspace_revision),
+                _ => RefusalDetail::None,
+            };
+            Refusal { code, detail }
+        }
+
+        /// Applies one target from the latest-target mailbox after rechecking it (see the
+        /// module doc) at the release `ctx` (its urgent-stop generation and clock).
+        pub fn consume_target_frame(&mut self, frame: &TargetFrame, ctx: &CommitCtx) -> Result<(), Refusal> {
+            #[cfg(feature = "policy-runtime")]
+            self.sync_policy_target_authority();
+            // a target is checked against the active workspace when applied; it carries no plan revision
+            let current = Authority { config_revision: frame.authority.config_revision, ..CoreOps::authority(self, ctx) };
+            let policy = frame.policy_generation != 0;
+            if let Some(code) = frame.check(ctx.arm, ctx.boot, ctx.now, &current, &self.core.target_authority()) {
+                if policy { self.policy_target_refused(code, frame); }
+                // a servo frame while a policy run owns the targets: the legacy MOTION_BUSY
+                #[cfg(feature = "policy-runtime")]
+                if code == "STREAM_NOT_AUTHORIZED" && !policy && (self.policy_run.is_some() || self.policy_loading) {
+                    return Err(Refusal::code("MOTION_BUSY"));
+                }
+                return Err(self.target_refusal(code, frame));
+            }
+            if self.lease_enabled && frame.authority.lease_generation == 0 { return Err(Refusal::code("NO_LEASE")); }
+            if self.core.motion_inhibited_by_config() { return Err(Refusal::code("CONFIG_BUSY")); }
+            if policy { return self.consume_policy_target(frame, ctx.now); }
+            if self.calibration_busy { return Err(Refusal::code("CALIBRATION_BUSY")); }
+            self.servo_slice(frame.positions(), frame.authority.epoch).map_err(|e| {
+                let joint = match &e {
+                    SafetyError::SoftLimitExceeded { joint, .. } => self.config.limits.iter().position(|l| &l.name == joint).map(|i| i as u8),
+                    _ => None,
+                };
+                let code = safety_code(&e);
+                Refusal { code, detail: if joint.is_some() { RefusalDetail::Limit { joint } } else { RefusalDetail::None } }
+            })
+        }
+
+        #[cfg(not(feature = "policy-runtime"))]
+        fn policy_target_refused(&mut self, _code: &str, _frame: &TargetFrame) {}
+
+        /// A target of the active run was refused by the consumption check: hold or end the
+        /// run where the legacy commit holds or ends it.
+        #[cfg(feature = "policy-runtime")]
+        fn policy_target_refused(&mut self, code: &str, frame: &TargetFrame) {
+            let Some(run) = self.policy_run.as_ref().filter(|r| frame.stream == policy_stream(r.action_id)) else { return; };
+            let (action_id, hold_on_stale) = (run.action_id, run.vision_stale_hold);
+            match code {
+                // revoked after the target was computed (vision hold or invalidation) or too late: brake now
+                "POLICY_REVOKED" | "DEADLINE_EXPIRED" => self.hold_policy_run(action_id),
+                "VISION_STALE" if hold_on_stale => self.hold_policy_run(action_id),
+                "VISION_STALE" => { self.fail_policy_run(action_id, "VISION_STALE", "Vision sample became stale before the target was applied"); }
+                "INPUT_STALE" => self.terminate_policy_run("STALE_INPUT", "failed", Some("STALE_INPUT"),
+                    Some("Live policy target computed from stale joint positions (aged while buffered)".into())),
+                "LEASE_LOST" => self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease lost or expired".into())),
+                "EPOCH_MISMATCH" => {
+                    if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
+                        self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+                    } else if let SafetyState::Fault(r) = self.safety.state().clone() {
+                        let reason = if matches!(r, crate::safety::FaultReason::WatchdogTimeout) { "WATCHDOG_TIMEOUT" } else { "FAULT" };
+                        self.terminate_policy_run(reason, "failed", Some(reason), Some(format!("Fault active: {r:?}")));
+                    } else {
+                        self.terminate_policy_run("STOPPED", "cancelled", Some("EPOCH_MISMATCH"), Some("Epoch changed during policy run".into()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[cfg(not(feature = "policy-runtime"))]
+        fn consume_policy_target(&mut self, _frame: &TargetFrame, _now: Instant) -> Result<(), Refusal> { Err(Refusal::code("POLICY_NOT_ACTIVE")) }
+
+        /// A policy frame that passed the consumption check: `policy_step_slice` (holds, gates,
+        /// input age, jump caps, servo checks; it ends the run where the legacy commit ends it).
+        #[cfg(feature = "policy-runtime")]
+        fn consume_policy_target(&mut self, frame: &TargetFrame, now: Instant) -> Result<(), Refusal> {
+            let ms = |t: Instant| now.saturating_duration_since(t).as_millis().min(u128::from(u64::MAX)) as u64;
+            let Some(action_id) = self.policy_run.as_ref().map(|r| r.action_id).filter(|id| frame.stream == policy_stream(*id)) else {
+                return Err(Refusal::code("POLICY_NOT_ACTIVE"));
+            };
+            let input_age_ms = self.policy_input_age_range_ms().map(|_| ms(frame.input_at));
+            self.policy_step_slice(action_id, frame.positions(), input_age_ms, frame.vision_at.map(ms), frame.vision_frame_id)
+                .map_err(|e| Refusal::code(policy_code(&e)))
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "streams_target_tests.rs"]
+mod target_tests;

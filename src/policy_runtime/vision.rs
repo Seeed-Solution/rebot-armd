@@ -574,6 +574,9 @@ struct EmbeddingHubInner {
     frames: VecDeque<EmbeddingFrame>,
     window_newest_deadline_ms: Option<u64>,
     window_oldest_deadline_ms: Option<u64>,
+    /// The bound run's target authorization: revoked on every change that invalidates an
+    /// `InferenceTicket` (invalidation, model, producer epoch, clock handshake, bind/unbind).
+    target_authorization: Option<super::runner::PolicyAuthorization>,
 }
 
 impl Default for EmbeddingHubInner {
@@ -599,11 +602,17 @@ impl Default for EmbeddingHubInner {
             frames: VecDeque::new(),
             window_newest_deadline_ms: None,
             window_oldest_deadline_ms: None,
+            target_authorization: None,
         }
     }
 }
 
 impl EmbeddingHubInner {
+    /// Refuses the bound run's targets that wait in the latest-target mailbox.
+    fn revoke_targets(&self) {
+        if let Some(a) = self.target_authorization.as_ref() { a.revoke(); }
+    }
+
     fn now_ms(&self) -> u64 {
         self.test_now_ms.unwrap_or_else(monotonic_now_ms)
     }
@@ -775,6 +784,7 @@ impl VideoEmbeddingHub {
     pub fn bump_invalidation_generation(&self) -> u64 {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
+        inner.revoke_targets();
         inner.invalidation_generation
     }
 
@@ -784,6 +794,7 @@ impl VideoEmbeddingHub {
             inner.producer_model_generation = gen;
             inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
+            inner.revoke_targets();
         }
     }
 
@@ -806,6 +817,7 @@ impl VideoEmbeddingHub {
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.recompute_deadlines();
             inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
+            inner.revoke_targets();
         }
     }
 
@@ -850,6 +862,7 @@ impl VideoEmbeddingHub {
         inner.continuous_renewal_floor_gen = inner.handshake_generation;
         inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
         inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
+        inner.revoke_targets();
         inner.recompute_deadlines();
     }
 
@@ -864,6 +877,17 @@ impl VideoEmbeddingHub {
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
             inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
             inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
+            inner.revoke_targets();
+            inner.target_authorization = None;
+        }
+    }
+
+    /// Binds the target authorization of run `policy_instance_id` (after [`Self::bind_policy`]):
+    /// every later ticket invalidation revokes the run's buffered targets.
+    pub fn bind_target_authorization(&self, policy_instance_id: u64, authorization: super::runner::PolicyAuthorization) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.bound.as_ref().is_some_and(|b| b.policy_instance_id == policy_instance_id) {
+            inner.target_authorization = Some(authorization);
         }
     }
 
@@ -1109,6 +1133,7 @@ impl VideoEmbeddingHub {
 
         let next_gen = inner.handshake_generation.wrapping_add(1);
         inner.handshake_generation = if next_gen == 0 { 1 } else { next_gen };
+        inner.revoke_targets();
         let gen = inner.handshake_generation;
         let expires_at = s2.saturating_add(ttl_ms);
 
@@ -1393,6 +1418,7 @@ impl VideoEmbeddingHub {
             inner.server_model_epoch = inner.server_model_epoch.wrapping_add(1);
             inner.invalidation_generation = inner.invalidation_generation.wrapping_add(1);
             inner.continuous_renewal_floor_gen = inner.handshake_generation;
+            inner.revoke_targets();
         }
 
         while let Some(front) = inner.frames.front() {
