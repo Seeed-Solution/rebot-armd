@@ -3889,6 +3889,8 @@ pub struct ArmSupervisor {
     dispatcher_start: std::sync::Mutex<()>,
     /// Control period of the last tick (µs): bounds how long a reader waits for a sample.
     control_period_us: Arc<AtomicU64>,
+    /// Configured nominal control loop frequency (Hz, immutable after startup).
+    control_frequency_hz: u32,
     obs_cache_hits: AtomicU64,
     obs_cache_misses: AtomicU64,
     obs_waits: AtomicU64,
@@ -3973,7 +3975,8 @@ impl ArmSupervisor {
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         let hub = inner.core.hub().clone();
-        let control_period_us = (1e6 / f64::from(inner.config.control_frequency_hz.max(1))) as u64;
+        let control_frequency_hz = inner.config.control_frequency_hz.max(1);
+        let control_period_us = (1e6 / f64::from(control_frequency_hz)) as u64;
         Self {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
@@ -3985,6 +3988,7 @@ impl ArmSupervisor {
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
             control_period_us: Arc::new(AtomicU64::new(control_period_us)),
+            control_frequency_hz,
             obs_cache_hits: AtomicU64::new(0),
             obs_cache_misses: AtomicU64::new(0),
             obs_waits: AtomicU64::new(0),
@@ -4001,6 +4005,11 @@ impl ArmSupervisor {
     /// Current ownership mode (`OWNER_LEGACY`, `OWNER_TRANSFERRING`, `OWNER_EXECUTOR`, `OWNER_FAILED`).
     pub fn owner_mode(&self) -> u8 {
         self.owner_mode.load(Ordering::Acquire)
+    }
+
+    /// Configured control frequency (Hz, immutable after startup, lock-free).
+    pub fn control_frequency_hz(&self) -> u32 {
+        self.control_frequency_hz
     }
 
     /// Handle to the synchronous RT executor when ownership has transferred.
@@ -4077,6 +4086,7 @@ impl ArmSupervisor {
             || guard.motor_zero_busy
             || guard.zero_check_persisting.is_some()
             || guard.gravity_comp.is_some()
+            || guard.macro_run.is_some()
             || guard.mit_active()
             || guard.mit.revoke_pending
         {
@@ -4084,7 +4094,7 @@ impl ArmSupervisor {
             return Err(ArmError::Rejected {
                 status: 409,
                 code: "TRANSFER_BLOCKED".into(),
-                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, or MIT tracking is active".into(),
+                message: "Cannot transfer ownership while calibration, zero_check persistence, motor_zero, gravity compensation, macro action, or MIT tracking is active".into(),
             });
         }
         #[cfg(feature = "policy-runtime")]
@@ -4910,6 +4920,95 @@ impl ArmSupervisor {
         self.trigger_e_stop_checked()
             .await
             .unwrap_or((SafetyState::EStop, 0))
+    }
+
+    /// Non-blocking urgent-stop enqueue in `OWNER_EXECUTOR` mode so a WS receive loop can
+    /// await the reply in `tokio::select!` without blocking subsequent `estop` frames on
+    /// the same socket. Returns `Ok(None)` in `OWNER_LEGACY`.
+    pub(crate) fn try_enqueue_executor_urgent_stop(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+    ) -> Result<
+        Option<(
+            Arc<crate::rt_core::urgent::UrgentStopClient>,
+            tokio::sync::oneshot::Receiver<
+                Result<crate::rt_core::urgent::UrgentStopOutcome, crate::rt_core::urgent::UrgentStopError>,
+            >,
+        )>,
+        ArmError,
+    > {
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::try_enqueue_executor_urgent_stop");
+        match self.owner_mode() {
+            OWNER_LEGACY => Ok(None),
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                let client = h.urgent_stop_client();
+                let rx = client.enqueue_async(stop).map_err(ArmError::from)?;
+                Ok(Some((client, rx)))
+            }
+            _ => Err(executor_unavailable()),
+        }
+    }
+
+    /// Authorized-stop handoff routed through whichever single owner holds `ArmCore`
+    /// (including concurrent Legacy -> Executor handoff).
+    /// - In `OWNER_EXECUTOR`: forwards through the bounded urgent `Stop` channel without
+    ///   touching the legacy supervisor lock; only an authorized stop advances `StopRequests`.
+    /// - In `OWNER_LEGACY`: validates under `inner.write()` and preserves exact legacy
+    ///   `/api/v1/motion/stop` semantics (gravity-comp exit, `stop_motion`, `request_macro_stop`).
+    pub async fn urgent_stop(
+        &self,
+        stop: crate::rt_core::urgent::UrgentStop,
+    ) -> Result<crate::rt_core::urgent::UrgentStopOutcome, ArmError> {
+        use crate::rt_core::urgent::UrgentStopOutcome;
+        crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::urgent_stop");
+        match self.owner_mode() {
+            OWNER_EXECUTOR => {
+                let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                h.urgent_stop_async(stop).await.map_err(ArmError::from)
+            }
+            OWNER_LEGACY => {
+                let mut guard = self.inner.write().await;
+                if !guard.detached {
+                    guard.consume_pending_estop();
+                    Self::flush_legacy_estop_acks_into(&self.estop_reg, &mut guard);
+                    let epoch = guard.safety.epoch_id();
+                    if stop.lease_generation == 0
+                        || !guard.validate_lease_at(stop.connection.as_str(), stop.lease_generation, Instant::now())
+                    {
+                        return Ok(UrgentStopOutcome::LeaseLost { epoch });
+                    }
+                    if stop.epoch != Some(epoch) {
+                        return Ok(UrgentStopOutcome::EpochMismatch { epoch });
+                    }
+                    if !stop.request_id_valid {
+                        return Ok(UrgentStopOutcome::InvalidRequestId);
+                    }
+                    if let Some(message) = stop.body_error {
+                        return Ok(UrgentStopOutcome::InvalidBody { message, epoch });
+                    }
+                    guard.exit_gravity_comp("STOPPED", "Stop command");
+                    guard.stop_motion();
+                    guard.request_macro_stop();
+                    return Ok(UrgentStopOutcome::Applied {
+                        stop_generation: 0,
+                        applied_to_motion: true,
+                        epoch: guard.safety.epoch_id(),
+                        safety_state: guard.safety.state_arc(),
+                        is_torqued: guard.is_torqued,
+                        control_mode_gravity_comp: guard.gravity_comp_active(),
+                    });
+                }
+                drop(guard);
+                if self.owner_mode() == OWNER_EXECUTOR {
+                    let h = self.executor_handle().ok_or_else(executor_unavailable)?;
+                    h.urgent_stop_async(stop).await.map_err(ArmError::from)
+                } else {
+                    Err(executor_unavailable())
+                }
+            }
+            _ => Err(executor_unavailable()),
+        }
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {

@@ -210,13 +210,20 @@ impl SupervisorInner {
     }
 
     pub fn validate_servo_lease(&mut self, client_id: &str, generation: u64) -> bool {
-        if self.detached {
+        self.validate_lease_at(client_id, generation, Instant::now())
+    }
+
+    /// Owner-serialized lease validation at `now`: verifies non-detached state, non-zero
+    /// generation, matching connection identity, and non-expiry at `now`, updating
+    /// `last_valid_motion_instant` on success. Zero allocations and zero frees.
+    pub fn validate_lease_at(&mut self, client_id: &str, generation: u64, now: Instant) -> bool {
+        if self.detached || generation == 0 || client_id.is_empty() {
             return false;
         }
         if let Some(ref mut active) = self.active_lease {
-            let not_expired = active.acquired_at.elapsed() < self.lease_timeout;
-            if not_expired && active.generation == generation && !client_id.is_empty() && active.client_id == client_id {
-                active.last_valid_motion_instant = Some(Instant::now());
+            let not_expired = now.saturating_duration_since(active.acquired_at) < self.lease_timeout;
+            if not_expired && active.generation == generation && active.client_id == client_id {
+                active.last_valid_motion_instant = Some(now);
                 true
             } else {
                 false

@@ -524,6 +524,14 @@ impl ReplayMotion {
     /// True when samples are borrowed directly from an immutable plan slot (no vector copy).
     pub fn borrows_plan_slot(&self) -> bool { matches!(self.samples, ReplaySamples::Slot { .. }) }
 
+    /// True when dropping this replay motion would free heap memory.
+    pub fn has_heap_storage(&self) -> bool {
+        matches!(self.episode, ReplayEpisode::Owned(_))
+            || matches!(self.samples, ReplaySamples::Owned(_))
+            || self.tag.is_some()
+            || matches!(&self.phase, Phase::Approach(q) if q.polynomials.is_heap())
+    }
+
     /// Recording time reached (s): 0 during the approach.
     pub fn t_s(&self) -> f64 {
         match &self.phase { Phase::Approach(_) => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }

@@ -64,6 +64,13 @@ impl SupervisorInner {
 
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
+        drop(self.stop_motion_retiring());
+    }
+
+    /// [`Self::stop_motion`] returning any heap-owning motion payloads (`ActiveTrajectory`
+    /// with owned storage, `UnloadSettle`, or heap `SlotBuf`) for off-thread disposal so
+    /// RT urgent stops perform zero frees on the control thread.
+    pub(crate) fn stop_motion_retiring(&mut self) -> crate::rt_core::urgent::RetiredStopPayloads {
         // a STOP cancels a park deferred behind the MIT hand back
         if std::mem::take(&mut self.mit.park_after_hand_back) {
             if let Some(id) = self.mit.deferred_park_action.take() {
@@ -77,12 +84,22 @@ impl SupervisorInner {
         }
         self.release_servo_target();
         self.servo_settled_ticks.fill(0);
-        self.servo_ws_min_depths = None;
-        self.active_trajectory = None;
+        let mut retired = crate::rt_core::urgent::RetiredStopPayloads::default();
+        if let Some(depths) = self.servo_ws_min_depths.take() {
+            if depths.1.is_heap() {
+                retired.servo_ws_min_depths = Some(depths);
+            }
+        }
+        if let Some(traj) = self.active_trajectory.take() {
+            if traj.has_heap_storage() {
+                retired.trajectory = Some(traj);
+            }
+        }
         self.pending_normal_unload = false;
-        self.unload_settle = None;
+        retired.unload_settle = self.unload_settle.take();
         self.zero_check_persisting = None;
         crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+        retired
     }
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {
@@ -1419,19 +1436,35 @@ impl SupervisorInner {
     }
 
     /// An authorized stop (the RT's urgent-stop generation advanced): ends client motion
-    /// like [`Self::stop_motion`], except a running watchdog park. The park belongs to the
-    /// lease watchdog, not to the client that stopped: only a new lease ([`Self::acquire_lease`],
-    /// [`Self::preempt_lease`]) takes it over. Returns false when the park was kept.
+    /// like [`Self::stop_motion`] (plus gravity-comp exit and macro cancellation), except a
+    /// running watchdog park. The park belongs to the lease watchdog, not to the client that
+    /// stopped: only a new lease ([`Self::acquire_lease`], [`Self::preempt_lease`]) takes it
+    /// over. Returns false when the park was kept.
     ///
     /// RT-safe: when keeping a watchdog park, records fields into [`crate::rt_core::ops::stop_diag`]
     /// without tracing or allocating; a normal-priority thread formats off-thread.
     pub fn authorized_stop(&mut self) -> bool {
+        let (applied, retired) = self.authorized_stop_rt();
+        drop(retired);
+        applied
+    }
+
+    /// [`Self::authorized_stop`] returning any heap-owning motion payloads for off-thread
+    /// retirement on `armd-control` (zero allocations and zero frees for all reachable
+    /// executor states).
+    pub(crate) fn authorized_stop_rt(&mut self) -> (bool, crate::rt_core::urgent::RetiredStopPayloads) {
         if let Some(park) = self.watchdog_park.as_ref().filter(|_| self.pending_normal_unload) {
             crate::rt_core::ops::stop_diag().record_park_ignored(self.core.id(), park.elapsed_s, park.budget_s);
-            return false;
+            return (false, crate::rt_core::urgent::RetiredStopPayloads::default());
         }
-        self.stop_motion();
-        true
+        if self.gravity_comp.is_some() {
+            self.exit_gravity_comp("STOPPED", "Stop command");
+        }
+        let retired = self.stop_motion_retiring();
+        if self.macro_run.is_some() {
+            self.request_macro_stop();
+        }
+        (true, retired)
     }
 
     pub(super) fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {

@@ -713,6 +713,11 @@ impl SlotBuf {
             Self::Heap(v) => v.as_mut_slice(),
         }
     }
+
+    /// True when backed by a heap `Vec` rather than the inline stack buffer.
+    pub fn is_heap(&self) -> bool {
+        matches!(self, Self::Heap(_))
+    }
 }
 
 /// Signed clearance of a capsule `(a, b, radius)` against an axis-aligned box `[lo, hi]`:

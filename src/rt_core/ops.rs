@@ -30,7 +30,7 @@ use super::broker::{
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
 use super::ids::ArmId;
 use super::mailbox::{target_mailbox, Refusal, TargetFrame, TargetOutcome, TargetReader, TargetWriter, MAX_DOF};
-use super::urgent::StopRequests;
+use super::urgent::{RetiredStopPayloads, StopRequests, UrgentStop, UrgentStopIntake, UrgentStopOutcome};
 use crate::driver::EnableState;
 use crate::supervisor::{ArmError, SupervisorInner};
 
@@ -485,6 +485,17 @@ pub trait CoreOps {
     fn apply_estop(&mut self) -> bool { false }
     /// An authorized stop was requested: stop active motion.
     fn apply_stop(&mut self);
+    /// Authorizes and applies one bounded urgent [`UrgentStop`] request at the owner.
+    /// Only an authorized stop advances `stops` (`StopRequests`), inhibits output, and
+    /// applies stop semantics before marking `stops` applied.
+    fn handle_urgent_stop(
+        &mut self,
+        _req: &UrgentStop,
+        _stops: &StopRequests,
+        _now: Instant,
+    ) -> (UrgentStopOutcome, RetiredStopPayloads) {
+        (UrgentStopOutcome::ExecutorStopped, RetiredStopPayloads::default())
+    }
     /// How `action` ended, None while it runs.
     fn action_outcome(&self, action: ActionId) -> Option<Outcome>;
     /// Child primitives the ended macro `action` ran (its terminal record,
@@ -866,6 +877,46 @@ impl CoreOps for SupervisorInner {
     // ends client motion; a running watchdog park belongs to the lease watchdog and continues
     fn apply_stop(&mut self) { self.authorized_stop(); }
 
+    fn handle_urgent_stop(
+        &mut self,
+        req: &UrgentStop,
+        stops: &StopRequests,
+        now: Instant,
+    ) -> (UrgentStopOutcome, RetiredStopPayloads) {
+        let epoch = self.safety.epoch_id();
+        if req.lease_generation == 0
+            || !self.validate_lease_at(req.connection.as_str(), req.lease_generation, now)
+        {
+            return (UrgentStopOutcome::LeaseLost { epoch }, RetiredStopPayloads::default());
+        }
+        if req.epoch != Some(epoch) {
+            return (UrgentStopOutcome::EpochMismatch { epoch }, RetiredStopPayloads::default());
+        }
+        if !req.request_id_valid {
+            return (UrgentStopOutcome::InvalidRequestId, RetiredStopPayloads::default());
+        }
+        if let Some(message) = req.body_error {
+            return (
+                UrgentStopOutcome::InvalidBody { message, epoch },
+                RetiredStopPayloads::default(),
+            );
+        }
+        let stop_generation = stops.request();
+        let (applied_to_motion, retired) = self.authorized_stop_rt();
+        stops.mark_applied(stop_generation);
+        (
+            UrgentStopOutcome::Applied {
+                stop_generation,
+                applied_to_motion,
+                epoch: self.safety.epoch_id(),
+                safety_state: self.safety.state_arc(),
+                is_torqued: self.is_torqued,
+                control_mode_gravity_comp: self.gravity_comp_active(),
+            },
+            retired,
+        )
+    }
+
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
         // a macro's terminal record outlives its action record (finish_action, a newer action)
         if let Some(m) = self.core.last_macro().filter(|m| m.action == action) { return Some(m.outcome); }
@@ -1120,6 +1171,8 @@ pub struct ReleaseEngine {
     intake: RtIntake<PlanSlot>,
     targets: TargetReader,
     stop: StopRequests,
+    urgent_stops: Option<UrgentStopIntake>,
+    urgent_replies_flushed: bool,
     active: Option<Installed>,
     /// The driver transition in flight.
     transition: Option<Installed>,
@@ -1138,6 +1191,8 @@ impl ReleaseEngine {
                 intake,
                 targets: tr,
                 stop: stop.clone(),
+                urgent_stops: None,
+                urgent_replies_flushed: false,
                 active: None,
                 transition: None,
                 releases: 0,
@@ -1147,6 +1202,42 @@ impl ReleaseEngine {
             tw,
             stop,
         )
+    }
+
+    /// Attaches the dedicated bounded urgent-stop intake drained at Step 1, every
+    /// checkpoint (`BeforeCommit`, `BeforeTarget`, `BeforeOutput`), and sub-release wakes.
+    pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
+        self.urgent_stops = Some(intake);
+    }
+
+    pub fn has_pending_urgent_stop_replies(&self) -> bool {
+        self.urgent_stops
+            .as_ref()
+            .is_some_and(UrgentStopIntake::has_pending_replies)
+    }
+
+    pub fn has_applied_urgent_stop_pending(&self) -> bool {
+        self.urgent_stops
+            .as_ref()
+            .is_some_and(UrgentStopIntake::has_applied_pending)
+    }
+
+    pub fn flush_urgent_stop_replies(&mut self) -> bool {
+        self.urgent_stops
+            .as_mut()
+            .is_some_and(UrgentStopIntake::flush_replies)
+    }
+
+    /// Returns true if urgent-stop replies were flushed since the last call (used by the
+    /// executor to wake `StateHub` even on refusal-only wakes or `CommitShutdown`).
+    pub fn take_urgent_replies_flushed(&mut self) -> bool {
+        std::mem::take(&mut self.urgent_replies_flushed)
+    }
+
+    pub fn drain_urgent_stops_stopped(&mut self, flush_existing: bool) -> bool {
+        self.urgent_stops
+            .as_mut()
+            .is_some_and(|intake| intake.drain_stopped(flush_existing))
     }
 
     pub fn boot(&self) -> BootId { self.intake.boot() }
@@ -1171,11 +1262,23 @@ impl ReleaseEngine {
         true
     }
 
-    /// Applies any pending urgent E-stop and/or authorized-stop requests; true when either applied.
-    pub fn apply_pending_urgent<O: CoreOps>(&mut self, core: &mut O) -> bool {
+    /// Applies any pending urgent E-stop, bounded urgent `Stop` handoffs (authorized against
+    /// the owner's lease at `now`), and/or direct `StopRequests`; true when any applied.
+    pub fn apply_pending_urgent_at<O: CoreOps>(&mut self, core: &mut O, now: Instant) -> bool {
         let estop = core.apply_estop();
+        let urgent_handoff = if let Some(intake) = self.urgent_stops.as_mut() {
+            let stops = &self.stop;
+            intake.drain_requests(|req| core.handle_urgent_stop(req, stops, now))
+        } else {
+            false
+        };
         let stop = self.apply_pending_stop(core);
-        estop || stop
+        estop || urgent_handoff || stop
+    }
+
+    /// Applies any pending urgent E-stop and/or authorized-stop requests at `Instant::now()`.
+    pub fn apply_pending_urgent<O: CoreOps>(&mut self, core: &mut O) -> bool {
+        self.apply_pending_urgent_at(core, Instant::now())
     }
 
     fn checkpoint<O: CoreOps>(
@@ -1186,8 +1289,9 @@ impl ReleaseEngine {
         report: &mut ReleaseReport,
     ) -> CommitCtx {
         if let Some(hook) = self.hook.as_mut() { hook(at); }
-        if self.apply_pending_urgent(core) { report.stopped = true; }
-        self.ctx(now_fn())
+        let now = now_fn();
+        if self.apply_pending_urgent_at(core, now) { report.stopped = true; }
+        self.ctx(now)
     }
 
     fn take_finished_transition(&mut self, report: &mut ReleaseReport) -> Option<(Installed, Outcome)> {
@@ -1234,8 +1338,8 @@ impl ReleaseEngine {
     ) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
-        // 1. Urgent requests (E-stop + authorized stop), independent of command ring capacity
-        if self.apply_pending_urgent(core) { report.stopped = true; }
+        // 1. Urgent requests (E-stop + urgent Stop handoff + authorized stop), independent of command ring capacity
+        if self.apply_pending_urgent_at(core, now_fn()) { report.stopped = true; }
         // 2. Single budgeted hardware poll (frees `self.transition`, defers terminal delivery until after Step 6 publish).
         // NOTE: `DamiaoArmDriver::receive_feedback` still has a legacy stale-joint RX-poll
         // recovery TX path (`src/driver.rs:4701`) outside Step 5's `BeforeOutput` checkpoint;
@@ -1250,9 +1354,12 @@ impl ReleaseEngine {
         if stopping {
             // Single publication boundary: publish any Step 1-2b state changes (such as an E-stop
             // or finished transition) strictly BEFORE delivering terminals, maintenance replies,
-            // or E-stop acknowledgements.
+            // urgent stop replies, or E-stop acknowledgements.
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if self.flush_urgent_stop_replies() {
+                self.urgent_replies_flushed = true;
+            }
             if let Some((t, outcome)) = finished_transition {
                 self.intake.terminal(t, outcome);
             }
@@ -1319,7 +1426,10 @@ impl ReleaseEngine {
         let timestamp = core.advance_output(dt, publish_generation);
         // 6. Publish
         core.publish(timestamp, publish_generation);
-        // 7. Deliver terminals (transition terminal, superseded terminal + deferred ACK, then active-action terminal) strictly AFTER publish
+        // 7. Deliver urgent stop replies and terminals strictly AFTER publish
+        if self.flush_urgent_stop_replies() {
+            self.urgent_replies_flushed = true;
+        }
         if let Some((t, outcome)) = finished_transition {
             self.intake.terminal(t, outcome);
         }
@@ -1339,8 +1449,9 @@ impl ReleaseEngine {
     }
 
     /// Runs one sub-release transition wake on `core` (no full feedback poll, no output step).
-    /// When the transition completes on this wake, publishes the updated state at `publish_generation`
-    /// BEFORE delivering the terminal reply and returns `true`.
+    /// When the transition completes or an urgent stop applies on this wake, publishes the
+    /// updated state at `publish_generation` BEFORE delivering replies/terminals and returns `true`.
+    /// Refusal-only urgent stops still flush their replies promptly without publishing.
     pub fn service_wake<O: CoreOps>(
         &mut self,
         core: &mut O,
@@ -1349,7 +1460,7 @@ impl ReleaseEngine {
         publish_generation: u64,
         report: &mut ReleaseReport,
     ) -> bool {
-        let urgent_applied = self.apply_pending_urgent(core);
+        let urgent_applied = self.apply_pending_urgent_at(core, now);
         if urgent_applied { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake(&budget);
@@ -1357,10 +1468,16 @@ impl ReleaseEngine {
         if urgent_applied || finished.is_some() {
             let ts = core.now_timestamp();
             core.publish(ts, publish_generation);
+            if self.flush_urgent_stop_replies() {
+                self.urgent_replies_flushed = true;
+            }
             if let Some((t, outcome)) = finished {
                 self.intake.terminal(t, outcome);
             }
             return true;
+        }
+        if self.has_pending_urgent_stop_replies() && self.flush_urgent_stop_replies() {
+            self.urgent_replies_flushed = true;
         }
         false
     }
@@ -1410,6 +1527,11 @@ impl<O: CoreOps> ReleaseFixture<O> {
 
     /// The executor's live urgent-stop handle.
     pub fn stops(&self) -> &StopRequests { self.engine.stop_requests() }
+
+    /// Attaches a bounded urgent-stop intake for deterministic fixture tests.
+    pub fn attach_urgent_stops(&mut self, intake: UrgentStopIntake) {
+        self.engine.attach_urgent_stops(intake);
+    }
 
     /// The fixture's virtual clock (clone it to advance time from a test).
     pub fn clock(&self) -> &VirtualClock { &self.clock }

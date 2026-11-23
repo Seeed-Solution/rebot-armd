@@ -313,7 +313,7 @@ impl SupervisorInner {
             self.commanded_velocities[i] = 0.0;
         }
         self.tracking.invalidate();
-        self.target_positions = self.commanded_positions.clone();
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
         let at = self.start_time.elapsed().as_secs_f64();
         if code == "REQUESTED" || code == "STOPPED" {
             tracing::info!("Gravity compensation exit: {code} {message}");

@@ -1276,6 +1276,11 @@ impl PathTrajectory {
         { false }
     }
 
+    /// True when dropping this path trajectory would free heap memory.
+    pub fn has_heap_storage(&self) -> bool {
+        !self.borrows_plan_slot()
+    }
+
     pub fn duration(&self) -> f64 { self.source.duration() }
 
     fn position_at(&mut self, s: f64) -> [f32; 7] {
@@ -1940,6 +1945,25 @@ impl ActiveTrajectory {
         a.span = Some((0.0, total));
         a.then = Some(then);
         a
+    }
+
+    /// True when dropping this trajectory would free heap memory (used to retire
+    /// heap-owning pre-handoff trajectories off-thread on RT urgent stops).
+    pub fn has_heap_storage(&self) -> bool {
+        if self.motion_limits.is_some() {
+            return true;
+        }
+        if self.then.as_ref().is_some_and(|q| q.polynomials.is_heap()) {
+            return true;
+        }
+        match &self.reference {
+            Reference::Quintic(q) => q.polynomials.is_heap(),
+            Reference::Path(p) => p.has_heap_storage(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Reference::Gripper(_) => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            Reference::Replay(r) => r.has_heap_storage(),
+        }
     }
     /// Action progress of this leg's `progress` (0..1) over the whole motion.
     pub fn overall_progress(&self, progress: f32) -> f32 {

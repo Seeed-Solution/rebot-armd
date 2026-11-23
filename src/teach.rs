@@ -242,7 +242,13 @@ impl ArmSupervisor {
     /// A WS connection closed: a recording it owns is discarded after [`OWNER_LOST_DISCARD`]
     /// unless a connection with the same client id takes it back.
     pub async fn recorder_connection_closed(&self, connection: &str) {
+        if self.owner_mode() != crate::supervisor::OWNER_LEGACY {
+            return;
+        }
         let mut inner = self.inner().write().await;
+        if inner.detached {
+            return;
+        }
         if let Some(r) = inner.recording.as_mut() {
             if matches!(&r.owner, RecorderOwner::Client { connection: c, .. } if c == connection) && r.owner_lost_at.is_none() {
                 r.owner_lost_at = Some(Instant::now());

@@ -26,7 +26,10 @@ use super::mailbox::TargetWriter;
 use super::ops::{CoreOps, PlanSlot, PlanningSnapshot, ReleaseEngine, MAX_SERVICE_WAKES};
 use super::publish::StateHub;
 use super::sched::{self, MemoryLock, RtReadiness, RtSchedConfig};
-use super::urgent::StopRequests;
+use super::urgent::{
+    urgent_stop_channel, StopRequests, UrgentStop, UrgentStopClient, UrgentStopError,
+    UrgentStopOutcome, URGENT_STOP_CAPACITY,
+};
 use crate::diagnostics::tick::{LockPhases, ThreadUsage, TickSample, UsageMark};
 use crate::model::{ArmObservation, GripperPolicy, JawOpening};
 use crate::persist::{PublishOutcome, StagedWrite};
@@ -659,6 +662,7 @@ pub(crate) struct OffThreadSinks {
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
+    urgent_stop_client: Arc<UrgentStopClient>,
 }
 
 impl OffThreadSinks {
@@ -687,6 +691,7 @@ impl OffThreadSinks {
             }
         }
         self.maint_client.drain_replies();
+        self.urgent_stop_client.drain_replies();
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
             while let Ok(rep) = rx.pop() {
@@ -738,6 +743,7 @@ struct RtExecutorShared {
     stop_requests: StopRequests,
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
+    urgent_stop_client: Arc<UrgentStopClient>,
     hub: Arc<StateHub>,
     tick_stats: Arc<Mutex<crate::diagnostics::tick::TickStats>>,
     sinks: Arc<OffThreadSinks>,
@@ -783,6 +789,7 @@ impl RtExecutorShared {
         self.persist_stop.store(true, Ordering::Release);
         self.persist_park_thread.unpark();
         self.maint_client.close();
+        self.urgent_stop_client.close();
         self.control_stop.store(true, Ordering::Release);
 
         if let Some(bound) = emergency_bound {
@@ -849,6 +856,7 @@ impl RtExecutorShared {
 
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
+        self.urgent_stop_client.finish_stopped();
         self.sinks.drain_all(&self.tick_stats);
         if let Some(ring) = self.hub.record_ring() {
             ring.drain();
@@ -890,6 +898,33 @@ impl RtExecutorHandle {
 
     pub async fn call_maintenance_async(&self, op: MaintenanceOp) -> Result<MaintenanceResult, OwnerError> {
         self.shared.maint_client.call_async(op).await
+    }
+
+    pub(crate) fn urgent_stop_client(&self) -> Arc<UrgentStopClient> {
+        Arc::clone(&self.shared.urgent_stop_client)
+    }
+
+    pub fn urgent_stop(&self, stop: UrgentStop) -> Result<UrgentStopOutcome, UrgentStopError> {
+        self.shared.urgent_stop_client.submit_sync(stop)
+    }
+
+    pub async fn urgent_stop_async(&self, stop: UrgentStop) -> Result<UrgentStopOutcome, UrgentStopError> {
+        self.shared.urgent_stop_client.submit_async(stop).await
+    }
+
+    pub fn enqueue_urgent_stop(
+        &self,
+        stop: UrgentStop,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<UrgentStopOutcome, UrgentStopError>>, UrgentStopError> {
+        self.shared.urgent_stop_client.enqueue_async(stop)
+    }
+
+    pub fn drain_urgent_stop_replies(&self) {
+        self.shared.urgent_stop_client.drain_replies();
+    }
+
+    pub fn urgent_stop_in_flight(&self) -> usize {
+        self.shared.urgent_stop_client.in_flight()
     }
 
     pub fn request_shutdown(&self) -> Result<bool, OwnerError> {
@@ -1034,7 +1069,7 @@ pub(crate) fn spawn_executor(
 ) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
     let hub = core.core.hub().clone();
     let e_stop_latched = core.e_stop_latched.clone();
-    let (engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
+    let (mut engine, broker, target_writer, stop_requests) = ReleaseEngine::new(cfg.boot, cfg.capacities);
     core.attach_stop_requests(stop_requests.clone());
 
     let (diag_tx, diag_rx) = RingBuffer::<TickSample>::new(DIAG_RING_CAPACITY);
@@ -1050,6 +1085,10 @@ pub(crate) fn spawn_executor(
     let control_stop = Arc::new(AtomicBool::new(false));
     let persist_stop = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
+    let (urgent_stop_client, urgent_stop_intake) =
+        urgent_stop_channel(URGENT_STOP_CAPACITY, exited.clone());
+    engine.attach_urgent_stops(urgent_stop_intake);
+    let urgent_stop_client = Arc::new(urgent_stop_client);
     let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
     let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1065,6 +1104,7 @@ pub(crate) fn spawn_executor(
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
+        urgent_stop_client: urgent_stop_client.clone(),
     });
 
     // Spawn dedicated persistence worker first so its thread handle can be woken on job push.
@@ -1168,6 +1208,7 @@ pub(crate) fn spawn_executor(
         stop_requests,
         stats,
         maint_client,
+        urgent_stop_client,
         hub,
         tick_stats,
         sinks: sinks.clone(),
@@ -2283,6 +2324,9 @@ fn control_thread_main(
                 state.flush_pending_maint_reply(&core);
                 state.emit_estop_ack_if_advanced(&mut core);
                 state.drain_retired_states(&mut core);
+                if engine.take_urgent_replies_flushed() {
+                    hub.wake();
+                }
                 return;
             }
             let (phases, body_end) = core.take_tick_phases();
@@ -2362,6 +2406,7 @@ fn control_thread_main(
             if diag_tx.push(sample).is_err() {
                 stats.diag_dropped.fetch_add(1, Ordering::Relaxed);
             }
+            let _ = engine.take_urgent_replies_flushed();
             hub.wake();
 
             // Sub-release transition wakes before `next_release_ns` (never resetting `last_release_start`).
@@ -2391,8 +2436,11 @@ fn control_thread_main(
                 );
                 let published = engine
                     .service_wake(&mut core, Instant::now(), release_deadline, publish_gen + 1, &mut report);
+                let urgent_flushed = engine.take_urgent_replies_flushed();
                 if published {
                     publish_gen += 1;
+                }
+                if published || urgent_flushed {
                     hub.wake();
                 }
                 if state
@@ -2511,15 +2559,17 @@ fn control_thread_main(
     }
 
     // Clean exit drain: return queued maintenance and persistence payloads off-thread without
-    // performing unpublished live state mutations, publish before flushing any unacked E-stops,
-    // and signal exit before waking sinks.
+    // performing unpublished live state mutations, publish before flushing any unacked E-stops
+    // or applied urgent stops (skipping publish if the release panicked), and signal exit before
+    // waking sinks.
     state.drain_maintenance_stopped();
     state.drain_persistence_stopped(&core);
-    if !core.pending_estop_acks.is_empty() {
+    if !panicked && (!core.pending_estop_acks.is_empty() || engine.has_applied_urgent_stop_pending()) {
         publish_gen += 1;
         let ts = core.now_timestamp();
         core.publish(ts, publish_gen);
     }
+    engine.drain_urgent_stops_stopped(!panicked);
     state.emit_estop_ack_if_advanced(&mut core);
     state.drain_retired_states(&mut core);
     exited.store(true, Ordering::Release);

@@ -2417,6 +2417,17 @@ impl HolderLabel {
         Self { len: n as u8, buf }
     }
 
+    /// Exact inline copy when `s` fits within [`Self::CAPACITY`] bytes; `None` if longer
+    /// (fail-closed for identity comparisons where truncation could alias two IDs).
+    pub fn try_new(s: &str) -> Option<Self> {
+        if s.len() > Self::CAPACITY {
+            return None;
+        }
+        let mut buf = [0u8; Self::CAPACITY];
+        buf[..s.len()].copy_from_slice(s.as_bytes());
+        Some(Self { len: s.len() as u8, buf })
+    }
+
     pub fn as_str(&self) -> &str {
         // SAFETY-free: `new` copies a prefix ending at a char boundary of a `str`
         std::str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
