@@ -69,6 +69,8 @@ impl Committed {
 
 /// A primitive staged in a plan slot. Fixed-size, so a slot is pre-touched at construction;
 /// tracks add variants (Cartesian path, same-side approach, replay) through the integrator.
+// a plan slot holds the largest variant inline and is pre-touched: no boxing, by design
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Primitive {
     #[default]
