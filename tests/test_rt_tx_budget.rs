@@ -2246,3 +2246,236 @@ fn confirmed_handover_and_mit_fresh_status_obey_per_send_stop_gate_and_tx_budget
         bus.with(|s| s.tx_log.clone())
     );
 }
+
+#[test]
+fn budget_1_completes_multi_joint_restore_readback_and_enable_within_deadline() {
+    // Item 3a regression: with max_frames = 1 and a joint (J4 in MIT) needing CTRL_MODE + hold
+    // frames alongside J7 PosForce restore + readback + pre-enable hold + 7 enable frames,
+    // budget-limited restore frames are deferred (not marked unsent/failed), so enable completes
+    // across several ticks within the existing deadline with <= 1 TX frame per poll.
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    // Establish fresh feedback, enable once, switch J4 to MIT, then disable so J4 is stray (MIT)
+    // and needs CTRL_MODE=POS_VEL + dual holds on the next enable alongside J7 PosForce!
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.set_torque(true).expect("initial enable");
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    let mut mit_j4 = [JointMode::Position; 7];
+    mit_j4[3] = JointMode::Mit;
+    d.set_joint_modes(&mit_j4, &targets_const(0.0)).expect("switch J4 to MIT");
+    d.set_torque(false).expect("disable while J4 is in MIT");
+    // Refresh feedback (torque off, state 0, fresh <= 100 ms).
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    // Now set max_frames = 1: J4 needs CTRL_MODE + 2 dual hold frames (3 frames > 1).
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+    bus.clear();
+    let p = d.begin_torque(true).expect("begin_torque under max_frames=1 with stray MIT joint");
+    assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+    assert!(
+        bus.with(|s| s.tx_log.len()) <= 1,
+        "begin_torque exceeded max_frames=1: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+
+    let mut confirmed = false;
+    let mut saw_j4_ctrl_mode = false;
+    let mut saw_j4_hold = false;
+    let mut total_enables = 0usize;
+    for step in 0..40 {
+        let sent_prev = bus.with(|s| s.tx_log.clone());
+        saw_j4_ctrl_mode |= sent_prev.iter().any(|f| {
+            f.id == 0x7FF && f.data[0] == 4 && f.data[2] == damiao::REG_WRITE && f.data[3] == damiao::RID_CTRL_MODE
+        });
+        saw_j4_hold |= sent_prev.iter().any(|f| f.id == 0x104);
+        total_enables += sent_prev.iter().filter(|f| f.data == damiao::CMD_ENABLE).count();
+        bus.clear();
+        clock.advance(ms(1));
+        match d.poll_torque(clock.now() + ms(5)).expect("poll_torque must defer, not fail, under max_frames=1") {
+            armd::driver::TorqueProgress::Done(armd::driver::TorqueOutcome::Confirmed) => {
+                let sent = bus.with(|s| s.tx_log.clone());
+                assert!(sent.len() <= 1, "step {step} exceeded max_frames=1: {sent:?}");
+                total_enables += sent.iter().filter(|f| f.data == damiao::CMD_ENABLE).count();
+                confirmed = true;
+                break;
+            }
+            armd::driver::TorqueProgress::Pending { .. } => {
+                let sent = bus.with(|s| s.tx_log.clone());
+                assert!(sent.len() <= 1, "step {step} exceeded max_frames=1: {sent:?}");
+            }
+            other => panic!("unexpected torque outcome: {other:?}"),
+        }
+    }
+    assert!(confirmed, "healthy arm with stray MIT joint must complete enable across ticks under max_frames=1");
+    assert!(saw_j4_ctrl_mode, "expected J4 CTRL_MODE=POS_VEL restore write");
+    assert!(saw_j4_hold, "expected J4 POS_VEL hold frame during restore");
+    assert_eq!(total_enables, 7, "all 7 motors enabled 1 frame per poll");
+    assert!(d.is_enabled());
+}
+
+#[test]
+fn carried_and_retried_j7_enable_fails_closed_when_j7_feedback_goes_stale() {
+    // Item 3b regression:
+    // Part A: Carried J7 CMD_ENABLE (under tight TX budget) whose J7 feedback ages > 100 ms
+    // after the pre-enable 0x307 hold MUST NOT transmit J7 CMD_ENABLE and MUST fail closed.
+    let limits = b601_limits();
+    let (bus, clock) = VirtualBus::new(&limits);
+    bus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits.clone())
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+
+    // Run under max_frames = 1 until the 0x307 pre-enable hold is sent (leaving all 7 enable
+    // frames carried in `unsent_mask`).
+    d.set_tx_budget(TxBudget { max_frames: 1, max_duration: ms(5), frame_max_age: ms(45) });
+    let _ = d.begin_torque(true).expect("begin");
+    let mut saw_pre_enable_hold = false;
+    for _ in 0..10 {
+        bus.clear();
+        clock.advance(ms(1));
+        let p = d.poll_torque(clock.now() + ms(5)).expect("poll before hold");
+        assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        if bus.with(|s| s.tx_accepted.iter().any(|f| f.id == 0x307)) {
+            saw_pre_enable_hold = true;
+            break;
+        }
+    }
+    assert!(saw_pre_enable_hold, "expected 0x307 pre-enable hold before carried enable");
+    // Drop the immediate feedback frame generated by VirtualBus in response to 0x307 so no newer
+    // J7 feedback arrives, then advance clock across carried J1..J6 polls past 100 ms before J7.
+    bus.with(|s| s.rx.clear());
+    clock.advance(ms(105));
+    bus.clear();
+    // Increase budget so J1..J6 and the stale check for J7 happen in one poll_enable pass.
+    d.set_tx_budget(TxBudget::default());
+    let err = d.poll_torque(clock.now() + ms(5)).unwrap_err();
+    assert!(
+        matches!(err, ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: 6 }),
+        "carried stale J7 enable must fail closed with PosForceFeedbackStaleBeforeTransmit: {err:?}"
+    );
+    assert!(
+        !bus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+        "stale carried J7 enable frame MUST NOT be transmitted: {:?}",
+        bus.with(|s| s.tx_log.clone())
+    );
+    assert!(!d.torque_transition_pending() && !d.is_enabled());
+
+    // Part B: Retried J7 CMD_ENABLE (at 75 ms retry after initial J7 enable reply was lost)
+    // when J7 feedback has aged > 100 ms MUST NOT retransmit J7 CMD_ENABLE and MUST fail closed.
+    struct DropJ7EnableReplyBus {
+        inner: VirtualBus,
+        drop_j7_enable: Arc<AtomicBool>,
+    }
+    impl CanTransport for DropJ7EnableReplyBus {
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> { self.inner.clock() }
+        fn supports_nonblocking_rt(&self) -> bool { true }
+        fn supports_bounded_flush(&self) -> bool { true }
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            let rx_before = self.inner.with(|s| s.rx.len());
+            let r = self.inner.transmit(frame);
+            if self.drop_j7_enable.load(Ordering::SeqCst)
+                && ((frame.id == 7 && frame.data == damiao::CMD_ENABLE) || frame.id == 0x307)
+            {
+                self.inner.with(|s| s.rx.truncate(rx_before));
+            }
+            r
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> { self.inner.receive() }
+        fn flush(&mut self) -> Result<(), TransportError> { self.inner.flush() }
+    }
+
+    let (vbus, clock2) = VirtualBus::new(&limits);
+    vbus.with(|s| {
+        s.motors[6].2 = -1.0;
+    });
+    let drop_j7 = Arc::new(AtomicBool::new(false));
+    let wrapper = DropJ7EnableReplyBus { inner: vbus.clone(), drop_j7_enable: drop_j7.clone() };
+    let mut d2 = DamiaoArmDriver::new(wrapper, vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 460,
+            close_speed_rad_s: 0.30,
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    d2.read_joint_states().unwrap();
+    vbus.with(|s| s.push_all_feedback());
+    d2.read_joint_states().unwrap();
+    // Age J7 to 40 ms before enable, drop J7 enable reply + 0x307 reply so initial enable sends at
+    // age ~42 ms (fresh), retry 1 at +25 ms (age ~67 ms, fresh), retry 2 at +75 ms (age ~117 ms > 100 ms -> fail closed!).
+    clock2.advance(ms(40));
+    drop_j7.store(true, Ordering::SeqCst);
+    let _ = d2.begin_torque(true).expect("begin");
+    let mut saw_enable_batch = false;
+    for _ in 0..10 {
+        clock2.advance(ms(1));
+        let p = d2.poll_torque(clock2.now() + ms(5)).expect("poll to enable");
+        assert!(matches!(p, armd::driver::TorqueProgress::Pending { .. }));
+        if vbus.with(|s| s.tx_accepted.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)) {
+            saw_enable_batch = true;
+            break;
+        }
+    }
+    assert!(saw_enable_batch, "expected initial J7 CMD_ENABLE while J7 feedback is still fresh");
+    // Drop the 0x307 feedback reply too if still sitting in RX so J7 stays aged from t=0.
+    vbus.with(|s| s.rx.retain(|f| f.id != 0x17));
+    // Advance +76 ms (past the 75 ms retry point and past 100 ms J7 feedback age, still < 150 ms enable confirm).
+    clock2.advance(ms(76));
+    vbus.clear();
+    let err2 = d2.poll_torque(clock2.now() + ms(5)).unwrap_err();
+    assert!(
+        matches!(err2, ArmDriverError::PosForceFeedbackStaleBeforeTransmit { joint: 6 }),
+        "retried J7 enable after feedback aged > 100 ms must fail closed: {err2:?}"
+    );
+    assert!(
+        !vbus.with(|s| s.tx_log.iter().any(|f| f.id == 7 && f.data == damiao::CMD_ENABLE)),
+        "stale retried J7 enable frame MUST NOT be transmitted: {:?}",
+        vbus.with(|s| s.tx_log.clone())
+    );
+    assert!(!d2.torque_transition_pending() && !d2.is_enabled());
+}
