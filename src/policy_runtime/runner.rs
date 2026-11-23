@@ -1233,6 +1233,38 @@ impl PreparedPolicy {
 
         Ok(self.arm_target_rad.clone())
     }
+
+    /// Advance a chunked policy's buffer by `late_periods` control periods that passed between
+    /// sampling and commit, discarding passed slots and returning the target for the current
+    /// period. Returns `Ok(None)` if the buffer cannot cover `late_periods` (or if cached
+    /// sources expired/invalidated), signalling the runner to submit nothing on this tick.
+    pub fn advance_chunk_for_commit(
+        &mut self,
+        late_periods: u32,
+        freshness: Option<&ChunkFreshnessLimits>,
+    ) -> Result<Option<Vec<f32>>, PolicyError> {
+        if late_periods == 0 || self.contract.chunking.chunk_size <= 1 {
+            return Ok(None);
+        }
+        if let Some(limits) = freshness {
+            self.prune_chunk_buffer(limits);
+        }
+        let late = late_periods as usize;
+        if self.chunk_ring.len() < late {
+            self.chunk_ring.clear();
+            self.periods_since_replan = self.periods_since_replan.saturating_add(late);
+            self.last_step_sources.clear();
+            return Ok(None);
+        }
+        self.chunk_ring.discard_front(late - 1);
+        self.chunk_ring.pop_front_into(
+            self.contract.chunking.temporal_ensemble_k,
+            &mut self.step_out_norm,
+            &mut self.last_step_sources,
+        )?;
+        self.periods_since_replan = self.periods_since_replan.saturating_add(late);
+        self.finalize_step_target().map(Some)
+    }
 }
 
 /// Load and validate a policy pack from `dir` against `config` without holding any supervisor lock.
@@ -1634,6 +1666,7 @@ pub fn spawn_policy_runner(
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let period_ns = period.as_nanos().max(1);
         let mut last_infer_period: Option<u64> = None;
+        let mut last_committed_period: Option<u64> = None;
 
         loop {
             if let Some(dl) = tokio_dl {
@@ -1654,6 +1687,11 @@ pub fn spawn_policy_runner(
             let cur_period = (tick_now.saturating_duration_since(interval_origin).as_nanos()
                 / period_ns)
                 .min(u64::MAX as u128) as u64;
+            if prepared.contract().chunking.chunk_size > 1
+                && last_committed_period.is_some_and(|p| cur_period <= p)
+            {
+                continue;
+            }
             let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
@@ -1858,7 +1896,7 @@ pub fn spawn_policy_runner(
                 infer_handle.await
             };
 
-            let (target, infer_us) = match infer_result {
+            let (mut target, infer_us) = match infer_result {
                 Err(e) => {
                     tracing::warn!("Policy inference task failed for action {action_id}: {e}");
                     let mut inner = supervisor.inner().write().await;
@@ -1997,6 +2035,55 @@ pub fn spawn_policy_runner(
             // calibration hashing / release-gate / deployment checks, and immediately commit
             // `policy_step_with_vision` with zero intervening work.
             let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
+            let commit_period = (tokio::time::Instant::now()
+                .saturating_duration_since(interval_origin)
+                .as_nanos()
+                / period_ns)
+                .min(u64::MAX as u128) as u64;
+            if prepared.contract().chunking.chunk_size > 1 && commit_period > cur_period {
+                let late = (commit_period - cur_period).min(u32::MAX as u64) as u32;
+                let commit_ticket_ctx = _hub_guard.as_ref().map(|guard| {
+                    let live_hub = guard.live_ticket_state();
+                    TicketVerificationContext {
+                        policy_instance_id: live_hub.policy_instance_id,
+                        lease_generation: active_run_lease_generation(&inner, action_id),
+                        producer_epoch: live_hub.producer_epoch,
+                        model_generation: live_hub.model_generation,
+                        invalidation_generation: live_hub.invalidation_generation,
+                        clock_handshake_generation: live_hub.clock_handshake_generation,
+                        now_armd_ms: live_hub.now_armd_ms,
+                    }
+                });
+                let commit_freshness = ChunkFreshnessLimits {
+                    now: Instant::now(),
+                    max_source_joint_age_ms,
+                    max_source_vision_age_ms,
+                    horizon_ms,
+                    vision_generation: locked_generation,
+                    vision_target_present,
+                    live_ticket_ctx: commit_ticket_ctx,
+                };
+                match prepared.advance_chunk_for_commit(late, Some(&commit_freshness)) {
+                    Ok(Some(updated_target)) => {
+                        target = updated_target;
+                        last_infer_period = Some(commit_period);
+                    }
+                    Ok(None) => {
+                        // Buffer cannot cover the period that is now current: submit nothing this tick.
+                        last_infer_period = Some(commit_period);
+                        continue;
+                    }
+                    Err(e) => {
+                        prepared.clear_chunk_buffer();
+                        let reason = match e {
+                            PolicyError::NonFinite(_) => "NON_FINITE",
+                            _ => "INFERENCE_ERROR",
+                        };
+                        inner.fail_policy_run(action_id, reason, e.to_string());
+                        break;
+                    }
+                }
+            }
             let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
                 match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
                     Ok(now_ms) => {
@@ -2054,6 +2141,7 @@ pub fn spawn_policy_runner(
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
             }
+            last_committed_period = Some(commit_period);
         }
     })
 }
@@ -2590,6 +2678,137 @@ mod chunking_tests {
             "unexpected start error: {start_msg}"
         );
         assert!(validate_chunking_horizon(contract.chunking, 20.0).is_ok());
+    }
+
+    #[test]
+    fn chunking_advance_for_commit_discards_passed_slots_or_returns_none() {
+        let state_dim = ArmConfig::default().dof;
+        let state = vec![0.0f32; state_dim];
+        let c0 = make_constant_chunk(state_dim, &[0.05, 0.15, 0.25, 0.35]);
+
+        // Case 1: 1 period late (period 0 passed -> return period 1 = 0.15).
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        let (backend, _) = CountingChunkBackend::new(state_dim, 4 * state_dim, vec![c0.clone()]);
+        let mut prep =
+            PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg).unwrap();
+        let sampled = prep.step_infer_periods(&state, 1).unwrap();
+        assert!((sampled[0] - 0.05).abs() < 1e-6);
+        let committed = prep.advance_chunk_for_commit(1, None).unwrap().unwrap();
+        assert!((committed[0] - 0.15).abs() < 1e-6);
+        assert_eq!(prep.chunk_buffer_len(), 2);
+
+        // Case 2: overrun larger than remaining buffer -> returns None and clears buffer.
+        let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(2, 2, None);
+        let c_short = make_constant_chunk(state_dim, &[0.05, 0.15]);
+        let (backend2, _) = CountingChunkBackend::new(state_dim, 2 * state_dim, vec![c_short]);
+        let mut prep2 =
+            PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2).unwrap();
+        let _ = prep2.step_infer_periods(&state, 1).unwrap();
+        assert!(prep2.advance_chunk_for_commit(2, None).unwrap().is_none());
+        assert_eq!(prep2.chunk_buffer_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn chunking_overrunning_replan_commits_current_period_or_nothing() {
+        // Part A: 60 ms replan at 20 Hz (50 ms period) starting in period 0 with chunk_size=4
+        // lands in period 1 -> action submitted must be chunk[1] (0.15), not chunk[0] (0.05).
+        let (snap, contract, cfg) = make_chunk_snapshot_and_contract(4, 2, None);
+        let dim = cfg.dof;
+        let c0 = make_constant_chunk(dim, &[0.05, 0.15, 0.25, 0.35]);
+        let (backend, _) = CountingChunkBackend::new(dim, 4 * dim, vec![c0]);
+        let prep = PreparedPolicy::from_backend(snap, contract, Box::new(backend), &cfg)
+            .unwrap()
+            .with_infer_delay(Duration::from_millis(60));
+
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        let lease_gen = sup.acquire_lease("chunk-overrun-a").await.unwrap();
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            let epoch_id = inner.safety.epoch_id();
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id,
+                    connection_id: "chunk-overrun-a".into(),
+                    lease_generation: lease_gen,
+                    policy_id: "chunk_overrun_a".into(),
+                    artifact_digest: prep.artifact_digest().to_string(),
+                    backend: prep.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    sim_only: true,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
+                })
+                .unwrap()
+        };
+        let handle = spawn_policy_runner(
+            sup.clone(),
+            action_id,
+            prep,
+            20.0,
+            compute_policy_deadline(Some(0.095)).unwrap(),
+            None,
+            None,
+        );
+        handle.await.unwrap();
+        let obs = sup.get_observation().await;
+        let pol = obs.policy.expect("policy observation");
+        assert_eq!(pol.steps, 1, "expected exactly 1 committed step before 95 ms deadline");
+        let first_target = pol.last_shadow_target.expect("shadow target");
+        assert!(
+            (first_target[0] - 0.15).abs() < 1e-6,
+            "60 ms replan at 20 Hz must commit period 1 (0.15), not period 0 (0.05); got {}",
+            first_target[0]
+        );
+
+        // Part B: 115 ms replan at 20 Hz with chunk_size=2 lands in period >= 2, which the
+        // 2-slot chunk [0, 1] cannot cover -> nothing is submitted on that tick.
+        let (snap2, contract2, cfg2) = make_chunk_snapshot_and_contract(2, 2, None);
+        let c_short = make_constant_chunk(dim, &[0.05, 0.15]);
+        let (backend2, _) = CountingChunkBackend::new(dim, 2 * dim, vec![c_short]);
+        let prep2 = PreparedPolicy::from_backend(snap2, contract2, Box::new(backend2), &cfg2)
+            .unwrap()
+            .with_infer_delay(Duration::from_millis(115));
+
+        let sup2 = Arc::new(ArmSupervisor::new(cfg2));
+        let lease_gen2 = sup2.acquire_lease("chunk-overrun-b").await.unwrap();
+        let action_id2 = {
+            let mut inner = sup2.inner().write().await;
+            let epoch_id = inner.safety.epoch_id();
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id,
+                    connection_id: "chunk-overrun-b".into(),
+                    lease_generation: lease_gen2,
+                    policy_id: "chunk_overrun_b".into(),
+                    artifact_digest: prep2.artifact_digest().to_string(),
+                    backend: prep2.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    sim_only: true,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
+                })
+                .unwrap()
+        };
+        let handle2 = spawn_policy_runner(
+            sup2.clone(),
+            action_id2,
+            prep2,
+            20.0,
+            compute_policy_deadline(Some(0.14)).unwrap(),
+            None,
+            None,
+        );
+        handle2.await.unwrap();
+        let obs2 = sup2.get_observation().await;
+        let pol2 = obs2.policy.expect("policy observation");
+        assert_eq!(pol2.steps, 0, "overrun past chunk buffer must submit nothing");
+        assert!(pol2.last_shadow_target.is_none());
     }
 
     #[test]
