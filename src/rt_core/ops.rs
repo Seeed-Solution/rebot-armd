@@ -19,6 +19,8 @@
 //! a stub or test double ([`StubCore`]) can refuse but never acknowledge success, and has no
 //! way to move hardware.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::broker::{
@@ -162,7 +164,30 @@ pub struct CommitCtx {
     pub stop_generation: u64,
 }
 
-/// One hardware poll: feedback validity and enable state (no bus traffic today).
+/// Receive frames the bus owner services per release at most (design: 64 frames or 5 ms).
+pub const RX_FRAME_BUDGET: u16 = 64;
+/// Time the bus owner services per release at most.
+pub const RX_TIME_BUDGET: Duration = Duration::from_millis(5);
+
+/// What one [`CoreOps::poll_hardware`] may spend: it returns by `deadline` (the earlier of
+/// the release deadline and the service budget) and services at most `max_rx_frames`.
+/// `now` is the executor's clock (virtual in [`ReleaseFixture`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceBudget {
+    pub now: Instant,
+    pub deadline: Instant,
+    pub max_rx_frames: u16,
+}
+
+impl ServiceBudget {
+    /// The per-release budget at `now` of a release ending at `release_deadline`.
+    pub fn for_release(now: Instant, release_deadline: Instant) -> Self {
+        Self { now, deadline: (now + RX_TIME_BUDGET).min(release_deadline), max_rx_frames: RX_FRAME_BUDGET }
+    }
+}
+
+/// One hardware poll: feedback validity and enable state, and what the poll serviced (no
+/// bus traffic today: `rx_frames` 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HardwarePoll {
     /// No driver (mock follower).
@@ -170,6 +195,10 @@ pub struct HardwarePoll {
     pub feedback_valid: bool,
     pub enable_state: Option<EnableState>,
     pub oldest_feedback_age: Option<Duration>,
+    /// Receive frames serviced in this poll (<= `ServiceBudget::max_rx_frames`).
+    pub rx_frames: u16,
+    /// The poll stopped at its budget (deadline or frame bound) with work left.
+    pub budget_exhausted: bool,
 }
 
 /// The narrow operations of one arm's core.
@@ -188,7 +217,9 @@ pub trait CoreOps {
     fn apply_stop(&mut self);
     /// How `action` ended, None while it runs.
     fn action_outcome(&self, action: ActionId) -> Option<Outcome>;
-    fn poll_hardware(&self) -> HardwarePoll;
+    /// The bus owner's progress and confirmations within `budget` (exclusive: the bus
+    /// owner's state machine advances here).
+    fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll;
     /// One release of the control tick (`generation`: the publication's lock generation).
     fn advance(&mut self, dt: f64, generation: u64);
 }
@@ -299,8 +330,10 @@ impl CoreOps for SupervisorInner {
         outcome_of(&a.state, a.code.as_deref())
     }
 
-    fn poll_hardware(&self) -> HardwarePoll {
-        let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, ..HardwarePoll::default() }; };
+    fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        // no bus servicing is delegated yet (the tick reads feedback): only the budget is reported
+        let budget_exhausted = budget.now > budget.deadline;
+        let Some(driver) = self.driver.as_ref() else { return HardwarePoll { driverless: true, budget_exhausted, ..HardwarePoll::default() }; };
         let d = driver.lock().unwrap_or_else(|e| e.into_inner());
         let ages = d.feedback_ages();
         HardwarePoll {
@@ -308,6 +341,8 @@ impl CoreOps for SupervisorInner {
             feedback_valid: d.is_feedback_valid(),
             enable_state: Some(d.enable_state()),
             oldest_feedback_age: ages.iter().copied().try_fold(Duration::ZERO, |m, a| a.map(|a| m.max(a))),
+            rx_frames: 0,
+            budget_exhausted,
         }
     }
 
@@ -354,6 +389,9 @@ pub struct StubCore {
     pub commits_seen: u64,
     pub targets_seen: u64,
     pub releases: u64,
+    pub polls: u64,
+    /// The budget of the last poll.
+    pub last_budget: Option<ServiceBudget>,
 }
 
 impl CoreOps for StubCore {
@@ -367,7 +405,11 @@ impl CoreOps for StubCore {
     fn consume_target(&mut self, _: &TargetFrame, _: &CommitCtx) -> Result<(), &'static str> { self.targets_seen += 1; Err("NOT_WIRED") }
     fn apply_stop(&mut self) {}
     fn action_outcome(&self, _: ActionId) -> Option<Outcome> { Some(Outcome::Failed("NOT_WIRED")) }
-    fn poll_hardware(&self) -> HardwarePoll { HardwarePoll { driverless: true, ..HardwarePoll::default() } }
+    fn poll_hardware(&mut self, budget: &ServiceBudget) -> HardwarePoll {
+        self.polls += 1;
+        self.last_budget = Some(*budget);
+        HardwarePoll { driverless: true, ..HardwarePoll::default() }
+    }
     fn advance(&mut self, _: f64, _: u64) { self.releases += 1; }
 }
 
@@ -383,11 +425,32 @@ pub struct ReleaseReport {
     pub target: Option<(u64, Result<(), &'static str>)>,
     /// The active action that ended in this release.
     pub ended: Option<(ActionId, Outcome)>,
+    /// The hardware poll of this release.
+    pub poll: HardwarePoll,
 }
 
-/// Advances one core one release at a time, in the executor's order: urgent stop, at most
-/// one ordinary command, the latest target, the control tick, terminal detection. Tests and
-/// tracks drive it deterministically (no thread, no clock other than the stamps' deadlines).
+/// The fixture's clock: virtual monotonic time, advanced by the fixture (one `dt` per
+/// release) or by a test ([`Self::advance`]); clones share it. Never reads the wall clock
+/// after construction.
+#[derive(Debug, Clone)]
+pub struct VirtualClock {
+    base: Instant,
+    offset_ns: Arc<AtomicU64>,
+}
+
+impl VirtualClock {
+    /// A clock starting at `base`.
+    pub fn starting_at(base: Instant) -> Self { Self { base, offset_ns: Arc::new(AtomicU64::new(0)) } }
+    pub fn base(&self) -> Instant { self.base }
+    pub fn now(&self) -> Instant { self.base + Duration::from_nanos(self.offset_ns.load(Ordering::SeqCst)) }
+    pub fn advance(&self, d: Duration) { self.offset_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst); }
+}
+
+/// Advances one core one release at a time, in the executor's order: urgent stop, hardware
+/// poll, at most one ordinary command, the latest target, the control tick, terminal
+/// detection. Tests and tracks drive it deterministically: no thread, and virtual time
+/// ([`VirtualClock`]): release `k` (from 1) starts at `clock.base() + (k - 1) * dt` plus what
+/// a test advanced.
 pub struct ReleaseFixture<O: CoreOps> {
     pub core: O,
     intake: RtIntake<Primitive>,
@@ -396,6 +459,7 @@ pub struct ReleaseFixture<O: CoreOps> {
     applied_stop: u64,
     active: Option<Installed>,
     releases: u64,
+    clock: VirtualClock,
     pub dt: f64,
 }
 
@@ -405,8 +469,14 @@ impl<O: CoreOps> ReleaseFixture<O> {
         let (broker, intake) = super::broker::channel(ArmId::LOCAL, boot, caps, Primitive::default);
         let (tw, tr) = target_mailbox();
         let stop = StopRequests::new();
-        (Self { core, intake, targets: tr, stop: stop.clone(), applied_stop: 0, active: None, releases: 0, dt: 0.02 }, broker, tw, stop)
+        let clock = VirtualClock::starting_at(Instant::now());
+        (Self { core, intake, targets: tr, stop: stop.clone(), applied_stop: 0, active: None, releases: 0, clock, dt: 0.02 }, broker, tw, stop)
     }
+
+    /// The fixture's virtual clock (clone it to advance time from a test).
+    pub fn clock(&self) -> &VirtualClock { &self.clock }
+    /// Virtual now.
+    pub fn now(&self) -> Instant { self.clock.now() }
 
     pub fn releases(&self) -> u64 { self.releases }
     pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
@@ -420,14 +490,18 @@ impl<O: CoreOps> ReleaseFixture<O> {
     pub fn step(&mut self) -> ReleaseReport {
         self.releases += 1;
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
-        let ctx = self.ctx(Instant::now());
+        let started = self.clock.now();
+        let release_deadline = started + Duration::from_secs_f64(self.dt);
+        let ctx = self.ctx(started);
         // 1. urgent stop, independent of the command ring's capacity
         if ctx.stop_generation != self.applied_stop {
             self.applied_stop = ctx.stop_generation;
             self.core.apply_stop();
             report.stopped = true;
         }
-        // 2. one ordinary command (the intake enforces one per release)
+        // 2. the bus owner, within the release's service budget
+        report.poll = self.core.poll_hardware(&ServiceBudget::for_release(self.clock.now(), release_deadline));
+        // 3. one ordinary command (the intake enforces one per release)
         self.intake.begin_release(self.releases);
         if let Some(mut t) = self.intake.take() {
             let d = *t.descriptor();
@@ -454,13 +528,13 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 }
             }));
         }
-        // 3. the latest target
+        // 4. the latest target
         if let Some(f) = self.targets.take() {
             report.target = Some((f.seq, self.core.consume_target(&f, &ctx)));
         }
-        // 4. the control tick
+        // 5. the control tick
         self.core.advance(self.dt, self.releases);
-        // 5. terminal of the active action
+        // 6. terminal of the active action
         if let Some(action) = self.active() {
             if let Some(outcome) = self.core.action_outcome(action) {
                 let installed = self.active.take().expect("active above");
@@ -468,6 +542,8 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 report.ended = Some((action, outcome));
             }
         }
+        // the next release starts one period later
+        self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
     }
 }

@@ -29,7 +29,7 @@ fn fixture(caps: Capacities) -> Fx { ReleaseFixture::new(supervisor(), BOOT, cap
 
 fn later() -> Instant { Instant::now() + Duration::from_secs(10) }
 
-fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(&fx.ctx(Instant::now())) }
+fn auth(fx: &ReleaseFixture<SupervisorInner>) -> Authority { fx.core.authority(&fx.ctx(fx.now())) }
 
 fn quintic(fx: &ReleaseFixture<SupervisorInner>, d0: f32, duration_s: f64) -> Primitive {
     let start = fx.core.commanded_positions.clone();
@@ -146,8 +146,8 @@ fn stale_authority_and_expired_deadlines_are_refused_at_commit() {
     submit_install(&mut b, 4, Authority { config_revision: a.config_revision + 1, ..a }, later(), quintic(&fx, -0.1, 1.0)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("PLAN_STALE"));
     // the original deadline passed while queued
-    submit_install(&mut b, 5, a, Instant::now(), quintic(&fx, -0.1, 1.0)).unwrap();
-    std::thread::sleep(Duration::from_millis(2));
+    submit_install(&mut b, 5, a, fx.now(), quintic(&fx, -0.1, 1.0)).unwrap();
+    fx.clock().advance(Duration::from_millis(1));
     assert_eq!(fx.step().command.unwrap().1, Err("DEADLINE_EXPIRED"));
     assert_eq!(fx.active(), Some(active));
     assert_eq!(fx.core.last_action.as_ref().map(|x| x.id), before, "a refused commit replaced the action");
@@ -212,12 +212,12 @@ fn a_planning_snapshot_is_stamped_with_the_publication_and_authority() {
     let (mut fx, _b, _tw, stop) = fixture(Capacities::default());
     fx.step();
     stop.request();
-    let snap = fx.core.planning_snapshot(&fx.ctx(Instant::now()));
+    let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
     assert_eq!(snap.published_seq, fx.core.core.published_seq());
     assert_eq!(snap.authority.stop_generation, 1);
     assert_eq!(snap.measured.len(), fx.core.config.dof);
     assert!(!snap.motion_active);
-    assert!(fx.core.poll_hardware().driverless);
+    assert!(fx.core.poll_hardware(&armd::rt_core::ops::ServiceBudget::for_release(fx.now(), fx.now())).driverless);
 }
 
 /// A supervisor that enforces leases, with `client` holding one (`lease_timeout_ms`).
@@ -334,4 +334,32 @@ fn a_terminal_keeps_the_cause_of_a_lease_loss() {
     let mut ended = None;
     for _ in 0..10 { if let Some(e) = fx.step().ended { ended = Some(e); break; } }
     assert_eq!(ended, Some((action, Outcome::Cancelled("LEASE_LOST"))));
+}
+
+#[test]
+fn the_fixture_polls_the_hardware_each_release_within_a_virtual_budget() {
+    let (mut fx, _b, _tw, _stop) = ReleaseFixture::new(StubCore::default(), BOOT, Capacities { commands: 4, plans: 2, replies: 8 });
+    let base = fx.clock().base();
+    // wall time passing does not move the fixture's clock
+    std::thread::sleep(Duration::from_millis(15));
+    for _ in 0..5 { fx.step(); }
+    assert_eq!(fx.core.polls, 5, "one poll per release");
+    let budget = fx.core.last_budget.unwrap();
+    assert_eq!(budget.now, base + Duration::from_millis(80));
+    assert_eq!(budget.deadline, base + Duration::from_millis(85), "5 ms service budget inside the 20 ms release");
+    assert_eq!(budget.max_rx_frames, 64);
+    assert_eq!(fx.now(), base + Duration::from_millis(100));
+}
+
+#[test]
+fn a_deadline_that_passes_between_releases_is_refused_in_virtual_time() {
+    let (mut fx, mut b, _tw, _stop) = fixture(Capacities { commands: 4, plans: 2, replies: 16 });
+    let a = auth(&fx);
+    let deadline = fx.now() + Duration::from_millis(10);
+    submit_install(&mut b, 1, a, deadline, quintic(&fx, 0.05, 0.5)).unwrap();
+    submit_install(&mut b, 2, a, deadline, quintic(&fx, 0.05, 0.5)).unwrap();
+    // wall time passing does not expire it; release 2 starts 20 ms later in virtual time
+    std::thread::sleep(Duration::from_millis(15));
+    assert!(fx.step().command.unwrap().1.is_ok());
+    assert_eq!(fx.step().command.unwrap().1, Err("DEADLINE_EXPIRED"));
 }
