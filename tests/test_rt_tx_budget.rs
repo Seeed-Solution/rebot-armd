@@ -1519,3 +1519,89 @@ fn refresh_round_robin_covers_all_stale_motors_without_starving_j7() {
     }
     assert_eq!(second_round, vec![1, 2, 3, 4, 5, 6, 7]);
 }
+
+#[test]
+fn merge_check_production_supervisor_estop_gate_with_stops_via_zero_offset_driver() {
+    // Merge-check test: wire the real DamiaoArmDriver through the production
+    // `SupervisorInner::with_driver` (which wraps in `ZeroOffsetDriver`) and
+    // `SupervisorInner::attach_stop_requests` so `SupervisorInner::estop_gate()` carries
+    // `with_stops` without any manual `.with_stops(...)` in the test.
+    struct SharedDamiao(Arc<Mutex<DamiaoArmDriver<VirtualBus>>>);
+    impl ArmDriver for SharedDamiao {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities { self.0.lock().unwrap().capabilities() }
+        fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, ArmDriverError> {
+            self.0.lock().unwrap().read_joint_states()
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            self.0.lock().unwrap().write_joint_targets(targets)
+        }
+        fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+            self.0.lock().unwrap().set_torque(enabled)
+        }
+        fn set_estop_gate(&mut self, gate: EstopGate) {
+            self.0.lock().unwrap().set_estop_gate(gate);
+        }
+    }
+
+    // Path A: production `SupervisorInner::with_driver` (wraps in `ZeroOffsetDriver`) +
+    // `SupervisorInner::attach_stop_requests` -> forwards `inner.estop_gate()` through `ZeroOffsetDriver`.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    let shared = Arc::new(Mutex::new(d));
+    let stops = StopRequests::new();
+    let cfg = ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() };
+    let mut inner = SupervisorInner::new(cfg.clone()).with_driver(Box::new(SharedDamiao(shared.clone())));
+    inner.attach_stop_requests(stops.clone());
+
+    assert_eq!(
+        shared.lock().unwrap().write_joint_targets_bounded(&targets_const(0.35)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    // Request and apply an ORDINARY authorized stop (E-stop stays at generation 0 and unlatched).
+    let g = stops.request();
+    assert!(inner.estop_gate().pending(), "ordinary stop must be pending before applied");
+    stops.mark_applied(g);
+    assert!(!inner.estop_gate().pending(), "ordinary stop is applied (requested == applied)");
+    assert_eq!(inner.estop_gate().generations(), (0, 1));
+    assert_eq!(inner.requested_estop_count.load(Ordering::SeqCst), 0);
+
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(10));
+    shared.lock().unwrap().begin_tx_tick();
+    let err = shared.lock().unwrap().drain_pending_tx().unwrap_err();
+    assert!(is_estop_inhibited(&err), "applied ordinary stop via production SupervisorInner::estop_gate must invalidate deferred frames: {err:?}");
+    assert!(bus.with(|s| s.tx_log.is_empty()), "no target frame may reach the bus after applied ordinary stop");
+    assert_eq!(shared.lock().unwrap().pending_tx_len(), 0);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stopped, m.pending), (0, 3, 0));
+
+    // Path B: direct `ZeroOffsetDriver::set_estop_gate(inner.estop_gate())` using the gate
+    // returned by `SupervisorInner::estop_gate()` (carrying `with_stops` from §1).
+    let (mut d2, bus2, clock2) = enabled_driver();
+    d2.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    let shared2 = Arc::new(Mutex::new(d2));
+    let mut wrapped = armd::joint_zero::ZeroOffsetDriver::new(Box::new(SharedDamiao(shared2.clone())), &[0.0; 7]);
+    wrapped.set_estop_gate(inner.estop_gate());
+
+    assert_eq!(
+        shared2.lock().unwrap().write_joint_targets_bounded(&targets_const(-0.35)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    let g2 = stops.request();
+    assert!(inner.estop_gate().pending());
+    stops.mark_applied(g2);
+    assert!(!inner.estop_gate().pending());
+    assert_eq!(inner.estop_gate().generations(), (0, 2));
+
+    bus2.clear();
+    reset_tx_metrics();
+    clock2.advance(ms(10));
+    shared2.lock().unwrap().begin_tx_tick();
+    let err2 = shared2.lock().unwrap().drain_pending_tx().unwrap_err();
+    assert!(is_estop_inhibited(&err2), "ZeroOffsetDriver forwarded SupervisorInner::estop_gate must invalidate deferred frames: {err2:?}");
+    assert!(bus2.with(|s| s.tx_log.is_empty()), "no target frame may reach the bus on drain");
+    assert_eq!(shared2.lock().unwrap().pending_tx_len(), 0);
+    let m2 = take_tx_metrics();
+    assert_eq!((m2.frames, m2.dropped_stopped, m2.pending), (0, 3, 0));
+}
