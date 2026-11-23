@@ -2457,3 +2457,298 @@ async fn emergency_timeout_detaches_stalled_control_thread_so_drop_is_bounded() 
     );
     let _ = release_tx2.send(());
 }
+
+// ============================================================================
+// 11. Post-merge Item 1: J7 refresh boundary drain counts against release RX budget
+// ============================================================================
+
+#[test]
+fn j7_refresh_drain_counts_against_release_rx_budget_and_reports_consumed_frames() {
+    use armd::protocol::damiao;
+    use armd::rt_core::broker::{BootId, Capacities, ClientId, Submit, TransitionOp};
+    use armd::rt_core::ops::{CoreOps, ReleaseFixture, ServiceBudget};
+    use armd::supervisor::SupervisorInner;
+    use armd::transport::{CanFrame, CanTransport, DriverClock, TransportError};
+
+    #[derive(Clone)]
+    struct RxCountingInjectBus {
+        inner: FakeBus,
+        rx_dequeued: Arc<AtomicUsize>,
+        inject_after_wouldblock: Arc<std::sync::Mutex<Option<Vec<CanFrame>>>>,
+    }
+
+    impl CanTransport for RxCountingInjectBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            match self.inner.receive() {
+                Ok(f) => {
+                    self.rx_dequeued.fetch_add(1, Ordering::SeqCst);
+                    Ok(f)
+                }
+                Err(e @ (TransportError::Timeout | TransportError::WouldBlock)) => {
+                    if let Some(frames) = self.inject_after_wouldblock.lock().unwrap().take() {
+                        self.inner.with(|s| {
+                            for f in frames {
+                                s.rx.push_back(f);
+                            }
+                        });
+                    }
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.inner.clock()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            true
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            true
+        }
+    }
+
+    let make_pf_cfg = || GripperPosForce {
+        joint: 6,
+        current_raw: 220,
+        close_speed_rad_s: 0.30,
+        closed_rad: 0.0,
+        open_rad: -5.7,
+        calibrated: false,
+        ceiling_torque_nm: None,
+        torque_reference: None,
+    };
+
+    // (a) RefreshBeforeRestore (boundary: None): `drain_rx_for_boundary` consumes N = 10 frames
+    // inside `poll_hardware` with budget 20 -> NO extra RX pass runs in `poll_hardware_rx`,
+    // total bus frames dequeued == 10, and `poll.rx_frames == 10` (not 0 or 10+extra).
+    let clock = MockClock::new();
+    let raw = FakeBus::with_clock(&dm_limits(), clock.clone());
+    raw.with(|s| s.motors[6].mute_feedback = true);
+    let bus = RxCountingInjectBus {
+        inner: raw.clone(),
+        rx_dequeued: Arc::new(AtomicUsize::new(0)),
+        inject_after_wouldblock: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap()
+        .with_gripper_pos_force(make_pf_cfg())
+        .unwrap();
+    // Establish drained state with stale/missing J7 feedback so `begin_torque_budgeted(true, 0)`
+    // enters `RefreshBeforeRestore { boundary: None }`.
+    raw.with(|s| s.push_all_feedback());
+    drv.read_joint_states().unwrap();
+    drv.set_rt_mode(true);
+
+    let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
+        .with_driver(Box::new(drv));
+    inner.lease_enabled = false;
+    let (mut fx, mut broker, _tw, _stop) =
+        ReleaseFixture::new(inner, BootId(11), Capacities { commands: 4, plans: 2, replies: 8 });
+    let a = fx.core.authority(&fx.ctx(fx.now()));
+    broker
+        .submit(ClientId(1), 1, a, fx.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
+    // Release 1 commits TorqueOn in Step 3 (`begin_torque_budgeted(true, 0)` -> `RefreshBeforeRestore { boundary: None }`).
+    let rep1 = fx.step();
+    assert!(rep1.command.unwrap().1.is_ok());
+
+    // Queue N = 10 non-J7 frames before Release 2's `poll_hardware` with budget 20.
+    let filler = raw.with(|s| s.motors[0].feedback_frame());
+    raw.with(|s| {
+        for _ in 0..10 {
+            s.rx.push_back(filler);
+        }
+    });
+    bus.rx_dequeued.store(0, Ordering::SeqCst);
+    raw.clear_log();
+    let budget20 = ServiceBudget {
+        now: fx.now(),
+        deadline: fx.now() + Duration::from_millis(20),
+        max_rx_frames: 20,
+    };
+    let poll_a = fx.core.poll_hardware(&budget20);
+    assert_eq!(
+        bus.rx_dequeued.load(Ordering::SeqCst),
+        10,
+        "refresh drain consumed 10 frames; poll_hardware_rx must not run another full RX pass"
+    );
+    assert_eq!(poll_a.rx_frames, 10, "poll.rx_frames must include all 10 refresh-drain frames: {poll_a:?}");
+    assert!(!poll_a.budget_exhausted, "10 < 20 budget should not exhaust: {poll_a:?}");
+    assert!(
+        raw.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "expected 0xCC refresh after boundary drain"
+    );
+
+    // (b) `poll_readback` -> `start_feedback_refresh` -> `drain_rx_for_boundary` in ONE release:
+    // budget = 12; `poll_readback`'s `receive_feedback` consumes N1 = 5 frames (4 filler + 1
+    // CTRL_MODE=4 readback reply) + WouldBlock, which injects 10 more frames right before
+    // `drain_rx_for_boundary`. The refresh drain MUST be reduced by N1 = 5 to 12 - 5 = 7 frames
+    // (total dequeued == 12, NOT 15), with `poll.rx_frames == 12` and `budget_exhausted == true`.
+    let clock_b = MockClock::new();
+    let raw_b = FakeBus::with_clock(&dm_limits(), clock_b.clone());
+    raw_b.with(|s| {
+        s.motors[6].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_FORCE);
+        s.motors[6].mute_feedback = true;
+    });
+    let bus_b = RxCountingInjectBus {
+        inner: raw_b.clone(),
+        rx_dequeued: Arc::new(AtomicUsize::new(0)),
+        inject_after_wouldblock: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let mut drv_b = DamiaoArmDriver::new(bus_b.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap()
+        .with_gripper_pos_force(make_pf_cfg())
+        .unwrap();
+    drv_b.read_joint_states().unwrap();
+    raw_b.with(|s| s.push_all_feedback());
+    drv_b.read_joint_states().unwrap();
+    drv_b.check_mapping_ranges(); // verifies J7 already in CTRL_MODE 4 -> skip Restore, enter Readback
+    // Age J7 past 100 ms so readback reply triggers `PreEnableRefresh` -> `drain_rx_for_boundary`.
+    clock_b.advance(Duration::from_millis(120));
+    drv_b.read_joint_states().unwrap();
+    drv_b.set_rt_mode(true);
+
+    let mut inner_b = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
+        .with_driver(Box::new(drv_b));
+    inner_b.lease_enabled = false;
+    let (mut fx_b, mut broker_b, _tw_b, _stop_b) =
+        ReleaseFixture::new(inner_b, BootId(12), Capacities { commands: 4, plans: 2, replies: 8 });
+    let a_b = fx_b.core.authority(&fx_b.ctx(fx_b.now()));
+    broker_b
+        .submit(ClientId(1), 1, a_b, fx_b.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
+    // Release 1 commits TorqueOn -> Readback { boundary: None }.
+    assert!(fx_b.step().command.unwrap().1.is_ok());
+    // Poll once to send the CTRL_MODE readback request (boundary becomes Some).
+    raw_b.with(|s| s.motors[6].silent = true);
+    let _ = fx_b.core.poll_hardware(&ServiceBudget::for_release(fx_b.now(), fx_b.now() + Duration::from_millis(20)));
+    assert!(
+        raw_b.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == damiao::REG_READ),
+        "expected CTRL_MODE readback request"
+    );
+
+    // Queue N1 = 5 frames (4 filler + 1 valid CTRL_MODE=4 reply) and arm 10 extra frames on
+    // WouldBlock so `drain_rx_for_boundary` runs immediately in the SAME release.
+    let filler_b = raw_b.with(|s| s.motors[0].feedback_frame());
+    let mode_bytes = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+    let readback_reply = CanFrame::new_standard(
+        0x17,
+        &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode_bytes[0], mode_bytes[1], mode_bytes[2], mode_bytes[3]],
+    )
+    .unwrap();
+    raw_b.with(|s| {
+        for _ in 0..4 {
+            s.rx.push_back(filler_b);
+        }
+        s.rx.push_back(readback_reply);
+    });
+    *bus_b.inject_after_wouldblock.lock().unwrap() = Some(vec![filler_b; 10]);
+    bus_b.rx_dequeued.store(0, Ordering::SeqCst);
+    raw_b.clear_log();
+
+    let budget12 = ServiceBudget {
+        now: fx_b.now(),
+        deadline: fx_b.now() + Duration::from_millis(20),
+        max_rx_frames: 12,
+    };
+    let poll_b = fx_b.core.poll_hardware(&budget12);
+    assert_eq!(
+        bus_b.rx_dequeued.load(Ordering::SeqCst),
+        12,
+        "combined receive_feedback (5) + drain_rx_for_boundary (capped at 12-5=7) must not exceed budget 12"
+    );
+    assert_eq!(poll_b.rx_frames, 12, "reported rx_frames must include both passes: {poll_b:?}");
+    assert!(poll_b.budget_exhausted, "hitting combined budget 12 must set budget_exhausted: {poll_b:?}");
+    assert!(
+        !raw_b.tx_log().iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC),
+        "must not send 0xCC when refresh drain exhausted remaining budget before queue emptied"
+    );
+
+    // (c) Non-caching driver reporting N = 7 frames from `take_last_poll_rx()`: `poll_hardware_rx`
+    // must reduce its `read_joint_states_budgeted` call to `max_rx_frames - 7` and sum both counts.
+    struct NonCachingAccountingDriver {
+        last_transition_rx: Option<(u16, bool)>,
+        seen_read_budget: Arc<AtomicUsize>,
+        read_returns: u16,
+    }
+    impl ArmDriver for NonCachingAccountingDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn is_enabled(&self) -> bool { false }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); 7])
+        }
+        fn read_joint_states_budgeted(
+            &mut self,
+            out: &mut Vec<JointState>,
+            _deadline: Instant,
+            max_rx_frames: u16,
+        ) -> Result<(u16, bool), ArmDriverError> {
+            self.seen_read_budget.store(usize::from(max_rx_frames), Ordering::SeqCst);
+            out.clear();
+            out.resize(7, JointState::default());
+            let used = self.read_returns.min(max_rx_frames);
+            Ok((used, self.read_returns >= max_rx_frames))
+        }
+        fn read_cached_joint_states_into(&self, _out: &mut Vec<JointState>) -> Option<()> { None }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+        fn begin_torque_budgeted(&mut self, _: bool, _: u16) -> Result<TorqueProgress, ArmDriverError> {
+            Ok(TorqueProgress::Pending { wake: Instant::now() })
+        }
+        fn poll_torque_budgeted(&mut self, _: Instant, _: u16) -> Result<TorqueProgress, ArmDriverError> {
+            self.last_transition_rx = Some((7, false));
+            Ok(TorqueProgress::Pending { wake: Instant::now() + Duration::from_millis(5) })
+        }
+        fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> {
+            self.last_transition_rx.take()
+        }
+        fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
+    }
+
+    let seen_budget = Arc::new(AtomicUsize::new(0));
+    let nc_drv = NonCachingAccountingDriver {
+        last_transition_rx: None,
+        seen_read_budget: seen_budget.clone(),
+        read_returns: 4,
+    };
+    let mut inner_c = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() })
+        .with_driver(Box::new(nc_drv));
+    inner_c.lease_enabled = false;
+    let (mut fx_c, mut broker_c, _tw_c, _stop_c) =
+        ReleaseFixture::new(inner_c, BootId(13), Capacities { commands: 4, plans: 2, replies: 8 });
+    let a_c = fx_c.core.authority(&fx_c.ctx(fx_c.now()));
+    broker_c
+        .submit(ClientId(1), 1, a_c, fx_c.now() + Duration::from_secs(5), Submit::Transition(TransitionOp::TorqueOn))
+        .unwrap();
+    assert!(fx_c.step().command.unwrap().1.is_ok());
+
+    let poll_c = fx_c.core.poll_hardware(&ServiceBudget {
+        now: fx_c.now(),
+        deadline: fx_c.now() + Duration::from_millis(20),
+        max_rx_frames: 20,
+    });
+    assert_eq!(seen_budget.load(Ordering::SeqCst), 13, "RX pass budget must be reduced by 7 (20 - 7 = 13)");
+    assert_eq!(poll_c.rx_frames, 11, "reported rx_frames must sum transition (7) + read pass (4) = 11: {poll_c:?}");
+    assert!(!poll_c.budget_exhausted);
+}

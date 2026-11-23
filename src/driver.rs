@@ -3762,36 +3762,50 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.last_command_was_disable = false;
         self.disable_confirmed_sticky = false;
 
-        let drained_now = match max_rx_frames {
-            Some(0) => {
-                if !self.last_read_drained {
-                    // Do not transmit enable frames or drain RX in Step 3; defer draining
-                    // to `poll_torque_budgeted` until an empty-queue boundary is reached.
-                    self.awaiting_rx_boundary = true;
-                    let now = self.now();
-                    self.torque_hs = Some(DamiaoTorque::DrainBeforeEnable(Deadline::after(now, DAMIAO_RX_PASS)));
-                    return Ok(TorqueProgress::Pending { wake: now });
-                }
-                false
-            }
-            Some(limit) => {
-                if !self.drain_rx_before_command_limit(usize::from(limit)) {
-                    self.awaiting_rx_boundary = true;
-                    self.enable_failed();
-                    return Err(ArmDriverError::HardwareFault("CAN RX buffer not drained before handshake".to_string()));
-                }
+        let budget_armed = match max_rx_frames {
+            Some(limit) if limit > 0 => {
+                self.last_poll_rx = None;
+                self.rx_frame_limit = Some(limit.min(64));
                 true
             }
-            None => {
-                if !self.drain_rx_before_command() {
-                    self.awaiting_rx_boundary = true;
-                    self.enable_failed();
-                    return Err(ArmDriverError::HardwareFault("CAN RX buffer not drained before handshake".to_string()));
-                }
-                true
-            }
+            _ => false,
         };
-        self.continue_enable_after_drain(drained_now)
+        let res = (|| -> Result<TorqueProgress, ArmDriverError> {
+            let drained_now = match max_rx_frames {
+                Some(0) => {
+                    if !self.last_read_drained {
+                        // Do not transmit enable frames or drain RX in Step 3; defer draining
+                        // to `poll_torque_budgeted` until an empty-queue boundary is reached.
+                        self.awaiting_rx_boundary = true;
+                        let now = self.now();
+                        self.torque_hs = Some(DamiaoTorque::DrainBeforeEnable(Deadline::after(now, DAMIAO_RX_PASS)));
+                        return Ok(TorqueProgress::Pending { wake: now });
+                    }
+                    false
+                }
+                Some(limit) => {
+                    if !self.drain_rx_before_command_limit(usize::from(limit)) {
+                        self.awaiting_rx_boundary = true;
+                        self.enable_failed();
+                        return Err(ArmDriverError::HardwareFault("CAN RX buffer not drained before handshake".to_string()));
+                    }
+                    true
+                }
+                None => {
+                    if !self.drain_rx_before_command() {
+                        self.awaiting_rx_boundary = true;
+                        self.enable_failed();
+                        return Err(ArmDriverError::HardwareFault("CAN RX buffer not drained before handshake".to_string()));
+                    }
+                    true
+                }
+            };
+            self.continue_enable_after_drain(drained_now)
+        })();
+        if budget_armed {
+            self.rx_frame_limit = None;
+        }
+        res
     }
 
     fn continue_enable_after_drain(&mut self, drained_now: bool) -> Result<TorqueProgress, ArmDriverError> {
@@ -3887,27 +3901,55 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake })
     }
 
-    /// Drain up to `rx_frame_limit` (max 64) RX frames within `rx_over` and `deadline`, stopping
-    /// on `Timeout` / `WouldBlock` and marking the empty-queue boundary.
+    /// Remaining frames allowed in the current budgeted RX pass (defaults to 64 when unbudgeted).
+    fn remaining_rx_frame_limit(&self) -> usize {
+        usize::from(self.rx_frame_limit.unwrap_or(64).min(64))
+    }
+
+    /// Account frames consumed by an RX pass into `last_poll_rx` and deduct them from the active
+    /// `rx_frame_limit` so multiple drains within one release share a single frame budget.
+    fn account_rx_pass(&mut self, frames_processed: usize, exhausted: bool) {
+        let frames = u16::try_from(frames_processed).unwrap_or(u16::MAX);
+        if let Some(rem) = self.rx_frame_limit.as_mut() {
+            *rem = rem.saturating_sub(frames);
+        }
+        let (prev_frames, prev_exhausted) = self.last_poll_rx.unwrap_or((0, false));
+        self.last_poll_rx = Some((
+            prev_frames.saturating_add(frames),
+            prev_exhausted || exhausted,
+        ));
+    }
+
+    /// Drain up to the remaining `rx_frame_limit` (max 64) RX frames within `rx_over` and
+    /// `deadline`, stopping on `Timeout` / `WouldBlock` and marking the empty-queue boundary.
+    /// Every frame consumed counts against the release's RX budget and `last_poll_rx`.
     fn drain_rx_for_boundary(&mut self, deadline: Deadline) -> bool {
-        let max_frames = usize::from(self.rx_frame_limit.unwrap_or(64).min(64));
+        let max_frames = self.remaining_rx_frame_limit();
         self.last_read_drained = false;
         let t0 = self.now();
-        for _ in 0..max_frames {
-            if self.rx_over(t0) || deadline.passed(self.now()) {
-                return false;
-            }
+        let mut frames_processed = 0usize;
+        let mut rx_drained = false;
+        let mut hit_err = false;
+        while frames_processed < max_frames && !self.rx_over(t0) && !deadline.passed(self.now()) {
             let attempt = self.now();
             match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => self.process_rx_frame(&frame, true, rx_ts),
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    self.mark_rx_empty(attempt);
-                    return true;
+                Ok((frame, rx_ts)) => {
+                    frames_processed += 1;
+                    self.process_rx_frame(&frame, true, rx_ts);
                 }
-                Err(_) => return false,
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    rx_drained = true;
+                    self.mark_rx_empty(attempt);
+                    break;
+                }
+                Err(_) => {
+                    hit_err = true;
+                    break;
+                }
             }
         }
-        false
+        self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        rx_drained
     }
 
     /// Establish a tight pre-transmit RX boundary, transmit `0xCC` for `joint`, and arm
@@ -4463,7 +4505,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
         self.awaiting_rx_boundary = match max_rx_frames {
             Some(0) => !self.last_read_drained,
-            Some(limit) => !self.drain_rx_before_command_limit(usize::from(limit)),
+            Some(limit) => {
+                self.last_poll_rx = None;
+                self.rx_frame_limit = Some(limit.min(64));
+                let drained = self.drain_rx_before_command_limit(usize::from(limit));
+                self.rx_frame_limit = None;
+                !drained
+            }
             None => !self.drain_rx_before_command(),
         };
         let after_seq = self.rx_seq;
@@ -4562,21 +4610,34 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn drain_rx_before_command_limit(&mut self, max_frames: usize) -> bool {
+        let limit = self.rx_frame_limit.map_or(max_frames, |rem| max_frames.min(usize::from(rem)));
         self.last_read_drained = false;
         let start = self.now();
-        for _ in 0..max_frames {
-            if self.since(start) >= Duration::from_millis(5) { return false; }
+        let mut frames_processed = 0usize;
+        let mut rx_drained = false;
+        let mut hit_err = false;
+        while frames_processed < limit && self.since(start) < Duration::from_millis(5) {
             let attempt = self.now();
             match self.can.receive_timestamped() {
-                Ok((frame, rx_ts)) => self.process_rx_frame(&frame, false, rx_ts),
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
-                    self.mark_rx_empty(attempt);
-                    return true;
+                Ok((frame, rx_ts)) => {
+                    frames_processed += 1;
+                    self.process_rx_frame(&frame, false, rx_ts);
                 }
-                Err(_) => return false,
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    rx_drained = true;
+                    self.mark_rx_empty(attempt);
+                    break;
+                }
+                Err(_) => {
+                    hit_err = true;
+                    break;
+                }
             }
         }
-        false
+        if self.rx_frame_limit.is_some() {
+            self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
+        }
+        rx_drained
     }
 
     /// Err([`ArmDriverError::EstopInhibited`]) while an E-stop request is not yet applied by the tick.
@@ -5505,7 +5566,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     fn receive_feedback(&mut self) -> Result<(), ArmDriverError> {
-        let max_frames = usize::from(self.rx_frame_limit.unwrap_or(64).min(64));
+        let max_frames = self.remaining_rx_frame_limit();
         let t0 = self.now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
@@ -5533,7 +5594,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
             }
         }
-        self.last_poll_rx = Some((frames_processed as u16, !rx_drained && !hit_err));
+        self.account_rx_pass(frames_processed, !rx_drained && !hit_err);
         if self.last_command_was_disable
             && !self.is_enabled
             && !self.is_enabling

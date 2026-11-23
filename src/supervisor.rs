@@ -2039,11 +2039,16 @@ impl SupervisorInner {
                             if driver.read_cached_joint_states_into(&mut sc.states).is_some() {
                                 Ok((frames, exhausted))
                             } else {
-                                let drv_now = driver.clock_now();
-                                let span = b.deadline.saturating_duration_since(b.now);
-                                driver
-                                    .read_joint_states_budgeted(&mut sc.states, drv_now + span, b.max_rx_frames)
-                                    .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
+                                let remaining = b.max_rx_frames.saturating_sub(frames);
+                                if remaining == 0 {
+                                    Ok((frames, true))
+                                } else {
+                                    let drv_now = driver.clock_now();
+                                    let span = b.deadline.saturating_duration_since(b.now);
+                                    driver
+                                        .read_joint_states_budgeted(&mut sc.states, drv_now + span, remaining)
+                                        .map(|(f2, ex2)| (frames.saturating_add(f2), exhausted || ex2))
+                                }
                             }
                         }
                         (Some(b), None) => {
