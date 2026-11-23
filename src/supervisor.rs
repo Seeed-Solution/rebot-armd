@@ -7763,6 +7763,12 @@ const OBS_POLL: Duration = Duration::from_millis(1);
 /// How long [`ArmSupervisor::observation`] waits for the read lock when no sample answers.
 pub const OBS_LOCK_WAIT: Duration = Duration::from_millis(500);
 
+/// 503 `OBSERVATION_UNAVAILABLE`: neither a fresh sample nor the read lock in time.
+fn observation_unavailable() -> ArmError {
+    ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
+        message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() }
+}
+
 /// A published sample, or the read guard when no sample answers (no control loop running).
 enum Fresh<'a> {
     Sample(Arc<crate::rt_core::publish::Snapshot>),
@@ -7907,6 +7913,7 @@ impl ArmSupervisor {
             waited = true;
             tokio::time::sleep(OBS_POLL).await;
         }
+        let seen_seq = self.hub.published_seq();
         let Ok(inner) = tokio::time::timeout(OBS_LOCK_WAIT, self.inner.read()).await else {
             // a stalled tick (or writer) holds the lock: one last non-blocking look
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
@@ -7916,17 +7923,25 @@ impl ArmSupervisor {
                 }
             }
             if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
-            return Err(ArmError::Rejected { status: 503, code: "OBSERVATION_UNAVAILABLE".into(),
-                message: "No current observation: the control tick has not published and the supervisor lock stayed busy".into() });
+            return Err(observation_unavailable());
         };
-        // a tick may have published while this call waited for the lock; never wait for the
-        // hub while holding the guard
-        if let Poll::Ready(Some(s)) = self.hub.try_latest() {
-            if Self::answers(&s, want, Instant::now()) {
-                drop(inner);
-                if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
-                return Ok(Fresh::Sample(s));
+        // a tick may have published while this call waited for the lock. Only the atomic
+        // sequence is read under the guard: refreshing the hub (reclamation, the snapshot's
+        // allocation) happens after the guard is dropped
+        if self.hub.published_seq() != seen_seq {
+            drop(inner);
+            if let Poll::Ready(Some(s)) = self.hub.try_latest() {
+                if Self::answers(&s, want, Instant::now()) {
+                    if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
+                    return Ok(Fresh::Sample(s));
+                }
             }
+            let Ok(inner) = tokio::time::timeout(OBS_LOCK_WAIT, self.inner.read()).await else {
+                if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
+                return Err(observation_unavailable());
+            };
+            if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
+            return Ok(Fresh::Locked(inner));
         }
         if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
         Ok(Fresh::Locked(inner))
