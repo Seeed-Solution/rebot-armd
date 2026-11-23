@@ -62,6 +62,8 @@ enum Mode {
     Ok,
     WouldBlockAfter(usize),
     EnobufsAfter(usize),
+    #[cfg(target_os = "linux")]
+    SocketCanOsAfter(usize, i32),
 }
 
 /// Pre-allocated Damiao CAN bus fake (zero allocations during `transmit` and `receive`).
@@ -141,6 +143,12 @@ impl CanTransport for NoAllocDamiaoBus {
             Mode::Ok => {}
             Mode::WouldBlockAfter(n) if self.tx_count >= n => return Err(TransportError::WouldBlock),
             Mode::EnobufsAfter(n) if self.tx_count >= n => return Err(TransportError::NoBufferSpace),
+            #[cfg(target_os = "linux")]
+            Mode::SocketCanOsAfter(n, errno) if self.tx_count >= n => {
+                return Err(armd::transport::socketcan::map_socketcan_tx_error(
+                    std::io::Error::from_raw_os_error(errno),
+                ));
+            }
             _ => {}
         }
         self.tx_count += 1;
@@ -219,6 +227,12 @@ impl CanTransport for NoAllocDamiaoBus {
             None | Some(Mode::Ok) => Ok(()),
             Some(Mode::WouldBlockAfter(_)) => Err(TransportError::WouldBlock),
             Some(Mode::EnobufsAfter(_)) => Err(TransportError::NoBufferSpace),
+            #[cfg(target_os = "linux")]
+            Some(Mode::SocketCanOsAfter(_, errno)) => {
+                Err(armd::transport::socketcan::map_socketcan_tx_error(
+                    std::io::Error::from_raw_os_error(errno),
+                ))
+            }
         }
     }
 }
@@ -397,7 +411,7 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     // 8. Unfenced mid-batch stop + mid-pass stale Timeout + flush ENOBUFS — 0 allocs, 0 frees.
     let bus = NoAllocDamiaoBus::new(&limits);
     let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
-        .with_joint_limits(limits)
+        .with_joint_limits(limits.clone())
         .unwrap();
     d.set_torque(true).expect("enable");
     let stops = StopRequests::new();
@@ -430,6 +444,81 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     let (res, a, f) = counted(|| d.write_joint_targets_bounded(&targets));
     assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace))), "{res:?}");
     assert_eq!((a, f), (0, 0), "unfenced flush ENOBUFS touched allocator");
+
+    // 9. Production SocketCAN hard OS error (ENETDOWN) construction + drop through fenced,
+    // unfenced, recovery, and refresh paths — 0 allocs, 0 frees.
+    #[cfg(target_os = "linux")]
+    {
+        // Direct mapper construction and disposal.
+        let (is_os_err, a, f) = counted(|| {
+            let err = armd::transport::socketcan::map_socketcan_tx_error(
+                std::io::Error::from_raw_os_error(libc::ENETDOWN),
+            );
+            let ok = matches!(
+                err,
+                TransportError::SocketCanOs { op: "send", errno: Some(libc::ENETDOWN), .. }
+            );
+            drop(err);
+            ok
+        });
+        assert!(is_os_err);
+        assert_eq!((a, f), (0, 0), "SocketCAN ENETDOWN map + drop touched allocator");
+
+        // Fenced MIT hard OS error + error drop.
+        let (mut d, _, _) = mk_fenced();
+        d.can_mut().mode = Mode::SocketCanOsAfter(2, libc::ENETDOWN);
+        let (matched, a, f) = counted(|| {
+            let res = d.write_joint_targets_bounded(&targets);
+            let ok = matches!(
+                res,
+                Err(ArmDriverError::Transport(TransportError::SocketCanOs {
+                    op: "send",
+                    errno: Some(libc::ENETDOWN),
+                    ..
+                }))
+            );
+            drop(res);
+            ok
+        });
+        assert!(matched);
+        assert_eq!((a, f), (0, 0), "fenced MIT SocketCAN ENETDOWN + drop touched allocator");
+
+        // Unfenced target write hard OS error + error drop.
+        let bus = NoAllocDamiaoBus::new(&limits);
+        let clock = bus.clock.clone();
+        let mut d = DamiaoArmDriver::new(bus, vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits)
+            .unwrap();
+        d.can_mut().push_all_feedback();
+        d.read_joint_states().unwrap();
+        d.set_torque(true).expect("enable");
+        d.can_mut().tx_count = 0;
+        d.can_mut().mode = Mode::SocketCanOsAfter(1, libc::ENETDOWN);
+        let (matched, a, f) = counted(|| {
+            let res = d.write_joint_targets_bounded(&targets);
+            let ok = matches!(
+                res,
+                Err(ArmDriverError::Transport(TransportError::SocketCanOs {
+                    op: "send",
+                    errno: Some(libc::ENETDOWN),
+                    ..
+                }))
+            );
+            drop(res);
+            ok
+        });
+        assert!(matched);
+        assert_eq!((a, f), (0, 0), "unfenced SocketCAN ENETDOWN + drop touched allocator");
+
+        // Receive-side recovery and 0xCC refresh discarding hard OS errors inside the tick.
+        clock.advance(Duration::from_millis(120));
+        d.can_mut().tx_count = 0;
+        d.can_mut().mode = Mode::SocketCanOsAfter(0, libc::ENETDOWN);
+        let mut scratch = Vec::with_capacity(7);
+        let (res, a, f) = counted(|| d.read_joint_states_into(&mut scratch));
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!((a, f), (0, 0), "recovery/refresh SocketCAN ENETDOWN disposal touched allocator");
+    }
 }
 
 #[test]

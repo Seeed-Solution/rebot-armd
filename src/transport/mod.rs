@@ -36,6 +36,24 @@ pub enum TransportError {
     #[error("Transmit queue full (ENOBUFS)")]
     NoBufferSpace,
 
+    #[error("SocketCAN {op} failed: {}", format_os_error(*errno, *kind))]
+    SocketCanOs {
+        op: &'static str,
+        errno: Option<i32>,
+        kind: std::io::ErrorKind,
+    },
+
+    #[error("Invalid CAN frame ({reason}, id 0x{id:X})")]
+    InvalidCanFrame {
+        reason: &'static str,
+        id: u32,
+    },
+
+    #[error("CAN bus error frame (id 0x{id:X})")]
+    CanBusErrorFrame {
+        id: u32,
+    },
+
     #[error("Device not open")]
     NotOpen,
 
@@ -59,6 +77,25 @@ impl TransportError {
     pub fn is_tx_backpressure(&self) -> bool {
         matches!(self, Self::WouldBlock | Self::NoBufferSpace)
     }
+}
+
+struct OsErrorDisplay {
+    errno: Option<i32>,
+    kind: std::io::ErrorKind,
+}
+
+impl fmt::Display for OsErrorDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(code) = self.errno {
+            write!(f, "{}", std::io::Error::from_raw_os_error(code))
+        } else {
+            write!(f, "{:?}", self.kind)
+        }
+    }
+}
+
+fn format_os_error(errno: Option<i32>, kind: std::io::ErrorKind) -> OsErrorDisplay {
+    OsErrorDisplay { errno, kind }
 }
 
 /// Standard 8-byte CAN frame definition

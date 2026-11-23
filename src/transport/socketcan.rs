@@ -93,14 +93,14 @@ impl CanTransport for SocketCanTransport {
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let sk_frame = if frame.is_extended {
             let id = ExtendedId::new(frame.id)
-                .ok_or_else(|| TransportError::Can(format!("Invalid extended CAN ID: {:#x}", frame.id)))?;
+                .ok_or(TransportError::InvalidCanFrame { reason: "extended ID out of range", id: frame.id })?;
             CanDataFrame::new(id, frame.data_slice())
-                .ok_or_else(|| TransportError::Can("Failed to create extended CanDataFrame".to_string()))?
+                .ok_or(TransportError::InvalidCanFrame { reason: "extended data frame rejected", id: frame.id })?
         } else {
             let id = StandardId::new(frame.id as u16)
-                .ok_or_else(|| TransportError::Can(format!("Invalid standard CAN ID: {:#x}", frame.id)))?;
+                .ok_or(TransportError::InvalidCanFrame { reason: "standard ID out of range", id: frame.id })?;
             CanDataFrame::new(id, frame.data_slice())
-                .ok_or_else(|| TransportError::Can("Failed to create standard CanDataFrame".to_string()))?
+                .ok_or(TransportError::InvalidCanFrame { reason: "standard data frame rejected", id: frame.id })?
         };
 
         self.socket
@@ -117,7 +117,11 @@ impl CanTransport for SocketCanTransport {
                 if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
                     return Err(TransportError::Timeout);
                 }
-                return Err(TransportError::Can(format!("SocketCAN read failed: {}", e)));
+                return Err(TransportError::SocketCanOs {
+                    op: "read",
+                    errno: e.raw_os_error(),
+                    kind: e.kind(),
+                });
             }
         };
 
@@ -157,7 +161,11 @@ impl CanTransport for SocketCanTransport {
                 })
             }
             SkCanFrame::Error(ef) => {
-                Err(TransportError::Can(format!("CAN bus error frame: {:?}", ef)))
+                let id = match ef.id() {
+                    Id::Standard(sid) => sid.as_raw() as u32,
+                    Id::Extended(eid) => eid.as_raw(),
+                };
+                Err(TransportError::CanBusErrorFrame { id })
             }
         }
     }
@@ -167,16 +175,20 @@ impl CanTransport for SocketCanTransport {
     }
 }
 
-/// Map a Linux SocketCAN transmit `io::Error` without heap allocation on backpressure
-/// (`EAGAIN`/`EWOULDBLOCK` and `ENOBUFS`).
+/// Map a Linux SocketCAN transmit `io::Error` without heap allocation on any outcome
+/// (`EAGAIN`/`EWOULDBLOCK`, `ENOBUFS`, or hard OS errors such as `ENETDOWN`).
 #[cfg(target_os = "linux")]
-fn map_socketcan_tx_error(e: std::io::Error) -> TransportError {
+pub fn map_socketcan_tx_error(e: std::io::Error) -> TransportError {
     if e.kind() == std::io::ErrorKind::WouldBlock {
         TransportError::WouldBlock
     } else if e.raw_os_error() == Some(libc::ENOBUFS) {
         TransportError::NoBufferSpace
     } else {
-        TransportError::Can(format!("SocketCAN send failed: {}", e))
+        TransportError::SocketCanOs {
+            op: "send",
+            errno: e.raw_os_error(),
+            kind: e.kind(),
+        }
     }
 }
 
@@ -194,8 +206,19 @@ mod tests {
         assert!(matches!(nb, TransportError::NoBufferSpace));
         assert!(nb.is_tx_backpressure());
 
+        let netdown = map_socketcan_tx_error(std::io::Error::from_raw_os_error(libc::ENETDOWN));
+        assert!(matches!(
+            netdown,
+            TransportError::SocketCanOs { op: "send", errno: Some(libc::ENETDOWN), .. }
+        ));
+        assert!(!netdown.is_tx_backpressure());
+        assert!(netdown.to_string().contains("SocketCAN send failed"), "{netdown}");
+
         let other = map_socketcan_tx_error(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        assert!(matches!(other, TransportError::Can(_)));
+        assert!(matches!(
+            other,
+            TransportError::SocketCanOs { op: "send", kind: std::io::ErrorKind::BrokenPipe, .. }
+        ));
         assert!(!other.is_tx_backpressure());
     }
 }
