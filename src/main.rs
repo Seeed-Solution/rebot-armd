@@ -215,7 +215,10 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
         Ok((rec, bb)) => {
             info!("Previous start: {}", diagnostics::boot::summary(&rec));
             info!("Black box recording to {} (boot {})", dir.display(), rec.boot);
-            diagnostics::blackbox::spawn_recorder(supervisor, bb);
+            if let Err(e) = diagnostics::blackbox::spawn_recorder(supervisor, bb) {
+                warn!("Black box off: {e}");
+                return;
+            }
             DiagnosticsState::set_global(DiagnosticsState { blackbox_dir: Some(dir), boot: rec.boot });
         }
         Err(e) => warn!("Black box directory {} unavailable ({e}); black box off", dir.display()),
@@ -401,6 +404,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feetech_config = config.feetech.clone();
     let gripper_index = config.gripper_index();
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    // before the control loop: frees retired observations, feeds telemetry and recordings
+    supervisor.start_dispatcher()?;
     supervisor.set_follower(follower).await;
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     let episodes = armd::recording::EpisodeStore::resolve(cli.episodes_dir.as_deref());

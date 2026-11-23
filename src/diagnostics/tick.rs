@@ -169,6 +169,10 @@ pub struct ObservationCacheStats {
     /// Requests answered 503 `OBSERVATION_UNAVAILABLE` (no sample and the lock stayed busy).
     #[serde(default)]
     pub unavailable: u64,
+    /// Displaced observations the tick freed itself because no reader drained the retire
+    /// ring (0 while the dispatcher runs).
+    #[serde(default)]
+    pub tick_frees: u64,
     /// Samples published by the tick so far.
     #[serde(default)]
     pub published: u64,

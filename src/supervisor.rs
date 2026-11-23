@@ -7624,26 +7624,31 @@ impl ArmSupervisor {
         self.inner.write().await.operator_auth_enforced = enforced;
     }
 
-    /// Every tick's observation, forwarded by the dispatcher thread (started here); a
-    /// lagging receiver skips observations, a lagging dispatcher forwards only the newest.
-    pub fn subscribe_telemetry(&self) -> broadcast::Receiver<ArmObservation> {
-        let rx = self.telemetry_tx.subscribe();
-        self.ensure_dispatcher();
-        rx
+    /// Every tick's observation, forwarded by the dispatcher thread (started here when it
+    /// does not run yet; an error when it cannot start); a lagging receiver skips
+    /// observations, a lagging dispatcher forwards only the newest.
+    pub fn subscribe_telemetry(&self) -> Result<broadcast::Receiver<ArmObservation>, ArmError> {
+        self.ensure_dispatcher()?;
+        Ok(self.telemetry_tx.subscribe())
     }
+
+    /// Starts the dispatcher thread (armd does at startup, before the control loop): it
+    /// frees the observations the tick retired, forwards telemetry and drains the
+    /// recording ring. Idempotent.
+    pub fn start_dispatcher(&self) -> Result<(), ArmError> { self.ensure_dispatcher() }
 
     /// Starts the dispatcher thread once: a normal-priority thread woken by every
     /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers and
     /// drains the recording ring.
-    pub(crate) fn ensure_dispatcher(&self) {
-        if self.hub.has_dispatcher() { return; }
+    pub(crate) fn ensure_dispatcher(&self) -> Result<(), ArmError> {
+        if self.hub.has_dispatcher() { return Ok(()); }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
-        if self.hub.has_dispatcher() { return; }
+        if self.hub.has_dispatcher() { return Ok(()); }
         let (hub, tx) = (Arc::clone(&self.hub), self.telemetry_tx.clone());
-        match std::thread::Builder::new().name("armd-dispatch".into()).spawn(move || dispatch_loop(&hub, &tx)) {
-            Ok(handle) => { self.hub.set_dispatcher(handle.thread().clone()); }
-            Err(e) => tracing::error!("Cannot start the observation dispatcher thread: {e}"),
-        }
+        let handle = std::thread::Builder::new().name("armd-dispatch".into()).spawn(move || dispatch_loop(&hub, &tx))
+            .map_err(|e| ArmError::Internal(format!("cannot start the observation dispatcher thread: {e}")))?;
+        self.hub.set_dispatcher(handle.thread().clone());
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -8345,6 +8350,7 @@ impl ArmSupervisor {
             waited: self.obs_waits.load(Ordering::Relaxed),
             unavailable: self.obs_unavailable.load(Ordering::Relaxed),
             published: self.hub.published_seq(),
+            tick_frees: self.hub.tick_frees(),
         };
         snap
     }

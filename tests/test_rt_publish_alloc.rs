@@ -58,21 +58,23 @@ fn publish_and_record_push_do_not_touch_the_allocator() {
     let template = armd::SupervisorInner::new(cfg).current_observation();
     let q = vec![0.1f32; dof];
     core.begin_recording();
-    let mut displaced = Vec::new();
     for i in 0..1000u64 {
         // built outside the counted region (the observation itself is the tick's existing cost)
         let mut obs = template.clone();
         obs.timestamp = i as f64;
         let now = Instant::now();
-        let (back, a, f) = counted(|| {
+        // the whole tick-side publication, including dropping what publish hands back: the
+        // readers lag (one read every 7 ticks), so most publications displace an unread
+        // observation, which must go to the retire ring and be freed by the reader
+        let ((none_back, pushed), a, f) = counted(|| {
             let back = core.publish(i, now, now + Duration::from_millis(40), obs, &q, &q);
-            let pushed = core.record.push(i, i as f64, &q, &q);
-            (back, pushed)
+            let none_back = back.is_none();
+            drop(back);
+            (none_back, core.record.push(i, i as f64, &q, &q))
         });
         assert_eq!((a, f), (0, 0), "publication {i}: {a} allocations, {f} deallocations");
-        assert!(back.1 || i >= 256, "ring full only after its capacity");
-        // the displaced observation leaves the counted region and is freed by the caller
-        displaced.push(back.0);
+        assert!(none_back, "publication {i}: the tick got an observation back to free");
+        assert!(pushed, "ring full");
         if i % 7 == 0 {
             // a reader takes samples in between (its own allocations are not the tick's)
             let s = hub.latest().unwrap();
@@ -84,6 +86,7 @@ fn publish_and_record_push_do_not_touch_the_allocator() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     dispatcher.thread().unpark();
     dispatcher.join().unwrap();
+    assert_eq!(hub.tick_frees(), 0);
     let done = core.record.finish();
     assert_eq!(done.frames.len() as u64 + done.dropped, 1000);
 }

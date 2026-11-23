@@ -178,6 +178,8 @@ impl ArmSupervisor {
         }
         if options.task.chars().count() > 256 { return Err(rejected(400, "INVALID_COMMAND", "task is at most 256 characters")); }
         self.ensure_episodes_loaded().await?;
+        // drains the recording ring off the tick: refused when it cannot run
+        self.ensure_dispatcher()?;
         let st = {
             let inner = self.inner().read().await;
             inner.recorder_idle()?;
@@ -205,8 +207,6 @@ impl ArmSupervisor {
                 started: Instant::now(), joint_zero: JointZeroStamp::of(&inner.joint_zero_offsets), max_frames, owner_lost_at: None,
             });
         }
-        // drains the recording ring off the tick
-        self.ensure_dispatcher();
         tracing::info!("Recording {id} started (owner {label})");
         let lock = self.inner().clone();
         let mid = id.clone();

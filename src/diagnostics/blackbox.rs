@@ -239,9 +239,9 @@ pub fn open(dir: &Path, boot: u64, start: Instant) -> io::Result<BlackBox> {
 }
 
 /// Feeds the black box from the supervisor's telemetry broadcast until it closes.
-pub fn spawn_recorder(supervisor: &crate::supervisor::ArmSupervisor, mut bb: BlackBox) -> tokio::task::JoinHandle<()> {
-    let mut rx = supervisor.subscribe_telemetry();
-    tokio::spawn(async move {
+pub fn spawn_recorder(supervisor: &crate::supervisor::ArmSupervisor, mut bb: BlackBox) -> Result<tokio::task::JoinHandle<()>, crate::supervisor::ArmError> {
+    let mut rx = supervisor.subscribe_telemetry()?;
+    Ok(tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
             match rx.recv().await {
@@ -252,7 +252,7 @@ pub fn spawn_recorder(supervisor: &crate::supervisor::ArmSupervisor, mut bb: Bla
                 Err(RecvError::Closed) => break,
             }
         }
-    })
+    }))
 }
 
 #[cfg(test)]

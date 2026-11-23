@@ -28,7 +28,7 @@ async fn diagnostics_routes_serve_boots_and_blackbox_records() {
 
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     let start = Instant::now();
-    blackbox::spawn_recorder(&supervisor, blackbox::open(dir.path(), rec.boot, start).unwrap());
+    blackbox::spawn_recorder(&supervisor, blackbox::open(dir.path(), rec.boot, start).unwrap()).unwrap();
     for _ in 0..5 {
         supervisor.tick(0.02).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -85,7 +85,7 @@ impl blackbox::Sink for Slow {
 async fn stalled_writer_does_not_slow_the_tick() {
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     let bb = blackbox::BlackBox::start(Slow, 1, Instant::now()).unwrap();
-    blackbox::spawn_recorder(&supervisor, bb);
+    blackbox::spawn_recorder(&supervisor, bb).unwrap();
     let mut worst = Duration::ZERO;
     for _ in 0..100 {
         let t = Instant::now();

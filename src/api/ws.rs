@@ -940,7 +940,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     #[cfg(not(feature = "policy-runtime"))]
     let _ = &sandbox;
     let (mut sender, mut receiver) = socket.split();
-    let mut telemetry = supervisor.subscribe_telemetry();
+    let mut telemetry = match supervisor.subscribe_telemetry() {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::error!("WebSocket refused: {e}");
+            let _ = sender.close().await;
+            return;
+        }
+    };
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
     // This identity never comes from a client payload and is never disclosed.
     let connection = format!("connection:{}", NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed));

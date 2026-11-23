@@ -27,6 +27,7 @@
 //! The tick never waits for a reader: publication is one atomic swap of a preallocated
 //! slot ([`super::triple`]). Readers share [`StateHub`]'s mutex with each other only.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -98,10 +99,57 @@ pub struct Snapshot {
     pub rt: RtSample,
 }
 
+/// Capacity of the retire ring.
+pub const RETIRE_CAPACITY: usize = 8;
+
+/// Observations the tick displaced from unconsumed slots, handed to the readers' side to
+/// be freed there: a single-producer (the tick) single-consumer (the holder of the hub
+/// mutex) ring of preallocated `Option` slots, so neither side allocates or waits.
+struct RetireRing {
+    slots: [UnsafeCell<Option<ArmObservation>>; RETIRE_CAPACITY],
+    head: AtomicU64,
+    tail: AtomicU64,
+}
+
+// SAFETY: slot `i % CAP` is written by the producer only while `tail <= i < tail + CAP`
+// (Acquire load of `tail`) and taken by the consumer only while `i < head` (Acquire load of
+// `head`); the consumer side runs under the hub mutex, so it is single.
+unsafe impl Sync for RetireRing {}
+
+impl RetireRing {
+    fn new() -> Self {
+        Self { slots: std::array::from_fn(|_| UnsafeCell::new(None)), head: AtomicU64::new(0), tail: AtomicU64::new(0) }
+    }
+
+    /// Producer: hands `obs` over, or gives it back when the ring is full.
+    fn push(&self, head: &mut u64, obs: ArmObservation) -> Result<(), ArmObservation> {
+        if *head - self.tail.load(Ordering::Acquire) >= RETIRE_CAPACITY as u64 { return Err(obs); }
+        // SAFETY: see the Sync impl; the replaced value is None (the consumer took it).
+        let old = unsafe { (*self.slots[(*head % RETIRE_CAPACITY as u64) as usize].get()).replace(obs) };
+        debug_assert!(old.is_none());
+        *head += 1;
+        self.head.store(*head, Ordering::Release);
+        Ok(())
+    }
+
+    /// Consumer (hub mutex held): frees what the producer handed over.
+    fn free_all(&self) {
+        let head = self.head.load(Ordering::Acquire);
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        while tail < head {
+            // SAFETY: tail < head: the producer finished this slot.
+            drop(unsafe { (*self.slots[(tail % RETIRE_CAPACITY as u64) as usize].get()).take() });
+            tail += 1;
+        }
+        self.tail.store(tail, Ordering::Release);
+    }
+}
+
 /// The tick's side: owned by `ArmCore`, used under the supervisor write lock.
 pub struct StatePublisher {
     producer: Producer<Slot>,
     seq: u64,
+    retire_head: u64,
     hub: Arc<StateHub>,
 }
 
@@ -114,16 +162,21 @@ pub struct RtInputs<'a> {
 }
 
 impl StatePublisher {
-    /// Publishes `obs` with its stamp and returns the observation the slot held before (the
-    /// caller drops it after releasing the lock). Copies the per-joint inputs into the slot's
+    /// Publishes `obs` with its stamp. Copies the per-joint inputs into the slot's
     /// preallocated vectors and swaps one atomic: no allocation, no deallocation, no wait
-    /// (while the dof does not grow beyond the profile's).
+    /// (while the dof does not grow beyond the profile's). An observation still in the slot
+    /// (no reader took it) goes to the retire ring and is freed by the readers' side; only
+    /// when that ring is full (no reader for [`RETIRE_CAPACITY`] ticks) it is returned, the
+    /// caller drops it after releasing the lock, and `StateHub::tick_frees` counts it.
     pub fn publish(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, rt: RtInputs<'_>) -> Option<ArmObservation> {
         self.seq += 1;
         let seq = self.seq;
         let slot = self.producer.back_mut();
         slot.meta = Some(SampleMeta { seq, generation, sampled_at, valid_until });
-        let displaced = slot.obs.replace(obs);
+        let displaced = slot.obs.replace(obs).and_then(|old| match self.hub.retire.push(&mut self.retire_head, old) {
+            Ok(()) => None,
+            Err(old) => { self.hub.tick_frees.fetch_add(1, Ordering::Relaxed); Some(old) }
+        });
         copy_into(&mut slot.rt.positions, rt.positions);
         copy_into(&mut slot.rt.velocities, rt.velocities);
         copy_into(&mut slot.rt.feedback_instants, rt.feedback_instants);
@@ -158,6 +211,9 @@ pub struct StateHub {
     closed: AtomicBool,
     /// The recording ring, drained by the dispatcher (set by the first recording).
     record: OnceLock<Arc<super::record_ring::RecordRing>>,
+    retire: RetireRing,
+    /// Displaced observations the tick had to free itself (retire ring full).
+    tick_frees: AtomicU64,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -170,8 +226,10 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         dispatcher: OnceLock::new(),
         closed: AtomicBool::new(false),
         record: OnceLock::new(),
+        retire: RetireRing::new(),
+        tick_frees: AtomicU64::new(0),
     });
-    (StatePublisher { producer, seq: 0, hub: hub.clone() }, hub)
+    (StatePublisher { producer, seq: 0, retire_head: 0, hub: hub.clone() }, hub)
 }
 
 impl StateHub {
@@ -181,10 +239,15 @@ impl StateHub {
     /// side when the last `Arc` drops, not in the tick).
     pub fn latest(&self) -> Option<Arc<Snapshot>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Self::refresh(&mut st)
+        self.refresh(&mut st)
     }
 
-    fn refresh(st: &mut HubState) -> Option<Arc<Snapshot>> {
+    /// Displaced observations the tick freed itself because no reader drained the retire ring.
+    pub fn tick_frees(&self) -> u64 { self.tick_frees.load(Ordering::Relaxed) }
+
+    /// Frees the observations the tick retired (hub mutex held: the single consumer).
+    fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
+        self.retire.free_all();
         if st.consumer.refresh() {
             let slot = st.consumer.front_mut();
             if let (Some(meta), Some(obs)) = (slot.meta, slot.obs.take()) {
@@ -202,8 +265,8 @@ impl StateHub {
     /// [`latest`](Self::latest) without waiting: `Busy` while another reader holds the hub.
     pub fn try_latest(&self) -> Poll {
         match self.state.try_lock() {
-            Ok(mut st) => Poll::Ready(Self::refresh(&mut st)),
-            Err(std::sync::TryLockError::Poisoned(p)) => Poll::Ready(Self::refresh(&mut p.into_inner())),
+            Ok(mut st) => Poll::Ready(self.refresh(&mut st)),
+            Err(std::sync::TryLockError::Poisoned(p)) => Poll::Ready(self.refresh(&mut p.into_inner())),
             Err(std::sync::TryLockError::WouldBlock) => Poll::Busy,
         }
     }
@@ -267,12 +330,30 @@ mod tests {
         assert_eq!(hub.published_seq(), 2);
         // nothing new: the same Arc
         assert!(Arc::ptr_eq(&snap, &hub.latest().unwrap()));
-        // slots rotate: the next publication gets back the unconsumed seq-1 observation;
-        // a slot without an observation (initial, or taken by a reader) comes back empty
-        let back = publisher.publish(13, now, now, obs(3.0), inputs(&p, &s, &i));
-        assert_eq!(back.map(|o| o.timestamp), Some(1.0));
+        // slots rotate: the unconsumed seq-1 observation goes to the retire ring, not back to
+        // the tick; the next reader frees it
+        assert!(publisher.publish(13, now, now, obs(3.0), inputs(&p, &s, &i)).is_none());
         assert!(publisher.publish(14, now, now, obs(4.0), inputs(&p, &s, &i)).is_none());
+        assert_eq!(hub.retire.head.load(Ordering::Relaxed), 1);
         assert_eq!(hub.latest().unwrap().obs.timestamp, 4.0);
+        assert_eq!(hub.retire.tail.load(Ordering::Relaxed), 1);
+        assert_eq!(hub.tick_frees(), 0);
+    }
+
+    #[test]
+    fn without_readers_the_retire_ring_fills_and_the_tick_frees_are_counted() {
+        let (mut publisher, hub) = state_channel(7);
+        let now = Instant::now();
+        let (p, s, i) = ([0.0f32; 7], [0u64; 7], [None; 7]);
+        let mut back = 0;
+        // the first two publications fill empty slots; each later one displaces one
+        for k in 0..(2 + RETIRE_CAPACITY + 3) {
+            if publisher.publish(k as u64, now, now, obs(k as f64), inputs(&p, &s, &i)).is_some() { back += 1; }
+        }
+        assert_eq!((back, hub.tick_frees()), (3, 3));
+        hub.latest();
+        assert!(publisher.publish(99, now, now, obs(99.0), inputs(&p, &s, &i)).is_none(), "room again after a reader");
+        assert_eq!(hub.latest().unwrap().obs.timestamp, 99.0);
     }
 
     #[test]
