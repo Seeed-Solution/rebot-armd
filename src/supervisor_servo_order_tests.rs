@@ -457,8 +457,12 @@ fn gripper_close_while_blocked() {
             eprintln!("  peak {:.3} N·m (bound {:.3}), held {low:.3}..{held:.3} N·m, cap {cap}", r.peak_tau, stiffness * lead);
             if r.peak_tau > cap {
                 // the impact sample was over the cap: the first over-cap sample latches
-                // (GRIPPER_FORCE_CAP_TICKS 1) and the latch holds the jaw at the block
-                assert!(held <= cap, "held at {low}..{held} N·m");
+                // (GRIPPER_FORCE_CAP_TICKS 1) at the measured jaw, then the grip ramps back in
+                // to about 0.6 x cap and holds there
+                // the ramp takes about 1 s (trip near tick 140): check the second half of the hold
+                let late = &r.tau_log[n.saturating_sub(180)..n.saturating_sub(100)];
+                let (lo, hi) = (late.iter().copied().fold(f32::MAX, f32::min), late.iter().copied().fold(0.0, f32::max));
+                assert!(hi <= cap && lo >= 0.55 && hi <= 0.65, "held at {lo}..{hi} N·m");
             } else {
                 assert!(held <= 1.2 * cap && low >= 0.3, "held at {low}..{held} N·m");
             }

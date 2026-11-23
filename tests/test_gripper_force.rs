@@ -572,11 +572,17 @@ fn close_stream(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>, speed: f32, 
     run
 }
 
+/// One tick of the post-latch grip ramp on a contact of `stiffness` (N·m), its largest step.
+fn stream_ramp_tick_nm(stiffness: f32) -> f32 {
+    stiffness * armd::supervisor::GRIPPER_STREAM_CAP_RAMP_RAD_S * DT as f32 + 1e-3
+}
+
 /// Seconds of a stream from open to closed at `speed`, plus a 5 s hold.
 fn stream_secs(speed: f32) -> f64 { f64::from(-INSPECT[6] / speed) + 5.0 }
 
 /// Item 1: a torque-cap latch under a stream that keeps asking for closed holds (no
-/// re-squeeze); regulator off, so the latch is what bounds the force.
+/// re-squeeze cycle); regulator off, so the latch is what bounds the force. After the latch the
+/// grip ramps back in once (GRIPPER_STREAM_CAP_RAMP_*) to about 0.6 x cap and holds there.
 #[test]
 fn stream_latch_does_not_release_while_closing() {
     for stiffness in [3.0f32, 10.0, 30.0] {
@@ -585,9 +591,10 @@ fn stream_latch_does_not_release_while_closing() {
         eprintln!("latch only, k {stiffness}: {run:?}");
         if run.trips > 0 {
             assert_eq!(run.trips, 1, "k {stiffness}: one trip, no re-squeeze cycle: {run:?}");
-            assert_eq!(run.cycles, 0, "k {stiffness}: {run:?}");
+            assert!(run.cycles <= 1, "k {stiffness}: one ramp back in after the latch: {run:?}");
             assert!(inner.gripper_stalled && inner.gripper_force_capped);
-            assert!(run.held_nm < 0.05, "k {stiffness}: held at {:.3} N·m", run.held_nm);
+            assert!((0.55..=0.65).contains(&run.held_nm), "k {stiffness}: held at {:.3} N·m", run.held_nm);
+            assert!(run.after_impact_nm <= cap() + stream_ramp_tick_nm(stiffness), "k {stiffness}: {run:?}");
         } else {
             // soft enough that the impact stays under the cap: the ordinary stall rule holds it
             assert!(run.after_impact_nm <= cap() + 1e-3, "k {stiffness}: {run:?}");
@@ -613,14 +620,16 @@ fn rigid_stream_contact_is_regulated() {
                 run.impact_nm, run.after_impact_nm, run.held_nm, run.cycles, run.trips);
             assert!(run.impact_nm <= stiffness * max_lead() + 1e-3, "{run:?}");
             assert!(run.after_impact_nm <= 1.2 * cap(), "k {stiffness} {speed} rad/s: {run:?}");
-            assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
             if stiffness * max_lead().min(speed / 4.5) > cap() {
                 // the impact sample is over the cap: the first over-cap sample latches
-                // (GRIPPER_FORCE_CAP_TICKS 1) and the latch holds the measured jaw, so a rigid
-                // block is held at about 0 N·m until the stream opens and closes again
+                // (GRIPPER_FORCE_CAP_TICKS 1) at the measured jaw; while the stream still closes
+                // the grip ramps back in once to about 0.6 x cap and holds there
                 assert_eq!(run.trips, 1, "k {stiffness} {speed} rad/s: {run:?}");
-                assert!(run.held_nm <= contact + 0.2, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+                assert!(run.cycles <= 1, "k {stiffness} {speed} rad/s: {run:?}");
+                assert!(run.after_impact_nm <= cap() + stream_ramp_tick_nm(stiffness), "k {stiffness} {speed} rad/s: {run:?}");
+                assert!((0.55..=0.65).contains(&run.held_nm), "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
             } else {
+                assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
                 assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
             }
             let r = rig.lock().unwrap();

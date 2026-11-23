@@ -99,6 +99,14 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// that latch the stall regardless of the jaw speed. One: the first sample over the cap latches
 /// (at two, one impact sample of a stiff contact passed before the latch).
 pub const GRIPPER_FORCE_CAP_TICKS: u32 = 1;
+/// After a torque-cap latch under a servo stream or live policy that still closes, the grip
+/// ramps back in: per tick the command moves GRIPPER_STREAM_CAP_RAMP_GAIN_RAD_PER_NM x the
+/// torque still missing to the hold torque, at most GRIPPER_STREAM_CAP_RAMP_RAD_S (the step
+/// shrinks as the torque nears the hold, so a stiff contact does not overshoot it) ...
+pub const GRIPPER_STREAM_CAP_RAMP_GAIN_RAD_PER_NM: f32 = 0.02;
+pub const GRIPPER_STREAM_CAP_RAMP_RAD_S: f32 = 0.25;
+/// ... until |τ| reaches this fraction of `max_close_torque_nm`, then holds.
+pub const GRIPPER_STREAM_CAP_HOLD_FRACTION: f32 = 0.6;
 /// The learned free-motion torque may raise the closing stall threshold above
 /// GRIPPER_STALL_LATCH_NM by at most this (N·m); opening keeps GRIPPER_STALL_LATCH_NM.
 pub const GRIPPER_STALL_BASELINE_RAISE_MAX_NM: f32 = 0.15;
@@ -5761,9 +5769,31 @@ impl SupervisorInner {
                     self.gripper_high_torque_ticks = 0;
                 }
             } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
-                // torque-cap latch under a stream: held until the stream opens (intake) or ends
+                // torque-cap latch under a stream: held until the stream opens (intake) or ends.
+                // While the stream still asks to close, the grip ramps back in from the measured
+                // jaw (GRIPPER_STREAM_CAP_RAMP_*) until |τ| reaches
+                // GRIPPER_STREAM_CAP_HOLD_FRACTION of the cap, then holds; a sample over the cap
+                // latches at the measured jaw again (branch above).
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+                let stream_g = self.gripper_stream_target.unwrap_or(p_cmd);
+                let want = (stream_g - p_cmd) * close_dir;
+                let hold_nm = force_cap.map(|c| GRIPPER_STREAM_CAP_HOLD_FRACTION * c);
+                if let Some(hold_nm) = hold_nm.filter(|_| has_torque_feedback && self.is_torqued && want > 1e-4 && p_cmd.is_finite()) {
+                    if tau_g.abs() < hold_nm {
+                        let step = (GRIPPER_STREAM_CAP_RAMP_GAIN_RAD_PER_NM * (hold_nm - tau_g.abs()))
+                            .min(GRIPPER_STREAM_CAP_RAMP_RAD_S * dt as f32).min(want);
+                        let mut next = p_cmd + close_dir * step;
+                        if let Some(lead) = self.config.gripper_policy.as_ref().and_then(|p| p.max_lead_rad) {
+                            if p_meas.is_finite() && (next - p_meas) * close_dir > lead { next = p_meas + close_dir * lead; }
+                        }
+                        if let Some(lim) = self.config.limits.get(g_idx) { next = next.clamp(lim.min_position, lim.max_position); }
+                        if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = next; }
+                        if g_idx < self.commanded_velocities.len() { self.commanded_velocities[g_idx] = 0.0; }
+                        if g_idx < self.target_positions.len() { self.target_positions[g_idx] = next; }
+                        if let Some(h) = self.gripper_motion_hold.as_mut() { h.0 = next; }
+                    }
+                }
             } else if self.gripper_stalled {
                 self.gripper_high_torque_ticks = 0;
                 let is_released = if has_torque_feedback {
