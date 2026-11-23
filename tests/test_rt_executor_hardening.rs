@@ -1938,3 +1938,189 @@ async fn estop_ack_waits_for_step6_publication_barrier() {
 
     handle.stop_and_join();
 }
+
+// ============================================================================
+// 12. Panic disable retries transient per-motor CAN TX failure within budget
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_disable_retries_transient_j3_send_failure_and_disables_all_motors() {
+    /// Virtual CAN bus wrapper that fails the first `fail_j3_remaining` disable transmits to J3
+    /// (CAN ID 3) while forwarding every other motor normally.
+    #[derive(Clone)]
+    struct FailJ3DisableBus {
+        inner: FakeBus,
+        fail_j3_remaining: Arc<AtomicUsize>,
+        j3_failures: Arc<AtomicUsize>,
+        j3_successes: Arc<AtomicUsize>,
+    }
+
+    impl CanTransport for FailJ3DisableBus {
+        fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
+            if frame.id == 3 && frame.data == armd::protocol::damiao::CMD_DISABLE {
+                let prev = self.fail_j3_remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    v.checked_sub(1)
+                });
+                if prev.is_ok() {
+                    self.j3_failures.fetch_add(1, Ordering::SeqCst);
+                    return Err(TransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "transient CAN TX failure on J3",
+                    )));
+                }
+                self.j3_successes.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.transmit(frame)
+        }
+        fn receive(&mut self) -> Result<CanFrame, TransportError> {
+            self.inner.receive()
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+        fn supports_nonblocking_rt(&self) -> bool {
+            self.inner.supports_nonblocking_rt()
+        }
+        fn supports_bounded_flush(&self) -> bool {
+            self.inner.supports_bounded_flush()
+        }
+        fn clock(&self) -> Option<Arc<dyn DriverClock>> {
+            self.inner.clock()
+        }
+    }
+
+    // (a) Executor panic path: first disable TX to J3 fails transiently; all other motors receive
+    // theirs on the first attempt and J3 is retried and disabled before the deadline.
+    let inner_bus = FakeBus::new(&dm_limits());
+    inner_bus.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus = FailJ3DisableBus {
+        inner: inner_bus.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(1)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    sup.set_lease_enabled(false).await;
+    sup.set_torque(true).await.unwrap();
+    assert!(inner_bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+    inner_bus.with(|s| s.tx_log.clear());
+
+    let mut cfg = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg.panic_policy = PanicPolicy::StopExecutor;
+    let handle = sup
+        .start_executor_with_hooks(cfg, PersistTestHooks { panic_on_release: Some(2), ..Default::default() })
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(2), || handle.is_exited()).await;
+
+    assert_eq!(bus.j3_failures.load(Ordering::SeqCst), 1, "first J3 disable send must have failed");
+    assert!(bus.j3_successes.load(Ordering::SeqCst) >= 1, "J3 disable must be retried and succeed");
+    let (all_disabled, disable_ids) = inner_bus.with(|s| {
+        let ids: Vec<u32> = s
+            .tx_log
+            .iter()
+            .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+            .map(|f| f.id)
+            .collect();
+        (s.motors.iter().all(|m| !m.enabled), ids)
+    });
+    assert!(all_disabled, "all 7 motors including J3 must be physically disabled after panic retry");
+    for id in 1u32..=7 {
+        assert!(
+            disable_ids.contains(&id),
+            "missing CMD_DISABLE frame for motor J{id}: {disable_ids:?}"
+        );
+    }
+    handle.stop_and_join();
+
+    // (b) Legacy panic disable path: first disable TX to J3 fails transiently; still retries J3
+    // and disables every motor with `PanicDisableOutcome::Confirmed`.
+    let inner_leg = FakeBus::new(&dm_limits());
+    inner_leg.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus_leg = FailJ3DisableBus {
+        inner: inner_leg.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(1)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv_leg = DamiaoArmDriver::new(bus_leg.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_leg.read_joint_states().unwrap();
+    drv_leg.check_mapping_ranges();
+    let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
+    sup_leg.set_lease_enabled(false).await;
+    sup_leg.set_torque(true).await.unwrap();
+    inner_leg.with(|s| s.tx_log.clear());
+
+    let sup_leg_c = sup_leg.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        sup_leg_c.attempt_legacy_panic_disable(Duration::from_millis(300))
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    assert_eq!(bus_leg.j3_failures.load(Ordering::SeqCst), 1);
+    assert!(bus_leg.j3_successes.load(Ordering::SeqCst) >= 1);
+    assert!(inner_leg.with(|s| s.motors.iter().all(|m| !m.enabled)));
+
+    // (c) Persistent J3 TX failure: all other motors (J1,J2,J4..J7) still receive disable and
+    // disable cleanly, J3 is retried across the budget until the deadline is spent, and the
+    // outcome is `Unconfirmed` (never exiting early on the first error).
+    let inner_perm = FakeBus::new(&dm_limits());
+    inner_perm.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let bus_perm = FailJ3DisableBus {
+        inner: inner_perm.clone(),
+        fail_j3_remaining: Arc::new(AtomicUsize::new(usize::MAX)),
+        j3_failures: Arc::new(AtomicUsize::new(0)),
+        j3_successes: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut drv_perm = DamiaoArmDriver::new(bus_perm.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_perm.read_joint_states().unwrap();
+    drv_perm.check_mapping_ranges();
+    let sup_perm = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_perm)));
+    sup_perm.set_lease_enabled(false).await;
+    sup_perm.set_torque(true).await.unwrap();
+    inner_perm.with(|s| s.tx_log.clear());
+
+    let sup_perm_c = sup_perm.clone();
+    let t_perm = Instant::now();
+    let out_perm = tokio::task::spawn_blocking(move || {
+        sup_perm_c.attempt_legacy_panic_disable(Duration::from_millis(80))
+    })
+    .await
+    .unwrap();
+    assert_eq!(out_perm, PanicDisableOutcome::Unconfirmed);
+    assert!(
+        t_perm.elapsed() >= Duration::from_millis(70),
+        "panic disable must keep retrying unconfirmed J3 until budget is spent (only took {:?})",
+        t_perm.elapsed()
+    );
+    assert!(
+        bus_perm.j3_failures.load(Ordering::SeqCst) >= 2,
+        "J3 must be retried multiple times within budget"
+    );
+    inner_perm.with(|s| {
+        for (i, m) in s.motors.iter().enumerate() {
+            if i != 2 {
+                assert!(!m.enabled, "motor J{} must still be disabled despite J3 TX failures", i + 1);
+            }
+        }
+    });
+}

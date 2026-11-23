@@ -196,6 +196,10 @@ impl ArmDriver for ZeroOffsetDriver {
     fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> { self.inner.take_last_poll_rx() }
     fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
     fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn panic_disable_step(&mut self, first: bool, deadline: Instant) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        self.inner.panic_disable_step(first, deadline)
+    }
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> { self.inner.unconfirmed_disable_joints() }
     fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
     fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }

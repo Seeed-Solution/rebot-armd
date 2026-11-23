@@ -265,6 +265,41 @@ pub trait ArmDriver: Send {
     /// (called when E-stop or a fault intervenes mid-enable).
     fn abort_enable(&mut self) {}
 
+    /// One panic-disable retry step for multi-motor drivers: transmits disable to every motor
+    /// not yet confirmed disabled without aborting remaining motors on a single-motor TX error,
+    /// performs one budgeted RX pass within `deadline`, and returns the 0-based indices of motors
+    /// still unconfirmed. Returns `None` to fall back to the generic `begin_torque_budgeted` loop.
+    fn panic_disable_step(
+        &mut self,
+        _first: bool,
+        _deadline: Instant,
+    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        None
+    }
+
+    /// 0-based joint indices whose torque-off is NOT yet confirmed by fresh state-0 feedback
+    /// after the last enable/disable command (empty when all confirmed).
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+        if self.enable_state() == EnableState::Disabled {
+            return Vec::new();
+        }
+        match self.motor_status() {
+            Some(status) => {
+                let non_zero: Vec<usize> = status
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &st)| (st != 0).then_some(i))
+                    .collect();
+                if non_zero.is_empty() {
+                    (0..status.len()).collect()
+                } else {
+                    non_zero
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Ok when this driver and its underlying transport support non-blocking synchronous
     /// RT executor ownership (`armd-control`).
     fn supports_rt_executor(&self) -> Result<(), &'static str> {
@@ -4380,6 +4415,79 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.torque_hs = None;
             self.enable_failed();
         }
+    }
+
+    fn panic_disable_step(
+        &mut self,
+        first: bool,
+        deadline: Instant,
+    ) -> Option<Result<Vec<usize>, ArmDriverError>> {
+        if first {
+            if matches!(
+                self.torque_hs.take(),
+                Some(
+                    DamiaoTorque::DrainBeforeEnable(_)
+                        | DamiaoTorque::Restore(_)
+                        | DamiaoTorque::Readback(_)
+                        | DamiaoTorque::Enable(_)
+                )
+            ) {
+                self.enable_failed();
+            }
+            self.last_target_frames.fill(None);
+            self.awaiting_rx_boundary = !self.last_read_drained;
+            let cmd_start = self.now();
+            self.last_enable_command = Some(cmd_start);
+            self.last_enable_command_rx_seq = Some(self.rx_seq);
+            self.is_enabled = false;
+            self.pending_rearm = true;
+            self.last_query_instant = Some(cmd_start);
+        }
+
+        let unconfirmed_before = self.unconfirmed_disable_joints();
+        if unconfirmed_before.is_empty() && self.enable_state() == EnableState::Disabled {
+            self.mit_fence = None;
+            return Some(Ok(Vec::new()));
+        }
+
+        // Send disable to every unconfirmed motor; a send error on one motor must NEVER stop
+        // attempts on the remaining motors.
+        for i in unconfirmed_before {
+            let Some(&id) = self.motor_ids.get(i) else { continue };
+            let frame = damiao::build_disable_frame(id);
+            if let Err(e) = self.can.transmit(&frame) {
+                tracing::warn!(
+                    "Panic disable TX failed for Damiao joint J{} (CAN ID 0x{:X}): {e}",
+                    i + 1,
+                    id
+                );
+            }
+        }
+        if let Err(e) = self.can.flush() {
+            tracing::warn!("Panic disable CAN flush failed: {e}");
+        }
+
+        self.last_poll_rx = None;
+        self.rx_deadline = Some(deadline);
+        self.rx_frame_limit = Some(64);
+        let _ = self.receive_feedback();
+        self.rx_deadline = None;
+        self.rx_frame_limit = None;
+
+        let remaining = self.unconfirmed_disable_joints();
+        if remaining.is_empty() && self.enable_state() == EnableState::Disabled {
+            self.mit_fence = None;
+        }
+        Some(Ok(remaining))
+    }
+
+    fn unconfirmed_disable_joints(&self) -> Vec<usize> {
+        (0..self.motor_ids.len())
+            .filter(|&i| {
+                !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
+                    && self.motor_status[i] == 0)
+            })
+            .collect()
     }
 
     fn supports_rt_executor(&self) -> Result<(), &'static str> {

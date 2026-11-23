@@ -152,53 +152,129 @@ pub fn run_with_panic_deadline_observer(
     }
 }
 
-/// Attempts one bounded hardware torque disable directly through the bus owner's driver using
-/// budgeted non-blocking driver operations (`begin_torque_budgeted`, `poll_torque_budgeted`,
-/// `read_joint_states_budgeted`). Wall-clock bounded to `timeout`; callers on panic paths wrap
-/// this with [`run_with_panic_deadline_observer`] to bound drivers whose fallback `begin_torque`
-/// or transport I/O may block inside a call.
+fn format_joint_list(joints: &[usize]) -> String {
+    joints.iter().map(|i| format!("J{}", i + 1)).collect::<Vec<_>>().join(", ")
+}
+
+/// Attempts bounded hardware torque disable directly through the bus owner's driver using
+/// budgeted non-blocking driver operations. Within `timeout`, retries disable for every motor
+/// not yet confirmed; a transient send error on one motor never stops attempts on the others
+/// and never exits before the budget is spent. Logs which motors remain unconfirmed when the
+/// budget expires. Callers on panic paths wrap this with [`run_with_panic_deadline_observer`]
+/// to bound drivers whose fallback `begin_torque` or transport I/O may block inside a call.
 pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) -> PanicDisableOutcome {
     let wall_deadline = Instant::now() + timeout;
-    let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drv.begin_torque_budgeted(false, 0)
-    }));
-    let mut progress = match begin_res {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
-        Err(_) => return PanicDisableOutcome::Failed("driver panicked during begin_torque(false)".into()),
-    };
+    let enable_fb = drv.capabilities().enable_feedback;
 
-    while matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
+    // Preferred per-motor selective retry path (e.g. Damiao CAN bus): sends disable to every
+    // unconfirmed motor on each pass, never stops on a single motor's TX error, and keeps
+    // retrying until all motors confirm or the budget is spent.
+    let mut first_step = true;
+    loop {
         let rem = wall_deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            break;
-        }
         let drv_deadline = drv.clock_now() + rem;
-        let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drv.poll_torque_budgeted(drv_deadline, 64)
+        let step_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.panic_disable_step(first_step, drv_deadline)
         }));
-        match poll_res {
-            Ok(Ok(p)) => progress = p,
-            Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
-            Err(_) => return PanicDisableOutcome::Failed("driver panicked during poll_torque(disable)".into()),
-        }
-        if matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
-            let rem = wall_deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
-                break;
+        match step_res {
+            Err(_) => return PanicDisableOutcome::Failed("driver panicked during panic_disable_step".into()),
+            Ok(None) => break, // Driver uses the generic retry loop below.
+            Ok(Some(Ok(unconfirmed))) => {
+                first_step = false;
+                if !enable_fb {
+                    return PanicDisableOutcome::Unconfirmed;
+                }
+                if unconfirmed.is_empty() && DisableConfirm::confirmed(drv) {
+                    return PanicDisableOutcome::Confirmed;
+                }
+                let rem = wall_deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    let final_unconfirmed = drv.unconfirmed_disable_joints();
+                    tracing::error!(
+                        "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]",
+                        timeout.as_millis(),
+                        format_joint_list(&final_unconfirmed)
+                    );
+                    return PanicDisableOutcome::Unconfirmed;
+                }
+                std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
             }
-            std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+            Ok(Some(Err(e))) => {
+                first_step = false;
+                tracing::warn!("Panic disable step error (retrying within budget): {e}");
+                let rem = wall_deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    let final_unconfirmed = drv.unconfirmed_disable_joints();
+                    tracing::error!(
+                        "Bounded panic disable budget ({} ms) exhausted after error ({e}); unconfirmed motors: [{}]",
+                        timeout.as_millis(),
+                        format_joint_list(&final_unconfirmed)
+                    );
+                    return PanicDisableOutcome::Unconfirmed;
+                }
+                std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+            }
         }
     }
 
-    if !drv.capabilities().enable_feedback {
-        return PanicDisableOutcome::Unconfirmed;
-    }
-    if DisableConfirm::confirmed(drv) {
-        return PanicDisableOutcome::Confirmed;
-    }
+    // Generic retry loop for drivers that do not implement `panic_disable_step`: retry disable
+    // sends and feedback confirmation until confirmed or `wall_deadline` is spent.
     let mut states_buf = Vec::new();
-    while Instant::now() < wall_deadline {
+    let mut any_send_ok = false;
+    let mut last_err: Option<String> = None;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drv.begin_torque_budgeted(false, 0)
+        }));
+        match begin_res {
+            Err(_) => return PanicDisableOutcome::Failed("driver panicked during begin_torque(false)".into()),
+            Ok(Err(e)) => {
+                tracing::warn!("Panic disable begin_torque(false) attempt {attempt} failed (retrying within budget): {e}");
+                last_err = Some(e.to_string());
+            }
+            Ok(Ok(mut progress)) => {
+                any_send_ok = true;
+                while matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
+                    let rem = wall_deadline.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        break;
+                    }
+                    let drv_deadline = drv.clock_now() + rem;
+                    let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drv.poll_torque_budgeted(drv_deadline, 64)
+                    }));
+                    match poll_res {
+                        Ok(Ok(p)) => progress = p,
+                        Ok(Err(e)) => {
+                            tracing::warn!("Panic disable poll_torque failed (retrying within budget): {e}");
+                            last_err = Some(e.to_string());
+                            break;
+                        }
+                        Err(_) => {
+                            return PanicDisableOutcome::Failed(
+                                "driver panicked during poll_torque(disable)".into(),
+                            );
+                        }
+                    }
+                    if matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
+                        let rem = wall_deadline.saturating_duration_since(Instant::now());
+                        if rem.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+                    }
+                }
+            }
+        }
+
+        if !enable_fb && any_send_ok {
+            return PanicDisableOutcome::Unconfirmed;
+        }
+        if enable_fb && DisableConfirm::confirmed(drv) {
+            return PanicDisableOutcome::Confirmed;
+        }
         let rem = wall_deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
             break;
@@ -210,7 +286,7 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
         if read_res.is_err() {
             return PanicDisableOutcome::Failed("driver panicked while confirming disable".into());
         }
-        if DisableConfirm::confirmed(drv) {
+        if enable_fb && DisableConfirm::confirmed(drv) {
             return PanicDisableOutcome::Confirmed;
         }
         let rem = wall_deadline.saturating_duration_since(Instant::now());
@@ -219,10 +295,21 @@ pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) 
         }
         std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
     }
-    if DisableConfirm::confirmed(drv) {
-        PanicDisableOutcome::Confirmed
-    } else {
+
+    if enable_fb && DisableConfirm::confirmed(drv) {
+        return PanicDisableOutcome::Confirmed;
+    }
+    let unconfirmed = drv.unconfirmed_disable_joints();
+    tracing::error!(
+        "Bounded panic disable budget ({} ms) exhausted; unconfirmed motors: [{}]{}",
+        timeout.as_millis(),
+        format_joint_list(&unconfirmed),
+        last_err.as_deref().map(|e| format!(" (last error: {e})")).unwrap_or_default()
+    );
+    if any_send_ok {
         PanicDisableOutcome::Unconfirmed
+    } else {
+        PanicDisableOutcome::Failed(last_err.unwrap_or_else(|| "panic disable send failed".into()))
     }
 }
 
