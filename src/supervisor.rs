@@ -3600,8 +3600,10 @@ impl ArmSupervisor {
             tokio::time::sleep(OBS_POLL).await;
         }
         let seen_seq = self.hub.published_seq();
-        let Ok(inner) = tokio::time::timeout(OBS_LOCK_WAIT, self.inner.read()).await else {
-            // a stalled tick (or writer) holds the lock: one last non-blocking look
+        // one deadline for every wait for the read lock below (not one per attempt)
+        let lock_deadline = tokio::time::Instant::now() + OBS_LOCK_WAIT;
+        // a stalled tick (or writer) holds the lock: one last non-blocking look, then 503
+        let unavailable = || {
             if let Poll::Ready(Some(s)) = self.hub.try_latest() {
                 if Self::answers(&s, want, Instant::now()) {
                     if count { self.obs_cache_hits.fetch_add(1, Ordering::Relaxed); }
@@ -3609,8 +3611,9 @@ impl ArmSupervisor {
                 }
             }
             if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
-            return Err(observation_unavailable());
+            Err(observation_unavailable())
         };
+        let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
         // a tick may have published while this call waited for the lock. Only the atomic
         // sequence is read under the guard: refreshing the hub (reclamation, the snapshot's
         // allocation) happens after the guard is dropped
@@ -3622,10 +3625,7 @@ impl ArmSupervisor {
                     return Ok(Fresh::Sample(s));
                 }
             }
-            let Ok(inner) = tokio::time::timeout(OBS_LOCK_WAIT, self.inner.read()).await else {
-                if count { self.obs_unavailable.fetch_add(1, Ordering::Relaxed); }
-                return Err(observation_unavailable());
-            };
+            let Ok(inner) = tokio::time::timeout_at(lock_deadline, self.inner.read()).await else { return unavailable(); };
             if count { self.obs_cache_misses.fetch_add(1, Ordering::Relaxed); }
             return Ok(Fresh::Locked(inner));
         }
@@ -4372,6 +4372,49 @@ mod observation_snapshot_tests {
         assert_eq!(sup.tick_stats().observation_cache.unavailable, 1);
         drop(stalled);
         assert!(sup.observation().await.is_ok());
+    }
+
+    /// The second lock wait (a sample was published while the first one waited, but it did
+    /// not answer) shares the first wait's deadline, and a sample published by the writer
+    /// that keeps it from the lock answers at that deadline instead of a 503.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_second_lock_wait_shares_one_deadline_and_ends_with_a_cache_check() {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.tick(0.02).await;
+        let mut w1 = sup.inner().write().await;
+        let t = Instant::now();
+        let reader = { let sup = sup.clone(); tokio::spawn(async move { sup.observation().await }) };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // a second writer queues behind the reader (tokio grants in queue order)
+        let w2 = {
+            let sup = sup.clone();
+            tokio::spawn(async move {
+                let mut w = sup.inner().write().await;
+                let generation = sup.inner().generation();
+                let mut obs = w.current_observation();
+                obs.timestamp = 456.0;
+                let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *w;
+                let now = Instant::now();
+                let _ = core.publish_displacing(generation, now, now + Duration::from_secs(5), obs, measured_positions, measured_velocities);
+                // keeps the reader from the lock past its deadline
+                tokio::time::sleep(OBS_LOCK_WAIT + Duration::from_millis(300)).await;
+                drop(w);
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        // a sample published while the reader waits, too old to answer: the reader retries
+        let generation = sup.inner().generation();
+        let mut stale = w1.current_observation();
+        stale.timestamp = 123.0;
+        let SupervisorInner { core, measured_positions, measured_velocities, .. } = &mut *w1;
+        let past = Instant::now() - Duration::from_millis(1);
+        let _ = core.publish_displacing(generation, past, past, stale, measured_positions, measured_velocities);
+        drop(w1);
+        let got = tokio::time::timeout(Duration::from_secs(3), reader).await.expect("must not hang").unwrap();
+        let elapsed = t.elapsed();
+        assert_eq!(got.expect("the final cache check answers").timestamp, 456.0);
+        assert!(elapsed < OBS_LOCK_WAIT + Duration::from_millis(150), "the budget restarted: {elapsed:?}");
+        w2.await.unwrap();
     }
 
     /// A preempted reader holding the hub mutex: a request after a write neither waits for
