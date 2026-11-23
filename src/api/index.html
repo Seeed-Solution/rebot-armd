@@ -14768,7 +14768,7 @@ function opCanRetry(path, body) {
    opCanRetry); opt.skip: the action goes on either way, Cancel reads "Not now". */
 function opRequire(path, body, opt = {}) {
   // refused while the page showed the session unlocked: it expired or was locked elsewhere
-  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); toast(t('op.expired'), 'warn'); }
+  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); opToastExpired(); }
   S.auth.enforced = true;
   renderOpBadge();
   return new Promise((resolve) => {
@@ -14776,6 +14776,9 @@ function opRequire(path, body, opt = {}) {
     openOperatorModal(opReasonKey(path, body), 'retry' in opt ? !!opt.retry : opCanRetry(path, body), !!opt.skip);
   });
 }
+/* "Session expired" and Unlock toasts describe a locked session: they go when it is unlocked again. */
+function opToastExpired() { const el = toast(t('op.expired'), 'warn'); if (el) el.classList.add('op-stale'); }
+function opDropStaleToasts() { document.querySelectorAll('#toasts .toast.op-stale, #toasts .toast.has-act').forEach((x) => x.remove()); }
 /* armd refused a request with OPERATOR_REQUIRED: the page's session state is wrong (expired, locked elsewhere,
    or never known). Show the locked badge; no dialog (the caller decides). */
 function opRefused() {
@@ -14783,7 +14786,7 @@ function opRefused() {
   const was = S.auth.role === 'operator';
   S.auth.enforced = true; S.auth.role = 'program'; S.auth.expiresIn = null; S.auth.expiresAt = null;
   scheduleAuthExpiryRefresh(); renderOpBadge();
-  if (was) toast(t('op.expired'), 'warn');
+  if (was) opToastExpired();
 }
 // every same-origin API answer: a 403 OPERATOR_REQUIRED updates the badge, whichever code path made the request
 {
@@ -14889,7 +14892,7 @@ async function loadAuthStatus() {
     S.auth.enforced = !!d.auth_enforced;
     S.auth.role = d.role || 'program';
     S.auth.expiresIn = d.expires_in_s ?? null;
-    if (was === 'operator' && S.auth.role !== 'operator' && S.auth.enforced) toast(t('op.expired'), 'warn');
+    if (was === 'operator' && S.auth.role !== 'operator' && S.auth.enforced) opToastExpired();
     scheduleAuthExpiryRefresh();
     renderOpBadge();
   } catch (_) {}
@@ -14968,6 +14971,7 @@ async function submitOperatorPin(ev) {
     renderOpBadge();
     await opSyncSocket(d.token || null);
     closeOperatorModal(true);
+    opDropStaleToasts();
     toast(t('op.unlocked_msg'), 'ok');
   } catch (e) {
     setText($('op-status'), e.message || t('err.reqfail'));
