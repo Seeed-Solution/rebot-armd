@@ -86,6 +86,7 @@ pub fn validate_startup_owner(owner: RtOwner, follower: &str) -> Result<(), Stri
 
 thread_local! {
     static IN_RT_RELEASE: Cell<bool> = const { Cell::new(false) };
+    static ON_RT_CONTROL_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
 /// True while the current thread is inside an RT release or sub-release wake.
@@ -93,11 +94,26 @@ pub fn in_rt_release() -> bool {
     IN_RT_RELEASE.with(Cell::get)
 }
 
+/// True while the current thread is marked as the RT executor control thread
+/// (`armd-control`), from thread entry to exit and independent of [`ReleaseGuard`].
+pub fn on_rt_control_thread() -> bool {
+    ON_RT_CONTROL_THREAD.with(Cell::get)
+}
+
 /// Panics if invoked while inside an RT release (asserted on Tokio / legacy lock entry paths).
 pub fn assert_not_in_rt_release(site: &'static str) {
     assert!(
         !in_rt_release(),
         "forbidden Tokio or legacy supervisor lock entry during RT release at {site}"
+    );
+}
+
+/// Panics if invoked on the RT executor control thread (asserted on legacy supervisor lock
+/// entry and async poll paths, independent of [`ReleaseGuard`]).
+pub fn assert_not_on_rt_control_thread(site: &'static str) {
+    assert!(
+        !on_rt_control_thread(),
+        "forbidden legacy supervisor lock entry on RT control thread at {site}"
     );
 }
 
@@ -113,6 +129,30 @@ impl ReleaseGuard {
 impl Drop for ReleaseGuard {
     fn drop(&mut self) {
         IN_RT_RELEASE.with(|flag| flag.set(self.0));
+    }
+}
+
+/// RAII thread-local guard marking the RT executor control thread (`armd-control`) from
+/// thread entry to exit, independent of [`ReleaseGuard`].
+///
+/// Intentionally `!Send` and `!Sync` so the guard is always dropped on the thread it marked.
+pub struct ControlThreadGuard {
+    prev: bool,
+    _not_send: std::marker::PhantomData<*mut ()>,
+}
+
+impl ControlThreadGuard {
+    pub fn enter() -> Self {
+        Self {
+            prev: ON_RT_CONTROL_THREAD.with(|flag| flag.replace(true)),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for ControlThreadGuard {
+    fn drop(&mut self) {
+        ON_RT_CONTROL_THREAD.with(|flag| flag.set(self.prev));
     }
 }
 
@@ -1147,6 +1187,7 @@ pub(crate) fn spawn_executor(
         let persist_wake = persist_park_thread.clone();
         let hooks = hooks.clone();
         match thread::Builder::new().name("armd-control".into()).spawn(move || {
+            let _control_thread_guard = ControlThreadGuard::enter();
             control_thread_main(
                 core,
                 engine,
