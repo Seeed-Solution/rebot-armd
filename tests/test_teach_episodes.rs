@@ -208,6 +208,10 @@ async fn new_store_episode_replays_by_id_and_stale_needs_allow_stale() {
         sup.tick(0.02).await;
         let mut i = sup.inner().write().await;
         i.measured_positions = i.commanded_positions.clone();
+        // recorded timestamps come from the wall clock (start_time); advance it by the tick so the
+        // episode keeps the motion's speed. Without this, 70 ticks in a few ms recorded the jog
+        // far above the speed limit and the replay was refused with REPLAY_TOO_FAST in ~30 % of runs.
+        i.start_time = i.start_time.checked_sub(Duration::from_millis(20)).unwrap();
     }
     let path = sup.save_recording().await.unwrap();
     let id = path.file_stem().unwrap().to_string_lossy().into_owned();

@@ -820,11 +820,15 @@ async fn zero_check_cancelled_before_persist_finishes_leaves_disk_and_memory_unc
     let gc = sup.gripper_calibration_response().await;
     assert!((gc.offset_rad.unwrap() - 0.01).abs() < 1e-6, "{gc:?}");
     assert_eq!(gc.revision, 1);
-    let files: Vec<String> = std::fs::read_dir(dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(files, ["gripper_calib.json"]);
+    // the background task aborts its staged write after the delay; under load that can come later
+    let files = || -> Vec<String> {
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while files().len() > 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(files(), ["gripper_calib.json"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -472,16 +472,17 @@ for (const [vpName, viewport] of (process.env.VIEWS ? ALL_VIEWS.filter(([n]) => 
     }).catch((e) => ({ err: String(e) }));
     if (w.type !== 'command' || w.path !== '/api/v1/datasets/create' || 'generation' in w || w.client_id == null) fail(`lease-free command ${tag}: ${JSON.stringify(w)}`);
 
-    // 10 Space / Escape trigger the E-stop with focus anywhere in the panel
-    await ev(() => { window.eStop = () => { window.__estop++; }; window.__estop = 0; document.querySelector('#teach-body .btn').focus(); });
+    // 10 Space triggers the E-stop, Escape the (non-latching) Stop, with focus anywhere in the panel (6851b57:
+    // Escape stops instead of E-stop); the panel stays open
+    await ev(() => { window.eStop = () => { window.__estop++; }; window.stopMotion = () => { window.__stop++; }; window.__estop = 0; window.__stop = 0; document.querySelector('#teach-body .btn').focus(); });
     await page.keyboard.press('Space');
     await ev(() => $('tch-task').focus());
     await page.keyboard.press('Escape');
     await ev(() => $('teach-tab-seq').focus());
     await page.keyboard.press('Escape');
-    const es = await ev(() => ({ n: window.__estop, open: !$('teach').hidden }));
-    if (es.n !== 3) fail(`E-stop keys ${tag}: ${JSON.stringify(es)}`);
-    console.log(`  E-stop from the panel: ${es.n}/3 key presses`);
+    const es = await ev(() => ({ estop: window.__estop, stop: window.__stop, open: !$('teach').hidden }));
+    if (es.estop !== 1 || es.stop !== 2 || !es.open) fail(`E-stop / Stop keys ${tag}: ${JSON.stringify(es)}`);
+    console.log(`  keys from the panel: Space -> E-stop ${es.estop}/1, Escape -> Stop ${es.stop}/2`);
     if (errs.length) fail(`page errors ${tag}: ${errs.join(' | ')}`);
     await ctx.close();
   }
