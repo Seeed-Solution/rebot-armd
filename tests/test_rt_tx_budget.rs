@@ -515,7 +515,8 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     assert_eq!((m.frames, m.dropped_stale, m.pending), (3, 0, 0));
     assert_eq!(bus.with(|s| s.tx_accepted.iter().map(|f| f.id).collect::<Vec<_>>()), vec![0x105, 0x106, 0x107]);
 
-    // Exactly 45 ms (inclusive): carried-over frames are dropped as stale, zero transmitted.
+    // Exactly 45 ms (inclusive): carried-over frames are dropped as stale, zero transmitted,
+    // and drain_pending_tx MUST report Expired (never Complete).
     let (mut d, bus, clock) = enabled_driver();
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
     assert_eq!(
@@ -526,10 +527,34 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     reset_tx_metrics();
     clock.advance(ms(45));
     d.begin_tx_tick();
-    assert_eq!(d.drain_pending_tx().unwrap(), TxBatchOutcome::Complete);
+    assert_eq!(
+        d.drain_pending_tx().unwrap(),
+        TxBatchOutcome::Expired { dropped: 3, pending: 0 }
+    );
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.dropped_stopped, m.pending), (0, 3, 0, 0));
     assert!(bus.with(|s| s.tx_log.is_empty()));
+
+    // Mid-drain expiry: J5 transmits at 44 ms taking 1 ms -> J6 and J7 hit 45 ms and expire;
+    // outcome MUST be Expired { dropped: 2, pending: 0 }, never Complete.
+    let (mut d, bus, clock) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.3)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    bus.clear();
+    bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(1))));
+    reset_tx_metrics();
+    clock.advance(ms(44));
+    d.begin_tx_tick();
+    assert_eq!(
+        d.drain_pending_tx().unwrap(),
+        TxBatchOutcome::Expired { dropped: 2, pending: 0 }
+    );
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 2, 0));
+    assert_eq!(bus.with(|s| s.tx_accepted.iter().map(|f| f.id).collect::<Vec<_>>()), vec![0x105]);
 
     // A stalled single transmit pushing the current batch past 45 ms must fail closed (Timeout),
     // never falsely reporting Complete after dropping the remaining frames as stale.

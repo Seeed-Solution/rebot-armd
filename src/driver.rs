@@ -197,15 +197,21 @@ pub enum ArmDriverError {
     TxQueueFull { queued: usize, new: usize, capacity: usize },
 }
 
-/// Outcome of a bounded target write ([`ArmDriver::write_joint_targets_bounded`]).
+/// Outcome of a bounded target write ([`ArmDriver::write_joint_targets_bounded`]) or pending
+/// queue drain ([`DamiaoArmDriver::drain_pending_tx`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxBatchOutcome {
-    /// Every frame of the batch (and any carried-over pending frames) was transmitted and flushed.
+    /// Every frame of the batch (and any carried-over pending frames) was transmitted and flushed
+    /// with zero expired or deferred frames.
     Complete,
     /// Queue backpressure (`WouldBlock` / `ENOBUFS`) or the per-tick TX budget stopped the pass;
     /// `pending` fresh frames remain queued for the next tick. Callers must not treat this as
     /// accepted/completed motion output.
     Deferred { pending: usize },
+    /// One or more queued frames expired (`age >= frame_max_age`) and were dropped instead of
+    /// being transmitted; `pending` fresher frames (if any) remain queued. Never reported as
+    /// `Complete`.
+    Expired { dropped: usize, pending: usize },
 }
 
 /// Default maximum CAN transmit attempts started in one tick (shared across RX recovery/refresh
@@ -3450,6 +3456,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn drain_pending_pass(
         &mut self,
         pass_stop_stamp: StopStamp,
+        pre_dropped_stale: usize,
         fail_on_stale_drop: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
@@ -3529,10 +3536,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
+        let total_dropped_stale = pre_dropped_stale.saturating_add(dropped_stale_in_pass);
         let newly_deferred = self.pending_tx.mark_newly_deferred();
         let pending = self.pending_tx.len();
         crate::diagnostics::tick::record_tx_deferred(newly_deferred as u32, pending as u32);
-        if pending == 0 {
+        if total_dropped_stale > 0 {
+            Ok(TxBatchOutcome::Expired { dropped: total_dropped_stale, pending })
+        } else if pending == 0 {
             Ok(TxBatchOutcome::Complete)
         } else {
             Ok(TxBatchOutcome::Deferred { pending })
@@ -3567,7 +3577,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        self.drain_pending_pass(current_stamp, false)
+        self.drain_pending_pass(current_stamp, stale, false)
     }
 
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
@@ -4596,6 +4606,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.discard_pending_tx_stopped();
                 Err(ArmDriverError::TxDeferred { pending })
             }
+            Ok(TxBatchOutcome::Expired { .. }) => {
+                self.discard_pending_tx_stopped();
+                Err(ArmDriverError::Transport(TransportError::Timeout))
+            }
             Err(e) => {
                 self.discard_pending_tx_stopped();
                 Err(e)
@@ -4776,7 +4790,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         // 5. Drain FIFO within the shared per-tick TX pass.
-        self.drain_pending_pass(batch_stamp, true)
+        self.drain_pending_pass(batch_stamp, 0, true)
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {

@@ -302,7 +302,7 @@ fn bounded_send_path_does_not_allocate_on_healthy_backpressure_carry_and_expiry(
     clock.advance(Duration::from_millis(45));
     driver.begin_tx_tick();
     let (res, a, f) = counted(|| driver.drain_pending_tx());
-    assert_eq!(res.unwrap(), TxBatchOutcome::Complete);
+    assert_eq!(res.unwrap(), TxBatchOutcome::Expired { dropped: 3, pending: 0 });
     assert_eq!((a, f), (0, 0), "45 ms stale expiry drop touched allocator");
 
     // 6. Legacy write_joint_targets returning Err(TxDeferred) + discarding queue: 0 allocs, 0 frees.
