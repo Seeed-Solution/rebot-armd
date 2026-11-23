@@ -5,6 +5,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::macro_action::{ChildTicket, ContactGuard, ContactWatch};
 
 impl SupervisorInner {
     /// True on a real/physical driver (non-sim, non-mock) where missing jaw calibration
@@ -265,7 +266,12 @@ impl SupervisorInner {
             self.held = Some(HeldObject { label: String::new(), spill_safe: false });
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
-        if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
+        if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
+            if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state.clone(), a.code.clone())) {
+                self.record_macro_terminal(id, &state, code.as_deref());
+            }
+            self.macro_run = None;
+        }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -324,7 +330,7 @@ impl SupervisorInner {
     pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None });
+        self.macro_run = Some(MacroRun::new(id, input.epoch));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -343,7 +349,7 @@ impl SupervisorInner {
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun { id, epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None });
+        self.macro_run = Some(MacroRun::new(id, epoch));
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -450,8 +456,182 @@ impl SupervisorInner {
         Ok(epoch)
     }
 
+    /// A child (sub-motion) of macro action `id` was installed: counts it and makes it the
+    /// current child (state Running, the pending contact guard).
     pub(crate) fn set_macro_sub_running(&mut self, id: u64) {
-        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) { m.sub = SubState::Running; }
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) { m.begin_child(); }
+    }
+
+    /// The state of child `t` while its parent runs; None when the parent ended or was
+    /// replaced, or `t` is not its current child (a late result is never read as another's).
+    pub fn macro_child_state(&self, t: ChildTicket) -> Option<SubState> {
+        if !self.macro_alive(t.parent.0) { return None; }
+        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.sub.clone())
+    }
+
+    /// What the contact guard of child `t` saw (also after the parent ended, until the next child).
+    pub fn macro_child_watch(&self, t: ChildTicket) -> Option<ContactWatch> {
+        self.macro_run.as_ref().filter(|m| m.ticket() == Some(t)).map(|m| m.child.watch)
+    }
+
+    /// Children of macro action `id` installed so far (None when it is not the current run).
+    pub fn macro_children(&self, id: u64) -> Option<u32> {
+        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.children)
+    }
+
+    /// Arms the RT deadline of the current child of macro `id` (the tick fails it with `code` /
+    /// `message` when it still runs after `deadline`). Returns its ticket.
+    pub fn arm_macro_child(&mut self, id: u64, deadline: Instant, code: &str, message: String) -> Option<ChildTicket> {
+        let m = self.macro_run.as_mut().filter(|m| m.id == id && m.children > 0)?;
+        m.child.deadline = Some(deadline);
+        m.child.timeout = Some((code.to_string(), message));
+        m.ticket()
+    }
+
+    /// The contact guard of the next child installed for macro `id` (None clears it).
+    pub fn guard_next_macro_child(&mut self, id: u64, guard: Option<ContactGuard>) {
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) { m.next_guard = guard; }
+    }
+
+    /// Child `t` still runs `grace` after its deadline (no tick ended it).
+    pub fn macro_child_overdue(&self, t: ChildTicket, now: Instant, grace: Duration) -> bool {
+        self.macro_run.as_ref()
+            .filter(|m| m.ticket() == Some(t) && m.sub == SubState::Running)
+            .and_then(|m| m.child.deadline)
+            .is_some_and(|d| now > d + grace)
+    }
+
+    /// Ends the running child of the current macro when its deadline passed: the motion
+    /// stops and the child fails with the macro's timeout code (the parent stays running, its
+    /// worker ends it with that code). True when it did.
+    pub fn expire_macro_child(&mut self, now: Instant) -> bool {
+        let Some(m) = self.macro_run.as_ref() else { return false; };
+        if m.stop_requested || m.sub != SubState::Running || !m.child.deadline.is_some_and(|d| now > d) { return false; }
+        let id = m.id;
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
+        let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) else { return false; };
+        let (code, message) = m.child.timeout.take().unwrap_or_else(|| ("TIMEOUT".into(), "Sub-motion did not finish in time".into()));
+        m.child.deadline = None;
+        m.sub = SubState::Failed { code, message };
+        true
+    }
+
+    /// The contact guard of the current macro child, once per tick while its motion runs:
+    /// peaks, and a residual above its joint's bound (0: unguarded) ends the child at the
+    /// measured position, done (`stop_code` None, a descent meant to touch) or failed with
+    /// `stop_code`.
+    fn step_macro_contact(&mut self) {
+        let Some((id, guard)) = self.macro_run.as_ref()
+            .filter(|m| !m.stop_requested && m.sub == SubState::Running)
+            .and_then(|m| m.child.guard.map(|g| (m.id, g))) else { return; };
+        if !self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { return; }
+        let n = self.config.arm_dof().min(self.commanded_positions.len()).min(self.measured_positions.len());
+        let trk = (0..n).map(|i| (self.commanded_positions[i] - self.measured_positions[i]).abs()).fold(0.0f32, f32::max);
+        let residual = self.residual_torques;
+        let Some(m) = self.macro_run.as_mut() else { return; };
+        let w = &mut m.child.watch;
+        w.peak_tracking_rad = Some(w.peak_tracking_rad.unwrap_or(0.0).max(trk));
+        let Some(r) = residual else { return; };
+        let pk = w.peak_residual_nm.get_or_insert([0.0; 2]);
+        pk[0] = pk[0].max(r[1].abs());
+        pk[1] = pk[1].max(r[2].abs());
+        let over = (0..r.len().min(guard.max_residual_nm.len()))
+            .find(|&j| guard.max_residual_nm[j] > 0.0 && r[j].abs() > guard.max_residual_nm[j]);
+        let Some(joint) = over.filter(|_| w.contact_joint.is_none()) else { return; };
+        if !self.end_macro_motion_at_measured(id) { return; }
+        let z = self.config.tcp_pose_f32(&self.measured_positions).map(|p| p.p[2]);
+        if let Some(m) = self.macro_run.as_mut() {
+            m.child.watch.contact_joint = Some(joint);
+            m.child.watch.contact_tcp_z_m = z;
+            if let Some(code) = guard.stop_code {
+                m.sub = SubState::Failed { code: code.into(), message: format!("contact on J{}", joint + 1) };
+            }
+        }
+    }
+
+    /// Installs one macro child primitive (`rt_core::ops::Primitive::{CartesianPath, Gripper,
+    /// JointQuinticLimited, Replay}`) for the commit of its descriptor, after the adapter
+    /// checked the stamp and that the ticket's parent is the stamp's parent generation.
+    /// Refuses (nothing installed, active motion unchanged): `PARENT_REPLACED` when the parent
+    /// is not the running macro, `PLAN_STALE` when the ticket is not its next child or the
+    /// prepared `start` differs from the commanded position (gripper included, `>= 1e-4`),
+    /// `MOTION_BUSY` while a child runs, and the install's own codes. Arms the child's RT
+    /// deadline (`now + timeout_s`, `timeout_code`) and contact guard. Returns the parent.
+    ///
+    /// `CartesianPath` takes one waypoint (`n == 1`, an end-link goal; more: `UNSUPPORTED`).
+    /// `JointQuinticLimited` plans from the commanded state with `max_velocity` (0: the
+    /// profile's); `duration_s` is the prepared estimate and is not enforced.
+    pub fn commit_macro_child(&mut self, primitive: &crate::rt_core::ops::Primitive, now: Instant) -> Result<crate::rt_core::broker::ActionId, &'static str> {
+        use crate::rt_core::ops::{Primitive, START_TOLERANCE};
+        let code = |e: ArmError| -> &'static str {
+            let c = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
+            crate::rt_core::ops::TERMINAL_CODES.iter().find(|k| **k == c).copied().unwrap_or("REJECTED")
+        };
+        let Some(spec) = primitive.child().copied() else { return Err("INVALID_COMMAND"); };
+        let id = spec.ticket.parent.0;
+        let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id)) else { return Err("PARENT_REPLACED"); };
+        if spec.ticket.child_seq != run.child.seq.wrapping_add(1) { return Err("PLAN_STALE"); }
+        if run.sub == SubState::Running { return Err("MOTION_BUSY"); }
+        let start = match primitive {
+            Primitive::CartesianPath { dof, start, .. } | Primitive::Gripper { dof, start, .. }
+            | Primitive::JointQuinticLimited { dof, start, .. } | Primitive::Replay { dof, start, .. } => &start[..usize::from(*dof).min(start.len())],
+            _ => return Err("INVALID_COMMAND"),
+        };
+        if start.len() != self.commanded_positions.len()
+            || start.iter().zip(&self.commanded_positions).any(|(s, c)| !s.is_finite() || (s - c).abs() >= START_TOLERANCE) {
+            return Err("PLAN_STALE");
+        }
+        self.guard_next_macro_child(id, spec.contact);
+        let installed = match *primitive {
+            Primitive::JointQuinticLimited { dof, q, max_velocity, .. } => {
+                let mut limits = self.planning_limits();
+                for (i, l) in limits.iter_mut().enumerate().take(usize::from(dof)) {
+                    if max_velocity[i] > 0.0 { l.max_velocity = l.max_velocity.min(max_velocity[i]); }
+                }
+                self.install_macro_quintic(id, q[..usize::from(dof)].to_vec(), &limits).map(drop)
+            }
+            Primitive::Gripper { fraction, speed, grasp, .. } => {
+                let command = if grasp && fraction <= 0.0 { GripperCommand::Close } else if !grasp && fraction >= 1.0 { GripperCommand::Open } else { GripperCommand::Move };
+                let request = GripperRequest { command, fraction: (command == GripperCommand::Move).then_some(f64::from(fraction)), grasp,
+                    speed: f64::from(speed), timeout_s: Some(spec.timeout_s), tag: None };
+                self.start_macro_gripper(id, request).map(drop)
+            }
+            Primitive::CartesianPath { n, waypoints, speed_mps, .. } => {
+                if n != 1 { self.guard_next_macro_child(id, None); return Err("UNSUPPORTED"); }
+                let w = waypoints[0];
+                let goal = crate::kinematics::Pose::new(crate::kinematics::rpy_to_r(f64::from(w[3]), f64::from(w[4]), f64::from(w[5])),
+                    [f64::from(w[0]), f64::from(w[1]), f64::from(w[2])]);
+                self.plan_input().and_then(|input| {
+                    let speed = crate::motion::Speed { linear: f64::from(speed_mps), angular: crate::motion::DEFAULT_ANGULAR_RPS };
+                    let path = crate::motion::plan_cartesian(&input, goal, speed).map_err(ArmError::from)?;
+                    self.install_macro_path(id, &input, path).map(drop)
+                })
+            }
+            Primitive::Replay { episode, speed, gripper, .. } => {
+                let request = crate::replay::ReplayRequest { episode: episode.as_str().to_string(), speed: f64::from(speed), gripper, tag: None, allow_stale: false };
+                let epoch = self.safety.epoch_id();
+                self.replay_input(request, epoch)
+                    .and_then(crate::replay::plan)
+                    .and_then(|planned| self.install_macro_replay(id, planned).map(drop))
+            }
+            _ => return Err("INVALID_COMMAND"),
+        };
+        if let Err(e) = installed {
+            self.guard_next_macro_child(id, None);
+            return Err(code(e));
+        }
+        let deadline = now + Duration::from_secs_f64(if spec.timeout_s.is_finite() { spec.timeout_s.clamp(0.0, 1e6) } else { 1e6 });
+        self.arm_macro_child(id, deadline, spec.timeout_code, "Sub-motion did not finish in time".into());
+        Ok(crate::rt_core::broker::ActionId(id))
+    }
+
+    /// Keeps the terminal record of macro `id` (outcome with its code, child count) in the
+    /// core, so it outlives the action record (`CoreOps::action_outcome`, `action_children`).
+    fn record_macro_terminal(&mut self, id: u64, state: &str, code: Option<&str>) {
+        let Some(children) = self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.children) else { return; };
+        let outcome = crate::rt_core::ops::outcome_of(state, code).unwrap_or(crate::rt_core::broker::Outcome::Failed("FAILED"));
+        self.core.record_macro_terminal(crate::rt_core::MacroTerminal { action: crate::rt_core::broker::ActionId(id), children, outcome });
     }
 
     /// Install a planned sub-motion of macro action `id`. Returns its planned duration.
@@ -462,7 +642,7 @@ impl SupervisorInner {
         let duration = self.start_path_motion(input, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
-        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
+        self.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
 
@@ -517,7 +697,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
-        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
+        self.set_macro_sub_running(id);
         Ok(duration)
     }
 
@@ -547,7 +727,7 @@ impl SupervisorInner {
         let duration = traj.duration;
         self.quintic_settle = None;
         self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)).with_motion_limits(limits.to_vec()));
-        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
+        self.set_macro_sub_running(id);
         Ok(duration + crate::motion::SETTLE_MAX_S)
     }
 
@@ -570,9 +750,10 @@ impl SupervisorInner {
     /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
     /// orchestrator cannot install another sub-motion before the next tick.
     pub fn request_macro_stop(&mut self) {
+        let Some(id) = self.macro_run.as_ref().map(|m| m.id) else { return; };
+        self.record_macro_terminal(id, "cancelled", Some("STOPPED"));
         let Some(mut m) = self.macro_run.take() else { return; };
         m.stop_requested = true;
-        let id = m.id;
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
         if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
             let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
@@ -772,6 +953,12 @@ impl SupervisorInner {
         if is_policy {
             return;
         }
+        if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
+            // decisions before further movement: contact stop, child deadline
+            self.step_macro_contact();
+            self.expire_macro_child(Instant::now());
+        }
+        let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
             // between sub-motions the orchestrator owns the action; it ends here only when
             // something else took the arm or a stop arrived

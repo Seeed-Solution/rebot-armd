@@ -37,7 +37,7 @@ use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
 use crate::model::{CameraMount, HoldingMode, WorkspacePolicy};
 use crate::estimate::{EstimateChain, EstimateEntry, SourceResult};
-use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
+use crate::macro_action::{fail, ContactGuard, MacroCtx, Stop, SubDone};
 use crate::motion::{self, GoalFrame, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
@@ -3289,6 +3289,15 @@ pub struct Orchestrator {
     pub generation: Option<u64>,
 }
 
+/// A guarded grasp insertion ([`Orchestrator::insert`]): the TCP goal, the linear speed and
+/// the same-side approach request of its final segment.
+#[derive(Debug, Clone, Copy)]
+struct Insertion {
+    goal_tcp: Vec3,
+    speed_mps: f64,
+    approach: crate::backlash::Request,
+}
+
 impl std::ops::Deref for Orchestrator {
     type Target = MacroCtx;
     fn deref(&self) -> &MacroCtx { &self.ctx }
@@ -4327,56 +4336,52 @@ impl Orchestrator {
         }
     }
 
-    /// Straight down to `close_h` above the table. Each poll while it runs records the peak
-    /// |residual| of J2 / J3 and the peak J1..J6 tracking error; with `descend_contact_stop_nm`
-    /// set, a J2 or J3 residual above it ends the descent at the measured position.
-    /// The final descent to the close height; with the same-side approach (`grasp_final`) it
-    /// ends with the short segment, never rising towards the target from below.
+    /// Straight down to `close_h` above the table: the [`Insertion`] along -z that ends at the
+    /// close height, run by [`insert`](Self::insert). With the same-side approach
+    /// (`grasp_final`) it ends with the short segment, never rising towards the target from below.
     async fn descend(&self, close_h: f64, approach: crate::backlash::Request) -> Result<(), Stop> {
         let s = &self.setup;
         let p = self.tcp_pose().await.p;
+        self.insert(Insertion { goal_tcp: [p[0], p[1], s.table_z_m + close_h], speed_mps: s.descend_speed_mps, approach }).await
+    }
+
+    /// One guarded insertion (phase `descend`): a TCP-frame path to `goal_tcp` whose final
+    /// segment is the same-side approach `grasp_final`, with the table clearance enforced on
+    /// the installed path. The control tick runs its contact guard ([`ContactGuard`]): it
+    /// records the peak |residual| of J2 / J3 and the peak tracking error, and with
+    /// `descend_contact_stop_nm` set a J2 or J3 residual above it ends the insertion at the
+    /// measured position (the short segment is then not run). The straight-down descent is the
+    /// insertion along -z; another approach direction is another `goal_tcp` from its pre-grasp.
+    async fn insert(&self, ins: Insertion) -> Result<(), Stop> {
+        let s = &self.setup;
         // the TCP never rises to the object from below; the envelope keeps the table clearance
         let rules = crate::backlash::DescentRules { table: Some((self.envelope.clone(), s.table_z_m + TABLE_CLEARANCE_M)), ..crate::backlash::DescentRules::tcp_at(self.tcp_offset) };
-        let final_approach = crate::macro_action::FinalApproach { use_: "grasp_final", request: approach, rules };
-        let mv = self.move_arm_final_in(GoalFrame::Tcp, "descend", GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + close_h], r: None }, s.descend_speed_mps, Some(final_approach));
-        tokio::pin!(mv);
-        let (mut peak_res, mut peak_trk, mut contact): (Option<[f32; 2]>, Option<f32>, Option<f64>) = (None, None, None);
-        let result = loop {
-            tokio::select! {
-                r = &mut mv => break r,
-                _ = tokio::time::sleep(POLL) => {
-                    let over = {
-                        let inner = self.sup.inner().read().await;
-                        if !inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(self.id)) { continue; }
-                        let arm_dof = inner.config.arm_dof();
-                        let trk = (0..arm_dof).map(|i| (inner.commanded_positions[i] - inner.measured_positions[i]).abs()).fold(0.0f32, f32::max);
-                        peak_trk = Some(peak_trk.unwrap_or(0.0).max(trk));
-                        let Some(r) = inner.residual_torques else { continue };
-                        let pk = peak_res.get_or_insert([0.0; 2]);
-                        pk[0] = pk[0].max(r[1].abs());
-                        pk[1] = pk[1].max(r[2].abs());
-                        s.descend_contact_stop_nm.is_some_and(|lim| f64::from(r[1].abs()) > lim || f64::from(r[2].abs()) > lim)
-                    };
-                    if over && contact.is_none() {
-                        let mut inner = self.sup.inner().write().await;
-                        if inner.end_macro_motion_at_measured(self.id) {
-                            let z = inner.config.tcp_pose_f32(&inner.measured_positions).map(|p| p.p[2]).unwrap_or(f64::NAN);
-                            contact = Some(z - s.table_z_m);
-                            tracing::info!("Grasp {}: contact during the descent at {:.3} m above the table", self.id, z - s.table_z_m);
-                        }
-                    }
-                }
-            }
-        };
+        let final_approach = crate::macro_action::FinalApproach { use_: "grasp_final", request: ins.approach, rules };
+        // J2 / J3 bounded by descend_contact_stop_nm (none: peaks only); a contact ends the descent done
+        let lim = s.descend_contact_stop_nm.map_or(0.0, |l| l as f32);
+        let mut max_residual_nm = [0.0; crate::rt_core::mailbox::MAX_DOF];
+        max_residual_nm[1] = lim;
+        max_residual_nm[2] = lim;
+        let guard = ContactGuard { max_residual_nm, stop_code: None };
+        self.sup.inner().write().await.guard_next_macro_child(self.id, Some(guard));
+        let result = self.move_arm_final_in(GoalFrame::Tcp, "descend", GoalSpec::Absolute { p: ins.goal_tcp, r: None }, ins.speed_mps, Some(final_approach)).await;
         {
             let mut inner = self.sup.inner().write().await;
+            // a guard not taken by a child (planning or install refused) does not stay armed
+            inner.guard_next_macro_child(self.id, None);
+            let watch = inner.macro_run.as_ref().filter(|m| m.id == self.id && m.child.guard == Some(guard)).and_then(|m| m.ticket())
+                .and_then(|t| inner.macro_child_watch(t)).unwrap_or_default();
+            let contact_h = watch.contact_joint.map(|_| watch.contact_tcp_z_m.unwrap_or(f64::NAN) - s.table_z_m);
             inner.update_action(self.id, |a| {
-                a.descend_peak_residual_nm = peak_res;
-                a.descend_peak_tracking_rad = peak_trk;
-                if let Some(h) = contact { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
+                a.descend_peak_residual_nm = watch.peak_residual_nm;
+                a.descend_peak_tracking_rad = watch.peak_tracking_rad;
+                if let Some(h) = contact_h { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
             });
-            // a contact stop ends the descent before the short segment
-            if contact.is_some() { inner.approach_interrupted(self.id, "contact"); }
+            if let Some(h) = contact_h {
+                tracing::info!("Grasp {}: contact during the descent at {h:.3} m above the table", self.id);
+                // a contact stop ends the descent before the short segment
+                inner.approach_interrupted(self.id, "contact");
+            }
         }
         result.map(|_| ())
     }
