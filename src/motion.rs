@@ -1486,9 +1486,22 @@ impl GripperMotion {
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {
-            if idx < positions.len() { positions[idx] = q_g; }
+            let hold = if m_g.is_finite() { m_g } else { q_g };
+            if idx < positions.len() { positions[idx] = hold; }
             if idx < velocities.len() { velocities[idx] = 0.0; }
-            done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
+            if self.request.command == GripperCommand::Seek
+                || (m_g - self.target).abs() < GRIPPER_STOP_SHORT_RAD
+            {
+                done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
+            } else {
+                StepStatus::Failed {
+                    code: "GRIPPER_TIMEOUT",
+                    message: format!(
+                        "Gripper stalled short of target (at {m_g:.3} rad, target {:.3} rad)",
+                        self.target
+                    ),
+                }
+            }
         } else if self.request.command != GripperCommand::Seek && still && ((m_g - self.target).abs() < SETTLE_POS_RAD as f32
             || (cmd_at_target && (m_g - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
             // the jaw stopped close to the target: the real gripper opens to about -5.61 against a

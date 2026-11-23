@@ -191,14 +191,14 @@ fn incident_grasp_latches_at_the_cap_and_holds() {
     assert!(!rig.lock().unwrap().broke);
 }
 
-/// A plain close (grasp false) through the incident profile ends at the cap.
+/// A plain close (grasp false) through the incident profile stops at the cap and fails short of closed.
 #[test]
 fn incident_close_without_grasp_detection_stops_at_the_cap() {
     let (mut inner, rig) = rig(Load::Incident);
     let epoch = inner.safety.epoch_id();
     let (id, _) = inner.start_gripper(close(false), epoch).unwrap();
     let a = run(&mut inner, id, 12.0);
-    assert_eq!(a.state, "done", "{a:?}");
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
     { let r = rig.lock().unwrap(); assert!(!r.broke && r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3} N·m", r.peak_tau); }
     let obs = inner.current_observation();
     let g = obs.gripper.unwrap();

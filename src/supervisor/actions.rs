@@ -948,6 +948,12 @@ impl SupervisorInner {
                 } else {
                     self.active_trajectory = None;
                 }
+                if action_id.is_none() && self.park_release == Some(ParkRelease::Opening) {
+                    tracing::warn!("Park release opening failed ({code}: {message}); skipping re-close and keeping held state");
+                    self.park_release = None;
+                    self.park_gripper_contact = false;
+                    self.releasing = false;
+                }
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 if !self.pending_normal_unload { self.safety.mark_motion_finished(); }

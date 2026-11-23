@@ -2410,3 +2410,192 @@ fn pos_force_full_stroke_close_plans_at_close_speed_without_timeout() {
         assert_eq!(damiao::pos_force_vel_raw(gm.limit.max_velocity), want_raw);
     }
 }
+
+#[test]
+fn stalled_empty_jaw_close_c300_pattern_fails_instead_of_done() {
+    use std::sync::{Arc, Mutex};
+    use armd::driver::{ArmDriverError, DriverCapabilities, EnableState};
+    use armd::model::{GripperPolicy, JointState};
+    use armd::motion::{GripperCommand, GripperMotion, GripperRequest, StepCtx, StepStatus, GRIPPER_STOP_SHORT_RAD};
+    use armd::supervisor::{HeldObject, ParkRelease, SupervisorInner};
+
+    const DT: f64 = 0.02;
+
+    // 1. Replay c300.json move 2: gripper_move(0.0) from -5.6401 stalls at -5.547 with ceiling
+    //    torque 0.554-0.569 N·m and near-zero velocity -> must fail with GRIPPER_TIMEOUT, not done.
+    struct C300StallState {
+        q: [f32; 7],
+        v: [f32; 7],
+        tau: [f32; 7],
+        enabled: EnableState,
+        stall_at: Option<f32>,
+        ceiling_nm: f32,
+        block_open: bool,
+    }
+    struct C300StallDriver(Arc<Mutex<C300StallState>>);
+    impl ArmDriver for C300StallDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true,
+                torque_feedforward: false, enable_feedback: true, load_feedback: false }
+        }
+        fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            let s = self.0.lock().unwrap();
+            Ok((0..7).map(|i| JointState { position: s.q[i], velocity: s.v[i], torque: s.tau[i], temperature: 30.0 }).collect())
+        }
+        fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+            let mut s = self.0.lock().unwrap();
+            for (i, t) in targets.iter().enumerate().take(7) {
+                if i != J7 { s.q[i] = t.position; s.v[i] = 0.0; continue; }
+                let delta = t.position - s.q[J7];
+                if s.block_open && delta < -1e-4 {
+                    s.v[J7] = -0.007;
+                    s.tau[J7] = -s.ceiling_nm;
+                    continue;
+                }
+                if let Some(stop) = s.stall_at {
+                    if delta > 0.0 && s.q[J7] + delta.min(0.30 * DT as f32) >= stop {
+                        s.q[J7] = stop;
+                        s.v[J7] = -0.007;
+                        s.tau[J7] = s.ceiling_nm;
+                        continue;
+                    }
+                }
+                let step = delta.clamp(-0.30 * DT as f32, 0.30 * DT as f32);
+                s.q[J7] += step;
+                s.v[J7] = step / DT as f32;
+                s.tau[J7] = if step.abs() > 1e-4 { 0.35 * step.signum() } else { 0.0 };
+            }
+            Ok(())
+        }
+        fn set_torque(&mut self, on: bool) -> Result<(), ArmDriverError> {
+            self.0.lock().unwrap().enabled = if on { EnableState::Enabled } else { EnableState::Disabled };
+            Ok(())
+        }
+    }
+
+    let state = Arc::new(Mutex::new(C300StallState {
+        q: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -5.6401],
+        v: [0.0; 7],
+        tau: [0.0; 7],
+        enabled: EnableState::Disabled,
+        stall_at: Some(-5.547),
+        ceiling_nm: 0.564, // c300.json plateau 0.554-0.569 N·m
+        block_open: false,
+    }));
+    let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(state.clone())));
+    inner.lease_enabled = false;
+    inner.tick(DT);
+    inner.set_torque(true).unwrap();
+    let epoch = inner.safety.epoch_id();
+    let req = GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None };
+    let (id, _) = inner.start_gripper(req, epoch).unwrap();
+    let mut finished = None;
+    for _ in 0..200 {
+        inner.tick(DT);
+        let a = inner.last_action.clone().unwrap();
+        if !a.is_running() { finished = Some(a); break; }
+    }
+    let a = finished.expect("stalled c300 close must finish on stall");
+    assert_eq!(a.id, id);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
+    assert!(a.message.as_deref().unwrap_or("").contains("stalled short of target"), "{a:?}");
+    assert!(inner.gripper_stalled && inner.gripper_stall_sign > 0.0);
+    assert!((inner.commanded_positions[J7] - (-5.547)).abs() < 1e-3, "held at {}", inner.commanded_positions[J7]);
+
+    // 2. Grasp close (grasp=true) hitting the same stalled ceiling torque keeps its contact=holding semantics.
+    let grasp_state = Arc::new(Mutex::new(C300StallState {
+        q: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -5.0],
+        v: [0.0; 7],
+        tau: [0.0; 7],
+        enabled: EnableState::Disabled,
+        stall_at: Some(-3.0),
+        ceiling_nm: 0.564,
+        block_open: false,
+    }));
+    let mut grasp_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(grasp_state)));
+    grasp_sup.lease_enabled = false;
+    grasp_sup.tick(DT);
+    grasp_sup.set_torque(true).unwrap();
+    let ep = grasp_sup.safety.epoch_id();
+    let (gid, _) = grasp_sup.start_gripper(
+        GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None }, ep
+    ).unwrap();
+    let mut ga = None;
+    for _ in 0..800 {
+        grasp_sup.tick(DT);
+        let a = grasp_sup.last_action.clone().unwrap();
+        if !a.is_running() { ga = Some(a); break; }
+    }
+    let ga = ga.expect("grasp close finished");
+    assert_eq!(ga.id, gid);
+    assert_eq!((ga.state.as_str(), ga.holding), ("done", Some(true)), "{ga:?}");
+
+    // 3. Direct GripperMotion boundary checks: < 0.25 Done, == 0.25 Failed, > 0.25 Failed, NaN Failed,
+    //    covering Move / Open / Close(grasp=false), while Seek stays Done.
+    let policy = GripperPolicy::rebot_dm();
+    let lim = ArmConfig::rebot_dm().limits[J7].clone();
+    let step_stalled = |cmd: GripperCommand, frac: Option<f64>, start: f32, meas: f32, cmd_q: f32, sign: f32| {
+        let req = GripperRequest { command: cmd, fraction: frac, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
+        let mut gm = GripperMotion::new(req, policy.clone(), lim.clone(), start, J7);
+        let mut m = [0.0f32; 7];
+        let mut q = [0.0f32; 7];
+        m[J7] = meas;
+        q[J7] = cmd_q;
+        let ctx = StepCtx {
+            dt: DT, time_scale: 1.0, measured: &m, measured_velocities: &[0.0; 7],
+            commanded: &q, commanded_velocities: &[0.0; 7], torques: &[0.0; 7], loads: &[0.0; 7],
+            feedback_fresh: true, torque_feedback: true, load_feedback: false,
+            gripper_stalled: true, gripper_stall_sign: sign, gripper_force_capped: false,
+        };
+        gm.step(&ctx)
+    };
+
+    // Move(0.0) target = 0.0: < 0.25 -> Done; == 0.25 -> Failed; > 0.25 -> Failed; NaN -> Failed.
+    let ok_short = step_stalled(GripperCommand::Move, Some(0.0), -1.0, -(GRIPPER_STOP_SHORT_RAD - 0.01), -0.24, 1.0);
+    assert!(matches!(ok_short.status, StepStatus::Done { .. }), "{ok_short:?}");
+    let eq_bound = step_stalled(GripperCommand::Move, Some(0.0), -1.0, -GRIPPER_STOP_SHORT_RAD, -0.25, 1.0);
+    assert!(matches!(eq_bound.status, StepStatus::Failed { code: "GRIPPER_TIMEOUT", .. }), "{eq_bound:?}");
+    assert!((eq_bound.positions[J7] - (-GRIPPER_STOP_SHORT_RAD)).abs() < 1e-5 && eq_bound.velocities[J7] == 0.0);
+    let far_open = step_stalled(GripperCommand::Open, None, 0.0, -3.0, -3.2, -1.0);
+    assert!(matches!(far_open.status, StepStatus::Failed { code: "GRIPPER_TIMEOUT", .. }), "{far_open:?}");
+    assert!((far_open.positions[J7] - (-3.0)).abs() < 1e-5 && far_open.velocities[J7] == 0.0);
+    let far_close = step_stalled(GripperCommand::Close, None, -5.0, -2.0, -1.8, 1.0);
+    assert!(matches!(far_close.status, StepStatus::Failed { code: "GRIPPER_TIMEOUT", .. }), "{far_close:?}");
+    let nan_meas = step_stalled(GripperCommand::Move, Some(0.0), -5.0, f32::NAN, -2.5, 1.0);
+    assert!(matches!(nan_meas.status, StepStatus::Failed { code: "GRIPPER_TIMEOUT", .. }), "{nan_meas:?}");
+    assert!((nan_meas.positions[J7] - (-2.5)).abs() < 1e-5 && nan_meas.velocities[J7] == 0.0);
+    // Seek (zero_check) stalled far from +0.6 target still succeeds.
+    let seek_ok = step_stalled(GripperCommand::Seek, None, -1.0, -0.3, -0.3, 1.0);
+    assert!(matches!(seek_ok.status, StepStatus::Done { .. }), "{seek_ok:?}");
+
+    // 4. Park-release stalled Opening fails without falsely clearing `held` or proceeding to Closing.
+    let park_state = Arc::new(Mutex::new(C300StallState {
+        q: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0],
+        v: [0.0; 7],
+        tau: [0.0; 7],
+        enabled: EnableState::Disabled,
+        stall_at: None,
+        ceiling_nm: 0.60,
+        block_open: true,
+    }));
+    let mut park_sup = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(C300StallDriver(park_state)));
+    park_sup.lease_enabled = false;
+    park_sup.tick(DT);
+    park_sup.set_torque(true).unwrap();
+    park_sup.pending_normal_unload = true;
+    park_sup.park_gripper_contact = true;
+    park_sup.held = Some(HeldObject { label: "box".into(), spill_safe: false });
+    // First tick installs ParkRelease::Opening; subsequent ticks stall while opening and abort park_release.
+    for _ in 0..40 {
+        park_sup.tick(DT);
+        if park_sup.park_release.is_none() && park_sup.active_trajectory.is_none() && !park_sup.park_gripper_contact {
+            break;
+        }
+    }
+    assert!(park_sup.held.is_some(), "stalled park-release opening falsely cleared held");
+    assert_ne!(park_sup.park_release, Some(ParkRelease::Closing), "proceeded to Closing after stalled Opening");
+    assert!(park_sup.park_release.is_none() && !park_sup.park_gripper_contact);
+}
