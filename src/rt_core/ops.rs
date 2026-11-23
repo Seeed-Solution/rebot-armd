@@ -495,8 +495,17 @@ impl CoreOps for SupervisorInner {
     }
 }
 
-/// The supervisor's configuration revisions; holds live in the core. Activation stays on
-/// the existing commit path (`NOT_WIRED` here) until track B moves it.
+/// The supervisor's configuration revisions; holds live in the core.
+///
+/// Protocol at the existing commit boundary (one supervisor write guard, track B): the worker
+/// keeps the candidate (its payload, keyed by the reservation's `CandidateId`) and stages its
+/// file off the lock; under the lock it rechecks authorization, lease and epoch, then
+/// [`ConfigAuthority::reserve`]s the domain at the revision the candidate was built from,
+/// renames the file into place and reports [`ConfigAuthority::persisted`], applies the
+/// candidate (`SupervisorInner::activate_config_candidate`, which moves the domain to
+/// `from + 1`) and [`ConfigAuthority::activate`]s the reservation, which confirms the new
+/// revision and ends the hold. A failure before the rename releases the reservation; a
+/// failure after it leaves the hold `Reconciling`.
 impl ConfigAuthority for SupervisorInner {
     fn revision(&self, domain: ConfigDomain) -> u64 {
         match domain {
@@ -524,7 +533,28 @@ impl ConfigAuthority for SupervisorInner {
 
     fn persisted(&mut self, r: &Reservation, durability: Durability) -> Result<(), &'static str> { self.core.config_mut().persisted(r, durability) }
 
-    fn activate(&mut self, r: Reservation) -> Activated { self.core.config_mut().activation_failed(r, "NOT_WIRED") }
+    /// Confirms a reservation whose candidate was applied: the domain must be at `from + 1`.
+    /// The durability is the one reported by [`ConfigAuthority::persisted`] (`Volatile`
+    /// without it). Refusals: `NOT_HELD` (another grant or none), `RECONCILING`,
+    /// `NOT_APPLIED` (still at `from`), `REVISION_MISMATCH` (moved elsewhere); before
+    /// persistence the reservation comes back, after it the hold is `Reconciling`.
+    fn activate(&mut self, r: Reservation) -> Activated {
+        let Some(held) = self.core.config_held(r.domain()).filter(|h| h.grant == Some(r.grant())) else {
+            return Activated::Refused { code: "NOT_HELD", reservation: r };
+        };
+        let durability = match held.state {
+            super::config_iface::HoldState::Reserved => Durability::Volatile,
+            super::config_iface::HoldState::PersistedAwaitingActivation { durability } => durability,
+            super::config_iface::HoldState::Reconciling => return self.core.config_mut().activation_failed(r, "RECONCILING"),
+        };
+        let revision = self.revision(r.domain());
+        if revision != r.from() + 1 {
+            let code = if revision == r.from() { "NOT_APPLIED" } else { "REVISION_MISMATCH" };
+            return self.core.config_mut().activation_failed(r, code);
+        }
+        self.core.config_mut().activated(&r);
+        Activated::Active { revision, durability }
+    }
 
     fn release(&mut self, r: Reservation) -> Released { self.core.config_mut().release(r) }
 
