@@ -288,6 +288,9 @@ pub struct SupervisorInner {
     pub temperatures: Vec<f32>,
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
+    /// The buffer `servo_target` reuses while it is None (`release_servo_target`), so a
+    /// stop and the next target neither free nor allocate it.
+    pub(crate) servo_target_spare: Vec<f32>,
     /// True while a servo/policy stream owns output, including its braking tail after
     /// `servo_target` is cleared by stop, timeout, or dirty-jump discard.
     pub servo_stream_active: bool,
@@ -645,6 +648,7 @@ impl SupervisorInner {
             temperatures: vec![25.0; dof],
             target_positions,
             servo_target: None,
+            servo_target_spare: Vec::with_capacity(crate::rt_core::mailbox::MAX_DOF.max(dof)),
             servo_stream_active: false,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
@@ -2315,7 +2319,11 @@ impl SupervisorInner {
                         self.pending_normal_unload = false;
                         self.unload_settle = None;
                         self.active_trajectory = None;
-                        self.servo_target = None; self.servo_settled_ticks.fill(0);
+                        // release_servo_target inline (the driver guard borrows self)
+                        if let Some(v) = self.servo_target.take() {
+                            if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
+                        }
+                        self.servo_settled_ticks.fill(0);
                         self.servo_ws_min_depths = None;
                         self.tracking.invalidate();
                         self.target_positions = hold_pos.clone();
@@ -2584,7 +2592,7 @@ impl SupervisorInner {
             // Check continuous motion frame timeout:
             // If > 200ms without a new pose frame, clear servo_target to begin controlled smooth deceleration
             if self.last_motion_frame.elapsed() > self.motion_frame_timeout {
-                self.servo_target = None;
+                self.release_servo_target();
                 self.servo_settled_ticks.fill(0);
                 self.fail_live_policy_from_control("TARGET_TIMEOUT",
                     format!("No policy target for {} ms; the control loop dropped the target", self.motion_frame_timeout.as_millis()));
@@ -2609,7 +2617,7 @@ impl SupervisorInner {
                     tracing::warn!(
                         "Discarding dirty servo target frame: instantaneous jump exceeds 0.35 rad relative to commanded_positions"
                     );
-                    self.servo_target = None;
+                    self.release_servo_target();
                     self.servo_settled_ticks.fill(0);
                     self.fail_live_policy_from_control("SERVO_TARGET_DISCARDED",
                         "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
@@ -2742,7 +2750,7 @@ impl SupervisorInner {
 
                         // If all axes have servo_settled_ticks[i] >= 2, mark motion finished
                         if self.servo_settled_ticks.iter().all(|&ticks| ticks >= 2) {
-                            self.servo_target = None;
+                            self.release_servo_target();
                             self.safety.mark_motion_finished();
                             if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                                 self.servo_ws_min_depths = None;

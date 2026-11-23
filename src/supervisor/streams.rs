@@ -14,6 +14,28 @@ fn set_vec(dst: &mut Option<Vec<f32>>, src: &[f32]) {
     }
 }
 
+impl SupervisorInner {
+    /// Clears the servo target, keeping its buffer for the next one (no free).
+    pub(crate) fn release_servo_target(&mut self) {
+        if let Some(v) = self.servo_target.take() {
+            // the spare is empty (capacity 0) while a target holds the buffer: nothing is freed
+            if v.capacity() >= self.servo_target_spare.capacity() { self.servo_target_spare = v; }
+        }
+    }
+
+    /// Sets the servo target, in the existing or the spare buffer (no allocation while one
+    /// has the capacity).
+    fn set_servo_target(&mut self, src: &[f32]) {
+        if self.servo_target.is_none() {
+            let mut v = std::mem::take(&mut self.servo_target_spare);
+            copy_into(&mut v, src);
+            self.servo_target = Some(v);
+        } else {
+            set_vec(&mut self.servo_target, src);
+        }
+    }
+}
+
 /// The run's observation into `dst`, reusing its memory.
 #[cfg(feature = "policy-runtime")]
 fn set_policy_obs(dst: &mut Option<crate::model::PolicyObservation>, run: &crate::policy_runtime::PolicyRun) {
@@ -325,7 +347,7 @@ impl SupervisorInner {
 
         // 2. Store servo target for tick(dt) to step with actual dt and velocity limits
         copy_into(&mut self.target_positions, targets);
-        set_vec(&mut self.servo_target, targets);
+        self.set_servo_target(targets);
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 
@@ -1167,7 +1189,7 @@ impl SupervisorInner {
         let _ = self.safety.mark_motion_started();
 
         copy_into(&mut self.target_positions, targets);
-        set_vec(&mut self.servo_target, targets);
+        self.set_servo_target(targets);
         self.servo_stream_active = true;
         self.servo_settled_ticks.fill(0);
 

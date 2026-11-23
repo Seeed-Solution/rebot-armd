@@ -70,16 +70,19 @@ impl SupervisorInner {
                 self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
             }
         }
+        // (the message is built only when a run ends: a stop without one does not allocate)
         #[cfg(feature = "policy-runtime")]
-        self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
-        self.servo_target = None;
+        if self.policy_run.is_some() {
+            self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
+        }
+        self.release_servo_target();
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
         self.active_trajectory = None;
         self.pending_normal_unload = false;
         self.unload_settle = None;
         self.zero_check_persisting = None;
-        self.target_positions = self.commanded_positions.clone();
+        crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
     }
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {

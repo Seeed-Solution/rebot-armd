@@ -138,3 +138,28 @@ fn consuming_live_policy_targets_does_not_allocate_in_steady_streaming() {
     assert_eq!((allocs, frees), (0, 0), "policy consumption touched the allocator");
     assert_eq!(inner.policy_run.as_ref().unwrap().steps, 20);
 }
+
+/// A stop between two servo targets keeps the target buffer: the stop and the first target
+/// after it neither free nor allocate.
+#[test]
+fn a_stop_and_the_next_servo_target_do_not_touch_the_allocator() {
+    let (mut inner, gen) = supervisor();
+    inner.authorize_servo_stream(gen);
+    let stream = inner.core.target_authority().stream.expect("authorized");
+    let base = inner.commanded_positions.clone();
+    let now = Instant::now();
+    let authority = Authority { lease_generation: gen, epoch: inner.safety.epoch_id(), config_revision: inner.workspace_revision, ..Authority::default() };
+    for seq in 1..=3 {
+        let f = frame(&inner, stream, authority, 0, &base, 0.0005 * seq as f32, seq, now);
+        inner.consume_target(&f, &ctx(now)).expect("applied");
+    }
+    let after = frame(&inner, stream, authority, 0, &base, 0.002, 4, now);
+    let (ok, allocs, frees) = counted(|| {
+        inner.stop_motion();
+        let stopped = inner.servo_target.is_none();
+        stopped && inner.consume_target(&after, &ctx(now)).is_ok()
+    });
+    assert!(ok, "stopped, then the next target applied");
+    assert_eq!((allocs, frees), (0, 0), "stop + next target touched the allocator");
+    assert!((inner.servo_target.as_ref().unwrap()[0] - (base[0] + 0.002)).abs() < 1e-6);
+}
