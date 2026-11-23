@@ -2699,6 +2699,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     default_kd: f32,
     cached_states: Vec<JointState>,
     last_target_frames: Vec<Option<CanFrame>>,
+    /// Last MIT `(kp, kd, torque)` parameters transmitted per joint (used to rebuild fresh
+    /// gravity-compensation recovery frames from live measured position without replaying bytes).
+    last_mit_params: Vec<Option<(f32, f32, f32)>>,
     last_feedback_instant: Vec<Option<Instant>>,
     feedback_seq: Vec<u64>,
     /// Instant taken before the last receive call that found the RX queue empty.
@@ -3166,6 +3169,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             default_kd: 1.0,
             cached_states: vec![JointState::default(); dof],
             last_target_frames: vec![None; dof],
+            last_mit_params: vec![None; dof],
             last_feedback_instant: vec![None; dof],
             feedback_seq: vec![0; dof],
             rx_empty_instant: None,
@@ -3711,14 +3715,36 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         damiao::build_pos_vel_frame(0x100, self.motor_ids[i], position, self.vlim())
     }
 
+    fn resolved_mit_params(&self, target: &JointTarget) -> (f32, f32, f32) {
+        (
+            target.kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
+            target.kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
+            target.torque.filter(|t| t.is_finite()).unwrap_or(0.0),
+        )
+    }
+
+    fn record_sent_target(&mut self, i: usize, frame: CanFrame, mit_params: Option<(f32, f32, f32)>) {
+        self.last_target_frames[i] = Some(frame);
+        self.last_mit_params[i] = if frame.id == u32::from(self.motor_ids[i]) {
+            mit_params
+        } else {
+            None
+        };
+    }
+
+    fn clear_cached_targets(&mut self) {
+        self.last_target_frames.fill(None);
+        self.last_mit_params.fill(None);
+    }
+
     fn mit_frame(&self, i: usize, target: &JointTarget) -> CanFrame {
-        let torque = target.torque.filter(|t| t.is_finite()).unwrap_or(0.0);
+        let (kp, kd, torque) = self.resolved_mit_params(target);
         damiao::build_mit_frame(
             self.motor_ids[i],
             target.position,
             target.velocity.filter(|v| v.is_finite()).unwrap_or(0.0),
-            target.kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
-            target.kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
+            kp,
+            kd,
             torque,
             &self.limits[i],
         )
@@ -4239,7 +4265,12 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     d.build_mode_hold_frame(i, modes[i], &eff_hold, dual_hold, slot)
                 }) {
                     Ok(sent_frame) => {
-                        self.last_target_frames[i] = Some(sent_frame);
+                        let mit_params = if self.rollback_requires_fresh(policy) {
+                            (self.default_kp, self.default_kd, 0.0)
+                        } else {
+                            self.resolved_mit_params(&hold[i])
+                        };
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
                     }
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
                         for &j in joints { self.joint_modes[j] = None; }
@@ -4260,6 +4291,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 if self.base_mode(i) == DamiaoControlMode::PosForce || self.rollback_requires_fresh(policy) {
                     self.joint_modes[i] = None;
                     self.last_target_frames[i] = None;
+                    self.last_mit_params[i] = None;
                 }
             }
         }
@@ -4374,7 +4406,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }) {
                     Ok(sent_frame) => {
                         sent_any = true;
-                        self.last_target_frames[i] = Some(sent_frame);
+                        let mit_params = (self.default_kp, self.default_kd, 0.0);
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
                         if stage == 1 && w.dual_hold && mode != DamiaoControlMode::PosForce {
                             w.deferred_stage[0] = 2;
                         } else {
@@ -4485,7 +4518,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.mit_fence_trip = Some((reason, self.now()));
         }
         // nothing cached or queued may be replayed: the group's outputs are uncertain
-        self.last_target_frames.fill(None);
+        self.clear_cached_targets();
         self.refresh_unfinished = 0;
         self.discard_pending_tx_stopped();
     }
@@ -4552,7 +4585,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             ) {
                 Ok(sent_frame) => {
                     let _ = self.pending_tx.pop_front();
-                    self.last_target_frames[entry.joint] = Some(sent_frame);
+                    let mit_params = match entry.cmd {
+                        PendingTargetCmd::Mit { kp, kd, torque, .. } => Some((
+                            kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
+                            kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
+                            torque.filter(|t| t.is_finite()).unwrap_or(0.0),
+                        )),
+                        PendingTargetCmd::PosVel { .. } | PendingTargetCmd::PosForce { .. } => None,
+                    };
+                    self.record_sent_target(entry.joint, sent_frame, mit_params);
                     sent_any = true;
                 }
                 Err(TxRefusal::DeadlinePassed) => {
@@ -4866,7 +4907,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     };
                     d.build_mode_hold_frame(i, modes[i], &eff_hold, dual_hold, slot)
                 }) {
-                    Ok(sent_frame) => self.last_target_frames[i] = Some(sent_frame),
+                    Ok(sent_frame) => {
+                        let mit_params = if self.rollback_requires_fresh(policy) {
+                            (self.default_kp, self.default_kd, 0.0)
+                        } else {
+                            self.resolved_mit_params(&hold[i])
+                        };
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
+                    }
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
                         if fenced {
                             self.trip_fence(MitFenceTripReason::EstopDuringBatch {
@@ -4882,6 +4930,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         if self.base_mode(i) == DamiaoControlMode::PosForce || self.rollback_requires_fresh(policy) {
                             self.joint_modes[i] = None;
                             self.last_target_frames[i] = None;
+                            self.last_mit_params[i] = None;
                         }
                     }
                 }
@@ -5892,7 +5941,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 },
             );
         }
-        self.last_target_frames[joint] = Some(hold);
+        self.record_sent_target(joint, hold, None);
         self.joint_modes[joint] = Some(DamiaoControlMode::PosForce);
         self.pos_force_verified = true;
         tracing::info!("Damiao joint {} confirmed in position-force mode (CTRL_MODE 4); pre-enable hold sent at {:.4} rad", joint + 1, hold_pos);
@@ -6117,7 +6166,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // later recovery can replay one, whatever the disable's outcome (the fence stays
         // armed until the disable is confirmed).
         if self.mit_fence.is_some() || self.mit_fence_trip.is_some() {
-            self.last_target_frames.fill(None);
+            self.clear_cached_targets();
         }
         // Still send disable if draining times out: thermal protection must not
         // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
@@ -6156,7 +6205,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.is_enabled = false;
         self.pending_rearm = true;
         self.pos_force_verified = false;
-        self.last_target_frames.fill(None);
+        self.clear_cached_targets();
         // MIT tracking: the fence stays until every motor is confirmed disabled
         let mit_fenced = self.mit_fence.is_some() || self.mit_fence_trip.is_some();
         self.last_query_instant = Some(self.now());
@@ -6292,16 +6341,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.rx_deadline = None;
         self.rx_frame_limit = None;
         r
-    }
-
-    /// Off-tick transmit helper for startup/commissioning register transactions; handles both
-    /// `WouldBlock` and `ENOBUFS` (`NoBufferSpace`) when `!rt_no_sleep`. Not used on the
-    /// control-tick target path.
-    pub fn transmit_with_retry(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
-        let start_stamp = self.current_stop_stamp();
-        self.send_with_retry(TxKind::ModeWrite, Some(start_stamp), None, false, |_| Some(*frame))
-            .map(|_| ())
-            .map_err(Self::refusal_to_driver_err)
     }
 }
 
@@ -6559,7 +6598,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.can.flush().map_err(|e| format!("flush: {e}"))?;
         }
         // 2. no cached frame may ever be replayed; then the disable of every motor
-        self.last_target_frames.fill(None);
+        self.clear_cached_targets();
         let res = self.set_torque(false);
         let unconfirmed: Vec<String> = (0..self.motor_ids.len()).filter(|&i| {
             !(self.motor_feedback_after(i, self.last_enable_command, self.last_enable_command_rx_seq)
@@ -6890,7 +6929,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             self.refresh_unfinished = 0;
             self.pos_force_verified = false;
-            self.last_target_frames.fill(None);
+            self.clear_cached_targets();
             self.awaiting_rx_boundary = !self.last_read_drained;
             let cmd_start = self.now();
             self.last_enable_command = Some(cmd_start);
@@ -7112,7 +7151,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     d.target_frames_checked(i, &hold_target).ok()?.0.get(slot).copied().flatten()
                 }) {
                     Ok(sent_frame) => {
-                        self.last_target_frames[i] = Some(sent_frame);
+                        let mit_params = self.resolved_mit_params(target);
+                        self.record_sent_target(i, sent_frame, Some(mit_params));
                         sent_any = true;
                     }
                     Err(TxRefusal::Deferred) => {
@@ -7318,7 +7358,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         d.target_frames_checked(i, target).ok()?.0.get(slot).copied().flatten()
                     }) {
                         Ok(sent_frame) => {
-                            self.last_target_frames[i] = Some(sent_frame);
+                            let mit_params = self.resolved_mit_params(target);
+                            self.record_sent_target(i, sent_frame, Some(mit_params));
                         }
                         Err(TxRefusal::Deferred) => {
                             let reason = MitFenceTripReason::TxBudgetExhausted {
@@ -7802,9 +7843,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         }
                         DamiaoControlMode::Mit if d.control_mode == DamiaoControlMode::PosVel => {
                             // A joint switched to MIT by set_joint_modes (gravity compensation):
-                            // repeat the last MIT command instead of inventing gains or dropping
-                            // its torque feed-forward; the supervisor owns the hold decision.
-                            d.last_target_frames[i].filter(|f| f.id == u32::from(id))
+                            // rebuild a fresh stationary MIT hold from current fresh measured state
+                            // (same <= 100 ms + observed-empty receive bound as J7 PosForce) and
+                            // the last MIT gains/torque instead of replaying cached bytes.
+                            let pos = d.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
+                            let (kp, kd, torque) = d.last_mit_params.get(i).copied().flatten()?;
+                            Some(damiao::build_mit_frame(
+                                id,
+                                pos,
+                                0.0,
+                                kp,
+                                kd,
+                                torque,
+                                &d.limits[i],
+                            ))
                         }
                         DamiaoControlMode::Mit => Some(damiao::build_mit_frame(
                             id,
@@ -7823,7 +7875,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         )),
                     }
                 }) {
-                    Ok(_) => true,
+                    Ok(sent_frame) => {
+                        self.last_target_frames[i] = Some(sent_frame);
+                        true
+                    }
                     Err(TxRefusal::Deferred) => break,
                     Err(TxRefusal::StopInhibited | TxRefusal::StopStampChanged) => {
                         self.discard_pending_tx_stopped();

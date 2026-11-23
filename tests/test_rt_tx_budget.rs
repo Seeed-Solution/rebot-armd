@@ -2171,6 +2171,82 @@ fn plain_mode_switch_refuses_pending_or_latched_stop_and_rollback_requires_fresh
 }
 
 #[test]
+fn gravity_comp_recovery_rebuilds_mit_frame_fresh_and_refuses_stale() {
+    let (mut d, bus, clock) = enabled_driver();
+    let mut modes = [JointMode::Position; 7];
+    modes[3] = JointMode::Mit; // J4 in gravity-comp MIT mode
+    d.set_joint_modes(&modes, &targets_const(0.0)).unwrap();
+
+    // Command J4 to target pos=1.25 with explicit MIT gains/torque (kp=12, kd=0.8, tau=1.5),
+    // while the motor's actual measured feedback is at pos=0.30.
+    let mut cmd = targets_const(0.0);
+    cmd[3] = JointTarget {
+        position: 1.25,
+        velocity: Some(0.5),
+        kp: Some(12.0),
+        kd: Some(0.8),
+        torque: Some(1.5),
+    };
+    d.write_joint_targets(&cmd).unwrap();
+    // Establish an observed-empty receive boundary and fresh feedback at measured pos=0.30.
+    d.read_joint_states().unwrap();
+    bus.with(|s| {
+        s.motors[3].2 = 0.30;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+
+    // Advance 50 ms (>= 45 ms recovery threshold, <= 100 ms freshness limit) with silent motors.
+    clock.advance(ms(50));
+    bus.clear();
+    d.read_joint_states().unwrap();
+    let j4_rec: Vec<_> = bus.with(|s| {
+        s.tx_accepted.iter().filter(|f| f.id == 4).copied().collect()
+    });
+    assert_eq!(
+        j4_rec.len(),
+        1,
+        "fresh gravity-comp recovery must send 1 rebuilt MIT hold frame for J4: {j4_rec:?}"
+    );
+    let data = j4_rec[0].data;
+    let lim = b601_limits()[3];
+    let p_u = ((data[0] as u16) << 8) | (data[1] as u16);
+    let v_u = ((data[2] as u16) << 4) | ((data[3] as u16) >> 4);
+    let kp_u = (((data[3] & 0x0f) as u16) << 8) | (data[4] as u16);
+    let kd_u = ((data[5] as u16) << 4) | ((data[6] as u16) >> 4);
+    let t_u = (((data[6] & 0x0f) as u16) << 8) | (data[7] as u16);
+    let wire_p = damiao::uint_to_float(p_u, lim.p_min, lim.p_max, 16);
+    let wire_v = damiao::uint_to_float(v_u, lim.v_min, lim.v_max, 12);
+    let wire_kp = damiao::uint_to_float(kp_u, 0.0, 500.0, 12);
+    let wire_kd = damiao::uint_to_float(kd_u, 0.0, 5.0, 12);
+    let wire_t = damiao::uint_to_float(t_u, lim.t_min, lim.t_max, 12);
+    assert!(
+        (wire_p - 0.30).abs() < 1e-2,
+        "recovery MIT frame must rebuild at fresh measured pos ~0.30, NOT cached target 1.25 (got {wire_p})"
+    );
+    assert!(
+        wire_v.abs() < 2e-2,
+        "recovery MIT hold must zero velocity, NOT replay cached 0.5 (got {wire_v})"
+    );
+    assert!((wire_kp - 12.0).abs() < 0.3, "expected preserved kp ~12.0, got {wire_kp}");
+    assert!((wire_kd - 0.8).abs() < 0.05, "expected preserved kd ~0.8, got {wire_kd}");
+    assert!((wire_t - 1.5).abs() < 0.05, "expected preserved torque ~1.5, got {wire_t}");
+
+    // Advance another 60 ms (feedback age = 110 ms > 100 ms freshness limit) with silent motors:
+    // recovery MUST fail closed and send ZERO MIT frames for J4.
+    clock.advance(ms(60));
+    bus.clear();
+    d.read_joint_states().unwrap();
+    let j4_stale_mit: Vec<_> = bus.with(|s| {
+        s.tx_log.iter().filter(|f| f.id == 4).copied().collect()
+    });
+    assert!(
+        j4_stale_mit.is_empty(),
+        "stale (> 100 ms) gravity-comp recovery must send 0 MIT frames for J4: {j4_stale_mit:?}"
+    );
+}
+
+#[test]
 fn confirmed_handover_and_mit_fresh_status_obey_per_send_stop_gate_and_tx_budget() {
     // Part A: Stop raised during the FIRST confirmation refresh send in `write_modes_confirmed`
     // (`set_joint_modes_confirmed`) -> NO further refresh frames sent, fails closed with EstopInhibited.
