@@ -100,19 +100,16 @@ impl Holds {
         self.log.lock().unwrap_or_else(|e| e.into_inner()).add(r);
     }
 
-    /// Counts any forbidden acquisition/poll attempt on the marked RT control thread (or
-    /// inside an RT release) strictly before asserting and before touching the underlying lock.
+    /// Counts any forbidden acquisition/poll attempt on the marked RT control thread strictly
+    /// before asserting and before touching the underlying lock, and independently enforces
+    /// the `ReleaseGuard` invariant.
     #[inline]
     fn check_not_on_control_thread(&self, site: &'static str) {
-        let on_control = crate::rt_core::executor::on_rt_control_thread();
-        let in_release = crate::rt_core::executor::in_rt_release();
-        if on_control || in_release {
+        if crate::rt_core::executor::on_rt_control_thread() {
             self.control_thread_attempts.fetch_add(1, Ordering::SeqCst);
-            if in_release {
-                crate::rt_core::executor::assert_not_in_rt_release(site);
-            }
             crate::rt_core::executor::assert_not_on_rt_control_thread(site);
         }
+        crate::rt_core::executor::assert_not_in_rt_release(site);
     }
 }
 
@@ -157,8 +154,8 @@ impl<T> SupervisorLock<T> {
     /// Write guards taken so far.
     pub fn generation(&self) -> u64 { self.holds.generation.load(Ordering::Acquire) }
 
-    /// Forbidden acquisition or async-poll attempts observed on a marked RT control thread
-    /// (or inside an RT release). Incremented before asserting and before touching the lock.
+    /// Forbidden acquisition or async-poll attempts observed on a marked RT control thread.
+    /// Incremented before asserting and before touching the lock.
     pub fn control_thread_attempts(&self) -> u64 {
         self.holds.control_thread_attempts.load(Ordering::Acquire)
     }
@@ -167,9 +164,8 @@ impl<T> SupervisorLock<T> {
 
     #[track_caller]
     pub fn read(&self) -> impl Future<Output = SupReadGuard<'_, T>> + '_ {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::read");
-        let called = Instant::now();
         GuardedFuture {
             holds: self.holds.as_ref(),
             site: "SupervisorLock::read",
@@ -182,18 +178,16 @@ impl<T> SupervisorLock<T> {
 
     #[track_caller]
     pub fn try_read(&self) -> Result<SupReadGuard<'_, T>, TryLockError> {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::try_read");
-        let called = Instant::now();
         let guard = self.lock.try_read()?;
         Ok(SupReadGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
     }
 
     #[track_caller]
     pub fn write(&self) -> impl Future<Output = SupWriteGuard<'_, T>> + '_ {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::write");
-        let called = Instant::now();
         GuardedFuture {
             holds: self.holds.as_ref(),
             site: "SupervisorLock::write",
@@ -207,9 +201,8 @@ impl<T> SupervisorLock<T> {
 
     #[track_caller]
     pub fn try_write(&self) -> Result<SupWriteGuard<'_, T>, TryLockError> {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::try_write");
-        let called = Instant::now();
         let guard = self.lock.try_write()?;
         self.bump();
         Ok(SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds })
@@ -217,9 +210,8 @@ impl<T> SupervisorLock<T> {
 
     #[track_caller]
     pub fn blocking_write(&self) -> SupWriteGuard<'_, T> {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::blocking_write");
-        let called = Instant::now();
         let guard = self.lock.blocking_write();
         self.bump();
         SupWriteGuard { guard: ManuallyDrop::new(guard), t: Timing { location, called, acquired: Instant::now() }, holds: &self.holds }
@@ -227,9 +219,8 @@ impl<T> SupervisorLock<T> {
 
     #[track_caller]
     pub fn write_owned(self: Arc<Self>) -> impl Future<Output = SupOwnedWriteGuard<T>> {
-        let location = Location::caller();
+        let (location, called) = (Location::caller(), Instant::now());
         self.holds.check_not_on_control_thread("SupervisorLock::write_owned");
-        let called = Instant::now();
         let holds = Arc::clone(&self.holds);
         GuardedFuture {
             holds,

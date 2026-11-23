@@ -131,17 +131,25 @@ impl Drop for ReleaseGuard {
 
 /// RAII thread-local guard marking the RT executor control thread (`armd-control`) from
 /// thread entry to exit, independent of [`ReleaseGuard`].
-pub struct ControlThreadGuard(bool);
+///
+/// Intentionally `!Send` and `!Sync` so the guard is always dropped on the thread it marked.
+pub struct ControlThreadGuard {
+    prev: bool,
+    _not_send: std::marker::PhantomData<*mut ()>,
+}
 
 impl ControlThreadGuard {
     pub fn enter() -> Self {
-        Self(ON_RT_CONTROL_THREAD.with(|flag| flag.replace(true)))
+        Self {
+            prev: ON_RT_CONTROL_THREAD.with(|flag| flag.replace(true)),
+            _not_send: std::marker::PhantomData,
+        }
     }
 }
 
 impl Drop for ControlThreadGuard {
     fn drop(&mut self) {
-        ON_RT_CONTROL_THREAD.with(|flag| flag.set(self.0));
+        ON_RT_CONTROL_THREAD.with(|flag| flag.set(self.prev));
     }
 }
 
