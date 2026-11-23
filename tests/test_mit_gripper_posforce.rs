@@ -59,6 +59,13 @@ fn pos_force_frame_bytes() {
     assert_eq!(f.data, [0x00, 0x00, 0x80, 0x3F, 0x1E, 0x00, 0xDC, 0x00]);
     assert_eq!(damiao::pos_force_vel_raw(2.0), 200);
     assert_eq!(damiao::pos_force_vel_raw(-0.304), 30);
+    assert_eq!(damiao::pos_force_vel_raw(0.306), 30, "must quantize downward so wire speed <= ceiling");
+    assert_eq!(damiao::pos_force_vel_raw(0.3099), 30);
+    assert_eq!(damiao::pos_force_vel_raw(0.29), 28, "0.29_f32 is 0.28999999...; strict f64 floor avoids exceeding speed_rad_s");
+    for v in [0.29_f32, 0.30, 0.304, 0.306, 0.3099, 2.0] {
+        let raw = damiao::pos_force_vel_raw(v);
+        assert!(f64::from(raw) / 100.0 <= f64::from(v.abs()), "v={v} raw={raw} exceeded speed_rad_s");
+    }
     assert_eq!(damiao::pos_force_vel_raw(f32::NAN), 0);
     assert_eq!(damiao::pos_force_vel_raw(1e9), u16::MAX);
 }
@@ -436,7 +443,217 @@ fn recovery_hold_of_a_stale_j7_is_capped() {
     let _ = d.read_joint_states();
     let j7 = j7_commands(&bus.tx_log());
     assert!(!j7.is_empty(), "no recovery frame for the stale J7: {:?}", bus.tx_log());
-    assert!(j7.iter().all(|f| f.id == 0x307 && u16::from_le_bytes([f.data[6], f.data[7]]) == RAW), "{j7:?}");
+    let close_raw = damiao::pos_force_vel_raw(0.30);
+    assert!(j7.iter().all(|f| {
+        f.id == 0x307
+            && u16::from_le_bytes([f.data[4], f.data[5]]) <= close_raw
+            && u16::from_le_bytes([f.data[6], f.data[7]]) == RAW
+    }), "{j7:?}");
+}
+
+#[test]
+fn stale_j7_recovery_caps_speed_and_fails_closed_without_fresh_feedback() {
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    d.write_joint_targets(&targets(-1.0)).unwrap();
+    // Drain both the empty-queue boundary and the pending replies of write_joint_targets at t=0.
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    let close_raw = damiao::pos_force_vel_raw(0.30);
+
+    // 1. Brief 50 ms gap (still within 100 ms freshness bound): recovery hold stays at <= close_speed (30, not 200).
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(50));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    bus.clear_log();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    let j7 = j7_commands(&bus.tx_log());
+    assert!(!j7.is_empty(), "expected capped hold at 50 ms");
+    for f in &j7 {
+        let pos = f32::from_le_bytes([f.data[0], f.data[1], f.data[2], f.data[3]]);
+        let vel = u16::from_le_bytes([f.data[4], f.data[5]]);
+        let cur = u16::from_le_bytes([f.data[6], f.data[7]]);
+        assert_eq!(f.id, 0x307);
+        assert!((pos - (-1.0)).abs() < 1e-3, "pos={pos}");
+        assert!(vel <= close_raw, "recovery bypassed close_speed: vel_raw={vel} > {close_raw}");
+        assert_eq!(cur, RAW);
+    }
+
+    // 2. Past 100 ms freshness bound (120 ms, still < 250 ms so arm stays enabled):
+    //    no fresh J7 feedback -> recovery must emit no J7 motion command (fail closed; 0xCC refresh only).
+    clock.advance(Duration::from_millis(70));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    bus.clear_log();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    let log = bus.tx_log();
+    assert!(j7_commands(&log).is_empty(), "emitted J7 motion frame without fresh feedback: {:?}", j7_commands(&log));
+    assert!(log.iter().any(|f| f.id == 0x7FF && f.data[0] == 7 && f.data[2] == 0xCC), "expected 0xCC refresh: {log:?}");
+
+    // 3. While J7 feedback is stale (> 100 ms), write_joint_targets must refuse the batch
+    //    before sending any frame (no changed target reaches J7 during the outage).
+    bus.clear_log();
+    let stale_err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
+    assert!(stale_err.contains("feedback stale"), "{stale_err}");
+    assert!(bus.tx_log().is_empty(), "frames sent during J7 stale outage: {:?}", bus.tx_log());
+
+    // 4. Fresh feedback returns with jaw physically opened to -2.5: ramping back toward -1.0 closes at <= close_speed;
+    //    a non-finite J7 target refuses the entire batch before sending J1-J6; strictly opening allows opening speed.
+    bus.with(|s| {
+        s.motors[J7].mute_feedback = false;
+        s.motors[J7].q = -2.5;
+        s.push_all_feedback();
+    });
+    d.read_joint_states().unwrap();
+    bus.clear_log();
+    let nan_err = d.write_joint_targets(&targets(f32::NAN)).unwrap_err().to_string();
+    assert!(nan_err.contains("not finite"), "{nan_err}");
+    assert!(bus.tx_log().is_empty(), "partial J1-J6 batch sent on non-finite J7 target: {:?}", bus.tx_log());
+
+    d.write_joint_targets(&targets(-1.0)).unwrap();
+    let close_cmd = j7_commands(&bus.tx_log());
+    assert_eq!(close_cmd.len(), 1);
+    assert_eq!(u16::from_le_bytes([close_cmd[0].data[4], close_cmd[0].data[5]]), close_raw);
+    assert_eq!(u16::from_le_bytes([close_cmd[0].data[6], close_cmd[0].data[7]]), RAW);
+
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    bus.clear_log();
+    d.write_joint_targets(&targets(-2.0)).unwrap();
+    let open_cmd = j7_commands(&bus.tx_log());
+    assert_eq!(open_cmd.len(), 1);
+    assert_eq!(u16::from_le_bytes([open_cmd[0].data[4], open_cmd[0].data[5]]), damiao::pos_force_vel_raw(2.0));
+
+    // 5. Non-0.01-multiple close_speed_rad_s (0.306) must quantize downward to raw 30 (0.30 <= 0.306),
+    //    never rounding up to raw 31 (0.31 > 0.306) on closing frames or stale recovery holds.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock.clone());
+    bus.with(|s| { s.motors[J7].q = -1.0; });
+    let mut cfg = pf();
+    cfg.close_speed_rad_s = 0.306;
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(cfg).unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    d.set_torque(true).unwrap();
+    bus.clear_log();
+    d.write_joint_targets(&targets(-0.5)).unwrap();
+    let close_306 = j7_commands(&bus.tx_log());
+    assert_eq!(u16::from_le_bytes([close_306[0].data[4], close_306[0].data[5]]), 30);
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(50));
+    bus.with(|s| for i in 0..6 { s.push_feedback(i); });
+    bus.clear_log();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    let rec_306 = j7_commands(&bus.tx_log());
+    assert!(!rec_306.is_empty());
+    assert!(rec_306.iter().all(|f| u16::from_le_bytes([f.data[4], f.data[5]]) == 30), "{rec_306:?}");
+}
+
+#[test]
+fn pos_force_mid_batch_expiry_and_invalid_handover_fail_closed() {
+    use armd::driver::JointMode;
+
+    // 1. Mid-batch expiry: feedback is 99 ms old at batch entry, J1-J6 take 1 ms each ->
+    //    J7 is 105 ms old when its frame is built -> write_joint_targets returns Err and emits NO 0x307 frame.
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(99));
+    bus.with(|s| s.tx_step = Duration::from_millis(1));
+    bus.clear_log();
+    let err = d.write_joint_targets(&targets(-2.0)).unwrap_err().to_string();
+    assert!(err.contains("feedback stale"), "{err}");
+    assert!(j7_commands(&bus.tx_log()).is_empty(), "emitted 0x307 after mid-batch expiry: {:?}", j7_commands(&bus.tx_log()));
+
+    // 2. WouldBlock stall crossing 100 ms: single-joint pos-force driver at 99 ms tries once,
+    //    stall advances clock to 101 ms -> retry re-checks freshness and fails closed without a 2nd attempt.
+    let clock = MockClock::new();
+    let one_limit = vec![b601_limits()[J7]];
+    let bus = FakeBus::with_clock(&one_limit, clock.clone());
+    bus.with(|s| { s.motors[0].q = -1.0; });
+    let mut one_pf = pf();
+    one_pf.joint = 0;
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1])
+        .with_joint_limits(one_limit).unwrap()
+        .with_gripper_pos_force(one_pf).unwrap();
+    d.read_joint_states().unwrap();
+    bus.with(|s| s.push_all_feedback());
+    d.read_joint_states().unwrap();
+    d.check_mapping_ranges();
+    d.set_torque(true).unwrap();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    clock.advance(Duration::from_millis(99));
+    bus.with(|s| { s.tx_stall = true; s.stall_step = Duration::from_millis(2); });
+    bus.clear_log();
+    let err = d.write_joint_targets(&[JointTarget::position(-2.0)]).unwrap_err().to_string();
+    assert!(err.contains("feedback stale before transmit"), "{err}");
+    assert_eq!(bus.tx_log().len(), 1, "retried transmit past freshness bound: {:?}", bus.tx_log());
+
+    // 3. Non-finite velocity (NaN / Inf) on an opening target refuses the entire batch before J1.
+    let (mut d, bus, _) = rig(true);
+    d.set_torque(true).unwrap();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    for bad_vel in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        bus.clear_log();
+        let mut t = targets(-2.0);
+        t[J7].velocity = Some(bad_vel);
+        let err = d.write_joint_targets(&t).unwrap_err().to_string();
+        assert!(err.contains("not finite"), "bad_vel={bad_vel}: {err}");
+        assert!(bus.tx_log().is_empty(), "sent partial batch for bad_vel={bad_vel}: {:?}", bus.tx_log());
+    }
+
+    // 4. Mode handover back to Position (PosForce) while enabled with invalid hold or stale feedback
+    //    must refuse BEFORE writing CTRL_MODE (both set_joint_modes and set_joint_modes_confirmed).
+    let (mut d, bus, clock) = rig(true);
+    d.set_torque(true).unwrap();
+    d.read_joint_states().unwrap();
+    d.read_joint_states().unwrap();
+    let mut mit_modes = vec![JointMode::Position; 7];
+    mit_modes[J7] = JointMode::Mit;
+    let pos_modes = vec![JointMode::Position; 7];
+    let valid_hold = targets(-1.0);
+    d.set_joint_modes(&mit_modes, &valid_hold).unwrap();
+    assert_eq!(d.joint_control_modes()[J7], Some(DamiaoControlMode::Mit));
+
+    // 4a. NaN hold position
+    let mut nan_hold = valid_hold.clone();
+    nan_hold[J7].position = f32::NAN;
+    bus.clear_log();
+    let err = d.set_joint_modes(&pos_modes, &nan_hold).unwrap_err().to_string();
+    assert!(err.contains("mode switch refused"), "{err}");
+    assert!(bus.tx_log().is_empty(), "wrote CTRL_MODE on NaN hold: {:?}", bus.tx_log());
+
+    // 4b. Infinite hold velocity
+    let mut inf_hold = valid_hold.clone();
+    inf_hold[J7].velocity = Some(f32::INFINITY);
+    bus.clear_log();
+    let err = d.set_joint_modes(&pos_modes, &inf_hold).unwrap_err().to_string();
+    assert!(err.contains("mode switch refused"), "{err}");
+    assert!(bus.tx_log().is_empty(), "wrote CTRL_MODE on Inf velocity hold: {:?}", bus.tx_log());
+
+    // 4c. Stale feedback (> 100 ms) refuses both set_joint_modes and set_joint_modes_confirmed before CTRL_MODE write
+    bus.with(|s| s.motors[J7].mute_feedback = true);
+    clock.advance(Duration::from_millis(120));
+    bus.clear_log();
+    let err = d.set_joint_modes(&pos_modes, &valid_hold).unwrap_err().to_string();
+    assert!(err.contains("mode switch refused"), "{err}");
+    assert!(bus.tx_log().is_empty(), "set_joint_modes wrote CTRL_MODE while stale: {:?}", bus.tx_log());
+
+    bus.clear_log();
+    let err = d.set_joint_modes_confirmed(&pos_modes, &valid_hold).unwrap_err().to_string();
+    assert!(err.contains("mode switch refused"), "{err}");
+    assert!(bus.tx_log().is_empty(), "set_joint_modes_confirmed wrote CTRL_MODE while stale: {:?}", bus.tx_log());
 }
 
 #[test]

@@ -2691,53 +2691,109 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         )
     }
 
+    /// Fresh, finite measured position of joint `i` with a provable receive-age bound:
+    /// both the decode instant and the prior observed-empty receive-queue boundary must
+    /// exist and be within `max_age` (samples queued before the first empty queue have
+    /// unknown age and return `None`).
+    fn fresh_measured_position(&self, i: usize, max_age: Duration) -> Option<f32> {
+        let fresh_rx = self.last_feedback_instant.get(i).copied().flatten()
+            .is_some_and(|t| self.since(t) <= max_age);
+        let fresh_bound = self.feedback_queue_bound.get(i).copied().flatten()
+            .is_some_and(|b| self.since(b) <= max_age);
+        if !(fresh_rx && fresh_bound) { return None; }
+        self.cached_states.get(i).map(|s| s.position).filter(|p| p.is_finite())
+    }
+
     /// Final writer of the position-force gripper: the configured current ceiling on every frame;
-    /// the speed field is the requested speed (`target.velocity`, else the POS_VEL ceiling),
-    /// limited to `close_speed_rad_s` when the frame moves the jaw toward `closed_rad`.
+    /// requires finite position/velocity and provably fresh measured feedback (<= 100 ms), failing
+    /// closed (`None`) otherwise. The speed field is the requested speed (`target.velocity`, else
+    /// the POS_VEL ceiling), limited to `close_speed_rad_s` unless fresh finite feedback proves
+    /// the frame moves the jaw strictly toward `open_rad`.
     fn pos_force_frame(&self, i: usize, target: &JointTarget) -> Option<CanFrame> {
         let pf = self.pos_force.as_ref().filter(|pf| pf.joint == i)?;
-        let requested = target.velocity.filter(|v| v.is_finite() && *v != 0.0).map_or(self.vlim(), f32::abs).min(self.vlim());
-        let measured = self.cached_states.get(i).map_or(target.position, |s| s.position);
-        let closing = (target.position - measured) * (pf.closed_rad - pf.open_rad) > 0.0;
-        let speed = if closing { requested.min(pf.close_speed_rad_s) } else { requested };
+        if !target.position.is_finite() || target.velocity.is_some_and(|v| !v.is_finite()) {
+            return None;
+        }
+        let measured = self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE)?;
+        let requested = target.velocity.filter(|v| *v != 0.0).map_or(self.vlim(), f32::abs).min(self.vlim());
+        let strictly_opening = (target.position - measured) * (pf.closed_rad - pf.open_rad) < 0.0;
+        let speed = if strictly_opening { requested } else { requested.min(pf.close_speed_rad_s) };
         Some(damiao::build_pos_force_frame(damiao::POS_FORCE_BASE_ID, self.motor_ids[i], target.position,
             damiao::pos_force_vel_raw(speed), pf.current_raw))
     }
 
     /// Hold frames of joint `i` in `mode` (`dual`: its mode is unknown, so both position
-    /// kinds; a position-force joint never gets a POS_VEL frame).
-    fn mode_frames(&self, i: usize, mode: DamiaoControlMode, hold: &JointTarget, dual: bool) -> Vec<CanFrame> {
-        let pos = |d: &Self| if d.base_mode(i) == DamiaoControlMode::PosForce { d.pos_force_frame(i, hold) } else { Some(d.pos_vel_frame(i, hold.position)) };
+    /// kinds; a position-force joint never gets a POS_VEL frame and returns `None` when no
+    /// valid capped hold frame can be built).
+    fn mode_frames(&self, i: usize, mode: DamiaoControlMode, hold: &JointTarget, dual: bool) -> Option<Vec<CanFrame>> {
         match mode {
-            DamiaoControlMode::PosForce => self.pos_force_frame(i, hold).into_iter().collect(),
-            _ if dual => pos(self).into_iter().chain(Some(self.mit_frame(i, hold))).collect(),
-            DamiaoControlMode::Mit => vec![self.mit_frame(i, hold)],
-            DamiaoControlMode::PosVel => vec![self.pos_vel_frame(i, hold.position)],
+            DamiaoControlMode::PosForce => Some(vec![self.pos_force_frame(i, hold)?]),
+            _ if dual => {
+                let pos = if self.base_mode(i) == DamiaoControlMode::PosForce {
+                    self.pos_force_frame(i, hold)?
+                } else {
+                    self.pos_vel_frame(i, hold.position)
+                };
+                Some(vec![pos, self.mit_frame(i, hold)])
+            }
+            DamiaoControlMode::Mit => Some(vec![self.mit_frame(i, hold)]),
+            DamiaoControlMode::PosVel => Some(vec![self.pos_vel_frame(i, hold.position)]),
         }
+    }
+
+    /// Validate that every position-force joint switching into `PosForce` can produce a valid
+    /// capped hold frame before any `CTRL_MODE` write goes on the bus.
+    fn validate_pos_force_holds(&self, joints: &[usize], modes: &[DamiaoControlMode], hold: &[JointTarget], require_when_disabled: bool) -> Result<(), ArmDriverError> {
+        for &i in joints {
+            if modes[i] == DamiaoControlMode::PosForce && (require_when_disabled || self.is_enabled) && self.pos_force_frame(i, &hold[i]).is_none() {
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "joint {} position-force mode switch refused: hold target invalid or feedback stale", i + 1)));
+            }
+        }
+        Ok(())
     }
 
     /// The frames of joint `i`'s target in its confirmed mode (one, or both kinds while its mode
     /// is unconfirmed), on the stack: the control tick's write does not allocate. A position-force
-    /// joint with an unconfirmed mode gets none (`target_frames_refused` refuses the batch first).
-    fn target_frames(&self, i: usize, target: &JointTarget) -> impl Iterator<Item = CanFrame> {
-        let (a, b) = match self.joint_modes[i] {
-            Some(DamiaoControlMode::PosVel) => (Some(self.pos_vel_frame(i, target.position)), None),
-            Some(DamiaoControlMode::Mit) => (Some(self.mit_frame(i, target)), None),
-            Some(DamiaoControlMode::PosForce) => (self.pos_force_frame(i, target), None),
-            None if self.base_mode(i) == DamiaoControlMode::PosForce => (None, None),
-            None => (Some(self.pos_vel_frame(i, target.position)), Some(self.mit_frame(i, target))),
-        };
-        a.into_iter().chain(b)
+    /// joint fails closed (`Err`) if its mode is unconfirmed, its feedback aged past the freshness
+    /// bound, or its target is non-finite.
+    fn target_frames_checked(&self, i: usize, target: &JointTarget) -> Result<([Option<CanFrame>; 2], Option<usize>), ArmDriverError> {
+        match self.joint_modes[i] {
+            Some(DamiaoControlMode::PosVel) => Ok(([Some(self.pos_vel_frame(i, target.position)), None], None)),
+            Some(DamiaoControlMode::Mit) => Ok(([Some(self.mit_frame(i, target)), None], None)),
+            Some(DamiaoControlMode::PosForce) => match self.pos_force_frame(i, target) {
+                Some(f) => Ok(([Some(f), None], Some(i))),
+                None => Err(ArmDriverError::HardwareFault(format!(
+                    "joint {} position-force feedback stale or target invalid, no frame sent", i + 1))),
+            },
+            None if self.base_mode(i) == DamiaoControlMode::PosForce => Err(ArmDriverError::HardwareFault(format!(
+                "joint {} position-force mode not confirmed: capped operation unavailable, no frame sent", i + 1))),
+            None => Ok(([Some(self.pos_vel_frame(i, target.position)), Some(self.mit_frame(i, target))], None)),
+        }
     }
 
     /// A batch is refused before its first frame when the position-force gripper's mode is not
-    /// confirmed: capped operation is unavailable and no speculative frame is sent.
-    fn target_frames_refused(&self) -> Option<ArmDriverError> {
+    /// confirmed, its target position or velocity is non-finite, or J7 lacks provably fresh
+    /// feedback: capped operation is unavailable (or holding with no motion) and no partial or
+    /// speculative frame is sent.
+    fn target_frames_refused(&self, targets: &[JointTarget]) -> Option<ArmDriverError> {
         let pf = self.pos_force.as_ref()?;
-        (self.joint_modes.get(pf.joint).copied().flatten() != Some(DamiaoControlMode::PosForce)
-            && self.joint_modes.get(pf.joint).copied().flatten() != Some(DamiaoControlMode::Mit))
-            .then(|| ArmDriverError::HardwareFault(format!(
-                "joint {} position-force mode not confirmed: capped operation unavailable, no frame sent", pf.joint + 1)))
+        let mode = self.joint_modes.get(pf.joint).copied().flatten();
+        if mode != Some(DamiaoControlMode::PosForce) && mode != Some(DamiaoControlMode::Mit) {
+            return Some(ArmDriverError::HardwareFault(format!(
+                "joint {} position-force mode not confirmed: capped operation unavailable, no frame sent", pf.joint + 1)));
+        }
+        if mode == Some(DamiaoControlMode::PosForce) {
+            if targets.get(pf.joint).is_some_and(|t| !t.position.is_finite() || t.velocity.is_some_and(|v| !v.is_finite())) {
+                return Some(ArmDriverError::Protocol(format!(
+                    "joint {} position-force target is not finite, no frame sent", pf.joint + 1)));
+            }
+            if self.fresh_measured_position(pf.joint, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+                return Some(ArmDriverError::HardwareFault(format!(
+                    "joint {} position-force feedback stale: holding (no motion), no frame sent", pf.joint + 1)));
+            }
+        }
+        None
     }
 
     /// Poll feedback until every `(joint, write, rid)` has a reply or the timeout passes.
@@ -2822,6 +2878,18 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut unsent = Vec::new();
         let mut hold_failed = Vec::new();
         for &i in joints {
+            // Build hold frames before writing CTRL_MODE so an enabled position-force joint
+            // never switches mode without a valid capped hold frame. A position-force restore
+            // (torque off, before the enable) sends no hold here.
+            let frames = if restoring_pos_force(self, i, modes[i]) {
+                Vec::new()
+            } else {
+                let Some(frames) = self.mode_frames(i, modes[i], &hold[i], dual_hold) else {
+                    unsent.push(i);
+                    continue;
+                };
+                frames
+            };
             let id = self.motor_ids[i];
             if self.transmit_with_retry(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
                 unsent.push(i);
@@ -2829,8 +2897,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             // The hold frame directly follows the mode write on the bus, so the time a
             // joint spends in the new mode without a target is one frame (about 0.13 ms).
-            // A position-force restore (torque off, before the enable) sends no hold.
-            let frames = if restoring_pos_force(self, i, modes[i]) { Vec::new() } else { self.mode_frames(i, modes[i], &hold[i], dual_hold) };
             let mut all_holds_ok = true;
             for frame in frames {
                 let sent = self.transmit_with_retry(&frame).is_ok();
@@ -2839,7 +2905,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 }
                 all_holds_ok &= sent;
             }
-            if !all_holds_ok && strict {
+            if !all_holds_ok && (strict || self.base_mode(i) == DamiaoControlMode::PosForce) {
                 hold_failed.push(i);
             }
         }
@@ -2875,7 +2941,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             {
                 self.joint_modes[i] = Some(w.modes[i]);
             } else {
-                if strict {
+                if strict || self.base_mode(i) == DamiaoControlMode::PosForce {
                     self.joint_modes[i] = None;
                 }
                 failed.push(i);
@@ -2983,13 +3049,19 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Target-frame transmit: up to 3 WouldBlock retries 100 µs apart, and before every attempt
-    /// the MIT fence (`fenced`, deadline inclusive) and the E-stop gate: a stop or an expiry
-    /// between two attempts of one frame sends nothing more.
-    fn transmit_target(&mut self, frame: &CanFrame, fenced: bool) -> Result<(), ArmDriverError> {
+    /// the MIT fence (`fenced`, deadline inclusive), the E-stop gate, and (for position-force
+    /// joints) feedback freshness: a stop or expiry between two attempts sends nothing more.
+    fn transmit_target(&mut self, frame: &CanFrame, fenced: bool, pos_force_joint: Option<usize>) -> Result<(), ArmDriverError> {
         let mut retries = 0;
         loop {
             if fenced { self.fence_check()?; }
             self.estop_check()?;
+            if let Some(j) = pos_force_joint {
+                if self.fresh_measured_position(j, POS_FORCE_FEEDBACK_MAX_AGE).is_none() {
+                    return Err(ArmDriverError::HardwareFault(format!(
+                        "joint {} position-force feedback stale before transmit", j + 1)));
+                }
+            }
             match self.can.transmit(frame) {
                 Ok(()) => return Ok(()),
                 Err(TransportError::WouldBlock) if retries < 3 => {
@@ -3053,12 +3125,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let mut failed: Vec<usize> = Vec::new();
         let mut hold_started: Vec<(usize, Instant)> = Vec::new();
         for &i in joints {
+            let Some(frames) = self.mode_frames(i, modes[i], &hold[i], dual_hold) else {
+                failed.push(i);
+                continue;
+            };
             let id = self.motor_ids[i];
             if self.tx_mit(&damiao::build_set_control_mode_frame(id, Self::mode_value(modes[i]))).is_err() {
                 failed.push(i);
                 continue;
             }
-            let frames = self.mode_frames(i, modes[i], &hold[i], dual_hold);
             hold_started.push((i, self.now()));
             for frame in frames {
                 if self.tx_mit(&frame).is_ok() { self.last_target_frames[i] = Some(frame); } else if !failed.contains(&i) { failed.push(i); }
@@ -3082,8 +3157,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.await_replies_after(&expected, sent);
         let ack_seq: Vec<Option<u64>> = pending.iter().map(|&i| {
             let (id, want) = (self.motor_ids[i], Self::mode_value(modes[i]));
+            let expected_id = self.expected_reply_id(i);
+            let check_id = self.base_mode(i) == DamiaoControlMode::PosForce;
             self.register_reply_log.iter().rev()
-                .find(|(r, _, _, seq, _)| r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE && *seq > sent && r.as_u32() == want)
+                .find(|(r, fid, _, seq, _)| (!check_id || *fid == expected_id) && r.motor_id == id && r.write && r.rid == damiao::RID_CTRL_MODE && *seq > sent && r.as_u32() == want)
                 .map(|(_, _, _, seq, _)| *seq)
         }).collect();
         if ack_seq.iter().any(Option::is_none) { why = "matching acknowledgement received after the mode write"; }
@@ -3138,6 +3215,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }).collect();
         let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
         if changing.is_empty() { return Ok(()); }
+        self.validate_pos_force_holds(&changing, &target, hold, true)?;
         let to_mit: Vec<usize> = changing.iter().copied()
             .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
         for &i in &to_mit {
@@ -3323,8 +3401,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn pos_force_write_refused(&self, stray: &[usize]) -> Option<ArmDriverError> {
         let j = self.pos_force.as_ref()?.joint;
         if !stray.contains(&j) { return None; }
-        let fresh = self.last_feedback_instant[j].is_some_and(|t| self.since(t) <= POS_FORCE_FEEDBACK_MAX_AGE)
-            && self.feedback_queue_bound[j].is_some_and(|b| self.since(b) <= POS_FORCE_FEEDBACK_MAX_AGE);
+        let fresh = self.fresh_measured_position(j, POS_FORCE_FEEDBACK_MAX_AGE).is_some();
         let still = self.cached_states[j].velocity.is_finite() && self.cached_states[j].velocity.abs() <= 0.05;
         let off = !self.is_enabled && self.motor_status[j] == 0;
         (!(fresh && still && off)).then(|| ArmDriverError::HardwareFault(format!(
@@ -3749,6 +3826,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }).collect();
         let changing: Vec<usize> = (0..n).filter(|&i| self.joint_modes[i] != Some(target[i])).collect();
         if changing.is_empty() { return Ok(()); }
+        self.validate_pos_force_holds(&changing, &target, hold, false)?;
         let to_mit: Vec<usize> = changing.iter().copied()
             .filter(|&i| target[i] == DamiaoControlMode::Mit && !self.mit_limits_verified[i]).collect();
         if !to_mit.is_empty() { self.verify_mit_limits(&to_mit)?; }
@@ -4051,7 +4129,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             // success of a torque transition is withheld until it is confirmed: no target before
             return Err(ArmDriverError::Protocol("torque transition pending: no target before its confirmation".into()));
         }
-        if let Some(e) = self.target_frames_refused() { return Err(e); }
+        if let Some(e) = self.target_frames_refused(targets) { return Err(e); }
         match self.control_mode {
             DamiaoControlMode::PosVel if self.mit_fence.is_some() || self.mit_fence_trip.is_some() => {
                 // MIT tracking owns joints: the fence is checked before every transmit; a failed
@@ -4065,14 +4143,21 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     return Err(ArmDriverError::JointCountMismatch { expected: started.len(), actual: targets.len() });
                 }
                 for (i, target) in targets.iter().enumerate() {
-                    for frame in self.target_frames(i, target) {
+                    let (frames, pf_joint) = match self.target_frames_checked(i, target) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            self.trip_fence(format!("joint {} target unavailable after {i} of {} joints: {e}", i + 1, targets.len()));
+                            return Err(e);
+                        }
+                    };
+                    for frame in frames.into_iter().flatten() {
                         if let Err(e) = self.estop_check() {
                             // a partial batch under MIT: the group trips (no cached output)
                             self.trip_fence(format!("E-stop during the batch after {i} of {} joints", targets.len()));
                             return Err(e);
                         }
                         if started[i].is_none() { started[i] = Some(self.now()); }
-                        if let Err(e) = self.transmit_target(&frame, true) {
+                        if let Err(e) = self.transmit_target(&frame, true, pf_joint) {
                             if is_estop_inhibited(&e) {
                                 self.trip_fence(format!("E-stop between transmit attempts to joint {} after {i} of {} joints", i + 1, targets.len()));
                             } else {
@@ -4096,15 +4181,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // Per joint: POS_VEL, MIT for joints switched by set_joint_modes, both when unconfirmed;
                 // position-force (current-capped) for the gripper in that mode.
                 for (i, target) in targets.iter().enumerate() {
-                    for frame in self.target_frames(i, target) {
+                    let (frames, pf_joint) = self.target_frames_checked(i, target)?;
+                    for frame in frames.into_iter().flatten() {
                         self.estop_check()?;
-                        self.transmit_target(&frame, false)?;
+                        self.transmit_target(&frame, false, pf_joint)?;
                         self.last_target_frames[i] = Some(frame);
                     }
                 }
             }
             DamiaoControlMode::Mit => {
                 for (i, target) in targets.iter().enumerate() {
+                    if self.base_mode(i) == DamiaoControlMode::PosForce {
+                        let (frames, pf_joint) = self.target_frames_checked(i, target)?;
+                        for frame in frames.into_iter().flatten() {
+                            self.estop_check()?;
+                            self.transmit_target(&frame, false, pf_joint)?;
+                            self.last_target_frames[i] = Some(frame);
+                        }
+                        continue;
+                    }
                     let kp = target.kp.unwrap_or(self.default_kp);
                     let kd = target.kd.unwrap_or(self.default_kd);
                     let vel = target.velocity.unwrap_or(0.0);
@@ -4123,7 +4218,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         &self.limits[i],
                     );
                     self.estop_check()?;
-                    self.transmit_target(&frame, false)?;
+                    self.transmit_target(&frame, false, None)?;
                     self.last_target_frames[i] = Some(frame);
                 }
             }
@@ -4325,9 +4420,23 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 };
                 match mode {
                     DamiaoControlMode::PosForce => {
-                        // capped hold at the measured position
-                        if let Some(frame) = self.pos_force_frame(i, &JointTarget::position(p)) {
-                            recovery_sent = self.can.transmit(&frame).is_ok();
+                        // Hold at the measured position only while feedback is still within the
+                        // pos-force freshness bound (<= 100 ms), always capped at <= close_speed_rad_s
+                        // (never comparing a cached position against itself to bypass the closing limit).
+                        // Without fresh feedback, fail closed: emit no motion frame (the read-only
+                        // 0xCC refresh below polls for fresh telemetry).
+                        if let (Some(pf), Some(pos)) = (
+                            self.pos_force.as_ref().filter(|pf| pf.joint == i),
+                            self.fresh_measured_position(i, POS_FORCE_FEEDBACK_MAX_AGE),
+                        ) {
+                            let hold = JointTarget {
+                                position: pos,
+                                velocity: Some(pf.close_speed_rad_s),
+                                ..JointTarget::position(pos)
+                            };
+                            if let Some(frame) = self.pos_force_frame(i, &hold) {
+                                recovery_sent = self.can.transmit(&frame).is_ok();
+                            }
                         }
                     }
                     DamiaoControlMode::Mit if self.control_mode == DamiaoControlMode::PosVel => {
