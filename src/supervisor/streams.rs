@@ -761,6 +761,9 @@ impl SupervisorInner {
             stop_reason: None,
             max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
             step_stats: crate::policy_runtime::PolicyStepStats::default(),
+            authorization: crate::policy_runtime::PolicyAuthorization::default(),
+            max_vision_age_ms: None,
+            vision_stale_hold: false,
         };
         self.last_policy_obs = Some(run.to_observation(true));
         self.set_action_policy_stats(action_id, run.step_stats.report());
@@ -1084,6 +1087,8 @@ impl SupervisorInner {
     /// is checked against the measured pose with the first-step limit.
     pub fn hold_policy_run(&mut self, action_id: u64) {
         let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live) else { return; };
+        // a target computed before the hold and still waiting in the mailbox is not applied
+        run.authorization.revoke();
         run.last_live_target = None;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
@@ -1095,6 +1100,15 @@ impl SupervisorInner {
     pub fn set_policy_max_input_age(&mut self, action_id: u64, max_ms: u64) {
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
             run.max_input_age_ms = max_ms;
+        }
+    }
+
+    /// Set the camera-sample age bound the RT applies when it consumes a target of the run
+    /// (the vision spec's staleness), and whether an older target holds the run.
+    pub fn set_policy_max_vision_age(&mut self, action_id: u64, max_ms: Option<u64>, hold_on_stale: bool) {
+        if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+            run.max_vision_age_ms = max_ms;
+            run.vision_stale_hold = hold_on_stale;
         }
     }
 
