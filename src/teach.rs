@@ -294,6 +294,17 @@ impl ArmSupervisor {
     }
 }
 
+/// Collects a stop fence's frames on a blocking thread: [`Fence::collect`] takes the
+/// recording ring's consumer mutex, which a preempted dispatcher can hold, so it must not run
+/// on an async worker (it would stall unrelated requests on a single-worker runtime).
+///
+/// [`Fence::collect`]: crate::rt_core::record_ring::Fence::collect
+async fn collect_fence(fence: Option<crate::rt_core::record_ring::Fence>) -> Result<crate::rt_core::record_ring::Finished, ArmError> {
+    let Some(fence) = fence else { return Ok(Default::default()); };
+    tokio::task::spawn_blocking(move || fence.collect()).await
+        .map_err(|e| ArmError::Internal(format!("recording frame collection failed: {e}")))
+}
+
 async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<SupervisorInner>>, by: Stopper, save: bool, outcome: Option<&str>, writer: Option<ParquetWriter>) -> Result<Stopped, ArmError> {
         let outcome = outcome.unwrap_or("ok");
         if !["ok", "aborted"].contains(&outcome) { return Err(rejected(400, "INVALID_COMMAND", "outcome must be \"ok\" or \"aborted\"")); }
@@ -329,7 +340,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 // stop fence; the ring's samples are dropped after the guard is released
                 let fence = inner.core.record.end();
                 drop(inner);
-                drop(fence.map(crate::rt_core::record_ring::Fence::collect));
+                if let Err(e) = collect_fence(fence).await { tracing::warn!("{e}"); }
                 tracing::info!("Recording {} discarded", r.id);
                 return Ok(Stopped::Discarded);
             }
@@ -352,7 +363,14 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
         };
         // the ring's frames of this session (a recorder without a session kept them itself)
         let (frames, dropped) = match fence {
-            Some(f) => { let done = f.collect(); (done.frames, done.dropped) }
+            Some(f) => match collect_fence(Some(f)).await {
+                Ok(done) => (done.frames, done.dropped),
+                Err(e) => {
+                    // the recorder is finalizing: end it as failed so a new recording can start
+                    lock.write().await.recorder.finish_save(Vec::new(), Err(ParquetRecordingError::Io(std::io::Error::other(e.to_string()))))?;
+                    return Err(e);
+                }
+            },
             None => (direct_frames, 0),
         };
         if dropped > 0 {
