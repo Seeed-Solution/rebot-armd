@@ -1417,6 +1417,10 @@ body::before {
 .safety-row .sw.holding .sw-track .thumb { width: 22px; }
 .safety-row .sw-text b { font-size: 14px; white-space: nowrap; }
 .safety-row .sw-text small { font-size: 10px; line-height: 1.2; }
+/* "⚠️ 点击复位急停" / "Tap to reset E-Stop" is longer than "Enable": it wraps instead of being cut off, and the
+   hint under it gives way (the safety card's note says the same) */
+.safety-row #enable-txt { white-space: normal; overflow-wrap: break-word; line-height: 1.2; }
+.safety-row .sw.clear .sw-text small { display: none; }
 .safety-row .btn-estop { padding: 0 10px; gap: 6px; font-size: 15px; }
 .safety-row .btn-estop svg { width: 18px; height: 18px; flex: none; }
 .safety-row .btn-estop small { font-size: 10px; }
