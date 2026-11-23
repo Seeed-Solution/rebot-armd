@@ -10,7 +10,8 @@
 //! that publishes it, and the consumer's swap that takes it acquires them; the same holds in
 //! the other direction for a slot the consumer hands back (it may have taken a value out).
 
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -33,15 +34,18 @@ pub struct Producer<T> {
 }
 
 /// Reading side. Not `Clone`: exactly one consumer (wrap it in a mutex for several readers).
+/// Not `Sync`: [`front`](Self::front) hands out `&T` without requiring `T: Sync`, so a
+/// shared `&Consumer` must not cross threads (it is `Send` and can move to one).
 pub struct Consumer<T> {
     shared: Arc<Shared<T>>,
     front: usize,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 /// A triple buffer whose slots start as `a`, `b`, `c` (back, middle, front).
 pub fn triple_buffer<T: Send>(a: T, b: T, c: T) -> (Producer<T>, Consumer<T>) {
     let shared = Arc::new(Shared { slots: [UnsafeCell::new(a), UnsafeCell::new(b), UnsafeCell::new(c)], middle: AtomicUsize::new(1) });
-    (Producer { shared: shared.clone(), back: 0 }, Consumer { shared, front: 2 })
+    (Producer { shared: shared.clone(), back: 0 }, Consumer { shared, front: 2, _not_sync: PhantomData })
 }
 
 impl<T> Producer<T> {
@@ -85,6 +89,17 @@ impl<T> Consumer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time: `Consumer<T>` is never `Sync` (even for `T: Sync`), but it is `Send`.
+    // `<C as NotSync<_>>::CHECK` is ambiguous, and fails to compile, when `C: Sync`.
+    trait NotSync<A> { const CHECK: () = (); }
+    impl<T: ?Sized> NotSync<()> for T {}
+    #[allow(dead_code)]
+    struct IsSync;
+    impl<T: ?Sized + Sync> NotSync<IsSync> for T {}
+    const _: () = <Consumer<std::cell::Cell<u32>> as NotSync<_>>::CHECK;
+    const _: () = <Consumer<u32> as NotSync<_>>::CHECK;
+    fn _consumer_is_send<T: Send>() { fn send<S: Send>() {} send::<Consumer<T>>(); }
 
     #[test]
     fn newest_wins_and_nothing_is_read_twice() {
