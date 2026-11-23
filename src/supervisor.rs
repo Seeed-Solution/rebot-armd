@@ -29,6 +29,7 @@ mod actions;
 /// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
 /// and the policy runner submit through it once they route through the mailbox.
 pub use streams::targets;
+pub use driver_transitions::{PanicDisableOutcome, PANIC_DISABLE_TIMEOUT};
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -1603,7 +1604,9 @@ impl SupervisorInner {
     }
 
     pub fn shutdown_ready(&self) -> bool {
-        if self.disable_pending || self.gravity_comp.is_some() { return false; }
+        if self.disable_pending || self.gravity_comp.is_some() || self.torque_transition_pending() {
+            return false;
+        }
         match &self.driver {
             None => !self.is_torqued,
             Some(driver) => !self.is_torqued
@@ -4452,6 +4455,64 @@ impl ArmSupervisor {
     }
 
     /// Authoritative shutdown gate routed through whichever single owner holds `ArmCore`.
+    /// Bounded last-chance hardware disable for the legacy control-thread panic handler.
+    /// Latches E-stop immediately and attempts one disable through the legacy driver within
+    /// `timeout` without ever blocking indefinitely (even if another task holds `inner` or a
+    /// blocking transport syscall stalls).
+    pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>, deadline: Instant| -> PanicDisableOutcome {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = loop {
+                    if let Ok(g) = inner.try_write() {
+                        break g;
+                    }
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        return PanicDisableOutcome::TimedOut;
+                    }
+                    std::thread::sleep(rem.min(Duration::from_millis(2)));
+                };
+                if guard.detached {
+                    return PanicDisableOutcome::NoDriver;
+                }
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return PanicDisableOutcome::TimedOut;
+                }
+                guard.attempt_panic_disable(rem)
+            }))
+            .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during legacy panic-disable".into()))
+        };
+
+        let deadline = Instant::now() + timeout;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let inner = Arc::clone(&self.inner);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            match std::thread::Builder::new()
+                .name("armd-panic-disable".into())
+                .spawn(move || {
+                    let outcome = run_inline(inner, deadline);
+                    let _ = tx.send(outcome);
+                }) {
+                Ok(_) => match rx.recv_timeout(timeout) {
+                    Ok(outcome) => outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PanicDisableOutcome::TimedOut,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        PanicDisableOutcome::Failed("panic-disable helper thread disconnected".into())
+                    }
+                },
+                Err(_) => run_inline(Arc::clone(&self.inner), deadline),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            run_inline(Arc::clone(&self.inner), deadline)
+        }
+    }
+
     pub async fn request_shutdown(&self) -> Result<bool, ArmError> {
         match self.owner_mode() {
             OWNER_EXECUTOR => match self.executor_handle() {

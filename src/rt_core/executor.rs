@@ -2109,6 +2109,13 @@ fn control_thread_main(
         if let Err(err) = step_res {
             e_stop_latched.store(true, Ordering::SeqCst);
             tracing::error!("RT executor thread panicked during release: {:?}", err);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.core.attempt_panic_disable(crate::supervisor::PANIC_DISABLE_TIMEOUT)
+            }))
+            .unwrap_or_else(|_| {
+                crate::supervisor::PanicDisableOutcome::Failed("secondary panic during RT executor panic-disable".into())
+            });
+            outcome.log("RT executor panic", crate::supervisor::PANIC_DISABLE_TIMEOUT);
             match cfg.panic_policy {
                 PanicPolicy::AbortProcess => {
                     crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));

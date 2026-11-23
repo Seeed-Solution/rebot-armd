@@ -2450,6 +2450,9 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pending_rearm: bool,
     last_query_instant: Option<Instant>,
     last_enable_command: Option<Instant>,
+    /// `rx_seq` snapshot when `last_enable_command` was recorded so pre-command feedback cannot
+    /// satisfy `enable_state()` even if a virtual clock does not advance between receive and send.
+    last_enable_command_rx_seq: Option<u64>,
     awaiting_rx_boundary: bool,
     is_enabling: bool,
     last_warn_sec: AtomicU64,
@@ -2581,6 +2584,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             pending_rearm: true,
             last_query_instant: None,
             last_enable_command: None,
+            last_enable_command_rx_seq: None,
             awaiting_rx_boundary: false,
             is_enabling: false,
             last_warn_sec: AtomicU64::new(0),
@@ -3624,6 +3628,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.enable_estop_inhibited()?;
         let handshake_start = self.now();
         self.last_enable_command = Some(handshake_start);
+        self.last_enable_command_rx_seq = Some(self.rx_seq);
         self.last_feedback_instant.fill(None);
 
         for i in 0..self.motor_ids.len() {
@@ -3768,6 +3773,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         };
         let cmd_start = self.now();
         self.last_enable_command = Some(cmd_start);
+        self.last_enable_command_rx_seq = Some(self.rx_seq);
         let mut last_err = None;
         for &id in &self.motor_ids {
             let frame = damiao::build_disable_frame(id);
@@ -3934,11 +3940,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn enable_state(&self) -> EnableState {
-        if self.awaiting_rx_boundary {
+        if self.awaiting_rx_boundary || self.motor_status.is_empty() {
             return EnableState::Unknown;
         }
-        if self.last_feedback_instant.iter().any(|t| {
-            self.last_enable_command.is_some_and(|command| t.is_none_or(|sample| sample < command))
+        // Every motor must have reported feedback since startup, and (once an enable or
+        // disable request has been issued) strictly after that request. Initial zeroed
+        // `motor_status` without observed feedback never proves `Disabled`.
+        if self.last_feedback_instant.iter().enumerate().any(|(i, t)| {
+            t.is_none_or(|sample| {
+                self.last_enable_command.is_some_and(|command| sample < command)
+                    || self.last_enable_command_rx_seq.is_some_and(|seq| self.last_feedback_seq[i] <= seq)
+            })
         }) {
             return EnableState::Unknown;
         }
@@ -3956,12 +3968,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             } else {
                 EnableState::Unknown
             }
+        } else if self.motor_status.iter().all(|&state| state == 0) {
+            EnableState::Disabled
         } else {
-            if self.motor_status.iter().all(|&state| state == 0) {
-                EnableState::Disabled
-            } else {
-                EnableState::Unknown
-            }
+            EnableState::Unknown
         }
     }
 
@@ -4673,6 +4683,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.awaiting_rx_boundary = false;
                         self.last_feedback_instant.fill(None);
                         self.last_enable_command = Some(self.now());
+                        self.last_enable_command_rx_seq = Some(self.rx_seq);
                     }
                     break;
                 }

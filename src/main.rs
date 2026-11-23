@@ -516,6 +516,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(e) = tick_res {
                         control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                         error!("Control thread panicked during tick: {:?}", e);
+                        let outcome = control_supervisor
+                            .attempt_legacy_panic_disable(armd::supervisor::PANIC_DISABLE_TIMEOUT);
+                        outcome.log("Legacy control thread panic", armd::supervisor::PANIC_DISABLE_TIMEOUT);
                         armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
                         std::process::exit(1);
                     }

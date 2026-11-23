@@ -13,6 +13,117 @@ use crate::driver::handshake::Deadline;
 pub const DISABLE_CONFIRM_WINDOW: Duration = Duration::from_millis(25);
 /// Interval between services of [`DisableConfirm`] in the blocking `request_disable`.
 pub const DISABLE_CONFIRM_SERVICE: Duration = Duration::from_millis(2);
+/// Upper wall-clock bound for last-chance hardware disable attempts on panic or forced teardown.
+pub const PANIC_DISABLE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Result of a bounded last-chance hardware disable attempt on a panic or forced teardown path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanicDisableOutcome {
+    /// No hardware driver attached (driverless mock).
+    NoDriver,
+    /// Disable command sent and fresh hardware feedback confirmed `EnableState::Disabled`.
+    Confirmed,
+    /// Disable command sent (or driver lacks enable feedback), but confirmation was not observed within the bound.
+    Unconfirmed,
+    /// Owner lock acquisition or blocking driver call exceeded the time bound.
+    TimedOut,
+    /// Disable transmission or teardown raised an error or secondary panic.
+    Failed(String),
+}
+
+impl PanicDisableOutcome {
+    pub fn is_confirmed(&self) -> bool {
+        matches!(self, Self::Confirmed | Self::NoDriver)
+    }
+
+    pub fn log(&self, context: &str, timeout: Duration) {
+        match self {
+            Self::NoDriver => {
+                tracing::warn!("{context}: no hardware driver attached (driverless); torque-off confirmed");
+            }
+            Self::Confirmed => {
+                tracing::warn!("{context}: bounded hardware torque disable CONFIRMED");
+            }
+            Self::Unconfirmed => {
+                tracing::error!(
+                    "{context}: bounded hardware torque disable sent but NOT CONFIRMED within {} ms; torque may still be ON",
+                    timeout.as_millis()
+                );
+            }
+            Self::TimedOut => {
+                tracing::error!(
+                    "{context}: bounded hardware torque disable TIMED OUT after {} ms; torque may still be ON",
+                    timeout.as_millis()
+                );
+            }
+            Self::Failed(err) => {
+                tracing::error!(
+                    "{context}: bounded hardware torque disable FAILED ({err}); torque may still be ON"
+                );
+            }
+        }
+    }
+}
+
+/// Attempts one bounded hardware torque disable directly through the bus owner's driver.
+/// Never blocks indefinitely when the driver implements non-blocking `begin_torque`/`poll_torque`;
+/// wall-clock bounded to `timeout`.
+pub fn bounded_panic_disable_driver(drv: &mut dyn ArmDriver, timeout: Duration) -> PanicDisableOutcome {
+    let wall_deadline = Instant::now() + timeout;
+    let driver_deadline = drv.clock_now() + timeout;
+    let begin_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.begin_torque(false)));
+    let mut progress = match begin_res {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
+        Err(_) => return PanicDisableOutcome::Failed("driver panicked during begin_torque(false)".into()),
+    };
+
+    while matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
+        let now_wall = Instant::now();
+        if now_wall >= wall_deadline {
+            break;
+        }
+        let poll_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.poll_torque(driver_deadline)));
+        match poll_res {
+            Ok(Ok(p)) => progress = p,
+            Ok(Err(e)) => return PanicDisableOutcome::Failed(e.to_string()),
+            Err(_) => return PanicDisableOutcome::Failed("driver panicked during poll_torque(disable)".into()),
+        }
+        if matches!(progress, crate::driver::TorqueProgress::Pending { .. }) {
+            let rem = wall_deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+        }
+    }
+
+    if !drv.capabilities().enable_feedback {
+        return PanicDisableOutcome::Unconfirmed;
+    }
+    if DisableConfirm::confirmed(drv) {
+        return PanicDisableOutcome::Confirmed;
+    }
+    while Instant::now() < wall_deadline {
+        let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drv.read_joint_states()));
+        if read_res.is_err() {
+            return PanicDisableOutcome::Failed("driver panicked while confirming disable".into());
+        }
+        if DisableConfirm::confirmed(drv) {
+            return PanicDisableOutcome::Confirmed;
+        }
+        let rem = wall_deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        std::thread::sleep(rem.min(DISABLE_CONFIRM_SERVICE));
+    }
+    if DisableConfirm::confirmed(drv) {
+        PanicDisableOutcome::Confirmed
+    } else {
+        PanicDisableOutcome::Unconfirmed
+    }
+}
 
 /// Result of one budgeted [`DisableConfirm::serve_budgeted`] call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1363,6 +1474,25 @@ impl SupervisorInner {
             return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
         }
         self.clear_fault_finish()
+    }
+
+    /// Bounded last-chance disable on a panic or forced teardown path owned by this `SupervisorInner`.
+    pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.disable_requested();
+        let Some(ref d) = self.driver else {
+            self.disable_confirmed();
+            return PanicDisableOutcome::NoDriver;
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut drv = d.lock().unwrap_or_else(|e| e.into_inner());
+            bounded_panic_disable_driver(&mut **drv, timeout)
+        }))
+        .unwrap_or_else(|_| PanicDisableOutcome::Failed("panic during driver panic-disable".into()));
+        if outcome == PanicDisableOutcome::Confirmed {
+            self.disable_confirmed();
+        }
+        outcome
     }
 
     pub fn driver_feedback_confirmed(&self) -> bool {

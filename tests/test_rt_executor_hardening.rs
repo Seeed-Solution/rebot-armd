@@ -24,13 +24,13 @@ use armd::driver::{
 use armd::model::{ArmConfig, JointState};
 use armd::protocol::damiao::DamiaoLimits;
 use armd::rt_core::broker::{ClientId, Outcome, Reply, RequestId, Submit, TransitionOp};
-use armd::rt_core::executor::{ExecutorConfig, RtExecutorHandle};
+use armd::rt_core::executor::{ExecutorConfig, PanicPolicy, PersistTestHooks, RtExecutorHandle};
 use armd::rt_core::urgent::EstopGate;
 use armd::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, RETIRED_STATE_CAPACITY};
 use armd::sim_driver::{SimArmDriver, SimCommand, SimState};
-use armd::supervisor::ArmSupervisor;
+use armd::supervisor::{ArmSupervisor, PanicDisableOutcome};
 use armd::tracking::JointTrackingConfig;
-use armd::transport::{CanFrame, CanTransport, DriverClock, MockClock, TransportError};
+use armd::transport::{CanFrame, CanTransport, DriverClock, MockCanTransport, MockClock, TransportError};
 use mit_support::FakeBus;
 
 #[global_allocator]
@@ -758,4 +758,216 @@ async fn sim_driver_rt_single_transport_writer_and_nonblocking_under_contended_r
     r2_tx.send(()).unwrap();
     holder_c.join().unwrap();
     h_c.stop_and_join();
+}
+
+// ============================================================================
+// 5. Fresh Damiao enable_state Unknown, shutdown gate refusal, and panic disable
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damiao_fresh_unknown_shutdown_gate_and_panic_disable_paths() {
+    let feedback_frame = |id: u8, state: u8| {
+        CanFrame::new_standard(0x10 + id as u16, &[state << 4 | id, 0x80, 0, 0x80, 0x08, 0, 30, 32]).unwrap()
+    };
+
+    // (a) Fresh Damiao driver with no feedback MUST NOT report Disabled; partial feedback is still Unknown.
+    let mut fresh = DamiaoArmDriver::new(MockCanTransport::new(), vec![1, 2]);
+    assert_eq!(fresh.enable_state(), EnableState::Unknown, "fresh Damiao driver without feedback must be Unknown");
+    fresh.can_mut().provide_rx_frame(feedback_frame(1, 0));
+    fresh.read_joint_states().unwrap();
+    assert_eq!(
+        fresh.enable_state(),
+        EnableState::Unknown,
+        "partial startup feedback must not report Disabled"
+    );
+    fresh.can_mut().provide_rx_frame(feedback_frame(2, 0));
+    fresh.read_joint_states().unwrap();
+    assert_eq!(
+        fresh.enable_state(),
+        EnableState::Disabled,
+        "state-0 feedback from every motor after startup confirms Disabled"
+    );
+
+    // On a frozen MockClock, pre-disable state-0 feedback must NOT satisfy enable_state() after begin_torque(false).
+    let frozen_clock = MockClock::new();
+    let frozen_bus = FakeBus::with_clock(&dm_limits(), frozen_clock.clone());
+    frozen_bus.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let mut frozen_drv = DamiaoArmDriver::new(frozen_bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    frozen_drv.read_joint_states().unwrap();
+    assert_eq!(frozen_drv.enable_state(), EnableState::Disabled);
+    let _ = frozen_drv.begin_torque(false).unwrap();
+    assert_eq!(
+        frozen_drv.enable_state(),
+        EnableState::Unknown,
+        "pre-disable feedback on frozen clock must not confirm Disabled"
+    );
+    frozen_bus.with(|s| s.push_all_feedback());
+    let _ = frozen_drv.poll_torque(frozen_clock.now() + Duration::from_millis(50)).unwrap();
+    assert_eq!(frozen_drv.enable_state(), EnableState::Disabled);
+
+    // (b) Shutdown gate refuses fresh Damiao driver (Unknown) until disable feedback arrives (Legacy + Executor).
+    let bus_gate = FakeBus::new(&dm_limits());
+    bus_gate.with(|s| {
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+    });
+    let drv_gate = DamiaoArmDriver::new(bus_gate.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    let sup_gate = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_gate)));
+    sup_gate.set_lease_enabled(false).await;
+    assert!(!sup_gate.shutdown_ready().await, "shutdown_ready must refuse fresh Damiao Unknown state");
+    assert!(
+        !sup_gate.request_shutdown().await.unwrap(),
+        "request_shutdown must refuse Unknown state before any feedback arrives"
+    );
+    let h_gate = sup_gate
+        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(1), || h_gate.stats().steps.load(Ordering::Relaxed) >= 3).await;
+    assert!(
+        !sup_gate.shutdown_ready().await,
+        "executor shutdown_ready must continue refusing Unknown with silent motors"
+    );
+    assert!(
+        !sup_gate.request_shutdown().await.unwrap(),
+        "executor request_shutdown must refuse Unknown until disable feedback arrives"
+    );
+    // Once state-0 feedback arrives from every motor, shutdown gate confirms.
+    bus_gate.with(|s| {
+        for m in &mut s.motors {
+            m.silent = false;
+        }
+        s.push_all_feedback();
+    });
+    wait_until_async(Duration::from_secs(1), || {
+        h_gate.shutdown_ready().unwrap_or(false)
+    })
+    .await;
+    assert!(sup_gate.request_shutdown().await.unwrap());
+    h_gate.shutdown_and_join().unwrap();
+
+    // (c) Executor panic path issues disable frames (CMD_DISABLE) to all 7 motors on virtual bus and confirms.
+    let bus_panic = FakeBus::new(&dm_limits());
+    bus_panic.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv_panic = DamiaoArmDriver::new(bus_panic.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_panic.read_joint_states().unwrap();
+    drv_panic.check_mapping_ranges();
+    let sup_panic = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_panic)));
+    sup_panic.set_lease_enabled(false).await;
+    // Enable torque before transfer so the arm is physically energized when the executor panics.
+    sup_panic.set_torque(true).await.unwrap();
+    assert!(bus_panic.with(|s| s.motors.iter().all(|m| m.enabled)));
+    bus_panic.with(|s| s.tx_log.clear());
+
+    let mut cfg_panic = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg_panic.panic_policy = PanicPolicy::StopExecutor;
+    let hooks_panic = PersistTestHooks { panic_on_release: Some(2), ..Default::default() };
+    let h_panic = sup_panic.start_executor_with_hooks(cfg_panic, hooks_panic).await.unwrap();
+    wait_until_async(Duration::from_secs(2), || h_panic.is_exited()).await;
+    assert!(sup_panic.e_stop_latched.load(Ordering::SeqCst));
+    let (all_disabled, disable_ids) = bus_panic.with(|s| {
+        let ids: Vec<u32> = s
+            .tx_log
+            .iter()
+            .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+            .map(|f| f.id)
+            .collect();
+        (s.motors.iter().all(|m| !m.enabled), ids)
+    });
+    assert!(all_disabled, "all 7 virtual motors must be disabled by executor panic path");
+    for motor_id in 1u32..=7 {
+        assert!(
+            disable_ids.contains(&motor_id),
+            "missing CMD_DISABLE frame for motor {motor_id} in executor panic tx_log: {disable_ids:?}"
+        );
+    }
+    h_panic.stop_and_join();
+
+    // (d) Executor panic with completely silent motors stays bounded within timeout (never hangs).
+    let bus_silent = FakeBus::new(&dm_limits());
+    bus_silent.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv_silent = DamiaoArmDriver::new(bus_silent.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_silent.read_joint_states().unwrap();
+    drv_silent.check_mapping_ranges();
+    let sup_silent = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_silent)));
+    sup_silent.set_lease_enabled(false).await;
+    sup_silent.set_torque(true).await.unwrap();
+    bus_silent.with(|s| {
+        for m in &mut s.motors {
+            m.silent = true;
+        }
+        s.tx_log.clear();
+    });
+    let mut cfg_silent = ExecutorConfig::for_tests(Duration::from_millis(5));
+    cfg_silent.panic_policy = PanicPolicy::StopExecutor;
+    let t_silent = Instant::now();
+    let h_silent = sup_silent
+        .start_executor_with_hooks(cfg_silent, PersistTestHooks { panic_on_release: Some(2), ..Default::default() })
+        .await
+        .unwrap();
+    wait_until_async(Duration::from_secs(2), || h_silent.is_exited()).await;
+    assert!(t_silent.elapsed() < Duration::from_millis(1200), "silent panic disable took {:?}", t_silent.elapsed());
+    assert!(
+        bus_silent.with(|s| s.tx_log.iter().any(|f| f.data == armd::protocol::damiao::CMD_DISABLE)),
+        "silent executor panic path must still issue CMD_DISABLE frames"
+    );
+    h_silent.stop_and_join();
+
+    // (e) Legacy panic disable helper issues disable frames on virtual bus and bounds lock contention.
+    let bus_leg = FakeBus::new(&dm_limits());
+    bus_leg.with(|s| {
+        s.immediate_replies = true;
+        s.push_all_feedback();
+    });
+    let mut drv_leg = DamiaoArmDriver::new(bus_leg.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv_leg.read_joint_states().unwrap();
+    drv_leg.check_mapping_ranges();
+    let sup_leg = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_leg)));
+    sup_leg.set_lease_enabled(false).await;
+    sup_leg.set_torque(true).await.unwrap();
+    bus_leg.with(|s| s.tx_log.clear());
+
+    let sup_leg_ref = sup_leg.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        sup_leg_ref.attempt_legacy_panic_disable(Duration::from_millis(250))
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, PanicDisableOutcome::Confirmed);
+    assert!(bus_leg.with(|s| s.motors.iter().all(|m| !m.enabled)));
+    assert!(bus_leg.with(|s| {
+        (1u32..=7).all(|id| s.tx_log.iter().any(|f| f.id == id && f.data == armd::protocol::damiao::CMD_DISABLE))
+    }));
+
+    // Held supervisor write lock -> bounded TimedOut without blocking indefinitely.
+    let _hold = sup_leg.inner().write().await;
+    let sup_leg_timeout = sup_leg.clone();
+    let t_to = Instant::now();
+    let outcome_to = tokio::task::spawn_blocking(move || {
+        sup_leg_timeout.attempt_legacy_panic_disable(Duration::from_millis(60))
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome_to, PanicDisableOutcome::TimedOut);
+    assert!(t_to.elapsed() < Duration::from_millis(400), "bounded timeout overran: {:?}", t_to.elapsed());
 }
