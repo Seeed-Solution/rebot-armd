@@ -1213,8 +1213,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let sup = reader_supervisor.clone();
                 let stop_gen = reader_stop_gen.clone();
                 let cancel_tx = reader_cancel_tx.clone();
-                let ord_q = reader_ordinary_queue.clone();
-                let writer_c = reader_writer.clone();
                 tokio::spawn(async move {
                     let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
                         Ok((state, epoch)) => (
@@ -1228,15 +1226,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             (r, sup.hub().latest().map(|s| s.obs.epoch_id))
                         }
                     };
-                    let next_gen = stop_gen.fetch_add(1, Ordering::SeqCst) + 1;
-                    let _ = cancel_tx.send(Some(CancelSignal { gen: next_gen, code: "ESTOP_ACTIVE", epoch: cancel_epoch }));
-                    let cancelled = ord_q.drain_cancellable("ESTOP_ACTIVE", cancel_epoch);
                     if let Some(permit) = permit {
                         permit.send(reply);
                     }
-                    for r in cancelled {
-                        if !writer_c.send_ordinary_control(r).await { break; }
-                    }
+                    let next_gen = stop_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = cancel_tx.send(Some(CancelSignal { gen: next_gen, code: "ESTOP_ACTIVE", epoch: cancel_epoch }));
                 });
                 if fatal_or_closed { break; }
                 continue;
@@ -1450,6 +1444,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             let mut r = json!({"type":"command_reject", "request_id":check.request_id, "status":409, "code":sig.code, "error":sig.code, "message":"Stopped before the action began"});
                             if let Some(ep) = sig.epoch { r["epoch_id"] = json!(ep); }
                             if !worker_writer.send_ordinary_control(r).await { break; }
+                            let mut failed = false;
+                            for queued_reply in worker_ordinary_queue.drain_cancellable(sig.code, sig.epoch) {
+                                if !worker_writer.send_ordinary_control(queued_reply).await {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                            if failed { break; }
                         }
                     }
                     continue;
