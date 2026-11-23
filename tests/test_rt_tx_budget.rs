@@ -349,12 +349,12 @@ fn queue_full_would_block_and_enobufs_defer_and_count_without_sleeping() {
 
 #[test]
 fn mid_batch_stop_and_estop_drop_pending_motion_frames() {
-    // Part A: authorized stop (StopRequests via EstopGate::with_stops) arriving mid-batch drops pending frames.
+    // Part A: authorized stop (StopRequests via set_stop_gate) arriving mid-batch drops pending frames.
     let (mut d, bus, clock) = enabled_driver();
     let req = Arc::new(AtomicU64::new(0));
     let app = Arc::new(AtomicU64::new(0));
     let stops = StopRequests::new();
-    d.set_estop_gate(EstopGate::new(req.clone(), app.clone()).with_stops(stops.clone()));
+    d.set_stop_gate(req.clone(), app.clone(), Some(stops.clone()));
     d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
 
     // Tick 1 defers J5..J7.
@@ -395,7 +395,7 @@ fn mid_batch_stop_and_estop_drop_pending_motion_frames() {
     let (mut d, bus, _) = enabled_driver();
     let req = Arc::new(AtomicU64::new(0));
     let app = Arc::new(AtomicU64::new(0));
-    d.set_estop_gate(EstopGate::new(req.clone(), app));
+    d.set_stop_gate(req.clone(), app, None);
     let req_hook = req.clone();
     bus.with(|s| {
         s.tx_script.push_back((TxRule::Ok, Duration::ZERO));
@@ -412,6 +412,89 @@ fn mid_batch_stop_and_estop_drop_pending_motion_frames() {
     assert_eq!(d.pending_tx_len(), 0);
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.enobufs, m.dropped_stopped), (1, 1, 6));
+
+    // Part C: deferred targets MUST NOT survive an already-applied ordinary stop (requested == applied).
+    let (mut d, bus, clock) = enabled_driver();
+    let req = Arc::new(AtomicU64::new(0));
+    let app = Arc::new(AtomicU64::new(0));
+    let stops = StopRequests::new();
+    d.set_stop_gate(req.clone(), app.clone(), Some(stops.clone()));
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.45)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    assert_eq!(d.pending_tx_len(), 3);
+    // Request AND immediately apply the stop BEFORE the next driver call (requested == applied).
+    let stop_gen = stops.request();
+    stops.mark_applied(stop_gen);
+    assert!(!stops.pending(), "stop is already applied (requested == applied)");
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(10)); // still fresh (< 45 ms)
+    d.begin_tx_tick();
+    let err = d.drain_pending_tx().unwrap_err();
+    assert!(is_estop_inhibited(&err), "applied stop must invalidate deferred frames: {err:?}");
+    assert!(bus.with(|s| s.tx_log.is_empty()), "no deferred frame may reach the bus after applied stop");
+    assert_eq!(d.pending_tx_len(), 0);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stopped, m.dropped_stale, m.pending), (0, 3, 0, 0));
+
+    // Part D: deferred targets MUST NOT survive an already-applied E-stop (requested == applied).
+    let (mut d, bus, clock) = enabled_driver();
+    let req = Arc::new(AtomicU64::new(0));
+    let app = Arc::new(AtomicU64::new(0));
+    d.set_stop_gate(req.clone(), app.clone(), None);
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.35)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    let estop_gen = req.fetch_add(1, Ordering::SeqCst) + 1;
+    app.store(estop_gen, Ordering::SeqCst);
+    bus.clear();
+    reset_tx_metrics();
+    clock.advance(ms(10)); // still fresh (< 45 ms)
+    d.begin_tx_tick();
+    let err = d.drain_pending_tx().unwrap_err();
+    assert!(is_estop_inhibited(&err), "applied E-stop must invalidate deferred frames: {err:?}");
+    assert!(bus.with(|s| s.tx_log.is_empty()), "no deferred frame may reach the bus after applied E-stop");
+    assert_eq!(d.pending_tx_len(), 0);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stopped, m.pending), (0, 3, 0));
+
+    // Part E: stop requested AND applied mid-batch during J5 transmit drops J6..J7 immediately.
+    let (mut d, bus, clock) = enabled_driver();
+    let req = Arc::new(AtomicU64::new(0));
+    let app = Arc::new(AtomicU64::new(0));
+    let stops = StopRequests::new();
+    d.set_stop_gate(req, app, Some(stops.clone()));
+    d.set_tx_budget(TxBudget { max_frames: 4, max_duration: ms(5), frame_max_age: ms(45) });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets_const(0.25)).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    let stops_hook = stops.clone();
+    bus.clear();
+    reset_tx_metrics();
+    bus.with(|s| {
+        s.on_tx = Some(Arc::new(move |idx, _| {
+            if idx == 0 {
+                let g = stops_hook.request();
+                stops_hook.mark_applied(g);
+            }
+        }));
+    });
+    clock.advance(ms(10));
+    d.begin_tx_tick();
+    let err = d.drain_pending_tx().unwrap_err();
+    assert!(is_estop_inhibited(&err), "{err:?}");
+    assert_eq!(bus.with(|s| s.tx_log.len()), 1, "only J5 sent before applied stop");
+    assert_eq!(d.pending_tx_len(), 0);
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stopped, m.pending), (1, 2, 0));
 }
 
 #[test]

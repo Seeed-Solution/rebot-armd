@@ -445,6 +445,29 @@ fn safety_and_fenced_mit_failure_paths_do_not_allocate_or_free() {
     assert!(matches!(res, Err(ArmDriverError::Transport(TransportError::NoBufferSpace))), "{res:?}");
     assert_eq!((a, f), (0, 0), "unfenced flush ENOBUFS touched allocator");
 
+    // 8b. Drain after an applied stop (requested == applied) invalidates stamped frames — 0 allocs, 0 frees.
+    d.can_mut().flush_err = None;
+    d.set_stop_gate(
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Some(stops.clone()),
+    );
+    d.set_tx_budget(TxBudget {
+        max_frames: 4,
+        max_duration: Duration::from_millis(5),
+        frame_max_age: Duration::from_millis(45),
+    });
+    assert_eq!(
+        d.write_joint_targets_bounded(&targets).unwrap(),
+        TxBatchOutcome::Deferred { pending: 3 }
+    );
+    let g = stops.request();
+    stops.mark_applied(g);
+    d.begin_tx_tick();
+    let (res, a, f) = counted(|| d.drain_pending_tx());
+    assert!(is_estop_inhibited(&res.unwrap_err()));
+    assert_eq!((a, f), (0, 0), "applied-stop invalidation on drain touched allocator");
+
     // 9. Production SocketCAN hard OS error (ENETDOWN) construction + drop through fenced,
     // unfenced, recovery, and refresh paths — 0 allocs, 0 frees.
     #[cfg(target_os = "linux")]

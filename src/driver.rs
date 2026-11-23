@@ -449,6 +449,19 @@ pub trait ArmDriver: Send {
     /// output).
     fn set_estop_gate(&mut self, _gate: crate::rt_core::urgent::EstopGate) {}
 
+    /// Supply monotonic E-stop (`requested`) and authorized-stop ([`crate::rt_core::urgent::StopRequests`])
+    /// generation counters so deferred motion frames stamped at admission are invalidated even after
+    /// a stop has already been applied (`requested == applied`).
+    fn set_stop_generations(
+        &mut self,
+        _estop_requested: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        _stops: Option<crate::rt_core::urgent::StopRequests>,
+    ) {}
+
+    /// Explicitly invalidate any carried-over pending motion frames (e.g. when applying a stop
+    /// through `dyn ArmDriver`). Returns the number of dropped frames.
+    fn invalidate_pending_tx(&mut self) -> usize { 0 }
+
     /// Set the gripper joint index if the arm model defines a gripper
     fn set_gripper_index(&mut self, _index: Option<usize>) {}
 
@@ -2594,6 +2607,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     pending_tx: PendingTxQueue,
     /// Shared TX pass state across `receive_feedback()` and `write_joint_targets*()` in one tick.
     tick_tx: Option<TickTxPass>,
+    /// Monotonic E-stop requested generation counter (for stamping queued motion frames).
+    estop_requested: Option<std::sync::Arc<AtomicU64>>,
+    /// Monotonic authorized-stop generation counter (for stamping queued motion frames).
+    stop_requests: Option<crate::rt_core::urgent::StopRequests>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2603,11 +2620,21 @@ struct TickTxPass {
     backpressured: bool,
 }
 
+/// Generation stamp captured when a motion frame is admitted into [`PendingTxQueue`].
+/// Any E-stop or authorized stop (even after `requested == applied`) changes this stamp so
+/// older deferred frames are never transmitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StopStamp {
+    estop_gen: u64,
+    stop_gen: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingTxFrame {
     joint: usize,
     frame: CanFrame,
     queued_at: Instant,
+    stop_stamp: StopStamp,
     /// Counted once in `tx_deferred` per command instance; reset on in-place target replacement.
     was_deferred: bool,
 }
@@ -2678,11 +2705,39 @@ impl PendingTxQueue {
         dropped
     }
 
+    /// Drop entries whose stop generation stamp no longer matches `current`, compacting in place.
+    fn drop_stopped(&mut self, current: StopStamp) -> usize {
+        let mut write = 0usize;
+        let mut dropped = 0usize;
+        for read in 0..self.len {
+            if let Some(entry) = self.buf[read] {
+                if entry.stop_stamp != current {
+                    dropped += 1;
+                } else {
+                    self.buf[write] = Some(entry);
+                    write += 1;
+                }
+            }
+        }
+        for slot in &mut self.buf[write..self.len] {
+            *slot = None;
+        }
+        self.len = write;
+        dropped
+    }
+
+    /// True if any queued entry carries a stop generation stamp older than `current`.
+    fn has_stopped_entry(&self, current: StopStamp) -> bool {
+        self.buf[..self.len]
+            .iter()
+            .any(|slot| slot.is_some_and(|e| e.stop_stamp != current))
+    }
+
     /// Replace an existing `(joint, frame.id)` slot in place (preserving FIFO position,
     /// dating the replacement from `queued_at` and marking it as a fresh command instance),
     /// or push to the back if capacity permits.
-    fn upsert(&mut self, joint: usize, frame: CanFrame, queued_at: Instant) -> bool {
-        let entry = PendingTxFrame { joint, frame, queued_at, was_deferred: false };
+    fn upsert(&mut self, joint: usize, frame: CanFrame, queued_at: Instant, stop_stamp: StopStamp) -> bool {
+        let entry = PendingTxFrame { joint, frame, queued_at, stop_stamp, was_deferred: false };
         if let Some(idx) = self.find_key(joint, frame.id) {
             self.buf[idx] = Some(entry);
             return true;
@@ -2803,6 +2858,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             tx_budget: TxBudget::default(),
             pending_tx: PendingTxQueue::new(),
             tick_tx: None,
+            estop_requested: None,
+            stop_requests: None,
         }
     }
 
@@ -2826,6 +2883,32 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// independently of `read_joint_states()`.
     pub fn begin_tx_tick(&mut self) {
         self.tick_tx = None;
+    }
+
+    /// Configure E-stop and optional authorized-stop gating together with their monotonic
+    /// generation counters so deferred motion frames stamped at admission cannot survive an
+    /// applied stop (`requested == applied`).
+    pub fn set_stop_gate(
+        &mut self,
+        estop_requested: std::sync::Arc<AtomicU64>,
+        estop_applied: std::sync::Arc<AtomicU64>,
+        stops: Option<crate::rt_core::urgent::StopRequests>,
+    ) {
+        let mut gate = crate::rt_core::urgent::EstopGate::new(estop_requested.clone(), estop_applied);
+        if let Some(ref s) = stops {
+            gate = gate.with_stops(s.clone());
+        }
+        self.estop_gate = Some(gate);
+        self.estop_requested = Some(estop_requested);
+        self.stop_requests = stops;
+    }
+
+    #[inline]
+    fn current_stop_stamp(&self) -> StopStamp {
+        StopStamp {
+            estop_gen: self.estop_requested.as_ref().map_or(0, |a| a.load(Ordering::SeqCst)),
+            stop_gen: self.stop_requests.as_ref().map_or(0, |s| s.current()),
+        }
     }
 
     /// Number of unsent target frames currently queued for the next tick.
@@ -3366,6 +3449,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     /// (zero alloc) instead of reporting `Complete` or carrying over expired frames.
     fn drain_pending_pass(
         &mut self,
+        pass_stop_stamp: StopStamp,
         fail_on_stale_drop: bool,
     ) -> Result<TxBatchOutcome, ArmDriverError> {
         let _ = self.ensure_tx_pass();
@@ -3375,6 +3459,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             if let Err(e) = self.estop_check() {
                 self.discard_pending_tx_stopped();
                 return Err(e);
+            }
+            if entry.stop_stamp != self.current_stop_stamp() {
+                self.discard_pending_tx_stopped();
+                return Err(ArmDriverError::EstopInhibited);
             }
             let now = self.now();
             if now.saturating_duration_since(entry.queued_at) >= self.tx_budget.frame_max_age {
@@ -3399,6 +3487,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.discard_pending_tx_stopped();
                         return Err(estop);
                     }
+                    if self.current_stop_stamp() != pass_stop_stamp {
+                        self.discard_pending_tx_stopped();
+                        return Err(ArmDriverError::EstopInhibited);
+                    }
                     break;
                 }
                 Err(e) => {
@@ -3417,10 +3509,15 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 return Err(e.into());
             }
         }
-        // Unconditional terminal stop check (also catches stop/E-stop raised during final send or flush).
+        // Unconditional terminal stop check (catches pending OR already-applied stops raised
+        // during the final send or flush).
         if let Err(e) = self.estop_check() {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        if self.current_stop_stamp() != pass_stop_stamp {
+            self.discard_pending_tx_stopped();
+            return Err(ArmDriverError::EstopInhibited);
         }
         // Recheck freshness AFTER flush so frames expiring during send or flush never carry over.
         let late_stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
@@ -3460,11 +3557,17 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.discard_pending_tx_stopped();
             return Err(e);
         }
+        // Fail closed if any stop/E-stop was requested and applied since these frames were admitted.
+        let current_stamp = self.current_stop_stamp();
+        if self.pending_tx.has_stopped_entry(current_stamp) {
+            self.discard_pending_tx_stopped();
+            return Err(ArmDriverError::EstopInhibited);
+        }
         let stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if stale > 0 {
             crate::diagnostics::tick::record_tx_dropped_stale(stale as u32);
         }
-        self.drain_pending_pass(false)
+        self.drain_pending_pass(current_stamp, false)
     }
 
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
@@ -4539,6 +4642,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.trip_fence(MitFenceTripReason::EstopBeforeBatch { total_joints });
                 return Err(e);
             }
+            let start_stamp = self.current_stop_stamp();
             let batch_frames: usize = targets.iter().enumerate().map(|(i, t)| self.target_frames(i, t).count()).sum();
             if pass.backpressured {
                 let reason = MitFenceTripReason::TxBackpressuredBeforeBatch;
@@ -4565,13 +4669,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             for (i, target) in targets.iter().enumerate() {
                 for frame in self.target_frames(i, target) {
                     self.fence_check()?;
-                    if let Err(e) = self.estop_check() {
+                    if self.estop_check().is_err() || self.current_stop_stamp() != start_stamp {
                         // a partial batch under MIT: the group trips (no cached output)
                         self.trip_fence(MitFenceTripReason::EstopDuringBatch {
                             completed_joints: i as u8,
                             total_joints,
                         });
-                        return Err(e);
+                        return Err(ArmDriverError::EstopInhibited);
                     }
                     if !self.can_start_tick_tx() {
                         let reason = MitFenceTripReason::TxBudgetExhausted {
@@ -4585,13 +4689,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     self.record_tx_pass_attempt();
                     if let Err(e) = self.transmit_instrumented(&frame) {
                         self.mark_tx_pass_backpressured();
-                        if let Err(estop) = self.estop_check() {
+                        if self.estop_check().is_err() || self.current_stop_stamp() != start_stamp {
                             self.trip_fence(MitFenceTripReason::EstopBetweenAttempts {
                                 joint: (i + 1) as u8,
                                 completed_joints: i as u8,
                                 total_joints,
                             });
-                            return Err(estop);
+                            return Err(ArmDriverError::EstopInhibited);
                         }
                         self.trip_fence(MitFenceTripReason::TransmitFailed {
                             joint: (i + 1) as u8,
@@ -4606,19 +4710,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
             if let Err(e) = self.can.flush() {
                 self.mark_tx_pass_backpressured();
-                if let Err(estop) = self.estop_check() {
+                if self.estop_check().is_err() || self.current_stop_stamp() != start_stamp {
                     self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
-                    return Err(estop);
+                    return Err(ArmDriverError::EstopInhibited);
                 }
                 self.trip_fence(MitFenceTripReason::FlushFailed {
                     kind: TxFailKind::from_transport(&e),
                 });
                 return Err(e.into());
             }
-            // Catch a stop/E-stop raised during the final transmit or flush before committing.
-            if let Err(e) = self.estop_check() {
+            // Catch a stop/E-stop (pending or already applied) raised during the final transmit or flush.
+            if self.estop_check().is_err() || self.current_stop_stamp() != start_stamp {
                 self.trip_fence(MitFenceTripReason::EstopAfterFlush { total_joints });
-                return Err(e);
+                return Err(ArmDriverError::EstopInhibited);
             }
             // a batch completing past the deadline trips and never resets it
             self.fence_check()?;
@@ -4631,6 +4735,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if let Err(e) = self.estop_check() {
             self.discard_pending_tx_stopped();
             return Err(e);
+        }
+        // 1b. Drop any carried-over frames admitted before an already-applied stop/E-stop.
+        let batch_stamp = self.current_stop_stamp();
+        let stopped_carry = self.pending_tx.drop_stopped(batch_stamp);
+        if stopped_carry > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(stopped_carry as u32);
         }
         // 2. Drop stale carried-over frames (inclusive: age >= frame_max_age) before coalescing.
         let stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
@@ -4656,17 +4766,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             });
         }
         // 4. Coalesce current batch into pending slots BEFORE draining: existing keys keep their
-        //    FIFO position (preventing joint starvation) while adopting the newer command payload
-        //    and timestamp so obsolete commands are never replayed over fresher ones.
+        //    FIFO position (preventing joint starvation) while adopting the newer command payload,
+        //    timestamp, and stop-generation stamp so obsolete commands are never replayed.
         let batch_ts = self.now();
         for (i, target) in targets.iter().enumerate() {
             for frame in self.target_frames(i, target) {
-                let ok = self.pending_tx.upsert(i, frame, batch_ts);
+                let ok = self.pending_tx.upsert(i, frame, batch_ts, batch_stamp);
                 debug_assert!(ok, "preflight checked pending queue capacity");
             }
         }
         // 5. Drain FIFO within the shared per-tick TX pass.
-        self.drain_pending_pass(true)
+        self.drain_pending_pass(batch_stamp, true)
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
@@ -4704,6 +4814,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
+    fn set_stop_generations(
+        &mut self,
+        estop_requested: Option<std::sync::Arc<AtomicU64>>,
+        stops: Option<crate::rt_core::urgent::StopRequests>,
+    ) {
+        self.estop_requested = estop_requested;
+        self.stop_requests = stops;
+    }
+    fn invalidate_pending_tx(&mut self) -> usize { self.discard_pending_tx() }
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
@@ -4840,11 +4959,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if self.estop_check().is_err() {
             self.discard_pending_tx_stopped();
         }
+        let rx_stop_stamp = self.current_stop_stamp();
+        let stopped_pending = self.pending_tx.drop_stopped(rx_stop_stamp);
+        if stopped_pending > 0 {
+            crate::diagnostics::tick::record_tx_dropped_stopped(stopped_pending as u32);
+        }
         if rx_drained && self.is_enabled && !self.is_enabling && self.recovery_tx_allowed()
             && self.enable_state() == EnableState::Enabled {
             let n = self.motor_ids.len();
             for i in 0..n {
-                if self.estop_check().is_err() {
+                if self.estop_check().is_err() || self.current_stop_stamp() != rx_stop_stamp {
                     self.discard_pending_tx_stopped();
                     break;
                 }
@@ -4914,7 +5038,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                         self.recovery_written_joints.push(i);
                     }
                 }
-                if self.estop_check().is_err() {
+                if self.estop_check().is_err() || self.current_stop_stamp() != rx_stop_stamp {
                     self.discard_pending_tx_stopped();
                     break;
                 }
