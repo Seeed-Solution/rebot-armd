@@ -77,6 +77,38 @@ fn assert_panics_with(expected_substrings: &[&str], f: impl FnOnce()) {
     }
 }
 
+fn run_bounded_fixture(
+    timeout: Duration,
+    name: &'static str,
+    f: impl FnOnce(Instant) + Send + 'static,
+) {
+    let deadline = Instant::now() + timeout;
+    let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let jh = thread::Builder::new()
+        .name(format!("fixture-{name}"))
+        .spawn(move || {
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(deadline)));
+            let _ = done_tx.send(res.map_err(panic_payload_to_string));
+        })
+        .expect("spawn bounded fixture thread");
+    match done_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => jh.join().expect("fixture thread join"),
+        Ok(Err(msg)) => {
+            let _ = jh.join();
+            panic!("fixture {name} failed: {msg}");
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Do not block on `jh.join()`: fail immediately if startup or teardown stalled.
+            panic!(
+                "fixture {name} exceeded bounded test deadline ({timeout:?}) during startup, assertions, or teardown"
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("fixture {name} thread terminated unexpectedly");
+        }
+    }
+}
+
 fn wait_until_deadline(deadline: Instant, desc: &str, mut pred: impl FnMut() -> bool) {
     while Instant::now() < deadline {
         if pred() {
@@ -374,72 +406,79 @@ impl Drop for LifecycleAuditDriver {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn control_thread_marked_from_entry_to_exit_independent_of_release_guard() {
-    let deadline = Instant::now() + Duration::from_secs(5);
+#[test]
+fn control_thread_marked_from_entry_to_exit_independent_of_release_guard() {
+    run_bounded_fixture(Duration::from_secs(15), "entry-to-exit", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            // (a) Full lifecycle: entry (`set_rt_mode`), releases, and exit (`Drop` of core).
+            let marks = Arc::new(Mutex::new(LifecycleMarks::default()));
+            let drv = LifecycleAuditDriver { dof: 7, marks: Arc::clone(&marks) };
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+            sup.set_lease_enabled(false).await;
+            let handle = sup
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .await
+                .expect("start executor");
+            let exec_tid = handle.executor_thread_id();
 
-    // (a) Full lifecycle: entry (`set_rt_mode`), releases, and exit (`Drop` of core).
-    let marks = Arc::new(Mutex::new(LifecycleMarks::default()));
-    let drv = LifecycleAuditDriver { dof: 7, marks: Arc::clone(&marks) };
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
-    sup.set_lease_enabled(false).await;
-    let handle = sup
-        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
-        .await
-        .expect("start executor");
-    let exec_tid = handle.executor_thread_id();
+            wait_until_deadline_async(deadline, ">= 3 releases observed", || {
+                handle.stats().steps.load(Ordering::Relaxed) >= 3
+            })
+            .await;
 
-    wait_until_deadline_async(deadline, ">= 3 releases observed", || {
-        handle.stats().steps.load(Ordering::Relaxed) >= 3
-    })
-    .await;
+            handle.stop_and_join();
 
-    handle.stop_and_join();
+            {
+                let m = marks.lock().unwrap();
+                assert_eq!(
+                    m.entry_rt_mode,
+                    Some((exec_tid, true, false)),
+                    "control thread must be marked on entry before any ReleaseGuard"
+                );
+                assert!(
+                    m.release_reads.len() >= 3,
+                    "expected >= 3 release reads, got {}",
+                    m.release_reads.len()
+                );
+                assert!(
+                    m.release_reads
+                        .iter()
+                        .all(|&(tid, on_ctrl, in_rel)| tid == exec_tid && on_ctrl && in_rel),
+                    "unexpected release marks: {:?}",
+                    m.release_reads
+                );
+                assert_eq!(
+                    m.drop_mark,
+                    Some((exec_tid, true, false)),
+                    "control thread must remain marked through core Drop on thread exit, outside ReleaseGuard"
+                );
+            }
+            assert_eq!(sup.inner().control_thread_attempts(), 0);
 
-    {
-        let m = marks.lock().unwrap();
-        assert_eq!(
-            m.entry_rt_mode,
-            Some((exec_tid, true, false)),
-            "control thread must be marked on entry before any ReleaseGuard"
-        );
-        assert!(
-            m.release_reads.len() >= 3,
-            "expected >= 3 release reads, got {}",
-            m.release_reads.len()
-        );
-        assert!(
-            m.release_reads
-                .iter()
-                .all(|&(tid, on_ctrl, in_rel)| tid == exec_tid && on_ctrl && in_rel),
-            "unexpected release marks: {:?}",
-            m.release_reads
-        );
-        assert_eq!(
-            m.drop_mark,
-            Some((exec_tid, true, false)),
-            "control thread must remain marked through core Drop on thread exit, outside ReleaseGuard"
-        );
-    }
-    assert_eq!(sup.inner().control_thread_attempts(), 0);
-
-    // (b) Early `fail_init` exit path: `core` drops on `armd-control` before any release.
-    let fail_marks = Arc::new(Mutex::new(LifecycleMarks::default()));
-    let drv_fail = LifecycleAuditDriver { dof: 7, marks: Arc::clone(&fail_marks) };
-    let sup_fail = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_fail)));
-    let hooks = PersistTestHooks { fail_init: Some(false), ..Default::default() };
-    assert!(
-        sup_fail
-            .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
-            .await
-            .is_err()
-    );
-    let fm = fail_marks.lock().unwrap();
-    let (drop_tid, on_ctrl, in_rel) = fm.drop_mark.expect("driver dropped on fail_init");
-    assert_ne!(drop_tid, thread::current().id());
-    assert!(on_ctrl, "control thread must be marked even on early fail_init exit");
-    assert!(!in_rel, "ReleaseGuard must not be active during early fail_init exit");
-    assert_eq!(sup_fail.inner().control_thread_attempts(), 0);
+            // (b) Early `fail_init` exit path: `core` drops on `armd-control` before any release.
+            let fail_marks = Arc::new(Mutex::new(LifecycleMarks::default()));
+            let drv_fail = LifecycleAuditDriver { dof: 7, marks: Arc::clone(&fail_marks) };
+            let sup_fail = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv_fail)));
+            let hooks = PersistTestHooks { fail_init: Some(false), ..Default::default() };
+            assert!(
+                sup_fail
+                    .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+                    .await
+                    .is_err()
+            );
+            let fm = fail_marks.lock().unwrap();
+            let (drop_tid, on_ctrl, in_rel) = fm.drop_mark.expect("driver dropped on fail_init");
+            assert_ne!(drop_tid, thread::current().id());
+            assert!(on_ctrl, "control thread must be marked even on early fail_init exit");
+            assert!(!in_rel, "ReleaseGuard must not be active during early fail_init exit");
+            assert_eq!(sup_fail.inner().control_thread_attempts(), 0);
+        });
+    });
 }
 
 // ============================================================================
@@ -450,6 +489,7 @@ fn assert_all_seven_forms_blocked(
     lock: &Arc<SupervisorLock<u32>>,
     expected_msg: &str,
     expected_gen: u64,
+    expect_count_increment: bool,
 ) {
     let cases: [(&str, fn(&Arc<SupervisorLock<u32>>)); 7] = [
         ("SupervisorLock::read", |l| drop(l.read())),
@@ -463,10 +503,11 @@ fn assert_all_seven_forms_blocked(
     for (site, invoke) in cases {
         let before = lock.control_thread_attempts();
         assert_panics_with(&[expected_msg, site], || invoke(lock));
+        let expected_after = if expect_count_increment { before + 1 } else { before };
         assert_eq!(
             lock.control_thread_attempts(),
-            before + 1,
-            "{site} must increment attempt counter before asserting"
+            expected_after,
+            "{site} unexpected attempt count delta (expect_increment={expect_count_increment})"
         );
         assert_eq!(
             lock.generation(),
@@ -505,7 +546,7 @@ fn all_seven_forms_count_and_assert_on_marked_thread_before_touching_lock() {
         .spawn(move || {
             let _guard = ControlThreadGuard::enter();
             assert!(on_rt_control_thread() && !in_rt_release());
-            assert_all_seven_forms_blocked(&lock_marked, "RT control thread", 1);
+            assert_all_seven_forms_blocked(&lock_marked, "RT control thread", 1, true);
         })
         .unwrap()
         .join()
@@ -521,20 +562,20 @@ fn all_seven_forms_count_and_assert_on_marked_thread_before_touching_lock() {
     {
         let _guard = ControlThreadGuard::enter();
         assert!(!in_rt_release());
-        assert_all_seven_forms_blocked(&free_lock, "RT control thread", 0);
+        assert_all_seven_forms_blocked(&free_lock, "RT control thread", 0, true);
     }
     assert_eq!((free_lock.control_thread_attempts(), free_lock.generation()), (7, 0));
     assert!(free_lock.take_log().unwrap().last_release.is_none());
 
-    // (c) ReleaseGuard alone (without ControlThreadGuard) also counts and panics with the
-    // release-guard message for all 7 forms.
+    // (c) ReleaseGuard alone (unmarked thread): enforces the release assertion for all 7
+    // forms WITHOUT misattributing the attempt to `control_thread_attempts()`.
     let rel_lock = Arc::new(SupervisorLock::new(0u32));
     {
         let _rel = ReleaseGuard::enter();
         assert!(!on_rt_control_thread() && in_rt_release());
-        assert_all_seven_forms_blocked(&rel_lock, "during RT release", 0);
+        assert_all_seven_forms_blocked(&rel_lock, "during RT release", 0, false);
     }
-    assert_eq!((rel_lock.control_thread_attempts(), rel_lock.generation()), (7, 0));
+    assert_eq!((rel_lock.control_thread_attempts(), rel_lock.generation()), (0, 0));
 }
 
 fn poll_once_on_marked_thread<F: Future + Send + 'static>(
@@ -726,49 +767,40 @@ async fn callsite_timing_and_location_preserved_for_all_timed_forms() {
     assert_eq!((rec.kind, rec.location.file(), rec.location.line()), (HoldKind::Write, file!(), blocking_line));
     assert!(rec.hold() >= Duration::from_millis(4), "{rec:?}");
 
-    // Async `read`, `write`, `write_owned` preserve callsite location and pre-poll `called` timestamp.
+    // Async `read`, `write`, `write_owned` capture `called` at callsite (NOT at first poll):
+    // delay first poll by 10 ms against an AVAILABLE lock so only callsite capture satisfies `acquire >= 8ms`.
     let read_line = line!() + 1;
-    let g = lock.read().await;
+    let fut = lock.read();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let g = fut.await;
     thread::sleep(Duration::from_millis(4));
     drop(g);
     let rec = lock.take_log().unwrap().last_release.unwrap();
     assert_eq!((rec.kind, rec.location.file(), rec.location.line()), (HoldKind::Read, file!(), read_line));
+    assert!(rec.acquire() >= Duration::from_millis(8), "read() must capture called at callsite: {rec:?}");
     assert!(rec.hold() >= Duration::from_millis(4), "{rec:?}");
 
     let write_line = line!() + 1;
-    let g = lock.write().await;
+    let fut = lock.write();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let g = fut.await;
     thread::sleep(Duration::from_millis(4));
     drop(g);
     let rec = lock.take_log().unwrap().last_release.unwrap();
     assert_eq!((rec.kind, rec.location.file(), rec.location.line()), (HoldKind::Write, file!(), write_line));
+    assert!(rec.acquire() >= Duration::from_millis(8), "write() must capture called at callsite: {rec:?}");
     assert!(rec.hold() >= Duration::from_millis(4), "{rec:?}");
 
-    let hold = lock.write().await;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let lock_c = Arc::clone(&lock);
-    let queued_line_holder = Arc::new(AtomicU64::new(0));
-    let line_c = Arc::clone(&queued_line_holder);
-    let task = tokio::spawn(async move {
-        let call_line = line!() + 2;
-        line_c.store(call_line as u64, Ordering::SeqCst);
-        let fut = Arc::clone(&lock_c).write_owned();
-        let _ = tx.send(());
-        let g = fut.await;
-        drop(g);
-    });
-    rx.await.unwrap();
+    let owned_line = line!() + 1;
+    let fut = Arc::clone(&lock).write_owned();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    drop(hold);
-    task.await.unwrap();
-
-    let log = lock.take_log().unwrap();
-    let rec = log.last_release.unwrap();
-    let expected_line = queued_line_holder.load(Ordering::SeqCst) as u32;
-    assert_eq!((rec.kind, rec.location.file(), rec.location.line()), (HoldKind::Write, file!(), expected_line));
-    assert!(
-        rec.acquire() >= Duration::from_millis(5),
-        "callsite `called` timestamp must precede wait before await: {rec:?}"
-    );
+    let g = fut.await;
+    thread::sleep(Duration::from_millis(4));
+    drop(g);
+    let rec = lock.take_log().unwrap().last_release.unwrap();
+    assert_eq!((rec.kind, rec.location.file(), rec.location.line()), (HoldKind::Write, file!(), owned_line));
+    assert!(rec.acquire() >= Duration::from_millis(8), "write_owned() must capture called at callsite: {rec:?}");
+    assert!(rec.hold() >= Duration::from_millis(4), "{rec:?}");
     assert_eq!(lock.control_thread_attempts(), 0);
 }
 
@@ -776,127 +808,186 @@ async fn callsite_timing_and_location_preserved_for_all_timed_forms() {
 // 3. Production executor fixtures holding the detached legacy writer on another thread
 // ============================================================================
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
-    let deadline = Instant::now() + Duration::from_secs(10);
+#[test]
+fn production_executor_mock_owner_zero_attempts_while_legacy_writer_held() {
+    run_bounded_fixture(Duration::from_secs(15), "mock-owner", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            // Match the production `--follower mock` executor startup owner gate.
+            validate_startup_owner(RtOwner::Executor, "mock").expect("--follower mock owner allowed");
 
-    // Match the production `--follower mock` executor startup owner gate.
-    validate_startup_owner(RtOwner::Executor, "mock").expect("--follower mock owner allowed");
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+            sup.set_lease_enabled(false).await;
+            sup.set_torque(true).await.expect("enable torque on mock arm");
 
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    sup.set_lease_enabled(false).await;
-    sup.set_torque(true).await.expect("enable torque on mock arm");
+            // Lock-free executor-side trigger inside `before_publish`: accumulates `dt`-clamped
+            // trajectory time (matching `SupervisorInner::tick_control`'s 80 ms clamp) after the
+            // jog is Ack'd and triggers the urgent stop at >= 3 releases and >= 700 ms of a 10 s
+            // quintic (zero race with test-thread scheduling or tick jitter).
+            let base = Instant::now();
+            let stop_cell: Arc<OnceLock<StopRequests>> = Arc::new(OnceLock::new());
+            let jog_armed = Arc::new(AtomicBool::new(false));
+            let active_pubs = Arc::new(AtomicU64::new(0));
+            let prev_pub_us = Arc::new(AtomicU64::new(u64::MAX));
+            let sim_us = Arc::new(AtomicU64::new(0));
+            let triggered_gen = Arc::new(AtomicU64::new(0));
 
-    let handle = sup
-        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
-        .await
-        .expect("start production executor for --follower mock");
-    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            let stop_cell_h = Arc::clone(&stop_cell);
+            let armed_h = Arc::clone(&jog_armed);
+            let pubs_h = Arc::clone(&active_pubs);
+            let prev_h = Arc::clone(&prev_pub_us);
+            let sim_h = Arc::clone(&sim_us);
+            let trig_h = Arc::clone(&triggered_gen);
+            let hooks = PersistTestHooks {
+                before_publish: Some(Arc::new(move || {
+                    if !armed_h.load(Ordering::Acquire) || trig_h.load(Ordering::Acquire) != 0 {
+                        return;
+                    }
+                    let now_us = base.elapsed().as_micros() as u64;
+                    let prev = prev_h.swap(now_us, Ordering::AcqRel);
+                    let dt_us = if prev == u64::MAX {
+                        0
+                    } else {
+                        now_us.saturating_sub(prev).min(80_000)
+                    };
+                    let n = pubs_h.fetch_add(1, Ordering::AcqRel) + 1;
+                    let acc = sim_h.fetch_add(dt_us, Ordering::AcqRel) + dt_us;
+                    if n >= 3 && acc >= 700_000 {
+                        if let Some(stops) = stop_cell_h.get() {
+                            let gen = stops.request();
+                            let _ = trig_h.compare_exchange(0, gen, Ordering::AcqRel, Ordering::Acquire);
+                        }
+                    }
+                })),
+                ..Default::default()
+            };
 
-    // Install an active quintic jog away from the initial pose before parking the legacy writer.
-    let snap = handle.planning_snapshot().expect("planning snapshot");
-    let start = snap.commanded.clone();
-    let mut goal = start.clone();
-    goal[0] += 0.35;
-    let req_jog = submit_joint_quintic(&handle, 1, snap.authority, &start, &goal, 2.0);
-    assert!(matches!(
-        wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
-        Reply::Ack { .. }
-    ));
+            let handle = sup
+                .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+                .await
+                .expect("start production executor for --follower mock");
+            assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            stop_cell
+                .set(handle.stop_requests().clone())
+                .expect("attach StopRequests to mock before_publish hook");
 
-    // Hold the detached legacy writer on another OS thread for the entire assertion window.
-    let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup), deadline);
-    assert!(
-        sup.inner().try_read().is_err(),
-        "detached legacy SupervisorLock must be exclusively held by the other thread"
-    );
+            // Acquire and hold the detached legacy writer FIRST before starting motion.
+            let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup), deadline);
+            assert!(
+                sup.inner().try_read().is_err(),
+                "detached legacy SupervisorLock must be exclusively held by the other thread"
+            );
 
-    // While the legacy writer is held: require >= 3 publication advances and advancing motion.
-    let seq_before = sup.hub().published_seq();
-    let pos_before = sup
-        .hub()
-        .latest()
-        .map(|s| s.obs.positions[0])
-        .unwrap_or(start[0]);
-    wait_until_deadline(deadline, ">= 3 publication advances and active mock motion", || {
-        let seq = sup.hub().published_seq();
-        let pos = sup.hub().latest().map(|s| s.obs.positions[0]).unwrap_or(start[0]);
-        seq >= seq_before + 3 && pos > pos_before + 1e-3
+            // Require >= 3 publication advances while the detached legacy writer is held.
+            let seq_before = sup.hub().published_seq();
+            wait_until_deadline(deadline, ">= 3 initial publication advances while writer held", || {
+                sup.hub().published_seq() >= seq_before + 3
+            });
+
+            // Start a 10 s quintic jog while the legacy writer is held; executor-side hook
+            // triggers the urgent stop at ~600 ms while the plan is guaranteed active.
+            let snap = handle.planning_snapshot().expect("planning snapshot while writer held");
+            let start = snap.commanded.clone();
+            let mut goal = start.clone();
+            goal[0] += 0.50;
+            let req_jog = submit_joint_quintic(&handle, 1, snap.authority, &start, &goal, 10.0);
+            assert!(matches!(
+                wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
+                Reply::Ack { .. }
+            ));
+            jog_armed.store(true, Ordering::Release);
+
+            // Wait for executor-side urgent stop to fire and be applied.
+            wait_until_deadline(deadline, "urgent stop requested and applied while writer held", || {
+                let gen = triggered_gen.load(Ordering::Acquire);
+                gen > 0 && handle.stop_requests().applied() == gen
+            });
+            let stop_gen = triggered_gen.load(Ordering::Acquire);
+
+            // Wait for bounded deceleration to reach rest, then require >= 3 more publication
+            // advances with dynamic output inhibited (positions stay frozen well short of goal[0]).
+            wait_until_deadline(
+                deadline,
+                "mock motion settled to Armed with zero velocity after urgent stop",
+                || {
+                    sup.hub().latest().is_some_and(|s| {
+                        s.obs.safety_state == SafetyState::Armed
+                            && s.obs.velocities.iter().all(|v| v.abs() < 1e-4)
+                    })
+                },
+            );
+            let frozen_snap = sup.hub().latest().expect("published snapshot after stop");
+            let frozen_seq = frozen_snap.meta.seq;
+            let frozen_pos = frozen_snap.obs.positions.clone();
+            assert!(
+                frozen_pos[0] > start[0] + 2e-4,
+                "expected active motion before urgent stop: start={}, frozen={}",
+                start[0],
+                frozen_pos[0]
+            );
+            assert!(
+                frozen_pos[0] < goal[0] - 0.05,
+                "urgent stop did not inhibit motion before reaching target: frozen={}, goal={}",
+                frozen_pos[0],
+                goal[0]
+            );
+
+            // A stale-generation command stamped with the pre-stop authority must be refused `STOPPED`.
+            let req_stale = submit_joint_quintic(&handle, 2, snap.authority, &frozen_pos, &goal, 1.0);
+            assert!(matches!(
+                wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
+                Reply::Refused { code: "STOPPED", .. }
+            ));
+
+            wait_until_deadline(deadline, ">= 3 post-stop publication advances while writer held", || {
+                sup.hub().published_seq() >= frozen_seq + 3
+            });
+            let after_snap = sup.hub().latest().expect("post-stop snapshot");
+            assert!(
+                after_snap
+                    .obs
+                    .positions
+                    .iter()
+                    .zip(&frozen_pos)
+                    .all(|(a, b)| (a - b).abs() <= 1e-5),
+                "dynamic output continued after urgent stop: before={frozen_pos:?}, after={:?}",
+                after_snap.obs.positions
+            );
+
+            // Collect final invariants strictly BEFORE releasing the detached legacy writer.
+            assert_eq!(handle.stop_requests().applied(), stop_gen);
+            assert!(!handle.is_exited(), "control thread must stay alive without panicking");
+            assert_eq!(
+                sup.inner().control_thread_attempts(),
+                0,
+                "RT control thread attempted SupervisorLock"
+            );
+            assert!(
+                sup.inner().try_read().is_err(),
+                "detached legacy writer must remain held until after all assertions"
+            );
+
+            writer_hold.release();
+            handle.stop_and_join();
+            assert_eq!(sup.inner().control_thread_attempts(), 0);
+        });
     });
-
-    // Issue an urgent stop while the legacy writer is still held.
-    let stop_gen = handle.stop_requests().request();
-    assert!(stop_gen > 0);
-    wait_until_deadline(deadline, "urgent stop generation applied", || {
-        handle.stop_requests().applied() == stop_gen
-    });
-
-    // Wait for bounded deceleration to reach rest, then require >= 3 more publication advances
-    // with dynamic output inhibited (positions stay frozen well short of goal[0]).
-    wait_until_deadline(deadline, "mock motion settled to Armed with zero velocity after urgent stop", || {
-        sup.hub().latest().is_some_and(|s| {
-            s.obs.safety_state == SafetyState::Armed
-                && s.obs.velocities.iter().all(|v| v.abs() < 1e-4)
-        })
-    });
-    let frozen_snap = sup.hub().latest().expect("published snapshot after stop");
-    let frozen_seq = frozen_snap.meta.seq;
-    let frozen_pos = frozen_snap.obs.positions.clone();
-    assert!(
-        frozen_pos[0] < goal[0] - 0.05,
-        "urgent stop did not inhibit motion before reaching target: frozen={}, goal={}",
-        frozen_pos[0],
-        goal[0]
-    );
-
-    // A stale-generation command stamped with the pre-stop authority must be refused `STOPPED`.
-    let req_stale = submit_joint_quintic(&handle, 2, snap.authority, &frozen_pos, &goal, 1.0);
-    assert!(matches!(
-        wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
-        Reply::Refused { code: "STOPPED", .. }
-    ));
-
-    wait_until_deadline(deadline, ">= 3 post-stop publication advances while writer held", || {
-        sup.hub().published_seq() >= frozen_seq + 3
-    });
-    let after_snap = sup.hub().latest().expect("post-stop snapshot");
-    assert!(
-        after_snap
-            .obs
-            .positions
-            .iter()
-            .zip(&frozen_pos)
-            .all(|(a, b)| (a - b).abs() <= 1e-5),
-        "dynamic output continued after urgent stop: before={frozen_pos:?}, after={:?}",
-        after_snap.obs.positions
-    );
-
-    // Collect final invariants strictly BEFORE releasing the detached legacy writer.
-    assert_eq!(handle.stop_requests().applied(), stop_gen);
-    assert!(!handle.is_exited(), "control thread must stay alive without panicking");
-    assert_eq!(
-        sup.inner().control_thread_attempts(),
-        0,
-        "RT control thread attempted SupervisorLock"
-    );
-    assert!(
-        sup.inner().try_read().is_err(),
-        "detached legacy writer must remain held until after all assertions"
-    );
-
-    writer_hold.release();
-    handle.stop_and_join();
-    assert_eq!(sup.inner().control_thread_attempts(), 0);
 }
 
-/// Recording CAN bus wrapper over `FakeBus` that captures every transmitted frame and can
-/// trigger a lock-free urgent stop right after a chosen target CAN ID (mid-batch).
+/// Recording CAN bus wrapper over `FakeBus` that captures every transmitted frame and
+/// triggers a lock-free mid-batch urgent stop right after `0x102` once the bus itself has
+/// observed >= 3 advancing `0x101` frames past the configured threshold.
 #[derive(Clone)]
 struct TracingBus {
     inner: FakeBus,
     tx_trace: Arc<Mutex<Vec<CanFrame>>>,
     stop_cell: Arc<OnceLock<StopRequests>>,
-    arm_stop_on_id: Arc<AtomicU64>,
+    arm_after_j1_threshold_bits: Arc<AtomicU64>,
+    advancing_j1_seen: Arc<AtomicU64>,
     triggered_gen: Arc<AtomicU64>,
     trigger_index: Arc<AtomicUsize>,
 }
@@ -907,10 +998,18 @@ impl TracingBus {
             inner,
             tx_trace: Arc::new(Mutex::new(Vec::with_capacity(2048))),
             stop_cell: Arc::new(OnceLock::new()),
-            arm_stop_on_id: Arc::new(AtomicU64::new(0)),
+            arm_after_j1_threshold_bits: Arc::new(AtomicU64::new(0)),
+            advancing_j1_seen: Arc::new(AtomicU64::new(0)),
             triggered_gen: Arc::new(AtomicU64::new(0)),
             trigger_index: Arc::new(AtomicUsize::new(usize::MAX)),
         }
+    }
+
+    fn arm_mid_batch_stop_after_j1_progress(&self, threshold_rad: f32) {
+        // Store a non-zero sentinel encoding `(1 << 32) | threshold_rad.to_bits()`.
+        self.advancing_j1_seen.store(0, Ordering::Release);
+        let encoded = (1u64 << 32) | u64::from(threshold_rad.to_bits());
+        self.arm_after_j1_threshold_bits.store(encoded, Ordering::Release);
     }
 
     fn trace_len(&self) -> usize {
@@ -932,18 +1031,25 @@ impl CanTransport for TracingBus {
             log.push(*frame);
             idx
         };
-        let target_id = self.arm_stop_on_id.load(Ordering::Acquire);
-        if target_id != 0
-            && u64::from(frame.id) == target_id
-            && self
-                .arm_stop_on_id
-                .compare_exchange(target_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            if let Some(stops) = self.stop_cell.get() {
-                let gen = stops.request();
-                self.trigger_index.store(idx, Ordering::Release);
-                self.triggered_gen.store(gen, Ordering::Release);
+        let encoded = self.arm_after_j1_threshold_bits.load(Ordering::Acquire);
+        if encoded != 0 {
+            if frame.id == 0x101 {
+                let threshold = f32::from_bits(encoded as u32);
+                if decode_pos_vel_position(frame) > threshold {
+                    self.advancing_j1_seen.fetch_add(1, Ordering::AcqRel);
+                }
+            } else if frame.id == 0x102
+                && self.advancing_j1_seen.load(Ordering::Acquire) >= 3
+                && self
+                    .arm_after_j1_threshold_bits
+                    .compare_exchange(encoded, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                if let Some(stops) = self.stop_cell.get() {
+                    let gen = stops.request();
+                    self.trigger_index.store(idx, Ordering::Release);
+                    self.triggered_gen.store(gen, Ordering::Release);
+                }
             }
         }
         Ok(())
@@ -978,173 +1084,185 @@ fn is_damiao_target_frame(id: u32) -> bool {
     (0x101..=0x107).contains(&id) || (0x301..=0x307).contains(&id)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_held() {
-    let deadline = Instant::now() + Duration::from_secs(10);
+#[test]
+fn production_executor_bus_trace_dynamic_output_inhibited_while_legacy_writer_held() {
+    run_bounded_fixture(Duration::from_secs(15), "damiao-bus-trace", |deadline| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let fake_bus = FakeBus::new(&dm_limits());
+            fake_bus.with(|s| {
+                s.immediate_replies = true;
+                s.record_tx_log = false;
+                s.follow_commands = true;
+                s.push_all_feedback();
+            });
+            let bus = TracingBus::new(fake_bus);
+            let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+                .with_joint_limits(dm_limits())
+                .unwrap();
+            drv.read_joint_states().unwrap();
+            drv.check_mapping_ranges();
 
-    let fake_bus = FakeBus::new(&dm_limits());
-    fake_bus.with(|s| {
-        s.immediate_replies = true;
-        s.record_tx_log = false;
-        s.follow_commands = true;
-        s.push_all_feedback();
-    });
-    let bus = TracingBus::new(fake_bus);
-    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
-        .with_joint_limits(dm_limits())
-        .unwrap();
-    drv.read_joint_states().unwrap();
-    drv.check_mapping_ranges();
+            let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+            sup.set_lease_enabled(false).await;
+            let handle = sup
+                .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
+                .await
+                .expect("start production executor with DamiaoArmDriver<TracingBus>");
+            assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
+            bus.stop_cell
+                .set(handle.stop_requests().clone())
+                .expect("attach StopRequests to TracingBus");
 
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
-    sup.set_lease_enabled(false).await;
-    let handle = sup
-        .start_executor(ExecutorConfig::for_tests(Duration::from_millis(5)))
-        .await
-        .expect("start production executor with DamiaoArmDriver<TracingBus>");
-    assert_eq!(sup.owner_mode(), OWNER_EXECUTOR);
-    bus.stop_cell
-        .set(handle.stop_requests().clone())
-        .expect("attach StopRequests to TracingBus");
+            // Enable torque via broker before acquiring the detached writer.
+            let req_on = submit_broker_transition(&handle, 1, TransitionOp::TorqueOn);
+            assert_eq!(wait_broker_terminal(&handle, req_on, deadline), Outcome::Completed);
 
-    // Enable torque via broker and start an active quintic jog on joint 0.
-    let req_on = submit_broker_transition(&handle, 1, TransitionOp::TorqueOn);
-    assert_eq!(wait_broker_terminal(&handle, req_on, deadline), Outcome::Completed);
+            // Hold the detached legacy writer FIRST before starting the jog.
+            let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup), deadline);
+            assert!(
+                sup.inner().try_read().is_err(),
+                "detached legacy SupervisorLock must be exclusively held by the other thread"
+            );
 
-    let snap = handle.planning_snapshot().expect("planning snapshot");
-    let start = snap.commanded.clone();
-    let mut goal = start.clone();
-    goal[0] += 0.35;
-    let req_jog = submit_joint_quintic(&handle, 2, snap.authority, &start, &goal, 2.0);
-    assert!(matches!(
-        wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
-        Reply::Ack { .. }
-    ));
+            // 1. Verify >= 3 publication advances while the detached legacy writer is held.
+            let seq_before = sup.hub().published_seq();
+            wait_until_deadline(
+                deadline,
+                ">= 3 initial publication advances while legacy writer held",
+                || sup.hub().published_seq() >= seq_before + 3,
+            );
 
-    // Hold the detached legacy writer on another OS thread for the entire assertion window.
-    let writer_hold = DetachedLegacyWriterHold::acquire(Arc::clone(&sup), deadline);
-    assert!(
-        sup.inner().try_read().is_err(),
-        "detached legacy SupervisorLock must be exclusively held by the other thread"
-    );
+            // 2. Arm the bus-driven mid-batch stop and start a 10 s quintic jog while the
+            // detached legacy writer is held. `TracingBus` fires `stops.request()` right after
+            // `0x102` once >= 3 advancing `0x101` frames exceed `start[0] + 5e-4` (zero race
+            // with test-thread scheduling).
+            let snap = handle.planning_snapshot().expect("planning snapshot while writer held");
+            let start = snap.commanded.clone();
+            let mut goal = start.clone();
+            goal[0] += 0.50;
+            let trace_before_jog = bus.trace_len();
+            bus.arm_mid_batch_stop_after_j1_progress(start[0] + 5e-4);
 
-    // 1. While held, require >= 3 publication advances and live advancing POS_VEL frames on 0x101.
-    let seq_before = sup.hub().published_seq();
-    let trace_start = bus.trace_len();
-    wait_until_deadline(
-        deadline,
-        ">= 3 publication advances and advancing 0x101 bus frames while legacy writer held",
-        || {
-            if sup.hub().published_seq() < seq_before + 3 {
-                return false;
-            }
-            let j1_positions: Vec<f32> = bus
-                .trace_slice_from(trace_start)
+            let req_jog = submit_joint_quintic(&handle, 2, snap.authority, &start, &goal, 10.0);
+            assert!(matches!(
+                wait_broker_reply(&handle, req_jog, deadline, |r| matches!(r, Reply::Ack { .. }).then_some(r)),
+                Reply::Ack { .. }
+            ));
+
+            wait_until_deadline(deadline, "bus-triggered mid-batch urgent stop applied", || {
+                let gen = bus.triggered_gen.load(Ordering::Acquire);
+                gen > 0 && handle.stop_requests().applied() == gen
+            });
+            let stop_gen = bus.triggered_gen.load(Ordering::Acquire);
+            let trigger_idx = bus.trigger_index.load(Ordering::Acquire);
+
+            // Confirm pre-stop bus trace recorded >= 3 advancing `0x101` frames before the stop.
+            let pre_stop_j1: Vec<f32> = bus
+                .trace_slice_from(trace_before_jog)
+                .into_iter()
+                .take(trigger_idx.saturating_sub(trace_before_jog) + 1)
+                .filter(|f| f.id == 0x101)
+                .map(|f| decode_pos_vel_position(&f))
+                .collect();
+            assert!(
+                pre_stop_j1.len() >= 3 && *pre_stop_j1.last().unwrap() > start[0] + 5e-4,
+                "expected >= 3 advancing 0x101 frames before stop: {pre_stop_j1:?}"
+            );
+
+            // 3. Wait for bounded braking to reach rest (`SafetyState::Armed`, i.e. commanded_velocities == 0),
+            // then capture >= 3 post-settle publications and bus frames while the legacy writer is STILL held.
+            wait_until_deadline(deadline, "bus motion settled to Armed after urgent stop", || {
+                sup.hub()
+                    .latest()
+                    .is_some_and(|s| s.obs.safety_state == SafetyState::Armed)
+            });
+            let post_settle_seq = sup.hub().published_seq();
+            let post_settle_trace_start = bus.trace_len();
+
+            // Stale-generation jog using the pre-stop authority must be refused `STOPPED`.
+            let frozen_pos = sup
+                .hub()
+                .latest()
+                .expect("snapshot after stop")
+                .obs
+                .commanded_positions
+                .clone();
+            let req_stale = submit_joint_quintic(&handle, 3, snap.authority, &frozen_pos, &goal, 1.0);
+            assert!(matches!(
+                wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
+                Reply::Refused { code: "STOPPED", .. }
+            ));
+
+            wait_until_deadline(
+                deadline,
+                ">= 3 post-settle publication advances and hold frames on bus while writer held",
+                || {
+                    sup.hub().published_seq() >= post_settle_seq + 3
+                        && bus
+                            .trace_slice_from(post_settle_trace_start)
+                            .iter()
+                            .filter(|f| f.id == 0x101)
+                            .count()
+                            >= 3
+                },
+            );
+
+            // 4. Inspect CAN bus trace:
+            // (a) In the interrupted batch, joints 3..7 (0x103..=0x107) were inhibited mid-batch:
+            //     the very next target frame after `0x102` at `trigger_idx` must be `0x101`.
+            let full_after_trigger = bus.trace_slice_from(trigger_idx);
+            assert_eq!(full_after_trigger[0].id, 0x102);
+            let next_target_after_trigger = full_after_trigger[1..]
+                .iter()
+                .find(|f| is_damiao_target_frame(f.id))
+                .expect("expected subsequent hold batch after mid-batch stop");
+            assert_eq!(
+                next_target_after_trigger.id, 0x101,
+                "mid-batch urgent stop failed to inhibit remaining joints 0x103..=0x107: next target was 0x{:X}",
+                next_target_after_trigger.id
+            );
+
+            // (b) After braking settled, every 0x101 bus frame holds constant position well short of goal.
+            let post_j1: Vec<f32> = bus
+                .trace_slice_from(post_settle_trace_start)
                 .into_iter()
                 .filter(|f| f.id == 0x101)
                 .map(|f| decode_pos_vel_position(&f))
                 .collect();
-            j1_positions.len() >= 3
-                && j1_positions.last().copied().unwrap() > j1_positions[0] + 1e-3
-        },
-    );
+            assert!(post_j1.len() >= 3, "expected >= 3 post-stop hold frames, got {}", post_j1.len());
+            let held_p = post_j1[0];
+            assert!(
+                held_p > start[0] + 5e-4 && held_p < goal[0] - 0.05,
+                "urgent stop did not inhibit dynamic trajectory before target: start={}, held={held_p}, goal={}",
+                start[0],
+                goal[0]
+            );
+            assert!(
+                post_j1.iter().all(|&p| (p - held_p).abs() <= 1e-5),
+                "dynamic output continued on CAN bus after urgent stop: {post_j1:?}"
+            );
 
-    // 2. Arm a mid-batch urgent stop right after joint 2's POS_VEL frame (`0x102`) while
-    // the detached legacy writer is still held.
-    bus.arm_stop_on_id.store(0x102, Ordering::Release);
-    wait_until_deadline(deadline, "mid-batch urgent stop requested and applied", || {
-        let gen = bus.triggered_gen.load(Ordering::Acquire);
-        gen > 0 && handle.stop_requests().applied() == gen
+            // 5. Collect final invariants strictly BEFORE releasing the detached legacy writer.
+            assert_eq!(handle.stop_requests().applied(), stop_gen);
+            assert!(!handle.is_exited(), "control thread must stay alive without panicking");
+            assert_eq!(
+                sup.inner().control_thread_attempts(),
+                0,
+                "RT control thread attempted SupervisorLock"
+            );
+            assert!(
+                sup.inner().try_read().is_err(),
+                "detached legacy writer must remain held until after all assertions"
+            );
+
+            writer_hold.release();
+            handle.stop_and_join();
+            assert_eq!(sup.inner().control_thread_attempts(), 0);
+        });
     });
-    let stop_gen = bus.triggered_gen.load(Ordering::Acquire);
-    let trigger_idx = bus.trigger_index.load(Ordering::Acquire);
-
-    // 3. Wait for bounded braking to reach rest (`SafetyState::Armed`, i.e. commanded_velocities == 0),
-    // then capture >= 3 post-settle publications and bus frames while the legacy writer is STILL held.
-    wait_until_deadline(deadline, "bus motion settled to Armed after urgent stop", || {
-        sup.hub()
-            .latest()
-            .is_some_and(|s| s.obs.safety_state == SafetyState::Armed)
-    });
-    let post_settle_seq = sup.hub().published_seq();
-    let post_settle_trace_start = bus.trace_len();
-
-    // Stale-generation jog using the pre-stop authority must be refused `STOPPED`.
-    let frozen_pos = sup
-        .hub()
-        .latest()
-        .expect("snapshot after stop")
-        .obs
-        .commanded_positions
-        .clone();
-    let req_stale = submit_joint_quintic(&handle, 3, snap.authority, &frozen_pos, &goal, 1.0);
-    assert!(matches!(
-        wait_broker_reply(&handle, req_stale, deadline, |r| matches!(r, Reply::Refused { .. }).then_some(r)),
-        Reply::Refused { code: "STOPPED", .. }
-    ));
-
-    wait_until_deadline(
-        deadline,
-        ">= 3 post-settle publication advances and hold frames on bus while writer held",
-        || {
-            sup.hub().published_seq() >= post_settle_seq + 3
-                && bus
-                    .trace_slice_from(post_settle_trace_start)
-                    .iter()
-                    .filter(|f| f.id == 0x101)
-                    .count()
-                    >= 3
-        },
-    );
-
-    // 4. Inspect CAN bus trace:
-    // (a) In the interrupted batch, joints 3..7 (0x103..=0x107) were inhibited mid-batch:
-    //     the very next target frame after `0x102` at `trigger_idx` must be `0x101`.
-    let full_after_trigger = bus.trace_slice_from(trigger_idx);
-    assert_eq!(full_after_trigger[0].id, 0x102);
-    let next_target_after_trigger = full_after_trigger[1..]
-        .iter()
-        .find(|f| is_damiao_target_frame(f.id))
-        .expect("expected subsequent hold batch after mid-batch stop");
-    assert_eq!(
-        next_target_after_trigger.id, 0x101,
-        "mid-batch urgent stop failed to inhibit remaining joints 0x103..=0x107: next target was 0x{:X}",
-        next_target_after_trigger.id
-    );
-
-    // (b) After braking settled, every 0x101 bus frame holds constant position well short of goal.
-    let post_j1: Vec<f32> = bus
-        .trace_slice_from(post_settle_trace_start)
-        .into_iter()
-        .filter(|f| f.id == 0x101)
-        .map(|f| decode_pos_vel_position(&f))
-        .collect();
-    assert!(post_j1.len() >= 3, "expected >= 3 post-stop hold frames, got {}", post_j1.len());
-    let held_p = post_j1[0];
-    assert!(
-        held_p < goal[0] - 0.05,
-        "urgent stop did not inhibit dynamic trajectory before target: held={held_p}, goal={}",
-        goal[0]
-    );
-    assert!(
-        post_j1.iter().all(|&p| (p - held_p).abs() <= 1e-5),
-        "dynamic output continued on CAN bus after urgent stop: {post_j1:?}"
-    );
-
-    // 5. Collect final invariants strictly BEFORE releasing the detached legacy writer.
-    assert_eq!(handle.stop_requests().applied(), stop_gen);
-    assert!(!handle.is_exited(), "control thread must stay alive without panicking");
-    assert_eq!(
-        sup.inner().control_thread_attempts(),
-        0,
-        "RT control thread attempted SupervisorLock"
-    );
-    assert!(
-        sup.inner().try_read().is_err(),
-        "detached legacy writer must remain held until after all assertions"
-    );
-
-    writer_hold.release();
-    handle.stop_and_join();
-    assert_eq!(sup.inner().control_thread_attempts(), 0);
 }
