@@ -756,3 +756,11 @@ fn a_worker_refuses_a_joint_move_at_admission_while_a_config_hold_inhibits_motio
     let snap = fx.core.planning_snapshot(&fx.ctx(fx.now()));
     assert!(armd::motion::prepare_joint_move(&snap, &snap.commanded.clone(), 0.5).is_ok());
 }
+
+#[test]
+fn the_target_port_is_reachable_from_the_supervisor_module() {
+    use armd::supervisor::targets::{policy_stream, servo_stream, SERVO_STREAM_BIT};
+    assert_ne!(servo_stream(7), policy_stream(7));
+    assert_eq!(servo_stream(7).0 & SERVO_STREAM_BIT, SERVO_STREAM_BIT);
+    assert_eq!(policy_stream(7).0 & SERVO_STREAM_BIT, 0);
+}

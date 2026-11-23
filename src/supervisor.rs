@@ -26,6 +26,10 @@ mod motion;
 mod streams;
 mod actions;
 
+/// Broker side of the servo, teleop and policy latest-target path (track D); the WS loop
+/// and the policy runner submit through it once they route through the mailbox.
+pub use streams::targets;
+
 #[derive(Debug, Error)]
 pub enum ArmError {
     #[error("Safety error: {0}")]

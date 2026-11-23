@@ -1336,8 +1336,8 @@ impl SupervisorInner {
     }
 }
 
-// The broker-side items have no production caller until the integrator routes the WS loop
-// and the policy runner through the mailbox (and re-exports this module).
+// Re-exported as `supervisor::targets`. The broker-side items have no production caller
+// until the WS loop and the policy runner route through the mailbox (stage 3 removes this).
 #[allow(dead_code)]
 pub mod targets {
     //! Latest-target path of servo, teleop and policy streams (armd 1.6 RT core, track D).
