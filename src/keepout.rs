@@ -183,6 +183,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 /// Load the persisted runtime list at startup (fail-closed: returns `Err` and leaves the file
 /// untouched on any read/parse/validation, missing-workspace non-empty boxes, or combined-install error).
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) -> Result<(), String> {
+    persist::remove_staged_leftovers(path);
     let text = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

@@ -609,6 +609,7 @@ pub fn start_action(inner: &mut SupervisorInner, body: &Value, epoch: u64) -> Re
 /// Load the persisted poses at startup (logs the outcome). An invalid file is left untouched
 /// and the store starts empty; the next successful save replaces the file.
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+    crate::persist::remove_staged_leftovers(path);
     let write = load_locked(supervisor, path).await;
     // poses saved before ids got theirs: written back so the ids stay stable
     if let Some(w) = write {

@@ -70,6 +70,11 @@ impl PendingDirSync {
         }
     }
 
+    /// The file that was renamed into place.
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
     pub fn sync_parent_dir(self) -> PublishOutcome {
         self.sync_with(|dir| std::fs::File::open(dir)?.sync_all())
     }
@@ -227,6 +232,31 @@ pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     })();
     if result.is_err() { let _ = std::fs::remove_file(&tmp); }
     result
+}
+
+/// Removes the temp files a [`StagedWrite`] of `path` left behind when the process ended
+/// between staging and the rename (`.<name>.tmp-<pid>-<n>` next to `path`). Such a candidate
+/// was never renamed into place, so it was never active nor durable: the file at `path` is
+/// both. Call it at startup, before the first write to `path`. Returns the removed files.
+pub fn remove_staged_leftovers(path: &Path) -> Vec<PathBuf> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Vec::new() };
+    let prefix = format!(".{name}.tmp-");
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut removed = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        if !file.to_string_lossy().starts_with(&prefix) { continue; }
+        let p = entry.path();
+        match std::fs::remove_file(&p) {
+            Ok(()) => {
+                tracing::warn!("Removed {} (a configuration candidate staged but never published)", p.display());
+                removed.push(p);
+            }
+            Err(e) => tracing::warn!("Could not remove {}: {e}", p.display()),
+        }
+    }
+    removed
 }
 
 /// Result of reading a state file.
