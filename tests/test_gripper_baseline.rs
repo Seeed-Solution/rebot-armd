@@ -731,5 +731,45 @@ async fn calibration_fails_on_a_thin_obstruction_before_the_closed_stroke_end() 
         eprintln!("thin obstruction k {k}: {} {:?} {:?} (phase {:?})", a.state, a.code, a.message, a.phase);
         assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("CALIBRATION_OBSTRUCTED"), Some("stroke:1/14")), "k {k}: {a:?}");
         assert_eq!(inner.gripper_baseline, before, "k {k}: baseline changed");
+        // the stroke's leading command was cleared: J7 holds the measured jaw, nothing presses
+        let (cmd, meas) = (inner.commanded_positions[6], inner.measured_positions[6]);
+        drop(inner);
+        eprintln!("thin obstruction k {k}: J7 command {cmd:.4}, jaw {meas:.4}");
+        assert!((cmd - meas).abs() < 1e-3, "k {k}: command {cmd} vs jaw {meas}");
+        rig.lock().unwrap().peak_tau = 0.0;
+        // the ticker runs a 20 ms tick every millisecond: 200 ms of wall time covers 50+ ticks
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let peak = rig.lock().unwrap().peak_tau;
+        assert!(peak <= 0.01, "k {k}: still pressing, {peak} N·m");
+    }
+}
+
+/// A plain fractional move that stops short of its target on an object (within the 0.25 rad
+/// done tolerance) ends done; on the next tick J7 holds the measured jaw and the object is not
+/// pressed any more.
+#[test]
+fn move_that_stops_short_on_an_object_releases_its_lead() {
+    let p = GripperPolicy::rebot_dm();
+    let target = p.closed_rad + 0.05 * (p.open_rad - p.closed_rad);
+    for k in [3.0f32, 20.0] {
+        let (mut inner, rig) = rig(Finger::New);
+        rig.lock().unwrap().load = Load::CloseBlock(target - 0.10, k);
+        let epoch = inner.safety.epoch_id();
+        let (id, _) = inner.start_gripper(req(GripperCommand::Move, Some(0.05), 0.3), epoch).unwrap();
+        let a = loop {
+            inner.tick(DT);
+            let a = inner.last_action.clone().unwrap();
+            assert_eq!(a.id, id);
+            if !a.is_running() { break a; }
+        };
+        let lead_at_end = inner.commanded_positions[6] - inner.measured_positions[6];
+        inner.tick(DT);
+        let (cmd, meas) = (inner.commanded_positions[6], inner.measured_positions[6]);
+        eprintln!("move short k {k}: {} {:?}, lead at the end {lead_at_end:.3} rad, one tick later command {cmd:.4} jaw {meas:.4}", a.state, a.code);
+        assert!((cmd - meas).abs() < 1e-3, "k {k}: command {cmd} vs jaw {meas}");
+        rig.lock().unwrap().peak_tau = 0.0;
+        for _ in 0..50 { inner.tick(DT); }
+        let peak = rig.lock().unwrap().peak_tau;
+        assert!(peak <= 0.01, "k {k}: still pressing, {peak} N·m");
     }
 }

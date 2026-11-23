@@ -94,6 +94,9 @@ pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
 pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
+/// A gripper action that ends with its J7 command more than this far from the measured jaw
+/// (rad) and no object held has J7 set to the measured jaw on the next tick.
+pub const GRIPPER_END_LEAD_RAD: f32 = 0.02;
 /// During a `gripper_calibrate` stroke the torque stall latch needs the J7 command at least this
 /// far from the measured jaw (rad): a blocked jaw falls behind its command, a free jaw settling
 /// onto its target does not (it reads 0.5-0.7 N·m of friction at low speed near open on the
@@ -400,8 +403,10 @@ pub struct SupervisorInner {
     pub gripper_stream_lease: Option<u64>,
     /// A gripper action reference was active at the start of the previous tick ...
     pub gripper_ref_prev: bool,
-    /// ... and it reported done in that tick (a normal end keeps its hold).
+    /// ... and it reported done in that tick ...
     pub gripper_ref_done: bool,
+    /// ... with `holding: true` (a grasp squeeze hold on an object is kept).
+    pub gripper_ref_holding: bool,
     /// Grip ramp of the current torque-cap latch (stiffness estimate, trips on this contact);
     /// None while no latch holds.
     pub gripper_cap_ramp: Option<crate::motion::CapRamp>,
@@ -739,6 +744,7 @@ impl SupervisorInner {
             gripper_stream_lease: None,
             gripper_ref_prev: false,
             gripper_ref_done: false,
+            gripper_ref_holding: false,
             gripper_cap_ramp: None,
             gripper_over_cap_prev: false,
             park_gripper_contact: false,
@@ -6161,14 +6167,22 @@ impl SupervisorInner {
             None
         };
         // a gripper action that ended since the last tick without reporting done (lease loss,
-        // fault, cancel), or one still installed while the arm is stopped: hold the measured jaw
+        // fault, cancel), or one still installed while the arm is stopped: hold the measured jaw;
+        // one that reported done short of its command (stopped on something) and is not holding
+        // an object: the same, so the leading command does not keep pressing
         let grip_active = self.gripper_reference_active();
-        if (self.gripper_ref_prev && !grip_active && !self.gripper_ref_done)
+        let lead = self.config.gripper_index()
+            .and_then(|g| Some((self.commanded_positions.get(g)? - self.measured_positions.get(g)?).abs()))
+            .filter(|l| l.is_finite()).unwrap_or(0.0);
+        let ended = self.gripper_ref_prev && !grip_active;
+        if (ended && !self.gripper_ref_done)
+            || (ended && !self.gripper_ref_holding && lead > GRIPPER_END_LEAD_RAD)
             || (grip_active && !self.safety.state().is_operational()) {
             self.hold_gripper_at_measured();
         }
         self.gripper_ref_prev = grip_active;
         self.gripper_ref_done = false;
+        self.gripper_ref_holding = false;
         let mut grip_learned: Option<(Option<u64>, crate::gripper_baseline::MoveRecord)> = None;
         let cap_k = self.gripper_cap_ramp.map(|r| r.k_est);
         let mut grip_contact: Option<crate::gripper_baseline::ContactInfo> = None;
@@ -6244,7 +6258,10 @@ impl SupervisorInner {
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
                 self.servo_stream_active = false;
-                if matches!(out.status, StepStatus::Done { .. }) { self.gripper_ref_done = true; }
+                if let StepStatus::Done { holding, .. } = &out.status {
+                    self.gripper_ref_done = true;
+                    self.gripper_ref_holding = *holding == Some(true);
+                }
                 deferred_done = self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Arm(mut out))) => {
