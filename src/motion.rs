@@ -1346,11 +1346,11 @@ impl GripperMotion {
     /// baseline). Off without `contact_torque_nm`; without a learned baseline near `m_g` it is
     /// `contact_torque_nm` (the absolute rule).
     fn contact_threshold(&self, m_g: f32, mv: f32) -> (Option<f32>, ThresholdSource, Option<f32>) {
-        let Some(floor) = self.policy.contact_torque_nm else { return (None, ThresholdSource::None, None) };
-        let cap = self.policy.max_close_torque_nm;
-        match self.baseline.as_ref().and_then(|b| b.estimate(m_g, Direction::Close, mv.abs())) {
-            Some(e) => (Some(e.threshold_nm(cap)), ThresholdSource::Baseline, Some(e.baseline_nm)),
-            None => (Some(floor), ThresholdSource::ContactTorqueNm, None),
+        match crate::gripper_baseline::closing_contact_threshold(self.baseline.as_ref(), m_g, mv.abs(),
+            self.policy.contact_torque_nm, self.policy.max_close_torque_nm) {
+            None => (None, ThresholdSource::None, None),
+            Some((t, true, b)) => (Some(t), ThresholdSource::Baseline, b),
+            Some((t, false, b)) => (Some(t), ThresholdSource::Uncalibrated, b),
         }
     }
 

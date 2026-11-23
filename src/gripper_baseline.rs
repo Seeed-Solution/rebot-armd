@@ -377,6 +377,31 @@ impl FreeTorqueBaseline {
     }
 }
 
+/// Before a calibration learned the closing direction, the closing contact threshold is at
+/// least `contact_torque_nm` + this (N·m), at most CONTACT_CAP_FRACTION x cap. B601-DM
+/// 2026-11-24, new finger, 0.3 rad/s: free closes read 0.72-0.79 N·m near open while the
+/// opening-borrowed threshold was 0.711 (first values capped at 0.45 N·m), so the closes
+/// reported a false contact at -5.56 rad and crept; 0.6 + 0.25 = 0.85 N·m (0.85 x the 1.0 N·m
+/// cap) is above them. The torque cap still latches at the cap, and lag contacts still count.
+pub const UNCALIBRATED_CLOSE_MARGIN_NM: f32 = 0.25;
+
+/// Closing contact threshold at `q` (|v| `speed`): (threshold, calibrated, baseline). From
+/// learned closing tables (a calibration) when they cover `q`; otherwise (no data, or only the
+/// opening tables) max(that estimate's threshold, `contact_nm` + UNCALIBRATED_CLOSE_MARGIN_NM),
+/// at most CONTACT_CAP_FRACTION x `cap_nm`. None without `contact_nm` (torque contact off).
+pub fn closing_contact_threshold(b: Option<&FreeTorqueBaseline>, q: f32, speed: f32, contact_nm: Option<f32>, cap_nm: Option<f32>) -> Option<(f32, bool, Option<f32>)> {
+    let floor = contact_nm?;
+    let e = b.and_then(|b| b.estimate(q, Direction::Close, speed));
+    match e {
+        Some(e) if !e.other_direction => Some((e.threshold_nm(cap_nm), true, Some(e.baseline_nm))),
+        _ => {
+            let mut t = (floor + UNCALIBRATED_CLOSE_MARGIN_NM).max(e.map_or(0.0, |e| e.threshold_nm(cap_nm)));
+            if let Some(cap) = cap_nm { t = t.min(CONTACT_CAP_FRACTION * cap); }
+            Some((t, false, e.map(|e| e.baseline_nm)))
+        }
+    }
+}
+
 /// Contact verdict details of the last grasp contact (observation `gripper.baseline.last_contact`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ContactInfo {
@@ -410,7 +435,10 @@ pub enum ContactSource {
 pub enum ThresholdSource {
     /// The learned baseline + margin.
     Baseline,
-    /// No baseline near this position: `gripper_policy.contact_torque_nm` (the absolute rule).
+    /// No closing calibration near this position: max(the opening tables' threshold,
+    /// `contact_torque_nm` + UNCALIBRATED_CLOSE_MARGIN_NM), at most CONTACT_CAP_FRACTION x cap.
+    Uncalibrated,
+    /// `gripper_policy.contact_torque_nm` (the absolute rule; no longer produced by armd).
     ContactTorqueNm,
     /// Torque contact off (no `contact_torque_nm`).
     None,

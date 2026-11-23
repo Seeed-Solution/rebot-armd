@@ -5688,11 +5688,15 @@ impl SupervisorInner {
             // stiffness x the POS_VEL lag at contact: no feedback precedes it.
             // A learned baseline moves the contact detection to baseline + margin; the regulated
             // grip torque stays contact_torque_nm, raised by at most GRIPPER_STREAM_TARGET_RAISE_MAX_NM.
+            let force_cap_nm = self.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm);
+            let stream_detect_nm = crate::gripper_baseline::closing_contact_threshold(self.gripper_baseline.as_ref(), p_meas,
+                crate::gripper_baseline::SLOW_BAND_MAX_RAD_S * 0.5,
+                self.config.gripper_policy.as_ref().and_then(|p| p.contact_torque_nm), force_cap_nm).map(|t| t.0);
             let regulator = self.config.gripper_policy.as_ref()
                 .and_then(|p| Some((p.contact_torque_nm?, p.stream_contact_speed_rad_s?)))
-                .map(|(c, speed)| match learned_close_nm {
-                    Some(d) => (d, d.clamp(c, c + GRIPPER_STREAM_TARGET_RAISE_MAX_NM), speed),
-                    None => (c, c, speed),
+                .map(|(c, speed)| {
+                    let d = stream_detect_nm.unwrap_or(c);
+                    (d, d.clamp(c, c + GRIPPER_STREAM_TARGET_RAISE_MAX_NM), speed)
                 })
                 .filter(|_| has_torque_feedback && self.is_torqued);
             match (regulator, self.gripper_stream_target) {

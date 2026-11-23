@@ -50,6 +50,10 @@ enum Finger {
     New,
     /// Old finger (2026-11-20): 0.40 N·m whatever the position (as `test_gripper_force`).
     Old,
+    /// B601-DM 1.6.0-dev5 run (2026-11-24, 0.3 rad/s, empty jaws): opens peak 0.63-0.69 N·m,
+    /// closes 0.72-0.79 N·m near open: the measured shape x 1.35 opening (0.66 at -6.0), closing
+    /// 13 % higher (0.75), noise ±0.04 N·m.
+    Real,
     /// New finger, `.0` x its torque everywhere (lower friction after lubrication).
     NewScaled(f32),
     /// New finger lubricated: the measured lubricated shape, closing 10 % higher (0.57 N·m at
@@ -63,6 +67,7 @@ impl Finger {
         let base = match self {
             Finger::New => 1.3 * shape(q) * if v > 0.0 { 1.04 } else { 1.0 } + noise,
             Finger::Old => 0.40,
+            Finger::Real => 1.35 * shape(q) * if v > 0.0 { 1.13 } else { 1.0 } + 0.67 * noise,
             Finger::NewScaled(f) => f * 1.3 * shape(q) * if v > 0.0 { 1.04 } else { 1.0 } + noise,
             Finger::Lube => interp(&SHAPE_LUBE, q) * if v > 0.0 { 1.1 } else { 1.0 } + 2.5 * noise,
         };
@@ -224,9 +229,9 @@ fn baseline_obs(inner: &SupervisorInner) -> armd::model::GripperBaselineObs {
     inner.current_observation().gripper.unwrap().baseline.unwrap()
 }
 
-/// New finger, nothing learned: the close uses the absolute rule (contact_torque_nm) and is not
-/// learned; "unlearned" until a move is learned. From the first plain open on, closes use the
-/// opening tables (+0.08 N·m) and run at speed.
+/// New finger, nothing learned: the close uses the uncalibrated threshold (contact_torque_nm +
+/// 0.25 = 0.85 N·m) and runs at speed, is not learned; "unlearned" until a move is learned.
+/// Plain opens teach the opening direction; closes stay on the uncalibrated threshold.
 #[test]
 fn new_finger_unlearned_uses_the_absolute_rule_and_learns_from_opens() {
     let (mut inner, rig) = rig(Finger::New);
@@ -234,10 +239,10 @@ fn new_finger_unlearned_uses_the_absolute_rule_and_learns_from_opens() {
     let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
     let c = inner.gripper_last_contact;
     eprintln!("unlearned air close: {} {:?} in {t:.1} s, contact {c:?}", a.state, a.code);
-    assert_eq!(c.map(|c| c.threshold_source), Some(ThresholdSource::ContactTorqueNm), "{c:?}");
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "{a:?}");
+    if let Some(c) = c { assert!(c.threshold_source == ThresholdSource::Uncalibrated && c.at_rad > -0.35, "{c:?}"); }
     assert_eq!(baseline_obs(&inner).state, "unlearned");
-    // the deadline of the unloaded-looking creep is not extended past timeout + 2 s
-    assert!(t <= 8.5 + 2.0 + 0.05, "{t:.1} s");
+    assert!(t < 7.5, "{t:.1} s");
     rig.lock().unwrap().q[6] = 0.0; // (jaw back to closed for a full opening stroke)
     inner.commanded_positions[6] = 0.0;
     inner.target_positions[6] = 0.0;
@@ -351,8 +356,8 @@ fn incident_still_stops_at_the_cap_with_a_baseline() {
     }
 }
 
-/// Old finger (0.40 N·m everywhere): with a learned baseline the soft object is caught at about
-/// the same place as without one, held, and not squeezed harder.
+/// Old finger (0.40 N·m everywhere): calibrated, the soft object is caught where the former
+/// absolute rule caught it; uncalibrated (0.85 N·m threshold) later. Both hold it.
 #[test]
 fn old_finger_contact_unchanged_by_the_baseline() {
     let contact = |learned: bool| {
@@ -373,15 +378,22 @@ fn old_finger_contact_unchanged_by_the_baseline() {
             }
         }
         let peak = rig.lock().unwrap().peak_tau;
-        (first.unwrap(), peak)
+        (first, peak, inner.gripper_force_trips)
     };
-    let (c0, p0) = contact(false);
-    let (c1, p1) = contact(true);
-    eprintln!("old finger: unlearned {c0:?} peak {p0:.2}; learned {c1:?} peak {p1:.2}");
-    assert!((c0.at_rad - c1.at_rad).abs() < 0.1, "{c0:?} vs {c1:?}");
-    // the learned threshold (0.40 + 0.15) sits a little below contact_torque_nm: same outcome,
-    // the contact is found slightly earlier and the peak is not higher
-    assert!(p1 <= p0 + 0.05, "{p0} vs {p1}");
+    let (c0, p0, trips0) = contact(false);
+    let (c1, p1, _) = contact(true);
+    eprintln!("old finger: unlearned {c0:?} peak {p0:.2} trips {trips0}; calibrated {c1:?} peak {p1:.2}");
+    let c1 = c1.expect("calibrated: torque contact");
+    // calibrated (0.40 + 0.15 = 0.55 N·m): where the former absolute rule (0.6 N·m) found it,
+    // 0.6 = 0.40 + 1.5 x pen at pen 0.13 rad (-1.87 rad), within 0.1 rad
+    assert_eq!(c1.threshold_source, ThresholdSource::Baseline);
+    assert!((c1.at_rad - (-1.867)).abs() < 0.1, "{c1:?}");
+    // uncalibrated (0.85 N·m): later, or the cap latches first; held either way
+    match c0 {
+        Some(c0) => assert!(c0.threshold_source == ThresholdSource::Uncalibrated && c0.at_rad >= c1.at_rad, "{c0:?} vs {c1:?}"),
+        None => assert!(trips0 >= 1, "uncalibrated: neither a contact nor a cap trip"),
+    }
+    assert!(p0 <= cap() + 0.25 && p1 <= cap() + 0.25, "{p0} {p1}");
 }
 
 /// After lubrication (free torque 0.65 x everywhere) the baseline follows down over a few
@@ -773,3 +785,41 @@ fn move_that_stops_short_on_an_object_releases_its_lead() {
         assert!(peak <= 0.01, "k {k}: still pressing, {peak} N·m");
     }
 }
+
+/// The real-arm run on 1.6.0-dev5 (no calibration): opens and grasp-closes at 0.3 rad/s with
+/// the closing torque 0.72-0.79 N·m near open. Before a closing calibration the closing contact
+/// threshold is at least contact_torque_nm + 0.25 = 0.85 N·m (it was 0.711 from the opening
+/// tables: false contact at -5.56 rad, creep, GRIPPER_TIMEOUT after 22 s); every close finishes
+/// within the default deadline, which covers the full stroke at 0.3 rad/s.
+#[test]
+fn real_profile_slow_closes_before_calibration() {
+    let (mut inner, rig) = rig(Finger::Real);
+    let slow = |command, fraction| GripperRequest { command, fraction, grasp: command == GripperCommand::Close, speed: 0.3, timeout_s: None, tag: None };
+    let (mut peak_open, mut peak_close) = (0.0f32, 0.0f32);
+    for k in 0..6 {
+        rig.lock().unwrap().peak_tau = 0.0;
+        let (a, t) = run(&mut inner, slow(GripperCommand::Open, None));
+        peak_open = peak_open.max(rig.lock().unwrap().peak_tau);
+        assert_eq!(a.state, "done", "open {k}: {a:?}");
+        assert!(t < 25.0, "open {k}: {t:.1} s");
+        inner.gripper_last_contact = None;
+        rig.lock().unwrap().peak_tau = 0.0;
+        let (a, t) = run(&mut inner, slow(GripperCommand::Close, None));
+        peak_close = peak_close.max(rig.lock().unwrap().peak_tau);
+        let c = inner.gripper_last_contact;
+        eprintln!("real close {k}: {} {:?} in {t:.1} s, holding {:?}, contact {c:?}", a.state, a.code, a.holding);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "close {k}: {a:?}");
+        if let Some(c) = c { assert!(c.at_rad > -0.35, "close {k}: early contact {c:?}"); }
+        assert!(t < 25.0, "close {k}: {t:.1} s");
+    }
+    let obs = baseline_obs(&inner);
+    eprintln!("real profile: opens peak {peak_open:.2}, closes peak {peak_close:.2} N·m; {obs:?}");
+    assert!(peak_close > 0.72 && peak_close < 0.85, "{peak_close}");
+    assert_eq!(obs.close_moves, 0);
+    // the closing threshold near open before a calibration
+    let p = GripperPolicy::rebot_dm();
+    let (t, calibrated, _) = armd::gripper_baseline::closing_contact_threshold(inner.gripper_baseline.as_ref(), -5.5, 0.3,
+        p.contact_torque_nm, p.max_close_torque_nm).unwrap();
+    assert!(!calibrated && (t - 0.85).abs() < 1e-4, "{t}");
+}
+
