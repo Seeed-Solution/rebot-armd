@@ -656,6 +656,79 @@ export function* calibrateIntrinsicsSteps(views, board, { size = IMAGE, gates = 
   return out;
 }
 
+// ---------------------------------------------------------------- board flatness (diagnosis only)
+/* When the reprojection RMS fails: is the board bent? Per marker corner an out-of-plane height h (board z) is
+   fitted to the residuals of every used view (pose by planar PnP with the solved intrinsics; one Gauss-Newton
+   step per corner, as the offline analysis of the real sessions 2026-11-23), then the intrinsics are solved again
+   with the bent board. When that alone brings the RMS under the gate, with a clear gain and a height spread a
+   flat board cannot have, the board explains the error. Real sessions: two bent prints 0.591 -> 0.328 and
+   0.636 -> 0.319 px (corner heights -1.6 .. +0.7 mm), a flat board 0.314 -> 0.297 px (-0.17 .. +0.20 mm).
+   The result is a diagnosis: nothing solved with the bent board is ever applied. */
+export const FLAT_GATES = Object.freeze({ minGain: 0.3, minRangeMm: 0.5 });
+export const boardFlatness = (views, board, intr, opt = {}) => runSync(boardFlatnessSteps(views, board, intr, opt));
+export function* boardFlatnessSteps(views, board, intr, { size = IMAGE, gates = GATES, init = NOMINAL, flat = FLAT_GATES, iters = 3 } = {}) {
+  if (!intr || !intr.K || !Array.isArray(intr.used)) return null;
+  // corner heights by the original corner (board.markers[].corners[k], the keys of correspondences)
+  const height = new Map();
+  let cur = intr, bent = board, r1 = null;
+  for (let it = 0; it < iters; it++) {
+    const K = cur.K, acc = new Map();
+    for (const i of cur.used) {
+      yield;
+      const c = correspondences({ markers: boardMarkers(views[i], board) }, board, intr.order);
+      const obj = c.obj.map((o) => [o[0], o[1], o[2] + (height.get(o) || 0)]);
+      const P = solvePnP(obj, c.img, K);
+      if (!P || !(P.rms <= gates.viewRmsPx * 1.5)) continue;
+      for (let k = 0; k < obj.length; k++) {
+        const o = obj[k], [u, w] = project(K, P.R, P.t, o), [u2, w2] = project(K, P.R, P.t, [o[0], o[1], o[2] + 1e-4]);
+        const J = [(u2 - u) / 1e-4, (w2 - w) / 1e-4], e = [c.img[k][0] - u, c.img[k][1] - w];
+        const a = acc.get(c.obj[k]) || { jj: 0, je: 0 };
+        a.jj += J[0] * J[0] + J[1] * J[1]; a.je += J[0] * e[0] + J[1] * e[1];
+        acc.set(c.obj[k], a);
+      }
+    }
+    for (const [o, a] of acc) if (a.jj > 0) height.set(o, (height.get(o) || 0) + a.je / a.jj);
+    // the bent board: a copy with the fitted corner heights
+    bent = { ...board, markers: board.markers.map((m) => ({ ...m, corners: m.corners.map((o) => [o[0], o[1], o[2] + (height.get(o) || 0)]) })) };
+    bent.byId = new Map(bent.markers.map((m) => [m.id, m]));
+    const r = yield* calibrateIntrinsicsSteps(views, bent, { size, gates, init, order: intr.order });
+    if (!r.K) break;
+    const gained = !r1 || r.rms < r1.rms - 0.005;
+    r1 = r; cur = { ...r, order: intr.order };
+    if (!gained) break;
+  }
+  const corners = [];
+  for (const m of board.markers) for (const o of m.corners) if (height.has(o)) corners.push({ id: m.id, x: o[0], y: o[1], h: height.get(o) });
+  if (corners.length < 12 || !r1) return null;
+  // the corner heights relative to their median; the bow = peak to peak of a quadratic surface fitted to them
+  const med = corners.map((c) => c.h).sort((p, q) => p - q)[corners.length >> 1];
+  const hs = corners.map((c) => c.h - med);
+  const A = corners.map((c) => [1, c.x, c.y, c.x * c.x, c.x * c.y, c.y * c.y]);
+  const AtA = A[0].map((_, i) => A[0].map((__, j) => A.reduce((s, r) => s + r[i] * r[j], 0)));
+  const Atb = A[0].map((_, i) => A.reduce((s, r, k) => s + r[i] * hs[k], 0));
+  const coef = solveSym(AtA, Atb);
+  const fitH = coef ? A.map((r) => r.reduce((s, v, i) => s + v * coef[i], 0)) : hs;
+  const worstK = hs.reduce((b, h, k) => (Math.abs(h) > Math.abs(hs[b]) ? k : b), 0);
+  const rangeMm = (Math.max(...hs) - Math.min(...hs)) * 1000, bowMm = (Math.max(...fitH) - Math.min(...fitH)) * 1000;
+  const rms0 = intr.rms, rms1 = r1.rms, gain = 1 - rms1 / rms0;
+  return {
+    rms0, rms1, gain, rangeMm, bowMm, worst: { id: corners[worstK].id, mm: hs[worstK] * 1000 },
+    explains: rms0 > gates.rmsPx && rms1 <= gates.rmsPx && gain >= flat.minGain && rangeMm >= flat.minRangeMm,
+    corners: corners.map((c, k) => ({ id: c.id, mm: +(hs[k] * 1000).toFixed(2) })),
+  };
+}
+// small symmetric solve (Gaussian elimination with partial pivoting); null when singular
+function solveSym(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (Math.abs(M[p][c]) < 1e-18) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c] / M[c][c]; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+  }
+  return M.map((r, i) => r[n] / r[i]);
+}
+
 // ---------------------------------------------------------------- hand-eye and table
 // CALM: the cockpit's calibration math (index.html CALIB-MATH block). G: T_base_end per view, M: T_cam_board.
 export function solveHandEye(CALM, G, M, gates = GATES) {
@@ -698,6 +771,7 @@ export function solveAll({ views, board, CALM, thickness = 0.0005, gates = GATES
   intr.rejected = screened.rejected;
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
+  if (intr.gates.some((g) => g.key === 'rms' && !g.ok)) res.flatness = boardFlatness(views, board, intr, { size, gates, init });
   const G = [], M = [], vi = [], obs = [];
   for (const i of intr.used) {
     const V = views[i];
@@ -1349,6 +1423,11 @@ export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, 
   const intr = yield* calibrateIntrinsicsSteps(views, board, { size, gates, init });
   intr.rejected = screened.rejected;
   const res = { ok: false, intr, gates: [...intr.gates] };
+  // a failed RMS: is the board bent? (diagnosis for the message; the solve below stays the planar one)
+  if (intr.K && intr.gates.some((g) => g.key === 'rms' && !g.ok)) {
+    if (onProgress) onProgress('flatness');
+    res.flatness = yield* boardFlatnessSteps(views, board, intr, { size, gates, init });
+  }
   if (!intr.K) return res;
   const kin = yield* solveKinematicsSteps({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, prior, onProgress });
   res.kin = kin; res.gates.push(...kin.gates);

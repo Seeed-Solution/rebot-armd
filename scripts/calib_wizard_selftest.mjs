@@ -20,6 +20,8 @@
 //   j. re-plan from a pose 15 mm under the clearance (plane estimate moved up after the re-solve): the tour
 //      completes with every move re-checked, no tool point lower than the start; a move to a target below
 //      the clearance stays refused
+//   k. board flatness: a print bent by 2 mm fails the RMS gate and the diagnosis explains it (bow within 40 %); the
+//      flat set is not flagged
 // CALM / VIK come from src/api/index.html (blocks CALIB-MATH and VIEW-IK), as in the browser.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -77,9 +79,9 @@ if (!q0) { console.log('FAIL  start pose unreachable'); process.exit(1); }
 
 // synthetic capture: board corners through the true camera at FK pose q, detector order = OpenCV (TL TR BR BL)
 const CVORDER = [3, 2, 1, 0];
-function synth(q, { K = Ktrue, X = Xtrue, B = Tbb, noise = 0.3, order = CVORDER } = {}) {
+function synth(q, { K = Ktrue, X = Xtrue, B = Tbb, noise = 0.3, order = CVORDER, bd = board } = {}) {
   const G = fk(q), Tcb = mul(inv(mul(G, X)), B), R = rotOf(Tcb), t = posOf(Tcb), markers = [];
-  for (const m of board.markers) {
+  for (const m of bd.markers) {
     const px = m.corners.map((c) => CW.project(K, R, t, c));
     if (!px.every(([u, v, z]) => z > 0 && u >= 4 && u <= 636 && v >= 4 && v <= 356)) continue;
     markers.push({ id: m.id, corners: order.map((k) => [px[k][0] + noise * gauss(), px[k][1] + noise * gauss()]) });
@@ -133,6 +135,22 @@ const views = qs.map((q) => synth(q));
   const ok = r.ok && Math.abs(K.fx / Ktrue.fx - 1) < 0.01 && Math.abs(K.fy / Ktrue.fy - 1) < 0.01 && Math.abs(K.cx - Ktrue.cx) < 3 && Math.abs(K.cy - Ktrue.cy) < 3 && Math.abs(K.k1 - Ktrue.k1) < 0.03;
   check('b. intrinsics 0.3 px noise', ok,
     `views ${r.used.length} (skipped ${r.skipped.length}, dropped ${r.dropped.length}), init ${r.method}; fx ${K.fx.toFixed(2)} fy ${K.fy.toFixed(2)} cx ${K.cx.toFixed(2)} cy ${K.cy.toFixed(2)} k1 ${K.k1.toFixed(4)} k2 ${K.k2.toFixed(4)}; rms ${r.rms.toFixed(3)} px, held-out ${r.heldOut.rms.toFixed(3)} px (${r.heldOut.n} views), sigma fx ${r.sigma.fx.toFixed(2)} cx ${r.sigma.cx.toFixed(2)} px, cond ${r.cond.toFixed(1)}, ${Date.now() - t1} ms; gates ${gateStr(r.gates)}`);
+}
+
+// ---- k. board flatness: a print bent by up to BOW mm (bowl, corners down, as the real bent boards 2026-11-23) fails the
+// RMS gate; the diagnosis explains it (the bent-board solve passes, bow estimated within 40 %); the flat set is not flagged
+{
+  const BOW = 0.002, hx = board.width / 2, hy = board.height / 2;
+  const bent = { ...board, markers: board.markers.map((m) => ({ ...m, corners: m.corners.map(([x, y]) => [x, y, BOW * ((x / hx) ** 2 + (y / hy) ** 2) / 2]) })) };
+  const bv = qs.map((q) => synth(q, { bd: bent }));
+  const t1 = Date.now();
+  const r = CW.calibrateIntrinsics(bv, board);
+  const rmsGate = r.gates.find((g) => g.key === 'rms');
+  const fl = CW.boardFlatness(bv, board, r);
+  const fl0 = CW.boardFlatness(views, board, CW.calibrateIntrinsics(views, board));
+  check('k. bent board: RMS fails, flatness explains it, bow estimated', !!rmsGate && !rmsGate.ok && fl && fl.explains && Math.abs(fl.bowMm - BOW * 1000) <= 0.4 * BOW * 1000,
+    `planar rms ${r.rms.toFixed(3)} px; with the fitted corner heights ${fl ? fl.rms1.toFixed(3) : '?'} px (gain ${fl ? fl.gain.toFixed(2) : '?'}), bow ${fl ? fl.bowMm.toFixed(2) : '?'} mm (true ${BOW * 1000}), largest ${fl ? fl.worst.mm.toFixed(2) + ' mm at marker ' + fl.worst.id : '?'}, ${Date.now() - t1} ms`);
+  check('k. flat board: not flagged', fl0 && !fl0.explains, `rms ${fl0 ? fl0.rms0.toFixed(3) : '?'} -> ${fl0 ? fl0.rms1.toFixed(3) : '?'} px, corner height range ${fl0 ? fl0.rangeMm.toFixed(2) : '?'} mm`);
 }
 
 // ---- c. PnP
