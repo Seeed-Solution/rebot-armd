@@ -169,6 +169,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn joint_loads_into(&self, out: &mut Vec<f32>) -> bool { self.inner.joint_loads_into(out) }
     fn motor_status_into(&self, out: &mut Vec<u8>) -> bool { self.inner.motor_status_into(out) }
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> { self.inner.set_torque(enabled) }
+    fn begin_torque(&mut self, enabled: bool) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.begin_torque(enabled) }
+    fn poll_torque(&mut self, deadline: Instant) -> Result<crate::driver::TorqueProgress, ArmDriverError> { self.inner.poll_torque(deadline) }
+    fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> { self.inner.check_hardware_status() }
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> { self.inner.clear_fault() }
@@ -209,6 +212,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn set_mit_deadline_fence(&mut self, deadline: Option<Duration>, holdoff: Duration) { self.inner.set_mit_deadline_fence(deadline, holdoff) }
     fn mit_fence_trip(&self) -> Option<String> { self.inner.mit_fence_trip() }
     fn clock_now(&self) -> std::time::Instant { self.inner.clock_now() }
+    fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn mit_expiry_recover(&mut self) -> Result<(), String> { self.inner.mit_expiry_recover() }
     fn mit_fresh_status(&mut self) -> Result<Vec<u8>, String> { self.inner.mit_fresh_status() }
     fn acknowledge_mit_fence_trip(&mut self) { self.inner.acknowledge_mit_fence_trip() }
