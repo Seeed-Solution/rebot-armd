@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget, MotorZeroSupport};
+use crate::driver::handshake::Deadline;
+use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget, MotorZeroSupport, TorqueOutcome, TorqueProgress};
 use crate::model::JointState;
 
 /// Default simulator address for `--follower sim` without `--follower-port`.
@@ -132,6 +133,8 @@ pub struct SimArmDriver {
     /// Simulated encoder zero (raw simulator angle of each joint's zero); None = the
     /// simulator's own zero. Set by `set_zero_position`, lost when armd restarts.
     zero_offsets: Option<Vec<f32>>,
+    /// Pending torque transition: requested state and the deadline of its acknowledgement.
+    torque_hs: Option<(bool, Deadline)>,
 }
 
 impl SimArmDriver {
@@ -161,6 +164,7 @@ impl SimArmDriver {
             cached_torques: vec![0.0; dof],
             load_only_feedback: false,
             zero_offsets: None,
+            torque_hs: None,
         })
     }
 
@@ -205,15 +209,9 @@ impl SimArmDriver {
         self.shared.lock().map_or((None, None), |s| (s.latest.clone(), s.received_at.map(|t| t.elapsed())))
     }
 
-    fn wait_for_ack(&self, seq: u64, enabled: bool, timeout: Duration) -> bool {
-        let start = Instant::now();
-        loop {
-            if let (Some(state), Some(age)) = self.snapshot() {
-                if state.ack >= seq && state.enabled == enabled && age <= SIM_FEEDBACK_STALE { return true; }
-            }
-            if start.elapsed() >= timeout { return false; }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+    /// The simulator applied command `seq` and reports `enabled` in fresh feedback.
+    fn acked(&self, seq: u64, enabled: bool) -> bool {
+        matches!(self.snapshot(), (Some(state), Some(age)) if state.ack >= seq && state.enabled == enabled && age <= SIM_FEEDBACK_STALE)
     }
 }
 
@@ -343,6 +341,9 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        if self.torque_hs.is_some() {
+            return Err(ArmDriverError::Protocol("torque transition pending: no target before its confirmation".into()));
+        }
         if targets.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
         }
@@ -361,18 +362,58 @@ impl ArmDriver for SimArmDriver {
         Ok(())
     }
 
+    /// Blocking: [`ArmDriver::begin_torque`], then served every 1 ms until it finishes. An
+    /// unacknowledged disable returns Ok (the caller checks the enable state).
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        let mut progress = self.begin_torque(enabled)?;
+        loop {
+            match progress {
+                TorqueProgress::Done(_) => return Ok(()),
+                TorqueProgress::Pending { .. } => {}
+            }
+            progress = self.poll_torque(Instant::now())?;
+            if matches!(progress, TorqueProgress::Pending { .. }) { std::thread::sleep(Duration::from_millis(1)); }
+        }
+    }
+
+    /// The enable / disable command goes out at once; its acknowledgement (fresh state datagram
+    /// with `ack >= seq` and the requested `enabled`) is awaited until the deadline. A disable
+    /// replaces a pending enable.
+    fn begin_torque(&mut self, enabled: bool) -> Result<TorqueProgress, ArmDriverError> {
+        if enabled && self.torque_hs.is_some() {
+            return Err(ArmDriverError::Protocol("a torque transition is pending".into()));
+        }
         self.enable_requested = enabled;
         self.enable_seq = self.send(None);
         let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
-        let confirmed = self.wait_for_ack(self.enable_seq, enabled, timeout);
-        if enabled && !confirmed {
+        let now = Instant::now();
+        self.torque_hs = Some((enabled, Deadline::after(now, timeout)));
+        Ok(TorqueProgress::Pending { wake: now })
+    }
+
+    /// No receive pass (the receiver thread fills the cache): `_deadline` bounds nothing.
+    fn poll_torque(&mut self, _deadline: Instant) -> Result<TorqueProgress, ArmDriverError> {
+        let Some((enabled, deadline)) = self.torque_hs else {
+            return Err(ArmDriverError::Protocol("no torque transition pending".into()));
+        };
+        // the acknowledgement is checked before the deadline (an ack seen at the deadline counts)
+        let outcome = if self.acked(self.enable_seq, enabled) {
+            TorqueOutcome::Confirmed
+        } else if deadline.passed(Instant::now()) {
+            TorqueOutcome::Unconfirmed
+        } else {
+            return Ok(TorqueProgress::Pending { wake: deadline.at });
+        };
+        self.torque_hs = None;
+        if enabled && outcome == TorqueOutcome::Unconfirmed {
             return Err(ArmDriverError::HardwareFault(format!(
                 "Simulator did not confirm enable within {} ms", ENABLE_CONFIRM_TIMEOUT.as_millis())));
         }
         if !enabled { self.modes.fill(JointMode::Position); }
-        Ok(())
+        Ok(TorqueProgress::Done(outcome))
     }
+
+    fn torque_transition_pending(&self) -> bool { self.torque_hs.is_some() }
 
     fn is_feedback_valid(&self) -> bool {
         self.snapshot().1.is_some_and(|age| age <= SIM_FEEDBACK_STALE)
