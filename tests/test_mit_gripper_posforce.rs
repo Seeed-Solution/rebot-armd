@@ -1244,3 +1244,123 @@ fn estop_holds_measured_position_only_when_feedback_is_fresh_else_commanded() {
     assert!((inner.commanded_positions[J7] - (-0.6)).abs() < 1e-5, "driver drain authorized stale supervisor snapshot: {}", inner.commanded_positions[J7]);
     assert!((inner.target_positions[J7] - (-0.6)).abs() < 1e-5);
 }
+
+#[test]
+fn estop_never_blocks_when_driver_mutex_held_by_another_thread() {
+    use std::sync::{mpsc, Arc};
+    use std::time::Instant;
+    use armd::gravity_comp::{GravityCompPhase, GravityCompRun};
+    use armd::model::GravityCompPolicy;
+    use armd::supervisor::SupervisorInner;
+
+    let setup_with_fresh_feedback = |floating_gravity_comp: bool| {
+        let (mut d, bus, _) = rig(true);
+        d.set_torque(true).unwrap();
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(d));
+        inner.is_torqued = true;
+        inner.tick(0.02);
+        bus.with(|s| {
+            for i in 0..6 { s.motors[i].q = 0.25 + 0.05 * i as f32; }
+            s.motors[J7].q = -1.2;
+            s.push_all_feedback();
+        });
+        inner.tick(0.02);
+        assert!((inner.measured_positions[J7] - (-1.2)).abs() < 1e-3);
+        for i in 0..6 { inner.commanded_positions[i] = -0.1 * (i as f32 + 1.0); }
+        inner.commanded_positions[J7] = -0.6;
+        if floating_gravity_comp {
+            inner.gravity_comp = Some(GravityCompRun {
+                phase: GravityCompPhase::Active,
+                policy: GravityCompPolicy::rebot_dm(),
+                elapsed_s: 1.0,
+                scale: 0.8,
+                damping_kd: [0.5; 6],
+                entry_pose: [0.0; 6],
+                entry_torque: [0.0; 6],
+                tau_ff: [0.0; 6],
+                kp: [0.0; 6],
+                kd: [0.5; 6],
+                position: [0.0; 6],
+                overspeed_count: 0,
+                prev_measured: None,
+                lease_generation: None,
+            });
+        }
+        inner
+    };
+
+    // 1. Safe multi-thread contention (zero unsafe): move the driver Mutex into an Arc held by
+    //    another OS thread and move the owned SupervisorInner onto the E-stop thread.
+    //    Test both ordinary operation and floating gravity compensation: E-stop must complete
+    //    within one 20 ms tick without waiting on the lock and hold pre-stop commanded_positions.
+    for floating_gc in [false, true] {
+        let mut inner = setup_with_fresh_feedback(floating_gc);
+        let pre_cmd = inner.commanded_positions.clone();
+        let shared_driver = Arc::new(inner.driver.take().unwrap());
+        let holder_driver = Arc::clone(&shared_driver);
+        let estop_driver = Arc::clone(&shared_driver);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let holder = std::thread::spawn(move || {
+            let _guard = holder_driver.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+
+        locked_rx.recv().unwrap();
+        let estop_thread = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            inner.apply_estop_latch_with_driver(Some(&estop_driver));
+            let _ = done_tx.send((t0.elapsed(), inner));
+        });
+
+        // Put the timeout on E-stop completion, then always release and join both threads so
+        // scheduler jitter cannot release the mutex early and any blocking regression fails fast.
+        let estop_res = done_rx.recv_timeout(Duration::from_millis(250));
+        let _ = release_tx.send(());
+        holder.join().unwrap();
+        estop_thread.join().unwrap();
+        let (elapsed, inner) = estop_res.expect("E-stop blocked past 250 ms while driver mutex was held");
+
+        assert!(elapsed < Duration::from_millis(20), "floating_gc={floating_gc}: E-stop blocked on driver mutex: {elapsed:?}");
+        assert_eq!(*inner.safety.state(), armd::SafetyState::EStop);
+        for i in 0..7 {
+            assert!((inner.commanded_positions[i] - pre_cmd[i]).abs() < 1e-5,
+                "floating_gc={floating_gc} joint {i}: expected commanded {}, got {}", pre_cmd[i], inner.commanded_positions[i]);
+            assert!((inner.target_positions[i] - pre_cmd[i]).abs() < 1e-5,
+                "floating_gc={floating_gc} joint {i}: target expected {}, got {}", pre_cmd[i], inner.target_positions[i]);
+        }
+        if floating_gc {
+            let run = inner.gravity_comp.as_ref().expect("gravity comp run kept for exiting");
+            assert_eq!(run.phase.name(), "exiting");
+            for i in 0..6 {
+                assert!((run.position[i] - pre_cmd[i]).abs() < 1e-5,
+                    "floating_gc joint {i}: exit hold overwrote commanded {} with {}", pre_cmd[i], run.position[i]);
+            }
+            assert_eq!(inner.gravity_comp_last_exit.as_ref().map(|e| e.code.as_str()), Some("ESTOP"));
+        }
+    }
+
+    // 2. End-to-end `apply_stop_policy(StopPolicy::EStopLatch)` with a poisoned inline driver mutex
+    //    and floating gravity compensation also completes immediately and falls back to commanded_positions.
+    let mut inner = setup_with_fresh_feedback(true);
+    let pre_cmd = inner.commanded_positions.clone();
+    let _ = std::thread::scope(|s| {
+        let drv = inner.driver.as_ref().unwrap();
+        s.spawn(move || {
+            let _guard = drv.lock().unwrap();
+            panic!("intentional poison");
+        }).join()
+    });
+    let t0 = Instant::now();
+    inner.apply_stop_policy(armd::StopPolicy::EStopLatch);
+    let elapsed = t0.elapsed();
+    assert!(elapsed < Duration::from_millis(20), "poisoned E-stop blocked: {elapsed:?}");
+    assert_eq!(*inner.safety.state(), armd::SafetyState::EStop);
+    for i in 0..7 {
+        assert!((inner.commanded_positions[i] - pre_cmd[i]).abs() < 1e-5);
+        assert!((inner.target_positions[i] - pre_cmd[i]).abs() < 1e-5);
+    }
+}
