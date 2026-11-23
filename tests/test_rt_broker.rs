@@ -633,6 +633,24 @@ fn a_stop_during_the_watchdog_park_keeps_the_park_until_it_parks() {
 }
 
 #[test]
+fn an_urgent_stop_through_the_release_keeps_the_watchdog_park() {
+    let ((mut fx, mut b, _tw, stop), _) = parking_arm();
+    renew(&mut fx);
+    submit_install(&mut b, 1, auth(&fx), later(), to(&fx, [0.6, 0.3], 0.2)).unwrap();
+    run_out(&mut fx);
+    expire(&mut fx);
+    fx.step();
+    assert!(fx.core.pending_normal_unload && fx.core.watchdog_park.is_some(), "watchdog park");
+    // CoreOps::apply_stop at the start of the release: the park is not the client's motion
+    stop.request();
+    assert!(fx.step().stopped);
+    assert!(fx.core.pending_normal_unload && fx.core.active_trajectory.is_some(), "the park continues");
+    for _ in 0..300 { fx.step(); if !fx.core.is_torqued { break; } }
+    assert_eq!(*fx.core.safety.state(), armd::SafetyState::Idle, "parked, no watchdog fault");
+    assert!(!fx.core.is_torqued && fx.core.watchdog_park.is_none());
+}
+
+#[test]
 fn saturated_ingress_then_stop_refuses_every_older_command_and_a_fresh_install_commits() {
     let (mut fx, mut b, _tw, stop) = fixture(Capacities { commands: 3, plans: 3, replies: 12 });
     let a = auth(&fx);

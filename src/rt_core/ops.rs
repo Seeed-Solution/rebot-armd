@@ -455,7 +455,8 @@ impl CoreOps for SupervisorInner {
         self.consume_target_frame(frame, ctx)
     }
 
-    fn apply_stop(&mut self) { self.stop_motion(); }
+    // ends client motion; a running watchdog park belongs to the lease watchdog and continues
+    fn apply_stop(&mut self) { self.authorized_stop(); }
 
     fn action_outcome(&self, action: ActionId) -> Option<Outcome> {
         // a macro's terminal record outlives its action record (finish_action, a newer action)
