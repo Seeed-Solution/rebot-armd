@@ -721,6 +721,7 @@ impl SupervisorInner {
         prepared: Option<PreparedQuintic>,
     ) -> Result<(u64, u64, f64), ArmError> {
         let mut target_positions = target_positions;
+        self.config_motion_check()?;
         self.gravity_comp_motion_busy()?;
         // jog, home, move_to_pose, backlash approach: MIT must own its joints when requested
         if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
@@ -1004,6 +1005,15 @@ impl SupervisorInner {
         if self.core.motion_inhibited_by_config() { return Some("CONFIG_BUSY"); }
         if !self.commit_feedback_valid() { return Some("FEEDBACK_STALE"); }
         None
+    }
+
+    /// Legacy motion admission (`action_preconditions`, `start_quintic_prepared`): a
+    /// configuration reservation or reconciliation inhibits motion (`CONFIG_BUSY`), as the RT
+    /// commit and the planning snapshot's `config_inhibited` do.
+    pub(crate) fn config_motion_check(&self) -> Result<(), ArmError> {
+        if !self.core.motion_inhibited_by_config() { return Ok(()); }
+        Err(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(),
+            message: "a configuration change is being activated or reconciled; motion is refused until it ends".into() })
     }
 
     /// An authorized stop (the RT's urgent-stop generation advanced): ends client motion

@@ -462,10 +462,18 @@ fn a_config_reservation_needs_current_authority_and_inhibits_motion_until_it_end
     assert!(fx.core.planning_snapshot(&ctx).config_inhibited);
     submit_install(&mut b, 1, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
     assert_eq!(fx.step().command.unwrap().1, Err("CONFIG_BUSY"));
+    // the legacy admission paths refuse it too: a jog (quintic) and a Cartesian plan input
+    let code = |e: armd::ArmError| armd::api::rest::ApiError::from(e).code;
+    let mut q = fx.core.commanded_positions.clone();
+    q[0] += 0.05;
+    assert_eq!(fx.core.jog_action(q.clone(), Some(0.5), None, "jog").map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert_eq!(fx.core.plan_input_tcp().map(drop).map_err(code), Err(Some("CONFIG_BUSY".into())));
+    assert!(fx.core.active_trajectory.is_none());
     // nothing was applied for this candidate: activation hands the reservation back, released
     let Activated::Refused { code: "NOT_APPLIED", reservation } = fx.core.activate(r) else { panic!() };
     assert_eq!(fx.core.release(reservation), Released::Cleared);
     assert!(!fx.core.core.motion_inhibited_by_config());
+    assert!(fx.core.plan_input_tcp().is_ok());
     submit_install(&mut b, 2, auth(&fx), later(), quintic(&fx, 0.05, 0.5)).unwrap();
     assert!(fx.step().command.unwrap().1.is_ok());
 }

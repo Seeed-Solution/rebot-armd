@@ -320,6 +320,7 @@ impl SupervisorInner {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
         self.collision_hold_check()?;
+        self.config_motion_check()?;
         if let Some(reason) = self.mit_motion_blocker() { return Err(MotionError::MotionBusy(reason).into()); }
         if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
         Ok(())
