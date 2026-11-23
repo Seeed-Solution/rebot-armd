@@ -654,16 +654,12 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 /* header icon buttons (settings, poses); same look as the full-screen button */
 .hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
 .hd-btn[hidden] { display: none; }
-/* the 点位 button carries its name where the header has room (tablet, desktop); icon only on phones */
+/* the 点位 button is a header icon like its neighbours; from 1180 px it adds the short name ("点位" / "Poses"),
+   no wider than the operator badge. The full name ("点位与动作" / "Positions & motions") is its tooltip and label. */
 .hd-lbl, .hd-lbl-s { display: none; }
-@media (min-width: 800px) {
-  #btn-pset { width: auto; gap: 6px; padding: 0 10px 0 8px; }
-  #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
-}
-/* the full name ("点位与动作" / "Positions & motions") where the header has room for it */
 @media (min-width: 1180px) {
-  #btn-pset .hd-lbl { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
-  #btn-pset .hd-lbl-s { display: none; }
+  #btn-pset { width: auto; gap: 5px; padding: 0 9px 0 7px; }
+  #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
 }
 .hd-btn svg { width: 18px; height: 18px; }
 .hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
