@@ -589,6 +589,12 @@
       "t_max": 10.0
     }
   ],
+  "damiao_gripper": {
+    "mode": "pos_force",
+    "current_ceiling_raw": 220,
+    "close_speed_rad_s": 0.3,
+    "calibrated": false
+  },
   "backlash_approach": {
     "enabled": true,
     "delta_deg": 0.5,

@@ -321,6 +321,20 @@ pub const RID_VMAX: u8 = 22;
 pub const RID_TMAX: u8 = 23;
 pub const CTRL_MODE_MIT: u32 = 1;
 pub const CTRL_MODE_POS_VEL: u32 = 2;
+/// Position-force mode (frame `0x300 + id`: f32 position, u16 speed limit in 0.01 rad/s, u16
+/// current limit in 1/10000 of the maximum phase current).
+pub const CTRL_MODE_POS_FORCE: u32 = 4;
+/// Command CAN ID base of position-force frames.
+pub const POS_FORCE_BASE_ID: u16 = 0x300;
+/// Full scale of the position-force current field (= the maximum phase current).
+pub const POS_FORCE_I_DES_FULL: u16 = 10_000;
+
+/// Speed limit of a position-force frame: |speed| in 0.01 rad/s, rounded, saturated to u16
+/// (non-finite: 0).
+pub fn pos_force_vel_raw(speed_rad_s: f32) -> u16 {
+    if !speed_rad_s.is_finite() { return 0; }
+    (speed_rad_s.abs() * 100.0).round().clamp(0.0, f32::from(u16::MAX)) as u16
+}
 /// Feedback (master) CAN ID of the motor (u32).
 pub const RID_MST_ID: u8 = 7;
 /// Command (ESC) CAN ID of the motor (u32).
