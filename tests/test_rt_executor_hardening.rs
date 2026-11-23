@@ -1181,3 +1181,116 @@ async fn detached_shell_lease_calls_refuse_after_executor_transfer_without_shado
 
     handle.stop_and_join();
 }
+
+// ============================================================================
+// 8. Emergency teardown disable reaches driver while persistence stalls in dir_sync
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn emergency_disable_reaches_driver_while_persistence_stalled_in_dir_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let calib_path = dir.path().join("gripper_calib_stalled.json");
+
+    let bus = FakeBus::new(&dm_limits());
+    bus.with(|s| {
+        s.immediate_replies = true;
+        // Simulate jaw stop torque on the gripper (motor 7) so `start_gripper_zero_check`
+        // detects stall and queues a real persistence job onto `armd-persist`.
+        s.motors[6].q = 0.05;
+        s.motors[6].tau = 2.0;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(dm_limits())
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    drv.check_mapping_ranges();
+
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        inner.gripper_calib_path = Some(calib_path.clone());
+        let epoch = inner.safety.epoch_id();
+        let _ = inner
+            .start_gripper_zero_check(
+                &serde_json::json!({"threshold_rad": 0.10, "store_offset": true}),
+                epoch,
+            )
+            .unwrap();
+    }
+    assert!(bus.with(|s| s.motors.iter().all(|m| m.enabled)));
+    bus.with(|s| s.tx_log.clear());
+
+    let (in_sync_tx, in_sync_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_sync_tx, release_sync_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let in_sync_tx = Arc::new(std::sync::Mutex::new(Some(in_sync_tx)));
+    let release_sync_rx = Arc::new(std::sync::Mutex::new(Some(release_sync_rx)));
+
+    let hooks = PersistTestHooks {
+        dir_sync_override: Some(Arc::new(move |_| {
+            if let Some(tx) = in_sync_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = release_sync_rx.lock().unwrap().take() {
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+            Ok(())
+        })),
+        ..Default::default()
+    };
+
+    let handle = sup
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(5)), hooks)
+        .await
+        .unwrap();
+
+    // Wait until `armd-persist` is actively blocked inside directory `sync_all()`.
+    tokio::task::spawn_blocking(move || {
+        in_sync_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("armd-persist must enter dir_sync_override");
+    })
+    .await
+    .unwrap();
+    assert!(!handle.persist_worker_exited(), "persistence worker must still be held in dir_sync");
+
+    // Trigger emergency teardown WHILE the dir-sync barrier is STILL HELD.
+    // Disable MUST reach all 7 motors and return Confirmed WITHOUT waiting on dir_sync!
+    let h_em = handle.clone();
+    let outcome = tokio::task::spawn_blocking(move || h_em.emergency_disable_and_join())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        PanicDisableOutcome::Confirmed,
+        "emergency disable must confirm through RT owner while persistence is stalled in dir_sync"
+    );
+    assert!(handle.is_exited(), "RT owner must exit after bounded disable even while dir_sync is held");
+    assert!(
+        !handle.persist_worker_exited(),
+        "test must still be holding persistence in dir_sync when disable is verified"
+    );
+    let (all_disabled, disable_ids) = bus.with(|s| {
+        let ids: Vec<u32> = s
+            .tx_log
+            .iter()
+            .filter(|f| f.data == armd::protocol::damiao::CMD_DISABLE)
+            .map(|f| f.id)
+            .collect();
+        (s.motors.iter().all(|m| !m.enabled), ids)
+    });
+    assert!(all_disabled, "all 7 virtual motors must be physically disabled while dir_sync is held");
+    for id in 1u32..=7 {
+        assert!(
+            disable_ids.contains(&id),
+            "missing CMD_DISABLE frame for motor {id} while dir_sync is held: {disable_ids:?}"
+        );
+    }
+
+    // Release the dir-sync barrier so `armd-persist` finishes cleanly before `handle` drops.
+    let _ = release_sync_tx.send(());
+    wait_until_async(Duration::from_secs(2), || handle.persist_worker_exited()).await;
+    handle.stop_and_join();
+}

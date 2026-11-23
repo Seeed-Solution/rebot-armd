@@ -162,7 +162,7 @@ impl SupervisorInner {
         }
         if blocked.is_some() { return blocked; }
         let policy = self.gravity_comp_policy()?;
-        if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
+        if self.shutdown_committed || self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(reason("ESTOP_ACTIVE", "E-stop is latched"));
         }
         if let SafetyState::Fault(r) = self.safety.state() { return Some(reason("FAULT_ACTIVE", format!("Fault active: {r:?}"))); }

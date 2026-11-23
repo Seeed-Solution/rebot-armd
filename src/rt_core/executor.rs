@@ -13,7 +13,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle, Thread, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -580,6 +580,8 @@ pub struct PersistTestHooks {
     pub payload_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
     /// Positive control: performs one deliberate heap allocation+drop inside the next sub-release wake body.
     pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
+    /// Runs on `armd-control` while handling `MaintenanceOp::CommitShutdown` before replying.
+    pub on_commit_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 enum PersistCmd {
@@ -691,6 +693,32 @@ impl OffThreadSinks {
 struct TeardownDisable {
     requested: AtomicBool,
     outcome: Mutex<Option<crate::supervisor::PanicDisableOutcome>>,
+    done: Condvar,
+}
+
+impl TeardownDisable {
+    fn set_outcome(&self, outcome: crate::supervisor::PanicDisableOutcome) {
+        let mut g = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(outcome);
+        self.done.notify_all();
+    }
+
+    fn wait_outcome(&self, timeout: Duration) -> Option<crate::supervisor::PanicDisableOutcome> {
+        let deadline = Instant::now() + timeout;
+        let mut g = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        while g.is_none() {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let (next, res) = self.done.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+            g = next;
+            if res.timed_out() {
+                break;
+            }
+        }
+        g.clone()
+    }
 }
 
 struct RtExecutorShared {
@@ -706,7 +734,9 @@ struct RtExecutorShared {
     control_stop: Arc<AtomicBool>,
     persist_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     persist_worker_exited: Arc<AtomicBool>,
+    persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     shutdown_confirmed: Arc<AtomicBool>,
     teardown_disable: Arc<TeardownDisable>,
     persist_thread: Mutex<Option<JoinHandle<()>>>,
@@ -716,21 +746,67 @@ struct RtExecutorShared {
 }
 
 impl RtExecutorShared {
-    fn teardown_and_join(&self) {
+    fn wait_flag(cv: &(Mutex<bool>, Condvar), timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut g = cv.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*g {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            let (next, res) = cv.1.wait_timeout(g, rem).unwrap_or_else(|e| e.into_inner());
+            g = next;
+            if res.timed_out() {
+                break;
+            }
+        }
+        *g
+    }
+
+    /// Stops the RT owner (`armd-control`) FIRST so a stalled persistence worker can never block
+    /// owner shutdown or emergency hardware disable, then joins or bounds persistence cleanup.
+    fn teardown_and_join_inner(&self, emergency_bound: Option<Duration>) {
+        // Non-blockingly ask persistence to wind down, but NEVER wait for it before stopping
+        // `armd-control`: a blocked directory `sync_all()` must not delay torque-off.
         self.persist_stop.store(true, Ordering::Release);
         self.persist_park_thread.unpark();
-        if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = jh.join();
-        }
         self.maint_client.close();
         self.control_stop.store(true, Ordering::Release);
-        if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+
+        if let Some(bound) = emergency_bound {
+            // Wait up to `bound` for `armd-control` to finish its bounded disable and exit;
+            // if a driver syscall stalls past the bound, do not hang emergency exit.
+            let _ = self.teardown_disable.wait_outcome(bound);
+            if Self::wait_flag(&self.control_exited_cv, Duration::from_millis(50)) {
+                if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = jh.join();
+                }
+            }
+        } else if let Some(jh) = self.control_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = jh.join();
         }
+
         if let Some(jh) = self.monitor_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
             jh.thread().unpark();
             let _ = jh.join();
         }
+
+        // Now wait for persistence cleanup: bounded on emergency teardown (so a hung `sync_all`
+        // cannot block returning the torque-off outcome), full join on normal teardown / Drop.
+        if emergency_bound.is_some() {
+            if Self::wait_flag(&self.persist_exited_cv, Duration::from_millis(50)) {
+                if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = jh.join();
+                }
+            } else {
+                tracing::warn!(
+                    "Emergency teardown: persistence worker still blocked in I/O after RT owner disable; returning without waiting"
+                );
+            }
+        } else if let Some(jh) = self.persist_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = jh.join();
+        }
+
         // Final off-thread drain and reclamation.
         self.maint_client.finish_stopped();
         self.sinks.drain_all(&self.tick_stats);
@@ -739,6 +815,10 @@ impl RtExecutorShared {
         }
         let _ = self.hub.latest();
         self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
+    }
+
+    fn teardown_and_join(&self) {
+        self.teardown_and_join_inner(None);
     }
 }
 
@@ -883,18 +963,20 @@ impl RtExecutorHandle {
     }
 
     /// Requests the RT owner thread (`armd-control`) to perform one bounded hardware torque
-    /// disable during teardown before exiting, then joins all worker threads. Preserves the
-    /// single-bus-writer invariant when final shutdown commit was refused or failed.
+    /// disable during teardown before exiting, then collects the bounded outcome before waiting
+    /// on persistence. Preserves the single-bus-writer invariant when final shutdown commit was
+    /// refused or failed, and never stalls behind persistence I/O.
     pub fn emergency_disable_and_join(&self) -> crate::supervisor::PanicDisableOutcome {
         self.shared.teardown_disable.requested.store(true, Ordering::Release);
-        self.shared.teardown_and_join();
+        let bound = crate::supervisor::PANIC_DISABLE_TIMEOUT + Duration::from_millis(100);
+        self.shared.teardown_and_join_inner(Some(bound));
         self.shared
             .teardown_disable
             .outcome
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .unwrap_or(crate::supervisor::PanicDisableOutcome::Unconfirmed)
+            .unwrap_or(crate::supervisor::PanicDisableOutcome::TimedOut)
     }
 }
 
@@ -928,7 +1010,9 @@ pub(crate) fn spawn_executor(
     let control_stop = Arc::new(AtomicBool::new(false));
     let persist_stop = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
+    let control_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let persist_worker_exited = Arc::new(AtomicBool::new(false));
+    let persist_exited_cv = Arc::new((Mutex::new(false), Condvar::new()));
     let teardown_disable = Arc::new(TeardownDisable::default());
     let stats = Arc::new(ExecutorStats::default());
 
@@ -952,6 +1036,7 @@ pub(crate) fn spawn_executor(
         persist_stop.clone(),
         exited.clone(),
         persist_worker_exited.clone(),
+        persist_exited_cv.clone(),
         hub.clone(),
         hooks.clone(),
     ) {
@@ -965,6 +1050,7 @@ pub(crate) fn spawn_executor(
         let cfg_clone = cfg.clone();
         let control_stop = control_stop.clone();
         let exited = exited.clone();
+        let control_exited_cv = control_exited_cv.clone();
         let teardown_disable = teardown_disable.clone();
         let stats = stats.clone();
         let estop_overflow_gen = estop_overflow_gen.clone();
@@ -980,6 +1066,7 @@ pub(crate) fn spawn_executor(
                 ready_tx,
                 control_stop,
                 exited,
+                control_exited_cv,
                 teardown_disable,
                 stats,
                 control_sched,
@@ -1048,7 +1135,9 @@ pub(crate) fn spawn_executor(
         control_stop,
         persist_stop,
         exited,
+        control_exited_cv,
         persist_worker_exited,
+        persist_exited_cv,
         shutdown_confirmed: Arc::new(AtomicBool::new(false)),
         teardown_disable,
         persist_thread: Mutex::new(Some(persist_thread)),
@@ -1134,12 +1223,10 @@ impl ControlState {
                 MaintenanceResult::ShutdownRequested(confirmed)
             }
             MaintenanceOp::CommitShutdown => {
-                let valid = self.shutdown_committed
-                    && (core.driver.is_none()
-                        || (core.shutdown_ready()
-                            && !core.is_torqued
-                            && !core.disable_pending
-                            && !core.torque_transition_pending()));
+                if let Some(hook) = self.hooks.on_commit_shutdown.as_ref() {
+                    hook();
+                }
+                let valid = self.shutdown_committed && core.commit_shutdown();
                 if valid {
                     self.control_stop.store(true, Ordering::Release);
                 } else {
@@ -1606,6 +1693,7 @@ impl ControlState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_persist_worker(
     mut job_rx: Consumer<PendingZeroCheckPersist>,
     mut cmd_tx: Producer<PersistCmd>,
@@ -1614,19 +1702,22 @@ fn spawn_persist_worker(
     persist_stop: Arc<AtomicBool>,
     control_exited: Arc<AtomicBool>,
     persist_worker_exited: Arc<AtomicBool>,
+    persist_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) -> std::io::Result<JoinHandle<()>> {
-    struct ExitFlag(Arc<AtomicBool>, Arc<StateHub>);
+    struct ExitFlag(Arc<AtomicBool>, Arc<(Mutex<bool>, Condvar)>, Arc<StateHub>);
     impl Drop for ExitFlag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
-            self.1.wake();
+            *self.1 .0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.1 .1.notify_all();
+            self.2.wake();
         }
     }
 
     thread::Builder::new().name("armd-persist".into()).spawn(move || {
-        let _exit_guard = ExitFlag(persist_worker_exited, hub);
+        let _exit_guard = ExitFlag(persist_worker_exited, persist_exited_cv, hub);
         let push_cmd = |tx: &mut Producer<PersistCmd>, cmd: PersistCmd, stop: &AtomicBool, dead: &AtomicBool| -> bool {
             let mut pending = Some(cmd);
             while let Some(c) = pending.take() {
@@ -1897,6 +1988,7 @@ fn control_thread_main(
     ready_tx: mpsc::SyncSender<Result<ThreadId, (Option<Box<SupervisorInner>>, String)>>,
     control_stop: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    control_exited_cv: Arc<(Mutex<bool>, Condvar)>,
     teardown_disable: Arc<TeardownDisable>,
     stats: Arc<ExecutorStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
@@ -1923,6 +2015,8 @@ fn control_thread_main(
             let _ = ready_tx.send(Err((None, "simulated executor init failure (core lost)".into())));
         }
         exited.store(true, Ordering::Release);
+        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        control_exited_cv.1.notify_all();
         hub.wake();
         return;
     }
@@ -1984,6 +2078,8 @@ fn control_thread_main(
 
     if ready_tx.send(Ok(thread::current().id())).is_err() {
         exited.store(true, Ordering::Release);
+        *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        control_exited_cv.1.notify_all();
         hub.wake();
         return;
     }
@@ -2210,7 +2306,7 @@ fn control_thread_main(
                 crate::supervisor::PanicDisableOutcome::Failed("secondary panic during RT executor panic-disable".into())
             });
             outcome.log("RT executor panic", crate::supervisor::PANIC_DISABLE_TIMEOUT);
-            *teardown_disable.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+            teardown_disable.set_outcome(outcome);
             match cfg.panic_policy {
                 PanicPolicy::AbortProcess => {
                     crate::diagnostics::logwriter::flush_all(Duration::from_millis(500));
@@ -2231,7 +2327,7 @@ fn control_thread_main(
             crate::supervisor::PanicDisableOutcome::Failed("panic during emergency teardown disable".into())
         });
         outcome.log("RT executor emergency shutdown", crate::supervisor::PANIC_DISABLE_TIMEOUT);
-        *teardown_disable.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        teardown_disable.set_outcome(outcome);
     }
 
     // Clean exit drain: return queued maintenance payloads off-thread, reconcile any abandoned
@@ -2241,6 +2337,8 @@ fn control_thread_main(
     state.service_persistence(&mut core, &exit_ctx);
     state.emit_estop_ack_if_advanced(&mut core);
     exited.store(true, Ordering::Release);
+    *control_exited_cv.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    control_exited_cv.1.notify_all();
     hub.wake();
 }
 

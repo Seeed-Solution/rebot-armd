@@ -540,6 +540,9 @@ impl SupervisorInner {
     }
 
     fn enable_prepare_inner(&mut self, allow_bus_read: bool) -> Result<(bool, Option<f32>), SafetyError> {
+        if self.shutdown_committed {
+            return Err(SafetyError::EStopActive);
+        }
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::MotionForbiddenInFaultState(format!("Driver limit configuration error: {err}")));
         }
@@ -1214,6 +1217,9 @@ impl SupervisorInner {
     }
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
+        if self.shutdown_committed {
+            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+        }
         Self::check_concurrent_estop(self)?;
         if self.driver_config_error.is_some() {
             self.reapply_driver_limits();
@@ -1341,6 +1347,9 @@ impl SupervisorInner {
     }
 
     fn clear_fault_finish(&mut self) -> Result<SafetyState, SafetyError> {
+        if self.shutdown_committed {
+            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+        }
         self.pending_rearm = true;
         if self.mit.owner == crate::mit::MitOwner::Lost {
             // cleared: a rearm (fresh readback, base modes restored) and a fresh handover follow
@@ -1383,6 +1392,9 @@ impl SupervisorInner {
     /// resets only via [`ArmDriver::clear_fault_budgeted`] while preserving the reset latch
     /// rule (a reset write never clears the fault on the same call).
     pub fn clear_fault_executor(&mut self, deadline: Instant) -> Result<SafetyState, SafetyError> {
+        if self.shutdown_committed {
+            return Err(SafetyError::ClearFaultRejected("Daemon shutdown is committed".into()));
+        }
         Self::check_concurrent_estop(self)?;
         if self.driver_config_error.is_some() {
             self.reapply_driver_limits();

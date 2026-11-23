@@ -755,7 +755,7 @@ impl SupervisorInner {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
         }
 
-        if self.e_stop_latched.load(Ordering::SeqCst) {
+        if self.shutdown_committed || self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
 

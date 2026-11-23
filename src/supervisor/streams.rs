@@ -255,7 +255,7 @@ impl SupervisorInner {
             return Err(SafetyError::HandoverSettling);
         }
 
-        if self.estop_pending() {
+        if self.shutdown_committed || self.estop_pending() {
             return Err(SafetyError::EStopActive);
         }
 

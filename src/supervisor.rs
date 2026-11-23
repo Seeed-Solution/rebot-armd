@@ -556,6 +556,10 @@ pub struct SupervisorInner {
     /// True once ownership has been transferred to the synchronous RT executor thread
     /// (`armd-control`); internal driver disable paths stay non-blocking and budgeted.
     pub rt_executor_owned: bool,
+    /// Irreversibly set by [`Self::commit_shutdown`] under the owner's authority once final
+    /// shutdown readiness is confirmed; permanently blocks `clear_fault`, torque enable, and
+    /// actuator motion admission while keeping hardware disable paths permitted.
+    pub shutdown_committed: bool,
     /// Preallocated bounded journal of immutable E-stop acknowledgements recorded at the exact
     /// moment [`Self::consume_pending_estop`] applies each urgent request (cap 64; never grows).
     pub(crate) pending_estop_acks: std::collections::VecDeque<crate::rt_core::executor::EstopAck>,
@@ -830,6 +834,7 @@ impl SupervisorInner {
             detached: false,
             persist_capacity_available: true,
             rt_executor_owned: false,
+            shutdown_committed: false,
             pending_estop_acks: std::collections::VecDeque::with_capacity(
                 crate::rt_core::executor::ESTOP_ACK_CAPACITY,
             ),
@@ -1635,6 +1640,25 @@ impl SupervisorInner {
             self.execute_stop(StopPolicy::EStopLatch);
         }
         false
+    }
+
+    /// Final shutdown admission executed under the owner's exclusive authority.
+    /// Returns `true` and irreversibly sets `shutdown_committed` + `e_stop_latched` when
+    /// shutdown is safe so no concurrent `clear_fault`, torque enable, or motion command can
+    /// re-energize the arm before process exit; hardware disable paths remain permitted.
+    pub fn commit_shutdown(&mut self) -> bool {
+        let ready = self.driver.is_none()
+            || (self.shutdown_ready()
+                && !self.is_torqued
+                && !self.disable_pending
+                && !self.torque_transition_pending());
+        if !ready {
+            return false;
+        }
+        self.shutdown_committed = true;
+        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.stop_motion();
+        true
     }
 
     pub fn is_fully_settled_hold(&self) -> bool {
@@ -3126,7 +3150,7 @@ impl SupervisorInner {
         let mut tick_output_accepted = false;
         // a torque transition in flight owns the bus until it ends (the driver refuses targets)
         let transition_owns_bus = self.torque_transition.is_some();
-        if self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
+        if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus && self.gravity_comp.is_some() {
             // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
             // feedback-freshness gate so that an exit hold reaches the motors even when
             // feedback is late; a floating phase never outlives fresh feedback (it exits).
@@ -3142,7 +3166,7 @@ impl SupervisorInner {
                     }
                 }
             }
-        } else if self.is_torqued && !self.disable_pending && !transition_owns_bus {
+        } else if !self.shutdown_committed && self.is_torqued && !self.disable_pending && !transition_owns_bus {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
