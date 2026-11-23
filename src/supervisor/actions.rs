@@ -109,8 +109,12 @@ impl SupervisorInner {
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
+        // Preallocate state string with capacity 16 so RT terminal updates ("done"/"failed"/"cancelled")
+        // mutate in place without allocation or deallocation.
+        let mut state = String::with_capacity(16);
+        state.push_str("running");
         self.last_action = Some(ActionStatus {
-            id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
+            id, kind: kind.into(), tag, state, code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             task: None, phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
@@ -205,10 +209,12 @@ impl SupervisorInner {
                         } else {
                             // Hold action as running until atomic persist-before-commit completes outside the lock.
                             if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state = "running".into();
+                                a.state.clear();
+                                a.state.push_str("running");
                                 a.finished_at = None;
                             }
                             self.zero_check_persisting = Some(id);
+                            let gripper_limit = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx)).cloned();
                             self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
                                 action_id: id,
                                 offset_rad,
@@ -217,6 +223,10 @@ impl SupervisorInner {
                                 lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
                                 operator_auth,
                                 write: crate::persist::PendingWrite::new(path, text),
+                                base_gripper_policy: self.base_gripper_policy.clone().or_else(|| self.config.gripper_policy.clone()),
+                                current_calib_jaw: self.gripper_calib_jaw_opening.clone(),
+                                gripper_limit,
+                                active_tool_is_stock: self.config.active_tool.is_stock,
                             });
                         }
                     } else {

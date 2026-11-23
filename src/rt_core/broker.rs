@@ -682,6 +682,11 @@ impl<P> RtIntake<P> {
         self.reply(Reply::Terminal { request: i.request, action: i.action, outcome, children });
     }
 
+    /// Emits a deferred reply previously built by [`Taken::ack_deferred`] (used by
+    /// `ReleaseEngine` so supersession terminals and their accompanying ACK are both
+    /// delivered strictly after Step 6 publication while keeping `Terminal(old)` before `Ack(new)`).
+    pub fn emit_reply(&mut self, reply: Reply) { self.reply(reply); }
+
     /// The broker is gone (dropped): the RT keeps running and drops replies.
     pub fn broker_gone(&self) -> bool { self.commands.is_abandoned() }
 }
@@ -719,6 +724,27 @@ impl<P> Taken<'_, P> {
             _ => None,
         };
         Ok(Acked { commit_seq, installed })
+    }
+
+    /// Validates and records the commit like [`Self::ack`], returning the `Reply::Ack` to be
+    /// emitted later via [`RtIntake::emit_reply`] (after publication + any supersession terminal).
+    pub fn ack_deferred(mut self, committed: super::ops::Committed) -> Result<(Acked, Reply), &'static str> {
+        let terminal = self.d.kind.starts_action();
+        if committed.request() != self.d.stamp.request || (terminal && committed.action().is_none()) {
+            self.refuse_now("COMMIT_MISMATCH");
+            return Err("COMMIT_MISMATCH");
+        }
+        self.answered = true;
+        let intake = &mut *self.intake;
+        intake.commit_seq += 1;
+        let commit_seq = intake.commit_seq;
+        let request = self.d.stamp.request;
+        let reply = Reply::Ack { request, commit_seq, action: committed.action() };
+        let installed = match (terminal, committed.action()) {
+            (true, Some(action)) => { intake.installed += 1; Some(Installed { request, plan: self.d.kind.plan(), action }) }
+            _ => None,
+        };
+        Ok((Acked { commit_seq, installed }, reply))
     }
 
     /// Refuses the command with `code`; retires its plan slot.

@@ -42,6 +42,8 @@ pub const DIAG_RING_CAPACITY: usize = 256;
 pub const MAINT_QUEUE_CAPACITY: usize = 16;
 /// Capacity of the E-stop acknowledgement ring (`armd-control` -> `EstopRegistry`).
 pub const ESTOP_ACK_CAPACITY: usize = 64;
+/// Bounded capacity of the off-thread fault-state `Arc<SafetyState>` reclamation ring.
+pub const RECLAIM_STATE_CAPACITY: usize = 64;
 
 /// Startup owner selection for `ArmCore` and the actuator bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -162,6 +164,10 @@ pub struct ExecutorStats {
     pub skipped_releases: AtomicU64,
     /// Diagnostic `TickSample` values dropped because the off-thread ring was full.
     pub diag_dropped: AtomicU64,
+    /// Sub-release transition wakes executed by `armd-control`.
+    pub wakes: AtomicU64,
+    /// Allocator calls observed across full sub-release wake bodies (when `alloc_timing` is enabled).
+    pub wake_alloc_calls: AtomicU64,
 }
 
 impl ExecutorStats {
@@ -171,7 +177,7 @@ impl ExecutorStats {
         thread::Builder::new().name("armd-rt-monitor".into()).spawn(move || {
             let mut seen = stats.late.load(Ordering::Acquire);
             while !stop.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_secs(1));
+                thread::park_timeout(Duration::from_secs(1));
                 let late = stats.late.load(Ordering::Acquire);
                 if late != seen {
                     let ms = stats.last_late_us.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -214,6 +220,7 @@ impl From<OwnerError> for ArmError {
 /// Bounded maintenance and shutdown operations routed through the single RT owner.
 pub enum MaintenanceOp {
     RequestShutdown,
+    CommitShutdown,
     ShutdownReady,
     PlanningSnapshot,
     Observation,
@@ -227,6 +234,7 @@ pub enum MaintenanceOp {
 /// Reply payload of one [`MaintenanceOp`].
 pub enum MaintenanceResult {
     ShutdownRequested(bool),
+    ShutdownCommitted(bool),
     ShutdownReady(bool),
     PlanningSnapshot(PlanningSnapshot),
     Observation(Box<ArmObservation>),
@@ -401,12 +409,12 @@ impl MaintClient {
     }
 }
 
-/// One contiguous E-stop application ack produced by `armd-control`.
+/// One contiguous E-stop application ack captured immutably at `consume_pending_estop()`.
 #[derive(Debug, Clone)]
 pub struct EstopAck {
     pub first_gen: u64,
     pub last_gen: u64,
-    pub state: SafetyState,
+    pub state: Arc<SafetyState>,
     pub epoch: u64,
 }
 
@@ -428,12 +436,34 @@ impl EstopRegistry {
         rx
     }
 
-    pub(crate) fn resolve_up_to(&mut self, applied: u64, state: SafetyState, epoch: u64) {
-        let matched: Vec<u64> = self.waiters.range(..=applied).map(|(&g, _)| g).collect();
+    pub(crate) fn record_ack(&mut self, ack: EstopAck) {
+        let matched: Vec<u64> = self
+            .waiters
+            .range(ack.first_gen..=ack.last_gen)
+            .map(|(&g, _)| g)
+            .collect();
         for g in matched {
             if let Some(senders) = self.waiters.remove(&g) {
                 for tx in senders {
-                    let _ = tx.send(Ok((state.clone(), epoch)));
+                    let _ = tx.send(Ok(((*ack.state).clone(), ack.epoch)));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_overflow(&mut self, max_dropped: u64) {
+        if max_dropped == 0 {
+            return;
+        }
+        let dropped: Vec<u64> = self.waiters.range(..=max_dropped).map(|(&g, _)| g).collect();
+        for g in dropped {
+            if let Some(senders) = self.waiters.remove(&g) {
+                for tx in senders {
+                    let _ = tx.send(Err(ArmError::Rejected {
+                        status: 503,
+                        code: "ESTOP_ACK_OVERFLOW".into(),
+                        message: "E-stop acknowledgement ring overflowed; epoch cannot be pinned".into(),
+                    }));
                 }
             }
         }
@@ -464,38 +494,18 @@ impl EstopRegistry {
     }
 
     pub(crate) fn drain(&mut self) {
+        let mut drained = Vec::new();
         if let Some(rx) = self.ack_rx.as_mut() {
             while let Ok(ack) = rx.pop() {
-                let matched: Vec<u64> = self
-                    .waiters
-                    .range(ack.first_gen..=ack.last_gen)
-                    .map(|(&g, _)| g)
-                    .collect();
-                for g in matched {
-                    if let Some(senders) = self.waiters.remove(&g) {
-                        for tx in senders {
-                            let _ = tx.send(Ok((ack.state.clone(), ack.epoch)));
-                        }
-                    }
-                }
+                drained.push(ack);
             }
+        }
+        for ack in drained {
+            self.record_ack(ack);
         }
         if let Some(ov) = self.overflow_gen.as_ref() {
             let max_dropped = ov.load(Ordering::Acquire);
-            if max_dropped > 0 {
-                let dropped: Vec<u64> = self.waiters.range(..=max_dropped).map(|(&g, _)| g).collect();
-                for g in dropped {
-                    if let Some(senders) = self.waiters.remove(&g) {
-                        for tx in senders {
-                            let _ = tx.send(Err(ArmError::Rejected {
-                                status: 503,
-                                code: "ESTOP_ACK_OVERFLOW".into(),
-                                message: "E-stop acknowledgement ring overflowed; epoch cannot be pinned".into(),
-                            }));
-                        }
-                    }
-                }
-            }
+            self.record_overflow(max_dropped);
         }
         if self.exited.as_ref().is_some_and(|e| e.load(Ordering::Acquire)) {
             let remaining = std::mem::take(&mut self.waiters);
@@ -540,26 +550,35 @@ pub struct PersistTestHooks {
     pub leave_final_reply_queued: bool,
     /// Optional probe payload attached to the `PersistReply` (tests off-thread drop `ThreadId`).
     pub reply_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
+    /// Optional probe payload carried across `PersistCmd::Reserve` -> `PersistReply::Reserved`
+    /// (tests off-thread drop `ThreadId` of actual persistence request payloads).
+    pub payload_drop_probe: Option<Arc<Mutex<Option<Box<dyn Any + Send>>>>>,
+    /// Positive control: performs one deliberate heap allocation+drop inside the next sub-release wake body.
+    pub inject_wake_alloc_once: Option<Arc<AtomicBool>>,
 }
 
 enum PersistCmd {
     Reserve {
         action_id: u64,
         base_revision: u64,
-        lease_owner: Option<(String, u64)>,
-        offset_rad: f32,
+        lease_owner: Option<(crate::model::HolderLabel, u64)>,
+        new_policy: GripperPolicy,
         jaw_opening: Option<JawOpening>,
+        probe: Option<Box<dyn Any + Send>>,
+        code_buf: String,
+        msg_buf: String,
     },
     Fail {
         action_id: u64,
-        code: &'static str,
+        code: String,
         message: String,
+        unused_policy: Option<GripperPolicy>,
         unused_jaw: Option<JawOpening>,
     },
     Abort {
         action_id: u64,
         reservation: Reservation,
-        code: &'static str,
+        code: String,
         message: String,
         unused_policy: Option<GripperPolicy>,
         unused_jaw: Option<JawOpening>,
@@ -568,21 +587,32 @@ enum PersistCmd {
         action_id: u64,
         reservation: Reservation,
         base_revision: u64,
-        lease_owner: Option<(String, u64)>,
+        lease_owner: Option<(crate::model::HolderLabel, u64)>,
         offset_rad: f32,
         new_policy: GripperPolicy,
         new_jaw: Option<JawOpening>,
         durability: Durability,
         warning: Option<String>,
+        code_buf: String,
+        msg_buf: String,
     },
 }
 
 enum PersistReply {
-    Reserved(Result<(Reservation, GripperPolicy, Option<JawOpening>), Option<JawOpening>>),
+    Reserved {
+        reservation: Option<Reservation>,
+        policy: Option<GripperPolicy>,
+        returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
+        _returned_msg: Option<String>,
+        _returned_probe: Option<Box<dyn Any + Send>>,
+    },
     Done {
         _returned_policy: Option<GripperPolicy>,
         _returned_jaw: Option<JawOpening>,
+        _returned_code: Option<String>,
         _returned_msg: Option<String>,
+        _returned_warning: Option<String>,
         _returned_probe: Option<Box<dyn Any + Send>>,
     },
 }
@@ -591,6 +621,7 @@ enum PersistReply {
 pub(crate) struct OffThreadSinks {
     diag_rx: Mutex<Consumer<TickSample>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
+    reclaim_state_rx: Mutex<Consumer<Arc<SafetyState>>>,
     persist_rep_rx: Arc<Mutex<Consumer<PersistReply>>>,
     persist_worker_exited: Arc<AtomicBool>,
     maint_client: Arc<MaintClient>,
@@ -615,6 +646,12 @@ impl OffThreadSinks {
     pub(crate) fn drain_all(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
+        {
+            let mut rx = self.reclaim_state_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while let Ok(arc) = rx.pop() {
+                drop(arc);
+            }
+        }
         self.maint_client.drain_replies();
         if self.persist_worker_exited.load(Ordering::Acquire) {
             let mut rx = self.persist_rep_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -659,6 +696,7 @@ impl RtExecutorShared {
             let _ = jh.join();
         }
         if let Some(jh) = self.monitor_thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            jh.thread().unpark();
             let _ = jh.join();
         }
         // Final off-thread drain and reclamation.
@@ -704,24 +742,14 @@ impl RtExecutorHandle {
 
     pub fn request_shutdown(&self) -> Result<bool, OwnerError> {
         match self.call_maintenance(MaintenanceOp::RequestShutdown)? {
-            MaintenanceResult::ShutdownRequested(confirmed) => {
-                if confirmed {
-                    self.shared.shutdown_confirmed.store(true, Ordering::Release);
-                }
-                Ok(confirmed)
-            }
+            MaintenanceResult::ShutdownRequested(confirmed) => Ok(confirmed),
             _ => Err(OwnerError::Protocol),
         }
     }
 
     pub async fn request_shutdown_async(&self) -> Result<bool, OwnerError> {
         match self.call_maintenance_async(MaintenanceOp::RequestShutdown).await? {
-            MaintenanceResult::ShutdownRequested(confirmed) => {
-                if confirmed {
-                    self.shared.shutdown_confirmed.store(true, Ordering::Release);
-                }
-                Ok(confirmed)
-            }
+            MaintenanceResult::ShutdownRequested(confirmed) => Ok(confirmed),
             _ => Err(OwnerError::Protocol),
         }
     }
@@ -797,13 +825,24 @@ impl RtExecutorHandle {
         }
     }
 
-    /// Joins worker and executor threads ONLY after [`Self::request_shutdown`] confirmed exit.
+    /// Atomically revalidates shutdown confirmation on the RT owner (`armd-control`), commits
+    /// stop on the owner thread, and joins all worker threads. Returns `Err(ShutdownNotConfirmed)`
+    /// without stopping the executor if shutdown was never confirmed or the arm was rearmed since.
     pub fn shutdown_and_join(&self) -> Result<(), OwnerError> {
-        if !self.shared.shutdown_confirmed.load(Ordering::Acquire) {
-            return Err(OwnerError::ShutdownNotConfirmed);
+        match self.call_maintenance(MaintenanceOp::CommitShutdown) {
+            Ok(MaintenanceResult::ShutdownCommitted(true)) => {
+                self.shared.shutdown_confirmed.store(true, Ordering::Release);
+                self.shared.teardown_and_join();
+                Ok(())
+            }
+            Ok(MaintenanceResult::ShutdownCommitted(false)) => Err(OwnerError::ShutdownNotConfirmed),
+            Ok(_) => Err(OwnerError::Protocol),
+            Err(OwnerError::Stopped) if self.shared.shutdown_confirmed.load(Ordering::Acquire) => {
+                self.shared.teardown_and_join();
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
-        self.shared.teardown_and_join();
-        Ok(())
     }
 
     /// Unconditional stop and join for tests and forced teardown.
@@ -833,6 +872,7 @@ pub(crate) fn spawn_executor(
     let (maint_req_tx, maint_req_rx) = RingBuffer::<MaintRequest>::new(MAINT_QUEUE_CAPACITY);
     let (maint_rep_tx, maint_rep_rx) = RingBuffer::<MaintReply>::new(MAINT_QUEUE_CAPACITY);
     let (estop_ack_tx, estop_ack_rx) = RingBuffer::<EstopAck>::new(ESTOP_ACK_CAPACITY);
+    let (reclaim_state_tx, reclaim_state_rx) = RingBuffer::<Arc<SafetyState>>::new(RECLAIM_STATE_CAPACITY);
     let (persist_job_tx, persist_job_rx) = RingBuffer::<PendingZeroCheckPersist>::new(4);
     let (persist_cmd_tx, persist_cmd_rx) = RingBuffer::<PersistCmd>::new(2);
     let (persist_rep_tx, persist_rep_rx) = RingBuffer::<PersistReply>::new(2);
@@ -849,6 +889,7 @@ pub(crate) fn spawn_executor(
     let sinks = Arc::new(OffThreadSinks {
         diag_rx: Mutex::new(diag_rx),
         estop_reg: estop_reg.clone(),
+        reclaim_state_rx: Mutex::new(reclaim_state_rx),
         persist_rep_rx: persist_rep_rx.clone(),
         persist_worker_exited: persist_worker_exited.clone(),
         maint_client: maint_client.clone(),
@@ -898,6 +939,7 @@ pub(crate) fn spawn_executor(
                 maint_rep_tx,
                 estop_ack_tx,
                 estop_overflow_gen,
+                reclaim_state_tx,
                 persist_job_tx,
                 persist_cmd_rx,
                 persist_rep_tx,
@@ -969,9 +1011,11 @@ pub(crate) fn spawn_executor(
 struct ControlState {
     core: SupervisorInner,
     engine: ReleaseEngine,
-    last_acked_estop_gen: u64,
+    shutdown_committed: bool,
+    control_stop: Arc<AtomicBool>,
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
+    reclaim_state_tx: Producer<Arc<SafetyState>>,
     maint_req_rx: Consumer<MaintRequest>,
     maint_rep_tx: Producer<MaintReply>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
@@ -980,23 +1024,43 @@ struct ControlState {
     persist_wake: Thread,
     persist_granted: Option<(u64, ConfigDomain)>,
     next_persist_req: u64,
+    disconnect_code_buf: Option<String>,
+    disconnect_msg_buf: Option<String>,
     hooks: PersistTestHooks,
 }
 
 impl ControlState {
     fn emit_estop_ack_if_advanced(&mut self) {
-        let applied = self.core.applied_estop_count;
-        if applied > self.last_acked_estop_gen {
-            let ack = EstopAck {
-                first_gen: self.last_acked_estop_gen + 1,
-                last_gen: applied,
-                state: self.core.safety.state().clone(),
-                epoch: self.core.safety.epoch_id(),
-            };
-            self.last_acked_estop_gen = applied;
+        let mut woke = false;
+        while let Some(ack) = self.core.pending_estop_acks.pop_front() {
+            let last_gen = ack.last_gen;
             if self.estop_ack_tx.push(ack).is_err() {
-                self.estop_overflow_gen.fetch_max(applied, Ordering::Release);
+                self.estop_overflow_gen.fetch_max(last_gen, Ordering::Release);
             }
+            woke = true;
+        }
+        if self.core.estop_ack_overflow_gen > 0 {
+            let ov = std::mem::replace(&mut self.core.estop_ack_overflow_gen, 0);
+            self.estop_overflow_gen.fetch_max(ov, Ordering::Release);
+            woke = true;
+        }
+        if woke {
+            self.core.core.hub().wake();
+        }
+    }
+
+    /// Moves retired fault `Arc<SafetyState>` snapshots off `armd-control` into the bounded SPSC
+    /// reclamation ring (never pops when the ring is full so no `Arc` can drop on `armd-control`).
+    fn drain_retired_states(&mut self) {
+        let mut drained = false;
+        while !self.reclaim_state_tx.is_full() {
+            let Some(arc) = self.core.safety.pop_retired_state_arc() else {
+                break;
+            };
+            let _ = self.reclaim_state_tx.push(arc);
+            drained = true;
+        }
+        if drained {
             self.core.core.hub().wake();
         }
     }
@@ -1006,7 +1070,25 @@ impl ControlState {
         let mut returned_offsets = None;
         let mut returned_probe = None;
         let result = match req.op {
-            MaintenanceOp::RequestShutdown => MaintenanceResult::ShutdownRequested(self.core.request_shutdown()),
+            MaintenanceOp::RequestShutdown => {
+                let confirmed = self.core.request_shutdown();
+                self.shutdown_committed = confirmed;
+                MaintenanceResult::ShutdownRequested(confirmed)
+            }
+            MaintenanceOp::CommitShutdown => {
+                let valid = self.shutdown_committed
+                    && (self.core.driver.is_none()
+                        || (self.core.shutdown_ready()
+                            && !self.core.is_torqued
+                            && !self.core.disable_pending
+                            && !self.core.torque_transition_pending()));
+                if valid {
+                    self.control_stop.store(true, Ordering::Release);
+                } else {
+                    self.shutdown_committed = false;
+                }
+                MaintenanceResult::ShutdownCommitted(valid)
+            }
             MaintenanceOp::ShutdownReady => MaintenanceResult::ShutdownReady(self.core.shutdown_ready()),
             MaintenanceOp::PlanningSnapshot => {
                 let ctx = self.engine.ctx(Instant::now());
@@ -1014,7 +1096,9 @@ impl ControlState {
             }
             MaintenanceOp::Observation => MaintenanceResult::Observation(Box::new(self.core.current_observation())),
             MaintenanceOp::ClearFault => {
-                MaintenanceResult::FaultCleared(self.core.clear_fault_executor(release_deadline))
+                self.shutdown_committed = false;
+                let res = self.core.clear_fault_executor(release_deadline);
+                MaintenanceResult::FaultCleared(res)
             }
             MaintenanceOp::SetJointZeroOffsets { offsets } => {
                 let res = if *self.core.safety.state() != SafetyState::Idle
@@ -1090,11 +1174,25 @@ impl ControlState {
                 if self.core.zero_check_persisting == Some(action_id) {
                     self.core.zero_check_persisting = None;
                 }
-                self.core.fail_zero_check_action(
+                let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
                     action_id,
+                    "failed",
                     "PERSIST_FAILED",
                     "Persistence worker disconnected after reservation",
+                    self.disconnect_code_buf.take(),
+                    self.disconnect_msg_buf.take(),
                 );
+                if old_code.is_some() || old_msg.is_some() {
+                    let _ = self.persist_rep_tx.push(PersistReply::Done {
+                        _returned_policy: None,
+                        _returned_jaw: None,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_warning: None,
+                        _returned_probe: None,
+                    });
+                    self.core.core.hub().wake();
+                }
             }
         }
     }
@@ -1108,38 +1206,53 @@ impl ControlState {
 
     fn handle_persist_cmd(&mut self, cmd: PersistCmd) {
         match cmd {
-            PersistCmd::Fail { action_id, code, message, unused_jaw } => {
+            PersistCmd::Fail { action_id, code, message, unused_policy, unused_jaw } => {
                 if self.core.zero_check_persisting == Some(action_id) {
                     self.core.zero_check_persisting = None;
                 }
-                self.core.fail_zero_check_action(action_id, code, &message);
+                let (old_code, old_msg) = self.core.fail_zero_check_action_owned(action_id, code, message);
                 let _ = self.persist_rep_tx.push(PersistReply::Done {
-                    _returned_policy: None,
+                    _returned_policy: unused_policy,
                     _returned_jaw: unused_jaw,
-                    _returned_msg: Some(message),
+                    _returned_code: old_code,
+                    _returned_msg: old_msg,
+                    _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 });
                 self.persist_wake.unpark();
                 self.core.core.hub().wake();
             }
-            PersistCmd::Reserve { action_id, base_revision, lease_owner, offset_rad, jaw_opening } => {
+            PersistCmd::Reserve {
+                action_id,
+                base_revision,
+                lease_owner,
+                new_policy,
+                jaw_opening,
+                probe,
+                code_buf,
+                msg_buf,
+            } => {
                 let now = Instant::now();
                 let still_persisting = self.core.zero_check_persisting == Some(action_id);
                 let action_running = self.core.last_action.as_ref().is_some_and(|a| a.id == action_id && a.is_running());
                 let lease_ok = match &lease_owner {
                     None => true,
                     Some((c, g)) => self.core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < self.core.lease_timeout && l.client_id == *c && l.generation == *g
+                        l.acquired_at.elapsed() < self.core.lease_timeout
+                            && l.generation == *g
+                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
                     }),
                 };
                 let rev_ok = self.core.gripper_calib_revision == base_revision;
-                let stopped = self.core.safety.state().is_stopped();
+                let urgent_pending = self.core.estop_pending()
+                    || self.engine.stop_requests().current() != self.engine.stop_requests().applied();
+                let stopped = self.core.safety.state().is_stopped() || urgent_pending;
 
                 if !still_persisting || !action_running || !lease_ok || stopped {
                     if self.core.zero_check_persisting == Some(action_id) {
                         self.core.zero_check_persisting = None;
                     }
-                    if action_running {
+                    let (old_code, old_msg) = if action_running {
                         let (code, msg) = if stopped {
                             ("STOPPED", "Safety stop intervened before gripper calibration persisted")
                         } else if !lease_ok {
@@ -1147,9 +1260,25 @@ impl ControlState {
                         } else {
                             ("CANCELLED", "Gripper zero check cancelled before calibration persisted")
                         };
-                        self.core.cancel_zero_check_action(action_id, code, msg);
-                    }
-                    let _ = self.persist_rep_tx.push(PersistReply::Reserved(Err(jaw_opening)));
+                        self.core.finish_zero_check_action_in_place(
+                            action_id,
+                            "cancelled",
+                            code,
+                            msg,
+                            Some(code_buf),
+                            Some(msg_buf),
+                        )
+                    } else {
+                        (Some(code_buf), Some(msg_buf))
+                    };
+                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
+                        reservation: None,
+                        policy: Some(new_policy),
+                        returned_jaw: jaw_opening,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_probe: probe,
+                    });
                     self.persist_wake.unpark();
                     self.core.core.hub().wake();
                     return;
@@ -1158,29 +1287,50 @@ impl ControlState {
                     if self.core.zero_check_persisting == Some(action_id) {
                         self.core.zero_check_persisting = None;
                     }
-                    self.core.fail_zero_check_action(
+                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
                         action_id,
+                        "failed",
                         "POLICY_REVISION_MISMATCH",
                         "Gripper calibration revision changed concurrently",
+                        Some(code_buf),
+                        Some(msg_buf),
                     );
-                    let _ = self.persist_rep_tx.push(PersistReply::Reserved(Err(jaw_opening)));
+                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
+                        reservation: None,
+                        policy: Some(new_policy),
+                        returned_jaw: jaw_opening,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_probe: probe,
+                    });
                     self.persist_wake.unpark();
                     self.core.core.hub().wake();
                     return;
                 }
-                let (new_policy, new_jaw) = match self.core.validate_gripper_calibration_light(Some(offset_rad), jaw_opening.as_ref()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if self.core.zero_check_persisting == Some(action_id) {
-                            self.core.zero_check_persisting = None;
-                        }
-                        self.core.fail_zero_check_action(action_id, "INVALID_CALIBRATION", &e);
-                        let _ = self.persist_rep_tx.push(PersistReply::Reserved(Err(jaw_opening)));
-                        self.persist_wake.unpark();
-                        self.core.core.hub().wake();
-                        return;
+                if self.core.driver_config_error.is_some() {
+                    if self.core.zero_check_persisting == Some(action_id) {
+                        self.core.zero_check_persisting = None;
                     }
-                };
+                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                        action_id,
+                        "failed",
+                        "INVALID_CALIBRATION",
+                        "Driver limit configuration error prevents gripper calibration",
+                        Some(code_buf),
+                        Some(msg_buf),
+                    );
+                    let _ = self.persist_rep_tx.push(PersistReply::Reserved {
+                        reservation: None,
+                        policy: Some(new_policy),
+                        returned_jaw: jaw_opening,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_probe: probe,
+                    });
+                    self.persist_wake.unpark();
+                    self.core.core.hub().wake();
+                    return;
+                }
                 let ctx = self.engine.ctx(now);
                 let auth = self.core.authority(&ctx);
                 self.next_persist_req += 1;
@@ -1201,14 +1351,35 @@ impl ControlState {
                 match ConfigAuthority::reserve(&mut self.core, &proposal, &ctx) {
                     Reserved::Granted(reservation) => {
                         self.persist_granted = Some((action_id, ConfigDomain::GripperCalibration));
-                        let _ = self.persist_rep_tx.push(PersistReply::Reserved(Ok((reservation, new_policy, new_jaw))));
+                        let _ = self.persist_rep_tx.push(PersistReply::Reserved {
+                            reservation: Some(reservation),
+                            policy: Some(new_policy),
+                            returned_jaw: jaw_opening,
+                            _returned_code: Some(code_buf),
+                            _returned_msg: Some(msg_buf),
+                            _returned_probe: probe,
+                        });
                     }
                     Reserved::Refused { code, .. } => {
                         if self.core.zero_check_persisting == Some(action_id) {
                             self.core.zero_check_persisting = None;
                         }
-                        self.core.fail_zero_check_action(action_id, code, "Failed to reserve gripper calibration domain");
-                        let _ = self.persist_rep_tx.push(PersistReply::Reserved(Err(jaw_opening)));
+                        let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
+                            action_id,
+                            "failed",
+                            code,
+                            "Failed to reserve gripper calibration domain",
+                            Some(code_buf),
+                            Some(msg_buf),
+                        );
+                        let _ = self.persist_rep_tx.push(PersistReply::Reserved {
+                            reservation: None,
+                            policy: Some(new_policy),
+                            returned_jaw: jaw_opening,
+                            _returned_code: old_code,
+                            _returned_msg: old_msg,
+                            _returned_probe: probe,
+                        });
                     }
                 }
                 self.persist_wake.unpark();
@@ -1220,11 +1391,13 @@ impl ControlState {
                 if self.core.zero_check_persisting == Some(action_id) {
                     self.core.zero_check_persisting = None;
                 }
-                self.core.fail_zero_check_action(action_id, code, &message);
+                let (old_code, old_msg) = self.core.fail_zero_check_action_owned(action_id, code, message);
                 let _ = self.persist_rep_tx.push(PersistReply::Done {
                     _returned_policy: unused_policy,
                     _returned_jaw: unused_jaw,
-                    _returned_msg: Some(message),
+                    _returned_code: old_code,
+                    _returned_msg: old_msg,
+                    _returned_warning: None,
                     _returned_probe: self.take_reply_probe(),
                 });
                 self.persist_wake.unpark();
@@ -1240,6 +1413,8 @@ impl ControlState {
                 new_jaw,
                 durability,
                 warning,
+                code_buf,
+                msg_buf,
             } => {
                 self.persist_granted = None;
                 let simulated_err = self
@@ -1260,15 +1435,20 @@ impl ControlState {
                     if self.core.zero_check_persisting == Some(action_id) {
                         self.core.zero_check_persisting = None;
                     }
-                    self.core.fail_zero_check_action(
+                    let (old_code, old_msg) = self.core.finish_zero_check_action_in_place(
                         action_id,
+                        "failed",
                         "PERSIST_FAILED",
                         "Failed to record post-rename persistence state; reconciling required",
+                        Some(code_buf),
+                        Some(msg_buf),
                     );
                     let _ = self.persist_rep_tx.push(PersistReply::Done {
                         _returned_policy: Some(new_policy),
                         _returned_jaw: new_jaw,
-                        _returned_msg: warning,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_warning: warning,
                         _returned_probe: self.take_reply_probe(),
                     });
                     self.persist_wake.unpark();
@@ -1281,11 +1461,15 @@ impl ControlState {
                 let lease_ok = match &lease_owner {
                     None => true,
                     Some((c, g)) => self.core.active_lease.as_ref().is_some_and(|l| {
-                        l.acquired_at.elapsed() < self.core.lease_timeout && l.client_id == *c && l.generation == *g
+                        l.acquired_at.elapsed() < self.core.lease_timeout
+                            && l.generation == *g
+                            && crate::model::HolderLabel::new(&l.client_id).as_str() == c.as_str()
                     }),
                 };
                 let rev_ok = self.core.gripper_calib_revision == base_revision;
-                let stopped = self.core.safety.state().is_stopped();
+                let urgent_pending = self.core.estop_pending()
+                    || self.engine.stop_requests().current() != self.engine.stop_requests().applied();
+                let stopped = self.core.safety.state().is_stopped() || urgent_pending;
 
                 if still_persisting && action_running && lease_ok && rev_ok && !stopped {
                     let (old_policy, old_jaw) = self.core.swap_gripper_calibration_in_place(offset_rad, new_policy, new_jaw);
@@ -1296,11 +1480,14 @@ impl ControlState {
                     if self.core.zero_check_persisting == Some(action_id) {
                         self.core.zero_check_persisting = None;
                     }
-                    self.core.complete_zero_check_action(action_id, durability, warning);
+                    let unused_warning = self.core.complete_zero_check_action(action_id, durability, warning);
+                    // Return unused scratch strings + any displaced warning/policy/jaw off-thread.
                     let _ = self.persist_rep_tx.push(PersistReply::Done {
                         _returned_policy: old_policy,
                         _returned_jaw: old_jaw,
-                        _returned_msg: None,
+                        _returned_code: Some(code_buf),
+                        _returned_msg: Some(msg_buf),
+                        _returned_warning: unused_warning,
                         _returned_probe: self.take_reply_probe(),
                     });
                 } else {
@@ -1321,17 +1508,24 @@ impl ControlState {
                     if self.core.zero_check_persisting == Some(action_id) {
                         self.core.zero_check_persisting = None;
                     }
-                    if action_running {
-                        self.core.cancel_zero_check_action(
+                    let (old_code, old_msg) = if action_running {
+                        self.core.finish_zero_check_action_in_place(
                             action_id,
+                            "cancelled",
                             code,
                             "Gripper calibration revoked after disk rename; reconciliation required",
-                        );
-                    }
+                            Some(code_buf),
+                            Some(msg_buf),
+                        )
+                    } else {
+                        (Some(code_buf), Some(msg_buf))
+                    };
                     let _ = self.persist_rep_tx.push(PersistReply::Done {
                         _returned_policy: Some(new_policy),
                         _returned_jaw: new_jaw,
-                        _returned_msg: warning,
+                        _returned_code: old_code,
+                        _returned_msg: old_msg,
+                        _returned_warning: warning,
                         _returned_probe: self.take_reply_probe(),
                     });
                 }
@@ -1400,7 +1594,17 @@ fn spawn_persist_worker(
                 thread::park_timeout(Duration::from_millis(2));
                 continue;
             };
-            let _cw = config_write_mutex.blocking_lock();
+            // Stop-aware config write lock acquisition: teardown unparks this thread and sets
+            // `persist_stop`, preventing deadlock even if the caller holds `config_write_mutex`.
+            let _cw = loop {
+                if persist_stop.load(Ordering::Acquire) || control_exited.load(Ordering::Acquire) {
+                    return;
+                }
+                match config_write_mutex.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(_) => thread::park_timeout(Duration::from_millis(2)),
+                }
+            };
             let auth_ok = job
                 .operator_auth
                 .as_ref()
@@ -1410,8 +1614,9 @@ fn spawn_persist_worker(
                     &mut cmd_tx,
                     PersistCmd::Fail {
                         action_id: job.action_id,
-                        code: "OPERATOR_REQUIRED",
+                        code: "OPERATOR_REQUIRED".into(),
                         message: "Operator session expired or locked before gripper calibration persisted".into(),
+                        unused_policy: None,
                         unused_jaw: job.jaw_opening,
                     },
                     &persist_stop,
@@ -1420,6 +1625,34 @@ fn spawn_persist_worker(
                 let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
                 continue;
             }
+            // Validate & build candidate GripperPolicy completely off `armd-control`.
+            let candidate_policy = match SupervisorInner::validate_gripper_calibration_off_thread(
+                job.base_gripper_policy.as_ref(),
+                job.current_calib_jaw.as_ref(),
+                job.gripper_limit.as_ref(),
+                job.active_tool_is_stock,
+                Some(job.offset_rad),
+                job.jaw_opening.as_ref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = push_cmd(
+                        &mut cmd_tx,
+                        PersistCmd::Fail {
+                            action_id: job.action_id,
+                            code: "INVALID_CALIBRATION".into(),
+                            message: e,
+                            unused_policy: None,
+                            unused_jaw: job.jaw_opening,
+                        },
+                        &persist_stop,
+                        &control_exited,
+                    );
+                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                    if hooks.exit_after_first_job { break; }
+                    continue;
+                }
+            };
             let staged = match StagedWrite::stage(job.write.path.clone(), job.write.text.clone()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1427,8 +1660,9 @@ fn spawn_persist_worker(
                         &mut cmd_tx,
                         PersistCmd::Fail {
                             action_id: job.action_id,
-                            code: "PERSIST_FAILED",
+                            code: "PERSIST_FAILED".into(),
                             message: format!("Failed to stage gripper calibration: {e}"),
+                            unused_policy: Some(candidate_policy),
                             unused_jaw: job.jaw_opening,
                         },
                         &persist_stop,
@@ -1438,14 +1672,25 @@ fn spawn_persist_worker(
                     continue;
                 }
             };
+            let lease_owner_inline = job
+                .lease_owner
+                .as_ref()
+                .map(|(c, g)| (crate::model::HolderLabel::new(c), *g));
+            let payload_probe = hooks
+                .payload_drop_probe
+                .as_ref()
+                .and_then(|p| p.lock().ok().and_then(|mut g| g.take()));
             if !push_cmd(
                 &mut cmd_tx,
                 PersistCmd::Reserve {
                     action_id: job.action_id,
                     base_revision: job.base_revision,
-                    lease_owner: job.lease_owner.clone(),
-                    offset_rad: job.offset_rad,
+                    lease_owner: lease_owner_inline,
+                    new_policy: candidate_policy,
                     jaw_opening: job.jaw_opening,
+                    probe: payload_probe,
+                    code_buf: String::with_capacity(64),
+                    msg_buf: String::with_capacity(160),
                 },
                 &persist_stop,
                 &control_exited,
@@ -1453,14 +1698,26 @@ fn spawn_persist_worker(
                 staged.abort();
                 break;
             }
-            let Some(PersistReply::Reserved(reserved)) = wait_reply(&rep_rx, &persist_stop, &control_exited) else {
+            let Some(PersistReply::Reserved {
+                reservation,
+                policy,
+                returned_jaw,
+                _returned_code,
+                _returned_msg,
+                _returned_probe,
+            }) = wait_reply(&rep_rx, &persist_stop, &control_exited)
+            else {
                 staged.abort();
                 break;
             };
-            let (reservation, new_policy, new_jaw) = match reserved {
-                Ok(v) => v,
-                Err(unused_jaw) => {
-                    drop(unused_jaw);
+            drop(_returned_code);
+            drop(_returned_msg);
+            drop(_returned_probe);
+            let (reservation, new_policy, new_jaw) = match (reservation, policy) {
+                (Some(reservation), Some(new_policy)) => (reservation, new_policy, returned_jaw),
+                (_, returned_policy) => {
+                    drop(returned_policy);
+                    drop(returned_jaw);
                     staged.abort();
                     if hooks.exit_after_first_job { break; }
                     continue;
@@ -1471,6 +1728,33 @@ fn spawn_persist_worker(
                 staged.abort();
                 break;
             }
+            // Re-verify operator authorization immediately before rename (operator session may
+            // have expired or locked during staging or reservation wait).
+            let auth_still_ok = job
+                .operator_auth
+                .as_ref()
+                .is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+            if !auth_still_ok {
+                staged.abort();
+                let _ = push_cmd(
+                    &mut cmd_tx,
+                    PersistCmd::Abort {
+                        action_id: job.action_id,
+                        reservation,
+                        code: "OPERATOR_REQUIRED".into(),
+                        message: "Operator session expired or locked before gripper calibration persisted".into(),
+                        unused_policy: Some(new_policy),
+                        unused_jaw: new_jaw,
+                    },
+                    &persist_stop,
+                    &control_exited,
+                );
+                if !hooks.leave_final_reply_queued {
+                    let _ = wait_reply(&rep_rx, &persist_stop, &control_exited);
+                }
+                if hooks.exit_after_first_job { break; }
+                continue;
+            }
             let dir_sync = match staged.rename_only() {
                 Ok(ds) => ds,
                 Err(e) => {
@@ -1479,7 +1763,7 @@ fn spawn_persist_worker(
                         PersistCmd::Abort {
                             action_id: job.action_id,
                             reservation,
-                            code: "PERSIST_FAILED",
+                            code: "PERSIST_FAILED".into(),
                             message: format!("Failed to rename gripper calibration: {e}"),
                             unused_policy: Some(new_policy),
                             unused_jaw: new_jaw,
@@ -1512,12 +1796,14 @@ fn spawn_persist_worker(
                     action_id: job.action_id,
                     reservation,
                     base_revision: job.base_revision,
-                    lease_owner: job.lease_owner,
+                    lease_owner: lease_owner_inline,
                     offset_rad: job.offset_rad,
                     new_policy,
                     new_jaw,
                     durability,
                     warning,
+                    code_buf: String::with_capacity(64),
+                    msg_buf: String::with_capacity(160),
                 },
                 &persist_stop,
                 &control_exited,
@@ -1533,7 +1819,7 @@ fn spawn_persist_worker(
 }
 
 fn control_thread_main(
-    core: SupervisorInner,
+    mut core: SupervisorInner,
     engine: ReleaseEngine,
     cfg: ExecutorConfig,
     initial_generation: u64,
@@ -1548,6 +1834,7 @@ fn control_thread_main(
     maint_rep_tx: Producer<MaintReply>,
     estop_ack_tx: Producer<EstopAck>,
     estop_overflow_gen: Arc<AtomicU64>,
+    reclaim_state_tx: Producer<Arc<SafetyState>>,
     persist_job_tx: Producer<PendingZeroCheckPersist>,
     persist_cmd_rx: Consumer<PersistCmd>,
     persist_rep_tx: Producer<PersistReply>,
@@ -1566,6 +1853,17 @@ fn control_thread_main(
         exited.store(true, Ordering::Release);
         hub.wake();
         return;
+    }
+
+    // Complete driver RT mode handoff (including any startup transport writer synchronization)
+    // BEFORE applying SCHED_FIFO so normal-priority helper threads (e.g. `armd-sim-rx`) can
+    // never suffer single-CPU priority inversion during startup.
+    core.rt_executor_owned = true;
+    core.safety.set_off_thread_reclaim(true);
+    if let Some(ref d) = core.driver {
+        if let Ok(mut drv) = d.lock() {
+            drv.set_rt_mode(true);
+        }
     }
 
     if cfg.apply_rt_sched {
@@ -1589,13 +1887,14 @@ fn control_thread_main(
         crate::diagnostics::alloc::time_this_thread();
     }
 
-    let last_acked_estop_gen = core.applied_estop_count;
     let mut state = ControlState {
         core,
         engine,
-        last_acked_estop_gen,
+        shutdown_committed: false,
+        control_stop: Arc::clone(&control_stop),
         estop_ack_tx,
         estop_overflow_gen,
+        reclaim_state_tx,
         maint_req_rx,
         maint_rep_tx,
         persist_job_tx,
@@ -1604,6 +1903,8 @@ fn control_thread_main(
         persist_wake,
         persist_granted: None,
         next_persist_req: 0,
+        disconnect_code_buf: Some(String::with_capacity(64)),
+        disconnect_msg_buf: Some(String::with_capacity(160)),
         hooks,
     };
 
@@ -1675,16 +1976,39 @@ fn control_thread_main(
             if let Some(job) = state.core.pending_zero_check_persist.take() {
                 if state.persist_job_tx.push(job).is_err() {
                     if let Some(id) = state.core.zero_check_persisting.take() {
-                        state.core.fail_zero_check_action(id, "PERSIST_FAILED", "Persistence queue saturated");
+                        let (old_code, old_msg) = state.core.finish_zero_check_action_in_place(
+                            id,
+                            "failed",
+                            "PERSIST_FAILED",
+                            "Persistence queue saturated",
+                            state.disconnect_code_buf.take(),
+                            state.disconnect_msg_buf.take(),
+                        );
+                        if old_code.is_some() || old_msg.is_some() {
+                            let _ = state.persist_rep_tx.push(PersistReply::Done {
+                                _returned_policy: None,
+                                _returned_jaw: None,
+                                _returned_code: old_code,
+                                _returned_msg: old_msg,
+                                _returned_warning: None,
+                                _returned_probe: None,
+                            });
+                        }
                     }
                 } else {
                     state.persist_wake.unpark();
                 }
             }
+            // Strict Arc lifetime ordering: drain all pending E-stop acks (or record overflow while
+            // `SafetyManager` still retains its own `Arc<SafetyState>` with refcount >= 2) BEFORE
+            // maintenance can run `ClearFault` and retire the fault `Arc` off-thread!
+            state.emit_estop_ack_if_advanced();
+            state.drain_retired_states();
             // Service persistence commands and at most one bounded maintenance op per release.
             state.service_persistence();
             state.service_one_maintenance(release_deadline);
             state.emit_estop_ack_if_advanced();
+            state.drain_retired_states();
             let control_hz = state.core.config.control_frequency_hz;
             let done = Instant::now();
             let allocs = crate::diagnostics::alloc::take();
@@ -1748,15 +2072,36 @@ fn control_thread_main(
                     break;
                 }
                 wakes += 1;
+                stats.wakes.fetch_add(1, Ordering::Relaxed);
                 let _wake_guard = ReleaseGuard::enter();
+                let _ = crate::diagnostics::alloc::take();
                 assert!(
                     tokio::runtime::Handle::try_current().is_err(),
                     "RT executor thread must never enter a Tokio runtime during a sub-release wake"
                 );
-                state
+                let published = state
                     .engine
-                    .service_wake(&mut state.core, Instant::now(), release_deadline, &mut report);
+                    .service_wake(&mut state.core, Instant::now(), release_deadline, publish_gen + 1, &mut report);
+                if published {
+                    publish_gen += 1;
+                    hub.wake();
+                }
+                if state
+                    .hooks
+                    .inject_wake_alloc_once
+                    .as_ref()
+                    .is_some_and(|f| f.swap(false, Ordering::AcqRel))
+                {
+                    let v: Vec<u8> = vec![0xA5; 64];
+                    std::hint::black_box(&v);
+                    drop(v);
+                }
                 state.emit_estop_ack_if_advanced();
+                state.drain_retired_states();
+                let wake_allocs = crate::diagnostics::alloc::take();
+                if wake_allocs.calls > 0 {
+                    stats.wake_alloc_calls.fetch_add(wake_allocs.calls, Ordering::Relaxed);
+                }
                 next_wake = report.poll.wake_before(release_deadline);
             }
         }));
@@ -1838,14 +2183,14 @@ impl Releases {
         Self { period_ns, next_ns: mono_now_ns() + period_ns }
     }
 
-    /// Advances past a release at `now_ns`: the next one is one period later, or, when that
-    /// has passed already, one period after `now_ns` (missed releases are skipped). Returns
-    /// the number of releases skipped.
+    /// Advances past a release at `now_ns`, preserving the original absolute release grid phase:
+    /// the next release is the earliest grid point strictly after `now_ns` (`next_ns + k * period_ns`),
+    /// and missed grid points are counted in the returned skip count.
     pub fn advance(&mut self, now_ns: u64) -> u64 {
         self.next_ns += self.period_ns;
-        if self.next_ns < now_ns {
+        if self.next_ns <= now_ns {
             let skipped = (now_ns - self.next_ns) / self.period_ns + 1;
-            self.next_ns = now_ns + self.period_ns;
+            self.next_ns += skipped * self.period_ns;
             skipped
         } else {
             0
@@ -1888,7 +2233,9 @@ mod tests {
         assert_eq!(r.advance(135), 0);
         assert_eq!(r.next_ns(), 140);
         assert_eq!(r.advance(190), 2);
-        assert_eq!(r.next_ns(), 210);
+        assert_eq!(r.next_ns(), 200);
+        assert_eq!(r.advance(220), 1);
+        assert_eq!(r.next_ns(), 240);
     }
 
     #[test]

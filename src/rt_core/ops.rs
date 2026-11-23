@@ -474,6 +474,9 @@ pub trait CoreOps {
     }
     /// Publishes the state computed by [`Self::advance_output`] at `timestamp` with `generation`.
     fn publish(&mut self, _timestamp: f64, _generation: u64) {}
+    /// Current local monotonic observation timestamp (seconds), used when publishing after
+    /// a sub-release transition wake before delivering its terminal.
+    fn now_timestamp(&self) -> f64 { 0.0 }
 }
 
 /// The protocol code of a delegated error, as a static string (unknown codes: `REJECTED`).
@@ -621,8 +624,18 @@ impl CoreOps for SupervisorInner {
                     None => return Err(if generation == 0 { "NO_LEASE" } else { "LEASE_LOST" }),
                 }
             }
-            ImmediateOp::TorqueOn => self.set_torque(true).map(drop).map_err(ArmError::Safety),
-            ImmediateOp::TorqueOff => self.set_torque(false).map(drop).map_err(ArmError::Safety),
+            ImmediateOp::TorqueOn => {
+                if self.driver.is_some() {
+                    return Err("UNSUPPORTED");
+                }
+                self.set_torque(true).map(drop).map_err(ArmError::Safety)
+            }
+            ImmediateOp::TorqueOff => {
+                if self.driver.is_some() {
+                    return Err("UNSUPPORTED");
+                }
+                self.set_torque(false).map(drop).map_err(ArmError::Safety)
+            }
         };
         r.map(|_| Committed::authorized(d, None)).map_err(static_code)
     }
@@ -663,11 +676,12 @@ impl CoreOps for SupervisorInner {
         // then apply feedback from the transition's RX cache (when this call polled the bus)
         // or run a single budgeted receive pass.
         let trans = self.service_torque_transition(budget);
-        let mut transition_rx = None;
-        if let Some(tp) = trans {
+        let transition_rx = if let Some(tp) = trans {
             self.core.begin_transition(tp.progress);
-            transition_rx = tp.rx;
-        }
+            tp.rx
+        } else {
+            self.service_background_disable(budget)
+        };
         let rx = self.poll_hardware_rx(Some(budget), transition_rx);
         let rx_frames = rx.rx_frames;
         let rx_exhausted = rx.budget_exhausted;
@@ -727,6 +741,10 @@ impl CoreOps for SupervisorInner {
 
     fn publish(&mut self, timestamp: f64, generation: u64) {
         drop(self.publish_at(timestamp, generation, false));
+    }
+
+    fn now_timestamp(&self) -> f64 {
+        self.now_s()
     }
 }
 
@@ -878,12 +896,12 @@ impl VirtualClock {
 ///
 /// Exact per-release order:
 /// 1. Urgent requests (E-stop, then authorized stop).
-/// 2. Single budgeted hardware poll (emitting any completed transition terminal at the poll boundary).
+/// 2. Single budgeted hardware poll (completing any pending transition, deferring terminal delivery until after Step 6 publish).
 /// 3. Urgent recheck (`BeforeCommit`), then commit at most one ordinary descriptor.
 /// 4. Urgent recheck (`BeforeTarget`), then consume at most one latest target.
 /// 5. Urgent recheck (`BeforeOutput`), then advance control output (`dt`).
 /// 6. Publish observation and RT inputs.
-/// 7. Deliver active-action terminal.
+/// 7. Deliver terminals (completed transition terminal, then active-action terminal).
 pub struct ReleaseEngine {
     intake: RtIntake<PlanSlot>,
     targets: TargetReader,
@@ -956,7 +974,7 @@ impl ReleaseEngine {
         self.ctx(now_fn())
     }
 
-    fn deliver_transition_terminal(&mut self, report: &mut ReleaseReport) {
+    fn take_finished_transition(&mut self, report: &mut ReleaseReport) -> Option<(Installed, Outcome)> {
         let ended = match report.poll.torque {
             Some(Ok(TorqueProgress::Done)) => Some(Outcome::Completed),
             Some(Err(code)) => Some(Outcome::Failed(code)),
@@ -965,9 +983,10 @@ impl ReleaseEngine {
         if let Some(outcome) = ended {
             if let Some(t) = self.transition.take() {
                 report.transition_ended = Some((t.action(), outcome));
-                self.intake.terminal(t, outcome);
+                return Some((t, outcome));
             }
         }
+        None
     }
 
     /// Runs one full release on `core`.
@@ -983,14 +1002,15 @@ impl ReleaseEngine {
         let mut report = ReleaseReport { release: self.releases, ..ReleaseReport::default() };
         // 1. Urgent requests (E-stop + authorized stop), independent of command ring capacity
         if self.apply_pending_urgent(core) { report.stopped = true; }
-        // 2. Single budgeted hardware poll (emitting completed transition terminal at poll boundary)
+        // 2. Single budgeted hardware poll (frees `self.transition`, defers terminal delivery until after Step 6 publish)
         let budget = ServiceBudget::for_release(now_fn(), release_deadline);
         report.poll = core.poll_hardware(&budget);
-        self.deliver_transition_terminal(&mut report);
+        let finished_transition = self.take_finished_transition(&mut report);
         // 3. Urgent recheck + at most one ordinary command
         self.intake.begin_release(self.releases);
         let ctx = self.checkpoint(core, Checkpoint::BeforeCommit, &mut now_fn, &mut report);
-        if let Some(mut t) = self.intake.take() {
+        let mut superseded_and_ack: Option<(Installed, super::broker::Reply)> = None;
+        if let Some(t) = self.intake.take() {
             let d = *t.descriptor();
             let result = match d.kind {
                 CommandKind::Install { .. } => match t.plan() {
@@ -1004,17 +1024,26 @@ impl ReleaseEngine {
             report.command = Some((d.stamp.request, match result {
                 Ok(c) => {
                     let install = matches!(d.kind, CommandKind::Install { .. });
-                    if install && c.action().is_some() && c.request() == d.stamp.request {
-                        if let Some(old) = self.active.take() { t.terminal_before(old, Outcome::Superseded); }
+                    let supersedes = install && c.action().is_some() && c.request() == d.stamp.request && self.active.is_some();
+                    if supersedes {
+                        t.ack_deferred(c).map(|(acked, ack_reply)| {
+                            let old = self.active.take().expect("checked active.is_some()");
+                            superseded_and_ack = Some((old, ack_reply));
+                            if let Some(i) = acked.installed {
+                                self.active = Some(i);
+                            }
+                            acked.commit_seq
+                        })
+                    } else {
+                        t.ack(c).map(|acked| {
+                            match acked.installed {
+                                Some(i) if install => self.active = Some(i),
+                                Some(i) => self.transition = Some(i),
+                                None => {}
+                            }
+                            acked.commit_seq
+                        })
                     }
-                    t.ack(c).map(|acked| {
-                        match acked.installed {
-                            Some(i) if install => self.active = Some(i),
-                            Some(i) => self.transition = Some(i),
-                            None => {}
-                        }
-                        acked.commit_seq
-                    })
                 }
                 Err(code) => {
                     t.refuse(code);
@@ -1035,7 +1064,14 @@ impl ReleaseEngine {
         let timestamp = core.advance_output(dt, publish_generation);
         // 6. Publish
         core.publish(timestamp, publish_generation);
-        // 7. Deliver active-action terminal
+        // 7. Deliver terminals (transition terminal, superseded terminal + deferred ACK, then active-action terminal) strictly AFTER publish
+        if let Some((t, outcome)) = finished_transition {
+            self.intake.terminal(t, outcome);
+        }
+        if let Some((old, ack_reply)) = superseded_and_ack {
+            self.intake.terminal(old, Outcome::Superseded);
+            self.intake.emit_reply(ack_reply);
+        }
         if let Some(action) = self.active() {
             if let Some(outcome) = core.action_outcome(action) {
                 let installed = self.active.take().expect("active above");
@@ -1048,17 +1084,26 @@ impl ReleaseEngine {
     }
 
     /// Runs one sub-release transition wake on `core` (no full feedback poll, no output step).
+    /// When the transition completes on this wake, publishes the updated state at `publish_generation`
+    /// BEFORE delivering the terminal reply and returns `true`.
     pub fn service_wake<O: CoreOps>(
         &mut self,
         core: &mut O,
         now: Instant,
         release_deadline: Instant,
+        publish_generation: u64,
         report: &mut ReleaseReport,
-    ) {
+    ) -> bool {
         if self.apply_pending_urgent(core) { report.stopped = true; }
         let budget = ServiceBudget::for_release(now, release_deadline);
         report.poll = core.poll_transition_wake(&budget);
-        self.deliver_transition_terminal(report);
+        if let Some((t, outcome)) = self.take_finished_transition(report) {
+            let ts = core.now_timestamp();
+            core.publish(ts, publish_generation);
+            self.intake.terminal(t, outcome);
+            return true;
+        }
+        false
     }
 }
 
@@ -1127,7 +1172,7 @@ impl<O: CoreOps> ReleaseFixture<O> {
             if report.wakes == MAX_SERVICE_WAKES { break; }
             report.wakes += 1;
             self.clock.advance(wake.saturating_duration_since(self.clock.now()));
-            self.engine.service_wake(&mut self.core, self.clock.now(), release_deadline, &mut report);
+            self.engine.service_wake(&mut self.core, self.clock.now(), release_deadline, next_gen, &mut report);
             next = report.poll.wake_before(release_deadline);
         }
         // The next release starts one period later

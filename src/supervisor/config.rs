@@ -385,19 +385,18 @@ impl SupervisorInner {
         res
     }
 
-    /// Lightweight pure-math validation of a gripper calibration candidate without cloning
-    /// `ArmConfig` or mutating `self` (used by the RT executor's two-phase persistence path).
-    pub(crate) fn validate_gripper_calibration_light(
-        &self,
+    /// Standalone off-thread validation and construction of a gripper calibration candidate
+    /// (`armd-persist` runs this off `armd-control` so policy cloning and error formatting never
+    /// touch the RT allocator).
+    pub(crate) fn validate_gripper_calibration_off_thread(
+        base_policy: Option<&crate::model::GripperPolicy>,
+        current_calib_jaw: Option<&crate::model::JawOpening>,
+        gripper_limit: Option<&crate::model::JointLimit>,
+        is_stock_tool: bool,
         offset_rad: Option<f32>,
         jaw_opening: Option<&crate::model::JawOpening>,
-    ) -> Result<(crate::model::GripperPolicy, Option<crate::model::JawOpening>), String> {
-        let base = self
-            .base_gripper_policy
-            .as_ref()
-            .or(self.config.gripper_policy.as_ref())
-            .ok_or_else(|| "No base gripper policy available".to_string())?;
-        let mut policy = base.clone();
+    ) -> Result<crate::model::GripperPolicy, String> {
+        let base = base_policy.ok_or_else(|| "No base gripper policy available".to_string())?;
         let offset = offset_rad.unwrap_or(0.0);
         if !offset.is_finite() {
             return Err("offset_rad must be finite".into());
@@ -407,8 +406,7 @@ impl SupervisorInner {
         if !closed_rad.is_finite() || !open_rad.is_finite() {
             return Err("Computed closed_rad or open_rad is not finite".into());
         }
-        let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
-        if let Some(lim) = lim {
+        if let Some(lim) = gripper_limit {
             if closed_rad < lim.min_position || closed_rad > lim.max_position {
                 return Err(format!(
                     "Calibrated closed_rad {closed_rad:.4} exceeds joint limits [{}, {}]",
@@ -422,28 +420,30 @@ impl SupervisorInner {
                 "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
             ));
         }
-        policy.closed_rad = closed_rad;
-        policy.open_rad = open_rad;
         let candidate_jo = jaw_opening
             .cloned()
-            .or_else(|| self.gripper_calib_jaw_opening.clone())
+            .or_else(|| current_calib_jaw.cloned())
             .or_else(|| base.jaw_opening.clone());
         let mut jo = match candidate_jo {
             Some(jo) => jo,
-            None if self.config.active_tool.is_stock => crate::model::JawOpening::sim_default(),
+            None if is_stock_tool => crate::model::JawOpening::sim_default(),
             None => return Err("Non-stock tool requires an explicit jaw_opening calibration curve".into()),
         };
-        jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
+        let mut policy = base.clone();
+        policy.closed_rad = closed_rad;
+        policy.open_rad = open_rad;
+        if let Err(e) = jo.validate(gripper_limit) {
+            return Err(format!("Invalid jaw_opening calibration against joint limits: {e}"));
+        }
         for pt in &mut jo.points {
             pt[0] += offset;
         }
-        jo.validate(None).map_err(|e| format!("Invalid jaw_opening calibration: {e}"))?;
-        policy.jaw_opening = Some(jo);
-        crate::model::validate_effective_gripper_policy_ex(&policy, lim, None, false)?;
-        if let Some(ref err) = self.driver_config_error {
-            return Err(err.clone());
+        if let Err(e) = jo.validate(None) {
+            return Err(format!("Invalid jaw_opening calibration: {e}"));
         }
-        Ok((policy, jaw_opening.cloned()))
+        policy.jaw_opening = Some(jo);
+        crate::model::validate_effective_gripper_policy_ex(&policy, gripper_limit, None, false)?;
+        Ok(policy)
     }
 
     /// In-place swap of validated gripper calibration fields on the RT executor thread,
@@ -454,10 +454,13 @@ impl SupervisorInner {
         new_policy: crate::model::GripperPolicy,
         new_jaw: Option<crate::model::JawOpening>,
     ) -> (Option<crate::model::GripperPolicy>, Option<crate::model::JawOpening>) {
-        if self.base_gripper_policy.is_none() {
-            self.base_gripper_policy = self.config.gripper_policy.clone();
-        }
         let old_policy = self.config.gripper_policy.replace(new_policy);
+        let returned_policy = if self.base_gripper_policy.is_none() {
+            self.base_gripper_policy = old_policy;
+            None
+        } else {
+            old_policy
+        };
         let old_jaw = match new_jaw {
             Some(j) => self.gripper_calib_jaw_opening.replace(j),
             None => None,
@@ -465,27 +468,83 @@ impl SupervisorInner {
         self.gripper_calib_offset = Some(offset_rad);
         self.gripper_calib_invalid = false;
         self.gripper_calib_revision += 1;
-        (old_policy, old_jaw)
+        (returned_policy, old_jaw)
     }
 
-    pub(crate) fn fail_zero_check_action(&mut self, action_id: u64, code: &str, message: &str) {
+    /// In-place terminal update for a failed or cancelled zero-check action on `armd-control`:
+    /// reuses `a.state` and preallocated `code_buf` / `msg_buf` (or worker-provided strings),
+    /// returning any replaced `(old_code, old_msg)` for off-thread reclamation.
+    pub(crate) fn finish_zero_check_action_in_place(
+        &mut self,
+        action_id: u64,
+        terminal_state: &str,
+        code: &str,
+        message: &str,
+        code_buf: Option<String>,
+        msg_buf: Option<String>,
+    ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
-            a.state = "failed".into();
-            a.code = Some(code.into());
-            a.message = Some(message.into());
+            a.state.clear();
+            a.state.push_str(terminal_state);
+            let old_code = match code_buf {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf.push_str(code);
+                    a.code.replace(buf)
+                }
+                None => {
+                    if let Some(existing) = a.code.as_mut() {
+                        existing.clear();
+                        existing.push_str(code);
+                        None
+                    } else {
+                        a.code = Some(code.into());
+                        None
+                    }
+                }
+            };
+            let old_msg = match msg_buf {
+                Some(mut buf) => {
+                    buf.clear();
+                    buf.push_str(message);
+                    a.message.replace(buf)
+                }
+                None => {
+                    if let Some(existing) = a.message.as_mut() {
+                        existing.clear();
+                        existing.push_str(message);
+                        None
+                    } else {
+                        a.message = Some(message.into());
+                        None
+                    }
+                }
+            };
             a.finished_at = Some(now);
+            return (old_code, old_msg);
         }
+        (code_buf, msg_buf)
     }
 
-    pub(crate) fn cancel_zero_check_action(&mut self, action_id: u64, code: &str, message: &str) {
+    /// In-place terminal update moving worker-allocated `code` and `message` strings into
+    /// `ActionStatus` without allocating on `armd-control`, returning any replaced/unused strings.
+    pub(crate) fn fail_zero_check_action_owned(
+        &mut self,
+        action_id: u64,
+        code: String,
+        message: String,
+    ) -> (Option<String>, Option<String>) {
         let now = self.now_s();
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id && a.is_running()) {
-            a.state = "cancelled".into();
-            a.code = Some(code.into());
-            a.message = Some(message.into());
+            a.state.clear();
+            a.state.push_str("failed");
+            let old_code = a.code.replace(code);
+            let old_msg = a.message.replace(message);
             a.finished_at = Some(now);
+            return (old_code, old_msg);
         }
+        (Some(code), Some(message))
     }
 
     pub(crate) fn complete_zero_check_action(
@@ -493,28 +552,35 @@ impl SupervisorInner {
         action_id: u64,
         durability: crate::rt_core::config_iface::Durability,
         warning: Option<String>,
-    ) {
+    ) -> Option<String> {
         let now = self.now_s();
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
             if a.is_running() {
-                a.state = "done".into();
+                a.state.clear();
+                a.state.push_str("done");
                 a.progress = 1.0;
                 a.finished_at = Some(now);
             }
             match durability {
                 crate::rt_core::config_iface::Durability::Durable => {
                     a.durability_confirmed = Some(true);
-                    a.durability_warning = None;
+                    let prev = a.durability_warning.take();
+                    return warning.or(prev);
                 }
                 crate::rt_core::config_iface::Durability::DurableUnconfirmed => {
                     a.durability_confirmed = Some(false);
-                    a.durability_warning = warning;
+                    return match warning {
+                        Some(w) => a.durability_warning.replace(w),
+                        None => a.durability_warning.take(),
+                    };
                 }
                 crate::rt_core::config_iface::Durability::Volatile => {
                     a.durability_confirmed = Some(false);
+                    return warning;
                 }
             }
         }
+        warning
     }
 
     /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
