@@ -2423,7 +2423,7 @@ enum DamiaoTorque {
     /// Enable frames sent, awaiting fresh state-1 feedback from every motor.
     Enable(ConfirmWindow),
     /// Disable frames sent, awaiting fresh state-0 feedback from every motor.
-    Disable { window: ConfirmWindow, mit_fenced: bool },
+    Disable { window: ConfirmWindow, mit_fenced: bool, after_seq: u64 },
 }
 
 /// CTRL_MODE read of the position-force gripper: `boundary` is the RX sequence of the empty
@@ -2449,6 +2449,9 @@ const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
 /// Time allowed per motor for the four register replies of the startup range check
 /// (7 silent motors: 140 ms).
 const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
+/// Feedback freshness bound for position-force gripper mode writes, pre-enable holds,
+/// stale-feedback recovery, and opening-speed allowance.
+const POS_FORCE_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(100);
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn new(can: C, motor_ids: Vec<u16>) -> Self {
@@ -3279,7 +3282,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     fn pos_force_write_refused(&self, stray: &[usize]) -> Option<ArmDriverError> {
         let j = self.pos_force.as_ref()?.joint;
         if !stray.contains(&j) { return None; }
-        let fresh = self.last_feedback_instant[j].is_some_and(|t| self.since(t) <= Duration::from_millis(100));
+        let fresh = self.last_feedback_instant[j].is_some_and(|t| self.since(t) <= POS_FORCE_FEEDBACK_MAX_AGE)
+            && self.feedback_queue_bound[j].is_some_and(|b| self.since(b) <= POS_FORCE_FEEDBACK_MAX_AGE);
         let still = self.cached_states[j].velocity.is_finite() && self.cached_states[j].velocity.abs() <= 0.05;
         let off = !self.is_enabled && self.motor_status[j] == 0;
         (!(fresh && still && off)).then(|| ArmDriverError::HardwareFault(format!(
@@ -3368,13 +3372,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
-    /// Joints (mask) whose feedback is newer than `after` and reports `state`; and whether every
-    /// joint answered after `after`.
-    fn fresh_state_mask(&self, after: Instant, state: u8) -> (u32, bool) {
+    /// Joints (mask) whose feedback is newer than `after` (and strictly after `after_seq`)
+    /// and reports `state`; and whether every joint answered after that boundary.
+    fn fresh_state_mask(&self, after: Instant, after_seq: Option<u64>, state: u8) -> (u32, bool) {
         let mut mask = 0u32;
         let mut all_fresh = !self.last_feedback_instant.is_empty();
         for i in 0..self.motor_ids.len().min(handshake::MAX_MASK_JOINTS) {
-            let fresh = self.last_feedback_instant[i].is_some_and(|t| t >= after);
+            let fresh = self.last_feedback_instant[i].is_some_and(|t| t >= after)
+                && after_seq.is_none_or(|seq| self.last_feedback_seq[i] > seq);
             all_fresh &= fresh;
             if fresh && self.motor_status[i] == state { mask |= 1 << i; }
         }
@@ -3407,7 +3412,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             )));
         }
         let _ = self.read_joint_states();
-        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, 1);
+        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, None, 1);
         let fault = if all_fresh { self.motor_status.iter().position(|&st| damiao_fault_name(st).is_some()) } else { None };
         match window.service(self.now(), mask, all_fresh, fault) {
             Service::Confirmed => {
@@ -3456,6 +3461,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // Still send disable if draining times out: thermal protection must not
         // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
         self.awaiting_rx_boundary = !self.drain_rx_before_command();
+        let after_seq = self.rx_seq;
         let cmd_start = self.now();
         self.last_enable_command = Some(cmd_start);
         let mut last_err = None;
@@ -3484,11 +3490,11 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         let poll_start = self.now();
         let window = ConfirmWindow::new(TorqueDirection::Disable, self.motor_ids.len(), cmd_start, poll_start,
             DAMIAO_DISABLE_CONFIRM, &DAMIAO_ENABLE_RETRY_AT);
-        self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced });
+        self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
         Ok(TorqueProgress::Pending { wake: poll_start })
     }
 
-    fn poll_disable(&mut self, mut window: ConfirmWindow, mit_fenced: bool) -> Result<TorqueProgress, ArmDriverError> {
+    fn poll_disable(&mut self, mut window: ConfirmWindow, mit_fenced: bool, after_seq: u64) -> Result<TorqueProgress, ArmDriverError> {
         if window.expire(self.now()).is_some() {
             if mit_fenced {
                 // unconfirmed: the motors may still be energized in MIT; keep the fence (no recovery,
@@ -3500,7 +3506,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             return Ok(TorqueProgress::Done(TorqueOutcome::Unconfirmed));
         }
         let _ = self.read_joint_states();
-        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, 0);
+        let (mask, all_fresh) = self.fresh_state_mask(window.fresh_after, Some(after_seq), 0);
         match window.service(self.now(), mask, all_fresh, None) {
             Service::Confirmed => {
                 tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", self.since(window.started));
@@ -3509,13 +3515,13 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             }
             Service::Retry { mask, wake } => {
                 self.retransmit(mask, "disable", damiao::build_disable_frame);
-                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced });
+                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
                 Ok(TorqueProgress::Pending { wake })
             }
             // a disable window never reports a fault (no fault index is passed)
             Service::Wait { .. } | Service::Fault { .. } => {
                 let wake = window.wake();
-                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced });
+                self.torque_hs = Some(DamiaoTorque::Disable { window, mit_fenced, after_seq });
                 Ok(TorqueProgress::Pending { wake })
             }
         }
@@ -3537,13 +3543,20 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// A command acknowledgement must be separated from buffered pre-command telemetry.
+    /// Drained telemetry frames update the feedback cache so pre-write checks (state 0,
+    /// stationarity, position) reflect the newest bus state; stale register replies are
+    /// ignored so they cannot satisfy a subsequent register transaction.
     fn drain_rx_before_command(&mut self) -> bool {
         let start = self.now();
         for _ in 0..128 {
             if self.since(start) >= Duration::from_millis(5) { return false; }
+            let attempt = self.now();
             match self.can.receive() {
-                Ok(_) => {},
-                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => return true,
+                Ok(frame) => self.process_rx_frame(&frame, false),
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
+                    self.mark_rx_empty(attempt);
+                    return true;
+                }
                 Err(_) => return false,
             }
         }
@@ -3950,7 +3963,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             Some(DamiaoTorque::Restore(w)) => self.poll_restore(w),
             Some(DamiaoTorque::Readback(r)) => self.poll_readback(r),
             Some(DamiaoTorque::Enable(window)) => self.poll_enable(window),
-            Some(DamiaoTorque::Disable { window, mit_fenced }) => self.poll_disable(window, mit_fenced),
+            Some(DamiaoTorque::Disable { window, mit_fenced, after_seq }) => self.poll_disable(window, mit_fenced, after_seq),
         };
         self.rx_deadline = None;
         r
@@ -4117,6 +4130,86 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         now.saturating_duration_since(t0) >= DAMIAO_RX_PASS || self.rx_deadline.is_some_and(|d| now >= d)
     }
 
+    /// Decode one received CAN frame into the driver's feedback cache and, when
+    /// `record_register_replies` is true, into the register reply buffers.
+    fn process_rx_frame(&mut self, frame: &CanFrame, record_register_replies: bool) {
+        self.rx_seq += 1;
+        if self.awaiting_rx_boundary {
+            return;
+        }
+        // Ignore transmit commands: on SocketCAN with local echo enabled,
+        // host transmit frames for PosVel are 0x100 + tx_id, gripper echo 0x300 + tx_id,
+        // or special 0x7FF, or command frames.
+        if frame.id == 0x7FF
+            || self
+                .motor_ids
+                .iter()
+                .any(|&tx_id| frame.id == (0x100 + tx_id as u32) || frame.id == (0x300 + tx_id as u32))
+            || frame.data == damiao::CMD_ENABLE
+            || frame.data == damiao::CMD_DISABLE
+            || frame.data == damiao::CMD_CLEAR_FAULTS
+            || frame.data == damiao::CMD_SET_ZERO
+        {
+            return;
+        }
+        // Local echo of an MIT command (same ID as some feedback paths).
+        if self.last_target_frames.iter().flatten().any(|f| f.id == frame.id && f.data == frame.data) {
+            return;
+        }
+        if let Some(reply) = damiao::parse_register_reply(frame)
+            .filter(|r| self.motor_ids.contains(&r.motor_id))
+        {
+            // A register reply is not feedback: byte 0 would decode as state 0.
+            if record_register_replies {
+                if self.register_replies.len() < 64 { self.register_replies.push(reply); }
+                if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, self.now(), self.rx_seq, self.rx_empty_seq)); }
+            }
+            return;
+        }
+        if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
+            // Byte 0 names the motor; bind per-motor feedback CAN IDs (own ID and 0x10 + own ID)
+            // to that specific joint so another motor's MST_ID (e.g. 0x16) cannot spoof it, while
+            // preserving shared-master addressing (0x00 and master_id).
+            let fid = damiao::feedback_motor_id(frame);
+            let Some(idx) = self.motor_ids.iter().position(|&id| id as u8 == fid) else {
+                return;
+            };
+            let motor_id = u32::from(self.motor_ids[idx]);
+            let is_valid_feedback_id = frame.id == 0
+                || frame.id == self.master_id
+                || frame.id == motor_id
+                || frame.id == (0x10 + motor_id);
+            if !is_valid_feedback_id {
+                return;
+            }
+            if let Ok(feedback) = damiao::unpack_feedback_frame(frame, &self.limits[idx]) {
+                self.cached_states[idx] = JointState {
+                    position: feedback.position,
+                    velocity: feedback.velocity,
+                    torque: feedback.torque,
+                    temperature: feedback.t_mos.max(feedback.t_rotor),
+                };
+                self.last_feedback_instant[idx] = Some(self.now());
+                self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
+                self.feedback_queue_bound[idx] = self.rx_empty_instant;
+                self.last_feedback_seq[idx] = self.rx_seq;
+                self.motor_status[idx] = feedback.state_or_error;
+            }
+        }
+    }
+
+    fn mark_rx_empty(&mut self, attempt: Instant) {
+        self.rx_empty_instant = Some(attempt);
+        self.last_read_drained = true;
+        self.rx_seq += 1;
+        self.rx_empty_seq = self.rx_seq;
+        if self.awaiting_rx_boundary {
+            self.awaiting_rx_boundary = false;
+            self.last_feedback_instant.fill(None);
+            self.last_enable_command = Some(self.now());
+        }
+    }
+
     fn receive_feedback(&mut self) -> Result<(), ArmDriverError> {
         let t0 = self.now();
         let mut frames_processed = 0;
@@ -4128,91 +4221,14 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
-                    self.rx_seq += 1;
-                    if self.awaiting_rx_boundary {
-                        if frames_processed >= 64 || self.rx_over(t0) { break; }
-                        continue;
-                    }
-                    // Ignore transmit commands: on SocketCAN with local echo enabled,
-                    // host transmit frames for PosVel are 0x100 + tx_id, gripper echo 0x300 + tx_id,
-                    // or special 0x7FF, or command frames.
-                    if frame.id == 0x7FF
-                        || self
-                            .motor_ids
-                            .iter()
-                            .any(|&tx_id| frame.id == (0x100 + tx_id as u32) || frame.id == (0x300 + tx_id as u32))
-                        || frame.data == damiao::CMD_ENABLE
-                        || frame.data == damiao::CMD_DISABLE
-                        || frame.data == damiao::CMD_CLEAR_FAULTS
-                        || frame.data == damiao::CMD_SET_ZERO
-                    {
-                        if frames_processed >= 64 || self.rx_over(t0) {
-                            break;
-                        }
-                        continue;
-                    }
-                    // Local echo of an MIT command (same ID as some feedback paths).
-                    if self.last_target_frames.iter().flatten().any(|f| f.id == frame.id && f.data == frame.data) {
-                        if frames_processed >= 64 || self.rx_over(t0) { break; }
-                        continue;
-                    }
-                    if let Some(reply) = damiao::parse_register_reply(&frame)
-                        .filter(|r| self.motor_ids.contains(&r.motor_id))
-                    {
-                        // A register reply is not feedback: byte 0 would decode as state 0.
-                        if self.register_replies.len() < 64 { self.register_replies.push(reply); }
-                        if self.register_reply_log.len() < 64 { self.register_reply_log.push((reply, frame.id, self.now(), self.rx_seq, self.rx_empty_seq)); }
-                        if frames_processed >= 64 || self.rx_over(t0) { break; }
-                        continue;
-                    }
-                    if !frame.is_extended && !frame.is_rtr && frame.dlc == 8 {
-                        // In Damiao protocol, feedback is addressed to master_id (or 0x00),
-                        // or broadcast with the motor's own ID, or 0x10 + motor_id.
-                        let is_valid_feedback_id = frame.id == 0
-                            || frame.id == self.master_id
-                            || self
-                                .motor_ids
-                                .iter()
-                                .any(|&m| frame.id == m as u32 || frame.id == (0x10 + m as u32));
-                        if !is_valid_feedback_id {
-                            if frames_processed >= 64 || self.rx_over(t0) {
-                                break;
-                            }
-                            continue;
-                        }
-
-                        // Byte 0 names the motor; decode with that joint's own range.
-                        let fid = damiao::feedback_motor_id(&frame);
-                        let idx = self.motor_ids.iter().position(|&id| id as u8 == fid);
-                        if let Some((idx, Ok(feedback))) = idx.map(|idx| (idx, damiao::unpack_feedback_frame(&frame, &self.limits[idx]))) {
-                            self.cached_states[idx] = JointState {
-                                position: feedback.position,
-                                velocity: feedback.velocity,
-                                torque: feedback.torque,
-                                temperature: feedback.t_mos.max(feedback.t_rotor),
-                            };
-                            self.last_feedback_instant[idx] = Some(self.now());
-                            self.feedback_seq[idx] = self.feedback_seq[idx].wrapping_add(1);
-                            self.feedback_queue_bound[idx] = self.rx_empty_instant;
-                            self.last_feedback_seq[idx] = self.rx_seq;
-                            self.motor_status[idx] = feedback.state_or_error;
-                        }
-                    }
+                    self.process_rx_frame(&frame, true);
                     if frames_processed >= 64 || self.rx_over(t0) {
                         break;
                     }
                 }
                 Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
-                    self.rx_empty_instant = Some(attempt);
-                    self.last_read_drained = true;
-                    self.rx_seq += 1;
-                    self.rx_empty_seq = self.rx_seq;
-                    if self.awaiting_rx_boundary {
-                        self.awaiting_rx_boundary = false;
-                        self.last_feedback_instant.fill(None);
-                        self.last_enable_command = Some(self.now());
-                    }
+                    self.mark_rx_empty(attempt);
                     break;
                 }
                 Err(_) => break,

@@ -32,6 +32,8 @@ fn rig(pos_force: bool) -> (DamiaoArmDriver<FakeBus>, FakeBus, MockClock) {
     bus.with(|s| { for (i, m) in s.motors.iter_mut().enumerate() { m.q = 0.1 * i as f32; } s.motors[J7].q = -1.0; });
     let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7]).with_joint_limits(b601_limits()).unwrap();
     if pos_force { d = d.with_gripper_pos_force(pf()).unwrap(); } else { d = d.with_gripper_pos_vel(J7); }
+    // Observe an empty receive queue before pushing feedback so samples carry a provable receive-age bound.
+    d.read_joint_states().unwrap();
     bus.with(|s| s.push_all_feedback());
     d.read_joint_states().unwrap();
     d.check_mapping_ranges();
@@ -164,6 +166,69 @@ fn mode_is_written_only_on_fresh_stationary_torque_off_feedback() {
     bus.with(|s| s.motors[J7].mute_feedback = true);
     bus.clear_log();
     assert!(d.set_torque(true).unwrap_err().to_string().contains("fresh stationary"));
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
+}
+
+#[test]
+fn handshake_drain_applies_queued_telemetry_before_mode_write_checks() {
+    // 1. Newer queued telemetry reports moving jaw (v = 0.5) without an intervening read_joint_states():
+    //    the pre-write drain must update the cache so the stationarity check refuses the write.
+    let (mut d, bus, _) = rig(true);
+    bus.with(|s| { s.motors[J7].v = 0.5; s.push_feedback(J7); });
+    bus.clear_log();
+    let e = d.set_torque(true).unwrap_err().to_string();
+    assert!(e.contains("still false"), "{e}");
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written despite drained moving frame");
+    assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE), "enabled despite drained moving frame");
+
+    // 2. Newer queued telemetry reports motor already enabled (state = 1): state-0 check must refuse.
+    let (mut d, bus, _) = rig(true);
+    bus.with(|s| { s.motors[J7].state_override = Some(1); s.push_feedback(J7); });
+    bus.clear_log();
+    let e = d.set_torque(true).unwrap_err().to_string();
+    assert!(e.contains("torque off false"), "{e}");
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written despite drained state-1 frame");
+
+    // 3. A stationary state-0 frame that sat in the RX buffer past 100 ms since the last empty queue
+    //    must not spoof fresh feedback during the pre-write drain.
+    let (mut d, bus, clock) = rig(true);
+    bus.with(|s| s.push_feedback(J7));
+    clock.advance(Duration::from_millis(200));
+    bus.clear_log();
+    let e = d.set_torque(true).unwrap_err().to_string();
+    assert!(e.contains("fresh false"), "{e}");
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written on aged queued frame");
+
+    // 4. A stationary state-0 frame already sitting in RX BEFORE the driver's first observed empty
+    //    queue has unknown age and must not authorize a mode write.
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&b601_limits(), clock);
+    bus.with(|s| { s.motors[J7].q = -1.0; s.push_all_feedback(); });
+    let mut d = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(b601_limits()).unwrap()
+        .with_gripper_pos_force(pf()).unwrap();
+    bus.clear_log();
+    let e = d.set_torque(true).unwrap_err().to_string();
+    assert!(e.contains("fresh false"), "accepted pre-boundary startup sample: {e}");
+    assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE), "mode written on pre-boundary sample");
+
+    // 5. A feedback frame on J6's arbitration ID (0x16) carrying J7 (id=7) in payload byte 0
+    //    must not overwrite a moving J7 sample from J7's real ID (0x17) during the pre-write drain.
+    let (mut d, bus, _) = rig(true);
+    bus.with(|s| {
+        s.motors[J7].v = 0.5;
+        s.push_feedback(J7);
+        let mut spoof = s.motors[J7].feedback_frame();
+        // Build a stationary state-0 J7 payload delivered on J6's MST_ID 0x16.
+        s.motors[J7].v = 0.0;
+        let still = s.motors[J7].feedback_frame();
+        spoof.id = 0x16;
+        spoof.data = still.data;
+        s.rx.push_back(spoof);
+    });
+    bus.clear_log();
+    let e = d.set_torque(true).unwrap_err().to_string();
+    assert!(e.contains("still false"), "0x16 spoof replaced moving J7 telemetry: {e}");
     assert!(!bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == damiao::REG_WRITE));
 }
 
