@@ -858,6 +858,19 @@ async fn grasp_setup_persists_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub").join("grasp_setup.json");
     let mut w = ws_rig(Some(path.clone())).await;
+    // the capture needs closed jaws held still for 0.2 s: no simulated object between the
+    // jaws (the ticker's hold opens them to OBJECT_J7), and the still window filled
+    w.rig.hold.store(false, Ordering::SeqCst);
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ready = {
+            let inner = w.rig.sup.inner().read().await;
+            inner.measured_positions[6].abs() < 1e-3 && inner.check_table_capture_stillness().is_ok()
+        };
+        if ready { break; }
+        assert!(Instant::now() < until, "the arm did not settle with closed jaws");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let tcp_z = start_pose(&w.rig).await.p[2];
     let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup",
         json!({"table_z_from_tcp": true, "grip_pixel_norm": [0.42, 0.71], "approach_height_m": 0.17, "camera_tilt_deg": 25.0})).await;
