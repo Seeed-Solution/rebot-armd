@@ -542,9 +542,9 @@ pub fn footprint(cams: &[Camera], sils: &[Silhouette], plane: [f64; 4], height_m
 // ---- contours of binary masks ----
 
 /// Exterior contour of the largest 4-connected component of a binary mask (`w` x `h`, row-major,
-/// non-zero = set), traced along pixel edges: vertices at pixel corners (x, y in pixel units, the
-/// mask's top-left corner at 0, 0), clockwise in image coordinates, corners only. Empty when the
-/// mask is empty.
+/// non-zero = set): one vertex per boundary pixel edge, at its midpoint (x, y in pixel units, the
+/// mask's top-left corner at 0, 0), clockwise in image coordinates (rebot-vision's tracing without
+/// logits). Empty when the mask is empty.
 pub fn trace_exterior(mask: &[u8], w: usize, h: usize) -> Vec<[f64; 2]> {
     let Some(lab) = largest_component(mask, w, h) else { return Vec::new() };
     trace_component(&lab, w, h)
@@ -605,21 +605,19 @@ fn trace_component(m: &[u8], w: usize, h: usize) -> Vec<[f64; 2]> {
     for _ in 0..limit {
         let (fl, fr) = ahead(x, y, d);
         let nd = if !fr { (d + 1) % 4 } else if fl { (d + 3) % 4 } else { d };
-        if nd != d { out.push([x as f64, y as f64]); }
         d = nd;
         if !fr || fl {
             // turned: the step is taken from the same vertex in the new direction next round
             if x == sx && y == sy && d == 0 && !out.is_empty() { break; }
             continue;
         }
+        // one boundary step: the midpoint of the pixel edge (the 0.5 level between the inside and
+        // the outside pixel centre of a binary mask; no half-pixel overshoot at corners)
+        out.push([x as f64 + 0.5 * D[d].0 as f64, y as f64 + 0.5 * D[d].1 as f64]);
         x += D[d].0;
         y += D[d].1;
         if x == sx && y == sy && d == 0 { break; }
     }
-    // the start vertex is a corner (top-left of the first pixel): make it the first vertex
-    if let Some(k) = out.iter().position(|p| p[0] == sx as f64 && p[1] == sy as f64) { out.rotate_left(k); }
-    out.dedup();
-    if out.len() > 1 && out.first() == out.last() { out.pop(); }
     out
 }
 
@@ -648,7 +646,12 @@ pub fn simplify_closed(input: &[[f64; 2]], eps: f64, max_vertices: usize) -> Vec
     dp(&poly, 0, far, e, &mut keep);
     dp_wrap(&poly, far, e, &mut keep);
     let mut out: Vec<[f64; 2]> = poly.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
-    if out.len() < 3 { out = poly; }
+    if out.len() < 3 {
+        // a thin outline can lose all but its two extremes: add the vertex farthest from their chord
+        let bi = (1..poly.len()).filter(|&k| k != far)
+            .max_by(|&a, &b| seg_dist(poly[a], poly[0], poly[far]).total_cmp(&seg_dist(poly[b], poly[0], poly[far]))).unwrap_or(1);
+        out = poly.iter().enumerate().filter(|(k, _)| *k == 0 || *k == far || *k == bi).map(|(_, p)| *p).collect();
+    }
     subsample(&out, cap)
 }
 
@@ -1005,12 +1008,14 @@ mod tests {
         m[4 * w] = 1;
         m[4 * w + 5] = 1;
         let c = trace_exterior(&m, w, h);
-        assert_eq!(c, vec![[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [1.0, 3.0], [1.0, 5.0], [0.0, 5.0]]);
-        assert!((polygon_area2(&c).abs() * 0.5 - 11.0).abs() < 1e-12);
+        let s = simplify_closed(&c, 0.01, 128);
+        assert_eq!(s, vec![[0.5, 0.0], [2.5, 0.0], [3.0, 0.5], [3.0, 2.5], [2.5, 3.0], [1.5, 3.0], [1.0, 3.5], [1.0, 4.5], [0.5, 5.0], [0.0, 4.5], [0.0, 0.5]]);
+        // 11 pixels, 5 convex corners cut by a triangle of 1/8, the concave one filled by 1/8
+        assert!((polygon_area2(&s).abs() * 0.5 - (11.0 - 4.0 * 0.125)).abs() < 1e-12);
         // diagonal neighbours are separate components
         let mut d = vec![0u8; 4];
         d[0] = 1; d[3] = 1;
-        assert_eq!(trace_exterior(&d, 2, 2).len(), 4);
+        assert_eq!(trace_exterior(&d, 2, 2), vec![[1.5, 1.0], [2.0, 1.5], [1.5, 2.0], [1.0, 1.5]]);
         assert!(trace_exterior(&[0u8; 4], 2, 2).is_empty());
         // a disk: many staircase vertices, simplified under the cap
         let (w, h) = (101, 101);
