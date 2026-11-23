@@ -6647,13 +6647,20 @@ impl SupervisorInner {
         self.tick_phase(3);
         let obs = self.current_observation();
 
-        // 5. Record frame if episode recording is active
+        // 5. Record frame if episode recording is active: a teach session appends to the
+        // preallocated ring (no allocation, `crate::rt_core::record_ring`); a recorder started
+        // directly (no session) keeps its frames itself
         if self.recording_frame_room() {
-            self.recorder.append_frame(RecordFrame {
-                timestamp: obs.timestamp,
-                observation_state: self.measured_positions.clone(),
-                action: self.commanded_positions.clone(),
-            });
+            if self.core.record.active() {
+                let seq = self.core.published_seq() + 1;
+                self.core.record.push(seq, obs.timestamp, &self.measured_positions, &self.commanded_positions);
+            } else {
+                self.recorder.append_frame(RecordFrame {
+                    timestamp: obs.timestamp,
+                    observation_state: self.measured_positions.clone(),
+                    action: self.commanded_positions.clone(),
+                });
+            }
         }
 
         obs
@@ -7617,8 +7624,9 @@ impl ArmSupervisor {
     }
 
     /// Starts the dispatcher thread once: a normal-priority thread woken by every
-    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers.
-    fn ensure_dispatcher(&self) {
+    /// publication that forwards samples to [`Self::subscribe_telemetry`] receivers and
+    /// drains the recording ring.
+    pub(crate) fn ensure_dispatcher(&self) {
         if self.hub.has_dispatcher() { return; }
         let _start = self.dispatcher_start.lock().unwrap_or_else(|e| e.into_inner());
         if self.hub.has_dispatcher() { return; }
@@ -8318,6 +8326,7 @@ fn dispatch_loop(hub: &crate::rt_core::publish::StateHub, tx: &broadcast::Sender
     }
     let mut last = 0;
     while !hub.is_closed() {
+        if let Some(ring) = hub.record_ring() { ring.drain(); }
         if hub.published_seq() != last {
             if let Some(s) = hub.latest().filter(|s| s.meta.seq > last) {
                 last = s.meta.seq;
@@ -8408,6 +8417,48 @@ mod observation_snapshot_tests {
         assert_eq!(obs.timestamp, ticked.timestamp);
         let c = sup.tick_stats().observation_cache;
         assert_eq!((c.hits, c.misses, c.waited), (1, 0, 1));
+    }
+
+    /// Recording boundaries: the saved frames are exactly the ticks between start and stop,
+    /// with the values the 1.5 in-tick append recorded (the tick's observation timestamp,
+    /// measured and commanded positions), also across ring drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recording_holds_exactly_the_ticks_between_start_and_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+        sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+        sup.tick(0.02).await;
+        sup.start_recording(None, None).await.unwrap();
+        let mut expected = Vec::new();
+        for i in 0..300 {
+            // move the commanded state so every frame differs
+            sup.inner().write().await.commanded_positions[0] = i as f32 * 1e-3;
+            let obs = sup.tick(0.02).await;
+            expected.push(RecordFrame { timestamp: obs.timestamp, observation_state: obs.positions.clone(), action: obs.commanded_positions.clone() });
+            if i % 100 == 0 { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }
+        assert_eq!(sup.get_recording_state().await.1, 300);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sup.save_recording_with(move |_, frames| { tx.send(frames.to_vec()).unwrap(); Ok(()) }).await.unwrap();
+        // a tick after the stop fence records nothing
+        sup.tick(0.02).await;
+        let frames = rx.recv().unwrap();
+        assert_eq!(frames.len(), expected.len());
+        assert_eq!(frames, expected);
+        assert_eq!(sup.inner().read().await.core.record.dropped(), 0);
+    }
+
+    /// A full ring drops samples without waiting and the session reports them.
+    #[test]
+    fn recording_ring_overflow_is_explicit() {
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.recorder.start(Some("r".into()), Some(std::env::temp_dir().join("rt1_overflow.parquet"))).unwrap();
+        inner.core.begin_recording();
+        let n = crate::rt_core::record_ring::RECORD_RING_CAPACITY + 44;
+        for _ in 0..n { inner.tick(0.02); }
+        assert_eq!(inner.recording_frames(), crate::rt_core::record_ring::RECORD_RING_CAPACITY);
+        let done = inner.core.record.finish();
+        assert_eq!((done.frames.len(), done.dropped), (crate::rt_core::record_ring::RECORD_RING_CAPACITY, 44));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

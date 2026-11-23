@@ -173,7 +173,7 @@ impl Rig {
             units: "rad".into(), joint_zero: armd::recording::JointZeroStamp::of(&inner.joint_zero_offsets), profile_id: inner.config.profile_id.clone(),
             armd_version: "test".into(), fps_nominal: 50.0, truncated: false, stopped_by: None, arm_dof: Some(inner.config.arm_dof()),
             gripper_joint: inner.config.gripper_index(), tool_id: Some(inner.config.active_tool.id.clone()),
-            tool_config_digest: Some(inner.config.active_tool.config_digest.clone()), has_gripper_motion: Some(false), recovered: None,
+            tool_config_digest: Some(inner.config.active_tool.config_digest.clone()), has_gripper_motion: Some(false), recovered: None, frames_dropped: None,
             first_state: Some(frames[0].observation_state.clone()), last_state: Some(frames[frames.len() - 1].observation_state.clone()),
         };
         drop(inner);

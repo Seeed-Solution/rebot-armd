@@ -288,7 +288,7 @@ pub fn check_with_provenance(
         fps_nominal: sidecar.get("fps_nominal").and_then(Value::as_f64).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(ctx.fps),
         truncated: false, stopped_by: None, arm_dof: Some(ctx.arm_dof), gripper_joint: ctx.gripper_joint, recovered: None,
         first_state: Some(frames[0].observation_state.clone()), last_state: Some(frames[frames.len() - 1].observation_state.clone()),
-        tool_id, tool_config_digest, has_gripper_motion: Some(has_gripper_motion),
+        tool_id, tool_config_digest, has_gripper_motion: Some(has_gripper_motion), frames_dropped: None,
     };
     Ok(CheckedImport { sidecar: sc, stale })
 }

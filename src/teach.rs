@@ -124,7 +124,13 @@ impl SupervisorInner {
     /// The tick appends frames while this holds.
     pub(crate) fn recording_frame_room(&self) -> bool {
         self.recorder.state() == &EpisodeState::Recording
-            && self.recording.as_ref().is_none_or(|r| self.recorder.frame_count() < r.max_frames)
+            && self.recording.as_ref().is_none_or(|r| self.recording_frames() < r.max_frames)
+    }
+
+    /// Frames of the running recording: those the recorder holds and those the ticks put
+    /// into the recording ring.
+    pub fn recording_frames(&self) -> usize {
+        self.recorder.frame_count() + if self.core.record.active() { self.core.record.pushed() } else { 0 }
     }
 
     /// `recording` field of `GET /api/v1/episodes` and the recorder status.
@@ -133,7 +139,7 @@ impl SupervisorInner {
             None => Value::Null,
             Some(r) => json!({
                 "recording_id": r.id, "owner": r.owner.label(), "dataset": r.options.dataset, "task": r.options.task, "started_at": r.recorded_at,
-                "source": r.options.source, "frames": self.recorder.frame_count(), "elapsed_s": r.started.elapsed().as_secs_f64(),
+                "source": r.options.source, "frames": self.recording_frames(), "elapsed_s": r.started.elapsed().as_secs_f64(),
                 "owner_connected": r.owner_lost_at.is_none(),
             }),
         }
@@ -191,6 +197,7 @@ impl ArmSupervisor {
             let mut inner = self.inner().write().await;
             inner.recorder_idle()?;
             inner.recorder.start(Some(id.clone()), Some(path))?;
+            inner.core.begin_recording();
             let max_frames = (inner.max_episode_s * f64::from(inner.config.control_frequency_hz.max(1))).ceil() as usize + 1;
             inner.recording = Some(ActiveRecording {
                 id: id.clone(), owner, options,
@@ -198,6 +205,8 @@ impl ArmSupervisor {
                 started: Instant::now(), joint_zero: JointZeroStamp::of(&inner.joint_zero_offsets), max_frames, owner_lost_at: None,
             });
         }
+        // drains the recording ring off the tick
+        self.ensure_dispatcher();
         tracing::info!("Recording {id} started (owner {label})");
         let lock = self.inner().clone();
         let mid = id.clone();
@@ -272,7 +281,7 @@ impl ArmSupervisor {
 
     pub async fn get_recording_state(&self) -> (EpisodeState, usize) {
         let inner = self.inner().read().await;
-        (inner.recorder.state().clone(), inner.recorder.frame_count())
+        (inner.recorder.state().clone(), inner.recording_frames())
     }
 
     /// Set the episode directory (`None`: storage off); the catalog loads on first use.
@@ -308,18 +317,25 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             tokio::task::spawn_blocking(move || s2.check_capacity()).await
                 .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
         }
-        let (rec, _path, frames, sidecar_base) = {
+        let (rec, _path, frames, sidecar_base, dropped) = {
             let mut inner = lock.write().await;
             let Some(r) = inner.recording.clone() else {
                 return Err(crate::recording::RecordingError::InvalidState { action: "save".into(), state: inner.recorder.state().clone() }.into());
             };
             if let Stopper::Owner(o) = &by { if o != &r.owner { return Err(rejected(409, "RECORDER_NOT_OWNER", "the recording changed owner")); } }
+            // stop fence: the ring's samples of this session, up to the last tick
+            let ring = inner.core.record.finish();
             if !save {
                 inner.recorder.discard()?;
                 inner.recording = None;
                 tracing::info!("Recording {} discarded", r.id);
                 return Ok(Stopped::Discarded);
             }
+            if ring.dropped > 0 {
+                tracing::warn!("Recording {}: {} samples dropped on a full recording ring; the episode is incomplete", r.id, ring.dropped);
+            }
+            let dropped = ring.dropped;
+            inner.recorder.append_frames(ring.frames);
             let (path, frames) = inner.recorder.begin_save()?;
             inner.recording = None;
             let base = (
@@ -331,7 +347,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
                 inner.config.active_tool.id.clone(),
                 inner.config.active_tool.config_digest.clone(),
             );
-            (r, path, frames, base)
+            (r, path, frames, base, dropped)
         };
         let (joint_names, profile_id, arm_dof, gripper_joint, fps, tool_id, tool_config_digest) = sidecar_base;
         let has_gripper_motion = store::episode_has_gripper_motion(&frames, gripper_joint);
@@ -345,6 +361,7 @@ async fn stop_recording(lock: &Arc<crate::supervisor_lock::SupervisorLock<Superv
             truncated, stopped_by, arm_dof: Some(arm_dof), gripper_joint, recovered: None,
             first_state: frames.first().map(|f| f.observation_state.clone()), last_state: frames.last().map(|f| f.observation_state.clone()),
             tool_id: Some(tool_id), tool_config_digest: Some(tool_config_digest), has_gripper_motion: Some(has_gripper_motion),
+            frames_dropped: (dropped > 0).then_some(dropped),
         };
         let sc = sidecar.clone();
         let (frames, result) = tokio::task::spawn_blocking(move || {
@@ -371,7 +388,7 @@ async fn monitor(lock: Arc<crate::supervisor_lock::SupervisorLock<SupervisorInne
         let (full, lost, st) = {
             let inner = lock.read().await;
             let Some(r) = inner.recording.as_ref().filter(|r| r.id == id) else { return; };
-            let full = inner.recorder.frame_count() >= r.max_frames || r.started.elapsed().as_secs_f64() >= inner.max_episode_s + 1.0;
+            let full = inner.recording_frames() >= r.max_frames || r.started.elapsed().as_secs_f64() >= inner.max_episode_s + 1.0;
             (full, r.owner_lost_at.is_some_and(|t| t.elapsed() >= OWNER_LOST_DISCARD), inner.episodes.clone())
         };
         let action = if lost {

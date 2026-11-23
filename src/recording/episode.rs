@@ -113,6 +113,13 @@ impl EpisodeRecorder {
         }
     }
 
+    /// Append frames recorded elsewhere (the control tick's recording ring) during recording.
+    pub fn append_frames(&mut self, frames: Vec<RecordFrame>) {
+        if self.state == EpisodeState::Recording {
+            if self.frames.is_empty() { self.frames = frames; } else { self.frames.extend(frames); }
+        }
+    }
+
     /// Commit the recording and save to Parquet file
     pub fn save(&mut self) -> Result<PathBuf, RecordingError> {
         let (path, frames) = self.begin_save()?;

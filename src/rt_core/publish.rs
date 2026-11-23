@@ -148,6 +148,8 @@ pub struct StateHub {
     published: AtomicU64,
     dispatcher: OnceLock<std::thread::Thread>,
     closed: AtomicBool,
+    /// The recording ring, drained by the dispatcher (set by the first recording).
+    record: OnceLock<Arc<super::record_ring::RecordRing>>,
 }
 
 /// A publisher for an arm with `dof` joints and its hub.
@@ -159,6 +161,7 @@ pub fn state_channel(dof: usize) -> (StatePublisher, Arc<StateHub>) {
         published: AtomicU64::new(0),
         dispatcher: OnceLock::new(),
         closed: AtomicBool::new(false),
+        record: OnceLock::new(),
     });
     (StatePublisher { producer, seq: 0, hub: hub.clone() }, hub)
 }
@@ -196,6 +199,11 @@ impl StateHub {
     pub fn wake(&self) {
         if let Some(t) = self.dispatcher.get() { t.unpark(); }
     }
+
+    /// Registers the recording ring the dispatcher drains (the first call counts).
+    pub fn set_record_ring(&self, ring: Arc<super::record_ring::RecordRing>) { let _ = self.record.set(ring); }
+
+    pub fn record_ring(&self) -> Option<&Arc<super::record_ring::RecordRing>> { self.record.get() }
 
     /// Ends the dispatcher thread (the supervisor is dropped).
     pub fn close(&self) {

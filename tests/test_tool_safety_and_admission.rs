@@ -518,6 +518,7 @@ async fn b5_b6_replay_checks_tool_provenance_and_tcp_reach_envelope() {
         tool_config_digest: Some(fin.active_tool.config_digest.clone()),
         has_gripper_motion: Some(true),
         recovered: None,
+        frames_dropped: None,
         first_state: Some(frames_g[0].observation_state.clone()),
         last_state: Some(frames_g.last().unwrap().observation_state.clone()),
     };
@@ -607,6 +608,7 @@ async fn b5_b6_replay_checks_tool_provenance_and_tcp_reach_envelope() {
             tool_config_digest: Some(ext_cfg.active_tool.config_digest.clone()),
             has_gripper_motion: Some(false),
             recovered: None,
+            frames_dropped: None,
             first_state: Some(frames_far[0].observation_state.clone()),
             last_state: Some(frames_far.last().unwrap().observation_state.clone()),
         };
@@ -1295,6 +1297,7 @@ fn r2_b05_replay_rejects_embedded_parquet_sidecar_conflict_and_m12_so101_manifes
         tool_config_digest: Some(fin.active_tool.config_digest.clone()),
         has_gripper_motion: Some(false),
         recovered: None,
+        frames_dropped: None,
         first_state: Some(frames[0].observation_state.clone()),
         last_state: Some(frames[0].observation_state.clone()),
     };

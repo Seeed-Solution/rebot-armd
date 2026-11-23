@@ -201,6 +201,10 @@ pub struct EpisodeSidecar {
     pub tool_config_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_gripper_motion: Option<bool>,
+    /// Samples the control tick dropped on a full recording ring (the episode is incomplete);
+    /// absent when none was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_dropped: Option<u64>,
 }
 
 impl EpisodeSidecar {
@@ -885,6 +889,7 @@ fn adopt_legacy(path: &Path, id: &str, offsets: &[f32], joint_names: &[String], 
         tool_id: meta.tool_id,
         tool_config_digest: meta.tool_config_digest,
         has_gripper_motion: Some(meta.has_gripper_motion.unwrap_or_else(|| episode_has_gripper_motion(&frames, meta.gripper_joint))),
+        frames_dropped: None,
     })
 }
 
@@ -954,7 +959,7 @@ mod tests {
             units: "rad".into(), joint_zero: JointZeroStamp::of(&[0.0, 0.0]), profile_id: None, armd_version: "x".into(),
             fps_nominal: 50.0, truncated: false, stopped_by: None, arm_dof: None, gripper_joint: None, recovered: None,
             first_state: None, last_state: None,
-            tool_id: None, tool_config_digest: None, has_gripper_motion: None,
+            tool_id: None, tool_config_digest: None, has_gripper_motion: None, frames_dropped: None,
         }
     }
 

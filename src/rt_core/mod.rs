@@ -74,6 +74,14 @@ mod core {
         /// The readers' side of the state channel.
         pub fn hub(&self) -> &Arc<StateHub> { self.publisher.hub() }
 
+        /// Start fence of a recording session (`RecordProducer::begin`); the dispatcher drains
+        /// the ring from now on.
+        pub fn begin_recording(&mut self) -> u64 {
+            let session = self.record.begin();
+            if let Some(ring) = self.record.ring() { self.publisher.hub().set_record_ring(ring.clone()); }
+            session
+        }
+
         /// `seq` of the last publication (0: none yet).
         pub fn published_seq(&self) -> u64 { self.hub().published_seq() }
 
