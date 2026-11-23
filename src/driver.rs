@@ -3208,8 +3208,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Drain queued motion frames within `pass` (zero heap allocation).
-    fn drain_pending_pass(&mut self, pass: &mut TickTxPass) -> Result<TxBatchOutcome, ArmDriverError> {
+    /// When `fail_on_stale_drop` is true (a newly staged target batch), dropping any frame of
+    /// that batch on age expiry mid-pass fails closed with `TransportError::Timeout` (zero alloc)
+    /// instead of reporting `Complete`.
+    fn drain_pending_pass(
+        &mut self,
+        pass: &mut TickTxPass,
+        fail_on_stale_drop: bool,
+    ) -> Result<TxBatchOutcome, ArmDriverError> {
         let mut sent_any = false;
+        let mut dropped_stale_in_pass = 0usize;
         while let Some(entry) = self.pending_tx.front() {
             if let Err(e) = self.estop_check() {
                 self.discard_pending_tx_stopped();
@@ -3218,6 +3226,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             let now = self.now();
             if now.saturating_duration_since(entry.queued_at) >= self.tx_budget.frame_max_age {
                 let _ = self.pending_tx.pop_front();
+                dropped_stale_in_pass += 1;
                 crate::diagnostics::tick::record_tx_dropped_stale(1);
                 continue;
             }
@@ -3248,6 +3257,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         // Drop any remaining entries that aged past frame_max_age during this pass.
         let late_stale = self.pending_tx.drop_stale(self.now(), self.tx_budget.frame_max_age);
         if late_stale > 0 {
+            dropped_stale_in_pass += late_stale;
             crate::diagnostics::tick::record_tx_dropped_stale(late_stale as u32);
         }
         if sent_any {
@@ -3257,6 +3267,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.discard_pending_tx_stopped();
                 return Err(e.into());
             }
+        }
+        if fail_on_stale_drop && dropped_stale_in_pass > 0 {
+            self.discard_pending_tx_stopped();
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
         let newly_deferred = self.pending_tx.mark_newly_deferred();
         let pending = self.pending_tx.len();
@@ -3291,7 +3305,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             attempts: 0,
             backpressured: false,
         });
-        self.drain_pending_pass(&mut pass)
+        self.drain_pending_pass(&mut pass, false)
     }
 
     /// Read u32 / f32 registers `rids` of joint `i`: requests sent after the log is cleared,
@@ -4347,8 +4361,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if targets.len() > started.len() {
                 return Err(ArmDriverError::JointCountMismatch { expected: started.len(), actual: targets.len() });
             }
-            // Preflight the entire batch frame count & pass budget BEFORE frame 0 so an oversized
-            // or already-exhausted MIT batch trips cleanly without partial bus output.
+            // Preflight E-stop and the entire batch frame count & pass budget BEFORE frame 0 so an
+            // oversized or already-exhausted MIT batch trips cleanly without partial bus output.
+            if let Err(e) = self.estop_check() {
+                self.trip_fence(format!("E-stop before the batch (0 of {} joints)", targets.len()));
+                return Err(e);
+            }
             let batch_frames: usize = targets.iter().enumerate().map(|(i, t)| self.target_frames(i, t).count()).sum();
             if pass.backpressured {
                 let reason = "TX pass already backpressured before MIT batch".to_string();
@@ -4444,7 +4462,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             }
         }
         // 5. Drain FIFO within the shared per-tick TX pass.
-        self.drain_pending_pass(&mut pass)
+        self.drain_pending_pass(&mut pass, true)
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {

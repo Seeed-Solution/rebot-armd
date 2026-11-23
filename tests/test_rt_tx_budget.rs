@@ -432,6 +432,17 @@ fn inclusive_45ms_expiry_carries_fresh_and_drops_stale() {
     let m = take_tx_metrics();
     assert_eq!((m.frames, m.dropped_stale, m.dropped_stopped, m.pending), (0, 3, 0, 0));
     assert!(bus.with(|s| s.tx_log.is_empty()));
+
+    // A stalled single transmit pushing the current batch past 45 ms must fail closed (Timeout),
+    // never falsely reporting Complete after dropping the remaining frames as stale.
+    let (mut d, bus, _) = enabled_driver();
+    d.set_tx_budget(TxBudget { max_frames: 16, max_duration: ms(100), frame_max_age: ms(45) });
+    bus.with(|s| s.tx_script.push_back((TxRule::Ok, ms(45))));
+    reset_tx_metrics();
+    let err = d.write_joint_targets_bounded(&targets_const(0.3)).unwrap_err();
+    assert!(matches!(err, ArmDriverError::Transport(TransportError::Timeout)), "{err:?}");
+    let m = take_tx_metrics();
+    assert_eq!((m.frames, m.dropped_stale, m.pending), (1, 6, 0));
 }
 
 #[test]
