@@ -263,9 +263,11 @@ impl StateHub {
     /// Displaced observations the tick freed itself because no reader drained the retire ring.
     pub fn tick_frees(&self) -> u64 { self.tick_frees.load(Ordering::Relaxed) }
 
-    /// Frees the observations the tick retired (hub mutex held: the single consumer).
+    /// Frees the observations the tick retired and drains any deferred RT stop diagnostics
+    /// (hub mutex held on the normal-priority dispatcher / reader path, never the RT tick).
     fn refresh(&self, st: &mut HubState) -> Option<Arc<Snapshot>> {
         self.retire.free_all();
+        super::ops::stop_diag().drain_and_log_once();
         if st.consumer.refresh() {
             let slot = st.consumer.front_mut();
             // copied, not moved: the slot keeps its memory for the tick to fill again (the

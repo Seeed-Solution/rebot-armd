@@ -309,7 +309,7 @@ fn run(inner: &mut SupervisorInner, id: u64, max_s: f64, mut each: impl FnMut(&S
         let obs = inner.tick(DT);
         let a = obs.action.clone().unwrap();
         assert_eq!(a.id, id);
-        if let Some(p) = a.phase.clone() { if phases.last() != Some(&p) { phases.push(p); } }
+        if let Some(p) = a.phase.as_deref() { if phases.last().map(String::as_str) != Some(p) { phases.push(p.to_string()); } }
         each(inner, &a);
         if !a.is_running() { return Run { phases, last: a }; }
     }
@@ -558,7 +558,7 @@ async fn record_jog_save_and_replay_matches_the_recording() {
         let mut approach_end: Option<Vec<f32>> = None;
         let a = wait_done(&sup, id, ((expected + 3.0) / DT) as usize, |o| {
             let a = o.action.as_ref().unwrap();
-            let phase = a.phase.clone().unwrap_or_default();
+            let phase = a.phase.as_deref().unwrap_or_default().to_string();
             if phases.last() != Some(&phase) {
                 if phase == "replay" { approach_end = Some(o.commanded_positions.clone()); }
                 phases.push(phase.clone());

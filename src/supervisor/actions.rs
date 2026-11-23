@@ -85,6 +85,16 @@ impl SupervisorInner {
 
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
+        self.begin_action_inner(kind, tag, true)
+    }
+
+    /// RT-safe [`Self::begin_action`]: no tag and no heap-formatted superseded message, so
+    /// starting or superseding an RT action performs zero allocations and zero frees.
+    pub(crate) fn begin_action_rt(&mut self, kind: &str) -> u64 {
+        self.begin_action_inner(kind, None, false)
+    }
+
+    fn begin_action_inner(&mut self, kind: &str, tag: Option<String>, format_superseded_msg: bool) -> u64 {
         let now = self.now_s();
         // any new action ends a running macro (its orchestrator sees the record cancelled)
         self.drop_macro_run("cancelled", Some("SUPERSEDED"));
@@ -102,17 +112,16 @@ impl SupervisorInner {
             if old.is_running() {
                 old.state = "cancelled".into();
                 old.code = Some("SUPERSEDED".into());
-                old.message = Some(format!("Replaced by a new {kind} action"));
+                if format_superseded_msg {
+                    old.message = Some(format!("Replaced by a new {kind} action"));
+                }
                 old.finished_at = Some(now);
             }
             self.previous_action = Some((old, now + 2.0));
         }
         self.next_action_id += 1;
         let id = self.next_action_id;
-        // Preallocate state string with capacity 16 so RT terminal updates ("done"/"failed"/"cancelled")
-        // mutate in place without allocation or deallocation.
-        let mut state = String::with_capacity(16);
-        state.push_str("running");
+        let state = crate::model::HolderLabel::new("running");
         self.last_action = Some(ActionStatus {
             id, kind: kind.into(), tag, state, code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
@@ -174,7 +183,14 @@ impl SupervisorInner {
                     }
                 }
             }
-            tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
+            tracing::info!(
+                "Action {} ({}) {}{}{}",
+                id,
+                a.kind,
+                state,
+                if code.is_some() { " " } else { "" },
+                code.unwrap_or(""),
+            );
         }
         if let Some((offset_rad, operator_auth)) = store_offset_req {
             let candidate_jaw = self.gripper_calib_jaw_opening.clone();
@@ -209,8 +225,7 @@ impl SupervisorInner {
                         } else {
                             // Hold action as running until atomic persist-before-commit completes outside the lock.
                             if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
-                                a.state.clear();
-                                a.state.push_str("running");
+                                a.state = crate::model::HolderLabel::new("running");
                                 a.finished_at = None;
                             }
                             self.zero_check_persisting = Some(id);
@@ -286,7 +301,7 @@ impl SupervisorInner {
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state.clone(), a.code.clone())) {
+            if let Some((state, code)) = self.last_action.as_ref().filter(|a| a.id == id && !a.is_running()).map(|a| (a.state, a.code)) {
                 self.record_macro_terminal(id, &state, code.as_deref());
             }
             self.macro_run = None;
@@ -674,6 +689,34 @@ impl SupervisorInner {
         let duration = self.start_path_motion_at(epoch, &path)?;
         if power_noted { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
+        self.set_macro_sub_running(id);
+        Ok(duration + 0.5)
+    }
+
+    /// Installs a prepared Cartesian path borrowing directly from an immutable pinned
+    /// [`crate::rt_core::broker::PlanSlotRef`] as a sub-motion of macro action `id` (zero
+    /// sample/param vector copies). Returns its planned duration.
+    pub(crate) fn install_macro_prepared_path_slot(
+        &mut self,
+        id: u64,
+        dof: usize,
+        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        duration_s: f64,
+        power_scale: Option<f64>,
+    ) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
+        self.validate_prepared_joint_path(dof, &slot.path, duration_s)
+            .map_err(|_| ArmError::Motion(MotionError::InvalidCommand("invalid prepared Cartesian path".into())))?;
+        self.check_prepared_fresh(epoch)?;
+        let last = &slot.path.samples()[slot.path.len() - 1][..dof];
+        let duration = self.start_path_motion_slice(epoch, last, duration_s)?;
+        let scale = power_scale.unwrap_or(1.0);
+        if power_scale.is_some() { self.note_action_power_scale(id, scale); }
+        let arm_dof = self.config.arm_dof();
+        self.active_trajectory = Some(ActiveTrajectory::new(
+            Some(id),
+            Reference::Path(PathTrajectory::from_plan_slot(slot, dof, arm_dof, duration_s)),
+        ));
         self.set_macro_sub_running(id);
         Ok(duration + 0.5)
     }
@@ -1120,12 +1163,12 @@ impl SupervisorInner {
                 }
                 return;
             }
-            let ended: Option<(&str, &str, String)> = if superseded {
-                Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into()))
+            let ended: Option<(&str, &str)> = if superseded {
+                Some(("cancelled", "SUPERSEDED"))
             } else if run.sub == SubState::Running || run.stop_requested {
-                Some(("cancelled", "STOPPED", "Motion stopped".into()))
+                Some(("cancelled", "STOPPED"))
             } else { None };
-            if let Some((state, code, message)) = ended { self.finish_action(id, state, Some(code), Some(message), None, None, None); }
+            if let Some((state, code)) = ended { self.finish_action(id, state, Some(code), None, None, None, None); }
             return;
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
@@ -1137,7 +1180,7 @@ impl SupervisorInner {
             } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
                 self.finish_action(id, "done", None, None, None, None, None);
             } else if superseded {
-                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
             } else {
                 self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
             }
@@ -1146,7 +1189,7 @@ impl SupervisorInner {
         if carried || self.zero_check_persisting == Some(id) { return; }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
             if superseded {
-                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
                 return;
             }
             if !tick_output_accepted { return; }
@@ -1158,9 +1201,9 @@ impl SupervisorInner {
             return;
         }
         if superseded {
-            self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+            self.finish_action(id, "cancelled", Some("SUPERSEDED"), None, None, None, None);
         } else {
-            self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+            self.finish_action(id, "cancelled", Some("STOPPED"), None, None, None, None);
         }
     }
 
@@ -1196,7 +1239,7 @@ impl SupervisorInner {
                     }
                     self.active_trajectory = None;
                     self.commanded_velocities.fill(0.0);
-                    self.target_positions = self.commanded_positions.clone();
+                    crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
                     if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                     if macro_sub {
                         if let Some(m) = self.macro_run.as_mut() {

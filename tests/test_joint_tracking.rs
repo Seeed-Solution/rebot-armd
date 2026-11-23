@@ -1098,7 +1098,7 @@ fn tracking_safety_references() {
         for _ in 0..100 {
             let obs = inner.tick(DT);
             if let Some(a) = obs.action.as_ref().filter(|a| a.id == id && !a.is_running()) {
-                stall_code = a.code.clone();
+                stall_code = a.code;
                 break;
             }
         }

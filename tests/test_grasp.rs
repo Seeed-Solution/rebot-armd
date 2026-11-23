@@ -1075,7 +1075,7 @@ async fn camera_down_grasp_with_the_v8_mount() {
         let sup = rig.sup.clone();
         let cam = rig.sim.cam.clone();
         let status = wait_done(&rig.sup, id, 60.0, |a| {
-            let p = a.phase.clone().unwrap_or_default();
+            let p = a.phase.as_deref().unwrap_or_default().to_string();
             if phases.last() != Some(&p) {
                 // optical axis at the end of the centring (first look at the transition phase)
                 if p == "transition" {
@@ -1168,7 +1168,7 @@ async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
     let a = wait_done(&rig.sup, id, 60.0, |a| {
         if let Ok(inner) = sup.inner().try_read() {
             let z = envelope_min_z(&config, &inner.commanded_positions);
-            if z < lowest { lowest = z; at = a.phase.clone().unwrap_or_default(); }
+            if z < lowest { lowest = z; at = a.phase.as_deref().unwrap_or_default().to_string(); }
         }
     }).await;
     println!("raised table: {} {:?} acquire_height_m {:?}, lowest envelope point {:.4} m (table {:.3}) in phase {at}",
@@ -1213,7 +1213,7 @@ async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
         }
         let mut phases = Vec::new();
         let a = wait_done(&rig.sup, id, 20.0, |a| {
-            let p = a.phase.clone().unwrap_or_default();
+            let p = a.phase.unwrap_or_default();
             if phases.last() != Some(&p) { phases.push(p); }
         }).await;
         let z = start_pose(&rig).await.p[2];
@@ -1757,7 +1757,7 @@ async fn recentre_at_mid_height_and_skip_when_lost() {
         }
         let mut phases: Vec<String> = Vec::new();
         let a = wait_done(&rig.sup, id, 60.0, |a| {
-            let p = a.phase.clone().unwrap_or_default();
+            let p = a.phase.as_deref().unwrap_or_default().to_string();
             if phases.last() != Some(&p) { phases.push(p); }
         }).await;
         let final_pose = start_pose(&rig).await;
@@ -3022,7 +3022,7 @@ async fn task_requirement_on_a_legacy_provider_and_provider_down() {
         let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", b).await;
         assert_eq!(ack["type"], "command_ack", "{ack}");
         let a = wait_done(&w.rig.sup, ack["action_id"].as_u64().unwrap(), 5.0, |_| {}).await;
-        results.push((a.state.clone(), a.code.clone(), a.message.clone()));
+        results.push((a.state, a.code, a.message.clone()));
     }
     assert_eq!(results[0], results[1]);
     assert_eq!((results[0].0.as_str(), results[0].1.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{results:?}");

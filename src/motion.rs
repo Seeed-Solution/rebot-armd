@@ -1172,9 +1172,74 @@ impl Settle {
     }
 }
 
+/// Backing storage of a [`PathTrajectory`]: owned [`JointPath`] (legacy) or a pinned
+/// immutable plan slot borrowed until terminal retirement (RT prepared commit, zero copies).
+#[derive(Debug, Clone)]
+enum PathSource {
+    Owned(JointPath),
+    #[cfg(not(target_arch = "wasm32"))]
+    Slot {
+        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        dof: usize,
+        arm_dof: usize,
+        duration: f64,
+    },
+}
+
+impl PathSource {
+    fn duration(&self) -> f64 {
+        match self {
+            Self::Owned(p) => p.duration,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Slot { duration, .. } => *duration,
+        }
+    }
+
+    fn arm_dof(&self) -> usize {
+        match self {
+            Self::Owned(p) => p.arm_dof,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Slot { arm_dof, .. } => *arm_dof,
+        }
+    }
+
+    fn params(&self) -> &[f64] {
+        match self {
+            Self::Owned(p) => &p.s,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Slot { slot, .. } => slot.path.params(),
+        }
+    }
+
+    fn sample7(&self, k: usize) -> [f32; 7] {
+        match self {
+            Self::Owned(p) => p.q[k],
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Slot { slot, dof, .. } => {
+                let src = &slot.path.samples()[k];
+                let n = (*dof).min(7);
+                let mut a = [0.0f32; 7];
+                a[..n].copy_from_slice(&src[..n]);
+                a
+            }
+        }
+    }
+
+    fn last_slice(&self, dof: usize) -> &[f32] {
+        match self {
+            Self::Owned(p) => &p.q.last().expect("path has samples")[..dof],
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Slot { slot, dof: sdof, .. } => {
+                let n = dof.min(*sdof);
+                &slot.path.samples().last().expect("path has samples")[..n]
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PathTrajectory {
-    pub path: JointPath,
+    source: PathSource,
     /// Path time, advanced at `dt · rate`.
     pub elapsed: f64,
     pub stalled_for: f64,
@@ -1183,17 +1248,45 @@ pub struct PathTrajectory {
 }
 
 impl PathTrajectory {
-    pub fn new(path: JointPath) -> Self { Self { path, elapsed: 0.0, stalled_for: 0.0, settle: None, index: 0 } }
+    pub fn new(path: JointPath) -> Self { Self { source: PathSource::Owned(path), elapsed: 0.0, stalled_for: 0.0, settle: None, index: 0 } }
 
-    pub fn duration(&self) -> f64 { self.path.duration }
+    /// Borrows a prepared Cartesian path directly from an immutable pinned plan slot
+    /// without copying sample or parameter vectors.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_plan_slot(
+        slot: crate::rt_core::broker::PlanSlotRef<crate::rt_core::ops::PlanSlot>,
+        dof: usize,
+        arm_dof: usize,
+        duration: f64,
+    ) -> Self {
+        Self {
+            source: PathSource::Slot { slot, dof, arm_dof, duration },
+            elapsed: 0.0,
+            stalled_for: 0.0,
+            settle: None,
+            index: 0,
+        }
+    }
+
+    /// True when samples and path parameters are borrowed directly from a pinned plan slot.
+    pub fn borrows_plan_slot(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        { matches!(self.source, PathSource::Slot { .. }) }
+        #[cfg(target_arch = "wasm32")]
+        { false }
+    }
+
+    pub fn duration(&self) -> f64 { self.source.duration() }
 
     fn position_at(&mut self, s: f64) -> [f32; 7] {
-        let ss = &self.path.s;
+        let ss = self.source.params();
         while self.index + 1 < ss.len() - 1 && ss[self.index + 1] <= s { self.index += 1; }
         let (a, b) = (self.index, (self.index + 1).min(ss.len() - 1));
-        if a == b { return self.path.q[a]; }
+        if a == b { return self.source.sample7(a); }
+        let qa = self.source.sample7(a);
+        let qb = self.source.sample7(b);
         let f = ((s - ss[a]) / (ss[b] - ss[a])).clamp(0.0, 1.0) as f32;
-        std::array::from_fn(|i| self.path.q[a][i] + (self.path.q[b][i] - self.path.q[a][i]) * f)
+        std::array::from_fn(|i| qa[i] + (qb[i] - qa[i]) * f)
     }
 
     step_into_via_with!();
@@ -1206,11 +1299,12 @@ impl PathTrajectory {
                 Some(settled) => StepStatus::Done { settled: Some(settled), holding: None, gripper_gap_rad: None },
                 None => StepStatus::Running,
             };
-            refill(&mut positions, &self.path.last()[..dof]);
+            refill(&mut positions, self.source.last_slice(dof));
             zeros(&mut velocities, dof);
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: false };
         }
-        let arm_joints = self.path.arm_dof.min(dof);
+        let duration = self.source.duration();
+        let arm_joints = self.source.arm_dof().min(dof);
         let lag = (0..arm_joints).map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
         let lag = if lag.is_finite() { lag } else { f64::INFINITY };
         let rate = ((LAG_STOP - lag) / (LAG_STOP - LAG_FULL)).clamp(0.0, 1.0);
@@ -1223,19 +1317,19 @@ impl PathTrajectory {
                     positions, velocities,
                     status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
                         "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
-                    progress: (self.elapsed / self.path.duration) as f32, clear_gripper_stall: false,
+                    progress: (self.elapsed / duration) as f32, clear_gripper_stall: false,
                 };
             }
         } else {
             self.stalled_for = 0.0;
         }
-        self.elapsed = (self.elapsed + ctx.dt * rate * ctx.time_scale).min(self.path.duration);
-        let u = self.elapsed / self.path.duration;
+        self.elapsed = (self.elapsed + ctx.dt * rate * ctx.time_scale).min(duration);
+        let u = self.elapsed / duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
         let q = self.position_at(s);
-        if self.elapsed >= self.path.duration {
+        if self.elapsed >= duration {
             self.settle = Some(Settle::default());
-            refill(&mut positions, &self.path.last()[..dof]);
+            refill(&mut positions, self.source.last_slice(dof));
             zeros(&mut velocities, dof);
             return StepOut { positions, velocities, status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
         }
@@ -1802,7 +1896,9 @@ impl GripperMotion {
 }
 
 /// What the supervisor steps each tick while a trajectory is active.
+/// `Quintic` and `Replay` stay inline so RT commits and stops neither box nor free.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Reference {
     Quintic(MultiJointQuinticTrajectory),
     Path(PathTrajectory),
@@ -1810,7 +1906,7 @@ pub enum Reference {
     Gripper(Box<GripperMotion>),
     /// Episode replay (`crate::replay`).
     #[cfg(not(target_arch = "wasm32"))]
-    Replay(Box<crate::replay::ReplayMotion>),
+    Replay(crate::replay::ReplayMotion),
 }
 
 #[derive(Debug, Clone)]
@@ -1887,11 +1983,11 @@ impl ActiveTrajectory {
 pub struct ActionStatus {
     pub id: u64,
     /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose | replay | sequence
-    pub kind: String,
+    pub kind: crate::model::HolderLabel,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
-    pub state: String,
-    pub code: Option<String>,
+    pub state: crate::model::HolderLabel,
+    pub code: Option<crate::model::HolderLabel>,
     pub message: Option<String>,
     pub progress: f32,
     pub started_at: f64,
@@ -1904,7 +2000,7 @@ pub struct ActionStatus {
     pub task: Option<String>,
     /// Grasp only: open | approach | centring | transition | align | descend | close | release | lift | done.
     #[serde(default)]
-    pub phase: Option<String>,
+    pub phase: Option<crate::model::HolderLabel>,
     /// Grasp centring: corrections made so far and the latest pixel error.
     #[serde(default)]
     pub iteration: Option<u32>,
@@ -1924,7 +2020,7 @@ pub struct ActionStatus {
     pub power_scale: Option<f32>,
     /// Replay only: episode id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub episode: Option<String>,
+    pub episode: Option<crate::model::HolderLabel>,
     /// Replay only: recording time reached (s); 0 during the approach (`phase` approach |
     /// replay | settle).
     #[serde(default, skip_serializing_if = "Option::is_none")]

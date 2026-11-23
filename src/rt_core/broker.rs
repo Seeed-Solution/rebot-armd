@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -53,9 +53,46 @@ pub const PLAN_SLOTS: usize = 8;
 /// slot (each action holds one slot until its terminal result).
 pub const REPLY_CAPACITY: usize = COMMAND_CAPACITY + PLAN_SLOTS;
 
-/// Identity of one armd process run (changes on every start).
+/// Identity of one armd process run or executor instance (non-zero; changes on every start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BootId(pub u64);
+
+static BOOT_BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static NEXT_BOOT: AtomicU64 = AtomicU64::new(1);
+static PROCESS_BOOT: std::sync::OnceLock<BootId> = std::sync::OnceLock::new();
+
+impl BootId {
+    fn base() -> u64 {
+        *BOOT_BASE.get_or_init(|| {
+            let time_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1u64, |d| d.as_nanos() as u64);
+            let pid = u64::from(std::process::id());
+            time_ns.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ pid.rotate_left(32)
+        })
+    }
+
+    /// Generates a fresh, non-zero boot identity (unique across process restarts and
+    /// strictly distinct across executors within the same process).
+    pub fn fresh() -> Self {
+        let base = Self::base();
+        loop {
+            let seq = NEXT_BOOT.fetch_add(1, Ordering::Relaxed);
+            let id = base.wrapping_add(seq);
+            if id != 0 { return Self(id); }
+        }
+    }
+
+    /// Process-wide non-zero boot identity for the current `armd` run (replaces the
+    /// `BootId(0)` placeholder at legacy boundaries until step 1 owns boot ids on `ArmCore`).
+    pub fn process() -> Self {
+        *PROCESS_BOOT.get_or_init(Self::fresh)
+    }
+
+    /// True for the uninitialized zero placeholder (`BootId(0)`), which commit checks refuse.
+    #[inline]
+    pub fn is_zero(self) -> bool { self.0 == 0 }
+}
 
 /// Broker-assigned id of one admitted request, unique within a boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -121,8 +158,9 @@ pub struct Stamp {
 
 impl Stamp {
     /// The rejection code at commit (`now`, RT identity and current authority), None to commit.
+    /// Refuses `BootId(0)` even when both stamp and target pass zero (fail-closed).
     pub fn check(&self, arm: ArmId, boot: BootId, now: Instant, current: &Authority) -> Option<&'static str> {
-        if self.arm != arm || self.boot != boot { return Some("WRONG_TARGET"); }
+        if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
         if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
         self.authority.admits(current)
     }
@@ -243,17 +281,73 @@ static NEXT_POOL: AtomicU64 = AtomicU64::new(1);
 pub struct PlanSlots<P> {
     pool: u64,
     words: Box<[AtomicU64]>,
+    /// Active immutable borrows ([`PlanSlotRef`]) per slot: [`PlanWriter::reclaim`] never
+    /// moves a `RETIRED` slot back to `FREE` while its pin count is non-zero.
+    pins: Box<[AtomicU32]>,
     plans: Box<[UnsafeCell<P>]>,
 }
 
 // SAFETY: a slot's plan is written only by the single `PlanWriter` while its state is
-// WRITING (no handle to it exists yet), and read only through `PlanReader::get` while the
-// state is READY with the handle's generation (Acquire load after the writer's Release
-// store); the writer does not touch a READY slot until the reader moved it to RETIRED
-// (Release) and the writer saw that (Acquire). `P: Send` moves between the two threads.
-// Only one thread reads: `PlanReader` is neither `Clone` nor `Sync`, so `&P` never reaches
-// two threads at once through it (which `P: Send` alone would not make sound).
+// WRITING (no handle to it exists yet, and reached only after `RETIRED` with `pins[i] == 0`
+// observed via Acquire), and read only through `PlanReader::get` while the state is READY
+// with the handle's generation (Acquire load after the writer's Release store) or through
+// `PlanSlotRef` while `pins[i] > 0` (acquired via `PlanReader::pin`, which requires `P: Sync`,
+// while READY and released on drop). The writer does not touch a READY or pinned RETIRED slot
+// until the reader moved it to RETIRED (Release), all borrows dropped (Release), and the
+// writer observed both (Acquire). `PlanReader` is neither `Clone` nor `Sync` (so `get` only
+// ever hands out `&P` on one thread at a time for non-`Sync` `P`), and pinning requires
+// `P: Sync` so moving `PlanReader` to another thread while a `PlanSlotRef` lives cannot give
+// two threads concurrent `&P` to a `!Sync` type.
 unsafe impl<P: Send> Sync for PlanSlots<P> {}
+
+/// An immutable, pinned borrow of a published plan slot that can outlive a single release
+/// until the active motion retires it (zero allocations, zero frees while the pool lives).
+///
+/// [`PlanWriter::reclaim`] will not overwrite or reuse the slot while any [`PlanSlotRef`]
+/// to it exists, even if [`PlanReader::retire`] has already been called.
+pub struct PlanSlotRef<P> {
+    slots: Arc<PlanSlots<P>>,
+    handle: PlanHandle,
+}
+
+// SAFETY: `PlanSlotRef` only hands out `&P` to an immutable slot held pinned (`pins[index] > 0`),
+// and is `Clone`; like `Arc<P>`, sending or sharing it across threads requires `P: Send + Sync`.
+unsafe impl<P: Send + Sync> Send for PlanSlotRef<P> {}
+unsafe impl<P: Send + Sync> Sync for PlanSlotRef<P> {}
+
+impl<P> PlanSlotRef<P> {
+    pub fn handle(&self) -> PlanHandle { self.handle }
+}
+
+impl<P> std::ops::Deref for PlanSlotRef<P> {
+    type Target = P;
+    fn deref(&self) -> &P {
+        // SAFETY: `self` holds a live pin on `self.handle.index()`, acquired while the slot
+        // was READY at `self.handle.generation()`; `PlanWriter` cannot reclaim or rewrite it
+        // until all pins drop with Release ordering.
+        unsafe { &*self.slots.plans[self.handle.index()].get() }
+    }
+}
+
+impl<P> Clone for PlanSlotRef<P> {
+    fn clone(&self) -> Self {
+        let prev = self.slots.pins[self.handle.index()].fetch_add(1, Ordering::Relaxed);
+        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
+        Self { slots: self.slots.clone(), handle: self.handle }
+    }
+}
+
+impl<P> Drop for PlanSlotRef<P> {
+    fn drop(&mut self) {
+        self.slots.pins[self.handle.index()].fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl<P: std::fmt::Debug> std::fmt::Debug for PlanSlotRef<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanSlotRef").field("handle", &self.handle).field("plan", &**self).finish()
+    }
+}
 
 /// The broker's side of the plan slots.
 pub struct PlanWriter<P> {
@@ -285,24 +379,40 @@ pub struct PlanReader<P> {
     _not_sync: PhantomData<Cell<()>>,
 }
 
-/// `capacity` pre-touched plan slots, each built (allocated and written) by `make` now.
+/// `capacity` pre-touched plan slots, each built (allocated and write-touched) by `make` now.
 pub fn plan_slots<P: Send>(capacity: usize, mut make: impl FnMut() -> P) -> (PlanWriter<P>, PlanReader<P>) {
     assert!(capacity > 0 && capacity <= usize::from(u8::MAX));
+    let mut words = Vec::with_capacity(capacity);
+    let mut pins = Vec::with_capacity(capacity);
+    let mut plans = Vec::with_capacity(capacity);
+    for _ in 0..capacity {
+        let w = AtomicU64::new(pack(0, FREE));
+        w.store(pack(0, FREE), Ordering::Relaxed);
+        words.push(w);
+        let p = AtomicU32::new(0);
+        p.store(0, Ordering::Relaxed);
+        pins.push(p);
+        plans.push(UnsafeCell::new(std::hint::black_box(make())));
+    }
     let slots = Arc::new(PlanSlots {
         pool: NEXT_POOL.fetch_add(1, Ordering::Relaxed),
-        words: (0..capacity).map(|_| AtomicU64::new(pack(0, FREE))).collect(),
-        plans: (0..capacity).map(|_| UnsafeCell::new(make())).collect(),
+        words: words.into_boxed_slice(),
+        pins: pins.into_boxed_slice(),
+        plans: plans.into_boxed_slice(),
     });
     (PlanWriter { slots: slots.clone(), retired: 0 }, PlanReader { slots, _not_sync: PhantomData })
 }
 
 impl<P> PlanWriter<P> {
-    /// Moves retired slots back to free; returns how many.
+    /// Total plan slots in this pool.
+    pub fn capacity(&self) -> usize { self.slots.words.len() }
+
+    /// Moves retired slots with no active [`PlanSlotRef`] borrows back to free; returns how many.
     pub fn reclaim(&mut self) -> usize {
         let mut n = 0;
-        for w in self.slots.words.iter() {
+        for (w, pin) in self.slots.words.iter().zip(self.slots.pins.iter()) {
             let (g, s) = unpack(w.load(Ordering::Acquire));
-            if s == RETIRED {
+            if s == RETIRED && pin.load(Ordering::Acquire) == 0 {
                 w.store(pack(g, FREE), Ordering::Relaxed);
                 n += 1;
             }
@@ -339,8 +449,11 @@ impl<P> PlanWriter<P> {
     /// Takes back a published slot whose descriptor was never queued (admission failed).
     fn unpublish(&mut self, h: PlanHandle) {
         if h.pool != self.slots.pool { return; }
-        let w = &self.slots.words[h.index()];
-        if w.load(Ordering::Acquire) == pack(h.generation, READY) { w.store(pack(h.generation, FREE), Ordering::Relaxed); }
+        let idx = h.index();
+        let w = &self.slots.words[idx];
+        if w.load(Ordering::Acquire) == pack(h.generation, READY) && self.slots.pins[idx].load(Ordering::Acquire) == 0 {
+            w.store(pack(h.generation, FREE), Ordering::Relaxed);
+        }
     }
 
     /// Sets slot `index` to `generation`, free (tests: generation exhaustion).
@@ -349,6 +462,9 @@ impl<P> PlanWriter<P> {
 }
 
 impl<P> PlanReader<P> {
+    /// Total plan slots in this pool.
+    pub fn capacity(&self) -> usize { self.slots.words.len() }
+
     /// The plan of `h`, None when the slot was retired or reused since (stale handle).
     pub fn get(&self, h: PlanHandle) -> Option<&P> {
         if h.pool != self.slots.pool { return None; }
@@ -373,6 +489,42 @@ impl<P> PlanReader<P> {
         if h.pool != self.slots.pool { return false; }
         let Some(w) = self.slots.words.get(h.index()) else { return false; };
         w.compare_exchange(pack(h.generation, READY), pack(h.generation, RETIRED), Ordering::Release, Ordering::Relaxed).is_ok()
+    }
+}
+
+impl<P: Sync> PlanReader<P> {
+    /// Pins a live slot for immutable borrowing past this release (zero allocations).
+    /// None when `h` belongs to another pool or was retired / reused.
+    ///
+    /// Requires `P: Sync`: `PlanReader` is `Send`, so safe code can pin a slot on one thread
+    /// and move `PlanReader` to another thread to call [`Self::get`]; requiring `P: Sync`
+    /// prevents two threads from holding `&P` to a non-`Sync` plan simultaneously.
+    ///
+    /// ```compile_fail
+    /// use std::cell::Cell;
+    /// let (mut w, r) = armd::rt_core::broker::plan_slots(1, || Cell::new(0u32));
+    /// let h = w.stage(|p| p.set(7)).unwrap();
+    /// let _pinned = r.pin(h);
+    /// ```
+    ///
+    /// ```
+    /// let (mut w, r) = armd::rt_core::broker::plan_slots(1, || 0u32);
+    /// let h = w.stage(|p| *p = 7).unwrap();
+    /// let pinned = r.pin(h).unwrap();
+    /// assert_eq!(*pinned, 7);
+    /// ```
+    pub fn pin(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> {
+        if h.pool != self.slots.pool { return None; }
+        let idx = h.index();
+        let w = self.slots.words.get(idx)?;
+        if w.load(Ordering::Acquire) != pack(h.generation, READY) { return None; }
+        let prev = self.slots.pins[idx].fetch_add(1, Ordering::Acquire);
+        assert!(prev < i32::MAX as u32, "plan slot pin count overflow");
+        if w.load(Ordering::Acquire) != pack(h.generation, READY) {
+            self.slots.pins[idx].fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        Some(PlanSlotRef { slots: self.slots.clone(), handle: h })
     }
 }
 
@@ -528,6 +680,9 @@ pub fn channel<P: Send>(arm: ArmId, boot: BootId, caps: Capacities, make: impl F
 }
 
 impl<P> Broker<P> {
+    pub fn arm(&self) -> ArmId { self.arm }
+    pub fn boot(&self) -> BootId { self.boot }
+    pub fn plan_capacity(&self) -> usize { self.plans.capacity() }
     pub fn stats(&self) -> BrokerStats { BrokerStats { retired: self.plans.retired_total(), ..self.stats } }
 
     /// Reply slots currently reserved.
@@ -691,6 +846,11 @@ impl<P> RtIntake<P> {
     pub fn broker_gone(&self) -> bool { self.commands.is_abandoned() }
 }
 
+impl<P: Sync> RtIntake<P> {
+    /// Pins a live plan slot for immutable borrowing until terminal retirement.
+    pub fn plan_ref(&self, h: PlanHandle) -> Option<PlanSlotRef<P>> { self.plans.pin(h) }
+}
+
 impl<P> Taken<'_, P> {
     pub fn descriptor(&self) -> &Descriptor { &self.d }
 
@@ -758,6 +918,13 @@ impl<P> Taken<'_, P> {
     }
 }
 
+impl<P: Sync> Taken<'_, P> {
+    /// Pins this install's plan slot for immutable borrowing until terminal retirement.
+    pub fn plan_ref(&self) -> Option<PlanSlotRef<P>> {
+        self.d.kind.plan().and_then(|plan| self.intake.plans.pin(plan))
+    }
+}
+
 impl<P> Drop for Taken<'_, P> {
     fn drop(&mut self) {
         if !self.answered { self.refuse_now("INTERNAL"); }
@@ -804,6 +971,11 @@ mod tests {
         assert_eq!(child.admits(&a), Some("PARENT_REPLACED"), "the parent ended");
         let s = Stamp { arm: ArmId::LOCAL, boot: BootId(1), request: RequestId(1), client: ClientId(1), client_seq: 1, authority: a, deadline: Instant::now() };
         assert_eq!(s.check(ArmId::LOCAL, BootId(2), Instant::now(), &a), Some("WRONG_TARGET"));
+        assert_eq!(s.check(ArmId::LOCAL, BootId(0), Instant::now(), &a), Some("WRONG_TARGET"));
+        let zero = Stamp { boot: BootId(0), ..s };
+        assert_eq!(zero.check(ArmId::LOCAL, BootId(0), Instant::now(), &a), Some("WRONG_TARGET"), "zero boot id refused fail-closed");
+        assert!(!BootId::process().is_zero());
+        assert_ne!(BootId::fresh(), BootId::fresh());
         assert_eq!(s.check(ArmId::LOCAL, BootId(1), s.deadline + Duration::from_millis(1), &a), Some("DEADLINE_EXPIRED"));
         assert_eq!(s.check(ArmId::LOCAL, BootId(1), s.deadline, &a), None);
     }
@@ -1042,5 +1214,50 @@ mod tests {
         assert_eq!(reader.join().unwrap(), 20_000);
         w.reclaim();
         assert_eq!(w.retired_total(), 20_000);
+    }
+
+    #[test]
+    fn pinned_slot_cannot_be_reclaimed_until_borrow_drops() {
+        let (mut w, mut r) = plan_slots(1, || [0.0f32; 4]);
+        let h1 = w.stage(|p| *p = [42.0; 4]).unwrap();
+        let pinned = r.pin(h1).expect("live slot pins");
+        let cloned = pinned.clone();
+        assert_eq!(*pinned, [42.0; 4]);
+        assert_eq!(pinned.handle(), h1);
+        // retiring prevents new pins / gets, but the writer cannot reclaim while borrows exist
+        assert!(r.retire(h1));
+        assert!(r.get(h1).is_none());
+        assert!(r.pin(h1).is_none());
+        assert_eq!(w.reclaim(), 0, "pinned slot must not be reclaimed");
+        assert!(w.stage(|p| *p = [99.0; 4]).is_none(), "slot still held by active borrow");
+        assert_eq!(*cloned, [42.0; 4]);
+        drop(pinned);
+        assert_eq!(w.reclaim(), 0, "second borrow still holds pin");
+        drop(cloned);
+        assert_eq!(w.reclaim(), 1, "reclaimed once all borrows dropped");
+        let h2 = w.stage(|p| *p = [99.0; 4]).unwrap();
+        assert_eq!(r.get(h2), Some(&[99.0; 4]));
+        assert!(r.retire(h2));
+    }
+
+    #[test]
+    fn eight_plan_slots_exhaust_and_recover_on_retire() {
+        let (mut w, mut r) = plan_slots(PLAN_SLOTS, || 0u64);
+        assert_eq!((w.capacity(), r.capacity()), (8, 8));
+        let mut handles = Vec::new();
+        for k in 0..PLAN_SLOTS {
+            handles.push(w.stage(|p| *p = k as u64).expect("slot available"));
+        }
+        assert_eq!(w.free(), 0);
+        assert!(w.stage(|_| {}).is_none(), "all 8 slots exhausted");
+        assert!(r.retire(handles[3]));
+        assert_eq!(w.reclaim(), 1);
+        let h = w.stage(|p| *p = 999).expect("reclaimed slot reusable");
+        assert_eq!(r.get(h), Some(&999));
+        for h in handles.into_iter().enumerate().filter(|(i, _)| *i != 3).map(|(_, h)| h) {
+            assert!(r.retire(h));
+        }
+        assert!(r.retire(h));
+        assert_eq!(w.reclaim(), PLAN_SLOTS);
     }
 }

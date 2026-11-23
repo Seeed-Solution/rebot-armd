@@ -498,7 +498,7 @@ async fn test_5dof_place_execution_lateral_target() {
         if let Some(act) = obs.action.as_ref().or(obs.previous_action.as_ref()).filter(|a| a.id == id) {
             if let Some(ref p) = act.phase {
                 if seen_phases.last() != Some(p) {
-                    seen_phases.push(p.clone());
+                    seen_phases.push(*p);
                 }
             }
             if !act.is_running() {
@@ -510,8 +510,8 @@ async fn test_5dof_place_execution_lateral_target() {
 
     ticker_task.abort();
     assert_eq!(a.state, "done", "Place should succeed without IK_UNREACHABLE error, got status: {:?}", a);
-    assert!(seen_phases.contains(&"approach".to_string()), "approach phase seen");
-    assert!(seen_phases.contains(&"descend".to_string()), "descend phase seen");
+    assert!(seen_phases.iter().any(|p| p == "approach"), "approach phase seen");
+    assert!(seen_phases.iter().any(|p| p == "descend"), "descend phase seen");
 }
 
 #[test]

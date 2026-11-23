@@ -166,10 +166,62 @@ pub struct TrajectoryPoint {
     pub accelerations: Vec<f32>,
 }
 
+/// Maximum joint count stored inline in [`JointPolynomials`] without heap allocation.
+pub const INLINE_POLYS: usize = 8;
+
+/// Fixed-storage polynomial array for up to [`INLINE_POLYS`] joints (zero allocations and
+/// zero frees on RT jog and replay approach commits), falling back to `Vec` above that.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum JointPolynomials {
+    Inline {
+        data: [QuinticPolynomial; INLINE_POLYS],
+        len: usize,
+    },
+    Heap(Vec<QuinticPolynomial>),
+}
+
+impl JointPolynomials {
+    pub fn as_slice(&self) -> &[QuinticPolynomial] {
+        match self {
+            Self::Inline { data, len } => &data[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [QuinticPolynomial] {
+        match self {
+            Self::Inline { data, len } => &mut data[..*len],
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+}
+
+impl std::ops::Deref for JointPolynomials {
+    type Target = [QuinticPolynomial];
+    fn deref(&self) -> &[QuinticPolynomial] { self.as_slice() }
+}
+
+impl std::ops::DerefMut for JointPolynomials {
+    fn deref_mut(&mut self) -> &mut [QuinticPolynomial] { self.as_mut_slice() }
+}
+
+impl<'a> IntoIterator for &'a JointPolynomials {
+    type Item = &'a QuinticPolynomial;
+    type IntoIter = std::slice::Iter<'a, QuinticPolynomial>;
+    fn into_iter(self) -> Self::IntoIter { self.as_slice().iter() }
+}
+
+impl<'a> IntoIterator for &'a mut JointPolynomials {
+    type Item = &'a mut QuinticPolynomial;
+    type IntoIter = std::slice::IterMut<'a, QuinticPolynomial>;
+    fn into_iter(self) -> Self::IntoIter { self.as_mut_slice().iter_mut() }
+}
+
 /// Multi-joint quintic polynomial trajectory
 #[derive(Debug, Clone)]
 pub struct MultiJointQuinticTrajectory {
-    pub polynomials: Vec<QuinticPolynomial>,
+    pub polynomials: JointPolynomials,
     pub duration: f64,
     pub elapsed: f64,
 }
@@ -201,20 +253,41 @@ impl MultiJointQuinticTrajectory {
             return Err(TrajectoryError::InvalidDuration(duration));
         }
 
-        let mut polynomials = Vec::with_capacity(dof);
-        for i in 0..dof {
-            // zero start and end acceleration to guarantee jerk-bounded smooth motion
-            let poly = QuinticPolynomial::new(
-                start_pos[i] as f64,
-                start_vel[i] as f64,
-                0.0,
-                target_pos[i] as f64,
-                target_vel[i] as f64,
-                0.0,
-                duration,
-            )?;
-            polynomials.push(poly);
-        }
+        let polynomials = if dof <= INLINE_POLYS {
+            let zero = QuinticPolynomial {
+                a0: 0.0, a1: 0.0, a2: 0.0, a3: 0.0, a4: 0.0, a5: 0.0,
+                duration, p0: 0.0, p1: 0.0, v0: 0.0, v1: 0.0, a_start: 0.0, a_end: 0.0,
+            };
+            let mut data = [zero; INLINE_POLYS];
+            for i in 0..dof {
+                data[i] = QuinticPolynomial::new(
+                    start_pos[i] as f64,
+                    start_vel[i] as f64,
+                    0.0,
+                    target_pos[i] as f64,
+                    target_vel[i] as f64,
+                    0.0,
+                    duration,
+                )?;
+            }
+            JointPolynomials::Inline { data, len: dof }
+        } else {
+            let mut polynomials = Vec::with_capacity(dof);
+            for i in 0..dof {
+                // zero start and end acceleration to guarantee jerk-bounded smooth motion
+                let poly = QuinticPolynomial::new(
+                    start_pos[i] as f64,
+                    start_vel[i] as f64,
+                    0.0,
+                    target_pos[i] as f64,
+                    target_vel[i] as f64,
+                    0.0,
+                    duration,
+                )?;
+                polynomials.push(poly);
+            }
+            JointPolynomials::Heap(polynomials)
+        };
 
         Ok(Self {
             polynomials,
@@ -277,6 +350,22 @@ impl MultiJointQuinticTrajectory {
             positions,
             velocities,
             accelerations,
+        }
+    }
+
+    /// Sample positions at time `t` into `out` without allocating (`out.len() >= dof`).
+    pub fn sample_positions_into(&self, t: f64, out: &mut [f32]) {
+        for (dst, poly) in out.iter_mut().zip(self.polynomials.iter()) {
+            *dst = poly.position(t) as f32;
+        }
+    }
+
+    /// Upper bound on how far each joint travels during `[t0, t1]` (rad) into `out` without allocating.
+    pub fn travel_bound_into(&self, t0: f64, t1: f64, out: &mut [f64]) {
+        let (a, b) = (t0.clamp(0.0, self.duration), t1.clamp(0.0, self.duration));
+        let dt = (b - a).abs();
+        for (dst, poly) in out.iter_mut().zip(self.polynomials.iter()) {
+            *dst = poly.speed_bound(a, b) * dt;
         }
     }
 
@@ -372,25 +461,27 @@ impl TrajectoryPlanner {
             let mut exceeds_limits = false;
             for sample_idx in 0..=NUM_SAMPLES {
                 let t = duration * (sample_idx as f64) / (NUM_SAMPLES as f64);
-                let point = traj.sample(t);
 
-                for i in 0..dof {
+                for (i, poly) in traj.polynomials.iter().enumerate() {
                     if i < limits.len() {
                         let v_max = limits[i].max_velocity * 1.001;
                         let a_max = limits[i].max_acceleration * 1.001;
+                        let pos = poly.position(t) as f32;
+                        let vel = poly.velocity(t) as f32;
+                        let acc = poly.acceleration(t) as f32;
 
                         // Check position soft limits
-                        if point.positions[i] < limits[i].min_position - 1e-4
-                            || point.positions[i] > limits[i].max_position + 1e-4
+                        if pos < limits[i].min_position - 1e-4
+                            || pos > limits[i].max_position + 1e-4
                         {
                             exceeds_limits = true;
                             break;
                         }
-                        if limits[i].max_velocity > 1e-6 && point.velocities[i].abs() > v_max {
+                        if limits[i].max_velocity > 1e-6 && vel.abs() > v_max {
                             exceeds_limits = true;
                             break;
                         }
-                        if limits[i].max_acceleration > 1e-6 && point.accelerations[i].abs() > a_max {
+                        if limits[i].max_acceleration > 1e-6 && acc.abs() > a_max {
                             exceeds_limits = true;
                             break;
                         }

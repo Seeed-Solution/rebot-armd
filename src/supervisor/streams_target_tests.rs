@@ -305,7 +305,7 @@ mod policy {
         r.port.submit_policy(&PolicyTarget { action_id, stamp, targets: &q, input_at, vision_at, vision_frame_id: vision_ago.map(|_| 41) })
     }
 
-    fn run_code(r: &Rig) -> Option<String> { r.fx.core.last_action.as_ref().and_then(|a| a.code.clone()) }
+    fn run_code(r: &Rig) -> Option<String> { r.fx.core.last_action.as_ref().and_then(|a| a.code.as_deref().map(str::to_owned)) }
 
     #[test]
     fn a_live_target_is_applied_and_policy_frames_do_not_coalesce() {

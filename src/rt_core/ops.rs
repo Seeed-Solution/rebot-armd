@@ -19,12 +19,12 @@
 //! a stub or test double ([`StubCore`]) can refuse but never acknowledge success, and has no
 //! way to move hardware.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::broker::{
-    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, RequestId, RtIntake,
+    ActionId, Authority, BootId, Broker, Capacities, CommandKind, Descriptor, ImmediateOp, Installed, Outcome, PlanSlotRef, RequestId, RtIntake,
     TransitionOp,
 };
 use super::config_iface::{Activated, ConfigAuthority, ConfigDomain, ConfigProposal, Durability, Released, Reservation, Reserved};
@@ -120,12 +120,27 @@ pub fn tool_digest_hash(digest: &str) -> u64 {
     digest.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Joint samples one plan slot's [`PreparedPath`] holds (allocated when the slot is built;
-/// a longer path or episode is refused `PLAN_TOO_LARGE` when it is prepared).
+/// Joint samples one plan slot's [`PreparedPath`] holds (allocated and write-touched when
+/// the slot is built; a longer path or episode is refused `PLAN_TOO_LARGE` when prepared).
 pub const MAX_PATH_SAMPLES: usize = 2048;
 
-/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated once (plan slot
-/// construction) and refilled in place: preparing never reallocates it.
+/// Payload bytes reserved by one default [`PlanSlot`]'s [`PreparedPath`] (`2048 * (8 * 4 + 8) = 81,920`).
+pub const PLAN_SLOT_PAYLOAD_BYTES: usize = MAX_PATH_SAMPLES * (std::mem::size_of::<[f32; MAX_DOF]>() + std::mem::size_of::<f64>());
+
+/// Total payload bytes reserved across [`super::broker::PLAN_SLOTS`] default plan slots (`8 * 81,920 = 655,360`).
+pub const ALL_PLAN_SLOTS_PAYLOAD_BYTES: usize = super::broker::PLAN_SLOTS * PLAN_SLOT_PAYLOAD_BYTES;
+
+/// Write-touches every element of `v`'s allocated spare capacity via volatile stores so the
+/// OS faults physical pages at construction rather than leaving lazy COW zero pages.
+fn pre_fault_spare<T: Copy>(v: &mut Vec<T>, val: T) {
+    for slot in v.spare_capacity_mut() {
+        // SAFETY: `slot` points to valid, aligned, exclusively-owned allocated memory in `v`.
+        unsafe { std::ptr::write_volatile(slot.as_mut_ptr(), val) };
+    }
+}
+
+/// The joint samples of a [`Primitive::Prepared`], in a buffer allocated and pre-faulted
+/// once (plan slot construction) and refilled in place: preparing never reallocates it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedPath {
     samples: Vec<[f32; MAX_DOF]>,
@@ -133,8 +148,18 @@ pub struct PreparedPath {
 }
 
 impl PreparedPath {
-    pub fn with_capacity(n: usize) -> Self { Self { samples: Vec::with_capacity(n), params: Vec::with_capacity(n) } }
+    pub fn with_capacity(n: usize) -> Self {
+        let mut samples = Vec::with_capacity(n);
+        pre_fault_spare(&mut samples, [0.0; MAX_DOF]);
+        let mut params = Vec::with_capacity(n);
+        pre_fault_spare(&mut params, 0.0);
+        Self { samples, params }
+    }
     pub fn capacity(&self) -> usize { self.samples.capacity().min(self.params.capacity()) }
+    /// Payload bytes reserved by `samples` and `params` backing buffers.
+    pub fn payload_bytes(&self) -> usize {
+        self.samples.capacity() * std::mem::size_of::<[f32; MAX_DOF]>() + self.params.capacity() * std::mem::size_of::<f64>()
+    }
     pub fn clear(&mut self) { self.samples.clear(); self.params.clear(); }
     pub fn len(&self) -> usize { self.samples.len() }
     pub fn is_empty(&self) -> bool { self.samples.is_empty() }
@@ -179,6 +204,9 @@ impl Default for PlanSlot {
 
 impl PlanSlot {
     pub fn with_path_capacity(n: usize) -> Self { Self { primitive: Primitive::None, path: PreparedPath::with_capacity(n) } }
+
+    /// Payload bytes reserved by this slot's [`PreparedPath`] buffers.
+    pub fn payload_bytes(&self) -> usize { self.path.payload_bytes() }
 
     /// Stages a primitive that reads no path (the path is cleared).
     pub fn set(&mut self, p: Primitive) {
@@ -436,6 +464,12 @@ pub trait CoreOps {
     fn commit_prepared(&mut self, _d: &Descriptor, _primitive: &Primitive, _path: &PreparedPath, _ctx: &CommitCtx) -> Result<Committed, &'static str> {
         Err("UNSUPPORTED")
     }
+    /// Installs a [`Primitive::Prepared`] using a pinned [`PlanSlotRef`] so implementations
+    /// can borrow the immutable slot samples until terminal retirement without vector copies.
+    /// Default delegates to [`Self::commit_prepared`].
+    fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        self.commit_prepared(d, &slot.primitive, &slot.path, ctx)
+    }
     /// Starts a driver transition after rechecking the stamp; its progress and outcome come
     /// from [`Self::poll_hardware`] (`HardwarePoll::torque`). The committed action id names
     /// the transition (the adapter uses the request id's value).
@@ -479,17 +513,150 @@ pub trait CoreOps {
     fn now_timestamp(&self) -> f64 { 0.0 }
 }
 
-/// The protocol code of a delegated error, as a static string (unknown codes: `REJECTED`).
-fn static_code(e: ArmError) -> &'static str {
+/// Diagnostic fields recorded on the RT thread when an authorized stop arrives during a
+/// watchdog park; formatted and logged off-thread via [`StopDiagSlot::drain_and_log`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopDiagRecord {
+    pub count: u64,
+    pub arm: ArmId,
+    pub park_elapsed_us: u64,
+    pub park_budget_us: u64,
+}
+
+/// Preallocated, lock-free diagnostic slot for `authorized_stop` on the RT thread.
+///
+/// The RT path only performs plain atomic stores (zero allocations, zero formatting, zero
+/// tracing); normal-priority periodic paths ([`super::publish::StateHub::latest`], driven by
+/// the dispatcher loop) drain and format via [`Self::drain_and_log_once`].
+#[derive(Debug)]
+pub struct StopDiagSlot {
+    count: AtomicU64,
+    drained: AtomicU64,
+    arm: AtomicU32,
+    park_elapsed_us: AtomicU64,
+    park_budget_us: AtomicU64,
+}
+
+impl StopDiagSlot {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            drained: AtomicU64::new(0),
+            arm: AtomicU32::new(0),
+            park_elapsed_us: AtomicU64::new(0),
+            park_budget_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Records an authorized stop ignored because a watchdog park is running (RT thread:
+    /// atomic stores only).
+    pub fn record_park_ignored(&self, arm: ArmId, elapsed_s: f64, budget_s: f64) {
+        let to_us = |s: f64| if s.is_finite() && s >= 0.0 { (s * 1_000_000.0).min(u64::MAX as f64) as u64 } else { 0 };
+        self.arm.store(u32::from(arm.0), Ordering::Relaxed);
+        self.park_elapsed_us.store(to_us(elapsed_s), Ordering::Relaxed);
+        self.park_budget_us.store(to_us(budget_s), Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Total park-ignored stop events recorded so far.
+    pub fn count(&self) -> u64 { self.count.load(Ordering::Acquire) }
+
+    /// Returns newly recorded events since `*seen` and advances `*seen` (off-thread).
+    pub fn poll(&self, seen: &mut u64) -> Option<StopDiagRecord> {
+        let now = self.count.load(Ordering::Acquire);
+        if now == *seen { return None; }
+        let delta = now.wrapping_sub(*seen);
+        *seen = now;
+        Some(StopDiagRecord {
+            count: delta,
+            arm: ArmId(self.arm.load(Ordering::Relaxed) as u16),
+            park_elapsed_us: self.park_elapsed_us.load(Ordering::Relaxed),
+            park_budget_us: self.park_budget_us.load(Ordering::Relaxed),
+        })
+    }
+
+    fn emit_log(rec: &StopDiagRecord) {
+        tracing::info!(
+            "Stop during a watchdog park (arm {}, elapsed {:.2} s / budget {:.2} s, {} event(s)): the park continues (only a new lease takes it over)",
+            rec.arm.0,
+            rec.park_elapsed_us as f64 / 1_000_000.0,
+            rec.park_budget_us as f64 / 1_000_000.0,
+            rec.count,
+        );
+    }
+
+    /// Off-thread drain with caller-managed cursor: formats and emits `tracing::info!` for
+    /// newly recorded events since `*seen`.
+    pub fn drain_and_log(&self, seen: &mut u64) -> Option<StopDiagRecord> {
+        let rec = self.poll(seen)?;
+        Self::emit_log(&rec);
+        Some(rec)
+    }
+
+    /// Off-thread shared drain called by normal-priority periodic paths (e.g.
+    /// `StateHub::refresh` driven by the supervisor dispatcher loop): claims unlogged events
+    /// via CAS on `self.drained` so each recorded stop event is emitted once.
+    pub fn drain_and_log_once(&self) -> Option<StopDiagRecord> {
+        loop {
+            let prev = self.drained.load(Ordering::Acquire);
+            let now = self.count.load(Ordering::Acquire);
+            if now == prev { return None; }
+            if self.drained.compare_exchange(prev, now, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                let rec = StopDiagRecord {
+                    count: now.wrapping_sub(prev),
+                    arm: ArmId(self.arm.load(Ordering::Relaxed) as u16),
+                    park_elapsed_us: self.park_elapsed_us.load(Ordering::Relaxed),
+                    park_budget_us: self.park_budget_us.load(Ordering::Relaxed),
+                };
+                Self::emit_log(&rec);
+                return Some(rec);
+            }
+        }
+    }
+}
+
+impl Default for StopDiagSlot {
+    fn default() -> Self { Self::new() }
+}
+
+static STOP_DIAG: StopDiagSlot = StopDiagSlot::new();
+
+/// Preallocated diagnostic slot written by [`SupervisorInner::authorized_stop`] until step 1
+/// moves it onto `ArmCore` / `ExecutorStats`.
+pub fn stop_diag() -> &'static StopDiagSlot { &STOP_DIAG }
+
+/// The protocol code of a delegated error, as a static string without allocating
+/// (unknown codes: `REJECTED`).
+pub(crate) fn static_code(e: ArmError) -> &'static str {
+    use crate::safety::SafetyError as S;
     const KNOWN: &[&str] = &[
         "MOTION_BUSY", "NOT_ARMED", "ESTOP_ACTIVE", "FAULT_ACTIVE", "EPOCH_MISMATCH", "INVALID_COMMAND", "IK_UNREACHABLE",
         "WORKSPACE_VIOLATION", "JOINT_LIMIT", "PLAN_STALE", "LEASE_LOST", "NO_LEASE", "COLLISION_HOLD", "COMMISSIONING_REQUIRED",
         "INVALID_VALUE", "UNSUPPORTED", "INTERNAL", "FEEDBACK_STALE", "CONFIG_BUSY", "ARM_NOT_AT_RESTING_POSE", "TOOL_MISMATCH",
         "MOTION_FORBIDDEN_IN_FAULT_STATE",
     ];
-    if let ArmError::Motion(m) = &e { return m.code(); }
-    let code = crate::api::rest::ApiError::from(e).code.unwrap_or_default();
-    KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
+    match &e {
+        ArmError::Motion(m) => m.code(),
+        ArmError::Safety(s) => match s {
+            S::EStopActive => "ESTOP_ACTIVE",
+            S::FaultActive(_) => "FAULT_ACTIVE",
+            S::NotArmed(_) => "NOT_ARMED",
+            S::EpochMismatch { .. } => "EPOCH_MISMATCH",
+            S::CollisionHold(_) => "COLLISION_HOLD",
+            S::CommissioningRequired(_) => "COMMISSIONING_REQUIRED",
+            S::MotionBusy => "MOTION_BUSY",
+            S::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
+            S::ArmNotAtRestingPose { .. } => "ARM_NOT_AT_RESTING_POSE",
+            S::MotionForbiddenInFaultState(_) => "MOTION_FORBIDDEN_IN_FAULT_STATE",
+            _ => "REJECTED",
+        },
+        ArmError::Unsupported(_) => "UNSUPPORTED",
+        ArmError::WorkspaceRejected { .. } => "WORKSPACE_VIOLATION",
+        ArmError::Rejected { code, .. } | ArmError::Detailed { code, .. } => {
+            KNOWN.iter().find(|k| **k == code.as_str()).copied().unwrap_or("REJECTED")
+        }
+        ArmError::Trajectory(_) | ArmError::Recording(_) | ArmError::PolicyRevisionMismatch { .. } | ArmError::Internal(_) => "REJECTED",
+    }
 }
 
 impl SupervisorInner {
@@ -566,8 +733,8 @@ impl CoreOps for SupervisorInner {
                 let n = usize::from(*dof);
                 if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
                 if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
-                let target = q[..n].to_vec();
-                self.jog_action(target, Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
+                self.jog_precheck_static()?;
+                self.jog_action_slice(&q[..n], Some(*duration_s), Some(d.stamp.authority.epoch), "joint_move")
                     .map(|(_, id, _)| Committed::authorized(d, Some(ActionId(id))))
                     .map_err(static_code)
             }
@@ -601,6 +768,43 @@ impl CoreOps for SupervisorInner {
                     }
                     Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
                         let prepared = this.prepared_replay_motion(n, path, kind, duration_s, power_scale, epoch)?;
+                        this.install_macro_prepared_replay(id, prepared).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+        }
+    }
+
+    fn commit_prepared_slot(&mut self, d: &Descriptor, slot: PlanSlotRef<PlanSlot>, ctx: &CommitCtx) -> Result<Committed, &'static str> {
+        let primitive = slot.primitive;
+        self.check_motion_commit(d, &primitive, ctx)?;
+        let Primitive::Prepared { child, dof, start, kind, duration_s, power_scale } = primitive else { return Err("INVALID_COMMAND"); };
+        let n = usize::from(dof);
+        if n == 0 || n > MAX_DOF { return Err("INVALID_COMMAND"); }
+        let epoch = d.stamp.authority.epoch;
+        let committed = |r: Result<u64, ArmError>| r.map(|id| Committed::authorized(d, Some(ActionId(id)))).map_err(static_code);
+        match kind {
+            PathKind::Cartesian => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                match child {
+                    None => self
+                        .install_prepared_path_slot(epoch, n, slot, duration_s, power_scale)
+                        .map(|(id, _)| Committed::authorized(d, Some(ActionId(id)))),
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        this.install_macro_prepared_path_slot(id, n, slot, duration_s, power_scale).map(drop)
+                    }).map(|parent| Committed::authorized(d, Some(parent))),
+                }
+            }
+            PathKind::Replay { .. } => {
+                if !start_matches(&start[..n], &self.commanded_positions) { return Err("PLAN_STALE"); }
+                match child {
+                    None => {
+                        let checked = self.validate_prepared_replay(n, &slot.path, kind, duration_s, epoch)?;
+                        let prepared = self.prepared_replay_from_slot_checked(n, slot, checked, duration_s, power_scale, epoch).map_err(static_code)?;
+                        committed(self.install_prepared_replay(prepared).map(|(id, _)| id))
+                    }
+                    Some(spec) => self.commit_child_install(spec, &start[..n], ctx.now, move |this, id| {
+                        let prepared = this.prepared_replay_from_slot(n, slot, kind, duration_s, power_scale, epoch)?;
                         this.install_macro_prepared_replay(id, prepared).map(drop)
                     }).map(|parent| Committed::authorized(d, Some(parent))),
                 }
@@ -783,6 +987,9 @@ impl ConfigAuthority for SupervisorInner {
 
     fn reserve(&mut self, p: &ConfigProposal, ctx: &CommitCtx) -> Reserved {
         let current = self.revision(p.domain);
+        if p.stamp.boot.is_zero() || ctx.boot.is_zero() {
+            return Reserved::Refused { code: "WRONG_TARGET", current };
+        }
         if let Some(code) = p.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Reserved::Refused { code, current }; }
         if p.expected_revision != current { return Reserved::Refused { code: "REVISION_MISMATCH", current }; }
         match self.core.config_mut().grant(p, current) {
@@ -942,6 +1149,7 @@ impl ReleaseEngine {
         )
     }
 
+    pub fn boot(&self) -> BootId { self.intake.boot() }
     pub fn releases(&self) -> u64 { self.releases }
     pub fn active(&self) -> Option<ActionId> { self.active.as_ref().map(Installed::action) }
     pub fn transition(&self) -> Option<ActionId> { self.transition.as_ref().map(Installed::action) }
@@ -954,19 +1162,20 @@ impl ReleaseEngine {
 
     pub fn on_checkpoint(&mut self, hook: impl FnMut(Checkpoint) + Send + 'static) { self.hook = Some(Box::new(hook)); }
 
+    /// Applies an authorized stop requested since the last one applied; true when it did.
+    pub fn apply_pending_stop<O: CoreOps>(&mut self, core: &mut O) -> bool {
+        let generation = self.stop.current();
+        if generation == self.stop.applied() { return false; }
+        core.apply_stop();
+        self.stop.mark_applied(generation);
+        true
+    }
+
     /// Applies any pending urgent E-stop and/or authorized-stop requests; true when either applied.
     pub fn apply_pending_urgent<O: CoreOps>(&mut self, core: &mut O) -> bool {
-        let mut applied = false;
-        if core.apply_estop() {
-            applied = true;
-        }
-        let generation = self.stop.current();
-        if generation != self.stop.applied() {
-            core.apply_stop();
-            self.stop.mark_applied(generation);
-            applied = true;
-        }
-        applied
+        let estop = core.apply_estop();
+        let stop = self.apply_pending_stop(core);
+        estop || stop
     }
 
     fn checkpoint<O: CoreOps>(
@@ -1058,7 +1267,10 @@ impl ReleaseEngine {
             let result = match d.kind {
                 CommandKind::Install { .. } => match t.plan() {
                     None => Err("PLAN_RETIRED"),
-                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => core.commit_prepared(&d, &slot.primitive, &slot.path, &ctx),
+                    Some(slot) if matches!(slot.primitive, Primitive::Prepared { .. }) => match t.plan_ref() {
+                        Some(slot_ref) => core.commit_prepared_slot(&d, slot_ref, &ctx),
+                        None => Err("PLAN_RETIRED"),
+                    },
                     Some(slot) => core.commit_primitive(&d, &slot.primitive, &ctx),
                 },
                 CommandKind::Immediate(op) => core.commit_immediate(&d, op, &ctx),
@@ -1188,6 +1400,17 @@ impl<O: CoreOps> ReleaseFixture<O> {
         (Self { core, engine, clock, dt: 0.02 }, broker, tw, stop)
     }
 
+    /// [`Self::new`] with a freshly generated non-zero executor [`BootId`].
+    pub fn new_fresh(core: O, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        Self::new(core, BootId::fresh(), caps)
+    }
+
+    /// The executor's boot identity.
+    pub fn boot(&self) -> BootId { self.engine.boot() }
+
+    /// The executor's live urgent-stop handle.
+    pub fn stops(&self) -> &StopRequests { self.engine.stop_requests() }
+
     /// The fixture's virtual clock (clone it to advance time from a test).
     pub fn clock(&self) -> &VirtualClock { &self.clock }
     /// Virtual now.
@@ -1225,6 +1448,16 @@ impl<O: CoreOps> ReleaseFixture<O> {
         // The next release starts one period later
         self.clock.advance(release_deadline.saturating_duration_since(self.clock.now()));
         report
+    }
+}
+
+impl<O: CoreOps + ConfigAuthority> ReleaseFixture<O> {
+    /// Reserves a configuration proposal against the fixture's real boot identity, virtual
+    /// clock, and live urgent-stop generation (applying any pending stop first).
+    pub fn reserve_config(&mut self, proposal: &ConfigProposal) -> Reserved {
+        self.engine.apply_pending_stop(&mut self.core);
+        let ctx = self.ctx(self.clock.now());
+        self.core.reserve(proposal, &ctx)
     }
 }
 
@@ -1278,5 +1511,53 @@ mod tests {
             let name = name.as_str().unwrap();
             if name != "OTHER" { assert!(TERMINAL_CODES.contains(&name), "{name}"); }
         }
+    }
+
+    #[test]
+    fn eight_plan_slots_reserve_655360_payload_bytes() {
+        assert_eq!(PLAN_SLOT_PAYLOAD_BYTES, 81_920);
+        assert_eq!(ALL_PLAN_SLOTS_PAYLOAD_BYTES, 655_360);
+        let (mut w, mut r) = super::super::broker::plan_slots(super::super::broker::PLAN_SLOTS, PlanSlot::default);
+        let mut handles = Vec::new();
+        let mut total_bytes = 0usize;
+        for _ in 0..super::super::broker::PLAN_SLOTS {
+            let h = w.stage(|s| { s.path.clear(); }).expect("slot");
+            let slot = r.get(h).expect("live");
+            assert_eq!(slot.path.capacity(), MAX_PATH_SAMPLES);
+            assert_eq!(slot.payload_bytes(), PLAN_SLOT_PAYLOAD_BYTES);
+            total_bytes += slot.payload_bytes();
+            handles.push(h);
+        }
+        assert_eq!(total_bytes, 655_360);
+        assert!(w.stage(|_| {}).is_none());
+        for h in handles { assert!(r.retire(h)); }
+    }
+
+    #[test]
+    fn stop_diag_slot_records_coalesces_and_drains() {
+        let slot = StopDiagSlot::new();
+        let mut seen = 0;
+        assert_eq!(slot.poll(&mut seen), None);
+
+        slot.record_park_ignored(ArmId(3), 1.25, 12.5);
+        slot.record_park_ignored(ArmId(3), 2.5, 12.5);
+        assert_eq!(slot.count(), 2);
+
+        let rec = slot.drain_and_log(&mut seen).expect("coalesced record");
+        assert_eq!(
+            rec,
+            StopDiagRecord {
+                count: 2,
+                arm: ArmId(3),
+                park_elapsed_us: 2_500_000,
+                park_budget_us: 12_500_000,
+            }
+        );
+        assert_eq!(seen, 2);
+        assert_eq!(slot.poll(&mut seen), None);
+
+        slot.record_park_ignored(ArmId::LOCAL, f64::NAN, -1.0);
+        let san = slot.poll(&mut seen).expect("sanitized record");
+        assert_eq!((san.count, san.park_elapsed_us, san.park_budget_us), (1, 0, 0));
     }
 }

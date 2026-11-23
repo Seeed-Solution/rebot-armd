@@ -439,3 +439,68 @@ async fn volatile_change_is_reserved_and_activated() {
     assert_eq!(runtime_boxes(&*sup.inner().read().await), ["mem"]);
     assert_motion_eligible(&mut ws, g, epoch, &sup).await;
 }
+
+/// B2: `config_ctx` supplies a real non-zero boot identity, `config_ctx_with` / `ReleaseFixture::reserve_config`
+/// thread real executor boot identity and live urgent-stop generation, and stale/zero boot ids
+/// or overtaken stops are refused without inhibiting motion or altering active configuration.
+#[test]
+fn config_identity_refuses_stale_boot_zero_boot_and_overtaken_stop() {
+    use armd::rt_core::urgent::StopRequests;
+
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let t0 = Instant::now();
+    let legacy_ctx = inner.config_ctx(t0);
+    assert!(!legacy_ctx.boot.is_zero(), "config_ctx must not substitute BootId(0)");
+    assert_eq!(legacy_ctx.boot, BootId::process());
+
+    // Live executor boot + live StopRequests threaded through config_ctx_with & reserve_config_proposal.
+    let boot = BootId::fresh();
+    let stale_boot = BootId::fresh();
+    assert_ne!(boot, stale_boot);
+    let stops = StopRequests::new();
+    let ctx = inner.config_ctx_with(boot, &stops, t0);
+    assert_eq!((ctx.boot, ctx.stop_generation), (boot, 0));
+
+    let p = inner.config_proposal(ConfigDomain::Keepout, inner.revision(ConfigDomain::Keepout), 0, &ctx);
+
+    // 1. Stale boot id refused with WRONG_TARGET.
+    let mut p_stale = p;
+    p_stale.stamp.boot = stale_boot;
+    let err = inner.reserve_config_proposal(&p_stale, &ctx).unwrap_err();
+    assert!(matches!(&err, ArmError::Rejected { code, .. } if code == "WRONG_TARGET"), "{err:?}");
+
+    // 2. Zero boot id refused fail-closed even when both proposal and ctx pass BootId(0).
+    let mut p_zero = p;
+    p_zero.stamp.boot = BootId(0);
+    let zero_ctx = armd::rt_core::ops::CommitCtx { boot: BootId(0), ..ctx };
+    assert_eq!(inner.reserve(&p_zero, &zero_ctx), Reserved::Refused { code: "WRONG_TARGET", current: 1 });
+
+    // 3. Overtaken stop refused with STOPPED when live stop generation advances before reserve.
+    stops.request();
+    let after_stop = inner.config_ctx_with(boot, &stops, t0);
+    assert_eq!(after_stop.stop_generation, 1);
+    let err = inner.reserve_config_proposal(&p, &after_stop).unwrap_err();
+    assert!(matches!(&err, ArmError::Rejected { code, .. } if code == "STOPPED"), "{err:?}");
+    assert!(!inner.core.motion_inhibited_by_config());
+    assert_eq!(inner.keepout.revision, 1);
+
+    // 4. Proposal stamped at the live stop generation succeeds and commits.
+    let fresh_p = inner.config_proposal(ConfigDomain::Keepout, 1, 0, &after_stop);
+    let ((), rev) = inner.commit_config_proposal(&fresh_p, &after_stop, |i| i.set_keepout_boxes(vec![boxed("live", 0.3)])).unwrap();
+    assert_eq!((rev, runtime_boxes(&inner)), (2, vec!["live".to_string()]));
+    assert!(!inner.core.motion_inhibited_by_config());
+
+    // 5. Same contract through ReleaseFixture::new_fresh + reserve_config.
+    let (mut fx, _b, _tw, fx_stops) = ReleaseFixture::new_fresh(inner, Capacities::default());
+    assert!(!fx.boot().is_zero());
+    let fx_ctx = fx.ctx(fx.now());
+    let fp = fx.core.config_proposal(ConfigDomain::Keepout, 2, 0, &fx_ctx);
+    let mut wrong_fx = fp;
+    wrong_fx.stamp.boot = stale_boot;
+    assert_eq!(fx.reserve_config(&wrong_fx), Reserved::Refused { code: "WRONG_TARGET", current: 2 });
+    fx_stops.request();
+    assert_eq!(fx.reserve_config(&fp), Reserved::Refused { code: "STOPPED", current: 2 });
+    let fp2 = fx.core.config_proposal(ConfigDomain::Keepout, 2, 0, &fx.ctx(fx.now()));
+    let Reserved::Granted(r) = fx.reserve_config(&fp2) else { panic!("fresh proposal after stop should grant") };
+    assert_eq!(fx.core.release(r), Released::Cleared);
+}

@@ -2436,6 +2436,18 @@ impl From<&str> for HolderLabel {
     fn from(s: &str) -> Self { Self::new(s) }
 }
 
+impl From<String> for HolderLabel {
+    fn from(s: String) -> Self { Self::new(&s) }
+}
+
+impl From<&String> for HolderLabel {
+    fn from(s: &String) -> Self { Self::new(s) }
+}
+
+impl AsRef<str> for HolderLabel {
+    fn as_ref(&self) -> &str { self.as_str() }
+}
+
 impl std::fmt::Debug for HolderLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { std::fmt::Debug::fmt(self.as_str(), f) }
 }
@@ -2446,6 +2458,22 @@ impl std::fmt::Display for HolderLabel {
 
 impl PartialEq<str> for HolderLabel {
     fn eq(&self, other: &str) -> bool { self.as_str() == other }
+}
+
+impl PartialEq<&str> for HolderLabel {
+    fn eq(&self, other: &&str) -> bool { self.as_str() == *other }
+}
+
+impl PartialEq<HolderLabel> for &str {
+    fn eq(&self, other: &HolderLabel) -> bool { *self == other.as_str() }
+}
+
+impl PartialEq<String> for HolderLabel {
+    fn eq(&self, other: &String) -> bool { self.as_str() == other.as_str() }
+}
+
+impl PartialEq<HolderLabel> for String {
+    fn eq(&self, other: &HolderLabel) -> bool { self.as_str() == other.as_str() }
 }
 
 impl Serialize for HolderLabel {
