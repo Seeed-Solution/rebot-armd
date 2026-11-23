@@ -243,7 +243,12 @@ fn spawn_simulator(q: Vec<f32>, stop: Arc<AtomicBool>) -> String {
             if let Ok((n, from)) = socket.recv_from(&mut buf) {
                 peer = Some(from);
                 if let Ok(c) = serde_json::from_slice::<Value>(&buf[..n]) {
-                    if c["type"] == "cmd" { ack = c["seq"].as_u64().unwrap_or(ack); enabled = c["enable"].as_bool().unwrap_or(false); }
+                    if c["type"] == "cmd" {
+                        ack = c["seq"].as_u64().unwrap_or(ack);
+                        if let Some(en) = c["enable"].as_bool() {
+                            enabled = en;
+                        }
+                    }
                 }
             }
             if let Some(p) = peer {

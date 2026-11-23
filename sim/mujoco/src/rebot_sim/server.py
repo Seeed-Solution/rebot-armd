@@ -435,7 +435,7 @@ class Simulator:
             self.peer = addr
             return
         enable, seq, targets = (
-            msg.get("enable", False),
+            msg.get("enable"),
             msg.get("seq", 0),
             msg.get("targets"),
         )
@@ -445,16 +445,18 @@ class Simulator:
             else self.motors.parse_targets(targets, self.motors.dof)
         )
         if (
-            not isinstance(enable, bool)
+            (enable is not None and not isinstance(enable, bool))
             or isinstance(seq, bool)
             or not isinstance(seq, int)
             or seq < 0
             or (targets is not None and parsed is None)
+            or (enable is None and targets is None)
         ):
             self.rejected += 1
             return
         self.peer = addr
-        self.motors.set_enabled(enable)
+        if enable is not None:
+            self.motors.set_enabled(enable)
         if targets is not None:
             self.motors.set_targets(targets)
         self.ack = seq

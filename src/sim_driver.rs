@@ -7,10 +7,12 @@
 //! enable handshake (80 ms enable, 25 ms disable), for the simulator to confirm.
 //!
 //! Wire protocol (version 1), one JSON object per UDP datagram:
-//! - armd -> sim `{"v":1,"type":"cmd","seq":N,"enable":bool,"targets":[...]|null}`;
+//! - armd -> sim `{"v":1,"type":"cmd","seq":N,"enable":bool|null,"targets":[...]|null}`;
 //!   a target is `{"mode":"pos_vel","q":rad,"vlim":rad/s}` or
 //!   `{"mode":"mit","q":rad,"dq":rad/s,"kp":Nm/rad,"kd":Nm·s/rad,"tau":Nm}`.
-//!   `targets: null` (enable / disable / keep-alive) leaves the motor targets unchanged.
+//!   `enable` is explicit (`true`/`false`) only on enable/disable commands (`targets: null`);
+//!   target packets omit `enable` so they preserve the simulator's current torque state and can
+//!   never energize a disabled or restarted peer under E-stop.
 //! - sim -> armd `{"v":1,"type":"state","session":u64,"seq":N,"ack":N,"enabled":bool,
 //!   "q":[..],"dq":[..],"tau":[..],"temp":[..],"t":s}` with one entry per joint.
 //!   `ack` is the highest command `seq` applied; `session` changes when the simulator restarts.
@@ -51,7 +53,8 @@ pub struct SimCommand {
     #[serde(rename = "type")]
     pub kind: String,
     pub seq: u64,
-    pub enable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable: Option<bool>,
     pub targets: Option<Vec<SimTarget>>,
 }
 
@@ -143,7 +146,8 @@ struct SimCommandRef<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     seq: u64,
-    enable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable: Option<bool>,
     targets: Option<&'a [SimTarget]>,
 }
 
@@ -198,6 +202,9 @@ pub struct SimArmDriver {
     abort_flag: Option<Arc<AtomicBool>>,
     /// Pending-E-stop gate checked immediately before target and enable sends.
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
+    /// Deterministic test hook invoked inside `send_ref` strictly after JSON serialization and
+    /// immediately before the final E-stop send gate and socket transmit.
+    before_send_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl SimArmDriver {
@@ -220,7 +227,7 @@ impl SimArmDriver {
             v: PROTOCOL_VERSION,
             kind: "poll".into(),
             seq: 0,
-            enable: false,
+            enable: None,
             targets: None,
         })
         .expect("serialisable");
@@ -272,12 +279,20 @@ impl SimArmDriver {
             torque_hs: None,
             abort_flag: None,
             estop_gate: None,
+            before_send_hook: None,
         })
     }
 
     pub fn with_load_only_feedback(mut self, enabled: bool) -> Self {
         self.load_only_feedback = enabled;
         self
+    }
+
+    /// Installs a deterministic test hook invoked inside `send_ref` right after serialization and
+    /// immediately before the final E-stop send gate + `send_nonblocking`.
+    #[doc(hidden)]
+    pub fn set_before_send_hook(&mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.before_send_hook = hook;
     }
 
     /// Count of keepalive polls transmitted by the background `armd-sim-rx` thread (must remain
@@ -350,7 +365,7 @@ impl SimArmDriver {
         Ok(())
     }
 
-    fn send_ref(&mut self, with_targets: bool, enable: bool, gate: SendGate) -> Result<u64, ArmDriverError> {
+    fn send_ref(&mut self, with_targets: bool, enable: Option<bool>, gate: SendGate) -> Result<u64, ArmDriverError> {
         let next_seq = self.seq + 1;
         let cmd = SimCommandRef {
             v: PROTOCOL_VERSION,
@@ -361,6 +376,9 @@ impl SimArmDriver {
         };
         self.tx_buf.clear();
         let serialized = serde_json::to_writer(&mut self.tx_buf, &cmd).is_ok();
+        if let Some(hook) = self.before_send_hook.as_ref() {
+            hook();
+        }
         // Final pending-E-stop gate right before the socket send.
         match gate {
             SendGate::Target => self.estop_check()?,
@@ -706,7 +724,9 @@ impl ArmDriver for SimArmDriver {
                 tau: t.torque.filter(|v| v.is_finite()).unwrap_or(0.0),
             },
         }));
-        self.send_ref(true, self.enable_requested, SendGate::Target)?;
+        // Target packets omit `enable` so they preserve the peer's torque state; torque changes
+        // go exclusively through explicit enable/disable commands (`begin_torque`).
+        self.send_ref(true, None, SendGate::Target)?;
         Ok(())
     }
 
@@ -735,7 +755,7 @@ impl ArmDriver for SimArmDriver {
             self.enable_estop_inhibited()?;
         }
         let gate = if enabled { SendGate::Enable } else { SendGate::Disable };
-        let seq = self.send_ref(false, enabled, gate)?;
+        let seq = self.send_ref(false, Some(enabled), gate)?;
         self.enable_requested = enabled;
         self.enable_seq = seq;
         let timeout = if enabled { ENABLE_CONFIRM_TIMEOUT } else { DISABLE_CONFIRM_TIMEOUT };
@@ -967,7 +987,8 @@ mod tests {
         let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
         let handle = std::thread::spawn(move || {
             let cmd = peer.recv_kind("cmd");
-            assert!(cmd.enable && cmd.targets.is_none());
+            assert_eq!(cmd.enable, Some(true));
+            assert!(cmd.targets.is_none());
             peer.send_state(1, 1, cmd.seq, true, 0.0);
             peer
         });

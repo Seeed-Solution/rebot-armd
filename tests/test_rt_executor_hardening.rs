@@ -584,7 +584,9 @@ impl PollCountingSim {
                     polls_c.fetch_add(1, Ordering::SeqCst);
                 } else if cmd.kind == "cmd" {
                     ack = cmd.seq;
-                    enabled = cmd.enable;
+                    if let Some(en) = cmd.enable {
+                        enabled = en;
+                    }
                 }
                 seq += 1;
                 let state = SimState {
@@ -1012,55 +1014,154 @@ async fn sim_driver_estop_gate_and_pre_publish_maintenance_ordering() {
     };
     let _ = drain_cmds(&peer);
 
-    // Pending E-stop inhibits write_joint_targets, set_joint_modes (without mutating modes), and begin_torque(true).
-    req.store(1, Ordering::SeqCst);
+    // Exercise the EXACT post-serialization pre-send gate inside `send_ref`: E-stop is clear
+    // (`req == 0, latched == false`) before every driver entry point so all early checks pass,
+    // and the hook injects E-stop strictly AFTER JSON serialization and right BEFORE the final
+    // gate + `send_nonblocking`!
     let targets = [JointTarget::position(0.1), JointTarget::position(0.2), JointTarget::position(0.3)];
+    let hook_hits = Arc::new(AtomicUsize::new(0));
+    {
+        let req_h = req.clone();
+        let hits = hook_hits.clone();
+        drv.set_before_send_hook(Some(Arc::new(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            req_h.store(1, Ordering::SeqCst);
+        })));
+    }
     let err_t = drv.write_joint_targets(&targets).unwrap_err();
-    assert!(is_estop_inhibited(&err_t), "expected EstopInhibited on target write: {err_t:?}");
+    assert!(is_estop_inhibited(&err_t), "expected EstopInhibited at final target send gate: {err_t:?}");
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 1, "must reach post-serialization send_ref boundary");
 
+    // Reset E-stop before `set_joint_modes`; hook injects pending E-stop after serialization ->
+    // 0 datagrams sent AND modes restored to Position!
+    req.store(0, Ordering::SeqCst);
     let err_m = drv
         .set_joint_modes(&[JointMode::Mit, JointMode::Mit, JointMode::Mit], &targets)
         .unwrap_err();
-    assert!(is_estop_inhibited(&err_m), "expected EstopInhibited on set_joint_modes: {err_m:?}");
+    assert!(is_estop_inhibited(&err_m), "expected EstopInhibited at final set_joint_modes gate: {err_m:?}");
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 2, "must reach post-serialization send_ref boundary");
     assert!(
         drv.max_command_velocity(0).is_some(),
-        "failed set_joint_modes under pending E-stop must not mutate joint modes"
+        "post-serialization E-stop refusal in set_joint_modes must restore joint modes"
     );
 
+    // Reset E-stop before `begin_torque(true)`; hook injects latched E-stop after serialization ->
+    // 0 datagrams sent AND no pending torque transition!
+    req.store(0, Ordering::SeqCst);
+    {
+        let latched_h = latched.clone();
+        let hits = hook_hits.clone();
+        drv.set_before_send_hook(Some(Arc::new(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            latched_h.store(true, Ordering::SeqCst);
+        })));
+    }
     let err_en = drv.begin_torque(true).unwrap_err();
-    assert!(is_estop_inhibited(&err_en), "expected EstopInhibited on begin_torque(true): {err_en:?}");
+    assert!(is_estop_inhibited(&err_en), "expected EstopInhibited at final enable send gate: {err_en:?}");
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 3, "must reach post-serialization send_ref boundary");
     assert!(!drv.torque_transition_pending(), "refused enable must not leave pending torque transition");
     assert!(
         drain_cmds(&peer).is_empty(),
-        "zero UDP cmd datagrams may be transmitted while E-stop is pending"
+        "zero UDP cmd datagrams may be transmitted when E-stop arrives after serialization"
     );
 
-    // Disable (`begin_torque(false)`) is NEVER inhibited by pending or latched E-stop!
-    latched.store(true, Ordering::SeqCst);
+    // Disable (`begin_torque(false)`) is NEVER inhibited even when BOTH pending and latched
+    // E-stop arrive right before `send_nonblocking`!
+    {
+        let req_h = req.clone();
+        let latched_h = latched.clone();
+        let hits = hook_hits.clone();
+        drv.set_before_send_hook(Some(Arc::new(move || {
+            hits.fetch_add(1, Ordering::SeqCst);
+            req_h.store(1, Ordering::SeqCst);
+            latched_h.store(true, Ordering::SeqCst);
+        })));
+    }
     let _ = drv.begin_torque(false).unwrap();
+    assert_eq!(hook_hits.load(Ordering::SeqCst), 4);
     let dis_cmds = drain_cmds(&peer);
     assert_eq!(dis_cmds.len(), 1, "disable cmd must still transmit under E-stop: {dis_cmds:?}");
-    assert!(!dis_cmds[0].enable && dis_cmds[0].targets.is_none());
+    assert_eq!(dis_cmds[0].enable, Some(false));
+    assert!(dis_cmds[0].targets.is_none());
 
-    // Clear torque_hs by advancing past disable or abort; test latched E-stop (with applied == requested)
-    // still inhibits enable while allowing E-stop hold target writes!
+    // Initially enabled driver against a peer that becomes disabled while E-stop stays latched:
+    // a hold target packet MUST omit `enable` (preserving the peer's torque state) so it NEVER
+    // re-energizes a disabled or restarted peer under latched E-stop!
     let peer2 = UdpSocket::bind("127.0.0.1:0").unwrap();
-    peer2.set_read_timeout(Some(Duration::from_millis(40))).unwrap();
+    peer2.set_read_timeout(Some(Duration::from_millis(80))).unwrap();
     let mut drv2 = SimArmDriver::connect(&format!("udp://{}", peer2.local_addr().unwrap()), 3).unwrap();
-    let req2 = Arc::new(AtomicU64::new(1));
-    let app2 = Arc::new(AtomicU64::new(1)); // E-stop already applied
-    let latched2 = Arc::new(AtomicBool::new(true));
-    drv2.set_estop_gate(EstopGate::new(req2, app2));
-    drv2.set_abort_flag(latched2);
+    let req2 = Arc::new(AtomicU64::new(0));
+    let app2 = Arc::new(AtomicU64::new(0));
+    let latched2 = Arc::new(AtomicBool::new(false));
+    drv2.set_estop_gate(EstopGate::new(req2.clone(), app2.clone()));
+    drv2.set_abort_flag(latched2.clone());
+
+    // 1. Enable torque and have peer acknowledge `enabled: true`.
+    let mut buf2 = [0u8; 4096];
+    let _ = drv2.begin_torque(true).unwrap();
+    let (en_cmd, armd_addr) = loop {
+        let (n, from) = peer2.recv_from(&mut buf2).expect("peer2 recv enable cmd");
+        if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&buf2[..n]) {
+            if cmd.kind == "cmd" {
+                break (cmd, from);
+            }
+        }
+    };
+    assert_eq!(en_cmd.enable, Some(true));
+    let mut peer_enabled = en_cmd.enable.unwrap_or(false);
+    assert!(peer_enabled);
+    let ack_state = SimState {
+        v: 1,
+        kind: "state".into(),
+        session: 1,
+        seq: 1,
+        ack: en_cmd.seq,
+        enabled: true,
+        q: vec![0.0; 3],
+        dq: vec![0.0; 3],
+        tau: vec![0.0; 3],
+        temp: vec![30.0; 3],
+        loads: None,
+        t: 0.01,
+    };
+    peer2.send_to(&serde_json::to_vec(&ack_state).unwrap(), armd_addr).unwrap();
+    let confirm_deadline = Instant::now() + Duration::from_millis(500);
+    while drv2.torque_transition_pending() {
+        assert!(Instant::now() < confirm_deadline, "sim enable confirmation timed out");
+        let _ = drv2.poll_torque(Instant::now() + Duration::from_millis(20)).unwrap();
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(drv2.enable_state(), EnableState::Enabled);
+
+    // 2. Latch and apply E-stop (`req == app == 1, latched == true`), then peer disables/restarts.
+    req2.store(1, Ordering::SeqCst);
+    app2.store(1, Ordering::SeqCst);
+    latched2.store(true, Ordering::SeqCst);
+    peer_enabled = false;
     let _ = drain_cmds(&peer2);
 
+    // Explicit enable is still inhibited by latched E-stop.
     assert!(is_estop_inhibited(&drv2.begin_torque(true).unwrap_err()));
     assert!(drain_cmds(&peer2).is_empty(), "latched E-stop must inhibit enable send");
-    // Applied E-stop still permits position-hold target writes so the arm does not drop under gravity.
+
+    // Applied E-stop hold target packet transmits targets WITHOUT `enable`, so the disabled peer
+    // preserves `peer_enabled == false` and is NEVER energized by a hold packet!
     drv2.write_joint_targets(&targets).unwrap();
     let hold_cmds = drain_cmds(&peer2);
     assert_eq!(hold_cmds.len(), 1, "applied E-stop hold write must succeed: {hold_cmds:?}");
     assert!(hold_cmds[0].targets.is_some());
+    assert_eq!(
+        hold_cmds[0].enable,
+        None,
+        "target hold packet must omit `enable` so it never energizes a disabled peer"
+    );
+    if let Some(en) = hold_cmds[0].enable {
+        peer_enabled = en;
+    }
+    assert!(
+        !peer_enabled,
+        "peer that became disabled while E-stop stayed latched must stay disabled after hold packet"
+    );
 
     // (b) Maintenance mutating state runs BEFORE publication: when `request_shutdown()` (refused ->
     // `StopPolicy::EStopLatch` while torqued) or `clear_fault()` returns, the already-published

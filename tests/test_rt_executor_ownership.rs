@@ -389,7 +389,9 @@ impl LoopbackSim {
                         if let Ok(cmd) = serde_json::from_slice::<SimCommand>(&buf[..n]) {
                             if cmd.kind == "cmd" {
                                 ack = ack.max(cmd.seq);
-                                enabled_c.store(cmd.enable, Ordering::Release);
+                                if let Some(en) = cmd.enable {
+                                    enabled_c.store(en, Ordering::Release);
+                                }
                                 if let Some(targets) = cmd.targets {
                                     let mut cur = q_c.lock().unwrap();
                                     for (i, t) in targets.iter().enumerate().take(dof) {

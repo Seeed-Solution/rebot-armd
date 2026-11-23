@@ -100,7 +100,7 @@ One JSON object per datagram.
 
 | direction | message |
 |---|---|
-| armd → sim | `{"v":1,"type":"cmd","seq":N,"enable":bool,"targets":[T × 7] \| null}` per control tick and on enable / disable (`targets: null`) |
+| armd → sim | `{"v":1,"type":"cmd","seq":N,"enable":bool\|null,"targets":[T × 7] \| null}`: target packets omit `enable` (preserving the simulator's torque state); explicit `enable: true\|false` (`targets: null`) changes torque |
 | armd → sim | `{"v":1,"type":"poll","seq":0,...}` keep-alive every 20 ms without other traffic |
 | sim → armd | `{"v":1,"type":"state","session":S,"seq":N,"ack":N,"enabled":bool,"q":[7],"dq":[7],"tau":[7],"temp":[7],"t":s}` to the sender of the last datagram |
 
