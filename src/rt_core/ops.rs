@@ -866,6 +866,9 @@ impl ConfigAuthority for SupervisorInner {
 
     fn reserve(&mut self, p: &ConfigProposal, ctx: &CommitCtx) -> Reserved {
         let current = self.revision(p.domain);
+        if p.stamp.boot.is_zero() || ctx.boot.is_zero() {
+            return Reserved::Refused { code: "WRONG_TARGET", current };
+        }
         if let Some(code) = p.check(ctx.arm, ctx.boot, ctx.now, &self.authority(ctx)) { return Reserved::Refused { code, current }; }
         if p.expected_revision != current { return Reserved::Refused { code: "REVISION_MISMATCH", current }; }
         match self.core.config_mut().grant(p, current) {
@@ -1024,6 +1027,17 @@ impl<O: CoreOps> ReleaseFixture<O> {
         (Self { core, intake, targets: tr, stop: stop.clone(), active: None, transition: None, releases: 0, clock, hook: None, dt: 0.02 }, broker, tw, stop)
     }
 
+    /// [`Self::new`] with a freshly generated non-zero executor [`BootId`].
+    pub fn new_fresh(core: O, caps: Capacities) -> (Self, Broker<PlanSlot>, TargetWriter, StopRequests) {
+        Self::new(core, BootId::fresh(), caps)
+    }
+
+    /// The executor's boot identity.
+    pub fn boot(&self) -> BootId { self.intake.boot() }
+
+    /// The executor's live urgent-stop handle.
+    pub fn stops(&self) -> &StopRequests { &self.stop }
+
     /// The fixture's virtual clock (clone it to advance time from a test).
     pub fn clock(&self) -> &VirtualClock { &self.clock }
     /// Virtual now.
@@ -1158,6 +1172,16 @@ impl<O: CoreOps> ReleaseFixture<O> {
                 self.intake.terminal(t, outcome);
             }
         }
+    }
+}
+
+impl<O: CoreOps + ConfigAuthority> ReleaseFixture<O> {
+    /// Reserves a configuration proposal against the fixture's real boot identity, virtual
+    /// clock, and live urgent-stop generation (applying any pending stop first).
+    pub fn reserve_config(&mut self, proposal: &ConfigProposal) -> Reserved {
+        self.apply_pending_stop();
+        let ctx = self.ctx(self.clock.now());
+        self.core.reserve(proposal, &ctx)
     }
 }
 

@@ -53,9 +53,46 @@ pub const PLAN_SLOTS: usize = 8;
 /// slot (each action holds one slot until its terminal result).
 pub const REPLY_CAPACITY: usize = COMMAND_CAPACITY + PLAN_SLOTS;
 
-/// Identity of one armd process run (changes on every start).
+/// Identity of one armd process run or executor instance (non-zero; changes on every start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BootId(pub u64);
+
+static BOOT_BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static NEXT_BOOT: AtomicU64 = AtomicU64::new(1);
+static PROCESS_BOOT: std::sync::OnceLock<BootId> = std::sync::OnceLock::new();
+
+impl BootId {
+    fn base() -> u64 {
+        *BOOT_BASE.get_or_init(|| {
+            let time_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1u64, |d| d.as_nanos() as u64);
+            let pid = u64::from(std::process::id());
+            time_ns.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ pid.rotate_left(32)
+        })
+    }
+
+    /// Generates a fresh, non-zero boot identity (unique across process restarts and
+    /// strictly distinct across executors within the same process).
+    pub fn fresh() -> Self {
+        let base = Self::base();
+        loop {
+            let seq = NEXT_BOOT.fetch_add(1, Ordering::Relaxed);
+            let id = base.wrapping_add(seq);
+            if id != 0 { return Self(id); }
+        }
+    }
+
+    /// Process-wide non-zero boot identity for the current `armd` run (replaces the
+    /// `BootId(0)` placeholder at legacy boundaries until step 1 owns boot ids on `ArmCore`).
+    pub fn process() -> Self {
+        *PROCESS_BOOT.get_or_init(Self::fresh)
+    }
+
+    /// True for the uninitialized zero placeholder (`BootId(0)`), which commit checks refuse.
+    #[inline]
+    pub fn is_zero(self) -> bool { self.0 == 0 }
+}
 
 /// Broker-assigned id of one admitted request, unique within a boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -121,8 +158,9 @@ pub struct Stamp {
 
 impl Stamp {
     /// The rejection code at commit (`now`, RT identity and current authority), None to commit.
+    /// Refuses `BootId(0)` even when both stamp and target pass zero (fail-closed).
     pub fn check(&self, arm: ArmId, boot: BootId, now: Instant, current: &Authority) -> Option<&'static str> {
-        if self.arm != arm || self.boot != boot { return Some("WRONG_TARGET"); }
+        if self.arm != arm || self.boot != boot || self.boot.is_zero() { return Some("WRONG_TARGET"); }
         if now > self.deadline { return Some("DEADLINE_EXPIRED"); }
         self.authority.admits(current)
     }
@@ -881,6 +919,11 @@ mod tests {
         assert_eq!(child.admits(&a), Some("PARENT_REPLACED"), "the parent ended");
         let s = Stamp { arm: ArmId::LOCAL, boot: BootId(1), request: RequestId(1), client: ClientId(1), client_seq: 1, authority: a, deadline: Instant::now() };
         assert_eq!(s.check(ArmId::LOCAL, BootId(2), Instant::now(), &a), Some("WRONG_TARGET"));
+        assert_eq!(s.check(ArmId::LOCAL, BootId(0), Instant::now(), &a), Some("WRONG_TARGET"));
+        let zero = Stamp { boot: BootId(0), ..s };
+        assert_eq!(zero.check(ArmId::LOCAL, BootId(0), Instant::now(), &a), Some("WRONG_TARGET"), "zero boot id refused fail-closed");
+        assert!(!BootId::process().is_zero());
+        assert_ne!(BootId::fresh(), BootId::fresh());
         assert_eq!(s.check(ArmId::LOCAL, BootId(1), s.deadline + Duration::from_millis(1), &a), Some("DEADLINE_EXPIRED"));
         assert_eq!(s.check(ArmId::LOCAL, BootId(1), s.deadline, &a), None);
     }
