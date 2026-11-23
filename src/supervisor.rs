@@ -98,9 +98,13 @@ pub enum PreemptError {
 /// stall window. Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's
 /// TMAX is 10, so the same physical torque is 0.80 × 10 / 18.
 pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
-/// Minimum measured position excursion (rad) proving the jaw is advancing under load
-/// (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7).
+/// Minimum measured net position progress (rad) along the commanded direction proving the jaw
+/// is advancing under load (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7,
+/// well below the 0.0057 rad median 50 Hz closing tick).
 pub const GRIPPER_STALL_PROGRESS_EPS: f32 = 0.002;
+/// Hard upper bound (s) on the stall-detection window so a real jam fails within <= 0.5 s after
+/// progress stops, independent of the action timeout.
+pub const GRIPPER_STALL_WINDOW_MAX_S: f64 = 0.50;
 /// J7 stall release: |τ7| below this (N·m) for 6 ticks (formerly 0.40 at TMAX 18;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
@@ -351,6 +355,7 @@ pub struct SupervisorInner {
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
     pub gripper_stall_anchor_pos: Option<f32>,
+    pub gripper_stall_anchor_dir: f32,
     pub gripper_stall_window_s: f64,
     pub gripper_stall_sign: f32,
     pub gripper_prev_hw_overload: bool,
@@ -689,6 +694,7 @@ impl SupervisorInner {
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
             gripper_stall_anchor_pos: None,
+            gripper_stall_anchor_dir: 0.0,
             gripper_stall_window_s: 0.0,
             gripper_stall_sign: 0.0,
             gripper_prev_hw_overload: false,
@@ -834,6 +840,7 @@ impl SupervisorInner {
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_anchor_dir = 0.0;
         self.gripper_stall_window_s = 0.0;
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
@@ -1650,11 +1657,12 @@ impl SupervisorInner {
         };
         let request = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
         let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
         let motion = match GripperMotion::try_with_close_speed_limit(
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
         ) {
-            Ok(m) => m,
+            Ok(m) => m.with_ceiling_torque_estimate(ceiling_est),
             Err(e) => {
                 tracing::error!("Park release skipped: {e}");
                 return false;
@@ -1665,6 +1673,7 @@ impl SupervisorInner {
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         self.gripper_stall_anchor_pos = None;
+        self.gripper_stall_anchor_dir = 0.0;
         self.gripper_stall_window_s = 0.0;
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
@@ -2212,28 +2221,47 @@ impl SupervisorInner {
                     let load_condition = if has_load_feedback { load_g.abs() > stall_load_thresh } else { true };
                     gap.abs() > 0.08 && load_condition
                 };
-                let active_gripper_speed = self.active_trajectory.as_ref()
-                    .and_then(|a| match &a.reference {
-                        crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm.planned_speed),
-                        _ => None,
-                    })
+                let active_gripper_motion = self.active_trajectory.as_ref().and_then(|a| match &a.reference {
+                    crate::motion::Reference::Gripper(gm) if gm.gripper_index == g_idx => Some(gm),
+                    _ => None,
+                });
+                let active_gripper_speed = active_gripper_motion
+                    .map(|gm| gm.planned_speed)
                     .or_else(|| {
                         let v = f64::from(v_cmd.abs());
                         (v > 1e-4).then_some(v)
                     })
                     .filter(|v| v.is_finite() && *v > 0.0);
+                let travel_dir = active_gripper_motion
+                    .and_then(|gm| {
+                        let d = gm.target - gm.start;
+                        (d.abs() > 1e-6).then_some(d.signum())
+                    })
+                    .or_else(|| (gap.abs() > 1e-3).then_some(gap.signum()))
+                    .or_else(|| ((desired_g - p_meas).abs() > 1e-3).then_some((desired_g - p_meas).signum()))
+                    .or_else(|| (v_cmd.abs() > 1e-4).then_some(v_cmd.signum()))
+                    .or_else(|| (tau_g.abs() > 1e-3).then_some(tau_g.signum()))
+                    .unwrap_or(close_dir);
                 let base_window_s: f64 = if has_torque_feedback { 0.10 } else { 0.18 };
                 let stall_window_s = match active_gripper_speed {
-                    Some(speed) => base_window_s.max((2.0 * f64::from(GRIPPER_STALL_PROGRESS_EPS) / speed + 0.06).min(1.0)),
+                    Some(speed) => base_window_s.max(
+                        (2.0 * f64::from(GRIPPER_STALL_PROGRESS_EPS) / speed + 0.06)
+                            .min(GRIPPER_STALL_WINDOW_MAX_S),
+                    ),
                     None => base_window_s,
                 };
 
                 if high_effort && p_meas.is_finite() {
-                    let progressed = self.gripper_high_torque_ticks > 0
+                    let same_dir = self.gripper_stall_anchor_dir == travel_dir;
+                    // Monotonic net progress along `travel_dir`: backward rebounds or jam
+                    // oscillations never lower the watermark and cannot keep resetting the timer.
+                    let net_progressed = self.gripper_high_torque_ticks > 0
+                        && same_dir
                         && self.gripper_stall_anchor_pos
-                            .is_some_and(|anchor| (p_meas - anchor).abs() >= GRIPPER_STALL_PROGRESS_EPS);
-                    if self.gripper_high_torque_ticks == 0 || progressed {
+                            .is_some_and(|anchor| (p_meas - anchor) * travel_dir >= GRIPPER_STALL_PROGRESS_EPS);
+                    if self.gripper_high_torque_ticks == 0 || !same_dir || net_progressed {
                         self.gripper_stall_anchor_pos = Some(p_meas);
+                        self.gripper_stall_anchor_dir = travel_dir;
                         self.gripper_high_torque_ticks = 1;
                         self.gripper_stall_window_s = 0.0;
                     } else {
@@ -2244,6 +2272,7 @@ impl SupervisorInner {
                         {
                             self.gripper_stalled = true;
                             self.gripper_stall_anchor_pos = None;
+                            self.gripper_stall_anchor_dir = 0.0;
                             self.gripper_stall_window_s = 0.0;
                             let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
                             self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
@@ -2262,6 +2291,7 @@ impl SupervisorInner {
                 } else {
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_stall_anchor_pos = None;
+                    self.gripper_stall_anchor_dir = 0.0;
                     self.gripper_stall_window_s = 0.0;
                 }
             } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {

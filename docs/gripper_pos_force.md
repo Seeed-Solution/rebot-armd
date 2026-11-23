@@ -53,6 +53,26 @@ Earlier `pos_vel` runs measured free-motion torque up to `0.79 N·m` near full o
 
 Not yet verified on the device: full-stroke close to `0.0 rad` at raw 460 after the close-speed timeout fix, external force/torque calibration at the jaws, readback after a host/motor power-cycle restart, holding after a slip, and CAN loss while holding (`TIMEOUT=0`).
 
+### Stall and contact thresholds
+
+Thresholds are anchored to office B601-DM J7 measurements (raw 460, 50 Hz loop):
+
+- Free-motion torque near full open peaks at **`0.80 N·m`** (feedback-equivalent raw-460 ceiling estimate **`≈ 0.87 N·m`** at `0.0019 N·m/raw`).
+- Stall encoder jitter is **`~0.0008 rad`** (2 LSB).
+- One median closing tick at 50 Hz (`0.30 rad/s`) advances **`0.0057 rad`**.
+- Rigid stall plateau at raw 300 (`c300`) is **`0.55–0.57 N·m`**.
+
+Resulting supervisor and gripper-motion rules:
+
+| Parameter / rule | Value | Basis |
+|---|---|---|
+| Net progress epsilon (`GRIPPER_STALL_PROGRESS_EPS` / `GRIPPER_STILL_PROGRESS_EPS`) | **`0.002 rad`** | ~2.5× the `0.0008 rad` stall jitter; well below the `0.0057 rad` median 50 Hz closing tick and below `0.006 rad / 100 ms` at `0.06 rad/s`. Measured as monotonic **net progress along the commanded direction** (`(pos − watermark) · dir >= 0.002 rad`), so jam oscillation cannot keep resetting the stall timer. |
+| Stall / no-progress window (`GRIPPER_STALL_WINDOW_MAX_S`) | **`0.10–0.50 s`** (hard cap **`<= 0.50 s`**) | `max(base_window_s, min(2 × 0.002 / speed + 0.06, 0.50))` (`base_window_s = 0.10 s` with torque feedback, `0.18 s` without). Bounds real-jam detection to **`<= 0.50 s`** after progress stops, independent of the action timeout. |
+| Non-grasp move stall (`Move`, `Open`, `Close(grasp=false)`) | `|τ| >= 0.444 N·m` **and** no net progress over the window | Requires lack of net progress rather than torque alone, so `0.75–0.80 N·m` free-motion torque bumps while moving do not trip stall, while the `c300` rigid stall (`0.56 N·m`, no progress) fails within the bound. |
+| Grasp moving-jaw contact (`GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM`) | 2 ticks at **`>= max(contact_torque_nm, 0.82 N·m, 0.9 × ceiling_estimate)`** | Strictly above the **`0.80 N·m`** free-motion peak (and `>= 0.9 ×` calibrated or `raw × 0.0019` ceiling estimate when higher) and below the `0.85 N·m` first-contact incident sample. |
+| Grasp stopped-progress contact | `|τ| >= contact_torque_nm` (`0.60 N·m`) **or** following lag `>= 0.30 rad`, **and** no closing net progress over the window (`<= 0.50 s`) | Retains `0.60 N·m` sensitivity once the jaw actually stops progressing against an object, without false-triggering during `0.75 N·m` empty-jaw free motion. |
+| Torque cap (`max_close_torque_nm`) | **`1.0 N·m`** (2 ticks) | Unchanged second-layer guard above the free-motion peak and raw-460 ceiling. |
+
 ### Commissioning: `current_ceiling_raw` to N·m
 
 Prerequisites:
@@ -132,6 +152,26 @@ Profile 块 `damiao_gripper`（B601-DM 默认）：
   旧版 profile 上报 `"no motor current cap (legacy POS_VEL gripper)"`。
 
 尚未在设备上验证：闭合超时修复后 raw 460 全行程闭合至 `0.0 rad`、夹爪处外部力/力矩标定、主机或电机断电重启后的回读、打滑后的保持、保持期间 CAN 断开（`TIMEOUT=0`）。
+
+### 堵转与接触阈值
+
+阈值依据办公室 B601-DM J7 实机测量数据设定（raw 460，50 Hz 控制循环）：
+
+- 接近全开位置的自由运动力矩峰值：**`0.80 N·m`**（按 `0.0019 N·m/raw` 推算 raw 460 反馈等效上限 **`≈ 0.87 N·m`**）。
+- 堵转编码器抖动：**`~0.0008 rad`**（2 LSB）。
+- 50 Hz（`0.30 rad/s`）单周期中位闭合步长：**`0.0057 rad`**。
+- raw 300（`c300`）刚性堵转平台：**`0.55–0.57 N·m`**。
+
+对应的监管器与夹爪运动判定规则：
+
+| 参数 / 规则 | 取值 | 依据 |
+|---|---|---|
+| 净位移阈值（`GRIPPER_STALL_PROGRESS_EPS` / `GRIPPER_STILL_PROGRESS_EPS`） | **`0.002 rad`** | 约为 `0.0008 rad` 堵转抖动的 2.5 倍，远小于 `0.0057 rad` 的 50 Hz 中位步长及 `0.06 rad/s` 下的 `0.006 rad / 100 ms`。按指令方向单调**净位移**（`(pos − watermark) · dir >= 0.002 rad`）判定，卡滞振荡不会反复重置堵转计时器。 |
+| 堵转 / 无进展窗口（`GRIPPER_STALL_WINDOW_MAX_S`） | **`0.10–0.50 s`**（硬上限 **`<= 0.50 s`**） | `max(base_window_s, min(2 × 0.002 / speed + 0.06, 0.50))`（有力矩反馈时 `base_window_s = 0.10 s`，无力矩反馈时 `0.18 s`）。保证真实卡滞在停止进展后 **`<= 0.50 s`** 内检出，与动作总超时解耦。 |
+| 非抓取移动堵转（`Move`、`Open`、`Close(grasp=false)`） | `|τ| >= 0.444 N·m` **且** 窗口内无净位移 | 不能仅凭力矩触发，从而允许自由行程中 `0.75–0.80 N·m` 力矩波动顺利完成，同时保持 `c300` 刚性堵转（`0.56 N·m`、无进展）在时限内失败。 |
+| 抓取运动中接触阈值（`GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM`） | 连续 2 周期 **`>= max(contact_torque_nm, 0.82 N·m, 0.9 × ceiling_estimate)`** | 严格高于 **`0.80 N·m`** 自由运动峰值（若已标定或按 `raw × 0.0019` 推算的 `0.9 ×` 上限更高则取后者），且低于事故日志中的 `0.85 N·m` 首次接触采样。 |
+| 抓取停止进展接触 | `|τ| >= contact_torque_nm`（`0.60 N·m`）**或** 跟随滞后 `>= 0.30 rad`，**且** 闭合方向在窗口（`<= 0.50 s`）内无净位移 | 夹爪真正停止推进后仍保持 `0.60 N·m` 灵敏度，避免空夹爪自由运动中 `0.75 N·m` 波动误触发接触。 |
+| 软件力矩上限（`max_close_torque_nm`） | **`1.0 N·m`**（连续 2 周期） | 保留为高于自由运动峰值与 raw 460 上限的第二层保护。 |
 
 ### 标定：`current_ceiling_raw` 对应 N·m
 

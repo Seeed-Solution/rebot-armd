@@ -1211,6 +1211,10 @@ pub struct DamiaoGripperDrive {
 }
 
 impl DamiaoGripperDrive {
+    /// Feedback-equivalent torque ratio (N·m per raw current unit) measured from office B601-DM J7
+    /// stall plateaus on 2026-11-23 (raw 220 -> 0.42 N·m, raw 300 -> 0.55–0.57 N·m).
+    pub const FEEDBACK_EQUIVALENT_NM_PER_RAW: f32 = 0.0019;
+
     /// B601-DM J7 default: position-force with raw 460 (4.6 % of maximum phase current),
     /// `calibrated: false`. On 2026-11-23 (office B601-DM, build 1.6.0-dev8j7 / 027e46c),
     /// stalled feedback-torque plateaus measured 0.42 N·m at raw 220 and 0.55-0.57 N·m at raw 300

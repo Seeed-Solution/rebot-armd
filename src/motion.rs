@@ -1076,9 +1076,19 @@ pub const SETTLE_VEL: f64 = 0.05;
 /// An open / move gripper action that stops within this distance of its target counts as done.
 pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
 pub const SETTLE_HOLD_S: f64 = 0.2;
-/// Minimum measured position excursion (rad) proving the jaw is still advancing over a
-/// stillness window (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7).
+/// Minimum measured net position progress (rad) along the travel direction proving the jaw is
+/// still advancing (~2.5x the 0.0008 rad / 2-LSB stall jitter measured on B601-DM J7, well below
+/// the 0.0057 rad median 50 Hz closing tick).
 pub const GRIPPER_STILL_PROGRESS_EPS: f32 = 0.002;
+/// Hard upper bound (s) on gripper stall / no-progress detection windows so a real jam is
+/// detected within <= 0.5 s after progress stops, independent of the action timeout.
+pub const GRIPPER_STALL_WINDOW_MAX_S: f64 = 0.50;
+/// Measured free-motion torque peak (N·m) near full open on B601-DM J7 (raw 460).
+pub const GRIPPER_FREE_MOTION_TORQUE_PEAK_NM: f32 = 0.80;
+/// Moving-jaw grasp contact torque floor (N·m): strictly above the 0.80 N·m free-motion peak
+/// and below the 0.85 N·m first-contact sample (2026-11-20 B601-DM incident log). Lower
+/// `contact_torque_nm` values (e.g. 0.60 N·m) trigger contact only when net progress has stopped.
+pub const GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM: f32 = 0.82;
 /// Grasp contact: consecutive ticks of torque rise or following error.
 pub const GRIPPER_CONTACT_TICKS: u32 = 2;
 /// Grasp contact from the following error: command at least this far ahead of the jaw (rad) ...
@@ -1220,6 +1230,9 @@ pub struct GripperMotion {
     pub planned_speed: f64,
     /// Wire-quantized velocity ceiling (`raw * 0.01` rad/s) when planned against a pos-force driver.
     pub planned_vel_raw: Option<u16>,
+    /// Driver ceiling torque estimate (N·m, calibrated or feedback-equivalent `raw * 0.0019`) when
+    /// running under a position-force current cap.
+    pub ceiling_torque_estimate_nm: Option<f32>,
     pub elapsed: f64,
     /// Deadline (s): the request's timeout_s, else the default rule.
     pub timeout_s: f64,
@@ -1232,6 +1245,8 @@ pub struct GripperMotion {
     /// again when the contact gave way (`contact_yielded`).
     pub contact_rad: Option<f32>,
     contact_ticks: u32,
+    contact_progress_anchor: Option<f32>,
+    contact_no_progress_s: f64,
     lag_anchor: Option<f32>,
     lag_stalled_s: f64,
 }
@@ -1309,11 +1324,20 @@ impl GripperMotion {
         let limit = JointLimit { max_velocity, ..limit };
         let mut m = Self {
             request, policy, limit, target, start, gripper_index, planned_speed, planned_vel_raw,
+            ceiling_torque_estimate_nm: None,
             elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, still_anchor: None, moved: false, phase: GripPhase::Moving,
-            contact_rad: None, contact_ticks: 0, lag_anchor: None, lag_stalled_s: 0.0,
+            contact_rad: None, contact_ticks: 0, contact_progress_anchor: None, contact_no_progress_s: 0.0,
+            lag_anchor: None, lag_stalled_s: 0.0,
         };
         m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
         Ok(m)
+    }
+
+    /// Attach the driver's ceiling torque estimate (N·m) so moving-jaw grasp contact scales with
+    /// the configured motor current cap (`>= max(0.82 N·m, 0.9 * ceiling_estimate)`).
+    pub fn with_ceiling_torque_estimate(mut self, ceiling_torque_estimate_nm: Option<f32>) -> Self {
+        self.ceiling_torque_estimate_nm = ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0);
+        self
     }
 
     /// True when this motion moves the jaw in the closing direction.
@@ -1480,6 +1504,8 @@ impl GripperMotion {
             self.phase = GripPhase::Moving;
             self.contact_rad = None;
             self.contact_ticks = 0;
+            self.contact_progress_anchor = None;
+            self.contact_no_progress_s = 0.0;
             self.lag_anchor = None;
             self.lag_stalled_s = 0.0;
             self.still_for = 0.0;
@@ -1525,17 +1551,53 @@ impl GripperMotion {
         }
 
         let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
-        // Grasp contact: torque rise (contact_torque_nm, once the jaw has moved) for
-        // GRIPPER_CONTACT_TICKS ticks, or following error with no closing-direction position
-        // progress (>= GRIPPER_STILL_PROGRESS_EPS) over the lag progress window.
+        // Grasp contact:
+        // - While moving: torque must exceed the measured 0.80 N·m free-motion peak
+        //   (>= max(contact_torque_nm, 0.82 N·m, 0.9 * ceiling_torque_estimate)) for
+        //   GRIPPER_CONTACT_TICKS ticks.
+        // - Once closing-direction net progress stops over `progress_window_s` (<= 0.50 s):
+        //   configured `contact_torque_nm` (e.g. 0.60 N·m) or following error (>= 0.30 rad)
+        //   marks object contact.
         if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !stalled {
-            let torque_hit = ctx.torque_feedback && self.moved
-                && self.policy.contact_torque_nm.is_some_and(|c| tau_g.abs() >= c);
-            let lag_window_s = if self.planned_speed.is_finite() && self.planned_speed > 0.0 {
-                0.10_f64.max((2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06).min(1.0))
+            let progress_window_s = if self.planned_speed.is_finite() && self.planned_speed > 0.0 {
+                0.10_f64.max(
+                    (2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06)
+                        .min(GRIPPER_STALL_WINDOW_MAX_S),
+                )
             } else {
                 0.10
             };
+            if m_g.is_finite() {
+                match self.contact_progress_anchor {
+                    Some(anchor) if (m_g - anchor) * dir < GRIPPER_STILL_PROGRESS_EPS => {
+                        self.contact_no_progress_s += ctx.dt;
+                    }
+                    _ => {
+                        self.contact_progress_anchor = Some(m_g);
+                        self.contact_no_progress_s = 0.0;
+                    }
+                }
+            } else {
+                self.contact_progress_anchor = None;
+                self.contact_no_progress_s = 0.0;
+            }
+            let progress_stopped = self.contact_progress_anchor.is_some()
+                && self.contact_no_progress_s >= progress_window_s - 1e-9;
+            let moving_contact_nm = self.policy.contact_torque_nm.map(|c| {
+                let mut thresh = c.max(GRIPPER_MOVING_CONTACT_TORQUE_FLOOR_NM);
+                if let Some(ceil) = self.ceiling_torque_estimate_nm.filter(|v| v.is_finite() && *v > 0.0) {
+                    thresh = thresh.max(0.9 * ceil);
+                }
+                thresh
+            });
+            let moving_torque_hit = ctx.torque_feedback
+                && self.moved
+                && moving_contact_nm.is_some_and(|c| tau_g.abs() >= c);
+            let stopped_torque_hit = ctx.torque_feedback
+                && self.moved
+                && progress_stopped
+                && self.policy.contact_torque_nm.is_some_and(|c| tau_g.abs() >= c);
+            let torque_hit = moving_torque_hit || stopped_torque_hit;
             if (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD && m_g.is_finite() {
                 match self.lag_anchor {
                     Some(anchor) if (m_g - anchor) * dir < GRIPPER_STILL_PROGRESS_EPS => {
@@ -1550,10 +1612,12 @@ impl GripperMotion {
                 self.lag_anchor = None;
                 self.lag_stalled_s = 0.0;
             }
-            let lag_hit = self.lag_anchor.is_some() && self.lag_stalled_s >= lag_window_s - 1e-9;
+            let lag_hit = self.lag_anchor.is_some() && self.lag_stalled_s >= progress_window_s - 1e-9;
             self.contact_ticks = if torque_hit { self.contact_ticks + 1 } else { 0 };
             if lag_hit || self.contact_ticks >= GRIPPER_CONTACT_TICKS {
                 self.contact_rad = Some(m_g);
+                self.contact_progress_anchor = None;
+                self.contact_no_progress_s = 0.0;
                 self.lag_anchor = None;
                 self.lag_stalled_s = 0.0;
                 if let Some(raw) = self.planned_vel_raw {
@@ -1566,6 +1630,8 @@ impl GripperMotion {
                 }
             }
         } else {
+            self.contact_progress_anchor = None;
+            self.contact_no_progress_s = 0.0;
             self.lag_anchor = None;
             self.lag_stalled_s = 0.0;
         }
@@ -1597,19 +1663,25 @@ impl GripperMotion {
         if (m_g - self.start).abs() > 0.05 { self.moved = true; }
         let cmd_at_target = idx < positions.len() && (positions[idx] - target).abs() < 1e-4;
         let still_window_s = if self.planned_speed.is_finite() && self.planned_speed > 0.0 {
-            SETTLE_HOLD_S.max((2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06).min(1.0))
+            SETTLE_HOLD_S.max(
+                (2.0 * f64::from(GRIPPER_STILL_PROGRESS_EPS) / self.planned_speed + 0.06)
+                    .min(GRIPPER_STALL_WINDOW_MAX_S),
+            )
         } else {
             SETTLE_HOLD_S
         };
+        let travel_dir = if (target - self.start) >= 0.0 { 1.0_f32 } else { -1.0_f32 };
         if m_g.is_finite() && (self.moved || cmd_at_target) {
-            match self.still_anchor {
-                Some(anchor) if (m_g - anchor).abs() < GRIPPER_STILL_PROGRESS_EPS => {
-                    self.still_for += ctx.dt;
-                }
-                _ => {
-                    self.still_anchor = Some(m_g);
-                    self.still_for = 0.0;
-                }
+            let no_net_progress = match self.still_anchor {
+                Some(anchor) if cmd_at_target => (m_g - anchor).abs() < GRIPPER_STILL_PROGRESS_EPS,
+                Some(anchor) => (m_g - anchor) * travel_dir < GRIPPER_STILL_PROGRESS_EPS,
+                None => false,
+            };
+            if no_net_progress {
+                self.still_for += ctx.dt;
+            } else {
+                self.still_anchor = Some(m_g);
+                self.still_for = 0.0;
             }
         } else {
             self.still_anchor = None;

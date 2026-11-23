@@ -3538,23 +3538,125 @@ fn pos_force_slow_travel_high_torque_progress_window_and_true_stall() {
     }
 
     // 3. True stall (c300 pattern at -5.547 rad, 0.56 N·m, with +-0.0004 rad = 0.0008 rad
-    //    peak-to-peak encoder jitter) still latches stall and fails with GRIPPER_TIMEOUT.
+    //    peak-to-peak encoder jitter) still latches stall and fails with GRIPPER_TIMEOUT within <= 0.5 s.
     {
-        let (mut sup, _) = make_sup(-5.6401, 0.30, Some(-5.547), 0.35, 0.56, 1, 0.0004);
+        let (mut sup, st) = make_sup(-5.6401, 0.30, Some(-5.547), 0.35, 0.56, 1, 0.0004);
         let ep = sup.safety.epoch_id();
         let (id, _) = sup.start_gripper(
-            GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: None, tag: None },
+            GripperRequest { command: GripperCommand::Move, fraction: Some(0.0), grasp: false, speed: 1.0, timeout_s: Some(30.0), tag: None },
             ep,
         ).unwrap();
+        let mut hit_stop_tick: Option<usize> = None;
+        let mut done_tick: Option<usize> = None;
         let mut done = None;
-        for _ in 0..200 {
+        for tick in 0..200 {
             sup.tick(0.02);
+            if hit_stop_tick.is_none() && (st.lock().unwrap().q_phys - (-5.547)).abs() < 1e-4 {
+                hit_stop_tick = Some(tick);
+            }
             let a = sup.last_action.clone().unwrap();
-            if !a.is_running() { done = Some(a); break; }
+            if !a.is_running() {
+                done_tick = Some(tick);
+                done = Some(a);
+                break;
+            }
         }
         let a = done.expect("true stall with 0.0008 rad peak-to-peak jitter did not finish");
         assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
         assert!(sup.gripper_stalled && sup.gripper_stall_sign > 0.0);
+        let detect_s = (done_tick.unwrap() - hit_stop_tick.expect("never reached -5.547")) as f64 * 0.02;
+        assert!(detect_s <= 0.50, "c300 stall took {detect_s:.2} s (> 0.50 s bound)");
+    }
+
+    // 3b. Oscillating jam (+-0.005 rad = 0.010 rad peak-to-peak, 5x the 0.002 rad progress eps)
+    //     around -3.0 rad with a 30 s action timeout must NOT keep resetting the stall timer and
+    //     MUST fail with GRIPPER_TIMEOUT within <= 0.50 s after progress stops.
+    for (label, planned_speed, cap_opt) in [
+        ("fast_0.30", 1.0_f64, Some(0.30_f32)),
+        ("slow_0.06", 0.06_f64, None),
+    ] {
+        let (mut sup, st) = make_sup(-3.10, 0.30, Some(-3.0), 0.35, 0.65, 1, 0.005);
+        st.lock().unwrap().close_speed_cap = cap_opt;
+        let ep = sup.safety.epoch_id();
+        let (id, _) = sup.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: false, speed: planned_speed, timeout_s: Some(30.0), tag: None },
+            ep,
+        ).unwrap();
+        let mut hit_stop_tick: Option<usize> = None;
+        let mut done_tick: Option<usize> = None;
+        let mut done = None;
+        for tick in 0..400 {
+            sup.tick(0.02);
+            if hit_stop_tick.is_none() && (st.lock().unwrap().q_phys - (-3.0)).abs() < 1e-4 {
+                hit_stop_tick = Some(tick);
+            }
+            let a = sup.last_action.clone().unwrap();
+            if !a.is_running() {
+                done_tick = Some(tick);
+                done = Some(a);
+                break;
+            }
+        }
+        let a = done.unwrap_or_else(|| panic!("{label}: oscillating jam did not fail within 8 s"));
+        assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "failed", Some("GRIPPER_TIMEOUT")), "{label}: {a:?}");
+        assert!(sup.gripper_stalled && sup.gripper_stall_sign > 0.0, "{label}: stall latch not set");
+        let detect_s = (done_tick.unwrap() - hit_stop_tick.expect("never reached jam stop")) as f64 * 0.02;
+        assert!(detect_s <= 0.50, "{label}: oscillating jam took {detect_s:.2} s (> 0.50 s bound)");
+    }
+
+    // 3c. Empty-jaw close (both grasp=false and grasp=true) with a sustained 0.75 N·m torque bump
+    //     while moving (above old 0.60 N·m contact threshold, below 0.80 N·m measured free-motion
+    //     peak) completes cleanly all the way to 0.0 rad without premature contact or stall.
+    for grasp in [false, true] {
+        let (mut sup, st) = make_sup(-2.0, 0.29, None, 0.75, 0.75, 1, 0.0);
+        st.lock().unwrap().close_speed_cap = Some(0.30);
+        let ep = sup.safety.epoch_id();
+        let (id, _) = sup.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp, speed: 1.0, timeout_s: None, tag: None },
+            ep,
+        ).unwrap();
+        let mut done = None;
+        for _ in 0..800 {
+            sup.tick(0.02);
+            assert!(!sup.gripper_stalled, "grasp={grasp}: 0.75 N·m moving bump falsely latched stall at {}", sup.measured_positions[J7]);
+            if sup.measured_positions[J7] < -0.20 {
+                if let Some(active) = &sup.active_trajectory {
+                    if let armd::motion::Reference::Gripper(gm) = &active.reference {
+                        assert!(gm.contact_rad.is_none(), "grasp={grasp}: 0.75 N·m moving bump falsely triggered contact at {}", sup.measured_positions[J7]);
+                    }
+                }
+            }
+            let a = sup.last_action.clone().unwrap();
+            if !a.is_running() { done = Some(a); break; }
+        }
+        let a = done.unwrap_or_else(|| panic!("grasp={grasp}: empty-jaw close with 0.75 N·m bump did not finish"));
+        assert_eq!(a.id, id);
+        assert_eq!(a.state, "done", "grasp={grasp}: {a:?}");
+        if grasp {
+            assert_eq!(a.holding, Some(false), "empty-jaw grasp falsely reported holding=true: {a:?}");
+        }
+        assert!(sup.measured_positions[J7].abs() < 0.05, "grasp={grasp}: ended short at {}", sup.measured_positions[J7]);
+    }
+
+    // 3d. Grasp hitting a stopped object with 0.65 N·m (>= 0.60 N·m contact_torque_nm, below 0.82 N·m
+    //     moving floor) still detects contact once net progress stops and finishes holding=true.
+    {
+        let (mut sup, st) = make_sup(-2.5, 0.29, Some(-2.0), 0.35, 0.65, 1, 0.0);
+        st.lock().unwrap().close_speed_cap = Some(0.30);
+        let ep = sup.safety.epoch_id();
+        let (id, _) = sup.start_gripper(
+            GripperRequest { command: GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: None, tag: None },
+            ep,
+        ).unwrap();
+        let mut done = None;
+        for _ in 0..600 {
+            sup.tick(0.02);
+            let a = sup.last_action.clone().unwrap();
+            if !a.is_running() { done = Some(a); break; }
+        }
+        let a = done.expect("0.65 N·m stopped grasp did not finish");
+        assert_eq!((a.id, a.state.as_str(), a.holding), (id, "done", Some(true)), "{a:?}");
+        assert!((sup.measured_positions[J7] - (-2.0)).abs() < 0.05, "ended at {}", sup.measured_positions[J7]);
     }
 
     // 4. Realistic lag (>= 0.30 rad) when planned_speed = 0.29 rad/s (close_speed_rad_s = 0.299)

@@ -505,6 +505,24 @@ impl SupervisorInner {
             .filter(|v| v.is_finite() && *v > 0.0)
     }
 
+    /// Estimated motor ceiling torque (N·m) of the attached position-force gripper: calibrated
+    /// `ceiling_torque_nm` when available, else the feedback-equivalent estimate from
+    /// `current_raw * 0.0019 N·m/raw`.
+    pub(crate) fn gripper_ceiling_torque_estimate(&self) -> Option<f32> {
+        let gripper_idx = self.config.gripper_index()?;
+        self.driver.as_ref()
+            .and_then(|d| d.lock().ok())
+            .and_then(|drv| drv.motor_current_cap())
+            .filter(|cap| cap.mode == "pos_force" && cap.joint == gripper_idx)
+            .and_then(|cap| {
+                cap.ceiling_torque_nm.or_else(|| {
+                    cap.current_raw
+                        .map(|raw| f32::from(raw) * crate::model::DamiaoGripperDrive::FEEDBACK_EQUIVALENT_NM_PER_RAW)
+                })
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+    }
+
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
         self.start_macro_gripper_within(id, request, None, false).map(|(dur, _, _)| dur)
@@ -532,10 +550,11 @@ impl SupervisorInner {
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
         let mut motion = GripperMotion::try_with_close_speed_limit(
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
-        )?;
+        )?.with_ceiling_torque_estimate(ceiling_est);
         let is_pos_force_close = close_cap.is_some() && motion.is_closing();
         if is_pos_force_close && extend_pos_force_close_timeout {
             motion.request.timeout_s = None;
@@ -655,10 +674,11 @@ impl SupervisorInner {
         self.action_preconditions()?;
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
         let motion = GripperMotion::try_with_close_speed_limit(
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
-        )?;
+        )?.with_ceiling_torque_estimate(ceiling_est);
         self.releasing = matches!(motion.request.command, GripperCommand::Open);
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         let duration = motion.expected_duration();
@@ -727,10 +747,11 @@ impl SupervisorInner {
         };
         self.check_gripper_close_torque_feedback(&request, &policy, gripper_idx)?;
         let close_cap = self.gripper_close_speed_limit();
+        let ceiling_est = self.gripper_ceiling_torque_estimate();
         let motion = GripperMotion::try_with_close_speed_limit(
             request, policy, self.config.limits[gripper_idx].clone(),
             self.commanded_positions[gripper_idx], gripper_idx, close_cap,
-        )?;
+        )?.with_ceiling_torque_estimate(ceiling_est);
         let duration = motion.expected_duration();
         self.gripper_hold_vel_ceiling = Some(motion.wire_velocity_ceiling());
         self.servo_target = None;
