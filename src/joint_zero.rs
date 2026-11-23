@@ -195,6 +195,9 @@ impl ArmDriver for ZeroOffsetDriver {
     }
     fn take_last_poll_rx(&mut self) -> Option<(u16, bool)> { self.inner.take_last_poll_rx() }
     fn torque_transition_pending(&self) -> bool { self.inner.torque_transition_pending() }
+    fn abort_enable(&mut self) { self.inner.abort_enable() }
+    fn supports_rt_executor(&self) -> Result<(), &'static str> { self.inner.supports_rt_executor() }
+    fn set_rt_mode(&mut self, rt: bool) { self.inner.set_rt_mode(rt) }
     fn motor_current_cap(&self) -> Option<crate::driver::MotorCurrentCap> { self.inner.motor_current_cap() }
     fn clock_pause(&self, d: Duration) { self.inner.clock_pause(d) }
     fn is_feedback_valid(&self) -> bool { self.inner.is_feedback_valid() }

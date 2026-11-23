@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use crate::model::JointLimit;
@@ -231,10 +232,21 @@ impl SafetyError {
     }
 }
 
+/// Capacity of [`SafetyManager`]'s inline off-thread fault reclamation queue.
+pub const RETIRED_STATE_CAPACITY: usize = 16;
+
 /// Safety Manager tracking safety state machine and command generation ID
 #[derive(Debug, Clone)]
 pub struct SafetyManager {
-    state: SafetyState,
+    state_arc: Arc<SafetyState>,
+    idle_arc: Arc<SafetyState>,
+    armed_arc: Arc<SafetyState>,
+    moving_arc: Arc<SafetyState>,
+    estop_arc: Arc<SafetyState>,
+    retired_state_arcs: [Option<Arc<SafetyState>>; RETIRED_STATE_CAPACITY],
+    retired_head: usize,
+    retired_len: usize,
+    off_thread_reclaim: bool,
     epoch_id: u64,
     /// Code recorded by the trigger site of the current Fault.
     fault_code: Option<FaultCode>,
@@ -242,8 +254,17 @@ pub struct SafetyManager {
 
 impl Default for SafetyManager {
     fn default() -> Self {
+        let idle_arc = Arc::new(SafetyState::Idle);
         Self {
-            state: SafetyState::Idle,
+            state_arc: Arc::clone(&idle_arc),
+            idle_arc,
+            armed_arc: Arc::new(SafetyState::Armed),
+            moving_arc: Arc::new(SafetyState::Moving),
+            estop_arc: Arc::new(SafetyState::EStop),
+            retired_state_arcs: std::array::from_fn(|_| None),
+            retired_head: 0,
+            retired_len: 0,
+            off_thread_reclaim: false,
             epoch_id: 1,
             fault_code: None,
         }
@@ -256,7 +277,63 @@ impl SafetyManager {
     }
 
     pub fn state(&self) -> &SafetyState {
-        &self.state
+        &self.state_arc
+    }
+
+    /// Cheap reference-counted snapshot of the current safety state (0 heap allocations).
+    pub fn state_arc(&self) -> Arc<SafetyState> {
+        Arc::clone(&self.state_arc)
+    }
+
+    /// Enables bounded off-thread fault state reclamation (fail-closed when full) for RT executor mode.
+    pub fn set_off_thread_reclaim(&mut self, enabled: bool) {
+        self.off_thread_reclaim = enabled;
+    }
+
+    /// True when the inline fault reclamation ring is at capacity.
+    pub fn retired_state_arcs_full(&self) -> bool {
+        self.retired_len >= RETIRED_STATE_CAPACITY
+    }
+
+    /// Number of retired heap-bearing fault states awaiting off-thread drop.
+    pub fn retired_state_arcs_len(&self) -> usize {
+        self.retired_len
+    }
+
+    /// Pops the oldest retired `Fault` state arc for off-thread drop (0 alloc, 0 drop).
+    pub fn pop_retired_state_arc(&mut self) -> Option<Arc<SafetyState>> {
+        if self.retired_len == 0 {
+            return None;
+        }
+        let arc = self.retired_state_arcs[self.retired_head].take();
+        self.retired_head = (self.retired_head + 1) % RETIRED_STATE_CAPACITY;
+        self.retired_len -= 1;
+        arc
+    }
+
+    /// Drops all queued retired fault states on a non-RT thread (legacy/pre-handoff cleanup).
+    pub fn drain_retired_state_arcs_off_thread(&mut self) {
+        while let Some(arc) = self.pop_retired_state_arc() {
+            drop(arc);
+        }
+    }
+
+    /// Replaces `state_arc` with `next`. When `off_thread_reclaim` is active and the current state
+    /// is a `Fault(_)`, queues the replaced `Arc` into `retired_state_arcs` without overwriting any
+    /// occupied slot; returns `false` (fail-closed, keeping the current `Fault` latched) if full.
+    fn try_replace_state_arc(&mut self, next: Arc<SafetyState>) -> bool {
+        if self.off_thread_reclaim && matches!(*self.state_arc, SafetyState::Fault(_)) {
+            if self.retired_len >= RETIRED_STATE_CAPACITY {
+                return false;
+            }
+            let prev = std::mem::replace(&mut self.state_arc, next);
+            let tail = (self.retired_head + self.retired_len) % RETIRED_STATE_CAPACITY;
+            self.retired_state_arcs[tail] = Some(prev);
+            self.retired_len += 1;
+            return true;
+        }
+        self.state_arc = next;
+        true
     }
 
     pub fn epoch_id(&self) -> u64 {
@@ -265,10 +342,10 @@ impl SafetyManager {
 
     /// Advance epoch and latch E-Stop immediately
     pub fn trigger_e_stop(&mut self) -> u64 {
-        if self.state != SafetyState::EStop {
-            tracing::warn!("Safety: {:?} -> EStop", self.state);
+        if *self.state_arc != SafetyState::EStop {
+            tracing::warn!("Safety: {:?} -> EStop", *self.state_arc);
         }
-        self.state = SafetyState::EStop;
+        let _ = self.try_replace_state_arc(Arc::clone(&self.estop_arc));
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
     }
@@ -276,7 +353,7 @@ impl SafetyManager {
     /// Structured cause of the current Fault / EStop; None in any other state.
     /// The `code` of [`Self::fault`] without building its message.
     pub fn fault_code(&self) -> Option<FaultCode> {
-        match &self.state {
+        match &*self.state_arc {
             SafetyState::EStop => Some(FaultCode::Estop),
             SafetyState::Fault(reason) => Some(self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason))),
             _ => None,
@@ -284,7 +361,7 @@ impl SafetyManager {
     }
 
     pub fn fault(&self) -> Option<FaultInfo> {
-        let (code, message) = match &self.state {
+        let (code, message) = match &*self.state_arc {
             SafetyState::EStop => (FaultCode::Estop, "E-stop latched".to_string()),
             SafetyState::Fault(reason) => (self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason)), reason.message()),
             _ => return None,
@@ -298,65 +375,110 @@ impl SafetyManager {
         self.trigger_fault_coded(code, reason)
     }
 
+    /// True when a fault transition can be accepted without overflowing the bounded off-thread
+    /// fault reclamation queue.
+    pub fn can_accept_fault_transition(&self) -> bool {
+        !(self.off_thread_reclaim
+            && matches!(*self.state_arc, SafetyState::Fault(_))
+            && self.retired_len >= RETIRED_STATE_CAPACITY)
+    }
+
+    /// Advance epoch and latch Fault lazily: when off-thread reclamation is saturated while already
+    /// faulted, fails closed without invoking `make_reason` (0 heap alloc / 0 drop on RT).
+    pub fn trigger_fault_coded_lazy(
+        &mut self,
+        code: FaultCode,
+        make_reason: impl FnOnce() -> FaultReason,
+    ) -> u64 {
+        if !self.can_accept_fault_transition() {
+            self.epoch_id = self.epoch_id.wrapping_add(1);
+            return self.epoch_id;
+        }
+        self.trigger_fault_coded(code, make_reason())
+    }
+
+    /// Fallible fault latch that returns `Err((epoch, reason))` without dropping `reason` when
+    /// off-thread reclamation is saturated while already faulted.
+    pub fn try_trigger_fault_coded(
+        &mut self,
+        code: FaultCode,
+        reason: FaultReason,
+    ) -> Result<u64, (u64, FaultReason)> {
+        if !self.can_accept_fault_transition() {
+            self.epoch_id = self.epoch_id.wrapping_add(1);
+            return Err((self.epoch_id, reason));
+        }
+        tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", *self.state_arc, reason);
+        self.fault_code = Some(code);
+        let replaced = self.try_replace_state_arc(Arc::new(SafetyState::Fault(reason)));
+        debug_assert!(replaced);
+        self.epoch_id = self.epoch_id.wrapping_add(1);
+        Ok(self.epoch_id)
+    }
+
     /// [`Self::trigger_fault`] with the code recorded by the trigger site.
     pub fn trigger_fault_coded(&mut self, code: FaultCode, reason: FaultReason) -> u64 {
-        tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", self.state, reason);
-        self.fault_code = Some(code);
-        self.state = SafetyState::Fault(reason);
-        self.epoch_id = self.epoch_id.wrapping_add(1);
-        self.epoch_id
+        match self.try_trigger_fault_coded(code, reason) {
+            Ok(ep) => ep,
+            Err((ep, _)) => ep,
+        }
     }
 
     /// Attempt to clear E-Stop or Fault back to Idle.
     /// Epoch is incremented to guarantee that any commands issued prior to fault clear are invalidated.
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
-        match &self.state {
+        match &*self.state_arc {
             SafetyState::EStop | SafetyState::Fault(_) => {
-                tracing::info!("Safety: {:?} cleared -> Idle", self.state);
-                self.state = SafetyState::Idle;
+                if !self.try_replace_state_arc(Arc::clone(&self.idle_arc)) {
+                    return Err(SafetyError::ClearFaultRejected(
+                        "Fault state reclamation queue is full; retry after off-thread drain".into(),
+                    ));
+                }
+                tracing::info!("Safety: cleared -> Idle");
                 self.fault_code = None;
                 self.epoch_id = self.epoch_id.wrapping_add(1);
-                Ok(self.state.clone())
+                Ok(SafetyState::Idle)
             }
-            _ => Ok(self.state.clone()),
+            other => Ok(other.clone()),
         }
     }
 
     /// Set torque enabled/disabled
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
-        if self.state.is_stopped() {
+        if self.state_arc.is_stopped() {
             if !enable {
                 return Err(SafetyError::MotionForbiddenInFaultState(
                     "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
                 ));
             }
-            if let SafetyState::Fault(ref reason) = self.state {
+            if let SafetyState::Fault(ref reason) = *self.state_arc {
                 return Err(SafetyError::FaultActive(reason.clone()));
             }
             return Err(SafetyError::EStopActive);
         }
 
         if enable {
-            self.state = SafetyState::Armed;
+            let _ = self.try_replace_state_arc(Arc::clone(&self.armed_arc));
+            Ok(SafetyState::Armed)
         } else {
-            self.state = SafetyState::Idle;
+            let _ = self.try_replace_state_arc(Arc::clone(&self.idle_arc));
+            Ok(SafetyState::Idle)
         }
-        Ok(self.state.clone())
     }
 
     /// Notify that motion has started
     pub fn mark_motion_started(&mut self) -> Result<(), SafetyError> {
-        if self.state != SafetyState::Armed && self.state != SafetyState::Moving {
-            return Err(SafetyError::NotArmed(self.state.clone()));
+        if *self.state_arc != SafetyState::Armed && *self.state_arc != SafetyState::Moving {
+            return Err(SafetyError::NotArmed((*self.state_arc).clone()));
         }
-        self.state = SafetyState::Moving;
+        let _ = self.try_replace_state_arc(Arc::clone(&self.moving_arc));
         Ok(())
     }
 
     /// Notify that motion has completed
     pub fn mark_motion_finished(&mut self) {
-        if self.state == SafetyState::Moving {
-            self.state = SafetyState::Armed;
+        if *self.state_arc == SafetyState::Moving {
+            let _ = self.try_replace_state_arc(Arc::clone(&self.armed_arc));
         }
     }
 
@@ -369,11 +491,11 @@ impl SafetyManager {
         limits: &[JointLimit],
     ) -> Result<(), SafetyError> {
         // 1. Safety state check
-        match &self.state {
+        match &*self.state_arc {
             SafetyState::EStop => return Err(SafetyError::EStopActive),
             SafetyState::Fault(reason) => return Err(SafetyError::FaultActive(reason.clone())),
             SafetyState::Booting | SafetyState::Idle => {
-                return Err(SafetyError::NotArmed(self.state.clone()));
+                return Err(SafetyError::NotArmed((*self.state_arc).clone()));
             }
             SafetyState::Armed | SafetyState::Moving => {}
         }

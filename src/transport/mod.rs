@@ -279,4 +279,11 @@ pub trait CanTransport: Send {
     fn supports_bounded_flush(&self) -> bool {
         false
     }
+
+    /// True when [`Self::receive`], [`Self::transmit`], and [`Self::flush`] are all non-blocking
+    /// and safe to drive directly from the synchronous RT executor (`armd-control`).
+    /// Blocking serial transports (`SlcanTransport`) default to `false`.
+    fn supports_nonblocking_rt(&self) -> bool {
+        false
+    }
 }

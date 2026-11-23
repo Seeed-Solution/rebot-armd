@@ -162,7 +162,12 @@ pub struct FakeBusState {
     /// fake time.
     pub tx_log: Vec<CanFrame>,
     pub tx_times: Vec<Option<Instant>>,
+    /// When false, skips pushing to `tx_log`/`tx_times` so long allocation tests never grow logs.
+    pub record_tx_log: bool,
     pub clock: Option<MockClock>,
+    /// Reusable scratch buffers keeping `transmit` and `receive` allocation-neutral.
+    scratch_frames: Vec<CanFrame>,
+    scratch_delayed: Vec<(Instant, CanFrame)>,
     /// TX-only loss: frames are accepted by the transport but never reach a motor.
     pub tx_lost: bool,
     /// Every transmit fails with an error.
@@ -352,9 +357,35 @@ impl FakeBus {
 
     fn build(limits: &[DamiaoLimits], clock: Option<MockClock>) -> Self {
         let motors = limits.iter().enumerate().map(|(i, l)| FakeMotor::new(i as u16 + 1, *l)).collect();
-        Self(Arc::new(Mutex::new(FakeBusState { motors, rx: VecDeque::new(), pending: VecDeque::new(), inject_on_next_tx: Vec::new(), inject_on_reg_write: Vec::new(), immediate_replies: false, on_disable: None, tx_log: Vec::new(), tx_times: Vec::new(), clock,
-            tx_lost: false, tx_error: false, tx_stall: false, stall_reg_writes: false, stall_step: Duration::from_millis(1), fail_tx_after: None,
-            fail_tx_ids: Vec::new(), rx_step: Duration::ZERO, tx_step: Duration::ZERO, fail_flushes: 0, poll_feeds_watchdog: false, follow_commands: true, delayed: Vec::new(), on_tx: None })))
+        Self(Arc::new(Mutex::new(FakeBusState {
+            motors,
+            rx: VecDeque::with_capacity(256),
+            pending: VecDeque::with_capacity(256),
+            inject_on_next_tx: Vec::with_capacity(32),
+            inject_on_reg_write: Vec::with_capacity(32),
+            immediate_replies: false,
+            on_disable: None,
+            tx_log: Vec::with_capacity(2048),
+            tx_times: Vec::with_capacity(2048),
+            record_tx_log: true,
+            clock,
+            scratch_frames: Vec::with_capacity(64),
+            scratch_delayed: Vec::with_capacity(64),
+            tx_lost: false,
+            tx_error: false,
+            tx_stall: false,
+            stall_reg_writes: false,
+            stall_step: Duration::from_millis(1),
+            fail_tx_after: None,
+            fail_tx_ids: Vec::new(),
+            rx_step: Duration::ZERO,
+            tx_step: Duration::ZERO,
+            fail_flushes: 0,
+            poll_feeds_watchdog: false,
+            follow_commands: true,
+            delayed: Vec::with_capacity(64),
+            on_tx: None,
+        })))
     }
     pub fn with<R>(&self, f: impl FnOnce(&mut FakeBusState) -> R) -> R { f(&mut self.0.lock().unwrap()) }
     pub fn tx_log(&self) -> Vec<CanFrame> { self.with(|s| s.tx_log.clone()) }
@@ -365,12 +396,16 @@ impl CanTransport for FakeBus {
     fn clock(&self) -> Option<Arc<dyn DriverClock>> {
         self.0.lock().unwrap().clock.clone().map(|c| Arc::new(c) as Arc<dyn DriverClock>)
     }
+    fn supports_bounded_flush(&self) -> bool { true }
+    fn supports_nonblocking_rt(&self) -> bool { true }
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
         let mut s = self.0.lock().unwrap();
         if let Some(c) = &s.clock { c.advance(s.tx_step); }
         let t = s.now();
-        s.tx_log.push(*frame);
-        s.tx_times.push(t);
+        if s.record_tx_log {
+            s.tx_log.push(*frame);
+            s.tx_times.push(t);
+        }
         if let Some(h) = s.on_tx.clone() { h(); }
         if s.stall_reg_writes && frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
             return Err(TransportError::WouldBlock);
@@ -389,18 +424,23 @@ impl CanTransport for FakeBus {
         if frame.data == damiao::CMD_DISABLE {
             if let Some(h) = s.on_disable.clone() { h(); }
         }
-        let stale = std::mem::take(&mut s.inject_on_next_tx);
-        s.rx.extend(stale);
-        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE {
-            let stale = std::mem::take(&mut s.inject_on_reg_write);
-            s.rx.extend(stale);
+        if !s.inject_on_next_tx.is_empty() {
+            let state = &mut *s;
+            state.rx.extend(state.inject_on_next_tx.drain(..));
+        }
+        if frame.id == 0x7FF && frame.data[2] == damiao::REG_WRITE && !s.inject_on_reg_write.is_empty() {
+            let state = &mut *s;
+            state.rx.extend(state.inject_on_reg_write.drain(..));
         }
         if !s.tx_lost {
             let before = s.rx.len();
             s.handle(frame);
-            if !s.immediate_replies {
-                let replies: Vec<CanFrame> = s.rx.drain(before..).collect();
-                s.pending.extend(replies);
+            if !s.immediate_replies && s.rx.len() > before {
+                let mut tmp = std::mem::take(&mut s.scratch_frames);
+                tmp.clear();
+                tmp.extend(s.rx.drain(before..));
+                for f in tmp.drain(..) { s.pending.push_back(f); }
+                s.scratch_frames = tmp;
             }
         }
         Ok(())
@@ -409,9 +449,20 @@ impl CanTransport for FakeBus {
         let mut s = self.0.lock().unwrap();
         s.run_watchdogs();
         if let Some(now) = s.now() {
-            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut s.delayed).into_iter().partition(|(t, _)| *t <= now);
-            s.delayed = later;
-            s.rx.extend(due.into_iter().map(|(_, f)| f));
+            if !s.delayed.is_empty() {
+                let mut later = std::mem::take(&mut s.scratch_delayed);
+                later.clear();
+                let mut delayed = std::mem::take(&mut s.delayed);
+                for (t, f) in delayed.drain(..) {
+                    if t <= now {
+                        s.rx.push_back(f);
+                    } else {
+                        later.push((t, f));
+                    }
+                }
+                s.delayed = later;
+                s.scratch_delayed = delayed;
+            }
         }
         match s.rx.pop_front() {
             Some(f) => {
@@ -419,8 +470,9 @@ impl CanTransport for FakeBus {
                 Ok(f)
             }
             None => {
-                let p = std::mem::take(&mut s.pending);
-                s.rx.extend(p);
+                while let Some(f) = s.pending.pop_front() {
+                    s.rx.push_back(f);
+                }
                 Err(TransportError::WouldBlock)
             }
         }

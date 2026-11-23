@@ -175,6 +175,10 @@ impl CanTransport for SocketCanTransport {
     fn supports_bounded_flush(&self) -> bool {
         true
     }
+
+    fn supports_nonblocking_rt(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -196,6 +200,10 @@ impl CanTransport for SocketCanTransport {
     }
 
     fn supports_bounded_flush(&self) -> bool {
+        true
+    }
+
+    fn supports_nonblocking_rt(&self) -> bool {
         true
     }
 }

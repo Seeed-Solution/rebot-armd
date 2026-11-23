@@ -91,18 +91,20 @@ impl SupervisorInner {
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
         #[cfg(feature = "policy-runtime")]
-        match policy {
-            StopPolicy::NormalUnload => {
-                self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
-            }
-            StopPolicy::EStopLatch => {
-                self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
-            }
-            StopPolicy::ThermalTrip => {
-                self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
-            }
-            StopPolicy::BusLossFallback => {
-                self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+        if self.policy_run.is_some() {
+            match policy {
+                StopPolicy::NormalUnload => {
+                    self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
+                }
+                StopPolicy::EStopLatch => {
+                    self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+                }
+                StopPolicy::ThermalTrip => {
+                    self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
+                }
+                StopPolicy::BusLossFallback => {
+                    self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+                }
             }
         }
         if policy == StopPolicy::NormalUnload && !self.supports_automatic_unload() {
@@ -292,18 +294,15 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.active_trajectory = None;
                 self.servo_target = None;
-                let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+                if self.measured_positions.iter().all(|p| p.is_finite())
                     && self.measured_positions.len() == self.config.dof
                 {
-                    self.measured_positions.clone()
-                } else {
-                    self.commanded_positions.clone()
-                };
-                self.target_positions = hold_pos.clone();
-                self.commanded_positions = hold_pos;
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                    crate::rt_core::scratch::copy_into(&mut self.commanded_positions, &self.measured_positions);
+                }
+                crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
+                self.commanded_velocities.fill(0.0);
                 if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    self.measured_velocities.fill(0.0);
                 }
                 self.safety.trigger_e_stop();
             }
