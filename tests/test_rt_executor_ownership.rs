@@ -20,7 +20,7 @@ static ALLOC: armd::diagnostics::alloc::TimedAlloc = armd::diagnostics::alloc::T
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,8 @@ use armd::rt_core::broker::{
 };
 use armd::rt_core::config_iface::{ConfigAuthority, ConfigDomain};
 use armd::rt_core::executor::{
-    assert_not_in_rt_release, in_rt_release, ExecutorConfig, MaintenanceOp, OwnerError, PanicPolicy,
-    PersistTestHooks, ReleaseGuard, RtExecutorHandle,
+    assert_not_in_rt_release, in_rt_release, ExecutorClock, ExecutorConfig, MaintenanceOp,
+    OwnerError, PanicPolicy, PersistTestHooks, ReleaseGuard, RtExecutorHandle,
 };
 use armd::rt_core::ids::ArmId;
 use armd::rt_core::mailbox::{Refusal, StreamId, TargetFrame, MAX_DOF};
@@ -99,6 +99,7 @@ struct ThreadAuditDriver {
     read_count: Arc<AtomicUsize>,
     torque_pending: Option<(bool, Instant)>,
     confirm_delay: Duration,
+    clock: Option<Arc<dyn ExecutorClock>>,
 }
 
 impl ThreadAuditDriver {
@@ -129,13 +130,18 @@ impl ThreadAuditDriver {
             read_count: reads.clone(),
             torque_pending: None,
             confirm_delay: Duration::from_millis(14),
+            clock: None,
         };
         (drv, enforce, threads, tokio_entered, missing_guard, writes, reads)
     }
 
-    fn with_confirm_delay(mut self, delay: Duration) -> Self {
-        self.confirm_delay = delay;
+    fn with_clock(mut self, clock: Arc<dyn ExecutorClock>) -> Self {
+        self.clock = Some(clock);
         self
+    }
+
+    fn now(&self) -> Instant {
+        self.clock.as_ref().map_or_else(Instant::now, |c| c.now())
     }
 
     fn record_access(&self) {
@@ -198,7 +204,7 @@ impl ArmDriver for ThreadAuditDriver {
     }
     fn begin_torque_budgeted(&mut self, enable: bool, _max_rx_frames: u16) -> Result<TorqueProgress, ArmDriverError> {
         self.record_access();
-        let wake = Instant::now() + self.confirm_delay;
+        let wake = self.now() + self.confirm_delay;
         self.torque_pending = Some((enable, wake));
         Ok(TorqueProgress::Pending { wake })
     }
@@ -209,7 +215,7 @@ impl ArmDriver for ThreadAuditDriver {
     ) -> Result<TorqueProgress, ArmDriverError> {
         self.record_access();
         if let Some((enable, ready_at)) = self.torque_pending {
-            if Instant::now() >= ready_at {
+            if self.now() >= ready_at {
                 self.enabled = enable;
                 self.torque_pending = None;
                 return Ok(TorqueProgress::Done(TorqueOutcome::Confirmed));
@@ -219,6 +225,7 @@ impl ArmDriver for ThreadAuditDriver {
         Err(ArmDriverError::Protocol("no torque transition pending".into()))
     }
     fn torque_transition_pending(&self) -> bool { self.torque_pending.is_some() }
+    fn clock_now(&self) -> Instant { self.now() }
     fn supports_rt_executor(&self) -> Result<(), &'static str> { Ok(()) }
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.enabled }
@@ -237,14 +244,14 @@ impl ArmDriver for ThreadAuditDriver {
         out.clear();
         out.resize(self.dof, Some(1));
     }
-    fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(Instant::now()); self.dof] }
+    fn feedback_instants(&self) -> Vec<Option<Instant>> { vec![Some(self.now()); self.dof] }
     fn feedback_instants_into(&self, out: &mut Vec<Option<Instant>>) {
         out.clear();
-        out.resize(self.dof, Some(Instant::now()));
+        out.resize(self.dof, Some(self.now()));
     }
     fn feedback_receive_instants_into(&self, out: &mut Vec<Option<Instant>>) {
         out.clear();
-        out.resize(self.dof, Some(Instant::now()));
+        out.resize(self.dof, Some(self.now()));
     }
     fn feedback_seqs(&self) -> Vec<u64> { vec![1; self.dof] }
     fn feedback_seqs_into(&self, out: &mut Vec<u64>) {
@@ -1232,66 +1239,180 @@ fn single_budgeted_rx_pass_and_zero_rx_torque_begin_and_unsupported_serial() {
 // 6. Release clock across overruns (`skipped_releases`) and sub-release wakes
 // ============================================================================
 
+/// Deterministic scripted clock gating executor sleeps to an explicit virtual time ceiling
+/// (`limit_ns`) so release cadence, overruns, and sub-release wakes execute identically under
+/// arbitrary host CPU scheduling load.
+struct ScriptedExecutorClock {
+    base: Instant,
+    state: Mutex<ScriptedClockState>,
+    cv: Condvar,
+}
+
+struct ScriptedClockState {
+    now_ns: u64,
+    limit_ns: u64,
+    waiting_for_ns: Option<u64>,
+}
+
+impl ScriptedExecutorClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            state: Mutex::new(ScriptedClockState {
+                now_ns: 0,
+                limit_ns: 0,
+                waiting_for_ns: None,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn advance_limit_to(&self, limit_ns: u64) {
+        let mut s = self.state.lock().unwrap();
+        if limit_ns > s.limit_ns {
+            s.limit_ns = limit_ns;
+        }
+        self.cv.notify_all();
+    }
+
+    fn wait_until_parked_at(&self, target_ns: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut s = self.state.lock().unwrap();
+        while s.waiting_for_ns != Some(target_ns) {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "timed out waiting for scripted executor clock to park at {} ms (now={} ms, limit={} ms, waiting_for={:?})",
+                target_ns / 1_000_000,
+                s.now_ns / 1_000_000,
+                s.limit_ns / 1_000_000,
+                s.waiting_for_ns.map(|ns| ns / 1_000_000)
+            );
+            let (next, _) = self.cv.wait_timeout(s, rem).unwrap();
+            s = next;
+        }
+    }
+}
+
+impl ExecutorClock for ScriptedExecutorClock {
+    fn now(&self) -> Instant {
+        let ns = self.state.lock().unwrap().now_ns;
+        self.base + Duration::from_nanos(ns)
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.state.lock().unwrap().now_ns
+    }
+
+    fn sleep_until_ns(&self, target_ns: u64, stop: &AtomicBool) {
+        let mut s = self.state.lock().unwrap();
+        while !stop.load(Ordering::Acquire) && s.now_ns < target_ns && s.limit_ns < target_ns {
+            s.waiting_for_ns = Some(target_ns);
+            self.cv.notify_all();
+            s = self.cv.wait(s).unwrap();
+        }
+        s.waiting_for_ns = None;
+        if !stop.load(Ordering::Acquire) && s.now_ns < target_ns {
+            s.now_ns = target_ns;
+        }
+        self.cv.notify_all();
+    }
+
+    fn sleep(&self, dur: Duration, stop: &AtomicBool) {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        let add_ns = dur.as_nanos().min(u128::from(u64::MAX)) as u64;
+        s.now_ns = s.now_ns.saturating_add(add_ns);
+        self.cv.notify_all();
+    }
+
+    fn wake(&self) {
+        let _guard = self.state.lock().unwrap();
+        self.cv.notify_all();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wakes() {
-    // Use a 50ms period with widened host-jitter margins so parallel CI scheduling cannot
-    // swallow the sub-release wake or drop a healthy release dt below the floor, while keeping
-    // the exact skipped-release, real-dt overrun, sub-release wake, and non-collapsed-dt
-    // semantics unchanged.
+    let clock = ScriptedExecutorClock::new();
     let (drv, ..) = ThreadAuditDriver::new(7);
-    let drv = drv.with_confirm_delay(Duration::from_millis(85));
+    let drv = drv.with_clock(clock.clone());
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(drv)));
     sup.set_lease_enabled(false).await;
     let delay = Arc::new(Mutex::new(None));
     let hooks = PersistTestHooks {
         release_delay_once: Some(delay.clone()),
+        clock: Some(clock.clone()),
         ..Default::default()
     };
     let handle = sup
-        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(50)), hooks)
+        .start_executor_with_hooks(ExecutorConfig::for_tests(Duration::from_millis(10)), hooks)
         .await
         .unwrap();
 
-    // Let 2 clean releases run, then inject a 200ms overrun (4 periods).
-    wait_until_async(Duration::from_secs(2), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
-    *delay.lock().unwrap() = Some(Duration::from_millis(200));
+    // Let 2 clean releases run (10ms, 20ms), then inject a 45ms overrun (> 4 periods) on release 3.
+    clock.advance_limit_to(20_000_000);
+    clock.wait_until_parked_at(30_000_000, Duration::from_secs(2));
+    assert_eq!(handle.stats().steps.load(Ordering::Relaxed), 2);
+
+    *delay.lock().unwrap() = Some(Duration::from_millis(45));
     let steps_before = handle.stats().steps.load(Ordering::Relaxed);
-    wait_until_async(Duration::from_secs(3), || {
-        handle.stats().steps.load(Ordering::Relaxed) >= steps_before + 3
-    })
-    .await;
+    // Release 3 starts at 30ms and overruns by 45ms -> ends at 75ms; release 4 runs immediately at
+    // 75ms (skipping 40/50/60/70 -> skipped = 3, dt = 45ms), then 80ms, 90ms, 100ms realign on grid.
+    clock.advance_limit_to(100_000_000);
+    clock.wait_until_parked_at(110_000_000, Duration::from_secs(2));
+    assert!(handle.stats().steps.load(Ordering::Relaxed) >= steps_before + 3);
 
     let skipped = handle.stats().skipped_releases.load(Ordering::Relaxed);
-    assert!(skipped >= 2, "expected skipped_releases >= 2 after 200ms overrun on 50ms period, got {skipped}");
+    assert!(skipped >= 2, "expected skipped_releases >= 2 after 45ms overrun on 10ms period, got {skipped}");
     let samples = sup.tick_samples();
     assert!(
-        samples.iter().any(|s| s.period_us >= 170_000),
-        "expected real elapsed dt >= 170ms after overrun; samples={:?}",
+        samples.iter().any(|s| s.period_us >= 40_000),
+        "expected real elapsed dt >= 40ms after overrun; samples={:?}",
         samples.iter().map(|s| s.period_us).collect::<Vec<_>>()
     );
 
-    // Sub-release torque confirmation wake (confirm_delay = 85ms on a 50ms period -> fires ~35ms
-    // into Release N+1, ~15ms before Release N+2, as a genuine sub-release wake!) must execute
-    // at least 1 measured wake and NOT collapse the release `dt` spanning that wake (~50ms vs
-    // ~15ms if the wake wrongly reset `last_release`, leaving 28ms of host-jitter headroom).
+    // Obtain current broker authority without racing the parked executor thread, then park
+    // cleanly at the next release boundary before submitting `TorqueOn`.
+    let snap_task = tokio::task::spawn_blocking({
+        let h = handle.clone();
+        move || h.planning_snapshot().unwrap()
+    });
+    let mut limit_ns = 110_000_000u64;
+    let snap = loop {
+        clock.advance_limit_to(limit_ns);
+        clock.wait_until_parked_at(limit_ns + 10_000_000, Duration::from_secs(2));
+        if snap_task.is_finished() {
+            break snap_task.await.unwrap();
+        }
+        limit_ns += 10_000_000;
+    };
+
+    // Sub-release torque confirmation wake (confirm_delay = 14ms on a 10ms period -> committed at
+    // Release N with wake at N + 14ms -> fires 4ms into Release N+1 as a genuine sub-release wake!)
+    // must execute at least 1 measured wake and NOT collapse the release `dt` spanning that wake!
     let wakes_before = handle.stats().wakes.load(Ordering::Relaxed);
     let steps_before_wake = handle.stats().steps.load(Ordering::Relaxed);
     let samples_before_wake = sup.tick_samples().len();
-    let req = submit_broker_transition(&handle, 1, TransitionOp::TorqueOn);
+    let req = {
+        let deadline = clock.now() + Duration::from_secs(5);
+        let mut b = handle.broker().lock().unwrap();
+        b.submit(ClientId(1), 1, snap.authority, deadline, Submit::Transition(TransitionOp::TorqueOn))
+            .unwrap()
+    };
+    // Advance 5 releases (+50ms): commit, poll + sub-release wake (+14ms), and 3 post-wake releases.
+    clock.advance_limit_to(limit_ns + 50_000_000);
     assert_eq!(wait_broker_terminal(&handle, req, Duration::from_secs(2)), Outcome::Completed);
+    clock.wait_until_parked_at(limit_ns + 60_000_000, Duration::from_secs(2));
     let wakes_after = handle.stats().wakes.load(Ordering::Relaxed);
     assert!(
         wakes_after > wakes_before,
         "expected a genuine sub-release wake (wakes {wakes_before} -> {wakes_after})"
     );
-    let steps_at_terminal = handle.stats().steps.load(Ordering::Relaxed);
-    let target_steps = steps_at_terminal + 2;
-    let min_wake_samples = (target_steps.saturating_sub(steps_before_wake) as usize).max(2);
-    wait_until_async(Duration::from_secs(2), || {
-        handle.stats().steps.load(Ordering::Relaxed) >= target_steps
-            && sup.tick_samples().len() >= samples_before_wake + min_wake_samples
-    })
-    .await;
+    let steps_after_wake = handle.stats().steps.load(Ordering::Relaxed);
+    let min_wake_samples = (steps_after_wake.saturating_sub(steps_before_wake) as usize).max(2);
     // Slice the exact non-empty diagnostic window produced strictly across the injected wake.
     let all_samples = sup.tick_samples();
     let recent: Vec<u32> = all_samples[samples_before_wake..]
@@ -1305,8 +1426,8 @@ async fn release_clock_tracks_skipped_releases_and_preserves_real_dt_across_wake
         min_wake_samples
     );
     assert!(
-        recent.iter().all(|&p| p >= 22_000),
-        "sub-release wake reset release dt below ~50ms period: {recent:?}"
+        recent.iter().all(|&p| p >= 7_000),
+        "sub-release wake reset release dt below ~10ms period: {recent:?}"
     );
     handle.stop_and_join();
 }
