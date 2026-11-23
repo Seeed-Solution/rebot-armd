@@ -174,6 +174,8 @@ impl ArmCore {
     /// displaces goes to the retire ring; when that ring is full it comes back, for the
     /// caller to drop off the control thread. Refused (the observation comes back as Err)
     /// while an [`ObservationBuffer`] is out.
+    // the refused observation comes back by value (not on the tick; boxing it would allocate)
+    #[allow(clippy::result_large_err)]
     pub fn publish_displacing(&mut self, generation: u64, sampled_at: Instant, valid_until: Instant, obs: ArmObservation, positions: &[f32], velocities: &[f32]) -> Result<Option<ArmObservation>, ArmObservation> {
         if self.buffer_out { return Err(obs); }
         let rt = RtInputs { positions, velocities, feedback_instants: &self.feedback.instants, feedback_seqs: &self.feedback.seqs };
