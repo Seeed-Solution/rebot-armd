@@ -373,6 +373,57 @@ fn readback_requires_motor_master_can_id_and_ctrl_mode_rid() {
 }
 
 #[test]
+fn readback_reply_at_or_after_50ms_deadline_times_out_fail_closed() {
+    let valid_reply = || {
+        let b = damiao::CTRL_MODE_POS_FORCE.to_le_bytes();
+        CanFrame::new_standard(0x17, &[7, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+    };
+    let step_to_readback_sent = || -> (DamiaoArmDriver<FakeBus>, FakeBus, MockClock, std::time::Instant) {
+        let (mut d, bus, clock) = rig(true);
+        bus.with(|s| s.motors[J7].silent_after_mode_ack = true);
+        let mut p = d.begin_torque(true).unwrap();
+        loop {
+            match p {
+                armd::driver::TorqueProgress::Pending { wake } if bus.tx_log().iter().any(|f| is_reg_read(f, 7, damiao::RID_CTRL_MODE)) => {
+                    return (d, bus, clock, wake);
+                }
+                armd::driver::TorqueProgress::Pending { .. } => {
+                    clock.advance(Duration::from_micros(500));
+                    p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+                }
+                armd::driver::TorqueProgress::Done(_) => panic!("unexpectedly finished before readback"),
+            }
+        }
+    };
+
+    // 1. Reply sitting in RX at exact 50 ms deadline or 10 ms past it must time out (fail closed).
+    for past in [Duration::ZERO, Duration::from_millis(10)] {
+        let (mut d, bus, clock, deadline) = step_to_readback_sent();
+        bus.with(|s| { s.motors[J7].silent = false; s.rx.push_back(valid_reply()); });
+        let dt = deadline.saturating_duration_since(clock.now()) + past;
+        clock.advance(dt);
+        let err = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap_err().to_string();
+        assert!(err.contains("no fresh reply within 50 ms"), "past={past:?}: {err}");
+        assert!(!d.is_enabled());
+        assert!(!d.motor_current_cap().unwrap().active);
+        assert!(!bus.tx_log().iter().any(|f| f.data == damiao::CMD_ENABLE));
+        assert!(d.write_joint_targets(&targets(-0.5)).is_err());
+    }
+
+    // 2. Reply arriving 1 ms before the 50 ms deadline is accepted and enables.
+    let (mut d, bus, clock, deadline) = step_to_readback_sent();
+    bus.with(|s| { s.motors[J7].silent = false; s.rx.push_back(valid_reply()); });
+    let dt = deadline.saturating_duration_since(clock.now()).saturating_sub(Duration::from_millis(1));
+    clock.advance(dt);
+    let mut p = d.poll_torque(clock.now() + Duration::from_millis(5)).expect("reply before 50 ms deadline accepted");
+    while let armd::driver::TorqueProgress::Pending { .. } = p {
+        clock.advance(Duration::from_micros(500));
+        p = d.poll_torque(clock.now() + Duration::from_millis(5)).unwrap();
+    }
+    assert!(d.is_enabled() && d.motor_current_cap().unwrap().active);
+}
+
+#[test]
 fn recovery_hold_of_a_stale_j7_is_capped() {
     let (mut d, bus, clock) = rig(true);
     d.set_torque(true).unwrap();

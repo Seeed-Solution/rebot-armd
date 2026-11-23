@@ -3277,10 +3277,33 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.readback_or_enable()
     }
 
-    /// Serve the base-mode restore: replies complete or deadline passed -> enable frames.
+    /// Serve the base-mode restore: replies complete before the deadline -> readback / enable;
+    /// once the deadline passes, post-deadline replies are ignored and missing joints fail closed.
     fn poll_restore(&mut self, w: ModeWrite) -> Result<TorqueProgress, ArmDriverError> {
+        if w.deadline.passed(self.now()) {
+            let failed = self.write_modes_finish(w);
+            self.enable_failed();
+            return Err(ArmDriverError::HardwareFault(format!(
+                "Control mode of joints {:?} could not be restored before enable",
+                failed.iter().map(|i| i + 1).collect::<Vec<_>>())));
+        }
         let _ = self.read_joint_states();
-        if !self.mode_write_replied(&w) && !w.deadline.passed(self.now()) {
+        if w.deadline.passed(self.now()) {
+            self.register_reply_log.retain(|(_, _, rx_at, _, _)| !w.deadline.passed(*rx_at));
+            self.register_replies.clear();
+            for (rep, ..) in &self.register_reply_log {
+                if self.register_replies.len() < 64 { self.register_replies.push(*rep); }
+            }
+            let failed = self.write_modes_finish(w);
+            if !failed.is_empty() {
+                self.enable_failed();
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "Control mode of joints {:?} could not be restored before enable",
+                    failed.iter().map(|i| i + 1).collect::<Vec<_>>())));
+            }
+            return self.readback_or_enable();
+        }
+        if !self.mode_write_replied(&w) {
             let wake = w.deadline.at;
             self.torque_hs = Some(DamiaoTorque::Restore(w));
             return Ok(TorqueProgress::Pending { wake });
@@ -3327,9 +3350,16 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     }
 
     /// Serve the readback: the request goes out once a receive pass observed an empty queue; only
-    /// a read reply dequeued after that (motor ID, read opcode, CTRL_MODE) counts; value 4 enables.
+    /// a read reply dequeued after that (expected master CAN ID, motor ID, read opcode, CTRL_MODE)
+    /// and strictly before the 50 ms deadline counts; value 4 enables.
     fn poll_readback(&mut self, mut r: ModeReadback) -> Result<TorqueProgress, ArmDriverError> {
+        if r.deadline.passed(self.now()) {
+            return self.readback_failed(r.joint, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()));
+        }
         let _ = self.read_joint_states();
+        if r.deadline.passed(self.now()) {
+            return self.readback_failed(r.joint, format!("no fresh reply within {} ms", REGISTER_REPLY_TIMEOUT.as_millis()));
+        }
         let id = self.motor_ids[r.joint];
         match r.boundary {
             None if self.last_read_drained => {
@@ -3344,7 +3374,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             Some(b) => {
                 let expected_id = self.expected_reply_id(r.joint);
                 let reply = self.register_reply_log.iter().rev()
-                    .find(|(rep, fid, _, seq, _)| *fid == expected_id && rep.motor_id == id && !rep.write && rep.rid == damiao::RID_CTRL_MODE && *seq > b)
+                    .find(|(rep, fid, rx_at, seq, _)| !r.deadline.passed(*rx_at) && *fid == expected_id && rep.motor_id == id && !rep.write && rep.rid == damiao::RID_CTRL_MODE && *seq > b)
                     .map(|(rep, ..)| rep.as_u32());
                 match reply {
                     Some(v) if v == damiao::CTRL_MODE_POS_FORCE => {
