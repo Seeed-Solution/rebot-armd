@@ -211,8 +211,8 @@ fn baseline_obs(inner: &SupervisorInner) -> armd::model::GripperBaselineObs {
 }
 
 /// New finger, nothing learned: the close uses the absolute rule (contact_torque_nm) and is not
-/// learned; "unlearned" until a move is learned; plain opens teach the opening direction, which
-/// closes then use.
+/// learned; "unlearned" until a move is learned. From the first plain open on, closes use the
+/// opening tables (+0.08 N·m) and run at speed.
 #[test]
 fn new_finger_unlearned_uses_the_absolute_rule_and_learns_from_opens() {
     let (mut inner, rig) = rig(Finger::New);
@@ -228,21 +228,21 @@ fn new_finger_unlearned_uses_the_absolute_rule_and_learns_from_opens() {
     inner.commanded_positions[6] = 0.0;
     inner.target_positions[6] = 0.0;
     inner.tick(DT);
-    for _ in 0..4 {
+    // one plain open: the closing direction uses the opening tables (+0.08 N·m), and every
+    // further close/open cycle keeps it so (closes are not learned)
+    for k in 0..4 {
         let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
         assert_eq!(a.state, "done");
-        let (a, _) = run(&mut inner, req(GripperCommand::Move, Some(0.05), 1.0));
-        assert_eq!(a.state, "done");
+        let obs = baseline_obs(&inner);
+        assert!(obs.open_moves as usize == k + 1 && obs.close_moves == 0, "{obs:?}");
+        inner.gripper_last_contact = None;
+        let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
+        let c = inner.gripper_last_contact;
+        eprintln!("close after {} open(s): {} in {t:.1} s, contact {c:?}", k + 1, a.state);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "{a:?}");
+        assert!(t < 7.5, "{t:.1} s");
+        if let Some(c) = c { assert!(c.at_rad > -0.35, "early contact {c:?}"); }
     }
-    let obs = baseline_obs(&inner);
-    assert!(obs.open_moves >= 4 && obs.close_moves == 0, "{obs:?}");
-    let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
-    assert_eq!(a.state, "done");
-    inner.gripper_last_contact = None;
-    let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
-    eprintln!("close on open-learned baseline: {} in {t:.1} s, contact {:?}", a.state, inner.gripper_last_contact);
-    assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "{a:?}");
-    assert!(t < 7.5, "{t:.1} s");
     // a grasp close is never learned
     assert_eq!(baseline_obs(&inner).close_moves, 0);
 }
@@ -529,3 +529,26 @@ fn lubricated_finger_spread_near_open() {
     assert!(rig.lock().unwrap().peak_tau < cap() + 0.25);
 }
 
+
+/// Lubricated finger (p90 0.69 N·m near open, closing 10 % above opening): one plain open is
+/// enough for air closes to run at speed on the opening tables.
+#[test]
+fn lubricated_finger_one_open_then_air_closes() {
+    let (mut inner, rig) = rig(Finger::Lube);
+    rig.lock().unwrap().q[6] = 0.0;
+    inner.commanded_positions[6] = 0.0;
+    inner.target_positions[6] = 0.0;
+    inner.tick(DT);
+    let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
+    assert_eq!(a.state, "done");
+    for _ in 0..5 {
+        inner.gripper_last_contact = None;
+        let (a, t) = run(&mut inner, req(GripperCommand::Close, None, 1.0));
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(false)), "{a:?}");
+        assert!(t < 7.5, "{t:.1} s");
+        if let Some(c) = inner.gripper_last_contact { assert!(c.at_rad > -0.35, "early contact {c:?}"); }
+        let (a, _) = run(&mut inner, req(GripperCommand::Open, None, 1.0));
+        assert_eq!(a.state, "done");
+    }
+    assert_eq!(baseline_obs(&inner).close_moves, 0);
+}
