@@ -14,6 +14,8 @@ use crate::kinematics::{self, Pose};
 use crate::model::{CameraMount, JointLimit, WorkspacePolicy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::{GripperPolicy, HoldingMode};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::gripper_baseline::{ContactInfo, ContactSource, Direction, FreeTorqueBaseline, MoveRecord, MoveSamples, ThresholdSource};
 use crate::trajectory::MultiJointQuinticTrajectory;
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -961,6 +963,19 @@ pub struct GripperRequest {
 pub const GRIPPER_DEFAULT_TIMEOUT_S: f64 = 6.0;
 /// Added to the expected duration for the default gripper deadline (s).
 pub const GRIPPER_TIMEOUT_MARGIN_S: f64 = 2.0;
+/// Default deadline: the commanded travel time x this ...
+pub const GRIPPER_TRAVEL_TIME_FACTOR: f64 = 1.2;
+/// ... bounded by this (s), the largest explicit `timeout_s` (a full 5.7 rad stroke at 0.3 rad/s
+/// gives 1.2 x 19 + 0.5 + 0.3 + 2 = 25.6 s).
+pub const GRIPPER_MAX_DEFAULT_TIMEOUT_S: f64 = 30.0;
+/// A default (derived) gripper deadline may be extended by at most this (s), and only while the
+/// jaw moves unloaded: progressing toward the target with |τ| within the learned free-motion
+/// threshold over the whole window. Against an obstacle it is never extended.
+pub const GRIPPER_MAX_EXTENSION_S: f64 = 2.0;
+/// Deadline extension: the jaw counts as progressing when it moved at least
+/// GRIPPER_PROGRESS_RAD toward the target over the last GRIPPER_PROGRESS_WINDOW_S.
+pub const GRIPPER_PROGRESS_WINDOW_S: f64 = 0.5;
+pub const GRIPPER_PROGRESS_RAD: f32 = 0.02;
 
 /// Body of `/api/v1/action/gripper`.
 pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
@@ -1047,17 +1062,21 @@ pub const SETTLE_POS_RAD: f64 = 0.05;
 pub const SETTLE_VEL: f64 = 0.05;
 /// An open / move gripper action that stops within this distance of its target counts as done.
 pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
+/// A calibration stroke must end within this distance of its target (rad).
+pub const CALIBRATION_END_TOL_RAD: f32 = 0.03;
 pub const SETTLE_HOLD_S: f64 = 0.2;
 /// Grasp contact: consecutive ticks of torque rise or following error.
 pub const GRIPPER_CONTACT_TICKS: u32 = 2;
+/// Grasp contact from the torque above a learned baseline:
+/// consecutive ticks (one more than GRIPPER_CONTACT_TICKS: the margin is closer to free motion).
+pub const GRIPPER_BASELINE_CONTACT_TICKS: u32 = 3;
+
 /// Grasp contact from the following error: command at least this far ahead of the jaw (rad) ...
 pub const GRIPPER_CONTACT_LAG_RAD: f32 = 0.30;
 /// ... while the jaw closes slower than this fraction of the requested speed.
 pub const GRIPPER_CONTACT_SLOW_FRACTION: f32 = 0.3;
 /// J7 speed (rad/s) from contact to the contact stop.
 pub const GRIPPER_CONTACT_SPEED: f32 = 0.3;
-/// A grasp squeeze above the gripper torque cap is reduced to aim at this fraction of the cap.
-pub const SQUEEZE_CAP_FRACTION: f32 = 0.8;
 /// Squeeze after a torque cap trip: press in from the measured position, reaching squeeze_rad
 /// in half the squeeze window (settle_ms), until |τ| reaches this fraction of the cap (or squeeze_rad past the measured position).
 pub const SQUEEZE_RAMP_FRACTION: f32 = 0.6;
@@ -1145,6 +1164,72 @@ impl PathTrajectory {
     }
 }
 
+/// Contact stiffness bounds for [`CapRamp`] (N·m/rad).
+pub const CAP_RAMP_K_MIN: f32 = 2.0;
+pub const CAP_RAMP_K_MAX: f32 = 5000.0;
+/// Stiffness assumed when a ramp starts without a measured trip (N·m/rad).
+pub const CAP_RAMP_K_UNKNOWN: f32 = 300.0;
+/// The ramp steps only while |τ| is below the hold torque minus this (N·m).
+pub const CAP_RAMP_MARGIN_NM: f32 = 0.05;
+/// Torque-cap trips on one contact after which the grip is no longer ramped back in.
+pub const CAP_RAMP_MAX_TRIPS: u32 = 3;
+
+/// Grip ramp after a torque-cap latch (servo streams, grasp squeeze): presses back in from
+/// the measured jaw toward a hold torque below the cap, with steps sized from the contact
+/// stiffness so the predicted torque after a step stays at or below the hold torque.
+///
+/// The stiffness estimate starts from the trip (|τ| over the command's lead on the jaw at the
+/// over-cap sample) and only grows with each step's observed torque change (Δτ / Δq), so a
+/// stiff contact is never stepped into with a soft estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CapRamp {
+    /// Contact stiffness estimate (N·m/rad).
+    pub k_est: f32,
+    /// Torque-cap trips on this contact.
+    pub trips: u32,
+    last_step: f32,
+    last_tau: f32,
+}
+
+impl CapRamp {
+    /// A ramp after a trip at |τ| `tau_abs` with the command `lead` rad ahead of the jaw.
+    pub fn from_trip(tau_abs: f32, lead: f32) -> Self {
+        let k = if lead > 1e-3 && tau_abs.is_finite() { tau_abs / lead } else { CAP_RAMP_K_UNKNOWN };
+        Self { k_est: k.clamp(CAP_RAMP_K_MIN, CAP_RAMP_K_MAX), trips: 1, last_step: 0.0, last_tau: 0.0 }
+    }
+
+    /// A ramp without a measured trip (stiffness unknown).
+    pub fn unknown() -> Self { Self { k_est: CAP_RAMP_K_UNKNOWN, trips: 0, last_step: 0.0, last_tau: 0.0 } }
+
+    /// A ramp continuing a supervisor latch with stiffness estimate `k` (one trip so far).
+    pub fn with_k(k: f32) -> Self { Self { k_est: k.clamp(CAP_RAMP_K_MIN, CAP_RAMP_K_MAX), trips: 1, last_step: 0.0, last_tau: 0.0 } }
+
+    /// Another trip on the same contact.
+    pub fn trip(&mut self, tau_abs: f32, lead: f32) {
+        let k = Self::from_trip(tau_abs, lead).k_est;
+        self.k_est = self.k_est.max(k);
+        self.trips = self.trips.saturating_add(1);
+        self.last_step = 0.0;
+    }
+
+    /// No more ramping on this contact (too many trips).
+    pub fn exhausted(&self) -> bool { self.trips >= CAP_RAMP_MAX_TRIPS }
+
+    /// Step (rad, >= 0, in the closing direction) for the current |τ| toward `hold_nm`, at most
+    /// `max_step`; 0 at or above `hold_nm - CAP_RAMP_MARGIN_NM` or once exhausted.
+    pub fn step(&mut self, tau_abs: f32, hold_nm: f32, max_step: f32) -> f32 {
+        if self.last_step > 1e-6 && tau_abs.is_finite() {
+            let k_obs = (tau_abs - self.last_tau) / self.last_step;
+            if k_obs.is_finite() { self.k_est = self.k_est.max(k_obs.min(CAP_RAMP_K_MAX)); }
+        }
+        self.last_tau = tau_abs;
+        let room = hold_nm - tau_abs;
+        let dq = if self.exhausted() || !tau_abs.is_finite() || room <= CAP_RAMP_MARGIN_NM { 0.0 } else { (room / self.k_est).min(max_step).max(0.0) };
+        self.last_step = dq;
+        dq
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
 enum GripPhase {
@@ -1152,7 +1237,7 @@ enum GripPhase {
     /// Squeezing an object: hold target, samples of |τ_gripper| and |load_gripper|.
     /// `ramp`: the squeeze started at the measured position after a torque cap trip and
     /// presses in (squeeze_rad over half the window) until the torque reaches SQUEEZE_RAMP_FRACTION of the cap.
-    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32>, ramp: bool },
+    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32>, ramp: bool, cap_ramp: CapRamp },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1175,6 +1260,37 @@ pub struct GripperMotion {
     /// again when the contact gave way (`contact_yielded`).
     pub contact_rad: Option<f32>,
     contact_ticks: u32,
+    /// Free-motion torque baseline of the active tool (snapshot at the start of the move).
+    baseline: Option<FreeTorqueBaseline>,
+    /// Which moves are recorded for learning ([`Self::take_learning`]).
+    learn: LearnMode,
+    samples: Option<MoveSamples>,
+    /// Last contact verdict of this move.
+    pub last_contact: Option<ContactInfo>,
+    /// A contact verdict, a stall or a torque cap trip farther than holding_gap_rad from the
+    /// target: the move is not unloaded and is not learned.
+    loaded: bool,
+    learned: Option<MoveRecord>,
+    /// Default deadline: extended while the jaw progresses (up to `hard_timeout_s`).
+    extendable: bool,
+    hard_timeout_s: f64,
+    progress_ref: (f64, f32),
+    /// Every tick of the current progress window moved within the learned free-motion threshold.
+    window_unloaded: bool,
+    /// Stiffness estimate of the supervisor's torque-cap latch ([`Self::set_cap_stiffness`]).
+    cap_k: Option<f32>,
+}
+
+/// Which finished gripper moves are offered to the free-motion baseline.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnMode {
+    Off,
+    /// Opening moves only (every ordinary gripper action): nothing is compressed while opening.
+    Opening,
+    /// A calibration stroke the operator started with nothing in the jaws
+    /// (`"baseline": "calibrate"` / `"reset"`): opening and non-grasp closing moves.
+    Calibration,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1190,10 +1306,82 @@ impl GripperMotion {
             }
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        let mut m = Self { request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0 };
-        m.timeout_s = m.request.timeout_s
-            .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
+        let mut m = Self {
+            request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false,
+            phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0,
+            baseline: None, learn: LearnMode::Off, samples: None,
+            last_contact: None, loaded: false, learned: None, extendable: false, hard_timeout_s: 0.0, progress_ref: (0.0, start),
+            window_unloaded: true, cap_k: None,
+        };
+        m.extendable = m.request.timeout_s.is_none();
+        m.timeout_s = m.request.timeout_s.unwrap_or_else(|| m.default_timeout_s());
+        m.hard_timeout_s = if m.extendable { (m.timeout_s + GRIPPER_MAX_EXTENSION_S).min(GRIPPER_MAX_DEFAULT_TIMEOUT_S).max(m.timeout_s) } else { m.timeout_s };
         m
+    }
+
+    /// Use `baseline` (the active tool's free-motion torque) for the contact threshold and record
+    /// the move for [`Self::take_learning`] as `learn` allows (Seek moves and grasp closes are
+    /// never recorded).
+    pub fn with_baseline(mut self, baseline: Option<FreeTorqueBaseline>, learn: LearnMode) -> Self {
+        self.baseline = baseline;
+        let closing = (self.target - self.start) * self.close_dir() > 0.0;
+        let recorded = match learn {
+            LearnMode::Off => false,
+            LearnMode::Opening => !closing,
+            LearnMode::Calibration => !(closing && self.request.grasp),
+        };
+        self.learn = if recorded && self.request.command != GripperCommand::Seek { learn } else { LearnMode::Off };
+        if self.learn != LearnMode::Off { self.samples = Some(MoveSamples::default()); }
+        self
+    }
+
+    /// The finished move when it was unloaded (no contact, stall or torque cap trip away from
+    /// the target, no object held): offered to the baseline once.
+    pub fn take_learning(&mut self) -> Option<MoveRecord> { self.learned.take() }
+
+    /// Stiffness estimate of the supervisor's torque-cap latch (set each tick by the supervisor;
+    /// None without a latch): a squeeze that starts after a cap trip ramps with it.
+    pub fn set_cap_stiffness(&mut self, k: Option<f32>) { self.cap_k = k; }
+
+    /// Upper bound of the deadline (s): the explicit `timeout_s`, else the derived bound.
+    pub fn hard_timeout_s(&self) -> f64 { self.hard_timeout_s }
+
+    /// Contact torque threshold at jaw `m_g` moving at `mv` (rad/s): (threshold, source,
+    /// baseline). Off without `contact_torque_nm`; without a learned baseline near `m_g` it is
+    /// `contact_torque_nm` (the absolute rule).
+    fn contact_threshold(&self, m_g: f32, mv: f32) -> (Option<f32>, ThresholdSource, Option<f32>) {
+        match crate::gripper_baseline::closing_contact_threshold(self.baseline.as_ref(), m_g, mv.abs(),
+            self.policy.contact_torque_nm, self.policy.max_close_torque_nm) {
+            None => (None, ThresholdSource::None, None),
+            Some((t, true, b)) => (Some(t), ThresholdSource::Baseline, b),
+            Some((t, false, b)) => (Some(t), ThresholdSource::Uncalibrated, b),
+        }
+    }
+
+    /// Mark the move loaded when `at` is farther than holding_gap_rad from the target.
+    fn note_load(&mut self, at: f32) {
+        if (self.target - at).abs() > self.policy.holding_gap_rad { self.loaded = true; }
+    }
+
+    /// A Done move: keep it for learning when unloaded.
+    fn finish_learning(&mut self, m_g: f32, holding: Option<bool>) {
+        if self.learn == LearnMode::Off || self.loaded || holding == Some(true) || !m_g.is_finite() { return; }
+        let tol = if self.learn == LearnMode::Calibration { CALIBRATION_END_TOL_RAD } else { self.policy.holding_gap_rad.max(GRIPPER_STOP_SHORT_RAD) };
+        if (self.target - m_g).abs() > tol { return; }
+        let Some(samples) = self.samples.take() else { return };
+        let direction = if (self.target - self.start) * self.close_dir() > 0.0 { Direction::Close } else { Direction::Open };
+        self.learned = Some(MoveRecord { direction, start_rad: self.start, end_rad: m_g, samples, calibration: self.learn == LearnMode::Calibration });
+    }
+
+    /// Default deadline (s): the travel at the requested speed with GRIPPER_TRAVEL_TIME_FACTOR
+    /// margin (the real jaw lags its command: B601-DM full closes at 0.3 rad/s took 20.0-21.1 s
+    /// for 19 s of commanded travel), plus 0.5 s, the squeeze window and
+    /// GRIPPER_TIMEOUT_MARGIN_S; at least GRIPPER_DEFAULT_TIMEOUT_S, at most
+    /// GRIPPER_MAX_DEFAULT_TIMEOUT_S.
+    pub fn default_timeout_s(&self) -> f64 {
+        let travel = f64::from((self.target - self.start).abs()) / self.request.speed;
+        (GRIPPER_TRAVEL_TIME_FACTOR * travel + 0.5 + self.policy.settle_ms as f64 / 1000.0 + GRIPPER_TIMEOUT_MARGIN_S)
+            .clamp(GRIPPER_DEFAULT_TIMEOUT_S, GRIPPER_MAX_DEFAULT_TIMEOUT_S)
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.
@@ -1238,9 +1426,10 @@ impl GripperMotion {
         // it: release it on every tick, not only the first. Only a stall in the travel direction holds.
         let clear = ctx.gripper_stalled && (self.target - q_g) * ctx.gripper_stall_sign < -1e-4;
         let stalled = ctx.gripper_stalled && !clear;
-        let progress_of = |q: f32| -> f32 {
-            let span = (self.target - self.start).abs();
-            if span < 1e-6 { 1.0 } else { (1.0 - (self.target - q).abs() / span).clamp(0.0, 1.0) }
+        let (p_target, p_start) = (self.target, self.start);
+        let progress_of = move |q: f32| -> f32 {
+            let span = (p_target - p_start).abs();
+            if span < 1e-6 { 1.0 } else { (1.0 - (p_target - q).abs() / span).clamp(0.0, 1.0) }
         };
         let done = |holding: Option<bool>, gap: Option<f32>| StepStatus::Done { settled: None, holding, gripper_gap_rad: gap };
 
@@ -1269,19 +1458,33 @@ impl GripperMotion {
         let contact_stop = self.contact_stop();
         let yielded = self.contact_yielded(m_g, tau_g, ctx.torque_feedback);
         let mut rearm = false;
-        if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp } = &mut self.phase {
+        // the deadline covers the squeeze too (with its rearms): past it the action fails; a
+        // squeeze keeps its hold (the grip on an object stays), a move holds the measured jaw
+        if self.elapsed > self.timeout_s {
+            if let GripPhase::Squeeze { hold, .. } = &self.phase {
+                if idx < positions.len() { positions[idx] = *hold; }
+                return StepOut { positions, velocities, progress: 1.0, clear_gripper_stall: false,
+                    status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
+                        "Gripper did not finish within {:.1} s (squeezing at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+            }
+        }
+        if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp, cap_ramp } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
             loads.push(ctx.loads.get(idx).copied().unwrap_or(0.0).abs());
-            // torque cap: back the squeeze off toward the measured position so the grip
-            // torque settles near SQUEEZE_CAP_FRACTION of the cap (position-proportional grip)
+            // torque cap: over it the squeeze holds the measured jaw and ramps in again
             if let Some(cap) = force_cap {
                 let press = (*hold - m_g) * dir;
                 if tau_g.abs() > cap {
-                    if press > 0.0 { *hold = m_g + dir * press * (SQUEEZE_CAP_FRACTION * cap / tau_g.abs()); }
-                    *ramp = false;
-                } else if *ramp && tau_g.abs() < SQUEEZE_RAMP_FRACTION * cap && press < squeeze_rad {
-                    *hold += dir * ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
+                    // over the cap: hold the measured jaw (no press), like the supervisor's latch,
+                    // then press in again on the stiffness-sized ramp (CapRamp) up to
+                    // SQUEEZE_RAMP_FRACTION of the cap; after CAP_RAMP_MAX_TRIPS trips it holds
+                    if *ramp { cap_ramp.trip(tau_g.abs(), press.max(0.0)); } else { *cap_ramp = CapRamp::from_trip(tau_g.abs(), press.max(0.0)); }
+                    if press > 0.0 { *hold = m_g; }
+                    *ramp = true;
+                } else if *ramp && press < squeeze_rad {
+                    let max_step = ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
+                    *hold += dir * cap_ramp.step(tau_g.abs(), SQUEEZE_RAMP_FRACTION * cap, max_step);
                 }
             }
             if idx < positions.len() { positions[idx] = *hold; }
@@ -1326,30 +1529,76 @@ impl GripperMotion {
                             && median_abs_load >= req
                     }
                 };
+                self.finish_learning(m_g, Some(holding));
                 done(Some(holding), Some(gap))
             } else { StepStatus::Running };
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: clear };
         }
 
+        // Default deadline: while the jaw progresses toward the target, it covers the remaining
+        // stroke at the current speed limit (the contact speed after a contact), up to the bound.
+        if self.extendable {
+            let toward = (self.target - self.start).signum();
+            let travel_dir = if toward * dir > 0.0 { Direction::Close } else { Direction::Open };
+            let cap = self.policy.max_close_torque_nm;
+            let unloaded = ctx.feedback_fresh && ctx.torque_feedback && !stalled && self.contact_rad.is_none()
+                && self.baseline.as_ref().and_then(|b| b.estimate(m_g, travel_dir, mv_g.abs()))
+                    .is_some_and(|e| tau_g.abs() <= e.threshold_nm(cap));
+            self.window_unloaded &= unloaded;
+        }
+        if self.extendable && self.elapsed - self.progress_ref.0 >= GRIPPER_PROGRESS_WINDOW_S - 1e-9 && m_g.is_finite() {
+            let toward = (self.target - self.start).signum();
+            // progressing: at least half the current speed limit over the window (a creep that
+            // only just moves earns nothing), with |τ| within the free-motion threshold
+            let min_progress = GRIPPER_PROGRESS_RAD.max(0.5 * self.limit.max_velocity * GRIPPER_PROGRESS_WINDOW_S as f32);
+            if self.window_unloaded && (m_g - self.progress_ref.1) * toward >= min_progress {
+                let remaining = f64::from((active_target - m_g).abs());
+                let need = self.elapsed + remaining / f64::from(self.limit.max_velocity.max(0.05))
+                    + 0.5 + self.policy.settle_ms as f64 / 1000.0 + GRIPPER_TIMEOUT_MARGIN_S;
+                self.timeout_s = self.timeout_s.max(need).min(self.hard_timeout_s);
+            }
+            self.progress_ref = (self.elapsed, m_g);
+            self.window_unloaded = true;
+        }
         if self.elapsed > self.timeout_s {
             if idx < positions.len() { positions[idx] = m_g; }
             return StepOut { positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
                 status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
                     "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
         }
+        if stalled { self.note_load(m_g); }
+        if ctx.gripper_force_capped { self.loaded = true; }
+        // a calibration stroke must not stall anywhere (near the target included)
+        if self.learn == LearnMode::Calibration && (stalled || (ctx.gripper_force_capped && !clear)) { self.loaded = true; }
+        if ctx.feedback_fresh && ctx.torque_feedback {
+            if let Some(s) = self.samples.as_mut() { s.push(m_g, tau_g.abs(), mv_g.abs()); }
+        }
 
         let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
-        // Grasp contact: torque rise (contact_torque_nm, once the jaw has moved) or following
-        // error (command ahead while the jaw slows down) for GRIPPER_CONTACT_TICKS ticks.
+        // Grasp contact: torque above the contact threshold (learned baseline + margin; without
+        // a baseline the move-start estimate or contact_torque_nm; once the jaw has moved) or
+        // following error (command ahead while the jaw slows down), sustained.
         if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !stalled {
-            let torque_hit = ctx.torque_feedback && self.moved
-                && self.policy.contact_torque_nm.is_some_and(|c| tau_g.abs() >= c);
+            let (threshold, threshold_source, baseline_nm) = self.contact_threshold(m_g, mv_g);
+            let torque_hit = ctx.torque_feedback && self.moved && threshold.is_some_and(|c| tau_g.abs() >= c);
             let lag_hit = (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD
                 && mv_g * dir < GRIPPER_CONTACT_SLOW_FRACTION * self.request.speed as f32;
             self.contact_ticks = if torque_hit || lag_hit { self.contact_ticks + 1 } else { 0 };
-            if self.contact_ticks >= GRIPPER_CONTACT_TICKS {
+            let needed = if lag_hit || threshold_source == ThresholdSource::ContactTorqueNm { GRIPPER_CONTACT_TICKS } else { GRIPPER_BASELINE_CONTACT_TICKS };
+            if self.contact_ticks >= needed {
                 self.contact_rad = Some(m_g);
                 self.limit.max_velocity = self.limit.max_velocity.min(GRIPPER_CONTACT_SPEED);
+                self.note_load(m_g);
+                let tau = tau_g.abs();
+                self.last_contact = Some(ContactInfo {
+                    at_rad: m_g,
+                    torque_nm: tau,
+                    threshold_nm: threshold,
+                    baseline_nm,
+                    margin_nm: baseline_nm.map(|b| tau - b),
+                    source: if torque_hit { ContactSource::Torque } else { ContactSource::Lag },
+                    threshold_source,
+                });
             }
         }
         let stop = self.contact_stop();
@@ -1389,17 +1638,20 @@ impl GripperMotion {
                 if idx < positions.len() { positions[idx] = hold; }
                 if idx < velocities.len() { velocities[idx] = 0.0; }
                 let ramp = capped && self.policy.max_close_torque_nm.is_some();
-                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp };
+                let cap_ramp = self.cap_k.map_or_else(CapRamp::unknown, CapRamp::with_k);
+                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp, cap_ramp };
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {
             if idx < positions.len() { positions[idx] = q_g; }
             if idx < velocities.len() { velocities[idx] = 0.0; }
+            self.finish_learning(m_g, None);
             done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
         } else if self.request.command != GripperCommand::Seek && still && ((m_g - self.target).abs() < SETTLE_POS_RAD as f32
             || (cmd_at_target && (m_g - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
             // the jaw stopped close to the target: the real gripper opens to about -5.61 against a
             // -5.70 command (mechanical stop / POS_VEL offset); stopping farther away is a jam -> timeout
+            self.finish_learning(m_g, None);
             done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
         } else { StepStatus::Running };
         StepOut { positions, velocities, status, progress: progress_of(m_g), clear_gripper_stall: clear }

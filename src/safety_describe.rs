@@ -167,7 +167,7 @@ impl SupervisorInner {
         if let Some((joint, g)) = gripper.filter(|(_, g)| g.max_close_torque_nm.is_some()) {
             stops.push(json!({
                 "id": "gripper_force_limit",
-                "trigger": "|gripper torque| above max_close_torque_nm for persist_ticks consecutive ticks on fresh feedback while the jaw is driven closed, whatever its speed",
+                "trigger": "|gripper torque| above max_close_torque_nm for persist_ticks consecutive ticks on fresh feedback while the jaw is driven closed, or the torque pushing open above it while the jaw is driven open, whatever its speed",
                 "joint": joint,
                 "max_close_torque_nm": g.max_close_torque_nm,
                 "persist_ticks": GRIPPER_FORCE_CAP_TICKS,
@@ -183,7 +183,7 @@ impl SupervisorInner {
                 "stream_release_margin_rad": crate::supervisor::GRIPPER_FORCE_RELEASE_MARGIN_RAD,
                 "stream_contact_regulator": g.contact_torque_nm.zip(g.stream_contact_speed_rad_s).map(|(nm, speed)| json!({
                     "applies_to": ["servo_stream", "live_policy"],
-                    "trigger": "|gripper torque| at or above contact_torque_nm (or at or above the stall threshold with the jaw still) on fresh feedback while the stream closes",
+                    "trigger": "|gripper torque| at or above the contact threshold (learned free-motion baseline + margin, contact_torque_nm until learned; or at or above the stall threshold with the jaw still) on fresh feedback while the stream closes",
                     "target_torque_nm": nm,
                     "contact_speed_rad_s": speed,
                     "effect": "closing command advances at most contact_speed_rad_s past the last command while |torque| is below target_torque_nm; above it the lead over the jaw is scaled by target_torque_nm / |torque|",
@@ -403,6 +403,21 @@ impl SupervisorInner {
                     "squeeze_rad": g.squeeze_rad,
                     "contact_speed_rad_s": crate::motion::GRIPPER_CONTACT_SPEED,
                     "stream_contact_speed_rad_s": g.stream_contact_speed_rad_s,
+                    // closing speed of grasp / place / sequence closes and calibration strokes
+                    "close_speed_rad_s": g.close_speed(),
+                    // grasp contact relative to the learned free-motion torque (crate::gripper_baseline)
+                    "contact_baseline": {
+                        "rule": "contact when |torque| >= baseline(position, direction, speed band) + max(margin_floor_nm, margin_spreads x spread), at least min_contact_nm, below cap_fraction x max_close_torque_nm, for 3 ticks; where no baseline is learned, contact_torque_nm for 2 ticks; the torque cap does not depend on it",
+                        "margin_floor_nm": crate::gripper_baseline::MARGIN_FLOOR_NM,
+                        "margin_spreads": crate::gripper_baseline::MARGIN_SPREADS,
+                        "min_contact_nm": crate::gripper_baseline::MIN_CONTACT_NM,
+                        "cap_fraction": crate::gripper_baseline::CONTACT_CAP_FRACTION,
+                        "learned_from": "opening moves, and calibration strokes (gripper action with baseline calibrate/reset, nothing in the jaws, grasp false), that end at the target without a contact, stall or torque cap trip",
+                        "stall_raise_max_nm": crate::supervisor::GRIPPER_STALL_BASELINE_RAISE_MAX_NM,
+                        "stream_target_raise_max_nm": crate::supervisor::GRIPPER_STREAM_TARGET_RAISE_MAX_NM,
+                        "observation": "gripper.baseline",
+                        "calibrated": false,
+                    },
                 })),
                 "action_speed_max": {
                     "linear_mps": cap.and_then(|s| s.linear_mps).map_or(MAX_LINEAR_MPS, |v| MAX_LINEAR_MPS.min(f64::from(v))),

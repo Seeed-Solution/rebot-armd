@@ -494,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!(),
     }
     armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
+    armd::gripper_calib::spawn_baseline_persister(supervisor.clone());
 
     // The control loop runs on its own OS thread at real-time priority. On the
     // single-core SG2002 a tokio task shares one worker with HTTP/WS/video proxies

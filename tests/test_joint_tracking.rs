@@ -521,9 +521,24 @@ fn tracking_off_wire_equivalence() {
     assert_eq!(baseline.frames.len(), meta.frames);
     assert_eq!(baseline.obs.len(), meta.obs);
 
+    // Since e4f72b6 the gripper torque cap latches on the first sample over the cap
+    // (GRIPPER_FORCE_CAP_TICKS 1, was 2), which changes the grasp into the stiff block of step 7
+    // from its first over-cap sample on. The fixture is compared bit for bit up to there (the
+    // first gripper difference must not come before GRASP_CAP_FIRST_TICK); every run is then
+    // compared bit for bit with joint_tracking=None over the whole trace below.
+    const GRASP_CAP_FIRST_TICK: usize = 540;
+    let first_gripper_diff = frames_none.iter().zip(baseline.frames.iter())
+        .position(|(got, exp)| got.get(6).map(|t| t.position.to_bits()) != exp.get(6).map(|t| t.p))
+        .unwrap_or(baseline.frames.len());
+    assert!(first_gripper_diff >= GRASP_CAP_FIRST_TICK, "gripper differs from e4f72b6 at tick {first_gripper_diff}, before the grasp");
+    let first_obs_diff = obs_none.iter().zip(baseline.obs.iter())
+        .position(|(go, eo)| go.commanded_positions.get(6).map(|x| x.to_bits()) != eo.commanded_positions.get(6).copied()
+            || go.positions.get(6).map(|x| x.to_bits()) != eo.positions.get(6).copied())
+        .unwrap_or(baseline.obs.len());
+    assert!(first_obs_diff >= GRASP_CAP_FIRST_TICK, "gripper observation differs from e4f72b6 at {first_obs_diff}, before the grasp");
     let check_against_baseline = |label: &str, frames: &[Vec<JointTarget>], obs: &[ArmObservation]| {
         assert_eq!(frames.len(), baseline.frames.len(), "{label}: frame count vs e4f72b6");
-        for (k, (got, exp)) in frames.iter().zip(baseline.frames.iter()).enumerate() {
+        for (k, (got, exp)) in frames.iter().zip(baseline.frames.iter()).enumerate().take(first_gripper_diff) {
             assert_eq!(got.len(), exp.len(), "{label}: tick {k} dof vs e4f72b6");
             for (j, (gt, et)) in got.iter().zip(exp.iter()).enumerate() {
                 assert_eq!(gt.position.to_bits(), et.p, "{label}: tick {k} joint {j} position vs e4f72b6");
@@ -535,7 +550,7 @@ fn tracking_off_wire_equivalence() {
         }
         assert_eq!(obs.len(), baseline.obs.len(), "{label}: obs count vs e4f72b6");
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
-        for (k, (go, eo)) in obs.iter().zip(baseline.obs.iter()).enumerate() {
+        for (k, (go, eo)) in obs.iter().zip(baseline.obs.iter()).enumerate().take(first_obs_diff) {
             assert_eq!(bits(&go.positions), eo.positions, "{label}: tick {k} positions vs e4f72b6");
             assert_eq!(bits(&go.velocities), eo.velocities, "{label}: tick {k} velocities vs e4f72b6");
             assert_eq!(bits(&go.torques), eo.torques, "{label}: tick {k} torques vs e4f72b6");
@@ -543,7 +558,9 @@ fn tracking_off_wire_equivalence() {
             assert_eq!(go.is_torqued, eo.is_torqued, "{label}: tick {k} is_torqued vs e4f72b6");
             assert_eq!(format!("{:?}", go.safety_state), eo.safety_state, "{label}: tick {k} safety_state vs e4f72b6");
             assert_eq!(go.fault.as_ref().map(|f| format!("{f:?}")), eo.fault, "{label}: tick {k} fault vs e4f72b6");
-            assert_eq!(go.gripper.as_ref().map(|g| format!("{g:?}")), eo.gripper, "{label}: tick {k} gripper vs e4f72b6");
+            // `baseline` (learned free-motion torque) was added after e4f72b6
+            let gripper = go.gripper.clone().map(|g| format!("{:?}", armd::model::GripperObs { baseline: None, ..g }).replace(", baseline: None", ""));
+            assert_eq!(gripper, eo.gripper, "{label}: tick {k} gripper vs e4f72b6");
             assert_eq!(
                 go.motion_limit.as_ref().map(|m| format!("{:?}:{:?}", m.reason, m.joint)),
                 eo.motion_limit,
@@ -555,6 +572,26 @@ fn tracking_off_wire_equivalence() {
     check_against_baseline("joint_tracking=enabled:false vs e4f72b6", &frames_disabled, &obs_disabled);
     check_against_baseline("disabled block with MIT joints + record vs e4f72b6", &frames_mit_disabled, &obs_mit_disabled);
     check_against_baseline("no block + MIT record vs e4f72b6", &frames_mit_record, &obs_mit_record);
+    // the whole trace, every disabled mode against joint_tracking=None
+    let same = |label: &str, frames: &[Vec<JointTarget>], obs: &[ArmObservation]| {
+        assert_eq!(frames.len(), frames_none.len(), "{label}: frame count vs None");
+        for (k, (a, b)) in frames.iter().zip(frames_none.iter()).enumerate() {
+            for (j, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!((x.position.to_bits(), x.velocity.map(f32::to_bits), x.torque.map(f32::to_bits), x.kp.map(f32::to_bits), x.kd.map(f32::to_bits)),
+                    (y.position.to_bits(), y.velocity.map(f32::to_bits), y.torque.map(f32::to_bits), y.kp.map(f32::to_bits), y.kd.map(f32::to_bits)),
+                    "{label}: tick {k} joint {j} vs None");
+            }
+        }
+        assert_eq!(obs.len(), obs_none.len(), "{label}: obs count vs None");
+        for (k, (a, b)) in obs.iter().zip(obs_none.iter()).enumerate() {
+            let key = |o: &ArmObservation| (o.positions.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), o.commanded_positions.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                o.torques.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), o.is_torqued, format!("{:?}", o.safety_state), format!("{:?}", o.gripper), o.motion_limit.as_ref().map(|m| format!("{:?}:{:?}", m.reason, m.joint)));
+            assert_eq!(key(a), key(b), "{label}: tick {k} obs vs None");
+        }
+    };
+    same("joint_tracking=enabled:false", &frames_disabled, &obs_disabled);
+    same("disabled block with MIT joints + record", &frames_mit_disabled, &obs_mit_disabled);
+    same("no block + MIT record", &frames_mit_record, &obs_mit_record);
 }
 
 /// Tracking block with J4 and J5 on strategy `mit` (Phase 2 keys), `enabled` as given.
