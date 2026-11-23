@@ -11506,7 +11506,7 @@ function toolsRelease() {
 function toolsWizard(mode) {
   ssetOpen(false);
   if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; }
-  if (!CWZ.views.length) CWZ.mode = mode;
+  if (!CWZ.views.length) { CWZ.mode = mode; CWZ.modeChosen = true; }
   cwOpen(true);
 }
 $('tools-release').addEventListener('click', toolsRelease);
