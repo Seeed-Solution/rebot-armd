@@ -476,17 +476,29 @@ pub struct EstopAck {
 
 type EstopResult = Result<(SafetyState, u64), ArmError>;
 
-/// Bounded capacity of the off-thread E-stop waiter registry (keeps reader intake O(1) with
-/// zero heap allocation under the registry lock; physical E-stop still latches if full).
+pub(crate) enum EstopWait {
+    Resolved(EstopResult),
+    Pending(tokio::sync::oneshot::Receiver<EstopResult>),
+}
+
+/// Bounded capacity of the off-thread E-stop waiter registry and recent-ACK replay window
+/// (keeps off-reader registration bounded with zero heap growth past capacity; the reader
+/// path itself is lock-free and never touches [`EstopRegistry`]).
 pub(crate) const ESTOP_REGISTRY_CAPACITY: usize = 256;
 
-/// Off-thread lock-serialized E-stop waiter registry (never touched by `armd-control`).
+/// Off-thread lock-serialized E-stop waiter registry (never touched by `armd-control` or by
+/// the WS reader task).
 ///
-/// Waiters are pushed in strictly monotonic `req` order into a fixed-capacity ring so
-/// registration is O(1) and ACK/overflow/drain sweeps pop from the front without `BTreeMap`
-/// scans or temporary `Vec` allocations.
+/// The reader only executes lock-free atomics (`e_stop_latched` + `requested_estop_count`),
+/// and the spawned off-reader waiter calls [`Self::register_or_resolve`]. Waiters are kept
+/// sorted by ascending `req` (O(1) fast path when in-order, bounded insert when out-of-order),
+/// and a bounded `recent_acks` window preserves exact pinned `(SafetyState, epoch)` results
+/// when an ACK is drained before the off-reader task registers (even across `clear_fault`).
 pub(crate) struct EstopRegistry {
     waiters: VecDeque<(u64, tokio::sync::oneshot::Sender<EstopResult>)>,
+    recent_acks: VecDeque<EstopAck>,
+    evicted_ack_gen: u64,
+    max_overflow_gen: u64,
     ack_rx: Option<Consumer<EstopAck>>,
     overflow_gen: Option<Arc<AtomicU64>>,
     exited: Option<Arc<AtomicBool>>,
@@ -496,6 +508,9 @@ impl Default for EstopRegistry {
     fn default() -> Self {
         Self {
             waiters: VecDeque::with_capacity(ESTOP_REGISTRY_CAPACITY),
+            recent_acks: VecDeque::with_capacity(ESTOP_REGISTRY_CAPACITY),
+            evicted_ack_gen: 0,
+            max_overflow_gen: 0,
             ack_rx: None,
             overflow_gen: None,
             exited: None,
@@ -504,27 +519,78 @@ impl Default for EstopRegistry {
 }
 
 impl EstopRegistry {
-    pub(crate) fn register(&mut self, req: u64) -> tokio::sync::oneshot::Receiver<EstopResult> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.waiters.len() >= ESTOP_REGISTRY_CAPACITY {
-            // Amortized O(1): drop already-abandoned front waiters before rejecting.
-            while self.waiters.front().is_some_and(|(_, s)| s.is_closed()) {
-                self.waiters.pop_front();
+    fn check_resolved(&self, req: u64) -> Option<EstopResult> {
+        for ack in self.recent_acks.iter().rev() {
+            if req >= ack.first_gen && req <= ack.last_gen {
+                return Some(Ok(((*ack.state).clone(), ack.epoch)));
             }
         }
+        if req <= self.max_overflow_gen || req <= self.evicted_ack_gen {
+            return Some(Err(ArmError::Rejected {
+                status: 503,
+                code: "ESTOP_ACK_OVERFLOW".into(),
+                message: "E-stop acknowledgement ring overflowed; epoch cannot be pinned".into(),
+            }));
+        }
+        None
+    }
+
+    pub(crate) fn register_or_resolve(&mut self, req: u64) -> EstopWait {
+        self.pop_acks_and_overflow();
+        if let Some(res) = self.check_resolved(req) {
+            return EstopWait::Resolved(res);
+        }
+        if self.exited.as_ref().is_some_and(|e| e.load(Ordering::Acquire)) {
+            self.pop_acks_and_overflow();
+            if let Some(res) = self.check_resolved(req) {
+                return EstopWait::Resolved(res);
+            }
+            return EstopWait::Resolved(Err(ArmError::Rejected {
+                status: 503,
+                code: "EXECUTOR_STOPPED".into(),
+                message: "RT executor stopped before acknowledging E-stop".into(),
+            }));
+        }
         if self.waiters.len() >= ESTOP_REGISTRY_CAPACITY {
-            let _ = tx.send(Err(ArmError::Rejected {
+            // Off-reader pruning of abandoned waiters before rejecting.
+            self.waiters.retain(|(_, s)| !s.is_closed());
+        }
+        if self.waiters.len() >= ESTOP_REGISTRY_CAPACITY {
+            return EstopWait::Resolved(Err(ArmError::Rejected {
                 status: 503,
                 code: "ESTOP_QUEUE_FULL".into(),
                 message: "E-stop waiter registry is full; physical E-stop is latched".into(),
             }));
-            return rx;
         }
-        self.waiters.push_back((req, tx));
-        rx
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.waiters.back().is_none_or(|&(last, _)| req >= last) {
+            self.waiters.push_back((req, tx));
+        } else {
+            let pos = self.waiters.partition_point(|&(g, _)| g <= req);
+            self.waiters.insert(pos, (req, tx));
+        }
+        EstopWait::Pending(rx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register(&mut self, req: u64) -> tokio::sync::oneshot::Receiver<EstopResult> {
+        match self.register_or_resolve(req) {
+            EstopWait::Pending(rx) => rx,
+            EstopWait::Resolved(res) => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = tx.send(res);
+                rx
+            }
+        }
     }
 
     pub(crate) fn record_ack(&mut self, ack: EstopAck) {
+        if self.recent_acks.len() >= ESTOP_REGISTRY_CAPACITY {
+            if let Some(evicted) = self.recent_acks.pop_front() {
+                self.evicted_ack_gen = self.evicted_ack_gen.max(evicted.last_gen);
+            }
+        }
+        self.recent_acks.push_back(ack.clone());
         // Fast path (monotonic FIFO): pop every front waiter covered by this ACK in O(1) each.
         while self
             .waiters
@@ -559,6 +625,7 @@ impl EstopRegistry {
         if max_dropped == 0 {
             return;
         }
+        self.max_overflow_gen = self.max_overflow_gen.max(max_dropped);
         while self.waiters.front().is_some_and(|&(g, _)| g <= max_dropped) {
             if let Some((_, tx)) = self.waiters.pop_front() {
                 let _ = tx.send(Err(ArmError::Rejected {
@@ -2988,6 +3055,50 @@ mod tests {
         for mut rx in rxs {
             assert_eq!(rx.try_recv().unwrap().unwrap(), (SafetyState::EStop, 99));
         }
+    }
+
+    #[test]
+    fn estop_registry_resolves_early_ack_and_out_of_order_off_reader() {
+        let mut reg = EstopRegistry::default();
+        // ACK for req=1 arrives and is drained BEFORE the off-reader task registers req=1.
+        reg.record_ack(EstopAck {
+            first_gen: 1,
+            last_gen: 1,
+            state: Arc::new(SafetyState::EStop),
+            epoch: 11,
+        });
+        // Even after a later ACK for req=2 at epoch 15, registering req=1 resolves to pinned epoch 11.
+        reg.record_ack(EstopAck {
+            first_gen: 2,
+            last_gen: 2,
+            state: Arc::new(SafetyState::EStop),
+            epoch: 15,
+        });
+        match reg.register_or_resolve(1) {
+            EstopWait::Resolved(Ok((st, ep))) => assert_eq!((st, ep), (SafetyState::EStop, 11)),
+            _ => panic!("early ACK for req=1 must resolve immediately to pinned epoch 11"),
+        }
+        // Out-of-order off-reader registration: req=5 registers before req=3 and req=4.
+        let EstopWait::Pending(mut rx5) = reg.register_or_resolve(5) else { panic!("req 5 pending") };
+        let EstopWait::Pending(mut rx3) = reg.register_or_resolve(3) else { panic!("req 3 pending") };
+        let EstopWait::Pending(mut rx4) = reg.register_or_resolve(4) else { panic!("req 4 pending") };
+        reg.record_ack(EstopAck {
+            first_gen: 3,
+            last_gen: 4,
+            state: Arc::new(SafetyState::EStop),
+            epoch: 21,
+        });
+        assert_eq!(rx3.try_recv().unwrap().unwrap(), (SafetyState::EStop, 21));
+        assert_eq!(rx4.try_recv().unwrap().unwrap(), (SafetyState::EStop, 21));
+        assert!(rx5.try_recv().is_err(), "req=5 must stay pending");
+        reg.record_ack(EstopAck {
+            first_gen: 5,
+            last_gen: 5,
+            state: Arc::new(SafetyState::EStop),
+            epoch: 25,
+        });
+        assert_eq!(rx5.try_recv().unwrap().unwrap(), (SafetyState::EStop, 25));
+        assert!(reg.waiters.is_empty());
     }
 
     #[test]

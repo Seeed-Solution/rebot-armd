@@ -2889,3 +2889,130 @@ async fn teardown_cancels_and_ignores_late_blocking_planners_with_no_install_or_
         assert!(!inner.policy_loading, "policy_loading must remain cleared");
     }
 }
+
+// 20. Round-5 Item 3:
+//     (a) Full Stop reply queue (>64 Stops with stalled writer) NEVER causes reader_task to exit:
+//         reader keeps reading, coalesces Stops, latches an E-stop right behind them, and only
+//         writer_task closes the connection after its bounded grace.
+//     (b) Full auth reply queue (auth_task exits on auth_out_tx full) + another auth frame + E-stop:
+//         reader STILL does not exit and latches the E-stop immediately.
+//     (c) Lock-free reader E-stop registration: holding the ACK-drain `estop_reg` mutex does NOT
+//         block the WS reader from latching `e_stop_latched` and incrementing `requested_estop_count`;
+//         the executor applies E-stop while the mutex is still held, and releasing it delivers the
+//         exact pinned `epoch_sync`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_stop_reply_queue_never_exits_reader_and_estop_registration_is_lock_free() {
+    // (a) Flood >64 Stops while writer is stalled (filling the 64-slot stop_out_tx), then send E-stop.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn.clone());
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let ep = sup.get_observation().await.epoch_id;
+
+        // Give writer a generous timeout so it stays stalled during the Stop flood, then closes cleanly.
+        armd::api::ws::set_test_ws_write_timeout(&conn, Some(Duration::from_millis(600)));
+        armd::api::ws::set_test_ws_write_paused(&conn, true);
+        // Block writer on one ordinary frame.
+        send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/home", "body": {}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn) >= 1).await;
+
+        // Send 75 Stops (exceeding URGENT_OUT_CAPACITY = 64; each distinct invalid epoch bypasses
+        // coalescing so all 64 slots of stop_out_tx truly fill and the 65th+ hits Full).
+        for k in 0..75u64 {
+            send(&mut ws, json!({
+                "type": "command", "request_id": 100 + k, "generation": gen, "epoch_id": ep + 1000 + k,
+                "path": "/api/v1/motion/stop", "body": {}
+            })).await;
+        }
+        // Also send 5 coalescing Stops behind the full queue, followed immediately by E-stop.
+        for k in 0..5u64 {
+            send(&mut ws, json!({
+                "type": "command", "request_id": 200 + k, "generation": gen, "epoch_id": ep,
+                "path": "/api/v1/motion/stop", "body": {}
+            })).await;
+        }
+        send(&mut ws, json!({"type": "estop"})).await;
+
+        // Reader MUST stay alive past the full Stop reply queue and latch the E-stop immediately!
+        wait_until(Duration::from_millis(250), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+        wait_until(Duration::from_millis(250), || {
+            sup.inner().try_read().is_ok_and(|g| *g.safety.state() == SafetyState::EStop)
+        }).await;
+        // Connection must NOT have been closed prematurely by the reader while writer is within grace;
+        // only writer_task closes after its bounded grace.
+        assert!(
+            armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn),
+            "reader must not close connection on full Stop reply queue while writer is still within grace"
+        );
+        armd::api::ws::set_test_ws_write_paused(&conn, false);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+    }
+
+    // (b) Auth reply queue full (auth_task stops on auth_out_tx full) + extra auth + E-stop:
+    //     reader does NOT exit and latches the E-stop immediately.
+    {
+        let (addr, sup) = spawn_server(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }).await;
+        let (mut ws, gen) = controller(addr).await;
+        let conn = sup.inner().read().await.active_lease.as_ref().unwrap().client_id.clone();
+        let _guard = WriteHookGuard(conn.clone());
+        let ep = sup.get_observation().await.epoch_id;
+
+        armd::api::ws::set_test_ws_write_timeout(&conn, Some(Duration::from_millis(600)));
+        armd::api::ws::set_test_ws_write_paused(&conn, true);
+        send(&mut ws, json!({"type": "command", "request_id": 1, "generation": gen, "epoch_id": ep, "path": "/api/v1/motion/home", "body": {}})).await;
+        wait_until(Duration::from_secs(1), || armd::api::ws::test_ws_writer_blocked_count(&conn) >= 1).await;
+
+        for seq in 1..=40u64 {
+            send(&mut ws, json!({"type": "auth", "seq": seq, "token": null})).await;
+        }
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(250), || sup.e_stop_latched.load(Ordering::SeqCst)).await;
+        armd::api::ws::set_test_ws_write_paused(&conn, false);
+        wait_until(Duration::from_secs(2), || {
+            !armd::api::ws::connection_registry().lock().unwrap().contains_key(&conn)
+        }).await;
+    }
+
+    // (c) Lock-free reader E-stop registration: holding `estop_reg` (the ACK-drain mutex) must NOT
+    //     block the WS reader from latching `e_stop_latched` and incrementing `requested_estop_count`.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig { lease_timeout_ms: 15_000, ..ArmConfig::rebot_dm() }));
+        let addr = serve(sup.clone()).await;
+        let (mut ws, gen) = controller(addr).await;
+        let ep0 = sup.get_observation().await.epoch_id;
+        assert_eq!(rpc(&mut ws, gen, ep0, "/api/v1/torque", json!({"enable": true})).await["type"], "command_ack");
+        let handle = sup.start_executor(ExecutorConfig::for_tests(Duration::from_millis(5))).await.unwrap();
+        wait_until(Duration::from_secs(1), || handle.stats().steps.load(Ordering::Relaxed) >= 2).await;
+        let ep_pre = sup.observation().await.unwrap().epoch_id;
+        let req_before = sup.test_requested_estop_count();
+
+        // Hold the ACK-drain mutex across WS E-stop intake AND executor application!
+        let held = sup.test_lock_estop_registry();
+        send(&mut ws, json!({"type": "estop"})).await;
+        wait_until(Duration::from_millis(200), || {
+            sup.e_stop_latched.load(Ordering::SeqCst)
+                && sup.test_requested_estop_count() == req_before + 1
+        }).await;
+        // Executor applies E-stop on its next release even while `estop_reg` is still held!
+        wait_until(Duration::from_millis(200), || {
+            sup.hub().latest().is_some_and(|s| s.obs.safety_state == SafetyState::EStop && s.obs.epoch_id > ep_pre)
+        }).await;
+        let applied_epoch = sup.hub().latest().unwrap().obs.epoch_id;
+
+        // Release `estop_reg`: off-reader `finish_e_stop_checked` drains the early ACK and replies
+        // with the exact pinned epoch.
+        drop(held);
+        let reply = next_of(&mut ws, &["epoch_sync", "estop_reject"]).await;
+        assert_eq!(
+            (reply["type"].as_str(), reply["safety_state"].as_str(), reply["epoch_id"].as_u64()),
+            (Some("epoch_sync"), Some("EStop"), Some(applied_epoch)),
+            "early ACK after lock-free reader registration must resolve to exact pinned epoch: {reply}"
+        );
+        handle.stop_and_join();
+    }
+}

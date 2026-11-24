@@ -512,6 +512,11 @@ impl WsWriterHandle {
         self.fatal_triggered.load(Ordering::Acquire)
     }
 
+    /// True only once `writer_task` has dropped its receivers and closed the outbound pipeline.
+    fn is_writer_closed(&self) -> bool {
+        self.estop_tx.is_closed()
+    }
+
     fn mark_estop_admitted(&self) {
         self.estop_admitted_count.fetch_add(1, Ordering::SeqCst);
     }
@@ -618,6 +623,10 @@ impl WsWriterHandle {
             mpsc::error::TrySendError::Full(_) => mpsc::error::TrySendError::Full(()),
             mpsc::error::TrySendError::Closed(_) => mpsc::error::TrySendError::Closed(()),
         })
+    }
+
+    fn try_send_stop_best_effort(&self, reply: Value) -> bool {
+        self.stop_tx.try_send(reply).is_ok()
     }
 }
 
@@ -1149,7 +1158,7 @@ struct CoalescedStopWaiter {
     parsed_request_id: Option<u64>,
     request_id_valid: bool,
     body_error: Option<&'static str>,
-    permit: mpsc::OwnedPermit<Value>,
+    permit: Option<mpsc::OwnedPermit<Value>>,
 }
 
 struct ActiveStopBatch {
@@ -1267,7 +1276,10 @@ async fn deliver_urgent_stop_batch(
             last_request,
             per_waiter,
         );
-        waiter.permit.send(reply);
+        match waiter.permit {
+            Some(permit) => { permit.send(reply); }
+            None => { let _ = writer.try_send_stop_best_effort(reply); }
+        }
     }
     for reply in cancelled {
         if !writer.send_ordinary_control(reply).await {
@@ -2058,9 +2070,14 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
 
+            let is_estop = kind == "estop" || kind == "e_stop";
+            let is_stop = kind == "command"
+                && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop");
+
             // When fatal close is already in progress, keep draining inbound bytes so closing the
-            // TCP fd does not emit RST over unread flood traffic; still latch urgent E-stop.
-            if reader_writer.is_fatal() && kind != "estop" && kind != "e_stop" {
+            // TCP fd does not emit RST over unread flood traffic; still latch urgent E-stop and
+            // coalesce/apply urgent Stop until the writer finishes its bounded close.
+            if reader_writer.is_fatal() && !is_estop && !is_stop {
                 continue;
             }
 
@@ -2072,7 +2089,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         reader_writer.trigger_fatal(FatalClose::outbound_queue_full());
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // Never exit reader just because auth_task stopped on reply-queue capacity;
+                        // only exit if writer_task itself has already closed.
+                        if reader_writer.is_writer_closed() {
+                            break;
+                        }
+                    }
                 }
                 continue;
             }
@@ -2085,9 +2108,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
 
             // Urgent E-stop (both aliases): reserve urgent reply capacity BEFORE latching, ALWAYS
-            // latch immediately in O(1) via the atomic checked path, and never drop the reply even
-            // when the urgent reply queue is momentarily full (deliver as soon as a slot frees).
-            if kind == "estop" || kind == "e_stop" {
+            // latch immediately in O(1) via lock-free atomics (no ACK-drain mutex, no waiter scan),
+            // and never exit reader because of reply-queue capacity.
+            if is_estop {
                 reader_writer.mark_estop_admitted();
                 let estop_guard = reader_writer.enter_in_flight_estop();
                 let reserved = reader_writer.try_reserve_estop();
@@ -2125,13 +2148,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
 
             // Urgent Stop (`/api/v1/motion/stop`): non-blocking handoff; coalesces into an already
-            // pending Stop from this connection with matching lease/epoch; never enters ordinary queue.
-            if kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop") {
+            // pending Stop from this connection with matching lease/epoch; never enters ordinary
+            // queue and NEVER exits the reader on reply-queue capacity (only writer closes after
+            // its bounded grace, while reader keeps reading and latching any E-stop behind it).
+            if is_stop {
                 let permit = match reader_writer.try_reserve_stop() {
-                    Ok(p) => p,
+                    Ok(p) => Some(p),
                     Err(mpsc::error::TrySendError::Full(())) => {
                         reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
-                        break;
+                        None
                     }
                     Err(mpsc::error::TrySendError::Closed(())) => break,
                 };
@@ -2171,7 +2196,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     (a, b) => a.or(b),
                                 };
                             }
-                            active.waiters.push(waiter);
+                            if waiter.permit.is_some() || active.waiters.len() < URGENT_OUT_CAPACITY {
+                                active.waiters.push(waiter);
+                            }
                             None
                         } else {
                             let stop = crate::rt_core::urgent::UrgentStop {
@@ -2274,7 +2301,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 let reply = format_urgent_stop_outcome(
                                     &w.raw_request_id, w.parsed_request_id, &reader_last_request, Err(&api),
                                 );
-                                w.permit.send(reply);
+                                match w.permit {
+                                    Some(permit) => { permit.send(reply); }
+                                    None => { let _ = reader_writer.try_send_stop_best_effort(reply); }
+                                }
                             }
                         }
                     }
@@ -2298,7 +2328,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
                 if let Some(reply) = backlog_full_reject(kind, &value) {
-                    if !reader_writer.try_send_ordinary_control(reply) && !reader_writer.is_fatal() {
+                    reader_writer.try_send_ordinary_control(reply);
+                    if reader_writer.is_writer_closed() {
                         break;
                     }
                 }
@@ -3448,7 +3479,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     }
     if !matches!(first_exit, FirstExit::Writer) {
         if fatal_close {
-            let grace = ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT);
+            let grace = ws_write_timeout(&connection).min(WS_FATAL_FLUSH_TIMEOUT)
+                + Duration::from_millis(250);
             if tokio::time::timeout(grace, &mut writer_task).await.is_err() {
                 writer_task.abort();
                 let _ = writer_task.await;

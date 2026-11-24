@@ -4136,11 +4136,11 @@ enum OwnerSlot {
     Failed,
 }
 
-/// Ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after latching
-/// `e_stop_latched` and registering the per-request waiter.
+/// Lock-free ticket returned synchronously by [`ArmSupervisor::begin_e_stop_checked`] after
+/// latching `e_stop_latched` and advancing `requested_estop_count` via atomics (zero mutexes,
+/// zero waiter scans).
 pub(crate) struct CheckedEstopTicket {
     req: u64,
-    rx: tokio::sync::oneshot::Receiver<Result<(SafetyState, u64), ArmError>>,
     mode: u8,
 }
 
@@ -5264,28 +5264,46 @@ impl ArmSupervisor {
         }
     }
 
-    /// Synchronously latches the physical E-stop flag, increments the requested generation,
-    /// and registers a per-request waiter in O(1) without awaiting any async lock or draining rings.
-    /// Call [`Self::finish_e_stop_checked`] to obtain the applied `(SafetyState, epoch_id)`.
+    /// Test-only hook: holds the ACK-drain `estop_reg` mutex so tests can prove the WS reader
+    /// E-stop path latches and increments `requested_estop_count` purely via lock-free atomics.
+    #[doc(hidden)]
+    pub fn test_lock_estop_registry(&self) -> impl Drop + '_ {
+        self.estop_reg.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only accessor for the monotonic lock-free E-stop request counter.
+    #[doc(hidden)]
+    pub fn test_requested_estop_count(&self) -> u64 {
+        self.requested_estop_count.load(Ordering::SeqCst)
+    }
+
+    /// Synchronously latches the physical E-stop flag and increments the requested generation
+    /// using ONLY lock-free atomics (never takes `estop_reg` mutex or scans waiters on the
+    /// reader path). Call [`Self::finish_e_stop_checked`] off-reader to register/resolve and
+    /// obtain the applied `(SafetyState, epoch_id)`.
     pub(crate) fn begin_e_stop_checked(&self) -> CheckedEstopTicket {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::begin_e_stop_checked");
-        // Set the physical E-stop latch FIRST before touching any lock.
         self.e_stop_latched.store(true, Ordering::SeqCst);
-        let (req, rx, mode) = {
-            let mut reg = self.estop_reg.lock().unwrap_or_else(|e| e.into_inner());
-            let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let rx = reg.register(req);
-            let mode = self.owner_mode.load(Ordering::Acquire);
-            (req, rx, mode)
-        };
-        CheckedEstopTicket { req, rx, mode }
+        let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let mode = self.owner_mode.load(Ordering::Acquire);
+        CheckedEstopTicket { req, mode }
     }
 
     pub(crate) async fn finish_e_stop_checked(
         &self,
         ticket: CheckedEstopTicket,
     ) -> Result<(SafetyState, u64), ArmError> {
-        let CheckedEstopTicket { req, mut rx, mode } = ticket;
+        let CheckedEstopTicket { req, mode } = ticket;
+        // Off-reader waiter registration / early-ACK resolution (never runs on WS reader).
+        let wait = self
+            .estop_reg
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_or_resolve(req);
+        let mut rx = match wait {
+            crate::rt_core::executor::EstopWait::Resolved(res) => return res,
+            crate::rt_core::executor::EstopWait::Pending(rx) => rx,
+        };
         match mode {
             OWNER_EXECUTOR => {
                 self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
