@@ -1726,9 +1726,34 @@ impl TeardownDisable {
     }
 }
 
+/// Shared bounded FIFO broker reply dispatcher (A7 / Major 10):
+/// routes replies for internal broker RPCs (`BeginMacro` ACK/Refused, `InstallChild`, `FinishMacro`)
+/// directly to their keyed oneshot waiters without head-of-line blocking behind unrelated replies,
+/// while buffering all other replies (including `BeginMacro` `Terminal`s and external client traffic)
+/// in a bounded (`<= external_cap`) FIFO queue for external consumers.
+///
+/// Lock order: ALWAYS lock `RtExecutorShared::broker` BEFORE `RtExecutorShared::reply_router`.
+struct ActionReplyRouter {
+    waiters: std::collections::HashMap<super::broker::RequestId, tokio::sync::oneshot::Sender<super::broker::Reply>>,
+    external: VecDeque<(ClientId, super::broker::Reply)>,
+    external_cap: usize,
+}
+
+impl ActionReplyRouter {
+    fn new(external_cap: usize) -> Self {
+        let cap = external_cap.max(1);
+        Self {
+            waiters: std::collections::HashMap::new(),
+            external: VecDeque::with_capacity(cap),
+            external_cap: cap,
+        }
+    }
+}
+
 struct RtExecutorShared {
     boot: BootId,
     broker: Arc<Mutex<Broker<PlanSlot>>>,
+    reply_router: Mutex<ActionReplyRouter>,
     target_writer: Arc<Mutex<TargetWriter>>,
     stop_requests: StopRequests,
     stats: Arc<ExecutorStats>,
@@ -1858,6 +1883,7 @@ impl RtExecutorShared {
         }
         let _ = self.hub.latest();
         self.broker.lock().unwrap_or_else(|e| e.into_inner()).poll(|_, _| true);
+        self.reply_router.lock().unwrap_or_else(|e| e.into_inner()).waiters.clear();
     }
 
     fn teardown_and_join(&self) {
@@ -1880,6 +1906,125 @@ pub struct RtExecutorHandle {
 impl RtExecutorHandle {
     pub fn boot(&self) -> BootId { self.shared.boot }
     pub fn broker(&self) -> &Arc<Mutex<Broker<PlanSlot>>> { &self.shared.broker }
+
+    /// Submits an internal A6/A7 action command (`BeginMacro`, `InstallChild`, `FinishMacro`, or
+    /// `InstallPrepared`) and atomically registers a keyed oneshot waiter in the shared bounded
+    /// FIFO reply router BEFORE releasing the broker lock (preventing ACK stealing and
+    /// head-of-line deadlock behind unrelated replies).
+    ///
+    /// For `BeginMacro` (which produces `Ack` followed later by `Terminal` under the same
+    /// `RequestId`), the oneshot receives ONLY the initial `Ack`/`Refused`; the subsequent
+    /// `Terminal` automatically routes into the external FIFO queue.
+    pub fn submit_internal_action<'a>(
+        &self,
+        client: ClientId,
+        seq: u64,
+        auth: super::broker::Authority,
+        deadline: Instant,
+        sub: super::requests::actions::ActionSubmit<'a, PlanSlot>,
+    ) -> Result<
+        (
+            super::broker::RequestId,
+            tokio::sync::oneshot::Receiver<super::broker::Reply>,
+        ),
+        super::broker::AdmitError,
+    > {
+        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
+        broker.reclaim_plans();
+        let req_id = broker.submit(
+            client,
+            seq,
+            auth,
+            deadline,
+            super::broker::Submit::Action(sub),
+        )?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut router = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        router.waiters.insert(req_id, tx);
+        Ok((req_id, rx))
+    }
+
+    /// Removes a previously registered internal waiter (e.g. on timeout/cancellation).
+    pub fn cancel_internal_waiter(&self, req_id: super::broker::RequestId) {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            .remove(&req_id);
+    }
+
+    /// Pumps ready replies from the broker into either matching internal waiters or the bounded
+    /// external FIFO buffer (`<= reply_capacity`), reclaiming retired plan slots.
+    pub fn pump_broker_replies(&self) -> usize {
+        use super::broker::DeliveryDecision;
+        let mut broker = self.shared.broker.lock().unwrap_or_else(|e| e.into_inner());
+        let mut router = self
+            .shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let n = broker.try_poll(|client, reply| {
+            if let Some(tx) = router.waiters.remove(&reply.request()) {
+                let _ = tx.send(reply);
+                DeliveryDecision::Delivered
+            } else if router.external.len() < router.external_cap {
+                router.external.push_back((client, reply));
+                DeliveryDecision::Delivered
+            } else {
+                DeliveryDecision::Backpressured
+            }
+        });
+        broker.reclaim_plans();
+        n
+    }
+
+    /// Drains external (non-internal-waiter) replies in strict broker FIFO order while honouring
+    /// downstream backpressure (`DeliveryDecision::Backpressured` keeps the undelivered reply at
+    /// the front of the bounded queue and never steals internal macro ACKs).
+    pub fn poll_external_replies<F>(&self, mut deliver: F) -> usize
+    where
+        F: FnMut(ClientId, super::broker::Reply) -> super::broker::DeliveryDecision,
+    {
+        use super::broker::DeliveryDecision;
+        self.pump_broker_replies();
+        let mut delivered = 0usize;
+        {
+            let mut router = self
+                .shared
+                .reply_router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            while let Some((client, reply)) = router.external.pop_front() {
+                match deliver(client, reply) {
+                    DeliveryDecision::Delivered | DeliveryDecision::Abandoned => delivered += 1,
+                    DeliveryDecision::Backpressured => {
+                        router.external.push_front((client, reply));
+                        break;
+                    }
+                }
+            }
+        }
+        if delivered > 0 {
+            self.pump_broker_replies();
+        }
+        delivered
+    }
+
+    /// Number of buffered external replies currently waiting in the bounded router queue.
+    pub fn pending_external_replies(&self) -> usize {
+        self.shared
+            .reply_router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .external
+            .len()
+    }
+
     pub fn disconnect_client(&self, client: ClientId) {
         self.shared.broker.lock().unwrap_or_else(|e| e.into_inner()).disconnect(client);
     }
@@ -2340,6 +2485,7 @@ pub(crate) fn spawn_executor(
     let shared = Arc::new(RtExecutorShared {
         boot: cfg.boot,
         broker: Arc::new(Mutex::new(broker)),
+        reply_router: Mutex::new(ActionReplyRouter::new(cfg.capacities.replies)),
         target_writer: Arc::new(Mutex::new(target_writer)),
         stop_requests,
         stats,

@@ -305,6 +305,175 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Hove
     })
 }
 
+/// Prepare a `calib_hover` plan from a published [`ActionSnapshot`] + existing hover jobs
+/// (0 `SupervisorLock` on `OWNER_EXECUTOR`).
+pub fn prepare_from_snapshot(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    existing_jobs: &[HoverJob],
+    body: &Value,
+    epoch: u64,
+) -> Result<HoverPlan, ArmError> {
+    if epoch != snap.owner.authority.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: snap.owner.authority.epoch,
+            received: epoch,
+        }
+        .into());
+    }
+    let Some(ws) = snap.env.workspace_policy.as_ref() else {
+        return Err(ArmError::detailed(
+            400,
+            "UNSUPPORTED",
+            "calib_hover needs the Cartesian workspace (profile workspace + kinematics)",
+            Value::Null,
+        ));
+    };
+    let o = body.as_object().ok_or_else(|| invalid("Command body must be an object"))?;
+    let floor = f64::from(ws.floor_z_m);
+    let mut job = if let Some(r) = o.get("resume") {
+        for k in o.keys() {
+            if k != "resume" && k != "candidate_fingerprint" {
+                return Err(invalid(format!("resume takes no other field ({k})")));
+            }
+        }
+        let id = r.as_str().filter(|i| valid_job_id(i)).ok_or_else(|| invalid("resume must be a job id"))?;
+        let mut job = existing_jobs
+            .iter()
+            .find(|j| j.id == id)
+            .cloned()
+            .ok_or_else(|| ArmError::detailed(404, "JOB_NOT_FOUND", format!("no hover job {id} (GET /api/v1/calibration/hover)"), Value::Null))?;
+        if job.state == "running" {
+            return Err(ArmError::detailed(409, "JOB_RUNNING", format!("hover job {id} is running"), Value::Null));
+        }
+        if !snap.env.config.active_tool.matches_record(job.tool_id.as_deref(), job.tool_config_digest.as_deref()) {
+            return Err(ArmError::detailed(
+                409,
+                "TOOL_MISMATCH",
+                format!(
+                    "hover job {id} belongs to tool {:?}/{:?}, not active tool {}/{}",
+                    job.tool_id, job.tool_config_digest, snap.env.config.active_tool.id, snap.env.config.active_tool.config_digest
+                ),
+                Value::Null,
+            ));
+        }
+        let fp = o
+            .get("candidate_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty() && f.len() <= 64)
+            .ok_or_else(|| invalid("resume requires candidate_fingerprint (1..64 bytes)"))?;
+        if fp != job.candidate_fingerprint {
+            return Err(ArmError::detailed(
+                409,
+                "FINGERPRINT_MISMATCH",
+                format!("hover job {id} belongs to candidate {}, not {}", job.candidate_fingerprint, fp),
+                Value::Null,
+            ));
+        }
+        for p in job.points.iter_mut().filter(|p| p.state != "done") {
+            p.state = "pending".into();
+            p.code = None;
+            p.message = None;
+            p.observations.clear();
+            p.discarded.clear();
+            p.settled_joints = None;
+            p.settled_end_m = None;
+        }
+        if job.points.iter().all(|p| p.state == "done") {
+            return Err(invalid(format!("hover job {id} has no point left")));
+        }
+        for (i, p) in job.points.iter().enumerate().filter(|(_, p)| p.state != "done") {
+            validate_hover_point(i, p.approach_m, p.hover_m, floor)?;
+        }
+        job
+    } else {
+        for k in o.keys() {
+            if !["candidate_fingerprint", "points", "rpy_rad", "approach_speed_mps", "descent_speed_mps", "settle_s", "frames", "discard"].contains(&k.as_str()) {
+                return Err(invalid(format!("unknown field: {k}")));
+            }
+        }
+        let fp = o
+            .get("candidate_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|f| !f.is_empty() && f.len() <= 64)
+            .ok_or_else(|| invalid("candidate_fingerprint must be a string of 1..64 bytes (dry-run apply after.fingerprint)"))?;
+        let rpy = vec3(o.get("rpy_rad"), "rpy_rad", 7.0)?;
+        let pts = o
+            .get("points")
+            .and_then(Value::as_array)
+            .filter(|p| (1..=MAX_POINTS).contains(&p.len()))
+            .ok_or_else(|| invalid(format!("points must be 1..{MAX_POINTS} objects")))?;
+        let params = HoverParams {
+            approach_speed_mps: num(body, "approach_speed_mps", DEFAULT_APPROACH_MPS, 0.005, MAX_APPROACH_MPS)?,
+            descent_speed_mps: num(body, "descent_speed_mps", DEFAULT_DESCENT_MPS, 0.002, MAX_DESCENT_MPS)?,
+            settle_s: num(body, "settle_s", MIN_SETTLE_S, MIN_SETTLE_S, MAX_SETTLE_S)?,
+            frames: num(body, "frames", DEFAULT_FRAMES as f64, 1.0, MAX_FRAMES as f64)? as usize,
+            discard: num(body, "discard", MIN_DISCARD as f64, MIN_DISCARD as f64, 4.0)? as usize,
+        };
+        let mut points = Vec::with_capacity(pts.len());
+        for (i, p) in pts.iter().enumerate() {
+            let id = p.get("id").and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= 32).ok_or_else(|| invalid(format!("points[{i}].id must be a string of 1..32 bytes")))?;
+            let approach = vec3(p.get("approach_m"), &format!("points[{i}].approach_m"), 1.0)?;
+            let hover = vec3(p.get("hover_m"), &format!("points[{i}].hover_m"), 1.0)?;
+            let prpy = match p.get("rpy_rad") { None | Some(Value::Null) => rpy, v => vec3(v, &format!("points[{i}].rpy_rad"), 7.0)? };
+            validate_hover_point(i, approach, hover, floor)?;
+            points.push(HoverPoint {
+                id: id.into(),
+                approach_m: approach,
+                hover_m: hover,
+                rpy_rad: prpy,
+                state: "pending".into(),
+                code: None,
+                message: None,
+                observations: Vec::new(),
+                discarded: Vec::new(),
+                settled_joints: None,
+                settled_end_m: None,
+            });
+        }
+        let t = now();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        HoverJob {
+            id: format!("hv-{nanos:x}"),
+            candidate_fingerprint: fp.into(),
+            tool_id: Some(snap.env.config.active_tool.id.clone()),
+            tool_config_digest: Some(snap.env.config.active_tool.config_digest.clone()),
+            created_at: t.clone(),
+            updated_at: t,
+            params,
+            points,
+            state: "pending".into(),
+            code: None,
+            message: None,
+            action_id: None,
+            runs: 0,
+            end: None,
+        }
+    };
+    snap.check_preconditions()?;
+    if !snap.owner.is_torqued {
+        return Err(crate::safety::SafetyError::NotArmed(snap.safety_state.clone()).into());
+    }
+    let angular_speed_rps = if snap.env.config.active_tool.commissioning_required {
+        job.params.approach_speed_mps = job.params.approach_speed_mps.min(COMMISSIONING_MAX_LINEAR_MPS);
+        job.params.descent_speed_mps = job.params.descent_speed_mps.min(COMMISSIONING_MAX_LINEAR_MPS);
+        crate::motion::DEFAULT_ANGULAR_RPS.min(COMMISSIONING_MAX_ANGULAR_RPS)
+    } else {
+        crate::motion::DEFAULT_ANGULAR_RPS
+    };
+    let p = &job.params;
+    let per_point = 0.6 / p.approach_speed_mps + 2.0 * APPROACH_RISE_M[1] / p.descent_speed_mps + p.settle_s
+        + (p.discard + p.frames) as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 0.5) + 3.0 * crate::motion::SETTLE_MAX_S;
+    let pending = job.points.iter().filter(|q| q.state == "pending").count() as f64;
+    Ok(HoverPlan {
+        job,
+        epoch,
+        workspace_revision: snap.env.workspace_revision,
+        calibration_revision: snap.env.calibration_revision,
+        angular_speed_rps,
+        deadline_s: per_point * pending + 30.0,
+    })
+}
+
 /// Store `job` (replacing one with the same id; at most [`KEEP_JOBS`]).
 fn put_job(inner: &mut SupervisorInner, job: HoverJob) {
     inner.hover_jobs.retain(|j| j.id != job.id);
@@ -456,10 +625,109 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
     Ok(finish_begin_hover(inner, sup, id, plan, upstream, dir, stamp, deadline_at))
 }
 
-/// Update the stored job of this run.
+/// Production broker-to-worker handoff for `calib_hover` on `OWNER_EXECUTOR` (A7 / Major 11 + Minor 2):
+/// submits `BeginMacro` carrying the caller's original `AdmissionStamp` and exact absolute
+/// `deadline_at`, records live job state via the owner-aware store, and spawns the worker with
+/// the accepted parent `ActionId`, original `stamp`, and exact `deadline_at` (0 `SupervisorLock`).
+pub async fn begin_executor(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    mut plan: HoverPlan,
+    upstream: crate::api::proxy::DetectorUpstream,
+    dir: PathBuf,
+) -> Result<(u64, f64, String), ArmError> {
+    use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
+    let handle = sup.executor_handle().ok_or_else(|| ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor is not active".into(),
+    })?;
+    let boot = handle.boot();
+    let arm = sup
+        .hub()
+        .latest()
+        .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
+    let now_inst = Instant::now();
+    let deadline_at = now_inst + Duration::from_secs_f64(plan.deadline_s);
+    let mut spec = begin_macro_spec(&plan, boot, deadline_at);
+    spec.admission_request_id = stamp.request_id;
+    let action_stamp = ActionStamp {
+        arm,
+        boot,
+        admission: stamp,
+        config_revision: plan.workspace_revision,
+        calibration_revision: Some(plan.calibration_revision),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: now_inst + DEFAULT_ACTION_DEADLINE,
+    };
+    let (id, _req_id) =
+        crate::macro_action::begin_macro_executor(sup, &action_stamp, spec, action_stamp.deadline)
+            .await?;
+    plan.job.state = "running".into();
+    plan.job.code = None;
+    plan.job.message = None;
+    plan.job.end = None;
+    plan.job.action_id = Some(id);
+    plan.job.runs += 1;
+    plan.job.updated_at = now();
+    let job_id = plan.job.id.clone();
+    let deadline_s = plan.deadline_s;
+    sup.put_hover_job(plan.job.clone()).await;
+    tracing::info!(
+        "Calibration hover job {} started on RT executor (action {}, run {}, {} points, bound {:.0} s)",
+        job_id,
+        id,
+        plan.job.runs,
+        plan.job.points.len(),
+        deadline_s
+    );
+    let sup = sup.clone();
+    tokio::spawn(async move {
+        let worker = {
+            let sup = sup.clone();
+            tokio::spawn(async move { run(sup, id, plan, upstream, dir, stamp, deadline_at).await })
+        };
+        if let Err(e) = worker.await {
+            tracing::error!("Calibration hover {id} orchestrator failed: {e}");
+            let ctx = MacroCtx {
+                sup: sup.clone(),
+                id,
+                stamp,
+                deadline: deadline_at,
+                phase_timeout_s: deadline_s,
+                timeout_code: "HOVER_TIMEOUT",
+                timeout_message: String::new(),
+            };
+            ctx.finish(
+                crate::rt_core::requests::actions::FinishState::Failed,
+                Some("INTERNAL"),
+                Some(format!("hover orchestrator failed: {e}")),
+                None,
+                None,
+                crate::rt_core::requests::actions::HeldUpdate::Unchanged,
+            )
+            .await;
+            let jobs = sup.hover_jobs_snapshot().await;
+            if let Some(mut j) = jobs.into_iter().find(|j| j.action_id == Some(id) && j.state == "running") {
+                j.state = "failed".into();
+                j.code = Some("INTERNAL".into());
+                j.message = Some(e.to_string());
+                j.updated_at = now();
+                sup.put_hover_job(j).await;
+            }
+        }
+    });
+    Ok((id, deadline_s, job_id))
+}
+
+/// Update the stored job of this run (owner-aware: uses sidecar store on `OWNER_EXECUTOR`).
 async fn update(sup: &ArmSupervisor, job: &HoverJob) {
-    let mut inner = sup.inner().write().await;
-    put_job(&mut inner, job.clone());
+    sup.put_hover_job(job.clone()).await;
 }
 
 async fn persist(dir: &Path, job: &HoverJob) {
@@ -690,9 +958,7 @@ async fn run(
         k += 1.0;
         job.updated_at = now();
         plan.job = job.clone();
-        if !ctx.is_executor() {
-            update(&sup, &job).await;
-        }
+        update(&sup, &job).await;
         persist(&dir, &job).await;
     }
     // end the action and record how the run ended
@@ -719,16 +985,42 @@ async fn run(
         job.updated_at = now();
         put_job(&mut inner, job.clone());
     } else {
+        let pub_snap = sup.hub().latest();
+        let action = pub_snap
+            .as_ref()
+            .and_then(|s| s.obs.action.as_ref())
+            .filter(|a| a.id == id);
         job.state = match &result { Ok(()) => "done".into(), Err(Stop::Fail(..)) => "failed".into(), Err(Stop::Cancelled) => "cancelled".into() };
         if let Err(Stop::Fail(code, msg)) = &result {
             job.code = Some(code.clone());
             job.message = Some(msg.clone());
+        } else {
+            job.code = action.and_then(|a| a.code.as_deref().map(str::to_owned));
+            job.message = action.and_then(|a| a.message.clone());
         }
+        if let Some(p) = job.points.iter_mut().find(|p| p.state == "pending" && matches!(result, Err(Stop::Cancelled))) {
+            p.code = job.code.clone();
+        }
+        job.end = pub_snap.as_deref().map(arm_state_from_snapshot);
         job.updated_at = now();
+        sup.put_hover_job(job.clone()).await;
     }
     tracing::info!("Calibration hover job {} run ended: {} {:?} ({} done, {} skipped)", job.id, job.state, job.code,
         job.points.iter().filter(|p| p.state == "done").count(), job.points.iter().filter(|p| p.state == "skipped").count());
     persist(&dir, &job).await;
+}
+
+/// Live arm state for a reconnecting client (from published snapshot on `OWNER_EXECUTOR`).
+fn arm_state_from_snapshot(snap: &crate::rt_core::publish::Snapshot) -> Value {
+    json!({
+        "is_torqued": snap.obs.is_torqued,
+        "safety_state": snap.obs.safety_state,
+        "fault": snap.obs.fault,
+        "watchdog_park": snap.obs.action.as_ref().is_some_and(|a| a.kind == "park" && a.is_running()),
+        "pending_normal_unload": snap.rt.owner.pending_normal_unload,
+        "lease_held": snap.rt.owner.authority.lease_generation != 0,
+        "at": now(),
+    })
 }
 
 /// Live arm state for a reconnecting client.
@@ -744,18 +1036,35 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 
 /// `GET /api/v1/calibration/hover`: `{jobs: [{id, state, code, created_at, updated_at, points, done}], arm}`.
 pub async fn get_jobs(axum::extract::State(sup): axum::extract::State<Arc<ArmSupervisor>>) -> Response {
-    let inner = sup.inner().read().await;
-    let jobs: Vec<Value> = inner.hover_jobs.iter().rev().map(|j| json!({"id": j.id, "state": j.state, "code": j.code, "created_at": j.created_at,
+    let (all_jobs, arm) = if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+        let jobs = sup.hover_jobs_snapshot().await;
+        let arm = sup
+            .hub()
+            .latest()
+            .map_or(Value::Null, |s| arm_state_from_snapshot(&s));
+        (jobs, arm)
+    } else {
+        let inner = sup.inner().read().await;
+        (inner.hover_jobs.clone(), arm_state(&inner))
+    };
+    let jobs: Vec<Value> = all_jobs.iter().rev().map(|j| json!({"id": j.id, "state": j.state, "code": j.code, "created_at": j.created_at,
         "updated_at": j.updated_at, "candidate_fingerprint": j.candidate_fingerprint, "points": j.points.len(),
         "done": j.points.iter().filter(|p| p.state == "done").count()})).collect();
-    axum::Json(json!({"jobs": jobs, "arm": arm_state(&inner)})).into_response()
+    axum::Json(json!({"jobs": jobs, "arm": arm})).into_response()
 }
 
 /// `GET /api/v1/calibration/hover/<id>`: the job (memory, else its file) with the live `arm` state.
 pub async fn get_job(axum::extract::State(sup): axum::extract::State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::calibration::CalibrationDeps>, UrlPath(id): UrlPath<String>) -> Response {
     if !valid_job_id(&id) { return err(StatusCode::BAD_REQUEST, "INVALID", "invalid job id"); }
-    let (job, arm) = {
+    let (job, arm) = if sup.owner_mode() == crate::supervisor::OWNER_EXECUTOR {
+        let jobs = sup.hover_jobs_snapshot().await;
+        let arm = sup
+            .hub()
+            .latest()
+            .map_or(Value::Null, |s| arm_state_from_snapshot(&s));
+        (jobs.into_iter().find(|j| j.id == id), arm)
+    } else {
         let inner = sup.inner().read().await;
         (inner.hover_jobs.iter().find(|j| j.id == id).cloned(), arm_state(&inner))
     };

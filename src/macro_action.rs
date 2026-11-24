@@ -496,8 +496,9 @@ impl MacroCtx {
         }
     }
 
-    /// Submits an A7 `InstallChild` or `FinishMacro` command through the RT executor's broker
-    /// without touching `SupervisorLock` and without stealing other clients' replies.
+    /// Submits an A7 `FinishMacro` command through the RT executor's shared bounded FIFO
+    /// reply router (`ActionReplyRouter`) without touching `SupervisorLock`, without head-of-line
+    /// blocking behind unrelated replies, and without stealing external traffic.
     async fn submit_action_executor(
         &self,
         stamp: &crate::rt_core::requests::actions::ActionStamp,
@@ -505,23 +506,20 @@ impl MacroCtx {
         make_submit: impl Fn() -> crate::rt_core::requests::actions::ActionSubmit<'static, crate::rt_core::ops::PlanSlot>,
         ignore_parent_dead: bool,
     ) -> Result<ActionId, Stop> {
-        use crate::rt_core::broker::{AdmitError, ClientId, DeliveryDecision, Reply, Submit};
+        use crate::rt_core::broker::{AdmitError, ClientId, Reply};
+        use tokio::sync::oneshot::error::TryRecvError;
         let Some(handle) = self.sup.executor_handle() else {
             return Err(Stop::Cancelled);
         };
         let client = ClientId(stamp.admission.connection_id);
         let auth = stamp.broker_authority();
-        let req_id = loop {
-            let res = {
-                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
-                broker.reclaim_plans();
-                let sub = make_submit();
-                broker.submit(client, 0, auth, deadline, Submit::Action(sub))
-            };
-            match res {
-                Ok(id) => break id,
+        let (req_id, mut rx) = loop {
+            let sub = make_submit();
+            match handle.submit_internal_action(client, 0, auth, deadline, sub) {
+                Ok(pair) => break pair,
                 Err(AdmitError::Disconnected) => return Err(Stop::Cancelled),
                 Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+                    handle.pump_broker_replies();
                     if !ignore_parent_dead && !self.alive().await {
                         return Err(Stop::Cancelled);
                     }
@@ -534,37 +532,45 @@ impl MacroCtx {
         };
         let wait_limit = deadline + Duration::from_secs(2);
         loop {
-            let mut got: Option<Reply> = None;
-            {
-                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
-                broker.try_poll(|_, reply| {
-                    if reply.request() == req_id {
-                        got = Some(reply);
-                        DeliveryDecision::Delivered
-                    } else {
-                        DeliveryDecision::Backpressured
-                    }
-                });
-                broker.reclaim_plans();
-            }
-            if let Some(reply) = got {
-                return match reply {
-                    Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
-                    Reply::Refused { code, .. } => match code {
-                        "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
-                        | "PARENT_REPLACED" => Err(Stop::Cancelled),
-                        "DEADLINE_EXPIRED" => {
-                            Err(fail(self.timeout_code, self.timeout_message.clone()))
-                        }
-                        other => Err(fail(other, format!("RT action refused: {other}"))),
-                    },
-                    Reply::Terminal { .. } => Ok(ActionId(self.id)),
-                };
+            handle.pump_broker_replies();
+            match rx.try_recv() {
+                Ok(reply) => {
+                    return match reply {
+                        Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                        Reply::Refused { code, .. } => match code {
+                            "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                            | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                            "DEADLINE_EXPIRED" => {
+                                Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            other => Err(fail(other, format!("RT action refused: {other}"))),
+                        },
+                        Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                    };
+                }
+                Err(TryRecvError::Closed) => return Err(Stop::Cancelled),
+                Err(TryRecvError::Empty) => {}
             }
             if !ignore_parent_dead && !self.alive().await {
+                handle.cancel_internal_waiter(req_id);
                 return Err(Stop::Cancelled);
             }
             if Instant::now() > wait_limit {
+                handle.cancel_internal_waiter(req_id);
+                if let Ok(reply) = rx.try_recv() {
+                    return match reply {
+                        Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                        Reply::Refused { code, .. } => match code {
+                            "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                            | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                            "DEADLINE_EXPIRED" => {
+                                Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            other => Err(fail(other, format!("RT action refused: {other}"))),
+                        },
+                        Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                    };
+                }
                 return Err(fail(self.timeout_code, self.timeout_message.clone()));
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1281,7 +1287,8 @@ impl MacroCtx {
         self.wait_child(ticket).await
     }
 
-    /// Helper to submit a staged child `PlanSlot` to `OWNER_EXECUTOR` without leaking heap memory.
+    /// Helper to submit a staged child `PlanSlot` to `OWNER_EXECUTOR` via the shared bounded FIFO
+    /// reply router (`ActionReplyRouter`) without leaking heap memory or blocking unrelated replies.
     async fn submit_child_slot_executor(
         &self,
         stamp: &crate::rt_core::requests::actions::ActionStamp,
@@ -1289,8 +1296,9 @@ impl MacroCtx {
         check_workspace_revision: bool,
         calibration_revision: Option<u64>,
     ) -> Result<ActionId, Stop> {
-        use crate::rt_core::broker::{AdmitError, ClientId, DeliveryDecision, Reply, Submit};
+        use crate::rt_core::broker::{AdmitError, ClientId, Reply};
         use crate::rt_core::requests::actions::ActionSubmit;
+        use tokio::sync::oneshot::error::TryRecvError;
         let Some(handle) = self.sup.executor_handle() else {
             return Err(Stop::Cancelled);
         };
@@ -1298,32 +1306,29 @@ impl MacroCtx {
         let auth = stamp.broker_authority();
         let deadline = stamp.deadline;
         let boot = stamp.boot;
-        let req_id = loop {
-            let res = {
-                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
-                broker.reclaim_plans();
-                let write = |dst: &mut crate::rt_core::ops::PlanSlot| {
-                    *dst = slot.clone();
-                };
-                broker.submit(
-                    client,
-                    0,
-                    auth,
-                    deadline,
-                    Submit::Action(ActionSubmit::InstallChild {
-                        write: &write,
-                        prepared_boot: boot,
-                        check_workspace_revision,
-                        calibration_revision,
-                        gripper_calib_revision: stamp.gripper_calib_revision,
-                        power_budget_revision: stamp.power_budget_revision,
-                    }),
-                )
+        let (req_id, mut rx) = loop {
+            let write = |dst: &mut crate::rt_core::ops::PlanSlot| {
+                *dst = slot.clone();
             };
+            let res = handle.submit_internal_action(
+                client,
+                0,
+                auth,
+                deadline,
+                ActionSubmit::InstallChild {
+                    write: &write,
+                    prepared_boot: boot,
+                    check_workspace_revision,
+                    calibration_revision,
+                    gripper_calib_revision: stamp.gripper_calib_revision,
+                    power_budget_revision: stamp.power_budget_revision,
+                },
+            );
             match res {
-                Ok(id) => break id,
+                Ok(pair) => break pair,
                 Err(AdmitError::Disconnected) => return Err(Stop::Cancelled),
                 Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+                    handle.pump_broker_replies();
                     if !self.alive().await {
                         return Err(Stop::Cancelled);
                     }
@@ -1336,37 +1341,45 @@ impl MacroCtx {
         };
         let wait_limit = deadline + Duration::from_secs(2);
         loop {
-            let mut got: Option<Reply> = None;
-            {
-                let mut broker = handle.broker().lock().unwrap_or_else(|e| e.into_inner());
-                broker.try_poll(|_, reply| {
-                    if reply.request() == req_id {
-                        got = Some(reply);
-                        DeliveryDecision::Delivered
-                    } else {
-                        DeliveryDecision::Backpressured
-                    }
-                });
-                broker.reclaim_plans();
-            }
-            if let Some(reply) = got {
-                return match reply {
-                    Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
-                    Reply::Refused { code, .. } => match code {
-                        "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
-                        | "PARENT_REPLACED" => Err(Stop::Cancelled),
-                        "DEADLINE_EXPIRED" => {
-                            Err(fail(self.timeout_code, self.timeout_message.clone()))
-                        }
-                        other => Err(fail(other, format!("RT child refused: {other}"))),
-                    },
-                    Reply::Terminal { .. } => Ok(ActionId(self.id)),
-                };
+            handle.pump_broker_replies();
+            match rx.try_recv() {
+                Ok(reply) => {
+                    return match reply {
+                        Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                        Reply::Refused { code, .. } => match code {
+                            "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                            | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                            "DEADLINE_EXPIRED" => {
+                                Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            other => Err(fail(other, format!("RT child refused: {other}"))),
+                        },
+                        Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                    };
+                }
+                Err(TryRecvError::Closed) => return Err(Stop::Cancelled),
+                Err(TryRecvError::Empty) => {}
             }
             if !self.alive().await {
+                handle.cancel_internal_waiter(req_id);
                 return Err(Stop::Cancelled);
             }
             if Instant::now() > wait_limit {
+                handle.cancel_internal_waiter(req_id);
+                if let Ok(reply) = rx.try_recv() {
+                    return match reply {
+                        Reply::Ack { action, .. } => Ok(action.unwrap_or(ActionId(self.id))),
+                        Reply::Refused { code, .. } => match code {
+                            "STOPPED" | "LEASE_LOST" | "ESTOP_ACTIVE" | "EPOCH_MISMATCH"
+                            | "PARENT_REPLACED" => Err(Stop::Cancelled),
+                            "DEADLINE_EXPIRED" => {
+                                Err(fail(self.timeout_code, self.timeout_message.clone()))
+                            }
+                            other => Err(fail(other, format!("RT child refused: {other}"))),
+                        },
+                        Reply::Terminal { .. } => Ok(ActionId(self.id)),
+                    };
+                }
                 return Err(fail(self.timeout_code, self.timeout_message.clone()));
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1390,5 +1403,85 @@ impl MacroCtx {
     pub async fn gripper_phase(&self, phase: &str, progress: f32, command: GripperCommand) -> Result<SubDone, Stop> {
         self.phase(phase, progress).await?;
         self.gripper(phase, command).await
+    }
+}
+
+/// Production broker-to-worker `BeginMacro` handoff on `OWNER_EXECUTOR` (A7 / Major 11):
+/// submits `ActionSubmit::BeginMacro(spec)` through the shared bounded FIFO `ActionReplyRouter`
+/// carrying the caller's original `AdmissionStamp` (including `admission_request_id`) and exact
+/// absolute `spec.macro_deadline`, returning `(accepted ActionId, broker RequestId)` on `Ack`
+/// while leaving the parent's subsequent `Reply::Terminal` in the external FIFO queue.
+pub async fn begin_macro_executor(
+    sup: &ArmSupervisor,
+    stamp: &crate::rt_core::requests::actions::ActionStamp,
+    spec: crate::rt_core::requests::actions::BeginMacroSpec,
+    submit_deadline: Instant,
+) -> Result<(u64, crate::rt_core::broker::RequestId), ArmError> {
+    use crate::rt_core::broker::{AdmitError, ClientId, Reply};
+    use crate::rt_core::requests::actions::{ActionRefusal, ActionSubmit};
+    use tokio::sync::oneshot::error::TryRecvError;
+    let Some(handle) = sup.executor_handle() else {
+        return Err(ArmError::Rejected {
+            status: 503,
+            code: "EXECUTOR_UNAVAILABLE".into(),
+            message: "RT executor is not active".into(),
+        });
+    };
+    let client = ClientId(stamp.admission.connection_id);
+    let auth = stamp.broker_authority();
+    let (req_id, mut rx) = loop {
+        match handle.submit_internal_action(
+            client,
+            0,
+            auth,
+            submit_deadline,
+            ActionSubmit::BeginMacro(spec),
+        ) {
+            Ok(pair) => break pair,
+            Err(AdmitError::Disconnected) => {
+                return Err(ActionRefusal::new("LEASE_LOST").into_arm_error_with_epoch(auth.epoch));
+            }
+            Err(AdmitError::PlansFull | AdmitError::CommandsFull | AdmitError::RepliesFull) => {
+                handle.pump_broker_replies();
+                if Instant::now() > submit_deadline {
+                    return Err(ActionRefusal::new("DEADLINE_EXPIRED")
+                        .into_arm_error_with_epoch(auth.epoch));
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    };
+    let wait_limit = submit_deadline + Duration::from_secs(2);
+    loop {
+        handle.pump_broker_replies();
+        match rx.try_recv() {
+            Ok(Reply::Ack { action: Some(id), .. }) => return Ok((id.0, req_id)),
+            Ok(Reply::Ack { action: None, .. }) => {
+                return Err(ArmError::Internal("BeginMacro ACK omitted ActionId".into()));
+            }
+            Ok(Reply::Refused { code, .. }) => {
+                let epoch = sup
+                    .hub()
+                    .latest()
+                    .map_or(auth.epoch, |s| s.rt.owner.authority.epoch);
+                return Err(ActionRefusal::new(code).into_arm_error_with_epoch(epoch));
+            }
+            Ok(Reply::Terminal { .. }) => {
+                return Err(ArmError::Internal("unexpected Terminal before BeginMacro ACK".into()));
+            }
+            Err(TryRecvError::Closed) => {
+                return Err(ArmError::Rejected {
+                    status: 503,
+                    code: "EXECUTOR_STOPPED".into(),
+                    message: "RT executor stopped before acknowledging BeginMacro".into(),
+                });
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() > wait_limit {
+            handle.cancel_internal_waiter(req_id);
+            return Err(ActionRefusal::new("DEADLINE_EXPIRED").into_arm_error_with_epoch(auth.epoch));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }

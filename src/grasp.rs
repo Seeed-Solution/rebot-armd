@@ -2980,6 +2980,54 @@ fn prepare_any(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
     })
 }
 
+/// Prepare a `grasp` action from a published [`ActionSnapshot`] (0 `SupervisorLock` on
+/// `OWNER_EXECUTOR`). Preserves Phase A refusal of live `strategy: "adaptive"`.
+pub fn prepare_from_snapshot(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    body: &Value,
+    epoch: u64,
+) -> Result<PendingGrasp, ArmError> {
+    if body.is_object() {
+        crate::grasp_select::refuse_execution(body)?;
+    }
+    if !body.is_object() {
+        return Err(MotionError::InvalidCommand("Command body must be an object".into()).into());
+    }
+    if snap.env.config.active_tool.commissioning_required {
+        return Err(crate::safety::SafetyError::CommissioningRequired(
+            "grasp (blocked while active tool requires commissioning; use jog/move_to/move_relative/gripper at speed_scale <= 0.2)".into(),
+        )
+        .into());
+    }
+    let Some(base) = snap.env.grasp_setup.clone() else {
+        return Err(MotionError::Unsupported(
+            "Grasp needs a profile with kinematics, a gripper policy and a grasp setup".into(),
+        )
+        .into());
+    };
+    if snap.env.camera_calibrated {
+        refuse_calibrated_request(&base, body)?;
+    }
+    let Some(policy) = snap.env.config.gripper_policy.clone() else {
+        return Err(MotionError::Unsupported("Grasp needs a gripper policy".into()).into());
+    };
+    let request = parse_grasp(body, &base)?;
+    if epoch != snap.owner.authority.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: snap.owner.authority.epoch,
+            received: epoch,
+        }
+        .into());
+    }
+    let input = snap.plan_input_in(GoalFrame::EndLink)?;
+    Ok(PendingGrasp {
+        input,
+        request: Box::new(request),
+        open_rad: policy.open_rad,
+        physical_contact_end_m: snap.env.config.effective_physical_contact_end_m(),
+    })
+}
+
 /// TCP height of the grasp plane (where box centres are assumed to lie).
 fn grasp_plane(setup: &GraspSetup) -> f64 { setup.table_z_m + setup.grasp_height_m }
 
@@ -3402,13 +3450,76 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, stamp: crate::supervisor::Ad
     Ok(begin_with_stamp(&mut inner, stamp, supervisor, source, planned)?)
 }
 
+/// Production broker-to-worker handoff for `grasp` on `OWNER_EXECUTOR` (A7 / Major 11):
+/// submits `BeginMacro` carrying the caller's original `AdmissionStamp` and exact absolute
+/// `deadline`, then spawns the orchestrator with the accepted parent `ActionId`, original
+/// `stamp`, and exact `deadline` (0 `SupervisorLock`).
+pub async fn begin_executor(
+    supervisor: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    source: Arc<dyn DetectionSource>,
+    planned: PlannedGrasp,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
+    let handle = supervisor.executor_handle().ok_or_else(|| ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor is not active".into(),
+    })?;
+    let boot = handle.boot();
+    let arm = supervisor
+        .hub()
+        .latest()
+        .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs_f64(planned.request.setup.timeout_s);
+    let (dof, gripper_idx) = supervisor
+        .hub()
+        .prep_env()
+        .map_or((planned.input.limits.len(), planned.input.limits.len().checked_sub(1)), |e| {
+            (e.config.dof, e.config.gripper_index())
+        });
+    let mut spec = begin_macro_spec(&planned, boot, dof, gripper_idx, deadline);
+    spec.admission_request_id = stamp.request_id;
+    let action_stamp = ActionStamp {
+        arm,
+        boot,
+        admission: stamp,
+        config_revision: planned.input.workspace_revision,
+        calibration_revision: None,
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: now + DEFAULT_ACTION_DEADLINE,
+    };
+    let (id, _req_id) =
+        crate::macro_action::begin_macro_executor(supervisor, &action_stamp, spec, action_stamp.deadline)
+            .await?;
+    let approach_extra = supervisor
+        .hub()
+        .prep_env()
+        .and_then(|env| env.approach_plan("grasp_final", planned.request.approach).ok())
+        .map_or(0.0, |p| {
+            (1.875 * f64::from(p.policy.delta_rad()) / f64::from(p.policy.speed_rad_s))
+                .max(crate::backlash::MIN_SEGMENT_S)
+                + 0.5
+        });
+    let duration = expected_duration(&planned) + approach_extra;
+    spawn_with_deadline(supervisor.clone(), source, id, planned, stamp, deadline);
+    Ok((id, duration))
+}
+
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro(stamp, "grasp", ..)`.
 pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp, stamp: crate::supervisor::AdmissionStamp) {
     let deadline = Instant::now() + Duration::from_secs_f64(planned.request.setup.timeout_s);
     spawn_with_deadline(supervisor, source, id, planned, stamp, deadline);
 }
 
-fn spawn_with_deadline(
+/// Spawn the `grasp` orchestrator with an explicit pre-committed `deadline` (broker handoff).
+pub fn spawn_with_deadline(
     supervisor: Arc<ArmSupervisor>,
     source: Arc<dyn DetectionSource>,
     id: u64,
@@ -3459,6 +3570,61 @@ impl std::ops::Deref for Orchestrator {
 }
 
 impl Orchestrator {
+    /// Applies a diagnostic `ActionStatus` update on Legacy owner only (0 lock on `OWNER_EXECUTOR`).
+    async fn update_action_if_legacy(&self, f: impl FnOnce(&mut crate::motion::ActionStatus)) {
+        if !self.is_executor() {
+            self.sup.inner().write().await.update_action(self.id, f);
+        }
+    }
+
+    async fn arm_dof(&self) -> usize {
+        if self.is_executor() {
+            self.sup
+                .hub()
+                .prep_env()
+                .map_or(6, |e| e.config.arm_model.arm_dof())
+        } else {
+            self.sup.inner().read().await.config.arm_model.arm_dof()
+        }
+    }
+
+    async fn gripper_policy(&self) -> Option<crate::model::GripperPolicy> {
+        if self.is_executor() {
+            self.sup
+                .hub()
+                .prep_env()
+                .and_then(|e| e.config.gripper_policy.clone())
+        } else {
+            self.sup.inner().read().await.config.gripper_policy.clone()
+        }
+    }
+
+    async fn held_width_m(&self) -> Option<f32> {
+        if self.is_executor() {
+            let env = self.sup.hub().prep_env()?;
+            let snap = self.sup.hub().latest()?;
+            let require_real = env.requires_real_jaw_curve;
+            let p = env.config.gripper_policy.as_ref()?;
+            if require_real && p.jaw_opening.is_none() {
+                return None;
+            }
+            let idx = env.config.gripper_index().unwrap_or(6);
+            let m = snap.rt.positions.get(idx).copied().unwrap_or(0.0);
+            Some(p.opening_m(m))
+        } else {
+            let inner = self.sup.inner().read().await;
+            let require_real = inner.requires_real_jaw_curve();
+            inner.config.gripper_policy.as_ref().and_then(|p| {
+                if require_real && p.jaw_opening.is_none() {
+                    return None;
+                }
+                let idx = inner.config.gripper_index().unwrap_or(6);
+                let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
+                Some(p.opening_m(m))
+            })
+        }
+    }
+
     /// Every grasp sub-motion in `EndLink` frame: WORKSPACE_VIOLATION before anything is
     /// installed when its straight path takes the envelope below table clearance.
     async fn move_arm(&self, phase: &str, spec: GoalSpec, linear: f64) -> Result<SubDone, Stop> {
@@ -3614,7 +3780,7 @@ impl Orchestrator {
 
         self.phase("approach", 0.1).await?;
         let target = planned.target;
-        let is_5dof = self.sup.inner().read().await.config.arm_model.arm_dof() == 5;
+        let is_5dof = self.arm_dof().await == 5;
         let r_ref_p = if camera_down { &pose0.p } else { &tcp0.p };
         let r_ref = if is_5dof { motion::apply_auto_yaw(r_ref_p, &target, pose0.r) } else { pose0.r };
         let goal = if camera_down { camera_down_pose(&r_ref, &target, s, &self.cam, &self.envelope) } else { approach_pose(&r_ref, &target, s) };
@@ -3622,7 +3788,9 @@ impl Orchestrator {
             let height = goal.p[2] - s.table_z_m;
             if height > s.approach_height_m + 1e-6 {
                 tracing::info!("Grasp {}: camera-down acquisition at {height:.3} m (approach_height_m {:.3}) for table clearance", self.id, s.approach_height_m);
-                self.sup.inner().write().await.set_action_acquire_height(self.id, height as f32);
+                if !self.is_executor() {
+                    self.sup.inner().write().await.set_action_acquire_height(self.id, height as f32);
+                }
             }
         }
         let approach_frame = if camera_down { GoalFrame::EndLink } else { GoalFrame::Tcp };
@@ -3654,10 +3822,10 @@ impl Orchestrator {
         let shifted = centred_at != aim_px;
         let cut = c.frames.iter().any(|d| touches_border(&d.box_norm, self.cam.size));
         if shifted || cut {
-            self.sup.inner().write().await.update_action(self.id, |a| {
+            self.update_action_if_legacy(|a| {
                 a.border = Some(if cut { "cut" } else { "shifted" }.into());
                 a.border_shift_px = shifted.then(|| [(centred_at[0] - aim_px[0]) as f32, (centred_at[1] - aim_px[1]) as f32]);
-            });
+            }).await;
         }
         let last = c.last.clone();
 
@@ -3715,26 +3883,26 @@ impl Orchestrator {
                 plane = s.table_z_m + s.grasp_height_m.max(h);
                 close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
                 tracing::info!("Grasp {}: object top {h:.3} m above the table ({source}), closing at {close_h:.3} m", self.id);
-                self.sup.inner().write().await.update_action(self.id, |a| {
+                self.update_action_if_legacy(|a| {
                     a.height_source = Some(if depth_chosen { "depth".into() } else { source });
                     a.object_height_m = Some(h as f32);
-                });
+                }).await;
             }
-            None => self.sup.inner().write().await.update_action(self.id, |a| {
+            None => self.update_action_if_legacy(|a| {
                 a.height_source = Some("setup".into());
                 a.height_reason = (!reasons.is_empty()).then(|| reasons.join(","));
-            }),
+            }).await,
         }
         // depth measurement fields: when depth decided or is record-only (diagnostic)
         if let Some(meas) = depth_meas.as_ref().filter(|_| depth_chosen || record.contains(&HeightSource::Depth)) {
-            self.sup.inner().write().await.update_action(self.id, |a| {
+            self.update_action_if_legacy(|a| {
                 a.depth_anchor = Some(meas.source.into());
                 a.object_depth_m = Some(meas.depth_m as f32);
                 a.object_length_m = meas.length_m.map(|l| l as f32);
                 a.jaw_clear = meas.jaw_clear;
-            });
+            }).await;
         }
-        self.sup.inner().write().await.update_action(self.id, |a| a.close_height_m = Some(close_h as f32));
+        self.update_action_if_legacy(|a| a.close_height_m = Some(close_h as f32)).await;
 
         // look-down, centred at a border-free aim: one base move that puts the TCP over the box
         // centre's point on the plane z = `plane`, seen from the centring pose. The point under
@@ -3774,7 +3942,7 @@ impl Orchestrator {
         // J6 alignment: close the jaws across the object's short side
         self.phase("align", 0.55).await?;
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
-        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); });
+        self.update_action_if_legacy(|a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); }).await;
 
         // grasp width: `width_record` sources first (reported only), then `width_sources` in
         // order until one accepts; one limit check on the chosen width. The width is measured
@@ -3801,10 +3969,10 @@ impl Orchestrator {
         }
         let (chosen_width, width_entries) = match wchain.finish() { Ok(r) => r, Err((_, e)) => (None, e) };
         let measured_width_m = chosen_width.map(|(w, _)| w);
-        self.sup.inner().write().await.update_action(self.id, |a| {
+        self.update_action_if_legacy(|a| {
             a.width_estimates = width_entries;
             if let Some(w) = measured_width_m { a.grasp_width_m = Some(w as f32); }
-        });
+        }).await;
         if let Some(w) = measured_width_m {
             let max_w = self.max_grasp_width().await;
             if max_w > 0.0 && w > max_w {
@@ -3818,9 +3986,7 @@ impl Orchestrator {
 
         // width-based pre-open before descend
         let (pre_open_decision, pre_open_target) = {
-            let inner = self.sup.inner().read().await;
-            let policy = inner.config.gripper_policy.clone();
-            drop(inner);
+            let policy = self.gripper_policy().await;
             match policy {
                 None => (Some("skipped:no_policy".to_string()), None),
                 Some(policy) => {
@@ -3869,39 +4035,27 @@ impl Orchestrator {
         if let Some((fraction, target_w)) = pre_open_target {
             self.phase("preopen", 0.6).await?;
             self.gripper_move("preopen", fraction).await?;
-            self.sup.inner().write().await.update_action(self.id, |a| {
+            self.update_action_if_legacy(|a| {
                 a.pre_open = Some("done".into());
                 a.pre_open_m = Some(target_w);
-            });
+            }).await;
         } else if let Some(reason) = pre_open_decision {
-            self.sup.inner().write().await.update_action(self.id, |a| {
+            self.update_action_if_legacy(|a| {
                 a.pre_open = Some(reason);
-            });
+            }).await;
         }
 
         // descend (look-down: re-centre at mid height on the way), close, check
         self.phase("descend", 0.65).await?;
         if !camera_down {
             let (recentre, iterations) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
-            self.sup.inner().write().await.update_action(self.id, |a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; });
+            self.update_action_if_legacy(|a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; }).await;
             self.phase("descend", 0.75).await?;
         }
         self.descend(close_h, planned.request.approach).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
-        let held_width = {
-            let inner = self.sup.inner().read().await;
-            let require_real = inner.requires_real_jaw_curve();
-            inner.config.gripper_policy.as_ref().and_then(|p| {
-                if require_real && p.jaw_opening.is_none() {
-                    return None;
-                }
-                let idx = inner.config.gripper_index().unwrap_or(6);
-                let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
-                Some(p.opening_m(m))
-            })
-        };
-        if let Some(w) = held_width {
-            self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+        if let Some(w) = self.held_width_m().await {
+            self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
         }
         let holding = closed.holding == Some(true);
         let lift_to = |p: Vec3| GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + s.lift_height_m], r: None };
@@ -3925,32 +4079,20 @@ impl Orchestrator {
         // stops on the object (holding) or runs to closed (dropped)
         let (held, gap) = self.holding_now().await?;
         if held {
-            self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("held".into()));
+            self.update_action_if_legacy(|a| a.post_lift = Some("held".into())).await;
             return Ok((true, closed.gripper_gap_rad));
         }
         tracing::info!("Grasp {}: grip torque gone after the lift (gap {gap:.2} rad), re-gripping", self.id);
         let regrip = self.gripper_phase("regrip", 0.95, GripperCommand::Close).await?;
         let gap = regrip.gripper_gap_rad.unwrap_or(gap);
         if regrip.holding == Some(true) {
-            let held_width = {
-                let inner = self.sup.inner().read().await;
-                let require_real = inner.requires_real_jaw_curve();
-                inner.config.gripper_policy.as_ref().and_then(|p| {
-                    if require_real && p.jaw_opening.is_none() {
-                        return None;
-                    }
-                    let idx = inner.config.gripper_index().unwrap_or(6);
-                    let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
-                    Some(p.opening_m(m))
-                })
-            };
-            if let Some(w) = held_width {
-                self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+            if let Some(w) = self.held_width_m().await {
+                self.update_action_if_legacy(|a| a.held_width_m = Some(w)).await;
             }
-            self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("regripped".into()));
+            self.update_action_if_legacy(|a| a.post_lift = Some("regripped".into())).await;
             return Ok((true, Some(gap)));
         }
-        self.sup.inner().write().await.update_action(self.id, |a| { a.post_lift = Some("dropped".into()); a.gripper_gap_rad = Some(gap); });
+        self.update_action_if_legacy(|a| { a.post_lift = Some("dropped".into()); a.gripper_gap_rad = Some(gap); }).await;
         Err(fail("DROPPED", format!("Object no longer held after the lift: the re-grip closed to {gap:.2} rad from closed")))
     }
 
@@ -3963,7 +4105,39 @@ impl Orchestrator {
         let mut vels = Vec::new();
         loop {
             self.check().await?;
-            let (gap, tau, load, vel, policy, feedback_fresh, torque_feedback, load_feedback) = {
+            let (gap, tau, load, vel, policy, feedback_fresh, torque_feedback, load_feedback) = if self.is_executor() {
+                let Some(env) = self.sup.hub().prep_env() else {
+                    return Err(fail("OBSERVATION_UNAVAILABLE", "No published planning environment"));
+                };
+                let Some(snap) = self.sup.hub().latest() else {
+                    return Err(fail("OBSERVATION_UNAVAILABLE", "No published telemetry snapshot"));
+                };
+                let Some(policy) = env.config.gripper_policy.clone() else {
+                    return Err(fail("UNSUPPORTED", "No gripper policy"));
+                };
+                let g_idx = env.config.gripper_index().unwrap_or(6);
+                let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                let m_g = snap.rt.positions.get(g_idx).copied().unwrap_or(f32::NAN);
+                let gap = (policy.closed_rad - m_g) * dir;
+                let tau = snap.obs.torques.get(g_idx).copied().unwrap_or(0.0).abs();
+                let load = snap
+                    .obs
+                    .loads
+                    .as_ref()
+                    .and_then(|l| l.get(g_idx).copied())
+                    .unwrap_or(0.0)
+                    .abs();
+                let vel = snap.rt.velocities.get(g_idx).copied().unwrap_or(0.0);
+                let fresh = if env.driver_present {
+                    let now = Instant::now();
+                    snap.rt.feedback_instants.iter().all(|t| {
+                        t.is_some_and(|ts| now.saturating_duration_since(ts) <= Duration::from_millis(250))
+                    })
+                } else {
+                    true
+                };
+                (gap, tau, load, vel, policy, fresh, env.has_torque_feedback, env.has_load_feedback)
+            } else {
                 let inner = self.sup.inner().read().await;
                 let Some(policy) = inner.config.gripper_policy.clone() else {
                     return Err(fail("UNSUPPORTED", "No gripper policy"));
@@ -4040,7 +4214,9 @@ impl Orchestrator {
         tracker.predict_at(self.cam.to_norm(p));
         let d = self.fresh_match(&tracker, since, after).await?;
         let c = self.cam.to_px(box_centre(&d.box_norm));
-        self.sup.inner().write().await.set_action_final_offset(self.id, [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]);
+        if !self.is_executor() {
+            self.sup.inner().write().await.set_action_final_offset(self.id, [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]);
+        }
         let moved = (c[0] - p[0]).hypot(c[1] - p[1]);
         if moved > self.setup.recheck_tol_px {
             return Err(fail("TARGET_DISPLACED", format!("Target {moved:.0} px from where it was expected after the transition (recheck_tol_px {:.0})", self.setup.recheck_tol_px)));
@@ -4080,7 +4256,9 @@ impl Orchestrator {
                 let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
                 if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
                 let (it, e) = if report { (Some(iteration), Some(err as f32)) } else { (None, None) };
-                self.sup.inner().write().await.set_action_phase(self.id, phase, progress, it, e);
+                if !self.is_executor() {
+                    self.sup.inner().write().await.set_action_phase(self.id, phase, progress, it, e);
+                }
                 if consecutive >= s.stable_frames { break None; }
                 let m = s.median_frames as usize;
                 if xs.len() >= m {
@@ -4255,7 +4433,7 @@ impl Orchestrator {
 
     async fn write_estimates(&self, chain: &EstimateChain) {
         let entries = chain.entries().to_vec();
-        self.sup.inner().write().await.update_action(self.id, |a| a.height_estimates = entries);
+        self.update_action_if_legacy(|a| a.height_estimates = entries).await;
     }
 
     /// Height probe after the centring (`height_probe_mode`): `Ok(Ok((h, source)))` with the
@@ -4288,7 +4466,7 @@ impl Orchestrator {
         let up = match self.probe_up(c, &est, label, after).await? { Ok(h) => self.accept_height(h)?, Err(e) => Err(e) };
         Ok(match (up, fallback) {
             (Ok(h), Some(f)) => {
-                self.sup.inner().write().await.update_action(self.id, |a| a.height_reason = Some(f));
+                self.update_action_if_legacy(|a| a.height_reason = Some(f)).await;
                 Ok((h, "scale"))
             }
             (Ok(h), None) => Ok((h, "scale")),
@@ -4337,7 +4515,7 @@ impl Orchestrator {
             }
         }
         let Some((done, dz)) = moved else { return Ok(Err("probe_unreachable".into())); };
-        self.sup.inner().write().await.update_action(self.id, |a| { a.probe_dz_m = Some(dz as f32); a.probe_mode = Some("up".into()); });
+        self.update_action_if_legacy(|a| { a.probe_dz_m = Some(dz as f32); a.probe_mode = Some("up".into()); }).await;
         let now = self.pose().await;
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
         if let Some(p) = self.cam.project(&now, est) { tracker.predict_at(self.cam.to_norm(p)); }
@@ -4374,7 +4552,7 @@ impl Orchestrator {
     /// component of the lens displacement between the poses from FK of the measured joints;
     /// top height = mean measured lens z − D − `table_z_m` (not yet accepted).
     pub async fn probe_lateral(&self, c: &Centred, est: &Vec3, label: &str, after: &mut Option<u64>) -> Result<Lateral, Stop> {
-        if self.sup.inner().read().await.config.arm_model.arm_dof() == 5 {
+        if self.arm_dof().await == 5 {
             return Ok(Lateral::Fallback("unreachable"));
         }
         let s = &self.setup;
@@ -4402,7 +4580,15 @@ impl Orchestrator {
             return Ok(Lateral::Fallback("unreachable"));
         }
         {
-            let mut input = self.sup.inner().read().await.plan_input().map_err(crate::macro_action::arm_fail)?;
+            let mut input = if self.is_executor() {
+                self.ctx
+                    .snapshot(self.deadline)
+                    .await?
+                    .plan_input_in(GoalFrame::EndLink)
+                    .map_err(crate::macro_action::arm_fail)?
+            } else {
+                self.sup.inner().read().await.plan_input().map_err(crate::macro_action::arm_fail)?
+            };
             let speed = Speed { linear: s.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS };
             let is_5dof = input.arm.arm_dof() == 5;
             for goal in [neg, pos] {
@@ -4426,7 +4612,7 @@ impl Orchestrator {
             };
             if !moved {
                 moved = true;
-                self.sup.inner().write().await.update_action(self.id, |a| a.probe_mode = Some("lateral".into()));
+                self.update_action_if_legacy(|a| a.probe_mode = Some("lateral".into())).await;
             }
             let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
             if let Some(p) = self.cam.project(&goal, est) { tracker.predict_at(self.cam.to_norm(p)); }
@@ -4441,7 +4627,12 @@ impl Orchestrator {
                 tracker.gate_px = s.match_dist_px;
                 tracker.predicted = d.box_norm;
                 boxes.push(px(d.box_norm));
-                let meas = {
+                let meas = if self.is_executor() {
+                    match (self.sup.hub().prep_env(), self.sup.hub().latest()) {
+                        (Some(env), Some(snap)) => env.config.arm_model.fk_f32(&snap.rt.positions),
+                        _ => None,
+                    }
+                } else {
                     let inner = self.sup.inner().read().await;
                     inner.config.arm_model.fk_f32(&inner.measured_positions)
                 };
@@ -4460,10 +4651,10 @@ impl Orchestrator {
         let b_meas = kinematics::dot(&kinematics::sub(&l_pos, &l_neg), &x_meas);
         // commanded: the image-x component of the commanded lens displacement (B · n)
         let b_cmd = kinematics::dot(&kinematics::sub(&self.cam.origin(&pos), &self.cam.origin(&neg)), &x_cam);
-        self.sup.inner().write().await.update_action(self.id, |a| {
+        self.update_action_if_legacy(|a| {
             a.lateral_baseline_m = Some(b_meas as f32);
             a.lateral_baseline_err_mm = Some(((b_meas - b_cmd) * 1000.0) as f32);
-        });
+        }).await;
         tracing::info!("Grasp {}: lateral probe baseline {:.4} m measured, {:.4} m commanded", self.id, b_meas, b_cmd);
         let z = (l_neg[2] + l_pos[2]) / 2.0;
         let Some((u_neg, u_pos, feature)) = top_face_u(&sides[0].0, &sides[1].0, self.cam.cx) else { return Ok(Lateral::Fallback("edge")); };
@@ -4585,12 +4776,25 @@ impl Orchestrator {
     /// last box is unreliable ([`align_guard`]) or no candidate fits J6's limits.
     async fn align_turn(&self, c: &Centred, plane: f64) -> (Option<f64>, String) {
         let pose = self.pose().await;
-        let inner = self.sup.inner().read().await;
-        let roll_idx = inner.config.arm_dof() - 1;
-        let (q_roll, lim) = (f64::from(inner.commanded_positions[roll_idx]), inner.config.limits[roll_idx].clone());
-        // a roll t about the tool axis moves the roll motor by sign * t
-        let sign = inner.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
-        drop(inner);
+        let (q_roll, lim, sign) = if self.is_executor() {
+            match (self.sup.hub().prep_env(), self.sup.hub().latest()) {
+                (Some(env), Some(snap)) => {
+                    let roll_idx = env.config.arm_dof().saturating_sub(1);
+                    let q_roll = f64::from(snap.rt.commanded_positions.get(roll_idx).copied().unwrap_or(0.0));
+                    let lim = env.config.limits.get(roll_idx).cloned().unwrap_or_else(|| crate::model::JointLimit::new("roll", -3.14, 3.14, 1.0, 1.0));
+                    let sign = env.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
+                    (q_roll, lim, sign)
+                }
+                _ => return (None, "skipped:no_snapshot".into()),
+            }
+        } else {
+            let inner = self.sup.inner().read().await;
+            let roll_idx = inner.config.arm_dof() - 1;
+            let (q_roll, lim) = (f64::from(inner.commanded_positions[roll_idx]), inner.config.limits[roll_idx].clone());
+            // a roll t about the tool axis moves the roll motor by sign * t
+            let sign = inner.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
+            (q_roll, lim, sign)
+        };
         let room = |t: f64| { let q = q_roll + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
         // an image angle: the long side on the plane, seen from the pose of the centring frames
         let angle_turn = |alpha: f64| -> Result<Option<f64>, &'static str> {
@@ -4618,10 +4822,10 @@ impl Orchestrator {
             Some([half, -half].into_iter().find(|t| room(*t)).unwrap_or(half))
         };
         let out = yaw_chain(&self.setup, &c.last, &c.frames, self.cam.size, &angle_turn, &box_turn);
-        self.sup.inner().write().await.update_action(self.id, |a| {
+        self.update_action_if_legacy(|a| {
             if let Some(spread) = out.angle_spread_deg { a.angle_spread_deg = Some(spread as f32); }
             a.yaw_estimates = out.entries.clone();
-        });
+        }).await;
         (out.turn, out.align)
     }
 
@@ -4654,15 +4858,32 @@ impl Orchestrator {
     /// most `max_grasp_width_m` (when > 0); `max_grasp_width_m` without a calibrated policy.
     async fn max_grasp_width(&self) -> f64 {
         let s = &self.setup;
-        let inner = self.sup.inner().read().await;
-        match inner.config.gripper_policy.as_ref().filter(|p| p.is_calibrated()) {
-            Some(p) => {
-                let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
-                if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit }
+        if self.is_executor() {
+            let Some(env) = self.sup.hub().prep_env() else {
+                return s.max_grasp_width_m;
+            };
+            match env.config.gripper_policy.as_ref() {
+                Some(p) if p.is_calibrated() => {
+                    let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
+                    if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit }
+                }
+                Some(p) => {
+                    let check = crate::model::check_grasp_width(p, s.max_grasp_width_m, env.requires_real_jaw_curve);
+                    check.effective_max_m(s.max_grasp_width_m)
+                }
+                None => s.max_grasp_width_m,
             }
-            // an uncalibrated (nominal) curve narrower than the setup clamps it
-            None => inner.grasp_width_check(s.max_grasp_width_m)
-                .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)),
+        } else {
+            let inner = self.sup.inner().read().await;
+            match inner.config.gripper_policy.as_ref().filter(|p| p.is_calibrated()) {
+                Some(p) => {
+                    let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
+                    if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit }
+                }
+                // an uncalibrated (nominal) curve narrower than the setup clamps it
+                None => inner.grasp_width_check(s.max_grasp_width_m)
+                    .map_or(s.max_grasp_width_m, |c| c.effective_max_m(s.max_grasp_width_m)),
+            }
         }
     }
 }

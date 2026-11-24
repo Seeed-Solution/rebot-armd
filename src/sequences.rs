@@ -578,6 +578,217 @@ pub fn prepare_run(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<
     })
 }
 
+/// Prepare a `run_sequence` plan from a published [`ActionSnapshot`] (0 `SupervisorLock` on
+/// `OWNER_EXECUTOR`). Refuses `record: Some(...)` upfront when `for_executor == true` so an
+/// executor run never touches the detached recorder shell.
+pub fn prepare_run_from_snapshot(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    body: &Value,
+    epoch: u64,
+    for_executor: bool,
+) -> Result<RunPlan, ArmError> {
+    if snap.env.config.active_tool.commissioning_required {
+        return Err(crate::safety::SafetyError::CommissioningRequired(
+            "run_sequence (blocked while active tool requires commissioning; use jog/move_to/move_relative/gripper at speed_scale <= 0.2)".into(),
+        )
+        .into());
+    }
+    let request = parse_run(body)?;
+    if for_executor && request.record.is_some() {
+        return Err(crate::motion::MotionError::Unsupported(
+            "sequence recording is not supported in RT executor owner mode".into(),
+        )
+        .into());
+    }
+    if epoch != snap.owner.authority.epoch {
+        return Err(crate::safety::SafetyError::EpochMismatch {
+            expected: snap.owner.authority.epoch,
+            received: epoch,
+        }
+        .into());
+    }
+    let sequence = snap
+        .env
+        .sequences
+        .get(&request.id)
+        .cloned()
+        .ok_or_else(|| rejected(404, "SEQUENCE_NOT_FOUND", format!("No sequence with id '{}'", request.id)))?;
+    if sequence.steps.is_empty() {
+        return Err(invalid("the sequence has no steps"));
+    }
+    if request.from_step >= sequence.steps.len() {
+        return Err(invalid(format!("from_step must be below {}", sequence.steps.len())));
+    }
+    let end = if request.single_step { request.from_step + 1 } else { sequence.steps.len() };
+    let repeats = if request.single_step { 1 } else { request.repeat };
+    let mut steps = Vec::new();
+    let mut stale = Vec::new();
+    for i in request.from_step..end {
+        let missing = |m: String| ArmError::detailed(422, "SEQUENCE_REF_MISSING", format!("step {i}: {m}"), json!({"step": i}));
+        let pinned = match &sequence.steps[i] {
+            Step::Pose { pose_id, speed_scale, gripper } => {
+                let p = snap
+                    .env
+                    .poses
+                    .poses
+                    .iter()
+                    .find(|p| p.id == *pose_id)
+                    .ok_or_else(|| missing(format!("no pose with id '{pose_id}'")))?;
+                if p.stale.is_some() { stale.push(i); }
+                if p.positions.len() != snap.env.config.dof {
+                    return Err(invalid(format!("step {i}: pose '{}' has {} joints", p.name, p.positions.len())));
+                }
+                if *gripper == PoseGripper::Pose
+                    && snap.env.config.gripper_index().is_some()
+                    && !snap
+                        .env
+                        .config
+                        .active_tool
+                        .matches_record(p.tool_id.as_deref(), p.tool_config_digest.as_deref())
+                {
+                    return Err(rejected(409, "TOOL_MISMATCH", format!(
+                        "step {i}: pose '{}' gripper position was saved with tool {:?} ({:?}), which does not match active tool '{}' ({})",
+                        p.name, p.tool_id, p.tool_config_digest, snap.env.config.active_tool.id, snap.env.config.active_tool.config_digest
+                    )));
+                }
+                PinnedStep::Pose { positions: p.positions.clone(), speed_scale: *speed_scale, gripper: *gripper, pose_id: pose_id.clone() }
+            }
+            Step::Gripper { action, fraction } => PinnedStep::Gripper { action: *action, fraction: *fraction },
+            Step::Wait { s } => PinnedStep::Wait { s: *s },
+            Step::Replay { episode_id, speed, gripper } => {
+                let e = snap.env.episodes.get(episode_id).ok_or_else(|| missing(format!("no episode '{episode_id}'")))?;
+                if e.joint_zero.stale_against(&snap.env.joint_zero_offsets) { stale.push(i); }
+                if *gripper {
+                    let gripper_involved = e.has_gripper_motion == Some(true)
+                        || snap.env.config.gripper_index().is_some_and(|g| {
+                            e.first_state
+                                .as_ref()
+                                .and_then(|fs| fs.get(g).copied())
+                                .zip(snap.commanded_positions.get(g).copied())
+                                .is_some_and(|(fg, cg)| (fg - cg).abs() > 1e-3)
+                        });
+                    if gripper_involved
+                        && !snap
+                            .env
+                            .config
+                            .active_tool
+                            .matches_record(e.tool_id.as_deref(), e.tool_config_digest.as_deref())
+                    {
+                        return Err(rejected(409, "TOOL_MISMATCH", format!(
+                            "step {i}: episode '{episode_id}' contains gripper motion from tool {:?} ({:?}), which does not match active tool '{}' ({})",
+                            e.tool_id, e.tool_config_digest, snap.env.config.active_tool.id, snap.env.config.active_tool.config_digest
+                        )));
+                    }
+                }
+                PinnedStep::Replay { episode_id: episode_id.clone(), speed: *speed, gripper: *gripper }
+            }
+        };
+        steps.push((i, pinned));
+    }
+    if !stale.is_empty() && !request.allow_stale {
+        return Err(ArmError::detailed(
+            409,
+            "DATA_STALE",
+            format!("steps {stale:?} use poses / episodes taught with another joint zero; check them, then run with allow_stale: true"),
+            json!({"steps": stale}),
+        ));
+    }
+    snap.check_preconditions()?;
+    let expected_duration_s = expected_duration_from_snapshot(snap, &steps, repeats, request.record.is_some());
+    Ok(RunPlan {
+        request,
+        sequence,
+        steps,
+        repeats,
+        epoch,
+        workspace_revision: snap.env.workspace_revision,
+        calibration_revision: snap.env.calibration_revision,
+        expected_duration_s,
+    })
+}
+
+fn expected_duration_from_snapshot(
+    snap: &crate::rt_core::requests::actions::ActionSnapshot,
+    steps: &[(usize, PinnedStep)],
+    repeats: u32,
+    record: bool,
+) -> f64 {
+    let dof = snap.env.config.dof;
+    let limits = snap.env.planning_limits(None);
+    let lo: Vec<f32> = snap.env.config.limits.iter().map(|l| l.min_position).collect();
+    let hi: Vec<f32> = snap.env.config.limits.iter().map(|l| l.max_position).collect();
+    let quintic = |a: &[f32], b: &[f32], lim: &[crate::model::JointLimit]| -> f64 {
+        crate::trajectory::TrajectoryPlanner::plan(a, &vec![0.0; dof], b, &vec![0.0; dof], None, lim)
+            .map_or(10.0, |t| t.duration)
+    };
+    let worst = quintic(&lo, &hi, &limits);
+    let gripper_idx = snap.env.config.gripper_index();
+    let pass = |mut q: Option<Vec<f32>>| -> (f64, Option<Vec<f32>>) {
+        let mut once = 0.0;
+        for (_, step) in steps {
+            match step {
+                PinnedStep::Pose { positions, speed_scale, gripper, .. } => {
+                    let mut lim = limits.clone();
+                    for (i, l) in lim.iter_mut().enumerate() {
+                        if Some(i) != gripper_idx {
+                            l.max_velocity *= *speed_scale as f32;
+                        }
+                    }
+                    let mut target = q.clone().unwrap_or_else(|| positions.clone());
+                    for i in (0..dof).filter(|i| Some(*i) != gripper_idx) { target[i] = positions[i]; }
+                    if let (PoseGripper::Pose, Some(g)) = (gripper, gripper_idx) { target[g] = positions[g]; }
+                    once += match &q {
+                        Some(a) => quintic(a, &target, &lim),
+                        None => quintic(&lo, &hi, &lim),
+                    } + crate::motion::SETTLE_MAX_S;
+                    q = Some(target);
+                }
+                PinnedStep::Gripper { action, fraction } => {
+                    once += 1.0 + match (gripper_idx, snap.env.config.gripper_policy.clone()) {
+                        (Some(g), Some(policy)) => {
+                            let request = gripper_request(*action, *fraction, policy.close_speed());
+                            let start = q.as_ref().map_or(snap.commanded_positions[g], |q| q[g]);
+                            match crate::motion::GripperMotion::try_with_close_speed_limit(
+                                request,
+                                policy,
+                                snap.env.config.limits[g].clone(),
+                                start,
+                                g,
+                                snap.env.gripper_close_speed_limit,
+                            ) {
+                                Ok(m) => {
+                                    if let Some(q) = q.as_mut() { q[g] = m.target; }
+                                    m.expected_duration()
+                                }
+                                Err(_) => 0.0,
+                            }
+                        }
+                        _ => 0.0,
+                    };
+                }
+                PinnedStep::Wait { s } => once += s,
+                PinnedStep::Replay { episode_id, speed, gripper } => {
+                    let e = snap.env.episodes.get(episode_id);
+                    let recorded = e.as_ref().map_or(crate::recording::store::MAX_EPISODE_S, |e| e.duration_s);
+                    let (first, last) = e.map_or((None, None), |e| (e.first_state, e.last_state));
+                    let hold = |mut f: Vec<f32>, q: &[f32]| { if let (false, Some(g)) = (gripper, gripper_idx) { f[g] = q[g]; } f };
+                    let approach = match (&q, first.filter(|f| f.len() == dof)) {
+                        (Some(a), Some(f)) => quintic(a, &hold(f, a), &limits),
+                        _ => worst,
+                    };
+                    once += approach + recorded / speed + 0.5;
+                    q = match (q, last.filter(|l| l.len() == dof)) { (Some(a), Some(l)) => Some(hold(l, &a)), _ => None };
+                }
+            }
+        }
+        (once + if record { 1.0 } else { 0.0 }, q)
+    };
+    let (first, end) = pass(Some(snap.commanded_positions.clone()));
+    if repeats <= 1 { return first; }
+    let (next, _) = pass(end);
+    first + next * f64::from(repeats - 1)
+}
+
 /// Upper bound of a run (s): per pose step the quintic from the previous target (from the
 /// joint-limit extremes when unknown, after a replay) plus the settle limit; gripper steps
 /// their expected duration + 1 s; waits; replays a worst-case approach + recorded duration /
@@ -768,6 +979,75 @@ pub fn begin(admitted: crate::supervisor::Admitted<'_>, sup: &Arc<ArmSupervisor>
         None,
     )?;
     Ok(finish_begin_setup(inner, sup, id, plan, stamp, deadline))
+}
+
+/// Production broker-to-worker handoff for `run_sequence` on `OWNER_EXECUTOR` (A7 / Majors 11 & 13):
+/// refuses `plan.request.record.is_some()` BEFORE starting the parent macro (recording requires
+/// legacy owner mode), submits `BeginMacro` carrying the caller's original `AdmissionStamp` and
+/// exact absolute `deadline`, and spawns the worker with the accepted parent `ActionId`, original
+/// `stamp`, and exact `deadline` (0 `SupervisorLock`).
+pub async fn begin_executor(
+    sup: &Arc<ArmSupervisor>,
+    stamp: crate::supervisor::AdmissionStamp,
+    plan: RunPlan,
+) -> Result<(u64, f64), ArmError> {
+    use crate::rt_core::requests::actions::{ActionStamp, DEFAULT_ACTION_DEADLINE};
+    if plan.request.record.is_some() {
+        return Err(crate::motion::MotionError::Unsupported(
+            "sequence recording is not supported in RT executor owner mode".into(),
+        )
+        .into());
+    }
+    let handle = sup.executor_handle().ok_or_else(|| ArmError::Rejected {
+        status: 503,
+        code: "EXECUTOR_UNAVAILABLE".into(),
+        message: "RT executor is not active".into(),
+    })?;
+    let boot = handle.boot();
+    let arm = sup
+        .hub()
+        .latest()
+        .map_or(crate::rt_core::ids::ArmId::LOCAL, |s| s.rt.owner.arm);
+    let now = Instant::now();
+    let expected = plan.expected_duration_s;
+    let deadline = now + Duration::from_secs_f64(expected * 2.0 + 30.0);
+    let mut spec = begin_macro_spec(&plan, boot, deadline);
+    spec.admission_request_id = stamp.request_id;
+    let action_stamp = ActionStamp {
+        arm,
+        boot,
+        admission: stamp,
+        config_revision: plan.workspace_revision,
+        calibration_revision: Some(plan.calibration_revision),
+        poses_revision: None,
+        sequences_revision: None,
+        grasp_setup_revision: None,
+        gripper_calib_revision: None,
+        power_budget_revision: None,
+        parent_generation: 0,
+        deadline: now + DEFAULT_ACTION_DEADLINE,
+    };
+    let (id, _req_id) =
+        crate::macro_action::begin_macro_executor(sup, &action_stamp, spec, action_stamp.deadline)
+            .await?;
+    tracing::info!(
+        "Sequence {} ('{}', id {}) started on RT executor ({} steps, {} repeats)",
+        id,
+        plan.sequence.name,
+        plan.sequence.id,
+        plan.steps.len(),
+        plan.repeats
+    );
+    let sup = sup.clone();
+    tokio::spawn(async move {
+        let worker = {
+            let sup = sup.clone();
+            tokio::spawn(async move { run(sup, id, plan, stamp, deadline).await })
+        };
+        let panic = worker.await.err().map(|e| e.to_string());
+        cleanup(&sup, id, stamp, deadline, panic).await;
+    });
+    Ok((id, expected))
 }
 
 /// After the orchestrator: discard an unfinished repeat's recording, release the pins, end

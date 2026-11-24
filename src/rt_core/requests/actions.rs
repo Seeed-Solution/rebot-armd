@@ -891,6 +891,8 @@ pub struct ActionPrepEnv {
     pub gripper_close_speed_limit: Option<f32>,
     pub gripper_ceiling_torque_estimate: Option<f32>,
     pub has_torque_feedback: bool,
+    pub has_load_feedback: bool,
+    pub camera_calibrated: bool,
     pub requires_real_jaw_curve: bool,
     pub driver_present: bool,
     pub follower: Option<String>,
@@ -910,10 +912,13 @@ impl ActionPrepEnv {
     /// Captures a coherent revision-tagged planning environment from `inner` (called off-RT
     /// at startup, before executor transfer, and after config mutations).
     pub fn from_inner(inner: &SupervisorInner) -> Self {
-        let has_torque_feedback = inner
-            .driver
-            .as_ref()
-            .is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let (has_torque_feedback, has_load_feedback) = match inner.driver.as_ref() {
+            Some(d) => d.lock().map_or((false, false), |drv| {
+                let caps = drv.capabilities();
+                (caps.torque_feedback, caps.load_feedback)
+            }),
+            None => (true, !inner.loads.is_empty()),
+        };
         Self {
             config: inner.config.clone(),
             workspace_policy: inner.workspace_policy().map(|(ws, _)| ws.clone()),
@@ -925,6 +930,8 @@ impl ActionPrepEnv {
             gripper_close_speed_limit: inner.gripper_close_speed_limit(),
             gripper_ceiling_torque_estimate: inner.gripper_ceiling_torque_estimate(),
             has_torque_feedback,
+            has_load_feedback,
+            camera_calibrated: inner.camera_calibrated(),
             requires_real_jaw_curve: inner.requires_real_jaw_curve(),
             driver_present: inner.driver.is_some(),
             follower: inner.follower.clone(),

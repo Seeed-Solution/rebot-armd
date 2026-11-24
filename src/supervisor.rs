@@ -6969,6 +6969,12 @@ pub struct ArmSupervisor {
     legacy_loop_stats: std::sync::Mutex<Option<Arc<crate::rt_core::executor::ExecutorStats>>>,
     /// Unique identifier for this daemon/supervisor instance (changes across restarts).
     instance_id: String,
+    /// Off-RT sidecar store of completed/failed `measure_multiview` measurements keyed by action ID
+    /// when `OWNER_EXECUTOR` is active (never touched by `armd-control`; bounded to 16 entries).
+    executor_measurements: std::sync::Mutex<std::collections::HashMap<u64, serde_json::Value>>,
+    /// Off-RT sidecar store of `calib_hover` jobs when `OWNER_EXECUTOR` is active (never touched
+    /// by `armd-control`; bounded to `calib_hover::KEEP_JOBS`).
+    executor_hover_jobs: std::sync::Mutex<Vec<crate::calib_hover::HoverJob>>,
 }
 
 /// How often a reader that waits for the next sample looks again.
@@ -7163,6 +7169,96 @@ impl ArmSupervisor {
             template_obs,
             legacy_loop_stats: std::sync::Mutex::new(None),
             instance_id,
+            executor_measurements: std::sync::Mutex::new(std::collections::HashMap::new()),
+            executor_hover_jobs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Owner-aware storage of a `measure_multiview` measurement payload for action `id`.
+    /// Never touches `SupervisorLock` when `OWNER_EXECUTOR` is active.
+    pub async fn record_action_measurement(&self, id: u64, value: serde_json::Value) {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            let mut map = self
+                .executor_measurements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(id, value);
+            while map.len() > 16 {
+                if let Some(&oldest) = map.keys().min() {
+                    map.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            self.inner()
+                .write()
+                .await
+                .update_action(id, |a| a.measurement = Some(value));
+        }
+    }
+
+    /// Owner-aware readback of the measurement payload recorded for action `id`.
+    /// Never touches `SupervisorLock` when `OWNER_EXECUTOR` is active.
+    pub async fn action_measurement(&self, id: u64) -> Option<serde_json::Value> {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.executor_measurements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .cloned()
+        } else {
+            let inner = self.inner().read().await;
+            inner
+                .last_action
+                .as_ref()
+                .filter(|a| a.id == id)
+                .and_then(|a| a.measurement.clone())
+                .or_else(|| {
+                    inner
+                        .previous_action
+                        .as_ref()
+                        .filter(|(a, _)| a.id == id)
+                        .and_then(|(a, _)| a.measurement.clone())
+                })
+        }
+    }
+
+    /// Owner-aware storage of a `calib_hover` job record (never touches `SupervisorLock` in
+    /// `OWNER_EXECUTOR` mode).
+    pub async fn put_hover_job(&self, job: crate::calib_hover::HoverJob) {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            let mut jobs = self
+                .executor_hover_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            jobs.retain(|j| j.id != job.id);
+            jobs.push(job);
+            let n = jobs.len();
+            if n > crate::calib_hover::KEEP_JOBS {
+                jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            }
+        } else {
+            let mut inner = self.inner().write().await;
+            inner.hover_jobs.retain(|j| j.id != job.id);
+            inner.hover_jobs.push(job);
+            let n = inner.hover_jobs.len();
+            if n > crate::calib_hover::KEEP_JOBS {
+                inner.hover_jobs.drain(..n - crate::calib_hover::KEEP_JOBS);
+            }
+        }
+    }
+
+    /// Owner-aware snapshot of stored `calib_hover` jobs (never touches `SupervisorLock` in
+    /// `OWNER_EXECUTOR` mode).
+    pub async fn hover_jobs_snapshot(&self) -> Vec<crate::calib_hover::HoverJob> {
+        if self.owner_mode() == OWNER_EXECUTOR {
+            self.executor_hover_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            self.inner().read().await.hover_jobs.clone()
         }
     }
 
