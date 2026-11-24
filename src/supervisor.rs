@@ -3494,8 +3494,10 @@ impl SupervisorInner {
         }
         if traj.motion_limits.is_none() && traj.then.is_none() {
             if let Reference::Gripper(mut b) = traj.reference {
-                if let Some(samples) = b.take_samples_spare() {
-                    self.recycle_move_samples_rt(samples);
+                if self.move_samples_spares.len() < self.move_samples_spares.capacity() {
+                    if let Some(samples) = b.take_samples_spare() {
+                        self.recycle_move_samples_rt(samples);
+                    }
                 }
                 if !b.has_inner_heap_storage() && self.gripper_motion_spare.is_none() {
                     self.gripper_motion_spare = Some(b);
