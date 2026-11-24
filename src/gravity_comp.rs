@@ -194,6 +194,9 @@ impl SupervisorInner {
                 let _ = core::fmt::write(msg, format_args!("Fault active: {br:?}"));
             }));
         }
+        if self.core.motion_inhibited_by_config() {
+            return Some(reason("CONFIG_BUSY", "A configuration change is activating or reconciling"));
+        }
         if self.handover_settling_since.is_some() { return Some(reason("HANDOVER_SETTLING", "Arm is settling after a control handover")); }
         if !self.is_torqued || self.pending_rearm || self.disable_pending || self.output_suspended
             || !self.safety.state().is_operational() {
@@ -304,7 +307,7 @@ impl SupervisorInner {
             ));
         };
         let pose = arm6(&this.measured_positions);
-        this.servo_ws_min_depths = None;
+        this.retire_servo_ws_min_depths();
         let mut entry_torque = model;
         for (i, t) in entry_torque.iter_mut().enumerate() {
             let lim = policy.torque_limits_nm[i];

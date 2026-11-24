@@ -1129,6 +1129,7 @@ pub enum GravityCompOp {
         damping_kd: Option<[f32; 6]>,
     },
     Exit {
+        lease_holder: Option<(HolderLabel, u64)>,
         code: &'static str,
         message: &'static str,
     },
@@ -2087,7 +2088,11 @@ fn install_gravity_comp(
                 }
             }
         }
-        GravityCompOp::Exit { code, message } => {
+        GravityCompOp::Exit {
+            lease_holder,
+            code,
+            message,
+        } => {
             if core.rt_executor_owned && core.driver.is_some() {
                 return Err(ConfigError::ExecutorCapabilityUnsupported(
                     "gravity_comp hardware MIT mode-switch is not supported on the RT executor",
@@ -2099,6 +2104,11 @@ fn install_gravity_comp(
                     code: "MOTION_BUSY",
                     message: "a calibration apply, restore or motor zero is running",
                 });
+            }
+            if let Some((conn, gen)) = lease_holder {
+                if gen == 0 || !core.validate_lease_at(conn.as_str(), gen, ctx.now) {
+                    return Err(ConfigError::LeaseLost);
+                }
             }
             core.exit_gravity_comp_rt(code, message);
             Ok(GravityCompReply {
@@ -2676,6 +2686,7 @@ pub async fn gravity_comp_command(
             }
         }
         GravityCompOp::Exit {
+            lease_holder,
             code: "REQUESTED",
             message: "Exit requested",
         }
