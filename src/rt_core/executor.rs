@@ -931,22 +931,14 @@ impl OffThreadSinks {
         self.stats.safety_log_dropped.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn drain_diag(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
+    pub(crate) fn drain_diag(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
         let mut rx = self.diag_rx.lock().unwrap_or_else(|e| e.into_inner());
-        let mut batch = Vec::new();
         while let Ok(sample) = rx.pop() {
-            batch.push(sample);
-        }
-        drop(rx);
-        if !batch.is_empty() {
-            let mut stats = tick_stats.lock().unwrap_or_else(|e| e.into_inner());
-            for s in &batch {
-                stats.record(s);
-            }
+            let _ = tick_stats.record(&sample);
         }
     }
 
-    pub(crate) fn drain_all(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
+    pub(crate) fn drain_all(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
         self.drain_diag(tick_stats);
         self.estop_reg.lock().unwrap_or_else(|e| e.into_inner()).drain();
         {
@@ -999,7 +991,7 @@ impl OffThreadSinks {
 
     /// Final off-thread drain at executor/dispatcher shutdown: emits any remaining events and a
     /// shutdown summary carrying the authoritative monotonic safety drop count.
-    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &Mutex<crate::diagnostics::tick::TickStats>) {
+    pub(crate) fn flush_and_report_shutdown(&self, tick_stats: &crate::diagnostics::tick::LockFreeTickStats) {
         self.drain_all(tick_stats);
         let mut log_g = self.safety_log_rx.lock().unwrap_or_else(|e| e.into_inner());
         let total = self.stats.safety_log_dropped.load(Ordering::Relaxed);
@@ -1053,7 +1045,7 @@ struct RtExecutorShared {
     stats: Arc<ExecutorStats>,
     maint_client: Arc<MaintClient>,
     hub: Arc<StateHub>,
-    tick_stats: Arc<Mutex<crate::diagnostics::tick::TickStats>>,
+    tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     sinks: Arc<OffThreadSinks>,
     executor_thread_id: ThreadId,
     control_stop: Arc<AtomicBool>,
@@ -1362,7 +1354,7 @@ pub(crate) fn spawn_executor(
     initial_generation: u64,
     config_write_mutex: Arc<tokio::sync::Mutex<()>>,
     estop_reg: Arc<Mutex<EstopRegistry>>,
-    tick_stats: Arc<Mutex<crate::diagnostics::tick::TickStats>>,
+    tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     control_period_us: Arc<AtomicU64>,
     hooks: PersistTestHooks,

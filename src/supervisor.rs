@@ -4543,9 +4543,7 @@ pub struct ArmSupervisor {
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
-    tick_stats: Arc<std::sync::Mutex<crate::diagnostics::tick::TickStats>>,
-    /// Wait for `tick_stats` of the previous tick (µs), recorded with the next tick.
-    tick_stats_wait_us: AtomicU64,
+    tick_stats: Arc<crate::diagnostics::tick::LockFreeTickStats>,
     control_sched: Arc<std::sync::Mutex<Option<crate::diagnostics::tick::ControlThreadSched>>>,
     /// Readers' side of the tick's state publication (`crate::rt_core::publish`).
     hub: Arc<crate::rt_core::publish::StateHub>,
@@ -4645,8 +4643,7 @@ impl ArmSupervisor {
             telemetry_tx: tx,
             e_stop_latched,
             requested_estop_count,
-            tick_stats: Arc::new(std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default())),
-            tick_stats_wait_us: AtomicU64::new(0),
+            tick_stats: Arc::new(crate::diagnostics::tick::LockFreeTickStats::new()),
             control_sched: Arc::new(std::sync::Mutex::new(None)),
             hub,
             dispatcher_start: std::sync::Mutex::new(()),
@@ -5944,7 +5941,7 @@ impl ArmSupervisor {
             writer_hold_us: us(log.writer_hold),
             reader_acquire_us: us(log.reader_acquire),
             writer_acquire_us: us(log.writer_acquire),
-            stats_wait_us: self.tick_stats_wait_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            stats_wait_us: 0,
             phases: crate::diagnostics::tick::LockPhases {
                 pre_us: us(pre),
                 rx_us: phases[0], control_us: phases[1], tx_us: phases[2], finish_us: phases[3], obs_us: phases[4],
@@ -5964,25 +5961,21 @@ impl ArmSupervisor {
             maint_req_id: 0,
             release_flags: 0,
         };
-        let mut stats = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner());
-        self.tick_stats_wait_us.store(done.elapsed().as_micros().min(u128::from(u64::MAX)) as u64, Ordering::Relaxed);
-        stats.record(&sample);
-        drop(stats);
+        let _ = self.tick_stats.record(&sample);
         obs
     }
 
     /// The raw samples of the last ticks, oldest first (tests, diagnostics).
     pub fn tick_samples(&self) -> Vec<crate::diagnostics::tick::TickSample> {
         self.drain_diag();
-        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window().samples().to_vec()
+        self.tick_stats.window().samples().to_vec()
     }
 
-    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). The ring is copied under
-    /// the stats mutex and sorted after it is released, so this route does not delay a tick.
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`). Reads the lock-free ring
+    /// without ever blocking the control thread.
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
         self.drain_diag();
-        let window = self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).window();
-        let mut snap = window.snapshot();
+        let mut snap = self.tick_stats.snapshot();
         snap.owner_mode = self.owner_mode_name();
         let active_stats = if let Some(h) = self.executor_handle() {
             Some(Arc::clone(h.stats()))
@@ -6042,7 +6035,7 @@ fn dispatch_loop(
     hub: &crate::rt_core::publish::StateHub,
     tx: &broadcast::Sender<ArmObservation>,
     sinks: &std::sync::Mutex<Option<Arc<crate::rt_core::executor::OffThreadSinks>>>,
-    tick_stats: &std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    tick_stats: &crate::diagnostics::tick::LockFreeTickStats,
 ) {
     #[cfg(target_os = "linux")]
     {
