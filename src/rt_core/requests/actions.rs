@@ -3844,6 +3844,7 @@ pub fn install_finish_macro(
                 action_id: id,
                 state: HolderLabel::new(spec.state.as_str()),
                 code: code_opt.map(HolderLabel::new),
+                clear_held: spec.held == HeldUpdate::Clear || spec.holding == Some(false),
             },
             epoch_id: inner.safety.epoch_id(),
             lease_generation: inner.active_lease.as_ref().map(|l| l.generation),
@@ -3857,7 +3858,7 @@ pub fn install_finish_macro(
     if spec.state == FinishState::Done {
         match spec.held {
             HeldUpdate::Unchanged => {}
-            HeldUpdate::Clear => inner.held = None,
+            HeldUpdate::Clear => inner.clear_held_rt(),
             HeldUpdate::Set { label, spill_safe } => {
                 if !inner.rt_executor_owned {
                     inner.held = Some(HeldObject {
@@ -3870,7 +3871,7 @@ pub fn install_finish_macro(
             }
         }
     } else if spec.held == HeldUpdate::Clear || spec.holding == Some(false) {
-        inner.held = None;
+        inner.clear_held_rt();
     }
     let msg = if inner.rt_executor_owned {
         if !spec.message.is_empty() {

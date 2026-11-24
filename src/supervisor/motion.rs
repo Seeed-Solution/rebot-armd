@@ -471,11 +471,11 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.is_torqued = false;
                 self.tracking.invalidate();
-                self.active_trajectory = None;
+                self.replace_active_trajectory(None);
                 self.reset_gripper_stall();
-                self.commanded_velocities = vec![0.0; self.config.dof];
+                self.commanded_velocities.fill(0.0);
                 if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                    self.measured_velocities.fill(0.0);
                 }
                 let _ = self.safety.set_torque(false);
                 self.mit_torque_off();

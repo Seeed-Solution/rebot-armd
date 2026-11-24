@@ -385,7 +385,7 @@ impl SupervisorInner {
                 }
             }
         }
-        if holding == Some(false) { self.held = None; }
+        if holding == Some(false) { self.clear_held_rt(); }
         // a standalone close that detected an object counts as holding until a release completes
         if holding == Some(true) && self.held.is_none() {
             self.held = Some(HeldObject { label: String::new(), spill_safe: false });
@@ -1530,6 +1530,7 @@ impl SupervisorInner {
                                 action_id: id,
                                 state: crate::model::HolderLabel::new("failed"),
                                 code: Some(crate::model::HolderLabel::new(code_str)),
+                                clear_held: false,
                             },
                             epoch_id: self.safety.epoch_id(),
                             lease_generation: self.active_lease.as_ref().map(|l| l.generation),

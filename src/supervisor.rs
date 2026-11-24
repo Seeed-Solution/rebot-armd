@@ -677,6 +677,7 @@ pub(crate) enum DeferredCompletionTarget {
         action_id: u64,
         state: crate::model::HolderLabel,
         code: Option<crate::model::HolderLabel>,
+        clear_held: bool,
     },
     ParkRelease(ParkRelease),
     Anonymous,
@@ -744,6 +745,8 @@ pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
     pub held: Option<HeldObject>,
+    /// Preallocated reusable `HeldObject::label` buffer on RT (0 alloc / 0 free).
+    pub(crate) held_label_spare: String,
     /// A gripper Open is running: `held` is cleared when it completes, not when it starts, so an
     /// interrupted release still counts as holding.
     pub releasing: bool,
@@ -1785,6 +1788,7 @@ impl SupervisorInner {
             retired_trajectories: std::collections::VecDeque::with_capacity(8),
             unload_settle_spare: Some(UnloadSettle::with_capacity(unload_settle_cap)),
             gripper_motion_spare: None,
+            held_label_spare: String::new(),
             boot_id: crate::rt_core::broker::BootId::process(),
             power_budget_revision: 1,
             rt_closed_connections: None,
@@ -2481,6 +2485,10 @@ impl SupervisorInner {
         self.joint_feedback_queue_bounds.reserve(dof);
         self.motor_errors.reserve(dof);
         self.gravity_torques.reserve(arm_dof);
+        self.held_label_spare.reserve(128);
+        if let Some(h) = self.held.as_mut() {
+            h.label.reserve(128);
+        }
         if self.gripper_motion_spare.is_none() {
             if let (Some(g_idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
                 let lim = &self.config.limits[g_idx];
@@ -3487,21 +3495,55 @@ impl SupervisorInner {
             })
     }
 
-    /// Updates `self.held` on RT without allocating heap memory.
+    /// Updates `self.held` on RT without allocating or freeing heap memory.
     pub(crate) fn set_held_rt(&mut self, label: crate::model::HolderLabel, spill_safe: bool) {
+        let src = label.as_str();
         if let Some(existing) = self.held.as_mut() {
             existing.spill_safe = spill_safe;
-            if existing.label.capacity() >= label.as_str().len() {
-                existing.label.clear();
-                existing.label.push_str(label.as_str());
-            } else {
-                existing.label.clear();
+            if existing.label.capacity() < src.len()
+                && self.held_label_spare.capacity() >= src.len()
+            {
+                let old = std::mem::replace(
+                    &mut existing.label,
+                    std::mem::take(&mut self.held_label_spare),
+                );
+                if old.capacity() > 0 && self.held_label_spare.capacity() == 0 {
+                    // Only reachable if prewarm wasn't called; recycle instead of dropping on RT.
+                    let mut recycled = old;
+                    recycled.clear();
+                    self.held_label_spare = recycled;
+                }
+            }
+            existing.label.clear();
+            if existing.label.capacity() >= src.len() {
+                existing.label.push_str(src);
             }
         } else {
+            let mut buf = if self.held_label_spare.capacity() >= src.len() {
+                std::mem::take(&mut self.held_label_spare)
+            } else {
+                String::new()
+            };
+            buf.clear();
+            if buf.capacity() >= src.len() {
+                buf.push_str(src);
+            }
             self.held = Some(HeldObject {
-                label: String::new(),
+                label: buf,
                 spill_safe,
             });
+        }
+    }
+
+    /// Clears `self.held`, recycling its heap `label` buffer into `held_label_spare` on RT
+    /// so clearing a held object never deallocates on `armd-control`.
+    pub(crate) fn clear_held_rt(&mut self) {
+        if let Some(old) = self.held.take() {
+            if self.rt_executor_owned && old.label.capacity() > self.held_label_spare.capacity() {
+                let mut recycled = old.label;
+                recycled.clear();
+                self.held_label_spare = recycled;
+            }
         }
     }
 
@@ -5425,8 +5467,8 @@ impl SupervisorInner {
                     if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
                 }
                 if finished && approach_started.is_none() {
-                    self.active_trajectory = None;
-                    self.commanded_velocities = vec![0.0; self.config.dof];
+                    self.replace_active_trajectory(None);
+                    self.commanded_velocities.fill(0.0);
                     if !self.pending_normal_unload {
                         self.safety.mark_motion_finished();
                         if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
@@ -6199,7 +6241,7 @@ impl SupervisorInner {
                 if let Some(done) = self.pending_deferred_done.take() {
                     if done.clear_releasing {
                         self.releasing = false;
-                        self.held = None;
+                        self.clear_held_rt();
                     }
                     if !self.pending_normal_unload {
                         self.safety.mark_motion_finished();
@@ -6220,7 +6262,15 @@ impl SupervisorInner {
                                 });
                             }
                         }
-                        DeferredCompletionTarget::MacroFinish { action_id, state, code } => {
+                        DeferredCompletionTarget::MacroFinish {
+                            action_id,
+                            state,
+                            code,
+                            clear_held,
+                        } => {
+                            if clear_held {
+                                self.clear_held_rt();
+                            }
                             self.finish_macro(
                                 action_id,
                                 state.as_str(),
