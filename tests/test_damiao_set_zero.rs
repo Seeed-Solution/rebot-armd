@@ -14,6 +14,12 @@ fn feedback_frame(id: u8, state: u8, position: f32) -> CanFrame {
     CanFrame::new_standard(0x10 + id as u16, &data).unwrap()
 }
 
+fn ctrl_mode_reply(id: u16, mode: u32) -> CanFrame {
+    let [lo, hi] = id.to_le_bytes();
+    let [m0, m1, m2, m3] = mode.to_le_bytes();
+    CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, m0, m1, m2, m3]).unwrap()
+}
+
 #[test]
 fn set_zero_needs_a_confirmed_disabled_motor_and_sends_the_fe_frame() {
     let ids = [1u16, 2, 3];
@@ -44,6 +50,7 @@ fn set_zero_is_refused_while_enabled_or_when_a_motor_reports_enabled() {
     let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
     for &id in &ids {
         let fb = feedback_frame(id as u8, 1, 0.2);
+        d.can_mut().respond_to_transmit(damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE), ctrl_mode_reply(id, damiao::CTRL_MODE_POS_VEL));
         d.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
         d.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }

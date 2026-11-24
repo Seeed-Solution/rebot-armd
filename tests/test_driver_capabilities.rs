@@ -87,6 +87,14 @@ fn damiao_requires_new_enable_feedback_and_exposes_real_sample_age() {
         "queued pre-enable feedback must not confirm enable"
     );
     assert_eq!(driver.enable_state(), EnableState::Unknown);
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
@@ -119,6 +127,14 @@ fn damiao_uses_hotter_mos_or_rotor_temperature() {
 #[test]
 fn damiao_disable_needs_feedback_and_failure_does_not_fabricate_disabled_status() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
@@ -194,6 +210,14 @@ fn clear_fault_write_does_not_erase_observed_hardware_faults() {
 #[test]
 fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
@@ -231,6 +255,14 @@ fn queued_disabled_feedback_cannot_acknowledge_a_later_disable_command() {
 #[test]
 fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));
@@ -278,6 +310,14 @@ fn overloaded_rx_still_sends_disable_but_requires_a_new_feedback_boundary() {
 #[test]
 fn genuine_response_to_disable_confirms_disabled_state() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    driver
+        .can_mut()
+        .respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     driver
         .can_mut()
         .respond_to_transmit(damiao::build_enable_frame(1), feedback(1, 30, 32));

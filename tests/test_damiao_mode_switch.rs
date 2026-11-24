@@ -40,6 +40,10 @@ fn enabled_driver(ids: &[u16]) -> DamiaoArmDriver<MockCanTransport> {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
     for &id in ids {
         let fb = feedback_frame(id as u8, 1, 0.2);
+        driver.can_mut().respond_to_transmit(
+            damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE),
+            reply(id, damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        );
         driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id), fb);
         driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id), fb);
     }

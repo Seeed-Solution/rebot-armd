@@ -111,6 +111,14 @@ impl Rig {
             let l = &lim[id as usize - 1];
             let p = damiao::float_to_uint(start[id as usize - 1], l.p_min, l.p_max, 16);
             let f = frame(id, 1, p, 2048, 2048);
+            let [lo, hi] = (id as u16).to_le_bytes();
+            let [m0, m1, m2, m3] = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+            let mode_reply = CanFrame::new_standard(
+                0x10 + id as u16,
+                &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, m0, m1, m2, m3],
+            )
+            .unwrap();
+            driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(id as u16, damiao::RID_CTRL_MODE), mode_reply);
             driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), f);
             driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), f);
             driver.can_mut().respond_to_transmit(damiao::build_disable_frame(id as u16), frame(id, 0, p, 2048, 2048));

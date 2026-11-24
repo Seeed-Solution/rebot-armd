@@ -529,6 +529,10 @@ pub enum EnableLifecycle {
     FailedHold,
 }
 
+/// Maximum time an energized joint may remain with an unverified control mode before latching a
+/// non-recoverable fault naming the joint (L2).
+pub const UNVERIFIED_MODE_READBACK_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Inline per-joint measured-position hold state (0 heap allocations on RT).
 #[derive(Debug, Clone, Copy)]
 pub struct MeasuredHoldTracker {
@@ -542,6 +546,11 @@ pub struct MeasuredHoldTracker {
     pub captured_continuity_epoch: [Option<u64>; crate::rt_core::mailbox::MAX_DOF],
     /// Driver-clock timestamp when this joint's capture was last confirmed continuously fresh.
     pub last_seen_fresh_at: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    /// Driver-clock timestamp when an energized joint was first seen with an unverified hold mode
+    /// (L2: per-tick `RID_CTRL_MODE` readback, non-recoverable fault at 200 ms).
+    pub unverified_mode_since: [Option<Instant>; crate::rt_core::mailbox::MAX_DOF],
+    /// Bitmask of joints that have already latched the 200 ms unverified-mode fault.
+    pub unverified_mode_faulted_mask: u64,
     /// Most recent per-motor torque evidence observed from the driver.
     pub motor_evidence: [crate::driver::MotorTorqueEvidence; crate::rt_core::mailbox::MAX_DOF],
     /// Most recent per-joint hold status observed during hold evaluation/servicing.
@@ -558,6 +567,8 @@ impl MeasuredHoldTracker {
             captured_positions: [None; crate::rt_core::mailbox::MAX_DOF],
             captured_continuity_epoch: [None; crate::rt_core::mailbox::MAX_DOF],
             last_seen_fresh_at: [None; crate::rt_core::mailbox::MAX_DOF],
+            unverified_mode_since: [None; crate::rt_core::mailbox::MAX_DOF],
+            unverified_mode_faulted_mask: 0,
             motor_evidence: [crate::driver::MotorTorqueEvidence::Unknown; crate::rt_core::mailbox::MAX_DOF],
             joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
             enable_failed_cause: crate::safety::BoundedText::empty(),
@@ -569,6 +580,8 @@ impl MeasuredHoldTracker {
         self.captured_positions.fill(None);
         self.captured_continuity_epoch.fill(None);
         self.last_seen_fresh_at.fill(None);
+        self.unverified_mode_since.fill(None);
+        self.unverified_mode_faulted_mask = 0;
         self.joint_status.fill(crate::driver::JointHoldStatus::SkippedOff);
         self.enable_failed_cause = crate::safety::BoundedText::empty();
     }
@@ -1579,6 +1592,68 @@ impl SupervisorInner {
         );
         self.scratch.ages = ages_buf;
         self.scratch.fb.bounds = bounds_buf;
+    }
+
+    /// L2: For every energized (or possibly energized while torqued/stopped) joint whose control
+    /// mode is unverified, request a `RID_CTRL_MODE` readback every tick while already holding the
+    /// driver lock in `poll_hardware_rx`. If still unverified after 200 ms, latch a non-recoverable
+    /// fault naming the joint(s) and report the joint unheld (`UnheldNoVerifiedMode`). Zero heap
+    /// allocations.
+    pub(crate) fn enforce_unverified_mode_readback_parts(
+        measured_hold: &mut MeasuredHoldTracker,
+        safety: &mut crate::safety::SafetyManager,
+        snap: &OwnerDriverSnapshot,
+        transition_pending: bool,
+        torqued_or_stopped: bool,
+        config_dof: usize,
+        driver: &mut dyn crate::driver::ArmDriver,
+    ) {
+        use crate::driver::{JointHoldStatus, MotorTorqueEvidence};
+        if !snap.valid || transition_pending {
+            return;
+        }
+        let drv_now = snap.captured_at.unwrap_or_else(|| driver.clock_now());
+        let dof = config_dof.min(crate::rt_core::mailbox::MAX_DOF);
+        measured_hold.dof = dof;
+        let mut unverified_mask = 0u64;
+        let mut timed_out_mask = 0u64;
+        for j in 0..dof {
+            let joint_energized = snap.motor_evidence[j] == MotorTorqueEvidence::OnConfirmed
+                || (torqued_or_stopped && snap.motor_evidence[j] != MotorTorqueEvidence::OffConfirmed);
+            if !joint_energized || snap.hold_mode_verified[j] {
+                measured_hold.unverified_mode_since[j] = None;
+                measured_hold.unverified_mode_faulted_mask &= !(1u64 << j);
+                continue;
+            }
+            unverified_mask |= 1u64 << j;
+            measured_hold.joint_status[j] = JointHoldStatus::UnheldNoVerifiedMode;
+            let since = *measured_hold.unverified_mode_since[j].get_or_insert(drv_now);
+            if drv_now.saturating_duration_since(since) >= UNVERIFIED_MODE_READBACK_TIMEOUT
+                && (measured_hold.unverified_mode_faulted_mask & (1u64 << j)) == 0
+            {
+                timed_out_mask |= 1u64 << j;
+            }
+        }
+        if unverified_mask != 0 {
+            let _ = driver.request_mode_readback_budgeted(unverified_mask);
+        }
+        if timed_out_mask != 0 {
+            measured_hold.unverified_mode_faulted_mask |= timed_out_mask;
+            let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                let mut first = true;
+                for j in 0..dof {
+                    if (timed_out_mask & (1u64 << j)) != 0 {
+                        if !first {
+                            buf.push_str(", ");
+                        }
+                        first = false;
+                        let _ = core::fmt::write(buf, format_args!("J{}", j + 1));
+                    }
+                }
+                buf.push_str(" control mode unverified after 200 ms readback timeout; joint unheld");
+            });
+            safety.latch(crate::safety::FaultKind::Other, detail);
+        }
     }
 
     /// Single shared stopped-hold capture kernel reading strictly from the owner's inline

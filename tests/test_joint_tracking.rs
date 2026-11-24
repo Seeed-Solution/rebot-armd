@@ -1699,6 +1699,15 @@ fn tracking_damiao_recovery_suspends_compensated_writes() {
                     let i = (id - 1) as usize;
                     if !s.drop_rx[i] { s.push_feedback(i); }
                 }
+            } else if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    let b = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let [lo, hi] = id.to_le_bytes();
+                    s.rx_queue.push_back(
+                        CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+                    );
+                }
             }
             Ok(())
         }
@@ -2056,6 +2065,10 @@ fn tracking_gravity_comp_handback_and_mode_switch_hold_loss() {
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
         };
+        mock.respond_to_transmit(
+            damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE),
+            mk_reply(damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        );
         for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
             mock.respond_to_transmit(damiao::build_read_register_frame(1, rid), mk_reply(damiao::REG_READ, rid, val.to_le_bytes()));
         }
@@ -2894,6 +2907,10 @@ fn damiao_write_modes_preserves_cold_arm_gravity_comp_and_interrupted_rearm() {
         let mk_reply = |op: u8, rid: u8, bytes: [u8; 4]| {
             CanFrame::new_standard(0, &[1, 0, op, rid, bytes[0], bytes[1], bytes[2], bytes[3]]).unwrap()
         };
+        mock.respond_to_transmit(
+            damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE),
+            mk_reply(damiao::REG_READ, damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL.to_le_bytes()),
+        );
         for (rid, val) in [(damiao::RID_PMAX, 12.5_f32), (damiao::RID_VMAX, 30.0), (damiao::RID_TMAX, 18.0)] {
             mock.respond_to_transmit(
                 damiao::build_read_register_frame(1, rid),
@@ -2992,6 +3009,12 @@ fn damiao_recovery_tx_failure_not_recorded_as_sent() {
     let limits = DamiaoLimits::default();
     let p = damiao::float_to_uint(0.1, limits.p_min, limits.p_max, 16);
     let fb = CanFrame::new_standard(0x11, &[0x11, (p >> 8) as u8, p as u8, 0, 0, 0, 30, 30]).unwrap();
+    let ctrl_mode_reply = CanFrame::new_standard(
+        0x11,
+        &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, 2, 0, 0, 0],
+    )
+    .unwrap();
+    mock.respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), ctrl_mode_reply);
     mock.respond_to_transmit(damiao::build_enable_frame(1), fb);
     mock.respond_to_transmit(damiao::build_refresh_frame(1), fb);
     let mut drv = DamiaoArmDriver::new(FailRecoveryTxCan { inner: mock, fail_pos_vel: false }, vec![1]);
@@ -3073,6 +3096,15 @@ fn tracking_damiao_recovery_preserves_unaffected_moving_joint() {
                 let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
                 if (1..=7).contains(&id) {
                     s.push_feedback((id - 1) as usize);
+                }
+            } else if frame.id == 0x7FF && frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                let id = u16::from_le_bytes([frame.data[0], frame.data[1]]);
+                if (1..=7).contains(&id) {
+                    let b = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let [lo, hi] = id.to_le_bytes();
+                    s.rx.push_back(
+                        CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, damiao::RID_CTRL_MODE, b[0], b[1], b[2], b[3]]).unwrap()
+                    );
                 }
             } else if (0x101..=0x107).contains(&frame.id) {
                 let idx = (frame.id - 0x101) as usize;

@@ -4174,6 +4174,20 @@ impl SupervisorInner {
                             &mut sc.ages,
                             &mut sc.fb.bounds,
                         );
+                    let torqued_or_stopped = self.is_torqued
+                        || matches!(
+                            self.enable_lifecycle,
+                            EnableLifecycle::FailedHold | EnableLifecycle::Armed
+                        );
+                    Self::enforce_unverified_mode_readback_parts(
+                        &mut self.measured_hold,
+                        &mut self.safety,
+                        &self.owner_driver_snapshot,
+                        self.torque_transition.is_some(),
+                        torqued_or_stopped,
+                        self.config.dof,
+                        &mut **driver,
+                    );
                 }
                 Err(_) => {
                     self.last_can_feedback_instant = None;

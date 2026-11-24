@@ -228,7 +228,8 @@ fn mit_not_requested_sends_no_register_reads_at_arm() {
     // the Phase 1 profile (tracking off) and an enabled position-lead profile: no readback
     for jt in [None, Some(JointTrackingConfig::rebot_dm()), Some(JointTrackingConfig { enabled: true, ..JointTrackingConfig::rebot_dm() })] {
         let bus = clocked_bus();
-        let d = disabled_driver(&bus);
+        let mut d = disabled_driver(&bus);
+        d.check_mapping_ranges();
         let cfg = ArmConfig { lease_timeout_ms: 600_000, workspace: None, joint_tracking: jt, ..ArmConfig::rebot_dm() };
         let mut inner = SupervisorInner::new(cfg).with_driver(Box::new(d));
         inner.lease_enabled = false;

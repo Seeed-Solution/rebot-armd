@@ -3959,10 +3959,10 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
         Capacities { commands: 8, plans: 1, replies: 16 },
     );
 
-    // Let J7 complete POS_FORCE register write/readback and pre-enable hold, then fail enable
-    // confirmation on J7 (drop enable frames on J7 while J1..J6 confirm OnConfirmed) with
-    // periodic 50 Hz feedback so ALL 7 joints stay fresh (<= 20 ms) when enable times out.
-    // `DamiaoArmDriver::enable_failed()` clears `pos_force_verified = false` on J7!
+    // 1. L2: J7 completed causal POS_FORCE register write/readback and pre-enable hold, then
+    //    enable confirmation times out on J7 (drop enable frames on J7 while J1..J6 confirm
+    //    OnConfirmed). Per L2, a failed enable MUST NOT clear J7's causally verified hold mode
+    //    flag (`verified_modes[6]`), so J7 remains verified and held alongside J1..J6.
     bus.with(|s| {
         s.motors[6].drop_torque_frames = 10;
         s.push_all_feedback();
@@ -3984,44 +3984,78 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
     assert_eq!(outcome, Some(Outcome::Failed("ENABLE_FAILED")));
     assert_eq!(fx.core.enable_lifecycle(), armd::supervisor::EnableLifecycle::FailedHold);
     assert_eq!(spec_count_damiao_disables(&bus), 0, "no automatic rollback on failed enable");
-
-    let fault = fx.core.safety.fault().expect("ENABLE_FAILED fault expected");
-    assert_eq!(fault.code, FaultCode::EnableFailed);
-    assert!(!fx.core.safety.recoverable());
-    assert!(
-        fault.message.contains("J1:on/queued") && fault.message.contains("J7:unk/unheld(no_mode)"),
-        "ENABLE_FAILED must report J1..J6 queued before first hold TX and J7 unheld(no_mode): {}",
-        fault.message
-    );
     assert_eq!(fx.core.motor_torque_evidence()[0..6], [MotorTorqueEvidence::OnConfirmed; 6]);
     assert_eq!(fx.core.motor_torque_evidence()[6], MotorTorqueEvidence::Unknown);
-    assert_eq!(fx.core.joint_hold_status()[0..6], [JointHoldStatus::Held; 6]);
-    assert_eq!(fx.core.joint_hold_status()[6], JointHoldStatus::UnheldNoVerifiedMode);
-
-    // Tick while in FailedHold with fresh feedback on all 7 joints:
-    // J1..J6 MUST all receive POS_VEL hold frames (`0x101..=0x106`) at their exact measured poses;
-    // J7 (`0x307` / `0x107` / `0x007`) MUST receive ZERO frames and NEVER veto J1..J6!
-    let epoch_before_hold = fx.core.safety.epoch_id();
-    clock.advance(Duration::from_millis(10));
-    bus.with(|s| s.push_all_feedback());
-    bus.clear_log();
-    fx.step();
-
-    assert_eq!(fx.core.joint_hold_status()[0..6], [JointHoldStatus::Held; 6]);
-    assert_eq!(fx.core.safety.epoch_id(), epoch_before_hold, "live hold update must not bump epoch");
-    let live_fault = fx.core.current_observation().fault.expect("live observation fault expected");
-    assert!(
-        live_fault.message.contains("J1:on/held") && live_fault.message.contains("J7:unk/unheld(no_mode)"),
-        "live observation fault must update to J1:on/held after hold TX: {}",
-        live_fault.message
+    assert_eq!(
+        fx.core.joint_hold_status()[6],
+        JointHoldStatus::Held,
+        "L2: failed enable must NOT clear J7's causally verified POS_FORCE hold mode"
     );
 
-    let tx = bus.tx_log();
+    // 2. B3: When J7 genuinely has NO causal mode verification (e.g. J7 silent on RID_CTRL_MODE
+    //    while J1..J6 are causally verified and energized in stopped hold), unverified J7 is
+    //    reported UnheldNoVerifiedMode, emits ZERO hold frames, and NEVER vetoes J1..J6 arm holds!
+    let clock2 = MockClock::new();
+    let bus2 = FakeBus::with_clock(&limits(), clock2.clone());
+    bus2.with(|s| {
+        s.follow_commands = false;
+        s.immediate_replies = true;
+        s.motors[6].regs.remove(&damiao::RID_CTRL_MODE);
+        for (i, m) in s.motors.iter_mut().enumerate() {
+            m.q = pose[i];
+            m.enabled = i < 6;
+        }
+    });
+    let mut dm2 = DamiaoArmDriver::new(bus2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits())
+        .unwrap()
+        .with_gripper_pos_force(GripperPosForce {
+            joint: 6,
+            current_raw: 1000,
+            close_speed_rad_s: 1.0,
+            closed_rad: -2.0,
+            open_rad: 0.0,
+            calibrated: false,
+            ceiling_torque_nm: None,
+            torque_reference: None,
+        })
+        .unwrap();
+    dm2.check_mapping_ranges();
+    for step in 0..3 {
+        if step > 0 {
+            clock2.advance(Duration::from_millis(10));
+        }
+        bus2.with(|s| s.push_all_feedback());
+        dm2.read_joint_states().unwrap();
+    }
+    let mut inner2 = SupervisorInner::new(ArmConfig {
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    })
+    .with_driver(Box::new(dm2));
+    inner2.lease_enabled = false;
+    inner2.is_torqued = true;
+    inner2.apply_stop_policy(StopPolicy::EStopLatch);
+    let (mut fx2, _b2, _tw2, _stop2) = ReleaseFixture::new(
+        inner2,
+        BOOT,
+        Capacities { commands: 8, plans: 1, replies: 16 },
+    );
+
+    clock2.advance(Duration::from_millis(10));
+    bus2.with(|s| s.push_all_feedback());
+    bus2.clear_log();
+    fx2.step();
+
+    assert_eq!(fx2.core.joint_hold_status()[0..6], [JointHoldStatus::Held; 6]);
+    assert_eq!(fx2.core.joint_hold_status()[6], JointHoldStatus::UnheldNoVerifiedMode);
+
+    let tx = bus2.tx_log();
     let arm_holds: Vec<_> = tx.iter().filter(|f| f.id >= 0x101 && f.id <= 0x106).collect();
     assert_eq!(
         arm_holds.len(),
         6,
-        "cleared POS_FORCE gripper verification must NOT veto arm joints J1..J6 holds; got {arm_holds:?}"
+        "unverified POS_FORCE gripper must NOT veto arm joints J1..J6 holds; got {arm_holds:?}"
     );
     for (j, f) in arm_holds.iter().enumerate() {
         assert_eq!(f.id, 0x101 + j as u32);
@@ -4041,7 +4075,7 @@ fn spec_b3_damiao_pos_force_gripper_cleared_mode_verification_does_not_veto_arm_
         j7_frames.is_empty(),
         "unverified POS_FORCE J7 must transmit ZERO hold frames, got {j7_frames:?}"
     );
-    assert_eq!(fx.core.joint_hold_status()[6], JointHoldStatus::UnheldNoVerifiedMode);
+    assert_eq!(fx2.core.joint_hold_status()[6], JointHoldStatus::UnheldNoVerifiedMode);
 }
 
 /// Spec test 4 (M1/M2): Both a delayed RT enable failure (Damiao via ReleaseFixture) and a
@@ -5381,14 +5415,21 @@ fn e1_damiao_causal_settle_window_rejects_5ms_in_flight_and_accepts_25ms() {
         let clock = MockClock::new();
         let bus = FakeBus::with_clock(&limits(), clock.clone());
         bus.with(|s| {
-            s.immediate_replies = false;
-            s.tx_lost = true;
+            s.immediate_replies = true;
+            s.tx_lost = false;
             s.push_all_feedback();
         });
         let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
             .with_joint_limits(limits())
             .unwrap();
         drv.read_joint_states().unwrap();
+        drv.check_mapping_ranges();
+        bus.with(|s| {
+            s.immediate_replies = false;
+            s.tx_lost = true; // inhibit real bus replies; test feeds controlled frames manually
+            s.rx.clear();
+            s.pending.clear();
+        });
 
         let p0 = drv.begin_torque(true).unwrap();
         assert!(matches!(p0, TorqueProgress::Pending { .. }));
@@ -7316,5 +7357,377 @@ fn l1_exhausted_drain_retries_and_completes_disable_within_1s_lifetime() {
         );
         assert_eq!(spec_count_damiao_disables(&r.bus), 0, "L1: ZERO CMD_DISABLE frames on 1 s expiry");
         assert!(r.fx.core.is_torqued);
+    }
+}
+
+/// L2 (part 1): Enable requires causal `verified_modes` for every joint it energizes (not just
+/// assumed `joint_modes`). When `PMAX`/`VMAX`/`TMAX` range replies arrive while `RID_CTRL_MODE`
+/// is missing, enable transmits ZERO `CMD_ENABLE` frames; and a failed enable NEVER clears a
+/// `verified_modes` flag established by a causal readback after this daemon started.
+#[test]
+fn l2_missing_ctrl_mode_with_range_replies_never_energizes() {
+    use armd::driver::RangeCheckStatus;
+
+    // 1. PMAX/VMAX/TMAX reply OK on all 7 motors while J3 drops RID_CTRL_MODE:
+    //    `check_mapping_ranges()` reports Passed, yet J3 `verified_modes` stays None, and
+    //    BOTH legacy and RT enable transmit ZERO `CMD_ENABLE` frames to any motor.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+            for m in &mut s.motors {
+                m.enabled = false;
+            }
+            s.push_all_feedback();
+        });
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        let rc = dm.check_mapping_ranges().clone();
+        assert_eq!(
+            rc.status,
+            RangeCheckStatus::Passed,
+            "precondition: PMAX/VMAX/TMAX range replies all arrived and passed"
+        );
+        assert!(dm.joint_hold_mode_verified(0), "J1 causal CTRL_MODE readback must verify");
+        assert!(!dm.joint_hold_mode_verified(2), "J3 missing CTRL_MODE must stay unverified");
+
+        // Legacy blocking `set_torque(true)` must fail with ZERO CMD_ENABLE frames.
+        bus.clear_log();
+        assert!(dm.set_torque(true).is_err(), "L2: enable with missing CTRL_MODE must fail");
+        let enables: Vec<_> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.data == damiao::CMD_ENABLE)
+            .collect();
+        assert!(
+            enables.is_empty(),
+            "L2: missing CTRL_MODE with passing ranges must send ZERO CMD_ENABLE frames, got {enables:?}"
+        );
+        // Failed enable must NOT clear J1..J2/J4..J7 causally verified flags!
+        for j in [0usize, 1, 3, 4, 5, 6] {
+            assert!(
+                dm.joint_hold_mode_verified(j),
+                "L2: failed enable must NOT clear causally verified J{}",
+                j + 1
+            );
+        }
+
+        // RT executor `TransitionOp::TorqueOn` must also fail with ZERO CMD_ENABLE frames.
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        let (mut fx, mut broker, _tw, _stop) = ReleaseFixture::new(
+            inner,
+            BOOT,
+            Capacities { commands: 8, plans: 1, replies: 16 },
+        );
+        bus.clear_log();
+        let auth = fx.core.authority(&fx.ctx(fx.now()));
+        broker
+            .submit(
+                ClientId(1),
+                1,
+                auth,
+                fx.now() + Duration::from_secs(5),
+                Submit::Transition(TransitionOp::TorqueOn),
+            )
+            .unwrap();
+        assert!(fx.step().command.unwrap().1.is_ok());
+        let mut outcome = None;
+        for _ in 0..10 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            let rep = fx.step();
+            if let Some((_, o)) = rep.transition_ended {
+                outcome = Some(o);
+                break;
+            }
+        }
+        assert_eq!(outcome, Some(Outcome::Failed("ENABLE_FAILED")));
+        let rt_enables: Vec<_> = bus
+            .tx_log()
+            .into_iter()
+            .filter(|f| f.data == damiao::CMD_ENABLE)
+            .collect();
+        assert!(
+            rt_enables.is_empty(),
+            "L2: RT enable with missing CTRL_MODE must send ZERO CMD_ENABLE frames, got {rt_enables:?}"
+        );
+    }
+
+    // 2. Failed enable on a joint that WAS causally verified after daemon start (e.g. J7
+    //    drops CMD_ENABLE or times out a later readback) MUST NOT clear its verified flag.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.immediate_replies = true;
+            s.push_all_feedback();
+        });
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        for j in 0..7 {
+            assert!(dm.joint_hold_mode_verified(j), "J{} causally verified at startup", j + 1);
+        }
+        // Fail enable on J7 (drop enable frames) -> every joint's verified flag stays true!
+        bus.with(|s| s.motors[6].drop_torque_frames = 10);
+        assert!(dm.set_torque(true).is_err());
+        for j in 0..7 {
+            assert!(
+                dm.joint_hold_mode_verified(j),
+                "L2: failed enable must preserve causal verified_modes on J{}",
+                j + 1
+            );
+        }
+    }
+}
+
+/// L2 (part 2): An energized joint whose control mode is unverified receives a `RID_CTRL_MODE`
+/// readback request every tick. If still unverified after 200 ms, latches a non-recoverable fault
+/// naming the joint (`J3`) and reports it unheld (`UnheldNoVerifiedMode`). If it answers before
+/// 200 ms, it becomes verified and held with no fault.
+#[test]
+fn l2_energized_unverified_mode_readback_200ms_bound_latches_non_recoverable_fault() {
+    use armd::driver::{JointHoldStatus, MotorTorqueEvidence};
+
+    let is_j3_ctrl_mode_read = |f: &armd::transport::CanFrame| -> bool {
+        f.id == 0x7FF
+            && f.data[0] == 3
+            && f.data[1] == 0
+            && f.data[2] == damiao::REG_READ
+            && f.data[3] == damiao::RID_CTRL_MODE
+    };
+
+    // 1. Silent RID_CTRL_MODE on energized J3: every tick requests readback; < 200 ms no fault;
+    //    at >= 200 ms latches non-recoverable fault naming J3 and keeps J3 unheld.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = if i < 6 { 0.25 } else { 0.0 };
+            }
+            s.push_all_feedback();
+        });
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+
+        // Fail a mode switch on energized J3 while J3 drops RID_CTRL_MODE -> J3 remains
+        // physically energized (`OnConfirmed`) with `verified_modes[2] == None`!
+        bus.with(|s| {
+            s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+            s.fail_tx_ids.push(0x7FF); // fail mode write to invalidate J3 mode verification
+        });
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let hold = vec![armd::driver::JointTarget::position(0.25); 7];
+            let modes = [
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+            ];
+            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_hold_mode_verified(2), "precondition: J3 mode unverified while energized");
+            let mut ev = [MotorTorqueEvidence::Unknown; 7];
+            drv.motor_torque_evidence_into(&mut ev);
+            assert_eq!(ev[2], MotorTorqueEvidence::OnConfirmed, "precondition: J3 is energized");
+        }
+        bus.with(|s| {
+            s.fail_tx_ids.clear();
+            s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+        });
+        // Enter recoverable WatchdogTimeout so stopped-hold is active (J1..J2/J4..J7 held,
+        // unverified J3 must stay UnheldNoVerifiedMode with 0 hold frames and receive a
+        // RID_CTRL_MODE readback request every tick until 200 ms latches a non-recoverable fault).
+        inner.safety.latch(
+            armd::safety::FaultKind::WatchdogTimeout,
+            armd::safety::FaultDetail::WatchdogTimeout,
+        );
+        assert!(inner.safety.recoverable(), "precondition: WatchdogTimeout is recoverable");
+
+        // Tick 0..9 (0 ms .. 180 ms): every tick sends RID_CTRL_MODE readback to J3, J3 is
+        // unheld (`UnheldNoVerifiedMode`), and no non-recoverable fault latches yet.
+        for tick_idx in 0..10 {
+            if tick_idx > 0 {
+                clock.advance(Duration::from_millis(20));
+            }
+            bus.with(|s| s.push_all_feedback());
+            bus.clear_log();
+            inner.tick(0.02);
+            let reads = bus.tx_log().iter().filter(|f| is_j3_ctrl_mode_read(f)).count();
+            assert!(
+                reads >= 1,
+                "L2: tick {tick_idx} ({} ms) must send RID_CTRL_MODE readback to unverified energized J3",
+                tick_idx * 20
+            );
+            assert_eq!(
+                inner.joint_hold_status()[2],
+                JointHoldStatus::UnheldNoVerifiedMode,
+                "L2: unverified J3 must be reported unheld at tick {tick_idx}"
+            );
+            assert!(
+                !bus.tx_log().iter().any(|f| f.id == 0x103 || f.id == 3),
+                "L2: unverified J3 must receive ZERO hold frames at tick {tick_idx}"
+            );
+            assert!(
+                inner.safety.recoverable(),
+                "L2: non-recoverable fault must NOT latch before 200 ms (tick {tick_idx}, {} ms): {:?}",
+                tick_idx * 20,
+                inner.safety.fault()
+            );
+        }
+
+        // Tick 10 (200 ms elapsed): non-recoverable fault naming J3 MUST latch and J3 stays unheld!
+        clock.advance(Duration::from_millis(20));
+        bus.with(|s| s.push_all_feedback());
+        bus.clear_log();
+        inner.tick(0.02);
+        let fault = inner
+            .safety
+            .fault()
+            .expect("L2: 200 ms unverified energized joint MUST latch a fault");
+        assert_eq!(fault.code, FaultCode::HardwareFault, "expected HardwareFault, got {fault:?}");
+        assert!(
+            !fault.recoverable && !inner.safety.recoverable(),
+            "L2: 200 ms unverified-mode fault MUST be non-recoverable: {fault:?}"
+        );
+        assert!(
+            fault.message.as_str().contains("J3"),
+            "L2: 200 ms unverified-mode fault must name J3, got: {}",
+            fault.message
+        );
+        assert_eq!(
+            inner.joint_hold_status()[2],
+            JointHoldStatus::UnheldNoVerifiedMode,
+            "L2: timed-out unverified J3 must remain reported unheld"
+        );
+        assert!(
+            !bus.tx_log().iter().any(|f| f.id == 0x103 || f.id == 3),
+            "L2: timed-out unverified J3 must still receive ZERO hold frames"
+        );
+    }
+
+    // 2. Contrast: if J3 answers the per-tick RID_CTRL_MODE readback before 200 ms (at 60 ms),
+    //    it becomes verified causally, transitions from UnheldNoVerifiedMode to Held, and no
+    //    non-recoverable 200 ms fault ever latches.
+    {
+        let clock = MockClock::new();
+        let bus = FakeBus::with_clock(&limits(), clock.clone());
+        bus.with(|s| {
+            s.follow_commands = false;
+            s.immediate_replies = true;
+            for (i, m) in s.motors.iter_mut().enumerate() {
+                m.q = if i < 6 { 0.25 } else { 0.0 };
+            }
+            s.push_all_feedback();
+        });
+        let mut dm = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+            .with_joint_limits(limits())
+            .unwrap();
+        dm.read_joint_states().unwrap();
+        dm.check_mapping_ranges();
+        let mut inner = SupervisorInner::new(ArmConfig {
+            lease_timeout_ms: 600_000,
+            ..ArmConfig::rebot_dm()
+        })
+        .with_driver(Box::new(dm));
+        inner.lease_enabled = false;
+        inner.tick(0.02);
+        enable_torque_admitted(&mut inner).unwrap();
+
+        bus.with(|s| {
+            s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+            s.fail_tx_ids.push(0x7FF);
+        });
+        {
+            let mut drv = inner.driver.as_ref().unwrap().lock().unwrap();
+            let hold = vec![armd::driver::JointTarget::position(0.25); 7];
+            let modes = [
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Mit,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+                armd::driver::JointMode::Position,
+            ];
+            let _ = drv.set_joint_modes_confirmed(&modes, &hold);
+            assert!(!drv.joint_hold_mode_verified(2));
+        }
+        bus.with(|s| {
+            s.fail_tx_ids.clear();
+            s.motors[2].regs.remove(&damiao::RID_CTRL_MODE);
+        });
+        inner.safety.latch(
+            armd::safety::FaultKind::WatchdogTimeout,
+            armd::safety::FaultDetail::WatchdogTimeout,
+        );
+        assert!(inner.safety.recoverable());
+
+        // 3 ticks (0, 20, 40 ms): unanswered -> still unverified, recoverable.
+        for tick_idx in 0..3 {
+            if tick_idx > 0 {
+                clock.advance(Duration::from_millis(20));
+            }
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+            assert_eq!(inner.joint_hold_status()[2], JointHoldStatus::UnheldNoVerifiedMode);
+            assert!(inner.safety.recoverable());
+        }
+        // At 60 ms, restore J3's CTRL_MODE register so the per-tick readback succeeds!
+        bus.with(|s| s.motors[2].set_reg_u32(damiao::RID_CTRL_MODE, damiao::CTRL_MODE_POS_VEL));
+        for _ in 0..2 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
+        assert!(
+            inner.driver.as_ref().unwrap().lock().unwrap().joint_hold_mode_verified(2),
+            "L2: causal on-tick readback reply before 200 ms must verify J3"
+        );
+        assert_eq!(
+            inner.joint_hold_status()[2],
+            JointHoldStatus::Held,
+            "L2: verified J3 must transition from UnheldNoVerifiedMode to Held"
+        );
+        // Advance past 200 ms -> NO non-recoverable fault ever latches because J3 is now verified!
+        for _ in 0..10 {
+            clock.advance(Duration::from_millis(20));
+            bus.with(|s| s.push_all_feedback());
+            inner.tick(0.02);
+        }
+        assert!(
+            inner.safety.recoverable(),
+            "L2: no non-recoverable fault after J3 verified before 200 ms: {:?}",
+            inner.safety.fault()
+        );
     }
 }

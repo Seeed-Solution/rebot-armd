@@ -15,6 +15,38 @@ fn feedback_frame(id: u8, state: u8, position: f32) -> CanFrame {
     CanFrame::new_standard(0x10 + id as u16, &data).unwrap()
 }
 
+fn reg_read_reply(id: u16, rid: u8, value: u32) -> CanFrame {
+    let [lo, hi] = id.to_le_bytes();
+    let [v0, v1, v2, v3] = value.to_le_bytes();
+    CanFrame::new_standard(0x10 + id, &[lo, hi, damiao::REG_READ, rid, v0, v1, v2, v3]).unwrap()
+}
+
+fn mock_ctrl_mode_readback(driver: &mut DamiaoArmDriver<MockCanTransport>, id: u16, mode: u32) {
+    driver.can_mut().respond_to_transmit(
+        damiao::build_read_register_frame(id, damiao::RID_CTRL_MODE),
+        reg_read_reply(id, damiao::RID_CTRL_MODE, mode),
+    );
+}
+
+fn verify_mode_at_startup(driver: &mut DamiaoArmDriver<MockCanTransport>, id: u16, mode: u32) {
+    let limits = DamiaoLimits::default();
+    mock_ctrl_mode_readback(driver, id, mode);
+    driver.can_mut().respond_to_transmit(
+        damiao::build_read_register_frame(id, damiao::RID_PMAX),
+        reg_read_reply(id, damiao::RID_PMAX, limits.p_max.to_bits()),
+    );
+    driver.can_mut().respond_to_transmit(
+        damiao::build_read_register_frame(id, damiao::RID_VMAX),
+        reg_read_reply(id, damiao::RID_VMAX, limits.v_max.to_bits()),
+    );
+    driver.can_mut().respond_to_transmit(
+        damiao::build_read_register_frame(id, damiao::RID_TMAX),
+        reg_read_reply(id, damiao::RID_TMAX, limits.t_max.to_bits()),
+    );
+    driver.check_mapping_ranges();
+    driver.can_mut().take_tx_frames();
+}
+
 #[test]
 fn posvel_allows_micro_motion_and_respects_configured_limit() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]).with_vlim(2.5);
@@ -42,6 +74,7 @@ fn queued_feedback_is_consumed_before_recovery_check() {
     let fb = feedback_frame(1, 1, 0.0);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
+    verify_mode_at_startup(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
     driver.set_torque(true).unwrap();
     let enable_frames = driver.can_mut().take_tx_frames();
     assert_eq!(enable_frames.iter().filter(|f| f.data == CMD_ENABLE).count(), 1);
@@ -58,6 +91,7 @@ fn queued_feedback_is_consumed_before_recovery_check() {
 fn recovery_defers_when_rx_budget_is_exhausted() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
     let fb = feedback_frame(1, 1, 0.0);
+    mock_ctrl_mode_readback(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
@@ -89,6 +123,7 @@ fn stale_mit_recovery_uses_mit_frame_id() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1])
         .with_control_mode(DamiaoControlMode::Mit);
     let fb = feedback_frame(1, 1, 0.0);
+    mock_ctrl_mode_readback(&mut driver, 1, damiao::CTRL_MODE_MIT);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
@@ -124,6 +159,7 @@ fn stale_posvel_gripper_recovery_uses_posvel_frame() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), motor_ids);
     for id in 1..=7 {
         let fb = feedback_frame(id, 1, 0.0);
+        mock_ctrl_mode_readback(&mut driver, id as u16, damiao::CTRL_MODE_POS_VEL);
         driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), fb);
         driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), fb);
     }
@@ -144,6 +180,7 @@ fn test_damiao_set_torque_fast_path_and_rearm_handshake() {
     let fb = feedback_frame(1, 1, 0.0);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
+    verify_mode_at_startup(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
 
     // 1. Initial arming: pending_rearm is true, must execute full handshake
     driver.set_torque(true).unwrap();
@@ -248,6 +285,7 @@ fn test_damiao_write_targets_defers_on_would_block_without_sleeping() {
 fn expired_feedback_does_not_replay_old_motion_on_recovery() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
     let fb = feedback_frame(1, 1, 0.0);
+    mock_ctrl_mode_readback(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb);
     driver.set_torque(true).unwrap();
@@ -276,6 +314,7 @@ fn all_motors_reporting_disabled_override_cached_enable_flag() {
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
     let fb_on = feedback_frame(1, 1, 0.0);
     let fb_off = feedback_frame(1, 0, 0.0);
+    mock_ctrl_mode_readback(&mut driver, 1, damiao::CTRL_MODE_POS_VEL);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), fb_on);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), fb_on);
     driver.set_torque(true).unwrap();

@@ -528,13 +528,18 @@ fn test_damiao_driver_mock_loopback() {
     let motor_ids = vec![1, 2];
     let mut driver = DamiaoArmDriver::new(mock_can, motor_ids.clone());
 
-    // 1. Receive enable feedback only after each enable command is transmitted.
+    // 1. Receive CTRL_MODE readback and enable feedback only after each command is transmitted.
+    let mode = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
     let mut d1_en = [0u8; 8];
     d1_en[0] = 0x11; // state=1 (enabled), motor_id=1
     let mut d2_en = [0u8; 8];
     d2_en[0] = 0x12; // state=1 (enabled), motor_id=2
     let f1 = CanFrame::new_standard(0x11, &d1_en).unwrap();
     let f2 = CanFrame::new_standard(0x12, &d2_en).unwrap();
+    let m1 = CanFrame::new_standard(0x11, &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap();
+    let m2 = CanFrame::new_standard(0x12, &[2, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap();
+    driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE), m1);
+    driver.can_mut().respond_to_transmit(damiao::build_read_register_frame(2, damiao::RID_CTRL_MODE), m2);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), f1);
     driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), f2);
     driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(1), f1);
@@ -864,10 +869,16 @@ fn test_e2e_damiao_over_slcan_mock_serial() {
     let slcan = SlcanTransport::new(mock_serial);
     let mut arm = DamiaoArmDriver::new(slcan, vec![1]);
 
-    // Configure post-enable motor 1 feedback with state=1 (enabled) for both CMD_ENABLE and
-    // the causal post-empty-queue 0x7FF 0xCC refresh probe.
+    // Configure causal REG_READ(RID_CTRL_MODE) -> POS_VEL reply and post-enable motor 1
+    // feedback with state=1 (enabled) for both CMD_ENABLE and the 0x7FF 0xCC refresh probe.
     // Motor 1 feedback: CAN ID 0x11, DLC 8, data[0] = 0x11 (enabled, motor_id=1)
     // In SLCAN format: t01181100000000002823\r
+    let mode = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+    let mode_req = SlcanCodec::encode_frame(&damiao::build_read_register_frame(1, damiao::RID_CTRL_MODE));
+    let mode_rep = SlcanCodec::encode_frame(
+        &CanFrame::new_standard(0x11, &[1, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]]).unwrap(),
+    );
+    arm.can_mut().inner_mut().respond_to_write(mode_req.as_bytes(), mode_rep.as_bytes());
     arm.can_mut().inner_mut().respond_to_write(b"t0018FFFFFFFFFFFFFFFC\r", b"t01181100000000002823\r");
     arm.can_mut().inner_mut().respond_to_write(b"t7FF80100CC0000000000\r", b"t01181100000000002823\r");
 

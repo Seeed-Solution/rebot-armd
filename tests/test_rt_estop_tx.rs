@@ -70,7 +70,15 @@ impl CanTransport for Bus {
         let find = |m: &[(u16, DamiaoLimits, f32, bool)], id: u16| m.iter().position(|x| x.0 == id);
         if id == 0x7FF {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
-            if let Some(k) = find(&self.motors, mid) { if frame.data[2] == 0xCC { self.reply(k); } }
+            if let Some(k) = find(&self.motors, mid) {
+                if frame.data[2] == 0xCC {
+                    self.reply(k);
+                } else if frame.data[2] == damiao::REG_READ && frame.data[3] == damiao::RID_CTRL_MODE {
+                    let m = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
+                    let data = [mid as u8, (mid >> 8) as u8, damiao::REG_READ, damiao::RID_CTRL_MODE, m[0], m[1], m[2], m[3]];
+                    self.rx.push_back((CanFrame::new_standard(0x10 + mid, &data).unwrap(), Some(self.clock.now())));
+                }
+            }
         } else if let Some(k) = find(&self.motors, id) {
             if frame.data == damiao::CMD_ENABLE { self.motors[k].3 = true; }
             if frame.data == damiao::CMD_DISABLE { self.motors[k].3 = false; }

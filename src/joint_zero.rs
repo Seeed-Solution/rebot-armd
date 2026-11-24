@@ -149,6 +149,9 @@ impl ArmDriver for ZeroOffsetDriver {
     fn joint_hold_mode_verified(&self, joint: usize) -> bool {
         self.inner.joint_hold_mode_verified(joint)
     }
+    fn request_mode_readback_budgeted(&mut self, unverified_mask: u64) -> bool {
+        self.inner.request_mode_readback_budgeted(unverified_mask)
+    }
     fn drop_pending_holds_outside_mask(&mut self, hold_mask: u64) {
         self.inner.drop_pending_holds_outside_mask(hold_mask);
     }

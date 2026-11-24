@@ -153,8 +153,17 @@ impl Rig {
         } else {
             driver = driver.with_joint_limits(profile_limits()).unwrap();
         }
+        let mode = damiao::CTRL_MODE_POS_VEL.to_le_bytes();
         for id in 1..=7u8 {
             let f = frame(id, home[id as usize - 1], ZERO, ZERO);
+            let mode_reply = CanFrame::new_standard(
+                0x10 + id as u16,
+                &[id, 0, damiao::REG_READ, damiao::RID_CTRL_MODE, mode[0], mode[1], mode[2], mode[3]],
+            ).unwrap();
+            driver.can_mut().respond_to_transmit(
+                damiao::build_read_register_frame(id as u16, damiao::RID_CTRL_MODE),
+                mode_reply,
+            );
             driver.can_mut().respond_to_transmit(damiao::build_enable_frame(id as u16), f);
             driver.can_mut().respond_to_transmit(damiao::build_refresh_frame(id as u16), f);
             driver.can_mut().provide_rx_frame(f);
