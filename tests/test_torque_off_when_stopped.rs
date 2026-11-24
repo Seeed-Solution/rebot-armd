@@ -498,7 +498,9 @@ fn stale_and_missing_feedback_refused_as_not_at_rest_on_both_owners() {
     assert!(matches!(err, SafetyError::TorqueOffWouldDrop { joint: None, .. }), "{err:?}");
     assert!(inner.is_torqued);
 
-    // Once fresh feedback arrives (<= 100 ms), disable succeeds and keeps Fault latch.
+    // Once fresh feedback arrives after an observed-empty queue boundary (<= 100 ms),
+    // disable succeeds and keeps Fault latch.
+    inner.tick(0.02); // observe empty RX queue at current time
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);
     assert!(matches!(inner.set_torque(false), Ok(SafetyState::Fault(_))));
@@ -566,7 +568,8 @@ fn estop_same_rules_and_disable_exempt_from_stop_gate_on_both_owners() {
         Err(SafetyError::TorqueOffWouldDrop { joint: None, .. })
     ));
 
-    // At rest + fresh feedback -> allowed; TxKind::Disable bypasses stop gate; EStop latch kept.
+    // At rest + fresh post-drain feedback -> allowed; TxKind::Disable bypasses stop gate; EStop latch kept.
+    inner.tick(0.02); // observe empty RX queue after 150 ms stall
     bus.with(|s| s.push_all_feedback());
     inner.tick(0.02);
     // First inject a disable TX failure while in EStop: sticky disable stays pending and
@@ -823,6 +826,7 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
         s.motors[6].silent = true;
     });
     clock.advance(Duration::from_millis(150));
+    inner.tick(0.02); // observe empty RX queue at current time
     bus.with(|s| {
         for j in 0..6 {
             s.push_feedback(j);
@@ -864,4 +868,33 @@ fn silent_gripper_does_not_block_arm_joint_rest_admission_and_driverless_missing
 
     mock.last_can_feedback_instant = Some(Instant::now() - Duration::from_millis(200));
     assert_eq!(mock.may_disable_torque_while_stopped(), Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback));
+}
+
+#[test]
+fn queued_old_can_frames_exceeding_queue_bound_are_rejected_as_stale() {
+    // Even if old at-rest frames are dequeued at `now` (decode age = 0 ms), the conservative
+    // receive-queue bound (`rx_empty_instant` > 100 ms ago) must reject them as stale.
+    let (mut inner, bus, clock) = make_driver_rig();
+    inner.set_torque(true).unwrap();
+    inner.safety.trigger_fault_coded(FaultCode::BusLoss, FaultReason::BusLoss);
+    bus.with(|s| {
+        s.follow_commands = false;
+        s.rx.clear();
+        s.pending.clear();
+    });
+    // Advance clock > 100 ms with no empty-queue drain, then enqueue old frames that get decoded now.
+    clock.advance(Duration::from_millis(150));
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
+    assert_eq!(
+        inner.may_disable_torque_while_stopped(),
+        Err(StoppedTorqueOffRefusal::StaleOrMissingFeedback),
+        "frames decoded after a >100 ms gap without a fresh empty-queue boundary must be rejected"
+    );
+    // After the previous tick drained the queue to WouldBlock, rx_empty_instant is now fresh.
+    // A new frame arriving now has a fresh queue bound (<= 100 ms) and passes admission.
+    clock.advance(Duration::from_millis(20));
+    bus.with(|s| s.push_all_feedback());
+    inner.tick(0.02);
+    assert_eq!(inner.may_disable_torque_while_stopped(), Ok(()));
 }

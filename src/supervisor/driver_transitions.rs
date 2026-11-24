@@ -1121,7 +1121,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            if !self.safety.state().is_stopped() {
+            if !self.safety.state().is_stopped() && !self.estop_pending() {
                 self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
             }
             return Err(crate::rt_core::ops::static_code(crate::supervisor::ArmError::Safety(error)));
@@ -1135,7 +1135,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            if !self.safety.state().is_stopped() {
+            if !self.safety.state().is_stopped() && !self.estop_pending() {
                 self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
             }
             return Err(error);
@@ -1278,7 +1278,7 @@ impl SupervisorInner {
     /// A disable step failed: `disable_pending` stays set and `DRIVER_WRITE_FAILED` latches
     /// (as in `torque_off`).
     fn disable_step_failed(&mut self, e: crate::driver::ArmDriverError) -> &'static str {
-        let already_stopped = self.safety.state().is_stopped();
+        let already_stopped = self.safety.state().is_stopped() || self.estop_pending();
         let message = (!already_stopped).then(|| format!("Torque disable transmission failed: {e}"));
         let code = crate::driver::handshake::rt_progress(false, Err(e)).err().unwrap_or("HARDWARE_FAULT");
         if let Some(msg) = message {
@@ -1408,7 +1408,7 @@ impl SupervisorInner {
                         self.torque_off_finish_in_place().map(|()| Rt::Done).map_err(|e| torque_error_code(&e))
                     }
                     Some(false) => {
-                        if !self.safety.state().is_stopped() {
+                        if !self.safety.state().is_stopped() && !self.estop_pending() {
                             self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(
                                 "Torque disable has not been confirmed by fresh hardware feedback".into()));
                         }

@@ -7595,6 +7595,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 .copied()
                 .flatten()
                 .is_some_and(|t| self.since(t) <= max_age)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| self.since(b) <= max_age)
         })
     }
     fn feedback_age_ms_into(&self, out: &mut Vec<Option<u64>>) {
@@ -8104,6 +8110,22 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
 
     fn feedback_receive_instants(&self) -> Vec<Option<Instant>> {
         self.last_feedback_instant.clone()
+    }
+
+    fn feedback_joints_within(&self, joints: &[usize], max_age: Duration) -> bool {
+        joints.iter().all(|&i| {
+            self.last_feedback_instant
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|t| t.elapsed() <= max_age)
+                && self
+                    .feedback_queue_bound
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|b| b.elapsed() <= max_age)
+        })
     }
 
     fn is_feedback_valid(&self) -> bool {
