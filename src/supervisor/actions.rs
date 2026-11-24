@@ -689,6 +689,34 @@ impl SupervisorInner {
             .is_some_and(|d| now > d + grace)
     }
 
+    /// **Single owner-side whole-macro parent deadline check** (M3): ends the current macro when
+    /// `m.deadline` has passed by entering [`Self::enter_macro_finish_rt`] (which immediately
+    /// quiesces any active child trajectory to a stationary hold). Called pre-output BEFORE
+    /// trajectory stepping and bus TX so an expired parent never advances or transmits another
+    /// child motion target on that tick, and reused as a fallback in `reconcile_action`.
+    pub fn expire_macro_parent(&mut self, now: Instant) -> bool {
+        let Some((id, timeout_code)) = self
+            .macro_run
+            .as_ref()
+            .filter(|m| !m.stop_requested && !m.finishing)
+            .and_then(|m| m.deadline.filter(|d| now > *d).map(|_| (m.id, m.timeout_code)))
+        else {
+            return false;
+        };
+        let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
+        self.enter_macro_finish_rt(
+            id,
+            "failed",
+            Some(code_str),
+            crate::motion::StepErrorText::empty(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .is_ok()
+    }
+
     /// Ends the running child of the current macro when its deadline passed: the motion
     /// stops and the child fails with the macro's timeout code (the parent stays running, its
     /// worker ends it with that code). True when it did.
@@ -1622,25 +1650,9 @@ impl SupervisorInner {
             return;
         }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
-            // Check parent whole-macro deadline BEFORE child expiry so child expiry never clears
-            // active trajectory evidence before the parent timeout enters the shared finishing gate.
-            let macro_expired = self
-                .macro_run
-                .as_ref()
-                .filter(|m| m.id == id && !m.stop_requested && !m.finishing)
-                .and_then(|m| m.deadline.filter(|d| now > *d).map(|_| m.timeout_code));
-            if let Some(timeout_code) = macro_expired {
-                let code_str = if timeout_code.is_empty() { "TIMEOUT" } else { timeout_code.as_str() };
-                let _ = self.enter_macro_finish_rt(
-                    id,
-                    "failed",
-                    Some(code_str),
-                    crate::motion::StepErrorText::empty(),
-                    None,
-                    None,
-                    None,
-                    false,
-                );
+            // Fallback check through the single `expire_macro_parent` entry point (also enforced
+            // pre-output before Step 3/4 in `tick_inner`).
+            if self.expire_macro_parent(now) {
                 return;
             }
             self.expire_macro_child(now);

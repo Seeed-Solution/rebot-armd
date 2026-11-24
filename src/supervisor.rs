@@ -3710,6 +3710,7 @@ impl SupervisorInner {
                 self.releasing = false;
             }
             self.replace_active_trajectory(None);
+            self.tracking.invalidate();
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
             crate::rt_core::scratch::copy_into(&mut self.target_positions, &self.commanded_positions);
@@ -5420,14 +5421,16 @@ impl SupervisorInner {
         self.torque_guard_tick(servo_dt);
         // Supply-current estimate (src/power.rs).
         self.power_tick(servo_dt);
-        // Enforce macro contact guard and child deadline BEFORE stepping any trajectory or
-        // submitting targets: a success-on-contact stop immediately replaces the trajectory with
-        // a hold at the measured pose so this release sends the replacement hold and commits
-        // `SubState::Done` strictly through the post-output accepted-output gate.
+        // Enforce whole-macro parent deadline FIRST, then contact guard and child deadline,
+        // BEFORE stepping any trajectory or submitting bus targets: an expired parent quiesces to
+        // a stationary hold immediately in THIS tick so no post-deadline motion target is advanced
+        // or transmitted.
         if self.macro_run.is_some() {
             let pre_tick_now = release_bound.map_or_else(Instant::now, |(now, _)| now);
-            self.step_macro_contact();
-            self.expire_macro_child(pre_tick_now);
+            if !self.expire_macro_parent(pre_tick_now) {
+                self.step_macro_contact();
+                self.expire_macro_child(pre_tick_now);
+            }
         }
         let mut reference_stepped = false;
 

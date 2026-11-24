@@ -3362,3 +3362,121 @@ async fn r2_m2_legacy_gripper_and_move_to_pose_ack_precedes_stop_terminal() {
         assert!(saw_cancelled_terminal, "must receive cancelled terminal for {expected_kind}");
     }
 }
+
+#[test]
+fn r2_m3_macro_parent_deadline_stops_output_pre_tx_with_no_advance() {
+    let clock = VirtualClock::starting_at(Instant::now());
+    let drv = RejectingBusDriver::new(&INSPECT, clock.clone());
+    let mut core = SupervisorInner::new(ArmConfig {
+        collision: None,
+        lease_timeout_ms: 600_000,
+        ..ArmConfig::rebot_dm()
+    });
+    core.lease_enabled = false;
+    core.driver = Some(Mutex::new(Box::new(drv.clone())));
+    core.commanded_positions = INSPECT.to_vec();
+    core.measured_positions = INSPECT.to_vec();
+    core.target_positions = INSPECT.to_vec();
+    {
+        let s = core.current_admission_stamp();
+        let a = core.check_admission(s).unwrap();
+        SupervisorInner::enable_torque(a).unwrap();
+    }
+    for _ in 0..3 {
+        core.tick(DT);
+    }
+    let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new_with_clock(
+        core,
+        BOOT,
+        Capacities {
+            commands: 8,
+            plans: 4,
+            replies: 32,
+        },
+        clock.clone(),
+    );
+    fx.step();
+
+    // Begin macro with whole-action parent deadline = now + 50ms, and install a long joint child
+    // moving J1 from 0.0 -> +0.40 rad (child timeout = 10s >> parent deadline).
+    let mut begin = BeginMacroSpec::new(MacroKind::Place, BOOT);
+    begin.macro_deadline = Some(fx.now() + Duration::from_millis(50));
+    begin.timeout_code = armd::safety::BoundedText::new("PLACE_TIMEOUT");
+    let r_b = b
+        .submit(
+            ClientId(1),
+            1,
+            auth(&fx),
+            fx.now() + DEFAULT_ACTION_DEADLINE,
+            Submit::Action(ActionSubmit::BeginMacro(begin)),
+        )
+        .unwrap();
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let parent = fx.active().unwrap();
+    let _ = drain_all(&mut b);
+
+    let snap = snap_of(&fx);
+    let mut target = snap.commanded_positions.clone();
+    target[0] += 0.40;
+    let max_vel: Vec<f32> = snap.env.planning_limits(None).iter().map(|l| l.max_velocity).collect();
+    let c = ChildSpec {
+        ticket: ChildTicket { parent, child_seq: 1 },
+        timeout_s: 10.0,
+        timeout_code: "CHILD_TIMEOUT",
+        contact: None,
+    };
+    let slot = prepare_child_joint_slot(&snap.commanded_positions, &target, &max_vel, 0.2, None, c).unwrap();
+    submit_child(&mut b, ClientId(1), 2, auth(&fx), fx.now() + DEFAULT_ACTION_DEADLINE, BOOT, slot, true).unwrap();
+    // Tick 1 (t = 20ms, before 50ms parent deadline): installs child and advances one step.
+    assert!(fx.step().command.unwrap().1.is_ok());
+    let _ = drain_all(&mut b);
+    // Tick 2 (t = 40ms, still before 50ms parent deadline): advances cleanly while alive.
+    let rep_mid = fx.step();
+    assert!(rep_mid.ended.is_none());
+    let q_before_expiry = fx.core.commanded_positions.clone();
+    let written_before_expiry = drv.last_written.lock().unwrap().clone();
+    assert!(
+        q_before_expiry[0] > INSPECT[0] + 1e-4,
+        "child must be actively advancing before parent deadline: q0={} inspect={}",
+        q_before_expiry[0],
+        INSPECT[0]
+    );
+    assert!(
+        (written_before_expiry[0] - q_before_expiry[0]).abs() < 1e-5,
+        "pre-expiry bus write matches commanded pose"
+    );
+
+    // Tick 3 (t = 60ms > 50ms parent deadline): pre-output parent expiry MUST fire BEFORE
+    // trajectory stepping and BEFORE bus TX -> ZERO reference advance, stationary hold written,
+    // and macro terminates with PLACE_TIMEOUT in THAT tick!
+    let rep_exp = fx.step();
+    assert_eq!(
+        rep_exp.ended,
+        Some((parent, Outcome::Failed("PLACE_TIMEOUT"))),
+        "expired parent must end with PLACE_TIMEOUT once hold write is accepted"
+    );
+    assert!(
+        (fx.core.commanded_positions[0] - q_before_expiry[0]).abs() < 1e-6,
+        "M3 violation: reference advanced after parent deadline! before={} after={}",
+        q_before_expiry[0],
+        fx.core.commanded_positions[0]
+    );
+    assert!(
+        fx.core.commanded_velocities.iter().all(|v| v.abs() < 1e-6),
+        "M3 violation: velocities must be zeroed on expired parent tick: {:?}",
+        fx.core.commanded_velocities
+    );
+    let written_on_expiry = drv.last_written.lock().unwrap().clone();
+    assert!(
+        (written_on_expiry[0] - q_before_expiry[0]).abs() < 1e-6,
+        "M3 violation: driver transmitted a post-deadline motion target! before={} written={}",
+        q_before_expiry[0],
+        written_on_expiry[0]
+    );
+    let reps = drain_all(&mut b);
+    assert!(reps.iter().any(|(_, r)| matches!(
+        r,
+        Reply::Terminal { request, action, outcome: Outcome::Failed("PLACE_TIMEOUT"), .. }
+            if *request == r_b && *action == parent
+    )));
+}
