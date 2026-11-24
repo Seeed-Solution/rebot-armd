@@ -1,0 +1,42 @@
+{
+  "id": "19_gravity_comp_mode",
+  "family": "gravity_comp",
+  "description": "mode/gravity_comp enable/disable, invalid enable/scale/damping_kd validation",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"damping_kd":0.2,"enable":true,"scale":0.8},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/mode/gravity_comp","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":false},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/mode/gravity_comp","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":"yes"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/mode/gravity_comp","request_id":4,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true,"scale":"bad"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/mode/gravity_comp","request_id":5,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"damping_kd":"bad","enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/mode/gravity_comp","request_id":6,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"damping_kd":0.2,"enable":true,"scale":0.8},"epoch_id":1,"generation":1,"path":"/api/v1/mode/gravity_comp","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"gravity_comp","epoch_id":1,"is_torqued":true,"request_id":2,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":false},"epoch_id":1,"generation":1,"path":"/api/v1/mode/gravity_comp","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"gravity_comp","epoch_id":1,"is_torqued":true,"request_id":3,"safety_state":"Moving","status":"accepted","type":"command_ack"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":"yes"},"epoch_id":1,"generation":1,"path":"/api/v1/mode/gravity_comp","request_id":4,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"enable must be boolean","request_id":4,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true,"scale":"bad"},"epoch_id":1,"generation":1,"path":"/api/v1/mode/gravity_comp","request_id":5,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"scale must be a number","request_id":5,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"damping_kd":"bad","enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/mode/gravity_comp","request_id":6,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"damping_kd must be a number or an array of 6 numbers","request_id":6,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

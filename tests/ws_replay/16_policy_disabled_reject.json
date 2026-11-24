@@ -1,0 +1,30 @@
+{
+  "id": "16_policy_disabled_reject",
+  "family": "policy",
+  "description": "without policy-runtime feature, policy/start and policy/stop return 400 INVALID_COMMAND Unknown action",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"mode":"shadow","policy_id":"shadow_demo"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/policy/start","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/policy/stop","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":"not_an_object","epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/action/policy/start","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"mode":"shadow","policy_id":"shadow_demo"},"epoch_id":1,"generation":1,"path":"/api/v1/action/policy/start","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"Unknown action","request_id":1,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/action/policy/stop","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"Unknown action","request_id":2,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":"not_an_object","epoch_id":1,"generation":1,"path":"/api/v1/action/policy/start","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","epoch_id":1,"error":"INVALID_COMMAND","message":"Command body must be an object","request_id":3,"safety_state":null,"status":400,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

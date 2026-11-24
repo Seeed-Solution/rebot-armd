@@ -297,12 +297,12 @@ async fn capability_is_advertised_with_cartesian() {
     assert_eq!(schema["capabilities"]["cartesian"], true);
 }
 
-/// Longest supervisor write hold by `ws.rs` at `line` in the recorded ticks (µs).
+/// Longest supervisor write hold by `ws/actions.rs` at `line` in the recorded ticks (µs).
 fn ws_hold_us(sup: &ArmSupervisor, line: u32) -> u32 {
     sup.tick_samples().iter()
         .flat_map(|s| [s.longest_hold, s.waited_for])
         .flatten()
-        .filter(|h| h.location.file().ends_with("api/ws.rs") && h.location.line() == line)
+        .filter(|h| h.location.file().ends_with("api/ws/actions.rs") && h.location.line() == line)
         .map(|h| h.hold_us)
         .max()
         .unwrap_or(0)
@@ -339,9 +339,9 @@ async fn joint_move_replans_under_the_lock_when_the_start_changed() {
     println!("install hold (planned under the lock) {} us", ws_hold_us(&r.sup, install_line()));
 }
 
-/// Line of the `path: "joint"` install's write guard in src/api/ws.rs.
+/// Line of the `path: "joint"` install's write guard in src/api/ws/actions.rs.
 fn install_line() -> u32 {
-    let src = include_str!("../src/api/ws.rs");
+    let src = include_str!("../src/api/ws/actions.rs");
     let at = src.find("SupervisorInner::install_joint_goal_prepared(").unwrap();
     let before = &src[..at];
     let guard = before.rfind("let mut inner = recv_supervisor.inner().write().await;").unwrap();

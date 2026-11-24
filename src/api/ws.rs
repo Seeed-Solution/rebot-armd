@@ -7,15 +7,21 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
-use crate::motion::{self, PlanInput};
+use crate::motion::PlanInput;
 use crate::safety::SafetyError;
 use crate::api::rest::ApiError;
 use axum::http::StatusCode;
 
 // ws leaf modules (armd 1.6 RT-core foundation)
-mod motion_cmds;
+mod lease;
 #[allow(unused_imports)]
-use motion_cmds::*;
+use lease::*;
+mod motion;
+#[allow(unused_imports)]
+use motion::*;
+mod actions;
+#[allow(unused_imports)]
+use actions::*;
 mod policy;
 #[allow(unused_imports)]
 use policy::*;
@@ -25,6 +31,20 @@ use calibration::*;
 mod config;
 #[allow(unused_imports)]
 use config::*;
+mod servo;
+#[allow(unused_imports)]
+use servo::*;
+mod dispatch;
+use dispatch::{
+    AdmissionClass, AuthRequirement, DispatchHandler, FrameKind, LeaseFreeCtx, LeaseRequirement,
+    OwnerDispatchCtx, ReplyPolicy, UrgentEStopCtx, UrgentStopCtx,
+};
+
+/// Initialises the WS dispatch tables ahead of the first connection (see
+/// `dispatch::prewarm_tables`).
+pub fn prewarm_dispatch_tables() {
+    dispatch::prewarm_tables();
+}
 
 pub type ConnectionRegistry = Arc<Mutex<HashMap<String, mpsc::Sender<Message>>>>;
 
@@ -386,23 +406,6 @@ fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
 /// Action started by a command: (action id, expected duration in s).
 type Started = Option<(u64, f64)>;
 
-enum ActionStart {
-    Started(u64, f64),
-    Plan(PendingPlan),
-    Macro(PendingMacro),
-    Replay(crate::replay::ReplayInput),
-    DryRunGrasp(Value),
-    Sequence(Box<crate::sequences::RunPlan>),
-    CalibHover(Box<crate::calib_hover::HoverPlan>),
-    /// `gripper_calibrate` (epoch, tag): begun with the supervisor handle at the call site.
-    GripperCalibrate(u64, Option<String>),
-    MeasureMultiview(Box<crate::measure_multiview::Plan>),
-    #[cfg(feature = "policy-runtime")]
-    Policy(Box<PendingPolicyStart>),
-    #[cfg(feature = "policy-runtime")]
-    PolicyStopped(bool),
-}
-
 /// Bounded inbound ordinary message queue capacity per WS connection.
 const ORDINARY_IN_CAPACITY: usize = 64;
 /// Bounded outbound ordinary control reply queue capacity per WS connection.
@@ -423,25 +426,29 @@ const WS_TEARDOWN_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Handled by the ordinary worker while a [`MacroCheck`] runs; motion commands stay queued in
 /// order within the bounded ordinary queue. (E-stop, `/api/v1/motion/stop`, `auth`, and
 /// `heartbeat` never enter the ordinary queue.)
-fn runs_during_macro_check(kind: &str) -> bool {
-    matches!(kind, "acquire_lease" | "release_lease")
+fn runs_during_macro_check(value: &Value) -> bool {
+    dispatch::classify(value)
+        .1
+        .is_some_and(|e| e.admission == AdmissionClass::OrdinarySession)
 }
 
 /// The reply to a message cancelled by a stop / e-stop before it ran (`code` STOPPED /
 /// ESTOP_ACTIVE). None for messages that are not acknowledged.
+/// Preserves the legacy cancellation precedence (`command` > `preset` > `servo::is_servo_frame`),
+/// including mixed-field lease frames carrying `positions` or `mode: "cartesian_joint_stream"`.
 fn cancelled_reply(value: &Value, code: &str, epoch: Option<u64>) -> Option<Value> {
-    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
     let mut reply = json!({"status":409, "code":code, "error":code, "message":"Cancelled by a stop before it began"});
     if let Some(ep) = epoch {
         reply["epoch_id"] = json!(ep);
     }
-    if kind == "command" {
+    if raw_kind == "command" {
         reply["type"] = json!("command_reject");
         reply["request_id"] = value.get("request_id").cloned().unwrap_or(Value::Null);
-    } else if kind == "preset" {
+    } else if raw_kind == "preset" {
         reply["type"] = json!("preset_reject");
         reply["name"] = value.get("name").cloned().unwrap_or(Value::Null);
-    } else if kind == "servo" || value.get("positions").is_some() || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") {
+    } else if servo::is_servo_frame(raw_kind, value) {
         reply["type"] = json!("servo_reject");
         reply["reason"] = json!("stopped");
     } else {
@@ -458,35 +465,41 @@ pub(super) fn validate_command_body_common(body: &Value) -> Result<(), &'static 
     Ok(())
 }
 
-fn ws_status_reject(kind: &str, value: &Value, status: u16, code: &str, msg: &str, servo_reason: &str) -> Option<Value> {
-    if kind == "acquire_lease" {
-        let mut r = json!({"type":"lease_rejected", "status":status, "code":code, "error":code, "message":msg});
-        if let Some(s) = value.get("seq").and_then(Value::as_u64) { r["seq"] = json!(s); }
-        Some(r)
-    } else if kind == "release_lease" {
-        Some(json!({"type":"lease_released", "success":false, "status":status, "code":code, "error":code, "message":msg}))
-    } else if kind == "command" {
-        Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":status, "code":code, "error":code, "message":msg}))
-    } else if kind == "preset" {
-        Some(json!({"type":"preset_reject", "name":value.get("name"), "status":status, "code":code, "error":code, "message":msg}))
-    } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
-        Some(json!({"type":"servo_reject", "reason":servo_reason, "status":status, "code":code, "error":code, "message":msg}))
-    } else {
-        None
+fn ws_status_reject(value: &Value, status: u16, code: &str, msg: &str, servo_reason: &str) -> Option<Value> {
+    let (kind, entry) = dispatch::classify(value);
+    match (kind, entry.map(|e| e.reply)) {
+        (FrameKind::AcquireLease, Some(ReplyPolicy::LeaseReply)) => {
+            let mut r = json!({"type":"lease_rejected", "status":status, "code":code, "error":code, "message":msg});
+            if let Some(s) = value.get("seq").and_then(Value::as_u64) { r["seq"] = json!(s); }
+            Some(r)
+        }
+        (FrameKind::ReleaseLease, Some(ReplyPolicy::LeaseReply)) => {
+            Some(json!({"type":"lease_released", "success":false, "status":status, "code":code, "error":code, "message":msg}))
+        }
+        (FrameKind::Command, _) => {
+            Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":status, "code":code, "error":code, "message":msg}))
+        }
+        (FrameKind::Preset, Some(ReplyPolicy::PresetReply)) => {
+            Some(json!({"type":"preset_reject", "name":value.get("name"), "status":status, "code":code, "error":code, "message":msg}))
+        }
+        (FrameKind::Servo | FrameKind::ImplicitServo, Some(ReplyPolicy::ServoRejectOnly)) => {
+            Some(json!({"type":"servo_reject", "reason":servo_reason, "status":status, "code":code, "error":code, "message":msg}))
+        }
+        _ => None,
     }
 }
 
-fn executor_routing_reject(kind: &str, value: &Value, owner_mode: u8) -> Option<Value> {
+fn executor_routing_reject(value: &Value, owner_mode: u8) -> Option<Value> {
     let (code, msg) = if owner_mode == crate::supervisor::OWNER_EXECUTOR {
         ("EXECUTOR_ROUTING_PENDING", "WebSocket message is not yet routed through the RT executor")
     } else {
         ("EXECUTOR_UNAVAILABLE", "RT executor ownership is transitioning or unavailable")
     };
-    ws_status_reject(kind, value, 503, code, msg, "executor_routing_pending")
+    ws_status_reject(value, 503, code, msg, "executor_routing_pending")
 }
 
-fn backlog_full_reject(kind: &str, value: &Value) -> Option<Value> {
-    ws_status_reject(kind, value, 503, "BACKLOG_FULL", "WebSocket ordinary message backlog is full", "backlog_full")
+fn backlog_full_reject(value: &Value) -> Option<Value> {
+    ws_status_reject(value, 503, "BACKLOG_FULL", "WebSocket ordinary message backlog is full", "backlog_full")
 }
 
 #[derive(Debug, Clone)]
@@ -1169,21 +1182,6 @@ struct OrdinaryQueue {
     notify: Arc<tokio::sync::Notify>,
 }
 
-/// Torque disable (`/api/v1/torque` or `/api/v1/arm` with `enable: false`) is a stop-direction
-/// action: an ordinary Stop must never cancel or drain it from the queue.
-fn is_torque_disable_command(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("command")
-        && matches!(
-            value.get("path").and_then(Value::as_str),
-            Some("/api/v1/torque" | "/api/v1/arm")
-        )
-        && value
-            .get("body")
-            .and_then(|b| b.get("enable"))
-            .and_then(Value::as_bool)
-            == Some(false)
-}
-
 impl OrdinaryQueue {
     fn new() -> Self {
         Self {
@@ -1214,10 +1212,7 @@ impl OrdinaryQueue {
                 let idx = if !macro_active {
                     (!g.items.is_empty()).then_some(0)
                 } else {
-                    g.items.iter().position(|item| {
-                        let kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
-                        runs_during_macro_check(kind)
-                    })
+                    g.items.iter().position(|item| runs_during_macro_check(&item.value))
                 };
                 if let Some(i) = idx {
                     return g.items.remove(i);
@@ -1232,6 +1227,8 @@ impl OrdinaryQueue {
 
     /// Drains cancellable motion/RPC items (`command`, `preset`, `servo`) while preserving
     /// non-cancellable session/lease frames (`acquire_lease`, `release_lease`, `auth`, `heartbeat`).
+    /// Preserves the legacy cancellation predicate (`command` | `preset` | `servo::is_servo_frame`)
+    /// so mixed-field frames retain exact baseline cancellation parity.
     /// Builds JSON cancellation payloads outside the sync lock so the reader critical section stays O(1).
     fn drain_cancellable(&self, code: &'static str, epoch: Option<u64>) -> Vec<Value> {
         let mut to_cancel = Vec::new();
@@ -1240,12 +1237,14 @@ impl OrdinaryQueue {
             let n = g.items.len();
             for _ in 0..n {
                 if let Some(item) = g.items.pop_front() {
-                    let kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
-                    let exempt_disable = code == "STOPPED" && is_torque_disable_command(&item.value);
+                    let raw_kind = item.value.get("type").and_then(Value::as_str).unwrap_or("");
+                    let (_, entry) = dispatch::classify(&item.value);
+                    let exempt_disable = code == "STOPPED"
+                        && entry.is_some_and(|e| e.admission == AdmissionClass::OrdinaryTorqueOrStopExempt)
+                        && lease::is_torque_disable_command(&item.value);
                     let cancellable = !exempt_disable
-                        && (matches!(kind, "command" | "preset" | "servo")
-                            || item.value.get("positions").is_some()
-                            || item.value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream"));
+                        && (matches!(raw_kind, "command" | "preset")
+                            || servo::is_servo_frame(raw_kind, &item.value));
                     if cancellable {
                         to_cancel.push(item.value);
                     } else {
@@ -1258,6 +1257,11 @@ impl OrdinaryQueue {
             .into_iter()
             .filter_map(|v| cancelled_reply(&v, code, epoch))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).items.len()
     }
 
     fn close(&self) {
@@ -1410,206 +1414,6 @@ async fn deliver_urgent_stop_batch(
     }
 }
 
-// Under the write lock, after lease / epoch / request_id checks.
-#[allow(clippy::too_many_arguments)]
-fn prepare_action(
-    inner: &mut SupervisorInner,
-    stamp: crate::supervisor::AdmissionStamp,
-    path: &str,
-    body: &Value,
-    epoch: u64,
-    request_id: &Value,
-    auth: &crate::auth::OperatorAuth,
-    ws_token: Option<&str>,
-) -> Result<ActionStart, ApiError> {
-    if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
-    let (kind, parsed) = match path {
-        "/api/v1/action/move_to" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_to", motion::parse_move_to(body))
-        }
-        "/api/v1/action/move_relative" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            ("move_relative", motion::parse_move_relative(body))
-        }
-        "/api/v1/action/gripper" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            let mut request = motion::parse_gripper(body).map_err(ArmError::from)?;
-            if let Some(scale) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
-                if !(0.05..=1.0).contains(&scale) {
-                    return Err(ArmError::from(motion::MotionError::InvalidCommand(
-                        "speed_scale must be in [0.05, 1.0]".into(),
-                    ))
-                    .into());
-                }
-                if inner.config.active_tool.commissioning_required && scale > 0.2 + 1e-6 {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "gripper (speed_scale {scale:.2} > 0.2)"
-                    )))
-                    .into());
-                }
-                if body.get("speed").is_none_or(Value::is_null) {
-                    request.speed = (2.0 * scale).clamp(0.01, 2.0);
-                }
-            }
-            if body.get("baseline").is_some_and(|v| !v.is_null()) {
-                return Err(invalid_command("baseline is not a gripper action field; calibrate with /api/v1/action/gripper_calibrate"));
-            }
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = SupervisorInner::start_gripper(admitted, request, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/gripper_zero_check" => {
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = SupervisorInner::start_gripper_zero_check_with_auth(
-                admitted,
-                body,
-                epoch,
-                Some((auth.clone(), ws_token.map(str::to_string))),
-            )?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/grasp" => {
-            if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
-                return Ok(ActionStart::DryRunGrasp(body.clone()));
-            }
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?)));
-        }
-        "/api/v1/action/place" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?)));
-        }
-        "/api/v1/action/replay" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
-        }
-        "/api/v1/action/move_to_pose" => {
-            let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-            let (id, duration) = crate::poses::start_action(admitted, body, epoch)?;
-            return Ok(ActionStart::Started(id, duration));
-        }
-        "/api/v1/action/run_sequence" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?)));
-        }
-        crate::calib_hover::PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?)));
-        }
-        crate::gripper_calib::CALIBRATE_PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let tag = motion::tag(body).map_err(ArmError::from)?;
-            return Ok(ActionStart::GripperCalibrate(epoch, tag));
-        }
-        crate::measure_multiview::PATH => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            return Ok(ActionStart::MeasureMultiview(Box::new(crate::measure_multiview::prepare(inner, body, epoch)?)));
-        }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/start" => {
-            inner.preflight_admission(stamp).map_err(ArmError::from)?;
-            inner.check_terminal_fifo_for_new_action().map_err(ArmError::from)?;
-            let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
-            let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
-            inner.check_policy_start_preconditions_with(
-                request.mode,
-                request.sim_only,
-                request.i_am_at_the_arm,
-                epoch,
-            )?;
-            return Ok(ActionStart::Policy(Box::new(PendingPolicyStart {
-                request,
-                config: inner.config.clone(),
-                epoch,
-                stamp,
-                policy_live_allowed: inner.policy_live_allowed(),
-            })));
-        }
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/stop" => {
-            inner.advance_stop_generation();
-            let stopped = inner.stop_policy_run(None, "STOPPED");
-            return Ok(ActionStart::PolicyStopped(stopped));
-        }
-        _ => return Err(invalid_command("Unknown action")),
-    };
-    let (mut spec, mut speed, tag) = parsed.map_err(ArmError::from)?;
-    let _ = &mut spec;
-    // move_to / move_relative keep their straight line to the goal; `precise: true` (profile
-    // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
-    let precise = motion::flag(body, "precise", false).map_err(ArmError::from)?;
-    let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
-    let path_mode = motion::parse_path_mode(body).map_err(ArmError::from)?;
-    let same_side = precise || request != crate::backlash::Request::Profile;
-    if path_mode == motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
-        return Err(invalid_command("speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"));
-    }
-    let linear_speed_scale = if path_mode == motion::PathMode::Linear {
-        if let Some(s) = motion::num(body, "speed_scale").map_err(ArmError::from)? {
-            if !(0.05..=1.0).contains(&s) {
-                return Err(invalid_command("speed_scale must be in [0.05, 1.0]"));
-            }
-            if body.get("speed").is_none_or(Value::is_null) {
-                speed.linear = (motion::MAX_LINEAR_MPS * s).min(motion::MAX_LINEAR_MPS);
-                speed.angular = (motion::MAX_ANGULAR_RPS * s).min(motion::MAX_ANGULAR_RPS);
-            }
-            Some(s)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let approach = if same_side && path_mode == motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
-    let input = inner.plan_input_tcp()?;
-    let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
-    let joint = match path_mode {
-        motion::PathMode::Linear => {
-            if inner.config.active_tool.commissioning_required {
-                let scale_ok = linear_speed_scale.is_none_or(|s| s <= 0.2 + 1e-6);
-                let speed_ok = speed.linear <= 0.2 * motion::MAX_LINEAR_MPS + 1e-6
-                    && speed.angular <= 0.2 * motion::MAX_ANGULAR_RPS + 1e-6;
-                if !scale_ok || !speed_ok {
-                    return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                        "{kind} (requires speed_scale <= 0.2 or speed <= {:.3} m/s / {:.2} rad/s)",
-                        0.2 * motion::MAX_LINEAR_MPS,
-                        0.2 * motion::MAX_ANGULAR_RPS
-                    )))
-                    .into());
-                }
-            }
-            None
-        }
-        motion::PathMode::Joint => {
-            let speed_scale = crate::poses::speed_scale(body)?;
-            if inner.config.active_tool.commissioning_required && speed_scale > 0.2 + 1e-6 {
-                return Err(ArmError::Safety(SafetyError::CommissioningRequired(format!(
-                    "{kind} (speed_scale {speed_scale:.2} > 0.2)"
-                )))
-                .into());
-            }
-            Some(JointGoal {
-                speed_scale,
-                same_side: same_side.then_some(request),
-                snapshot: inner.joint_goal_snapshot(speed_scale),
-            })
-        }
-    };
-    let seeds = motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint, seeds }))
-}
-
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
     let control_mode = if inner.gravity_comp_active() { "gravity_comp" } else { "position" };
     let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued, "control_mode":control_mode});
@@ -1618,28 +1422,6 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
         ack["expected_duration_s"] = json!(duration);
     }
     ack
-}
-
-fn pose_ack_fields(inner: &SupervisorInner, pose: &crate::poses::NamedPose, revision: u64) -> Vec<(&'static str, Value)> {
-    let default_joint_names = inner
-        .poses
-        .list
-        .joint_names
-        .clone()
-        .unwrap_or_else(|| inner.joint_names());
-    let pose_val = crate::poses::pose_response_value(pose, &default_joint_names);
-    let pose_id = pose_val.get("pose_id").cloned().unwrap_or_else(|| json!(pose.id));
-    let content_sha256 = pose_val.get("content_sha256").cloned().unwrap_or(Value::Null);
-    let joint_names = pose_val.get("joint_names").cloned().unwrap_or_else(|| json!(default_joint_names));
-    let stale = pose_val.get("stale").cloned().unwrap_or(Value::Null);
-    vec![
-        ("pose", pose_val),
-        ("pose_id", pose_id),
-        ("content_sha256", content_sha256),
-        ("joint_names", joint_names),
-        ("stale", stale),
-        ("revision", json!(revision)),
-    ]
 }
 
 struct WsAuthState {
@@ -1690,96 +1472,279 @@ impl WsAuth {
     }
 }
 
-/// Check privileged-operations authorization under the supervisor write lock.
-/// Returns `Some(ApiError)` if rejected, `None` if allowed.
-fn check_operator_privilege(
-    ws_auth: &WsAuth,
-    inner: &mut SupervisorInner,
-    path: &str,
-    body: &Value,
-    epoch: u64,
-) -> Option<ApiError> {
-    if path == "/api/v1/safety/clear_fault"
-        && inner.consume_pending_estop()
-        && inner.safety.epoch_id() != epoch
-    {
-        return Some(ArmError::Safety(SafetyError::EpochMismatch {
-            expected: inner.safety.epoch_id(),
-            received: epoch,
-        }).into());
-    }
-    if ws_auth.is_operator() {
-        return None;
-    }
-    match path {
-        "/api/v1/workspace/keepout"
-        | "/api/v1/safety/collision"
-        | "/api/v1/mode/gravity_comp"
-        | "/api/v1/gripper/calibration"
-        | "/api/v1/calibration/apply"
-        | "/api/v1/calibration/restore"
-        | "/api/v1/calibration/motor_zero"
-        | "/api/v1/calibration/joint_zero/restore"
-        | crate::mit::TIMEOUT_PATH
-        | crate::mit::QUALIFICATION_PATH
-        | "/api/v1/poses/save"
-        | "/api/v1/poses/rename"
-        | "/api/v1/poses/delete"
-        | "/api/v1/sequences/save"
-        | "/api/v1/sequences/delete"
-        | "/api/v1/grasp/setup"
-        | "/api/v1/tool/commissioning/confirm" => Some(ApiError::operator_required(path)),
-        // moves the arm and triggers the camera (like /api/v1/detection/trigger)
-        crate::measure_multiview::PATH => Some(ApiError::operator_required(path)),
-        // a sequence run that records writes episodes (like /api/v1/dataset/record/*)
-        "/api/v1/action/run_sequence"
-            if body.get("record").is_some_and(|r| !r.is_null()) =>
-        {
-            Some(ApiError::operator_required("run_sequence (record)"))
-        }
-        // learns the free-motion torque of the jaw (stored on the device)
-        crate::gripper_calib::CALIBRATE_PATH => Some(ApiError::operator_required("gripper_calibrate")),
-        "/api/v1/action/gripper_zero_check"
-            if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
-        {
-            Some(ApiError::operator_required("gripper_zero_check (store_offset=true)"))
-        }
-        // a policy run on a real (or unknown) driver, in any mode; mock / sim drivers stay open.
-        // policy/stop needs no session, like /api/v1/motion/stop. Rechecked after loading.
-        #[cfg(feature = "policy-runtime")]
-        "/api/v1/action/policy/start" if !inner.policy_live_allowed() => {
-            Some(ApiError::operator_required("policy/start (real arm)"))
-        }
-        "/api/v1/safety/clear_fault" => {
-            if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
-                return Some(ArmError::Safety(SafetyError::EpochMismatch {
-                    expected: inner.safety.epoch_id(),
-                    received: epoch,
-                }).into());
-            }
-            if inner.e_stop_latched.load(Ordering::SeqCst) {
-                return Some(ApiError::operator_required("clear_fault (EStop latched)"));
-            }
-            if (inner.safety.state().is_stopped() || inner.safety.has_latched_fault())
-                && !inner.safety.recoverable()
-            {
-                return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
-            }
-            None
-        }
-        _ => None,
-    }
+/// Bound `auth` lane handler executed off-reader by `auth_task` via `DISPATCH_TABLE`.
+fn handle_auth_frame(ws_auth: &WsAuth, value: &Value) -> Value {
+    let next_token = value
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    let status = ws_auth.update_token(next_token);
+    json!({
+        "type": "auth_ack",
+        "seq": value.get("seq"),
+        "auth_enforced": status.auth_enforced,
+        "role": status.role,
+        "expires_in_s": status.expires_in_s
+    })
 }
 
-/// OperatorAuth for the WS commands handled without a lease (teach v1 episode store and
-/// recorder, depth measurement). Every one of them writes the episode store or triggers the
-/// camera, so it needs an operator session when auth is enforced, like
-/// `/api/v1/dataset/record/*` and `/api/v1/detection/trigger`; the owner can always end a
-/// recording without saving it (`record/stop {save: false}`).
-fn lease_free_operator_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Option<ApiError> {
-    if ws_auth.is_operator() { return None; }
-    if path == "/api/v1/record/stop" && body.get("save").and_then(Value::as_bool) == Some(false) { return None; }
-    Some(ApiError::operator_required(path))
+/// Bound urgent E-stop reader transition handler (`estop` / `e_stop`).
+/// Reserves urgent reply capacity before latching, always latches in O(1) via lock-free atomics,
+/// and returns `true` iff the writer estop channel is already closed.
+fn handle_urgent_estop_frame(ctx: &mut UrgentEStopCtx<'_>) -> bool {
+    ctx.reader_writer.mark_estop_admitted();
+    let estop_guard = ctx.reader_writer.enter_in_flight_estop();
+    let reserved = ctx.reader_writer.try_reserve_estop();
+    let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
+    let ticket = ctx.reader_supervisor.begin_e_stop_checked();
+    let req_id = ctx.value.get("request_id").cloned();
+    let sup = ctx.reader_supervisor.clone();
+    let cancel_tx = ctx.reader_cancel_tx.clone();
+    let writer_c = ctx.reader_writer.clone();
+    ctx.reader_tasks.spawn(async move {
+        let _estop_guard = estop_guard;
+        let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
+            Ok((state, epoch)) => (
+                json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
+                Some(epoch),
+            ),
+            Err(err) => {
+                let api: ApiError = err.into();
+                let mut r = json!({"type":"estop_reject", "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message, "latched":true});
+                if let Some(id) = req_id {
+                    r["request_id"] = id;
+                }
+                (r, sup.hub().latest().map(|s| s.obs.epoch_id))
+            }
+        };
+        match reserved {
+            Ok(permit) => {
+                permit.send(reply);
+            }
+            Err(mpsc::error::TrySendError::Full(())) => {
+                let _ = writer_c.send_estop_blocking(reply).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {}
+        }
+        let _ = cancel_tx.send(Some(CancelSignal {
+            gen: sup.stop_generation(),
+            code: "ESTOP_ACTIVE",
+            epoch: cancel_epoch,
+        }));
+    });
+    closed
+}
+
+/// Bound urgent Stop reader transition handler (`/api/v1/motion/stop`).
+/// Non-blocking handoff with coalescing; returns `true` iff the writer stop channel is closed.
+fn handle_urgent_stop_frame(ctx: &mut UrgentStopCtx<'_>) -> bool {
+    let permit = match ctx.reader_writer.try_reserve_stop() {
+        Ok(p) => Some(p),
+        Err(mpsc::error::TrySendError::Full(())) => {
+            ctx.reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
+            None
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => return true,
+    };
+    let local_gen = ctx.reader_generation.load(Ordering::SeqCst);
+    let supplied_gen = ctx.value.get("generation").and_then(Value::as_u64).unwrap_or(0);
+    let label_ok = {
+        let lbl = ctx
+            .reader_client_label
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ctx.value
+            .get("client_id")
+            .is_none_or(|id| id.as_str() == lbl.as_deref())
+    };
+    let conn_label = crate::model::HolderLabel::try_new(ctx.reader_connection);
+    let effective_gen = if conn_label.is_some()
+        && local_gen != 0
+        && supplied_gen == local_gen
+        && label_ok
+    {
+        local_gen
+    } else {
+        0
+    };
+    let raw_request_id = ctx.value.get("request_id").cloned().unwrap_or(Value::Null);
+    let parsed_request_id = ctx.value.get("request_id").and_then(Value::as_u64);
+    let epoch = ctx.value.get("epoch_id").and_then(Value::as_u64);
+    let body_error = validate_command_body_common(&ctx.value["body"]).err();
+
+    let dispatch = {
+        let last_req = last_request_get(ctx.reader_last_request);
+        let mut st = ctx
+            .reader_in_flight_stop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let high_water = match (
+            last_req,
+            st.active.as_ref().and_then(|a| a.pending_max_request_id),
+        ) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        let request_id_valid =
+            parsed_request_id.is_some_and(|id| high_water.is_none_or(|last| id > last));
+        let waiter = CoalescedStopWaiter {
+            raw_request_id,
+            parsed_request_id,
+            request_id_valid,
+            body_error,
+            permit,
+        };
+        if let Some(active) = st.active.as_mut() {
+            if active.lease_generation == effective_gen && active.epoch == epoch {
+                if request_id_valid {
+                    active.pending_max_request_id =
+                        match (active.pending_max_request_id, parsed_request_id) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                }
+                if waiter.permit.is_some() || active.waiters.len() < URGENT_OUT_CAPACITY {
+                    active.waiters.push(waiter);
+                }
+                None
+            } else {
+                let stop = crate::rt_core::urgent::UrgentStop {
+                    connection: conn_label.unwrap_or_default(),
+                    lease_generation: effective_gen,
+                    epoch,
+                    request_id: parsed_request_id.unwrap_or(0),
+                    request_id_valid,
+                    body_error,
+                };
+                Some((None, stop, Some(waiter)))
+            }
+        } else {
+            let stop = crate::rt_core::urgent::UrgentStop {
+                connection: conn_label.unwrap_or_default(),
+                lease_generation: effective_gen,
+                epoch,
+                request_id: parsed_request_id.unwrap_or(0),
+                request_id_valid,
+                body_error,
+            };
+            let can_lead = effective_gen != 0 && request_id_valid && body_error.is_none();
+            if can_lead {
+                st.next_leader_id += 1;
+                let leader_id = st.next_leader_id;
+                st.active = Some(ActiveStopBatch {
+                    leader_id,
+                    lease_generation: effective_gen,
+                    epoch,
+                    pending_max_request_id: parsed_request_id,
+                    waiters: vec![waiter],
+                });
+                Some((Some(leader_id), stop, None))
+            } else {
+                Some((None, stop, Some(waiter)))
+            }
+        }
+    };
+
+    if let Some((leader_id, stop, single_waiter)) = dispatch {
+        let take_waiters = |state: &Mutex<InFlightStopState>,
+                            lid: Option<u64>,
+                            single: Option<CoalescedStopWaiter>|
+         -> Vec<CoalescedStopWaiter> {
+            if let Some(id) = lid {
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.active.as_ref().is_some_and(|a| a.leader_id == id) {
+                    return st.active.take().map(|b| b.waiters).unwrap_or_default();
+                }
+                Vec::new()
+            } else {
+                single.into_iter().collect()
+            }
+        };
+        match ctx.reader_supervisor.try_enqueue_executor_urgent_stop(stop) {
+            Ok(Some((client, mut rx))) => {
+                let stop_guard = ctx.reader_writer.enter_in_flight_stop();
+                let in_flight_c = ctx.reader_in_flight_stop.clone();
+                let last_req_c = ctx.reader_last_request.clone();
+                let cancel_tx_c = ctx.reader_cancel_tx.clone();
+                let ord_q_c = ctx.reader_ordinary_queue.clone();
+                let writer_c = ctx.reader_writer.clone();
+                ctx.reader_tasks.spawn(async move {
+                    let _stop_guard = stop_guard;
+                    let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
+                    let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
+                    deliver_urgent_stop_batch(
+                        waiters,
+                        stop_res,
+                        None,
+                        &last_req_c,
+                        &cancel_tx_c,
+                        &ord_q_c,
+                        &writer_c,
+                    )
+                    .await;
+                });
+            }
+            Ok(None) => {
+                let stop_guard = ctx.reader_writer.enter_in_flight_stop();
+                let sup_c = ctx.reader_supervisor.clone();
+                let in_flight_c = ctx.reader_in_flight_stop.clone();
+                let last_req_c = ctx.reader_last_request.clone();
+                let cancel_tx_c = ctx.reader_cancel_tx.clone();
+                let ord_q_c = ctx.reader_ordinary_queue.clone();
+                let writer_c = ctx.reader_writer.clone();
+                ctx.reader_tasks.spawn(async move {
+                    let _stop_guard = stop_guard;
+                    let mut pre_drained: Option<Vec<Value>> = None;
+                    let stop_res = sup_c
+                        .urgent_stop_with_legacy_hook(stop, |applied_epoch, next_gen| {
+                            // Owner `stop_gen` was already advanced under `inner.write()`;
+                            // notify macro cancellation and drain the ordinary queue atomically.
+                            let _ = cancel_tx_c.send(Some(CancelSignal {
+                                gen: next_gen,
+                                code: "STOPPED",
+                                epoch: Some(applied_epoch),
+                            }));
+                            pre_drained =
+                                Some(ord_q_c.drain_cancellable("STOPPED", Some(applied_epoch)));
+                        })
+                        .await;
+                    let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
+                    deliver_urgent_stop_batch(
+                        waiters,
+                        stop_res,
+                        pre_drained,
+                        &last_req_c,
+                        &cancel_tx_c,
+                        &ord_q_c,
+                        &writer_c,
+                    )
+                    .await;
+                });
+            }
+            Err(err) => {
+                let api = ApiError::from(err);
+                let waiters = take_waiters(ctx.reader_in_flight_stop, leader_id, single_waiter);
+                for w in waiters {
+                    let reply = format_urgent_stop_outcome(
+                        &w.raw_request_id,
+                        w.parsed_request_id,
+                        ctx.reader_last_request,
+                        Err(&api),
+                    );
+                    match w.permit {
+                        Some(permit) => {
+                            permit.send(reply);
+                        }
+                        None => {
+                            let _ = ctx.reader_writer.try_send_stop_best_effort(reply);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `command_ack` carrying the fields of `reply`.
@@ -2180,16 +2145,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let auth_ws_auth = ws_auth.clone();
     let auth_writer = writer.clone();
     let auth_task = tokio::spawn(async move {
+        let Some(DispatchHandler::Auth(auth_handler)) =
+            dispatch::lookup(FrameKind::Auth, None).map(|e| e.handler)
+        else {
+            unreachable!("FrameKind::Auth must bind DispatchHandler::Auth");
+        };
         while let Some(value) = auth_in_rx.recv().await {
-            let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
-            let status = auth_ws_auth.update_token(next_token);
-            let reply = json!({
-                "type": "auth_ack",
-                "seq": value.get("seq"),
-                "auth_enforced": status.auth_enforced,
-                "role": status.role,
-                "expires_in_s": status.expires_in_s
-            });
+            let reply = auth_handler(&auth_ws_auth, &value);
             if !auth_writer.send_auth(reply).await {
                 break;
             }
@@ -2204,40 +2166,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let hb_slot = heartbeat_slot.clone();
     let hb_writer = writer.clone();
     let heartbeat_task = tokio::spawn(async move {
+        let Some(DispatchHandler::Heartbeat(hb_handler)) =
+            dispatch::lookup(FrameKind::Heartbeat, None).map(|e| e.handler)
+        else {
+            unreachable!("FrameKind::Heartbeat must bind DispatchHandler::Heartbeat");
+        };
         while let Some(value) = hb_slot.pop().await {
             if hb_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
                 continue;
             }
             let reply = {
                 let mut inner = hb_supervisor.inner().write().await;
-                if inner.detached {
-                    None
-                } else {
-                    let local_generation = hb_generation.load(Ordering::SeqCst);
-                    let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                    let label_matches = {
-                        let lbl = hb_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                        value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-                    };
-                    let supplied_generation_ok = generation == local_generation || generation == 0;
-                    let authorized = local_generation != 0 && supplied_generation_ok && label_matches
-                        && inner.validate_servo_lease(&hb_connection, local_generation);
-                    if !authorized {
-                        Some(if local_generation == 0 {
-                            json!({"type":"lease_lost", "generation":0})
-                        } else {
-                            json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&hb_connection, local_generation)})
-                        })
-                    } else {
-                        let epoch = inner.safety.epoch_id();
-                        if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-                            Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}))
-                        } else {
-                            let _ = inner.heartbeat(&hb_connection, epoch);
-                            None
-                        }
-                    }
-                }
+                hb_handler(
+                    &mut inner,
+                    &value,
+                    &hb_connection,
+                    &hb_generation,
+                    &hb_client_label,
+                )
             };
             if let Some(reply) = reply {
                 if !hb_writer.send_ordinary_control(reply).await {
@@ -2270,11 +2216,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 continue;
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let (_, entry) = dispatch::classify(&value);
+            let admission = entry.map_or(AdmissionClass::Ordinary, |e| e.admission);
 
-            let is_estop = kind == "estop" || kind == "e_stop";
-            let is_stop = kind == "command"
-                && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop");
+            let is_estop = admission == AdmissionClass::UrgentEStop;
+            let is_stop = admission == AdmissionClass::UrgentStop;
 
             // When fatal close is already in progress, keep draining inbound bytes so closing the
             // TCP fd does not emit RST over unread flood traffic; still latch urgent E-stop and
@@ -2285,7 +2231,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
             // `auth` is classified in O(1) on the reader and verified off-reader by `auth_task`
             // so `OperatorAuth::sessions` table scans never stall urgent E-stop/Stop intake.
-            if kind == "auth" {
+            if admission == AdmissionClass::Auth {
                 match reader_auth_in_tx.try_send(value) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2304,212 +2250,43 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
             // `heartbeat` uses its own latest-wins slot so an ordinary backlog or slow worker
             // task never drops lease renewals.
-            if kind == "heartbeat" {
+            if admission == AdmissionClass::Heartbeat {
                 reader_heartbeat_slot.push_latest(value);
                 continue;
             }
 
-            // Urgent E-stop (both aliases): reserve urgent reply capacity BEFORE latching, ALWAYS
-            // latch immediately in O(1) via lock-free atomics (no ACK-drain mutex, no waiter scan),
-            // and never exit reader because of reply-queue capacity.
-            if is_estop {
-                reader_writer.mark_estop_admitted();
-                let estop_guard = reader_writer.enter_in_flight_estop();
-                let reserved = reader_writer.try_reserve_estop();
-                let closed = matches!(reserved, Err(mpsc::error::TrySendError::Closed(())));
-                let ticket = reader_supervisor.begin_e_stop_checked();
-                let req_id = value.get("request_id").cloned();
-                let sup = reader_supervisor.clone();
-                let cancel_tx = reader_cancel_tx.clone();
-                let writer_c = reader_writer.clone();
-                reader_tasks.spawn(async move {
-                    let _estop_guard = estop_guard;
-                    let (reply, cancel_epoch) = match sup.finish_e_stop_checked(ticket).await {
-                        Ok((state, epoch)) => (
-                            json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}),
-                            Some(epoch),
-                        ),
-                        Err(err) => {
-                            let api: ApiError = err.into();
-                            let mut r = json!({"type":"estop_reject", "status":api.status.as_u16(), "code":api.code, "error":api.error, "message":api.message, "latched":true});
-                            if let Some(id) = req_id { r["request_id"] = id; }
-                            (r, sup.hub().latest().map(|s| s.obs.epoch_id))
-                        }
-                    };
-                    match reserved {
-                        Ok(permit) => { permit.send(reply); }
-                        Err(mpsc::error::TrySendError::Full(())) => {
-                            let _ = writer_c.send_estop_blocking(reply).await;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(())) => {}
-                    }
-                    let _ = cancel_tx.send(Some(CancelSignal { gen: sup.stop_generation(), code: "ESTOP_ACTIVE", epoch: cancel_epoch }));
-                });
-                if closed { break; }
+            // Urgent E-stop (both aliases): dispatched through bound table handler.
+            if let Some(DispatchHandler::UrgentEStop(handler)) = entry.map(|e| e.handler) {
+                let mut ctx = UrgentEStopCtx {
+                    value: &value,
+                    reader_supervisor: &reader_supervisor,
+                    reader_cancel_tx: &reader_cancel_tx,
+                    reader_writer: &reader_writer,
+                    reader_tasks: &reader_tasks,
+                };
+                if handler(&mut ctx) {
+                    break;
+                }
                 continue;
             }
 
-            // Urgent Stop (`/api/v1/motion/stop`): non-blocking handoff; coalesces into an already
-            // pending Stop from this connection with matching lease/epoch; never enters ordinary
-            // queue and NEVER exits the reader on reply-queue capacity (only writer closes after
-            // its bounded grace, while reader keeps reading and latching any E-stop behind it).
-            if is_stop {
-                let permit = match reader_writer.try_reserve_stop() {
-                    Ok(p) => Some(p),
-                    Err(mpsc::error::TrySendError::Full(())) => {
-                        reader_writer.trigger_fatal(FatalClose::urgent_queue_full());
-                        None
-                    }
-                    Err(mpsc::error::TrySendError::Closed(())) => break,
+            // Urgent Stop (`/api/v1/motion/stop`): dispatched through bound table handler.
+            if let Some(DispatchHandler::UrgentStop(handler)) = entry.map(|e| e.handler) {
+                let mut ctx = UrgentStopCtx {
+                    value: &value,
+                    reader_supervisor: &reader_supervisor,
+                    reader_connection: &reader_connection,
+                    reader_generation: &reader_generation,
+                    reader_client_label: &reader_client_label,
+                    reader_last_request: &reader_last_request,
+                    reader_in_flight_stop: &reader_in_flight_stop,
+                    reader_ordinary_queue: &reader_ordinary_queue,
+                    reader_cancel_tx: &reader_cancel_tx,
+                    reader_writer: &reader_writer,
+                    reader_tasks: &reader_tasks,
                 };
-                let local_gen = reader_generation.load(Ordering::SeqCst);
-                let supplied_gen = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                let label_ok = {
-                    let lbl = reader_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                    value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-                };
-                let conn_label = crate::model::HolderLabel::try_new(&reader_connection);
-                let effective_gen = if conn_label.is_some() && local_gen != 0 && supplied_gen == local_gen && label_ok { local_gen } else { 0 };
-                let raw_request_id = value.get("request_id").cloned().unwrap_or(Value::Null);
-                let parsed_request_id = value.get("request_id").and_then(Value::as_u64);
-                let epoch = value.get("epoch_id").and_then(Value::as_u64);
-                let body_error = validate_command_body_common(&value["body"]).err();
-
-                let dispatch = {
-                    let last_req = last_request_get(&reader_last_request);
-                    let mut st = reader_in_flight_stop.lock().unwrap_or_else(|e| e.into_inner());
-                    let high_water = match (last_req, st.active.as_ref().and_then(|a| a.pending_max_request_id)) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (a, b) => a.or(b),
-                    };
-                    let request_id_valid = parsed_request_id.is_some_and(|id| high_water.is_none_or(|last| id > last));
-                    let waiter = CoalescedStopWaiter {
-                        raw_request_id,
-                        parsed_request_id,
-                        request_id_valid,
-                        body_error,
-                        permit,
-                    };
-                    if let Some(active) = st.active.as_mut() {
-                        if active.lease_generation == effective_gen && active.epoch == epoch {
-                            if request_id_valid {
-                                active.pending_max_request_id = match (active.pending_max_request_id, parsed_request_id) {
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    (a, b) => a.or(b),
-                                };
-                            }
-                            if waiter.permit.is_some() || active.waiters.len() < URGENT_OUT_CAPACITY {
-                                active.waiters.push(waiter);
-                            }
-                            None
-                        } else {
-                            let stop = crate::rt_core::urgent::UrgentStop {
-                                connection: conn_label.unwrap_or_default(),
-                                lease_generation: effective_gen,
-                                epoch,
-                                request_id: parsed_request_id.unwrap_or(0),
-                                request_id_valid,
-                                body_error,
-                            };
-                            Some((None, stop, Some(waiter)))
-                        }
-                    } else {
-                        let stop = crate::rt_core::urgent::UrgentStop {
-                            connection: conn_label.unwrap_or_default(),
-                            lease_generation: effective_gen,
-                            epoch,
-                            request_id: parsed_request_id.unwrap_or(0),
-                            request_id_valid,
-                            body_error,
-                        };
-                        let can_lead = effective_gen != 0 && request_id_valid && body_error.is_none();
-                        if can_lead {
-                            st.next_leader_id += 1;
-                            let leader_id = st.next_leader_id;
-                            st.active = Some(ActiveStopBatch {
-                                leader_id,
-                                lease_generation: effective_gen,
-                                epoch,
-                                pending_max_request_id: parsed_request_id,
-                                waiters: vec![waiter],
-                            });
-                            Some((Some(leader_id), stop, None))
-                        } else {
-                            Some((None, stop, Some(waiter)))
-                        }
-                    }
-                };
-
-                if let Some((leader_id, stop, single_waiter)) = dispatch {
-                    let take_waiters = |state: &Mutex<InFlightStopState>, lid: Option<u64>, single: Option<CoalescedStopWaiter>| -> Vec<CoalescedStopWaiter> {
-                        if let Some(id) = lid {
-                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                            if st.active.as_ref().is_some_and(|a| a.leader_id == id) {
-                                return st.active.take().map(|b| b.waiters).unwrap_or_default();
-                            }
-                            Vec::new()
-                        } else {
-                            single.into_iter().collect()
-                        }
-                    };
-                    match reader_supervisor.try_enqueue_executor_urgent_stop(stop) {
-                        Ok(Some((client, mut rx))) => {
-                            let stop_guard = reader_writer.enter_in_flight_stop();
-                            let in_flight_c = reader_in_flight_stop.clone();
-                            let last_req_c = reader_last_request.clone();
-                            let cancel_tx_c = reader_cancel_tx.clone();
-                            let ord_q_c = reader_ordinary_queue.clone();
-                            let writer_c = reader_writer.clone();
-                            reader_tasks.spawn(async move {
-                                let _stop_guard = stop_guard;
-                                let stop_res = client.await_ticket(&mut rx).await.map_err(ArmError::from);
-                                let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
-                                deliver_urgent_stop_batch(
-                                    waiters, stop_res, None, &last_req_c, &cancel_tx_c, &ord_q_c, &writer_c,
-                                ).await;
-                            });
-                        }
-                        Ok(None) => {
-                            let stop_guard = reader_writer.enter_in_flight_stop();
-                            let sup_c = reader_supervisor.clone();
-                            let in_flight_c = reader_in_flight_stop.clone();
-                            let last_req_c = reader_last_request.clone();
-                            let cancel_tx_c = reader_cancel_tx.clone();
-                            let ord_q_c = reader_ordinary_queue.clone();
-                            let writer_c = reader_writer.clone();
-                            reader_tasks.spawn(async move {
-                                let _stop_guard = stop_guard;
-                                let mut pre_drained: Option<Vec<Value>> = None;
-                                let stop_res = sup_c.urgent_stop_with_legacy_hook(stop, |applied_epoch, next_gen| {
-                                    // Owner `stop_gen` was already advanced under `inner.write()`;
-                                    // notify macro cancellation and drain the ordinary queue atomically.
-                                    let _ = cancel_tx_c.send(Some(CancelSignal {
-                                        gen: next_gen,
-                                        code: "STOPPED",
-                                        epoch: Some(applied_epoch),
-                                    }));
-                                    pre_drained = Some(ord_q_c.drain_cancellable("STOPPED", Some(applied_epoch)));
-                                }).await;
-                                let waiters = take_waiters(&in_flight_c, leader_id, single_waiter);
-                                deliver_urgent_stop_batch(
-                                    waiters, stop_res, pre_drained, &last_req_c, &cancel_tx_c, &ord_q_c, &writer_c,
-                                ).await;
-                            });
-                        }
-                        Err(err) => {
-                            let api = ApiError::from(err);
-                            let waiters = take_waiters(&reader_in_flight_stop, leader_id, single_waiter);
-                            for w in waiters {
-                                let reply = format_urgent_stop_outcome(
-                                    &w.raw_request_id, w.parsed_request_id, &reader_last_request, Err(&api),
-                                );
-                                match w.permit {
-                                    Some(permit) => { permit.send(reply); }
-                                    None => { let _ = reader_writer.try_send_stop_best_effort(reply); }
-                                }
-                            }
-                        }
-                    }
+                if handler(&mut ctx) {
+                    break;
                 }
                 continue;
             }
@@ -2530,8 +2307,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             };
             // Every other frame goes onto the connection's bounded ordinary queue (non-blocking).
             if let Err(value) = reader_ordinary_queue.try_push(value, stamp) {
-                let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-                if let Some(reply) = backlog_full_reject(kind, &value) {
+                if let Some(reply) = backlog_full_reject(&value) {
                     reader_writer.try_send_ordinary_control(reply);
                     if reader_writer.is_writer_closed() {
                         break;
@@ -2622,44 +2398,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
                 joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").rx).await }, if macro_active => {
                     let MacroCheck { request_id, generation, stamp, .. } = macro_check.take().expect("checked above");
-                    let owner_transferred = || {
-                        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning macro"});
-                        if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                        r
-                    };
-                    let reply = if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    } else if recv_supervisor.owner_mode() != crate::supervisor::OWNER_LEGACY {
-                        owner_transferred()
-                    } else {
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            drop(inner);
-                            break;
-                        } else if inner.detached {
-                            drop(inner);
-                            owner_transferred()
-                        } else {
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                command_reject(&inner, &request_id, ArmError::from(err).into())
-                            } else {
-                                match joined {
-                                    Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                                    Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                                    Ok(Ok(planned)) => {
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| planned.start(admitted, &recv_supervisor, &recv_deps)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    };
+                    let Some(reply) = actions::complete_macro_check(
+                        request_id,
+                        generation,
+                        stamp,
+                        joined,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_deps,
+                        &worker_closing,
+                    ).await else { break; };
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                     continue;
                 }
@@ -2669,74 +2418,68 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 }
             };
             let QueuedOrdinary { value, stamp } = queued;
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let raw_kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            let (frame_kind, entry) = dispatch::classify(&value);
             // Fail closed before any legacy lock/reader path (including depth/teach) whenever
             // `ArmCore` is not owned by the legacy supervisor lock.
             let owner_mode = recv_supervisor.owner_mode();
             if owner_mode != crate::supervisor::OWNER_LEGACY {
-                if let Some(reply) = executor_routing_reject(kind, &value, owner_mode) {
+                if let Some(reply) = executor_routing_reject(&value, owner_mode) {
                     if !worker_writer.send_ordinary_control(reply).await { break; }
                 }
                 continue;
             }
-            // depth measurement: read-only, no motion, no lease
-            if kind == "command" && value.get("path").and_then(Value::as_str) == Some(crate::depth_measure::PATH) {
+            // Pre-lock lease-free commands (depth measurement, teach episode/recorder store).
+            // Request-ID ordering and `entry.auth` are enforced uniformly by the dispatcher before
+            // invoking the bound handler.
+            if let Some((auth_req, DispatchHandler::LeaseFree(handler))) =
+                entry.map(|e| (e.auth, e.handler))
+            {
                 let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
+                if request_id.is_none()
+                    || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last)
+                {
                     let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if !worker_writer.send_ordinary_control(reply).await {
+                        break;
+                    }
                     continue;
                 }
                 last_ordinary_request = request_id;
-                if let Some(e) = lease_free_operator_check(&ws_auth, crate::depth_measure::PATH, &value["body"]) {
-                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
+                let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                if let Some(error) = auth_req.check_lease_free(&ws_auth, path, &value["body"]) {
+                    let mut reply = rejection(
+                        error,
+                        "command_reject",
+                        recv_supervisor.inner().read().await.safety.epoch_id(),
+                    );
                     reply["request_id"] = value["request_id"].clone();
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
+                    if !worker_writer.send_ordinary_control(reply).await {
+                        break;
+                    }
                     continue;
                 }
-                let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
-                worker_tasks.spawn(async move {
-                    let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
-                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
-                });
-                continue;
-            }
-            // teach commands without a motion lease (episode store; recorder ownership)
-            if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
-                let request_id = value.get("request_id").and_then(Value::as_u64);
-                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
-                }
-                last_ordinary_request = request_id;
-                if let Some(e) = lease_free_operator_check(&ws_auth, value["path"].as_str().unwrap_or(""), &value["body"]) {
-                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
-                    reply["request_id"] = value["request_id"].clone();
-                    if !worker_writer.send_ordinary_control(reply).await { break; }
-                    continue;
-                }
-                let caller_label = recv_client_label.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let caller = crate::teach::Caller {
-                    connection: recv_connection.clone(),
-                    client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or(caller_label),
-                };
-                let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
-                worker_tasks.spawn(async move {
-                    let path = value["path"].as_str().unwrap_or("").to_string();
-                    let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
-                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+                handler(LeaseFreeCtx {
+                    value,
+                    recv_supervisor: &recv_supervisor,
+                    recv_deps: &recv_deps,
+                    recv_connection: &recv_connection,
+                    recv_client_label: &recv_client_label,
+                    ack_tx: &ack_tx,
+                    worker_tasks: &worker_tasks,
                 });
                 continue;
             }
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
-            let mut pending_plan: Option<(PendingPlan, u64)> = None;
-            let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
-            let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
-            #[cfg(feature = "policy-runtime")]
-            let mut pending_policy: Option<(Value, PendingPolicyStart, u64, PolicyLoadingGuard)> = None;
-            let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
+            let mut action_pending = actions::ActionPending {
+                plan: None,
+                macro_action: None,
+                replay: None,
+                #[cfg(feature = "policy-runtime")]
+                policy: None,
+                dry_run_grasp: None,
+            };
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             maybe_pause_worker_before_lock(&recv_connection).await;
@@ -2744,888 +2487,250 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 let mut inner = recv_supervisor.inner().write().await;
                 if inner.detached {
                     drop(inner);
-                    if let Some(reply) = executor_routing_reject(kind, &value, recv_supervisor.owner_mode()) {
+                    if let Some(reply) = executor_routing_reject(&value, recv_supervisor.owner_mode()) {
                         if !worker_writer.send_ordinary_control(reply).await { break; }
                     }
                     continue;
                 }
-                if kind == "acquire_lease" {
-                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                        // Teardown already started while waiting for the owner lock: stop any
-                        // existing lease's motion first, then release it; never acquire or evict.
-                        let _ = inner.release_lease_for_connection_and_stop(&recv_connection);
-                        recv_generation.store(0, Ordering::SeqCst);
-                        response = None;
-                    } else {
-                        let label = value.get("client_id").and_then(Value::as_str).unwrap_or("");
-                        let seq = value.get("seq").and_then(Value::as_u64);
-                        let force_val = value.get("force");
-
-                        if label.is_empty() || label.len() > 128 {
-                            let mut reply = json!({"type":"lease_rejected", "error":"invalid_client_id"});
-                            if let Some(s) = seq { reply["seq"] = json!(s); }
-                            response = Some(reply);
-                        } else {
-                            match force_val {
-                                Some(v) if !v.is_boolean() && !v.is_null() => {
-                                    let mut reply = json!({
-                                        "type": "lease_rejected",
-                                        "status": 400,
-                                        "error": "invalid_argument",
-                                        "message": "force must be a boolean"
-                                    });
-                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                    response = Some(reply);
-                                }
-                                _ => {
-                                    let force = force_val.and_then(Value::as_bool).unwrap_or(false);
-                                    if force {
-                                        if !ws_auth.is_operator() {
-                                            let mut reply = json!({
-                                                "type": "lease_rejected",
-                                                "status": 403,
-                                                "code": "OPERATOR_REQUIRED",
-                                                "error": "operator_required",
-                                                "message": "Operator unlock is required for force lease preemption"
-                                            });
-                                            if let Some(s) = seq { reply["seq"] = json!(s); }
-                                            response = Some(reply);
-                                        } else {
-                                            match inner.preempt_lease(&recv_connection, label) {
-                                                Ok((generation, evicted)) => {
-                                                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                                                        // Late acquire completing after teardown started: stop motion first, then release.
-                                                        let _ = inner.release_lease_and_stop(&recv_connection, generation);
-                                                        recv_generation.store(0, Ordering::SeqCst);
-                                                        response = None;
-                                                    } else {
-                                                        let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                        *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                        if previous != generation { last_sequence = None; }
-                                                        let mut reply = json!({
-                                                            "type": "lease_granted",
-                                                            "client_id": label,
-                                                            "generation": generation
-                                                        });
-                                                        if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                        response = Some(reply);
-                                                        evicted_notify = evicted;
-                                                    }
-                                                }
-                                                Err(crate::supervisor::PreemptError::Cooldown(remaining)) => {
-                                                    let mut reply = json!({
-                                                        "type": "lease_rejected",
-                                                        "error": "preemption_cooldown",
-                                                        "remaining_ms": remaining
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                                Err(crate::supervisor::PreemptError::OwnerTransferred) => {
-                                                    let mut reply = json!({
-                                                        "type": "lease_rejected",
-                                                        "error": "owner_transferred",
-                                                        "code": "OWNER_TRANSFERRED"
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        match inner.acquire_lease(&recv_connection) {
-                                            Ok(generation) => {
-                                                if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                                                    // Late acquire completing after teardown started: stop motion first, then release.
-                                                    let _ = inner.release_lease_and_stop(&recv_connection, generation);
-                                                    recv_generation.store(0, Ordering::SeqCst);
-                                                    response = None;
-                                                } else {
-                                                    inner.set_lease_label(&recv_connection, generation, label);
-                                                    let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                    *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                    if previous != generation { last_sequence = None; }
-                                                    let mut reply = json!({
-                                                        "type": "lease_granted",
-                                                        "client_id": label,
-                                                        "generation": generation
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                            }
-                                            Err((code, 0)) if code == "OWNER_TRANSFERRED" => {
-                                                let mut reply = json!({
-                                                    "type": "lease_rejected",
-                                                    "error": "owner_transferred",
-                                                    "code": "OWNER_TRANSFERRED"
-                                                });
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
-                                            }
-                                            Err(_) => {
-                                                let mut reply = json!({"type":"lease_rejected", "error":"controller_busy"});
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    } else {
-                        let local_generation = recv_generation.load(Ordering::SeqCst);
-                        let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                        let label_matches = {
-                            let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                            value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
+                macro_rules! call_owner {
+                    ($handler:expr, $path:expr, $epoch:expr, $gen:expr) => {{
+                        let mut ctx = OwnerDispatchCtx {
+                            inner: &mut inner,
+                            stamp,
+                            path: $path,
+                            value: &value,
+                            epoch: $epoch,
+                            local_generation: $gen,
+                            recv_conn_id,
+                            recv_connection: &recv_connection,
+                            recv_generation: &recv_generation,
+                            recv_client_label: &recv_client_label,
+                            worker_closing: &worker_closing,
+                            ws_auth: &ws_auth,
+                            recv_supervisor: &recv_supervisor,
+                            recv_deps: &recv_deps,
+                            recv_calib: &recv_calib,
+                            #[cfg(feature = "policy-runtime")]
+                            pending_policy_loads: &pending_policy_loads,
+                            last_sequence: &mut last_sequence,
+                            evicted_notify: &mut evicted_notify,
+                            action_pending: &mut action_pending,
+                            pending_config_write: &mut pending_config_write,
+                            pending_calibration: &mut pending_calibration,
                         };
-                        // Heartbeat from legacy clients may omit generation; connection still must own it.
-                        let supplied_generation_ok = generation == local_generation || (kind == "heartbeat" && generation == 0);
-                        let authorized = local_generation != 0 && supplied_generation_ok && label_matches
-                            && inner.validate_servo_lease(&recv_connection, local_generation);
-                        let is_dry_run = kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/action/grasp") && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
-                        if (kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")) && value.get("generation").and_then(Value::as_u64).is_none() {
-                            response = Some(json!({"type":"servo_reject", "reason":"missing_generation"}));
-                        } else if !authorized && !is_dry_run {
-                            response = Some(if kind == "command" {
-                                json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                            } else if kind == "release_lease" {
-                                json!({"type":"lease_released", "success":false})
-                            } else if local_generation == 0 {
-                                json!({"type":"lease_lost", "generation":0})
-                            } else {
-                                json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&recv_connection, local_generation)})
-                            });
-                        } else if kind == "release_lease" {
-                            let released = inner.release_lease_and_stop(&recv_connection, local_generation);
-                            recv_generation.store(0, Ordering::SeqCst);
-                            *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            response = Some(json!({"type":"lease_released", "success":released}));
-                        } else {
-                            inner.consume_pending_estop();
-                            let epoch = inner.safety.epoch_id();
-                            if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-                                response = Some(if kind == "command" {
-                                    json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
-                                } else { json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}) });
-                            } else if kind == "heartbeat" {
-                                let _ = inner.heartbeat(&recv_connection, epoch);
-                                response = None;
-                            } else if kind == "command" {
-                                let request_id = value.get("request_id").and_then(Value::as_u64);
-                                if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
-                                    response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
-                                } else {
-                                    last_ordinary_request = request_id;
-                                    let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                    if let Some(auth_err) = check_operator_privilege(&ws_auth, &mut inner, path, &value["body"], epoch) {
-                                        response = Some(command_reject(&inner, &value["request_id"], auth_err));
-                                    } else if let Some(code) = calibration_busy_code(&inner, path) {
-                                        response = Some(command_reject(&inner, &value["request_id"],
-                                            ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
-                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" || path == crate::motor_zero::PATH
-                                        || path == crate::motor_zero::RESTORE_PATH || path == crate::mit::TIMEOUT_PATH || path == crate::mit::QUALIFICATION_PATH {
-                                        response = match calibration_job(&mut inner, path, &value["body"]) {
-                                            Ok(CalibStart::Job(job, busy)) => { pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy)); None }
-                                            Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
-                                            Err(e) => Some(calibration_reject(&value["request_id"], &e)),
-                                        };
-                                    } else if path.starts_with("/api/v1/action/") {
-                                        let (auth_snap, token_snap) = ws_auth.auth_and_token();
-                                        response = match prepare_action(&mut inner, stamp, path, &value["body"], epoch, &value["request_id"], &auth_snap, token_snap.as_deref()) {
-                                            Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
-                                            Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
-                                            Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
-                                            Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
-                                            Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
-                                            Ok(ActionStart::Sequence(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::sequences::begin(admitted, &recv_supervisor, *plan)) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::CalibHover(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::calib_hover::begin(admitted, &recv_supervisor, *plan,
-                                                recv_calib.upstream.clone(), crate::calib_hover::jobs_dir(&recv_calib.path))) {
-                                                Ok((id, duration, job_id)) => {
-                                                    let mut ack = command_ack(&inner, &value["request_id"], Some((id, duration)));
-                                                    ack["job_id"] = json!(job_id);
-                                                    ack
-                                                }
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::GripperCalibrate(epoch, tag)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::gripper_calib::begin_calibration(admitted, &recv_supervisor, epoch, tag)) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            Ok(ActionStart::MeasureMultiview(plan)) => Some(match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| crate::measure_multiview::begin(admitted, &recv_supervisor, *plan, recv_deps.source.clone())) {
-                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
-                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                            }),
-                                            #[cfg(feature = "policy-runtime")]
-                                            Ok(ActionStart::Policy(p)) => {
-                                                inner.policy_loading = true;
-                                                let loading_guard = PolicyLoadingGuard::new(recv_supervisor.clone());
-                                                pending_policy = Some((value["request_id"].clone(), *p, local_generation, loading_guard));
-                                                None
-                                            }
-                                            #[cfg(feature = "policy-runtime")]
-                                            Ok(ActionStart::PolicyStopped(stopped)) => {
-                                                let had_pending = pending_policy_loads.load(Ordering::SeqCst) > 0;
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["stopped"] = json!(stopped || had_pending);
-                                                Some(ack)
-                                            }
-                                            Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
-                                        };
-                                    } else if let Some(result) = PreparedConfigWrite::prepare(
-                                        &mut inner,
-                                        path,
-                                        &value["body"],
-                                        recv_deps.setup_path.as_ref(),
-                                        ws_auth.is_enforced(),
-                                    ) {
-                                        match result {
-                                            Ok(prepared) if !prepared.has_write() => {
-                                                response = Some(match prepared.commit(&mut inner) {
-                                                    Ok(fields) => {
-                                                        let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                        for (key, field) in fields { ack[key] = field; }
-                                                        ack
-                                                    }
-                                                    Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                                });
-                                            }
-                                            Ok(prepared) => {
-                                                pending_config_write = Some((value["request_id"].clone(), prepared, local_generation, epoch));
-                                                response = None;
-                                            }
-                                            Err(error) => {
-                                                response = Some(command_reject(&inner, &value["request_id"], error.into()));
-                                            }
-                                        }
-                                    } else {
-                                        let result = execute_command(&mut inner, stamp, path, &value["body"], epoch);
-                                        response = Some(match result {
-                                            Ok(started) => command_ack(&inner, &value["request_id"], started),
-                                            Err(error) => command_reject(&inner, &value["request_id"], error),
-                                        });
-                                    }
-                                }
-                            } else if kind == "preset" && inner.calibration_busy {
-                                response = Some(json!({"type":"preset_reject", "name":value.get("name"), "status":409, "code":"MOTION_BUSY", "error":"MOTION_BUSY",
-                                    "message":"a camera calibration apply or restore is running", "epoch_id":epoch}));
-                            } else if kind == "preset" {
-                                let name = value.get("name").and_then(Value::as_str).unwrap_or("");
-                                let (path, body) = match name {
-                                    "home" => ("/api/v1/motion/home", json!({})),
-                                    "park" | "unload" => ("/api/v1/motion/unload", json!({})),
-                                    _ => {
-                                        let mut j = json!({"target_positions":value.get("positions")});
-                                        if let Some(s) = value.get("speed_scale") {
-                                            j["speed_scale"] = s.clone();
-                                        }
-                                        ("/api/v1/motion/jog", j)
-                                    }
-                                };
-                                response = Some(match execute_command(&mut inner, stamp, path, &body, epoch) {
-                                    Ok(started) => {
-                                        let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()});
-                                        if let Some((id, _)) = started { ack["action_id"] = json!(id); }
-                                        ack
-                                    }
-                                    Err(error) => {
-                                        let mut reply = rejection(error, "preset_reject", inner.safety.epoch_id());
-                                        reply["name"] = json!(name);
-                                        reply
-                                    },
-                                });
-                            } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
-                                match value.get("sequence_id").and_then(Value::as_u64) {
-                                    _ if inner.calibration_busy => response = Some(json!({"type":"servo_reject", "reason":"calibration_busy"})),
-                                    None => response = Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})),
-                                    Some(sequence) if last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) => {
-                                        response = Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}));
-                                    }
-                                    Some(sequence) => {
-                                        last_sequence = Some(sequence);
-                                        response = match positions(value.get("positions")).and_then(|targets| {
-                                            let admitted = inner.check_admission(stamp).map_err(|error| ApiError::from(ArmError::from(error)))?;
-                                            SupervisorInner::servo(admitted, targets, epoch).map_err(|error| ApiError::from(ArmError::from(error)))
-                                        }) {
-                                            Ok(()) => None,
-                                            Err(error) => {
-                                                let stopped = error.code.as_deref() == Some("STOPPED");
-                                                let mut r = rejection(error, "servo_reject", epoch);
-                                                if stopped { r["reason"] = json!("stopped"); }
-                                                Some(r)
-                                            }
-                                        };
-                                    }
-                                }
-                            } else { response = None; }
-                        }
-                    }
+                        ($handler)(&mut ctx)
+                    }};
                 }
-
-                // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
-                // so the control tick is never blocked by it; cancellable between steps and
-                // late results after teardown are ignored before installing anything.
-                if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint, seeds } = plan;
-                    if let Some(joint) = joint {
-                        // path "joint": IK of the goal only (several seeds) without the lock,
-                        // then the move_to_pose quintic, checked under the lock
-                        // ... and the quintic's plan, power fit and swept-workspace check, which
-                        // the install reuses when the arm and the workspace did not change
-                        let JointGoal { speed_scale, same_side, snapshot } = joint;
-                        let cancel = worker_closing.clone();
-                        let plan_conn = recv_connection.clone();
-                        let solved = tokio::task::spawn_blocking(move || {
-                            maybe_pause_blocking_plan(&plan_conn);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let prepared = match (&q, same_side) {
-                                (Ok(q), None) => crate::supervisor::prepare_quintic(&input, &snapshot, q),
-                                _ => None,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            Some((input, q.map(|q| (q, prepared))))
-                        }).await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if inner.detached {
-                            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-                            if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                            response = Some(r);
-                        } else {
-                            if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                            } else {
-                                response = match solved {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err(error)))) => Some(command_reject(&inner, &request_id, ArmError::from(error).into())),
-                                    Ok(Some((input, Ok((q, prepared))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_joint_goal_prepared(admitted, &input, &q, speed_scale, kind, tag, same_side, prepared)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    ),
-                                };
-                            }
-                        }
+                if frame_kind == FrameKind::AcquireLease {
+                    let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) else {
+                        unreachable!("AcquireLease must have an owner handler");
+                    };
+                    response = call_owner!(handler, "", 0, 0);
+                } else {
+                    let (local_generation, authorized) = lease::check_lease_authority(
+                        &mut inner,
+                        raw_kind,
+                        &value,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                    );
+                    let is_dry_run = entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExceptDryRun)
+                        && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
+                    let missing_gen = (entry.is_some_and(|e| e.lease == LeaseRequirement::RequiredExplicitGeneration)
+                        && value.get("generation").and_then(Value::as_u64).is_none())
+                        .then(|| json!({"type":"servo_reject", "reason":"missing_generation"}))
+                        .or_else(|| servo::missing_generation_reject(raw_kind, &value));
+                    if let Some(reject) = missing_gen {
+                        response = Some(reject);
+                    } else if !authorized && !is_dry_run {
+                        response = Some(lease::lease_loss_reply(&inner, raw_kind, &value, &recv_connection, local_generation));
+                    } else if frame_kind == FrameKind::ReleaseLease {
+                        let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) else {
+                            unreachable!("ReleaseLease must have an owner handler");
+                        };
+                        response = call_owner!(handler, "", 0, local_generation);
                     } else {
-                        let cancel = worker_closing.clone();
-                        let plan_conn = recv_connection.clone();
-                        let planned = tokio::task::spawn_blocking(move || {
-                            maybe_pause_blocking_plan(&plan_conn);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            let pre = match (&approach, &result) {
-                                (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
-                                (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
-                                _ => crate::backlash::Pre::Off,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            // a branch flip: would the joint-space move reach the goal (hint)?
-                            let joint_goal = match &result {
-                                Err(motion::MotionError::IkBranchFlip { .. }) => motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
-                                _ => None,
-                            };
-                            if cancel.load(Ordering::Acquire) {
-                                return None;
-                            }
-                            Some((input, result.map(|path| (path, pre, approach.ok())).map_err(|e| (e, joint_goal))))
-                        }).await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let mut inner = recv_supervisor.inner().write().await;
-                        if worker_closing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        if inner.detached {
-                            let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while planning"});
-                            if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                            response = Some(r);
-                        } else {
-                            if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                            if let Err(err) = inner.preflight_admission(stamp) {
-                                response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
+                        inner.consume_pending_estop();
+                        let epoch = inner.safety.epoch_id();
+                        if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+                            response = Some(if frame_kind == FrameKind::Command {
+                                json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
+                            } else { json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}) });
+                        } else if frame_kind == FrameKind::Command {
+                            let request_id = value.get("request_id").and_then(Value::as_u64);
+                            if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
+                                response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
                             } else {
-                                response = match planned {
-                                    Ok(None) => None,
-                                    Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into())),
-                                    Ok(Some((_, Err((error, joint_goal))))) => {
-                                        let mut api: ApiError = ArmError::from(error).into();
-                                        if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
-                                        Some(command_reject(&inner, &request_id, api))
-                                    }
-                                    Ok(Some((input, Ok((path, pre, approach))))) => Some(
-                                        if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                            json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                        } else {
-                                            match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_path_same_side(admitted, &input, path, pre, approach.as_ref(), kind, tag)) {
-                                                Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                            }
-                                        }
-                                    ),
-                                };
+                                last_ordinary_request = request_id;
+                                let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                                let auth_req = entry.map_or(AuthRequirement::None, |e| e.auth);
+                                if let Some(auth_err) = auth_req.check_owner(&ws_auth, &mut inner, path, &value["body"], epoch) {
+                                    response = Some(command_reject(&inner, &value["request_id"], auth_err));
+                                } else if let Some(code) = calibration_busy_code(&inner, path) {
+                                    response = Some(command_reject(&inner, &value["request_id"],
+                                        ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
+                                } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
+                                    response = call_owner!(handler, path, epoch, local_generation);
+                                } else if path.starts_with("/api/v1/action/") {
+                                    let err = if !value["body"].is_object() {
+                                        invalid_command("Command body must be an object")
+                                    } else {
+                                        invalid_command("Unknown action")
+                                    };
+                                    response = Some(command_reject(&inner, &value["request_id"], err));
+                                } else {
+                                    let result = validate_command_body_common(&value["body"])
+                                        .map_err(invalid_command)
+                                        .and_then(|()| Err::<Started, ApiError>(invalid_command("Unknown actuator command")));
+                                    response = Some(match result {
+                                        Ok(started) => command_ack(&inner, &value["request_id"], started),
+                                        Err(error) => command_reject(&inner, &value["request_id"], error),
+                                    });
+                                }
                             }
+                        } else if let Some(DispatchHandler::Owner(handler)) = entry.map(|e| e.handler) {
+                            response = call_owner!(handler, "", epoch, local_generation);
+                        } else {
+                            response = None;
                         }
                     }
                 }
+            }
 
-                // Macro actions (grasp, place): the first motions are planned without the lock
-                // (feasibility check), then the action begins and the orchestrator task takes over.
-                // The check runs in its own task; its result is taken by the select! above
-                // (lease re-check, then begin), while later ordinary commands stay in the bounded queue.
-                if let Some((request_id, pending, generation)) = pending_macro.take() {
-                    let source = recv_deps.source.clone();
-                    let cancel = worker_closing.clone();
-                    let plan_conn = recv_connection.clone();
-                    let (res_tx, res_rx) = tokio::sync::oneshot::channel();
-                    let abort = worker_tasks.spawn_abortable(async move {
-                        let planned_res = async {
-                            let cancel_blk = cancel.clone();
-                            let mut planned = tokio::task::spawn_blocking(move || {
-                                maybe_pause_blocking_plan(&plan_conn);
-                                if cancel_blk.load(Ordering::Acquire) {
-                                    return Err(ArmError::Safety(SafetyError::Stopped));
-                                }
-                                let out = pending.plan()?;
-                                if cancel_blk.load(Ordering::Acquire) {
-                                    return Err(ArmError::Safety(SafetyError::Stopped));
-                                }
-                                Ok(out)
-                            }).await
-                                .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-                            if cancel.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            // grasp task requirements: checked without the lock, before the action begins
-                            if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
-                            if cancel.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            Ok(planned)
-                        }.await;
-                        if !cancel.load(Ordering::Acquire) {
-                            let _ = res_tx.send(planned_res);
-                        }
-                    });
-                    macro_check = Some(MacroCheck {
-                        request_id,
+            let allows_deferred = entry.is_some_and(|e| e.reply == ReplyPolicy::CommandDeferred);
+            if allows_deferred {
+                if let Some((plan, generation)) = action_pending.plan.take() {
+                    let Some(next) = actions::complete_pending_plan(
+                        plan,
                         generation,
                         stamp,
-                        abort: motion_cmds::AbortOnDrop(abort),
-                        rx: res_rx,
-                    });
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                    ).await else { break; };
+                    response = next;
                 }
-                // Replay: the episode is read and checked without the lock; cancellable and late
-                // results after teardown are ignored before installing anything.
-                if let Some((request_id, input, generation)) = pending_replay.take() {
-                    let cancel = worker_closing.clone();
-                    let plan_conn = recv_connection.clone();
-                    let planned = tokio::task::spawn_blocking(move || {
-                        maybe_pause_blocking_plan(&plan_conn);
-                        if cancel.load(Ordering::Acquire) {
-                            return None;
-                        }
-                        let out = crate::replay::plan(input);
-                        if cancel.load(Ordering::Acquire) {
-                            return None;
-                        }
-                        Some(out)
-                    }).await;
-                    if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let mut inner = recv_supervisor.inner().write().await;
-                    if worker_closing.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    if inner.detached {
-                        let mut r = json!({"type":"command_reject", "request_id":request_id, "status":503, "code":"OWNER_TRANSFERRED", "error":"OWNER_TRANSFERRED", "message":"Ownership transferred to RT executor while checking replay"});
-                        if let Some(s) = recv_supervisor.hub().latest() { r["epoch_id"] = json!(s.obs.epoch_id); }
-                        response = Some(r);
-                    } else if let Err(err) = inner.preflight_admission(stamp) {
-                        response = Some(command_reject(&inner, &request_id, ArmError::from(err).into()));
-                    } else {
-                        response = match planned {
-                            Ok(None) => None,
-                            Err(e) => Some(command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into())),
-                            Ok(Some(Err(error))) => Some(command_reject(&inner, &request_id, error.into())),
-                            Ok(Some(Ok(plan))) => Some(
-                                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                } else {
-                                    match inner.check_admission(stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::install_replay(admitted, plan)) {
-                                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                        Err(error) => command_reject(&inner, &request_id, error.into()),
-                                    }
-                                }
-                            ),
-                        };
-                    }
+
+                if let Some((request_id, pending, generation)) = action_pending.macro_action.take() {
+                    macro_check = Some(actions::spawn_macro_check(
+                        request_id,
+                        pending,
+                        generation,
+                        stamp,
+                        &recv_deps,
+                        &worker_closing,
+                        &recv_connection,
+                        &worker_tasks,
+                    ));
+                }
+
+                if let Some((request_id, input, generation)) = action_pending.replay.take() {
+                    let Some(next) = actions::complete_pending_replay(
+                        request_id,
+                        input,
+                        generation,
+                        stamp,
+                        &recv_supervisor,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_closing,
+                    ).await else { break; };
+                    response = next;
                 }
                 #[cfg(feature = "policy-runtime")]
-                if let Some((request_id, pending, generation, loading_guard)) = pending_policy.take() {
-                    let sup = recv_supervisor.clone();
-                    let sandbox_c = recv_sandbox.clone();
-                    let vision_src = recv_deps.source.clone();
-                    let conn = recv_connection.clone();
-                    let gen_now = recv_generation.clone();
-                    let tx = ack_tx.clone();
-                    let ws_closed_c = worker_ws_closed.clone();
-                    let policy_stamp = pending.stamp;
-                    let pending_loads_c = pending_policy_loads.clone();
-                    pending_loads_c.fetch_add(1, Ordering::SeqCst);
-                    struct PendingLoadGuard(Arc<AtomicUsize>);
-                    impl Drop for PendingLoadGuard {
-                        fn drop(&mut self) {
-                            self.0.fetch_sub(1, Ordering::SeqCst);
-                        }
-                    }
-                    let load_guard = PendingLoadGuard(pending_loads_c);
-                    let epoch_id = pending.epoch;
-                    let policy_id = pending.request.policy_id.clone();
-                    let config = pending.config;
-                    let request_mode = pending.request.mode;
-                    let request_sim_only = pending.request.sim_only;
-                    let request_fps = pending.request.fps;
-                    let inline_release_gate = pending.request.release_gate;
-                    let policy_live_allowed = pending.policy_live_allowed;
-                    let i_am_at_the_arm = pending.request.i_am_at_the_arm;
-                    let ws_auth_c = ws_auth.clone();
-                    worker_tasks.spawn(async move {
-                        let _load_guard = load_guard;
-                        let mut loading_guard = loading_guard;
-                        let policy_id_load = policy_id.clone();
-                        let deployment = if request_mode == crate::policy_runtime::PolicyMode::Live && !policy_live_allowed {
-                            let (scene_id, tool_id) = sandbox_c.active_scene_and_tool().await;
-                            let calibration_digest = {
-                                let inner = sup.inner().read().await;
-                                inner.active_calibration_digest()
-                            };
-                            Some(crate::policy_runtime::ActiveDeploymentContext {
-                                scene_id,
-                                tool_id,
-                                calibration_digest,
-                            })
-                        } else {
-                            None
-                        };
-                        let sandbox_load = sandbox_c.clone();
-                        let cancel_policy = ws_closed_c.clone();
-                        let plan_conn = conn.clone();
-                        let prepared = tokio::task::spawn_blocking(move || {
-                            maybe_pause_blocking_plan(&plan_conn);
-                            let delay_ms = sandbox_load.policy_load_delay_ms();
-                            if delay_ms > 0 && !sleep_cancellable_ms(delay_ms, &cancel_policy) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            if cancel_policy.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            let dir = sandbox_load.policy_dir(&policy_id_load).ok_or_else(|| ArmError::Rejected {
-                                status: 404,
-                                code: "POLICY_NOT_FOUND".into(),
-                                message: format!("Policy pack '{policy_id_load}' not found"),
-                            })?;
-                            let mut prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
-                            if cancel_policy.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            let infer_delay_ms = sandbox_load.policy_infer_delay_ms();
-                            if infer_delay_ms > 0 {
-                                prepared_policy = prepared_policy.with_infer_delay(std::time::Duration::from_millis(infer_delay_ms));
-                            }
-                            let effective_fps = request_fps
-                                .or(prepared_policy.contract().fps)
-                                .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
-                            let effective_fps = crate::policy_runtime::validate_policy_fps(request_mode, effective_fps)
-                                .map_err(ArmError::from)?;
-                            let verified_release_gate = if let Some(ref deployment_ctx) = deployment {
-                                let raw_gate = match inline_release_gate {
-                                    Some(v) => Some(v),
-                                    None => crate::policy_runtime::load_release_gate_json(&dir).map_err(ArmError::from)?,
-                                };
-                                match raw_gate {
-                                    Some(raw) => Some(
-                                        crate::policy_runtime::ReleaseGate::parse_and_verify(
-                                            &raw,
-                                            prepared_policy.artifact_digest(),
-                                            &config,
-                                            prepared_policy.contract(),
-                                            effective_fps,
-                                            deployment_ctx,
-                                        )
-                                        .map_err(ArmError::from)?,
-                                    ),
-                                    None => None,
-                                }
-                            } else {
-                                None
-                            };
-                            if cancel_policy.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            // speed gate: measured here, off the supervisor lock and the control tick
-                            let warmup = prepared_policy
-                                .warmup(crate::policy_runtime::WARMUP_INFERENCES, crate::policy_runtime::WARMUP_MAX_TOTAL)
-                                .map_err(ArmError::from)?;
-                            if cancel_policy.load(Ordering::Acquire) {
-                                return Err(ArmError::Safety(SafetyError::Stopped));
-                            }
-                            let speed = crate::policy_runtime::SpeedGateReport::new(warmup, effective_fps);
-                            Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate, speed))
-                        }).await;
-
-                        if ws_closed_c.load(Ordering::SeqCst) {
-                            let mut inner = sup.inner().write().await;
-                            loading_guard.clear(&mut inner);
-                            return;
-                        }
-
-                        let reply = match prepared {
-                            Err(e) => {
-                                let mut inner = sup.inner().write().await;
-                                loading_guard.clear(&mut inner);
-                                command_reject(&inner, &request_id, ArmError::Internal(format!("policy load task failed: {e}")).into())
-                            }
-                            Ok(Err(error)) => {
-                                let mut inner = sup.inner().write().await;
-                                loading_guard.clear(&mut inner);
-                                command_reject(&inner, &request_id, error.into())
-                            }
-                            Ok(Ok((prepared_policy, fps, verified_release_gate, speed))) => {
-                                let deadline_res = crate::policy_runtime::compute_policy_deadline(pending.request.max_seconds)
-                                    .map_err(ArmError::from);
-                                // Fetch deployment context BEFORE taking the owner lock so NO `.await`
-                                // ever happens while holding `inner` and connection-closed is checked
-                                // atomically under the same lock as install.
-                                let active_scene_tool = if verified_release_gate.is_some() {
-                                    Some(sandbox_c.active_scene_and_tool().await)
-                                } else {
-                                    None
-                                };
-                                maybe_pause_worker_before_lock(&conn).await;
-
-                                let mut inner = sup.inner().write().await;
-                                loading_guard.clear(&mut inner);
-                                if ws_closed_c.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                                    return;
-                                }
-                                if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
-                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                                } else if inner.safety.epoch_id() != epoch_id {
-                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
-                                } else if !inner.policy_live_allowed() && !ws_auth_c.is_operator() {
-                                    // the operator session may have expired or been locked while loading
-                                    command_reject(&inner, &request_id, ApiError::operator_required("policy/start (real arm)"))
-                                } else if let Err(err) = speed.check(request_mode) {
-                                    let mut reply = command_reject(&inner, &request_id, err.into());
-                                    for (k, v) in speed.ack_fields() { reply[k] = v; }
-                                    reply
-                                } else {
-                                    match deadline_res {
-                                        Err(err) => command_reject(&inner, &request_id, err.into()),
-                                        Ok(deadline) => {
-                                            let deployment_check = if let Some(ref gate) = verified_release_gate {
-                                                let (cur_scene, cur_tool) = active_scene_tool.unwrap_or_default();
-                                                let cur_ctx = crate::policy_runtime::ActiveDeploymentContext {
-                                                    scene_id: cur_scene,
-                                                    tool_id: cur_tool,
-                                                    calibration_digest: inner.active_calibration_digest(),
-                                                };
-                                                gate.verify_deployment(&cur_ctx).map_err(ArmError::from)
-                                            } else {
-                                                Ok(())
-                                            };
-                                            if let Err(err) = deployment_check {
-                                                command_reject(&inner, &request_id, err.into())
-                                            } else {
-                                                let start_req = crate::policy_runtime::PolicyRunStart {
-                                                    epoch_id,
-                                                    connection_id: conn,
-                                                    lease_generation: generation,
-                                                    policy_id: policy_id.clone(),
-                                                    artifact_digest: prepared_policy.artifact_digest().to_string(),
-                                                    backend: prepared_policy.backend_name().to_string(),
-                                                    mode: request_mode,
-                                                    sim_only: request_sim_only,
-                                                    max_first_step_rad: prepared_policy.contract().max_first_step_rad,
-                                                    max_step_rad: prepared_policy.contract().max_step_rad,
-                                                    tag: pending.request.tag,
-                                                    i_am_at_the_arm,
-                                                    verified_release_gate,
-                                                };
-                                                match inner.check_admission(policy_stamp).map_err(ArmError::from).and_then(|admitted| SupervisorInner::begin_policy_run(admitted, start_req)) {
-                                                Ok(action_id) => {
-                                                    let digest = prepared_policy.artifact_digest().to_string();
-                                                    let backend = prepared_policy.backend_name().to_string();
-                                                    let mode_str = pending.request.mode.as_str().to_string();
-                                                    let vision_source = prepared_policy
-                                                        .contract()
-                                                        .vision
-                                                        .as_ref()
-                                                        .map(|_| {
-                                                            Arc::new(crate::policy_runtime::DetectionSourceAdapter(
-                                                                vision_src.clone(),
-                                                            ))
-                                                                as Arc<dyn crate::policy_runtime::PolicyVisionSource>
-                                                        });
-                                                    crate::policy_runtime::spawn_policy_runner(
-                                                        sup.clone(),
-                                                        action_id,
-                                                        prepared_policy,
-                                                        fps,
-                                                        deadline,
-                                                        vision_source,
-                                                        Some(sandbox_c.clone()),
-                                                    );
-                                                    let mut ack = command_ack(&inner, &request_id, Some((action_id, pending.request.max_seconds.unwrap_or(0.0))));
-                                                    ack["policy_id"] = json!(policy_id);
-                                                    ack["artifact_digest"] = json!(digest);
-                                                    ack["backend"] = json!(backend);
-                                                    ack["mode"] = json!(mode_str);
-                                                    for (k, v) in speed.ack_fields() { ack[k] = v; }
-                                                    ack
-                                                }
-                                                Err(error) => command_reject(&inner, &request_id, error.into()),
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        };
-                        let _ = tx.send(reply).await;
-                    });
+                if let Some((request_id, pending, generation, loading_guard)) = action_pending.policy.take() {
+                    policy::spawn_policy_start(
+                        request_id,
+                        pending,
+                        generation,
+                        loading_guard,
+                        recv_conn_id,
+                        &recv_supervisor,
+                        &recv_sandbox,
+                        &recv_deps,
+                        &recv_connection,
+                        &recv_generation,
+                        &ack_tx,
+                        &worker_ws_closed,
+                        &pending_policy_loads,
+                        &ws_auth,
+                        &worker_tasks,
+                    );
                 }
-                if let Some((request_id, body)) = pending_dry_run_grasp.take() {
-                    let dry = crate::grasp::dry_run_task(&recv_supervisor, recv_deps.source.as_ref(), &body).await;
-                    let mut ack = {
-                        let inner = recv_supervisor.inner().read().await;
-                        if !inner.detached {
-                            command_ack(&inner, &request_id, None)
-                        } else if let Some(s) = recv_supervisor.hub().latest() {
-                            let control_mode = if s.obs.control_mode == crate::model::ControlMode::GravityComp { "gravity_comp" } else { "position" };
-                            json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":s.obs.epoch_id, "safety_state":s.obs.safety_state, "is_torqued":s.obs.is_torqued, "control_mode":control_mode})
-                        } else {
-                            command_ack(&inner, &request_id, None)
-                        }
-                    };
-                    for (k, v) in dry.fields() { ack[k.as_str()] = v; }
-                    response = Some(ack);
+                if let Some((request_id, body)) = action_pending.dry_run_grasp.take() {
+                    response = Some(actions::complete_dry_run_grasp(request_id, body, &recv_supervisor, &recv_deps).await);
                 }
                 // Calibration apply / restore: its own tracked task (HTTP to rebot-vision, file writes);
                 // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
                 if let Some((request_id, job, generation, epoch, busy)) = pending_calibration.take() {
-                    let (sup, calib, conn, gen_now, tx) = (recv_supervisor.clone(), recv_calib.clone(), recv_connection.clone(), recv_generation.clone(), ack_tx.clone());
-                    let ws_auth_c = ws_auth.clone();
-                    let tasks_c = worker_tasks.clone();
-                    worker_tasks.spawn(async move {
-                        let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
-                            if !ws_auth_c.is_operator() {
-                                return Err(crate::calibration::CalibError::new(403, "OPERATOR_REQUIRED", "Operator session expired or locked during calibration"));
-                            }
-                            if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
-                                return Err(crate::calibration::CalibError::new(409, "LEASE_LOST", "This connection lost the lease during the calibration"));
-                            }
-                            if inner.safety.epoch_id() != epoch {
-                                return Err(crate::calibration::CalibError::new(409, "EPOCH_MISMATCH", "The epoch changed during the calibration (stop or e-stop)"));
-                            }
-                            Ok(())
-                        });
-                        // the busy flag is released by the guard, also when the job panics
-                        let guard = busy.then(|| crate::calibration::BusyGuard::new(sup.clone()));
-                        let job_sup = sup.clone();
-                        let (job_tx, job_rx) = tokio::sync::oneshot::channel();
-                        let job_abort = tasks_c.spawn_abortable(async move {
-                            let res = match job {
-                                CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
-                                CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
-                                CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
-                                CalibJob::JointZeroRestore(name) => crate::motor_zero::restore(&job_sup, &calib, name, &check).await,
-                                CalibJob::MitQualification(file) => crate::mit::store_qualification(&job_sup, &calib, *file, &check).await,
-                            };
-                            let _ = job_tx.send(res);
-                        });
-                        let _abort_inner = motion_cmds::AbortOnDrop(job_abort);
-                        let result = job_rx.await.unwrap_or_else(|e| {
-                            tracing::error!("calibration task failed: {e}");
-                            Err(crate::calibration::CalibError::new(500, "INTERNAL", format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups")))
-                        });
-                        if let Some(g) = guard { g.release().await; }
-                        let reply = match result {
-                            Ok(v) => fields_ack(&request_id, v),
-                            Err(e) => calibration_reject(&request_id, &e),
-                        };
-                        let _ = tx.send(reply).await;
-                    });
+                    calibration::spawn_calibration_job(
+                        request_id,
+                        job,
+                        generation,
+                        epoch,
+                        busy,
+                        &recv_supervisor,
+                        &recv_calib,
+                        &recv_connection,
+                        &recv_generation,
+                        &ack_tx,
+                        &ws_auth,
+                        &worker_tasks,
+                    );
                 }
                 // Atomic two-phase persist-before-commit config writes (track B, `config::persist_and_activate`).
                 if let Some((request_id, prepared, generation, epoch)) = pending_config_write.take() {
-                    let sup = recv_supervisor.clone();
-                    let tx = ack_tx.clone();
-                    let (ws_auth_c, conn_c, gen_now) = (ws_auth.clone(), recv_connection.clone(), recv_generation.clone());
-                    worker_tasks.spawn(async move {
-                        let reply = persist_and_activate(sup, request_id, prepared, generation, epoch, ws_auth_c, conn_c, gen_now).await;
-                        let _ = tx.send(reply).await;
-                    });
+                    config::spawn_config_write(
+                        request_id,
+                        prepared,
+                        generation,
+                        epoch,
+                        &recv_supervisor,
+                        &ack_tx,
+                        &ws_auth,
+                        &recv_connection,
+                        &recv_generation,
+                        &worker_tasks,
+                    );
                 }
+            } else {
+                #[cfg(feature = "policy-runtime")]
+                let has_policy = action_pending.policy.is_some();
+                #[cfg(not(feature = "policy-runtime"))]
+                let has_policy = false;
+                let unexpected_deferred = action_pending.plan.is_some()
+                    || action_pending.macro_action.is_some()
+                    || action_pending.replay.is_some()
+                    || has_policy
+                    || action_pending.dry_run_grasp.is_some()
+                    || pending_calibration.is_some()
+                    || pending_config_write.is_some();
+                debug_assert!(
+                    !unexpected_deferred,
+                    "non-CommandDeferred entry populated a deferred async slot"
+                );
+                if unexpected_deferred
+                    || (entry.is_some_and(|e| e.reply == ReplyPolicy::CommandImmediate)
+                        && response.is_none())
+                {
+                    tracing::error!(
+                        "WS dispatch contract violation: immediate entry {:?} produced no immediate reply or populated deferred slot",
+                        entry.map(|e| e.key)
+                    );
+                    response = Some(json!({
+                        "type": "command_reject",
+                        "request_id": value.get("request_id"),
+                        "status": 500,
+                        "code": "INTERNAL_ERROR",
+                        "error": "INTERNAL_ERROR",
+                        "message": "Command handler violated immediate reply policy"
+                    }));
+                }
+            }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
-                    let (sender_opt, closer_opt) = {
-                        let reg = CONNECTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                        let closers = CONNECTION_CLOSERS.lock().unwrap_or_else(|e| e.into_inner());
-                        (reg.get(&evicted_conn).cloned(), closers.get(&evicted_conn).cloned())
-                    };
-                    if let Some(sender) = sender_opt {
-                        let lost = json!({
-                            "type": "lease_lost",
-                            "generation": evicted_gen,
-                            "reason": "preempted"
-                        });
-                        match sender.try_send(Message::Text(lost.to_string().into())) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!("Urgent revocation queue full for {}; closing evicted connection", evicted_conn);
-                                if let Some((closer, fatal_flag, notify)) = closer_opt {
-                                    fatal_flag.store(true, Ordering::Release);
-                                    notify.notify_waiters();
-                                    let _ = closer.try_send(FatalClose::urgent_queue_full());
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                        }
-                    }
+                    lease::notify_evicted(evicted_conn, evicted_gen);
                 }
             // Control replies are never silently dropped: saturation closes the connection with an error.
             if let Some(response) = response {

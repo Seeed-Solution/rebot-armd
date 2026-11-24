@@ -1,0 +1,36 @@
+{
+  "id": "24_estop_injected_rest_owner_event",
+  "family": "estop",
+  "description": "REST POST /api/v1/safety/e_stop owner event -> WS heartbeat epoch_sync + stale EPOCH_MISMATCH + clear_fault",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":false,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"rest","method":"POST","path":"/api/v1/safety/e_stop","capture_token":false,"record_body":true},
+    {"op":"send","client":"c0","frame":{"epoch_id":1,"generation":"{{gen:c0}}","type":"heartbeat"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":"{{gen:c0}}","path":"/api/v1/torque","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/safety/clear_fault","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":1,"is_torqued":true,"request_id":1,"safety_state":"Armed","status":"accepted","type":"command_ack"}},
+    {"ev":"rest_response","method":"POST","path":"/api/v1/safety/e_stop","status":200,"body":{"epoch_id":2,"safety_state":"EStop"}},
+    {"ev":"client_frame","client":"c0","frame":{"epoch_id":1,"generation":1,"type":"heartbeat"}},
+    {"ev":"server_frame","client":"c0","frame":{"epoch_id":2,"safety_state":"EStop","type":"epoch_sync"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"enable":true},"epoch_id":1,"generation":1,"path":"/api/v1/torque","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"EPOCH_MISMATCH","epoch_id":2,"error":"EPOCH_MISMATCH","message":"Command epoch is no longer current","request_id":2,"status":409,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":2,"generation":1,"path":"/api/v1/safety/clear_fault","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"control_mode":"position","epoch_id":3,"is_torqued":true,"request_id":3,"safety_state":"Idle","status":"accepted","type":"command_ack"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}

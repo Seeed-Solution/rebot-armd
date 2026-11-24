@@ -162,6 +162,7 @@ pub fn create_router_full_with_sandbox(
     auth: crate::auth::OperatorAuth,
     sandbox: Arc<sandbox::SandboxState>,
 ) -> Router {
+    ws::prewarm_dispatch_tables();
     let router = Router::new()
         .route("/api/v1/auth/status", get(rest::auth_status))
         .route("/api/v1/auth/unlock", post(rest::auth_unlock))

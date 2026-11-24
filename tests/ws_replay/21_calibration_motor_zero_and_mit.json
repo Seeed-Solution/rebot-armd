@@ -1,0 +1,38 @@
+{
+  "id": "21_calibration_motor_zero_and_mit",
+  "family": "calibration",
+  "description": "calibration/motor_zero, joint_zero/restore, mit_timeout, mit_qualification",
+  "setup": {"profile":"rebot_dm","seed_poses":false,"seed_episode":false,"seed_policy":false,"seed_calibration":true,"mock_detector":false},
+  "steps": [
+    {"op":"connect","client":"c0"},
+    {"op":"send","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"dry_run":true,"joints":[1]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/calibration/motor_zero","request_id":1,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"joints":[]},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/calibration/motor_zero","request_id":2,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{"backup":"none.json"},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/calibration/joint_zero/restore","request_id":3,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/calibration/mit_timeout","request_id":4,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"send","client":"c0","frame":{"body":{},"epoch_id":"{{epoch}}","generation":"{{gen:c0}}","path":"/api/v1/calibration/mit_qualification","request_id":5,"type":"command"}},
+    {"op":"expect_control","client":"c0","count":1},
+    {"op":"close_client","client":"c0"}
+  ],
+  "events": [
+    {"ev":"upgrade_status","client":"c0","status":101},
+    {"ev":"client_frame","client":"c0","frame":{"client_id":"ctrl","seq":1,"type":"acquire_lease"}},
+    {"ev":"server_frame","client":"c0","frame":{"client_id":"ctrl","generation":1,"seq":1,"type":"lease_granted"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"dry_run":true,"joints":[1]},"epoch_id":1,"generation":1,"path":"/api/v1/calibration/motor_zero","request_id":1,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"dry_run":true,"far_joints":[],"invalidates":{"camera":true,"gripper_calibration":false,"kinematics":false,"poses":[]},"joints":[{"after_rad":0.0,"change_rad":0.0,"far":false,"joint":1,"name":"J1","reading_deg":0.0,"reading_rad":0.0,"reference_rad":0.0}],"max_offset_deg":45,"method":"set_current","needs_force":false,"persist":"process","persist_verified":true,"request_id":1,"status":"accepted","type":"command_ack","zero_method":"motor"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"joints":[]},"epoch_id":1,"generation":1,"path":"/api/v1/calibration/motor_zero","request_id":2,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","error":"INVALID_COMMAND","message":"joints must be a non-empty array of joint numbers (1-based)","request_id":2,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{"backup":"none.json"},"epoch_id":1,"generation":1,"path":"/api/v1/calibration/joint_zero/restore","request_id":3,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","error":"INVALID_COMMAND","message":"backup must be the name of a software zero backup (GET /api/v1/calibration backups)","request_id":3,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/calibration/mit_timeout","request_id":4,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","error":"INVALID_COMMAND","message":"joints must be a non-empty array of 1-based arm joints","request_id":4,"status":400,"type":"command_reject"}},
+    {"ev":"client_frame","client":"c0","frame":{"body":{},"epoch_id":1,"generation":1,"path":"/api/v1/calibration/mit_qualification","request_id":5,"type":"command"}},
+    {"ev":"server_frame","client":"c0","frame":{"code":"INVALID_COMMAND","error":"INVALID_COMMAND","message":"record: invalid type: null, expected struct MitQualificationFile","request_id":5,"status":400,"type":"command_reject"}},
+    {"ev":"client_closed","client":"c0"}
+  ]
+}
