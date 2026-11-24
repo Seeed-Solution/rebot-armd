@@ -13,6 +13,9 @@ use crate::api::rest::ApiError;
 use axum::http::StatusCode;
 
 // ws leaf modules (armd 1.6 RT-core foundation)
+mod lease;
+#[allow(unused_imports)]
+use lease::*;
 mod motion_cmds;
 #[allow(unused_imports)]
 use motion_cmds::*;
@@ -1169,21 +1172,6 @@ struct OrdinaryQueue {
     notify: Arc<tokio::sync::Notify>,
 }
 
-/// Torque disable (`/api/v1/torque` or `/api/v1/arm` with `enable: false`) is a stop-direction
-/// action: an ordinary Stop must never cancel or drain it from the queue.
-fn is_torque_disable_command(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("command")
-        && matches!(
-            value.get("path").and_then(Value::as_str),
-            Some("/api/v1/torque" | "/api/v1/arm")
-        )
-        && value
-            .get("body")
-            .and_then(|b| b.get("enable"))
-            .and_then(Value::as_bool)
-            == Some(false)
-}
-
 impl OrdinaryQueue {
     fn new() -> Self {
         Self {
@@ -2210,34 +2198,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             }
             let reply = {
                 let mut inner = hb_supervisor.inner().write().await;
-                if inner.detached {
-                    None
-                } else {
-                    let local_generation = hb_generation.load(Ordering::SeqCst);
-                    let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                    let label_matches = {
-                        let lbl = hb_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                        value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-                    };
-                    let supplied_generation_ok = generation == local_generation || generation == 0;
-                    let authorized = local_generation != 0 && supplied_generation_ok && label_matches
-                        && inner.validate_servo_lease(&hb_connection, local_generation);
-                    if !authorized {
-                        Some(if local_generation == 0 {
-                            json!({"type":"lease_lost", "generation":0})
-                        } else {
-                            json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&hb_connection, local_generation)})
-                        })
-                    } else {
-                        let epoch = inner.safety.epoch_id();
-                        if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
-                            Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}))
-                        } else {
-                            let _ = inner.heartbeat(&hb_connection, epoch);
-                            None
-                        }
-                    }
-                }
+                lease::handle_heartbeat_task_step(
+                    &mut inner,
+                    &value,
+                    &hb_connection,
+                    &hb_generation,
+                    &hb_client_label,
+                )
             };
             if let Some(reply) = reply {
                 if !hb_writer.send_ordinary_control(reply).await {
@@ -2750,159 +2717,41 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 if kind == "acquire_lease" {
-                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                        // Teardown already started while waiting for the owner lock: stop any
-                        // existing lease's motion first, then release it; never acquire or evict.
-                        let _ = inner.release_lease_for_connection_and_stop(&recv_connection);
-                        recv_generation.store(0, Ordering::SeqCst);
-                        response = None;
+                    let (acq_resp, acq_evicted) = lease::handle_acquire_lease(
+                        &mut inner,
+                        &value,
+                        recv_conn_id,
+                        &recv_connection,
+                        &recv_generation,
+                        &recv_client_label,
+                        &worker_closing,
+                        &ws_auth,
+                        &mut last_sequence,
+                    );
+                    response = acq_resp;
+                    evicted_notify = acq_evicted;
                     } else {
-                        let label = value.get("client_id").and_then(Value::as_str).unwrap_or("");
-                        let seq = value.get("seq").and_then(Value::as_u64);
-                        let force_val = value.get("force");
-
-                        if label.is_empty() || label.len() > 128 {
-                            let mut reply = json!({"type":"lease_rejected", "error":"invalid_client_id"});
-                            if let Some(s) = seq { reply["seq"] = json!(s); }
-                            response = Some(reply);
-                        } else {
-                            match force_val {
-                                Some(v) if !v.is_boolean() && !v.is_null() => {
-                                    let mut reply = json!({
-                                        "type": "lease_rejected",
-                                        "status": 400,
-                                        "error": "invalid_argument",
-                                        "message": "force must be a boolean"
-                                    });
-                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                    response = Some(reply);
-                                }
-                                _ => {
-                                    let force = force_val.and_then(Value::as_bool).unwrap_or(false);
-                                    if force {
-                                        if !ws_auth.is_operator() {
-                                            let mut reply = json!({
-                                                "type": "lease_rejected",
-                                                "status": 403,
-                                                "code": "OPERATOR_REQUIRED",
-                                                "error": "operator_required",
-                                                "message": "Operator unlock is required for force lease preemption"
-                                            });
-                                            if let Some(s) = seq { reply["seq"] = json!(s); }
-                                            response = Some(reply);
-                                        } else {
-                                            match inner.preempt_lease(&recv_connection, label) {
-                                                Ok((generation, evicted)) => {
-                                                    if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                                                        // Late acquire completing after teardown started: stop motion first, then release.
-                                                        let _ = inner.release_lease_and_stop(&recv_connection, generation);
-                                                        recv_generation.store(0, Ordering::SeqCst);
-                                                        response = None;
-                                                    } else {
-                                                        let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                        *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                        if previous != generation { last_sequence = None; }
-                                                        let mut reply = json!({
-                                                            "type": "lease_granted",
-                                                            "client_id": label,
-                                                            "generation": generation
-                                                        });
-                                                        if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                        response = Some(reply);
-                                                        evicted_notify = evicted;
-                                                    }
-                                                }
-                                                Err(crate::supervisor::PreemptError::Cooldown(remaining)) => {
-                                                    let mut reply = json!({
-                                                        "type": "lease_rejected",
-                                                        "error": "preemption_cooldown",
-                                                        "remaining_ms": remaining
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                                Err(crate::supervisor::PreemptError::OwnerTransferred) => {
-                                                    let mut reply = json!({
-                                                        "type": "lease_rejected",
-                                                        "error": "owner_transferred",
-                                                        "code": "OWNER_TRANSFERRED"
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        match inner.acquire_lease(&recv_connection) {
-                                            Ok(generation) => {
-                                                if worker_closing.load(Ordering::SeqCst) || inner.is_connection_closed(recv_conn_id) {
-                                                    // Late acquire completing after teardown started: stop motion first, then release.
-                                                    let _ = inner.release_lease_and_stop(&recv_connection, generation);
-                                                    recv_generation.store(0, Ordering::SeqCst);
-                                                    response = None;
-                                                } else {
-                                                    inner.set_lease_label(&recv_connection, generation, label);
-                                                    let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                    *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.to_owned());
-                                                    if previous != generation { last_sequence = None; }
-                                                    let mut reply = json!({
-                                                        "type": "lease_granted",
-                                                        "client_id": label,
-                                                        "generation": generation
-                                                    });
-                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                    response = Some(reply);
-                                                }
-                                            }
-                                            Err((code, 0)) if code == "OWNER_TRANSFERRED" => {
-                                                let mut reply = json!({
-                                                    "type": "lease_rejected",
-                                                    "error": "owner_transferred",
-                                                    "code": "OWNER_TRANSFERRED"
-                                                });
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
-                                            }
-                                            Err(_) => {
-                                                let mut reply = json!({"type":"lease_rejected", "error":"controller_busy"});
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    } else {
-                        let local_generation = recv_generation.load(Ordering::SeqCst);
-                        let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                        let label_matches = {
-                            let lbl = recv_client_label.lock().unwrap_or_else(|e| e.into_inner());
-                            value.get("client_id").is_none_or(|id| id.as_str() == lbl.as_deref())
-                        };
-                        // Heartbeat from legacy clients may omit generation; connection still must own it.
-                        let supplied_generation_ok = generation == local_generation || (kind == "heartbeat" && generation == 0);
-                        let authorized = local_generation != 0 && supplied_generation_ok && label_matches
-                            && inner.validate_servo_lease(&recv_connection, local_generation);
+                        let (local_generation, authorized) = lease::check_lease_authority(
+                            &mut inner,
+                            kind,
+                            &value,
+                            &recv_connection,
+                            &recv_generation,
+                            &recv_client_label,
+                        );
                         let is_dry_run = kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/action/grasp") && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
                         if (kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")) && value.get("generation").and_then(Value::as_u64).is_none() {
                             response = Some(json!({"type":"servo_reject", "reason":"missing_generation"}));
                         } else if !authorized && !is_dry_run {
-                            response = Some(if kind == "command" {
-                                json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                            } else if kind == "release_lease" {
-                                json!({"type":"lease_released", "success":false})
-                            } else if local_generation == 0 {
-                                json!({"type":"lease_lost", "generation":0})
-                            } else {
-                                json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&recv_connection, local_generation)})
-                            });
+                            response = Some(lease::lease_loss_reply(&inner, kind, &value, &recv_connection, local_generation));
                         } else if kind == "release_lease" {
-                            let released = inner.release_lease_and_stop(&recv_connection, local_generation);
-                            recv_generation.store(0, Ordering::SeqCst);
-                            *recv_client_label.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            response = Some(json!({"type":"lease_released", "success":released}));
+                            response = Some(lease::handle_release_lease(
+                                &mut inner,
+                                &recv_connection,
+                                local_generation,
+                                &recv_generation,
+                                &recv_client_label,
+                            ));
                         } else {
                             inner.consume_pending_estop();
                             let epoch = inner.safety.epoch_id();
@@ -2911,8 +2760,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
                                 } else { json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}) });
                             } else if kind == "heartbeat" {
-                                let _ = inner.heartbeat(&recv_connection, epoch);
-                                response = None;
+                                response = lease::handle_heartbeat_inline(&mut inner, &recv_connection, epoch);
                             } else if kind == "command" {
                                 let request_id = value.get("request_id").and_then(Value::as_u64);
                                 if request_id.is_none() || last_ordinary_request.is_some_and(|last| request_id.unwrap() <= last) {
@@ -3602,30 +3450,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     });
                 }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
-                    let (sender_opt, closer_opt) = {
-                        let reg = CONNECTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-                        let closers = CONNECTION_CLOSERS.lock().unwrap_or_else(|e| e.into_inner());
-                        (reg.get(&evicted_conn).cloned(), closers.get(&evicted_conn).cloned())
-                    };
-                    if let Some(sender) = sender_opt {
-                        let lost = json!({
-                            "type": "lease_lost",
-                            "generation": evicted_gen,
-                            "reason": "preempted"
-                        });
-                        match sender.try_send(Message::Text(lost.to_string().into())) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!("Urgent revocation queue full for {}; closing evicted connection", evicted_conn);
-                                if let Some((closer, fatal_flag, notify)) = closer_opt {
-                                    fatal_flag.store(true, Ordering::Release);
-                                    notify.notify_waiters();
-                                    let _ = closer.try_send(FatalClose::urgent_queue_full());
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
-                        }
-                    }
+                    lease::notify_evicted(evicted_conn, evicted_gen);
                 }
             // Control replies are never silently dropped: saturation closes the connection with an error.
             if let Some(response) = response {

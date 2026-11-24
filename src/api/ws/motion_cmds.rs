@@ -11,24 +11,10 @@ pub(super) fn execute_command(inner: &mut SupervisorInner, stamp: crate::supervi
     validate_command_body_common(body).map_err(invalid_command)?;
     match path {
         "/api/v1/torque" | "/api/v1/arm" => {
-            let enabled = body.get("enable").and_then(Value::as_bool)
-                .ok_or_else(|| invalid_command("enable must be boolean"))?;
-            if enabled {
-                let admitted = inner.check_admission(stamp).map_err(ArmError::from)?;
-                SupervisorInner::enable_torque(admitted).map_err(ArmError::from)?;
-            } else {
-                inner.disable_torque().map_err(ArmError::from)?;
-            }
+            return lease::execute_torque_command(inner, stamp, body);
         }
         "/api/v1/safety/clear_fault" => {
-            // {"mit_recovery": "torque_off_all"}: the operator accepts the MIT expiry recovery
-            // (torque off on every joint); any other value is refused
-            let mit_recovery = match body.get("mit_recovery") {
-                None | Some(Value::Null) => false,
-                Some(v) if v.as_str() == Some(crate::mit::RECOVERY_CONFIRM_VALUE) => true,
-                Some(_) => return Err(invalid_command(&format!("mit_recovery must be \"{}\"", crate::mit::RECOVERY_CONFIRM_VALUE))),
-            };
-            inner.clear_fault_confirmed_for_epoch(mit_recovery, Some(epoch))?;
+            return lease::execute_clear_fault(inner, body, epoch);
         }
         "/api/v1/motion/servo" => {
             let targets = positions(body.get("targets"))?;
