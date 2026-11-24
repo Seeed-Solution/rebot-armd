@@ -70,6 +70,9 @@ enum Mode {
 struct NoAllocDamiaoBus {
     motors: Vec<(u16, DamiaoLimits, f32, bool, u32)>,
     rx: VecDeque<CanFrame>,
+    /// Post-transmit replies promoted to `rx` once `rx` drains empty (models SocketCAN causality
+    /// without heap allocation so post-write probe drains separate pre-probe from post-probe RX).
+    pending_rx: VecDeque<CanFrame>,
     clock: std::sync::Arc<MockClock>,
     mode: Mode,
     tx_count: usize,
@@ -88,6 +91,7 @@ impl NoAllocDamiaoBus {
                 .map(|(i, l)| (i as u16 + 1, *l, 0.0, false, damiao::CTRL_MODE_POS_VEL))
                 .collect(),
             rx: VecDeque::with_capacity(1024),
+            pending_rx: VecDeque::with_capacity(64),
             clock: std::sync::Arc::new(MockClock::new()),
             mode: Mode::Ok,
             tx_count: 0,
@@ -98,7 +102,7 @@ impl NoAllocDamiaoBus {
         }
     }
 
-    fn reply(&mut self, k: usize) {
+    fn build_reply_frame(&self, k: usize) -> CanFrame {
         let (id, l, q, enabled, _) = self.motors[k];
         let p = damiao::float_to_uint(q, l.p_min, l.p_max, 16);
         let v = damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
@@ -113,8 +117,20 @@ impl NoAllocDamiaoBus {
             30,
             30,
         ];
+        CanFrame::new_standard(0x10 + id, &data).unwrap()
+    }
+
+    fn reply(&mut self, k: usize) {
+        let frame = self.build_reply_frame(k);
         if self.rx.len() < self.rx.capacity() {
-            self.rx.push_back(CanFrame::new_standard(0x10 + id, &data).unwrap());
+            self.rx.push_back(frame);
+        }
+    }
+
+    fn reply_pending(&mut self, k: usize) {
+        let frame = self.build_reply_frame(k);
+        if self.pending_rx.len() < self.pending_rx.capacity() {
+            self.pending_rx.push_back(frame);
         }
     }
 
@@ -158,7 +174,7 @@ impl CanTransport for NoAllocDamiaoBus {
             let mid = u16::from_le_bytes([frame.data[0], frame.data[1]]);
             if let Some(k) = find(&self.motors, mid) {
                 match frame.data[2] {
-                    0xCC => self.reply(k),
+                    0xCC => self.reply_pending(k),
                     damiao::REG_READ => {
                         let (_, l, _, _, mode) = self.motors[k];
                         let val = match frame.data[3] {
@@ -216,7 +232,17 @@ impl CanTransport for NoAllocDamiaoBus {
     }
 
     fn receive(&mut self) -> Result<CanFrame, TransportError> {
-        self.rx.pop_front().ok_or(TransportError::WouldBlock)
+        match self.rx.pop_front() {
+            Some(f) => Ok(f),
+            None => {
+                while let Some(f) = self.pending_rx.pop_front() {
+                    if self.rx.len() < self.rx.capacity() {
+                        self.rx.push_back(f);
+                    }
+                }
+                Err(TransportError::WouldBlock)
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {

@@ -345,8 +345,12 @@ pub trait CanTransport: Send {
 
     /// Receive a CAN frame together with its optional transport-measured monotonic receive time
     /// (on the same clock domain as [`Self::clock`], or `Instant::now()` when `clock()` is `None`).
-    /// Transports that do not capture arrival timestamps inherit the default (`None`) and callers
-    /// fall back to the host decode instant.
+    /// Transports that do not capture arrival timestamps — including Linux SocketCAN
+    /// (`SocketCanTransport`) — inherit the default (`None`) and callers fall back to the host
+    /// decode instant. Because SocketCAN gives no arrival timestamps, TX-probe confirmation
+    /// (`DamiaoArmDriver::probe_tx_ready_inner` / `tx_probe_confirmed`) relies on draining RX and
+    /// snapshotting the RX sequence boundary immediately AFTER the probe write returns
+    /// successfully, requiring confirming feedback to carry a strictly greater RX sequence number.
     fn receive_timestamped(
         &mut self,
     ) -> Result<(CanFrame, Option<std::time::Instant>), TransportError> {

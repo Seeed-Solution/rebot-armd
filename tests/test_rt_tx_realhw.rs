@@ -65,7 +65,7 @@ impl DualRig {
         let clock = MockClock::new();
         let bus = FakeBus::with_clock(&limits, clock.clone());
         bus.with(|s| {
-            s.immediate_replies = true;
+            s.immediate_replies = false;
             s.follow_commands = true;
             s.push_all_feedback();
         });
@@ -1370,7 +1370,6 @@ fn dual_owner_can_tx_stalled_clear_check_requires_drained_tx_queue_and_fresh_fee
         }
 
         // 3. Push fresh feedback + drained TX queue -> clear_fault succeeds and resets latched kinds!
-        rig.bus.with(|s| s.immediate_replies = true);
         rig.step();
         rig.clear_fault_and_enable();
         assert_eq!(rig.inner().safety.latched_fault_kinds(), 0);
@@ -1636,12 +1635,12 @@ fn dual_owner_can_tx_stalled_clear_requires_tx_probe_and_post_probe_feedback() {
         }
 
         // 4. ENOBUFS gone + replies active -> probe transmits cleanly, fresh feedback arrives
-        //    strictly after the probe, clear_fault passes to Idle and re-enable succeeds!
+        //    strictly after the post-write empty boundary, clear_fault passes to Idle and re-enable succeeds!
         rig.bus.clear_log();
         rig.bus.with(|s| {
             s.tx_enobufs = false;
             s.motors[0].silent = false;
-            s.immediate_replies = true;
+            s.immediate_replies = false;
         });
         rig.step();
         rig.clear_fault_and_enable();
@@ -2228,4 +2227,136 @@ fn enable_transition_polling_and_clear_fault_probe_obey_release_margin_cap() {
         rig_cf.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
         "on-time clear_fault_executor_bounded_for_release must transmit the 0xCC probe"
     );
+}
+
+/// Round-3 Item 4:
+/// Probe proof uses the RX sequence boundary captured immediately AFTER the probe write returns
+/// successfully (because SocketCAN gives no arrival timestamps).
+/// A feedback reply queued between the pre-drain and the probe write MUST NOT satisfy the clear;
+/// only feedback arriving strictly after that post-write RX sequence boundary counts.
+#[test]
+fn dual_owner_probe_rejects_pre_probe_reply_queued_between_drain_and_write() {
+    let build_motor0_feedback = |pos: f32, enabled: bool| -> armd::transport::CanFrame {
+        let l = dm_limits()[0];
+        let p = armd::protocol::damiao::float_to_uint(pos, l.p_min, l.p_max, 16);
+        let v = armd::protocol::damiao::float_to_uint(0.0, l.v_min, l.v_max, 12);
+        let t = armd::protocol::damiao::float_to_uint(0.0, l.t_min, l.t_max, 12);
+        let data = [
+            (u8::from(enabled) << 4) | 1u8,
+            (p >> 8) as u8,
+            p as u8,
+            (v >> 4) as u8,
+            (((v & 0x0f) << 4) | ((t >> 8) & 0x0f)) as u8,
+            t as u8,
+            30,
+            30,
+        ];
+        armd::transport::CanFrame::new_standard(0x11, &data).unwrap()
+    };
+
+    // Part A: Direct driver check — a reply queued between the pre-drain and the 0xCC probe write
+    // (`inject_on_next_tx`, with motor 0 silent so no genuine post-probe reply arrives) is drained
+    // before the post-write sequence snapshot and MUST NOT confirm the probe. A subsequent genuine
+    // feedback frame decoded after the post-write boundary DOES confirm it.
+    let limits = dm_limits();
+    let clock = MockClock::new();
+    let bus = FakeBus::with_clock(&limits, clock.clone());
+    bus.with(|s| {
+        s.immediate_replies = false;
+        s.push_all_feedback();
+    });
+    let mut drv = DamiaoArmDriver::new(bus.clone(), vec![1, 2, 3, 4, 5, 6, 7])
+        .with_joint_limits(limits)
+        .unwrap();
+    drv.read_joint_states().unwrap();
+    bus.clear_log();
+    bus.with(|s| {
+        s.motors[0].silent = true;
+        s.inject_on_next_tx = vec![build_motor0_feedback(0.05, false)];
+    });
+    let confirmed = drv.probe_tx_ready_budgeted(clock.now() + ms(200)).expect("probe write ok");
+    assert!(!confirmed, "reply queued between pre-drain and probe write must NOT confirm probe");
+    assert!(!drv.tx_probe_confirmed(), "tx_probe_confirmed must stay false for pre-probe reply");
+    assert!(
+        bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+        "probe must have transmitted 0xCC refresh frame"
+    );
+    assert!(
+        bus.with(|s| s.inject_on_next_tx.is_empty()),
+        "injected pre-probe reply must have been queued on probe write and consumed by post-write drain"
+    );
+
+    // Now push a genuine post-probe reply strictly after the post-write sequence boundary -> confirms!
+    bus.with(|s| {
+        s.motors[0].silent = false;
+        s.push_feedback(0);
+    });
+    drv.read_joint_states().unwrap();
+    assert!(
+        drv.tx_probe_confirmed(),
+        "genuine post-probe feedback after post-write sequence boundary must confirm probe"
+    );
+
+    // Part B: Full dual-owner (Legacy + Executor) end-to-end CAN_TX_STALLED clear test.
+    for owner in [Owner::Legacy, Owner::Executor] {
+        let mut rig = DualRig::new(owner, base_cfg(), None);
+        rig.bus.with(|s| s.tx_enobufs = true);
+        for _ in 0..8 {
+            rig.step();
+            if rig.inner().safety.fault_code() == Some(FaultCode::CanTxStalled) {
+                break;
+            }
+        }
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+        let latched_epoch = rig.inner().safety.epoch_id();
+
+        // Clear ENOBUFS, silence motor 0's genuine 0xCC reply, and inject a reply right between
+        // the pre-drain and the probe write (`inject_on_next_tx`). Clear MUST be refused with
+        // TxProbeFeedbackRequired even though that pre-probe reply arrived after the pre-drain!
+        rig.bus.clear_log();
+        rig.bus.with(|s| {
+            s.tx_enobufs = false;
+            s.motors[0].silent = true;
+            s.inject_on_next_tx = vec![build_motor0_feedback(0.0, true)];
+        });
+        match &mut rig.owner {
+            RigOwner::Legacy(inner) => {
+                let err = inner.clear_fault().unwrap_err().to_string();
+                assert!(
+                    err.contains("CAN TX probe sent; wait for fresh feedback received after the probe"),
+                    "{owner:?}: pre-probe reply queued between drain and write must be rejected with TxProbeFeedbackRequired, got: {err}"
+                );
+            }
+            RigOwner::Executor { fx, .. } => {
+                let dl = armd::transport::DriverClock::now(&rig.clock) + ms(200);
+                let err = fx.core.clear_fault_executor_bounded(dl).unwrap_err();
+                assert_eq!(
+                    err,
+                    armd::safety::ClearFaultError::Rejected(
+                        armd::safety::ClearRefusal::TxProbeFeedbackRequired
+                    ),
+                    "{owner:?}: pre-probe reply queued between drain and write must be rejected"
+                );
+            }
+        }
+        assert!(
+            rig.bus.tx_log().iter().any(|f| f.id == 0x7FF && f.data[2] == 0xCC),
+            "{owner:?}: probe must transmit 0xCC"
+        );
+        assert!(
+            rig.bus.with(|s| s.inject_on_next_tx.is_empty()),
+            "{owner:?}: pre-probe reply must have been injected on probe write"
+        );
+        assert_eq!(rig.inner().safety.fault_code(), Some(FaultCode::CanTxStalled));
+        assert_eq!(rig.inner().safety.epoch_id(), latched_epoch);
+
+        // Once motor 0 replies strictly AFTER the post-write boundary, clear succeeds cleanly.
+        rig.bus.with(|s| {
+            s.motors[0].silent = false;
+            s.push_all_feedback();
+        });
+        rig.step();
+        rig.clear_fault_and_enable();
+        assert!(rig.inner().safety.state().is_operational());
+    }
 }

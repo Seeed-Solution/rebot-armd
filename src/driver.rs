@@ -4929,8 +4929,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
-        // Drain pre-existing queued RX frames to establish an empty-queue sequence boundary so
-        // pre-probe replies cannot satisfy post-probe feedback confirmation.
+        // Pre-drain pre-existing queued RX backlog before writing the probe.
         let mut drained = self.drain_rx_frames_only(deadline, 64);
         if !drained && blocking {
             for _ in 0..7 {
@@ -4943,7 +4942,6 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         if !drained {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
         }
-        let boundary_seq = self.rx_empty_seq;
         self.pending_stop_check(Some(start_stamp))?;
         if deadline.is_some_and(|d| d.passed(self.now())) || release_cap_passed(self) {
             return Err(ArmDriverError::Transport(TransportError::Timeout));
@@ -4985,6 +4983,25 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             self.mark_tx_pass_backpressured();
             return Err(ArmDriverError::Transport(e));
         }
+        // Snapshot the empty-queue RX sequence boundary strictly AFTER the probe write and flush
+        // return successfully, draining any pre-probe frames that arrived between the pre-drain
+        // and the probe write. Because Linux SocketCAN supplies no per-frame hardware arrival
+        // timestamps (`CanTransport::receive_timestamped` returns `None`), this post-write empty
+        // sequence boundary is the causal proof: only feedback decoded strictly after it
+        // (`last_feedback_seq[probe_joint] > boundary_seq`) can satisfy `tx_probe_confirmed()`.
+        let mut post_drained = self.drain_rx_frames_only(deadline, 64);
+        if !post_drained && blocking {
+            for _ in 0..7 {
+                post_drained = self.drain_rx_frames_only(deadline, 64);
+                if post_drained {
+                    break;
+                }
+            }
+        }
+        if !post_drained {
+            return Err(ArmDriverError::Transport(TransportError::Timeout));
+        }
+        let boundary_seq = self.rx_empty_seq;
         let sent_at = self.now();
         self.tx_probe = Some(TxProbeState {
             joint: probe_joint,
@@ -7053,6 +7070,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.pending_hold_tx.len()
     }
 
+    /// True only when a `0xCC` TX probe write & flush completed and fresh feedback for the probed
+    /// motor arrived strictly after the post-write empty-queue RX sequence boundary
+    /// (`last_feedback_seq[probe.joint] > probe.boundary_seq`). Because SocketCAN supplies no
+    /// arrival timestamps (`CanTransport::receive_timestamped` returns `None`), this post-write
+    /// RX sequence boundary is the proof that confirming feedback came after the probe write.
     fn tx_probe_confirmed(&self) -> bool {
         let Some(probe) = self.tx_probe else { return false };
         !self.awaiting_rx_boundary
@@ -7138,13 +7160,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let _ = self.read_joint_states();
             let stale: Vec<String> = (0..self.motor_ids.len()).filter(|&i| self.last_feedback_seq[i] <= pre).map(|i| format!("J{}", i + 1)).collect();
             if stale.is_empty() {
-                if self.total_pending_tx_len() == 0 && !self.motor_ids.is_empty() {
-                    self.tx_probe = Some(TxProbeState {
-                        joint: 0,
-                        boundary_seq: pre,
-                        sent_at: start,
-                    });
-                }
                 return Ok(self.motor_status.clone());
             }
             if self.since(start) >= REGISTER_REPLY_TIMEOUT {
@@ -7199,13 +7214,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return Err(format!("{} did not confirm the disable (fresh state 0)", unconfirmed.join(", ")));
         }
         self.last_mit_recovery_rx_seq = Some(boundary);
-        if self.total_pending_tx_len() == 0 && !self.motor_ids.is_empty() {
-            self.tx_probe = Some(TxProbeState {
-                joint: 0,
-                boundary_seq: boundary,
-                sent_at: self.now(),
-            });
-        }
         self.disable_confirmed_sticky = true;
         self.mit_fence = None;
         Ok(())
