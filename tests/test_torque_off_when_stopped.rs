@@ -1464,3 +1464,338 @@ fn feetech_fault_reset_routes_through_rest_pose_decision_on_both_owners() {
     let _ = inner_ok.clear_fault(); // sends reset, asks for fresh post-reset feedback
     assert_eq!(reset_ok.load(Ordering::SeqCst), 1, "reset must be sent when within rest_pose_tolerance_rad");
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_sigterm_to_armd_subprocess_refuses_while_raised_and_exits_once_disabled() {
+    use std::io::{BufRead, BufReader};
+    use std::net::{SocketAddr, UdpSocket};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    struct ChildGuard(Option<Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    struct SimPeerState {
+        enabled: bool,
+        q: [f32; 7],
+        ack: u64,
+        disable_cmds: Vec<u64>,
+        enable_cmds: Vec<u64>,
+        client: Option<SocketAddr>,
+    }
+
+    async fn run_sigterm_for_owner(rt_owner: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sim_addr = udp.local_addr().unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+
+        let peer_state = Arc::new(Mutex::new(SimPeerState {
+            enabled: false,
+            q: [0.0; 7],
+            ack: 0,
+            disable_cmds: Vec::new(),
+            enable_cmds: Vec::new(),
+            client: None,
+        }));
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        let peer_thread = {
+            let state = Arc::clone(&peer_state);
+            let stop = Arc::clone(&peer_stop);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut seq = 0u64;
+                let mut last_tx = Instant::now() - Duration::from_secs(1);
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok((n, src)) = udp.recv_from(&mut buf) {
+                        if let Ok(cmd) = serde_json::from_slice::<armd::sim_driver::SimCommand>(&buf[..n]) {
+                            let mut s = state.lock().unwrap();
+                            s.client = Some(src);
+                            if cmd.kind == "cmd" {
+                                s.ack = s.ack.max(cmd.seq);
+                                match cmd.enable {
+                                    Some(true) => {
+                                        s.enabled = true;
+                                        s.enable_cmds.push(cmd.seq);
+                                    }
+                                    Some(false) => {
+                                        s.enabled = false;
+                                        s.disable_cmds.push(cmd.seq);
+                                    }
+                                    None => {}
+                                }
+                                seq += 1;
+                                let reply = armd::sim_driver::SimState {
+                                    v: 1,
+                                    kind: "state".into(),
+                                    session: 1,
+                                    seq,
+                                    ack: s.ack,
+                                    enabled: s.enabled,
+                                    q: s.q.to_vec(),
+                                    dq: vec![0.0; 7],
+                                    tau: vec![0.0; 7],
+                                    temp: vec![30.0; 7],
+                                    loads: None,
+                                    t: 0.0,
+                                };
+                                let bytes = serde_json::to_vec(&reply).unwrap();
+                                let _ = udp.send_to(&bytes, src);
+                                last_tx = Instant::now();
+                            }
+                        }
+                    }
+                    if last_tx.elapsed() >= Duration::from_millis(10) {
+                        let s = state.lock().unwrap();
+                        if let Some(dst) = s.client {
+                            seq += 1;
+                            let reply = armd::sim_driver::SimState {
+                                v: 1,
+                                kind: "state".into(),
+                                session: 1,
+                                seq,
+                                ack: s.ack,
+                                enabled: s.enabled,
+                                q: s.q.to_vec(),
+                                dq: vec![0.0; 7],
+                                tau: vec![0.0; 7],
+                                temp: vec![30.0; 7],
+                                loads: None,
+                                t: 0.0,
+                            };
+                            drop(s);
+                            let bytes = serde_json::to_vec(&reply).unwrap();
+                            let _ = udp.send_to(&bytes, dst);
+                            last_tx = Instant::now();
+                        }
+                    }
+                }
+            })
+        };
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_armd"))
+            .args([
+                "--follower",
+                "sim",
+                "--follower-port",
+                &format!("udp://{sim_addr}"),
+                "--port",
+                "0",
+                "--log-dir",
+                "off",
+                "--blackbox-dir",
+                "off",
+                "--episodes-dir",
+                "off",
+                "--no-operator-auth",
+            ])
+            .env("ARMD_RT_OWNER", rt_owner)
+            .env("ARMD_CALIBRATION", tmp.path().join("calibration.json"))
+            .env("ARMD_GRASP_SETUP", tmp.path().join("grasp_setup.json"))
+            .env("ARMD_KEEPOUT", tmp.path().join("keepout.json"))
+            .env("ARMD_POSES", tmp.path().join("poses.json"))
+            .env("ARMD_SEQUENCES", tmp.path().join("sequences.json"))
+            .env("ARMD_COLLISION", tmp.path().join("collision.json"))
+            .env("ARMD_TOOL_COMMISSIONING", tmp.path().join("tool_comm.json"))
+            .env("ARMD_GRIPPER_CALIB", tmp.path().join("gripper_calib.json"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn armd binary");
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+        let stdout_drain = std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut sent = false;
+            for line in reader.lines().map_while(Result::ok) {
+                if !sent {
+                    if let Some(idx) = line.find("listening on http://") {
+                        let rest = &line[idx + "listening on http://".len()..];
+                        if let Some(colon) = rest.rfind(':') {
+                            let digits: String = rest[colon + 1..]
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect();
+                            if let Ok(port) = digits.parse::<u16>() {
+                                let _ = port_tx.send(port);
+                                sent = true;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut guard = ChildGuard(Some(child));
+        let pid = guard.0.as_ref().unwrap().id() as libc::pid_t;
+
+        let http_port = port_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("armd did not advertise listening port");
+        assert!(
+            ![18765u16, 18001, 18990].contains(&http_port),
+            "ephemeral test port collided with forbidden port {http_port}"
+        );
+        let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
+        let client = reqwest::Client::new();
+        let obs_url = format!("http://{http_addr}/api/v1/observation");
+
+        // Wait until armd has fresh feedback from the UDP sim peer.
+        let mut ready = false;
+        for _ in 0..100 {
+            if let Ok(resp) = client.get(&obs_url).send().await {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if v["feedback_valid"] == true && v["enable_state"] == "Disabled" {
+                        ready = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(ready, "armd ({rt_owner}) never became feedback_valid/Disabled");
+
+        // Acquire WS lease and enable torque at rest.
+        let (mut ws, generation) = common::controller(http_addr).await;
+        let obs0: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+        let epoch0 = obs0["epoch_id"].as_u64().unwrap();
+        let ack = common::rpc(&mut ws, generation, epoch0, "/api/v1/torque", json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "enable torque failed ({rt_owner}): {ack}");
+
+        // Move arm to a raised pose on the sim peer and wait until armd observes it.
+        peer_state.lock().unwrap().q = [0.0, 0.45, -0.35, 0.0, 0.0, 0.0, 0.0];
+        let mut raised_observed = false;
+        for _ in 0..100 {
+            let obs: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+            if obs["is_torqued"] == true
+                && obs["enable_state"] == "Enabled"
+                && obs["positions"][1].as_f64().is_some_and(|p| p > 0.40)
+            {
+                raised_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(raised_observed, "armd ({rt_owner}) did not observe raised torqued arm");
+
+        // Clear recorded disable commands, then deliver a REAL OS SIGTERM to the armd PID.
+        peer_state.lock().unwrap().disable_cmds.clear();
+        // SAFETY: `pid` is the live child process owned by `guard`.
+        let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert_eq!(rc, 0, "libc::kill(SIGTERM) failed");
+
+        // Wait until armd processes SIGTERM and latches EStop.
+        let mut estop_observed = false;
+        for _ in 0..100 {
+            let obs: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+            if obs["safety_state"] == "EStop" {
+                estop_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(estop_observed, "armd ({rt_owner}) did not latch EStop upon real SIGTERM");
+
+        // Give the control loop time to run multiple ticks after SIGTERM: process MUST stay alive,
+        // keep holding torque, and transmit ZERO disable commands to the sim peer.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            guard.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "armd ({rt_owner}) must NOT exit on SIGTERM while arm is known-enabled and raised"
+        );
+        {
+            let s = peer_state.lock().unwrap();
+            assert!(
+                s.disable_cmds.is_empty(),
+                "real SIGTERM on raised arm ({rt_owner}) must send ZERO disable commands, got {:?}",
+                s.disable_cmds
+            );
+            assert!(s.enabled, "sim motors must remain enabled after refused SIGTERM ({rt_owner})");
+        }
+        let obs_after: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+        assert_eq!(obs_after["safety_state"], "EStop");
+        assert_eq!(obs_after["is_torqued"], true);
+
+        // Requested torque-off via WS while raised is STILL refused with TORQUE_OFF_WOULD_DROP
+        // and sends ZERO disable commands.
+        let epoch_estop = obs_after["epoch_id"].as_u64().unwrap();
+        let rej = common::rpc(&mut ws, generation, epoch_estop, "/api/v1/torque", json!({"enable": false})).await;
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["code"], "TORQUE_OFF_WOULD_DROP", "{rej}");
+        assert!(peer_state.lock().unwrap().disable_cmds.is_empty());
+
+        // Bring the arm back to the resting pose, disable torque cleanly, then send a second
+        // real SIGTERM and confirm armd exits cleanly.
+        peer_state.lock().unwrap().q = [0.0; 7];
+        let mut rest_observed = false;
+        for _ in 0..100 {
+            let obs: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+            if obs["positions"][1].as_f64().is_some_and(|p| p.abs() < 0.01) {
+                rest_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(rest_observed, "armd ({rt_owner}) did not observe arm returning to rest");
+
+        // Refresh WS heartbeat before torque-off at rest so lease stays fresh even under CI load.
+        common::send(
+            &mut ws,
+            json!({"type": "heartbeat", "generation": generation, "epoch_id": epoch_estop}),
+        )
+        .await;
+        let off_ack = common::rpc(&mut ws, generation, epoch_estop, "/api/v1/torque", json!({"enable": false})).await;
+        assert_eq!(off_ack["type"], "command_ack", "torque-off at rest failed ({rt_owner}): {off_ack}");
+        assert!(
+            !peer_state.lock().unwrap().disable_cmds.is_empty(),
+            "torque-off at rest must send disable command"
+        );
+
+        let mut disabled_observed = false;
+        for _ in 0..100 {
+            let obs: serde_json::Value = client.get(&obs_url).send().await.unwrap().json().await.unwrap();
+            if obs["is_torqued"] == false && obs["enable_state"] == "Disabled" {
+                disabled_observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(disabled_observed, "armd ({rt_owner}) did not confirm Disabled at rest");
+
+        // Second real SIGTERM now that torque is confirmed off: armd exits cleanly.
+        // SAFETY: `pid` is the live child process owned by `guard`.
+        let rc2 = unsafe { libc::kill(pid, libc::SIGTERM) };
+        assert_eq!(rc2, 0, "second libc::kill(SIGTERM) failed");
+
+        let mut exit_status = None;
+        for _ in 0..200 {
+            if let Some(st) = guard.0.as_mut().unwrap().try_wait().unwrap() {
+                exit_status = Some(st);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let status = exit_status.expect("armd did not exit within 5 s after SIGTERM while Disabled");
+        assert!(
+            status.success(),
+            "armd ({rt_owner}) must exit cleanly after SIGTERM while Disabled, got {status:?}"
+        );
+        guard.0 = None;
+        peer_stop.store(true, Ordering::Relaxed);
+        let _ = peer_thread.join();
+        let _ = stdout_drain.join();
+    }
+
+    run_sigterm_for_owner("legacy").await;
+}
