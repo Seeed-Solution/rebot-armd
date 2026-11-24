@@ -70,7 +70,7 @@ pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, Join
 pub use safety::{FaultCode, FaultInfo, FaultKind, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 #[cfg(not(target_arch = "wasm32"))] pub use supervisor::{
     AdmissionStamp, Admitted, ArmError, ArmSupervisor, MotionStartKind, MotionStartOp,
-    PreemptError, SupervisorInner, TorqueIntent,
+    PreemptError, SupervisorInner, TorqueIntent, STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS,
 };
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,

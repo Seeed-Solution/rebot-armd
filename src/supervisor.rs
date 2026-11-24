@@ -32,6 +32,7 @@ mod torque_off;
 pub use streams::targets;
 pub use driver_transitions::{
     run_with_panic_deadline_observer, EnableLifecycle, PanicDisableOutcome, TorqueIntent,
+    STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS,
     PANIC_DISABLE_TIMEOUT,
 };
 pub(crate) use driver_transitions::{panic_disable_deadlines, run_with_panic_deadline_observer_until};

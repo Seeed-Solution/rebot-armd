@@ -454,6 +454,10 @@ pub enum EnableLifecycle {
 /// non-recoverable fault naming the joint (L2).
 pub const UNVERIFIED_MODE_READBACK_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Consecutive stopped-hold `driver.try_lock()` skips (0.5 s at 50 Hz) before escalating with
+/// a counted warning and latching a non-recoverable [`FaultCode::HardwareFault`].
+pub const STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS: u32 = 25;
+
 /// Inline per-joint measured-position hold state (0 heap allocations on RT).
 #[derive(Debug, Clone, Copy)]
 pub struct MeasuredHoldTracker {
@@ -482,6 +486,10 @@ pub struct MeasuredHoldTracker {
     /// Original failure cause stored on `FailedHold` entry so live `ENABLE_FAILED` messages
     /// reflect updated per-joint hold status without relatching or bumping `epoch_id`.
     pub enable_failed_cause: crate::safety::BoundedText<{ crate::safety::SAFETY_LOG_TEXT_CAPACITY }>,
+    /// Consecutive stopped-hold TX ticks skipped due to `driver.try_lock()` contention.
+    pub consecutive_lock_contended: u32,
+    /// True once the current contiguous contention streak has escalated (>= 25 skips).
+    pub lock_contended_escalated: bool,
     pub dof: usize,
 }
 
@@ -498,6 +506,8 @@ impl MeasuredHoldTracker {
             owner_hold_targets: [0.0; crate::rt_core::mailbox::MAX_DOF],
             joint_status: [crate::driver::JointHoldStatus::SkippedOff; crate::rt_core::mailbox::MAX_DOF],
             enable_failed_cause: crate::safety::BoundedText::empty(),
+            consecutive_lock_contended: 0,
+            lock_contended_escalated: false,
             dof: dof.min(crate::rt_core::mailbox::MAX_DOF),
         }
     }
@@ -513,6 +523,8 @@ impl MeasuredHoldTracker {
         self.owner_hold_targets.fill(0.0);
         self.joint_status.fill(crate::driver::JointHoldStatus::SkippedOff);
         self.enable_failed_cause = crate::safety::BoundedText::empty();
+        self.consecutive_lock_contended = 0;
+        self.lock_contended_escalated = false;
     }
 
     /// Append concise per-joint hold status (`[J1:held,...]`) into a bounded text
@@ -1776,12 +1788,17 @@ impl SupervisorInner {
         let keep_queued_mask = hold_mask & !invalidated_mask;
         let needs_prune = (self.measured_hold.owner_pending_hold_mask & !keep_queued_mask) != 0;
         if hold_mask == 0 && !needs_prune {
+            self.measured_hold.consecutive_lock_contended = 0;
+            self.measured_hold.lock_contended_escalated = false;
             self.scratch.targets = targets;
             return TickOutput::None;
         }
 
         // L3: Non-blocking `try_lock` for stopped-hold TX: on contention, skip this tick's send
-        // and increment the diagnostics counter (never blocks the control thread).
+        // and increment the diagnostics counter; escalate after `STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS`
+        // (25 consecutive skips, 0.5 s at 50 Hz) with a counted warning and a non-recoverable fault
+        // (zero heap allocation on RT).
+        let mut lock_contended = false;
         let write_result = match self.driver.as_ref() {
             Some(d) => match d.try_lock() {
                 Ok(mut drv) => {
@@ -1801,13 +1818,39 @@ impl SupervisorInner {
                     Some((r, now, max_age, oldest_pending, last_expired, sent_any_fallback, has_pending_holds))
                 }
                 Err(_) => {
-                    crate::diagnostics::tick::record_stopped_hold_lock_contended();
+                    lock_contended = true;
                     None
                 }
             },
             None => None,
         };
         self.scratch.targets = targets;
+
+        if lock_contended {
+            crate::diagnostics::tick::record_stopped_hold_lock_contended();
+            self.measured_hold.consecutive_lock_contended =
+                self.measured_hold.consecutive_lock_contended.saturating_add(1);
+            if self.measured_hold.consecutive_lock_contended >= STOPPED_HOLD_CONTENTION_ESCALATE_SKIPS
+                && !self.measured_hold.lock_contended_escalated
+            {
+                self.measured_hold.lock_contended_escalated = true;
+                crate::diagnostics::tick::record_stopped_hold_contention_escalation();
+                let skips = self.measured_hold.consecutive_lock_contended;
+                let detail = crate::safety::FaultDetail::formatted(FaultCode::HardwareFault, |buf| {
+                    let _ = core::fmt::write(
+                        buf,
+                        format_args!(
+                            "Stopped-hold TX skipped {} consecutive ticks due to driver mutex contention",
+                            skips
+                        ),
+                    );
+                });
+                self.safety.latch(crate::safety::FaultKind::Other, detail);
+            }
+            return TickOutput::None;
+        }
+        self.measured_hold.consecutive_lock_contended = 0;
+        self.measured_hold.lock_contended_escalated = false;
 
         let Some((write_res, now, max_age, oldest_pending, last_expired, sent_any_fallback, has_pending_holds)) = write_result else {
             return TickOutput::None;
