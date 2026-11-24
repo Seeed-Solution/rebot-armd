@@ -181,7 +181,7 @@ impl SupervisorInner {
     /// against the exact production latch path in safe Rust.
     #[doc(hidden)]
     pub fn apply_estop_latch_with_driver(&mut self, driver: Option<&std::sync::Mutex<Box<dyn ArmDriver>>>) {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         // Immediate rigid lock at current position, latch E-Stop, advance epoch.
         // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false.
         self.pending_normal_unload = false;

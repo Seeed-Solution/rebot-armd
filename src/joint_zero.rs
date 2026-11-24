@@ -317,6 +317,7 @@ impl ArmDriver for ZeroOffsetDriver {
     fn has_any_joint_enabled(&self) -> bool { self.inner.has_any_joint_enabled() }
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> { self.inner.refresh_enable_state() }
     fn set_abort_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.inner.set_abort_flag(flag) }
+    fn set_estop_state(&mut self, state: std::sync::Arc<crate::rt_core::urgent::EstopState>) { self.inner.set_estop_state(state) }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.inner.set_estop_gate(gate) }
     fn set_gripper_index(&mut self, index: Option<usize>) { self.inner.set_gripper_index(index) }
     fn is_enabled(&self) -> bool { self.inner.is_enabled() }

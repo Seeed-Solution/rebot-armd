@@ -962,6 +962,10 @@ pub trait ArmDriver: Send {
     /// Set an atomic abort flag that hardware loops should check to abort early on E-stop
     fn set_abort_flag(&mut self, _flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {}
 
+    /// Attach the arm's single packed [`crate::rt_core::urgent::EstopState`] so hardware loops
+    /// observe the authoritative atomic E-stop latch bit without a separate mirror flag.
+    fn set_estop_state(&mut self, _state: std::sync::Arc<crate::rt_core::urgent::EstopState>) {}
+
     /// The arm's E-stop gate ([`crate::rt_core::urgent::EstopGate`]): a driver that sends a
     /// target batch frame by frame checks it before each frame and stops the batch while an
     /// E-stop request is not yet applied by the tick (`write_joint_targets` then fails with
@@ -1167,6 +1171,7 @@ pub struct FeetechArmDriver<T: Transport> {
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
     abort_flag: Option<Arc<AtomicBool>>,
+    estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
     pub last_enable_poll: Option<Instant>,
     gripper_index: Option<usize>,
     pub hw_angle_limits: Vec<Option<(u16, u16)>>,
@@ -1216,6 +1221,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             partial_enable_known: false,
             joint_torque_enabled: vec![None; dof],
             abort_flag: None,
+            estop_state: None,
             last_enable_poll: None,
             gripper_index: None,
             hw_angle_limits: vec![None; dof],
@@ -1420,9 +1426,11 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     fn is_aborted(&self) -> bool {
-        self.abort_flag
-            .as_ref()
-            .is_some_and(|f| f.load(Ordering::SeqCst))
+        self.estop_state.as_ref().is_some_and(|s| s.is_latched())
+            || self
+                .abort_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::SeqCst))
     }
 
     pub fn clock_now(&self) -> Instant {
@@ -2192,6 +2200,11 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
         self.assert_clock_matches_transport();
         self.abort_flag = Some(flag);
+    }
+
+    fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) {
+        self.assert_clock_matches_transport();
+        self.estop_state = Some(state);
     }
 
     fn refresh_enable_state(&mut self) -> Result<EnableState, ArmDriverError> {
@@ -3116,6 +3129,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     estop_gate: Option<crate::rt_core::urgent::EstopGate>,
     /// Atomic E-stop latch (`ArmDriver::set_abort_flag`), checked before enable transmissions.
     abort_flag: Option<Arc<AtomicBool>>,
+    /// Authoritative packed E-stop state (`ArmDriver::set_estop_state`).
+    estop_state: Option<Arc<crate::rt_core::urgent::EstopState>>,
     /// Strict non-sleeping RT mode (`ArmDriver::set_rt_mode`), disables retry sleeps on WouldBlock.
     rt_no_sleep: bool,
     motor_ids: Vec<u16>,
@@ -3824,6 +3839,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             mit_fence_last_cmd: vec![None; dof],
             estop_gate: None,
             abort_flag: None,
+            estop_state: None,
             rt_no_sleep: false,
             mit_fence_trip: None,
             mit_fence_holdoff: Duration::ZERO,
@@ -4209,7 +4225,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     #[inline]
     fn is_stop_latched(&self) -> bool {
-        self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
+        self.estop_state.as_ref().is_some_and(|s| s.is_latched())
+            || self.abort_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst))
     }
 
     #[inline]
@@ -9772,6 +9789,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
     fn with_range_check(&self, f: &mut dyn FnMut(Option<&DriverRangeCheck>)) { f(self.range_check.as_ref()) }
     fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) { self.abort_flag = Some(flag); }
+    fn set_estop_state(&mut self, state: Arc<crate::rt_core::urgent::EstopState>) { self.estop_state = Some(state); }
     fn set_estop_gate(&mut self, gate: crate::rt_core::urgent::EstopGate) { self.estop_gate = Some(gate); }
 }
 

@@ -4350,3 +4350,174 @@ fn m4_disable_confirm_timeout_retries_in_background_preserving_original_timestam
         assert_eq!(disable_calls.load(Ordering::SeqCst), total_calls);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m5_concurrent_estop_latch_never_overwritten_by_prior_clear() {
+    ensure_tracing_subscriber();
+
+    // (a) Direct single-AtomicU64 `EstopState` invariants: generation + latch bit live in one
+    //     word; clearing an older generation fails CAS without ever touching bit 0.
+    {
+        let st = armd::rt_core::urgent::EstopState::new();
+        assert_eq!(st.snapshot(), (0, false));
+        assert_eq!(st.request_and_latch(), 1);
+        assert_eq!(st.snapshot(), (1, true));
+        assert_eq!(st.request_and_latch(), 2);
+        assert_eq!(st.snapshot(), (2, true));
+        // Clearing prior gen 1 MUST fail with observed gen 2 and keep latch bit true.
+        assert_eq!(st.try_clear_if_generation(1), Err(2));
+        assert_eq!(st.snapshot(), (2, true));
+        // Clearing current gen 2 succeeds and preserves generation count.
+        assert_eq!(st.try_clear_if_generation(2), Ok(()));
+        assert_eq!(st.snapshot(), (2, false));
+    }
+
+    // (b) Deterministic interleaving across prior E-stop clear vs concurrent `trigger_e_stop_checked`:
+    //     Task 1 clears E-stop #1 and pauses inside `before_estop_unlatch_hook` (strictly after
+    //     `safety.clear_with_check` committed and strictly before `try_clear_if_generation(1)`).
+    //     Task 2 fires a real concurrent `sup.trigger_e_stop_checked()` (which calls
+    //     `estop_state.request_and_latch()`, bumping gen 1 -> 2 with bit 0 = 1).
+    //     A concurrent poller continuously observes `sup.e_stop_latched.load(SeqCst)` across the
+    //     entire clear -> unlatch CAS -> re-apply window and proves bit 0 NEVER drops to `false`.
+    {
+        let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+        sup.set_lease_enabled(false).await;
+        let (st1, ep1) = sup.trigger_e_stop_checked().await.expect("E-stop #1");
+        assert_eq!(st1, SafetyState::EStop);
+        assert_eq!(sup.estop_state.snapshot(), (1, true));
+
+        let (hook_entered_tx, hook_entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (allow_unlatch_tx, allow_unlatch_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let allow_unlatch_rx = std::sync::Mutex::new(allow_unlatch_rx);
+        let saw_false = Arc::new(AtomicBool::new(false));
+        let stop_poller = Arc::new(AtomicBool::new(false));
+
+        // Continuous observer verifying zero transient-false window on `e_stop_latched` once
+        // E-stop #2 is requested.
+        let estop_for_poller = Arc::clone(&sup.estop_state);
+        let saw_false_p = Arc::clone(&saw_false);
+        let stop_poller_p = Arc::clone(&stop_poller);
+        let poller = std::thread::spawn(move || {
+            while !stop_poller_p.load(Ordering::Acquire) {
+                let (gen, latched) = estop_for_poller.snapshot();
+                if gen >= 2 && !latched {
+                    saw_false_p.store(true, Ordering::SeqCst);
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        {
+            let mut inner = sup.inner().write().await;
+            inner.before_estop_unlatch_hook = Some(Box::new(move || {
+                let _ = hook_entered_tx.send(());
+                allow_unlatch_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("test harness must release unlatch barrier");
+            }));
+        }
+
+        let sup_clear = Arc::clone(&sup);
+        let clear_task = tokio::spawn(async move {
+            sup_clear.clear_fault_for_epoch(Some(ep1)).await
+        });
+
+        // Wait deterministically until clear_fault has committed `safety.clear_with_check` and
+        // is parked right before `try_clear_if_generation(1)`.
+        tokio::task::spawn_blocking(move || {
+            hook_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("clear_fault must reach before_estop_unlatch_hook")
+        })
+        .await
+        .unwrap();
+
+        // Now fire concurrent E-stop #2 through the real public API (`begin_e_stop_checked` runs
+        // immediately via lock-free `estop_state.request_and_latch()` even while `clear_fault`
+        // holds the supervisor write lock!).
+        let sup_estop2 = Arc::clone(&sup);
+        let estop2_task = tokio::spawn(async move { sup_estop2.trigger_e_stop_checked().await });
+
+        // Wait deterministically until E-stop #2's atomic `request_and_latch()` is visible.
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while sup.estop_state.requested_count() < 2 {
+            assert!(
+                Instant::now() < wait_deadline,
+                "E-stop #2 did not publish atomic request generation in time"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(sup.estop_state.snapshot(), (2, true));
+
+        // Release `clear_fault` to execute `try_clear_if_generation(1)` while E-stop #2 is live.
+        allow_unlatch_tx.send(()).unwrap();
+
+        let clear_res = tokio::time::timeout(Duration::from_secs(5), clear_task)
+            .await
+            .expect("clear_fault must not hang")
+            .unwrap()
+            .expect("clear_fault returns Ok(EStop) after re-applying concurrent E-stop #2");
+        assert_eq!(
+            clear_res,
+            SafetyState::EStop,
+            "clearing prior E-stop #1 must leave concurrent E-stop #2 latched"
+        );
+
+        let (st2, ep2) = tokio::time::timeout(Duration::from_secs(5), estop2_task)
+            .await
+            .expect("trigger_e_stop_checked #2 must resolve cleanly")
+            .unwrap()
+            .expect("E-stop #2 result");
+        assert_eq!(st2, SafetyState::EStop);
+        assert!(ep2 > ep1, "E-stop #2 must advance epoch past ep1 ({ep2} <= {ep1})");
+
+        stop_poller.store(true, Ordering::Release);
+        poller.join().unwrap();
+
+        assert!(
+            !saw_false.load(Ordering::SeqCst),
+            "prior E-stop clear transiently overwrote newer E-stop latch to false"
+        );
+        assert_eq!(sup.estop_state.snapshot(), (2, true));
+        assert!(sup.e_stop_latched.load(Ordering::SeqCst));
+        {
+            let inner = sup.inner().read().await;
+            assert_eq!(inner.applied_estop_count, 2);
+            assert_eq!(*inner.safety.state(), SafetyState::EStop);
+            assert_eq!(inner.safety.epoch_id(), ep2);
+        }
+
+        // Positive control: clearing E-stop #2 with the NEW epoch `ep2` and no newer E-stop
+        // succeeds and unlatches cleanly.
+        let cleared = sup
+            .clear_fault_for_epoch(Some(ep2))
+            .await
+            .expect("clearing E-stop #2 with matching epoch must succeed");
+        assert_eq!(cleared, SafetyState::Idle);
+        assert_eq!(sup.estop_state.snapshot(), (2, false));
+        assert!(!sup.e_stop_latched.load(Ordering::SeqCst));
+    }
+
+    // (c) Deterministic interleaving on non-E-stop fault clear: a concurrent E-stop arriving
+    //     after `safety.clear_with_check` is never cleared by the non-E-stop fault clear.
+    {
+        let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
+        inner.lease_enabled = false;
+        inner.safety.trigger_fault(armd::safety::FaultReason::WatchdogTimeout);
+        let fault_ep = inner.safety.epoch_id();
+        let estop_ref = Arc::clone(&inner.estop_state);
+        inner.before_estop_unlatch_hook = Some(Box::new(move || {
+            let gen = estop_ref.request_and_latch();
+            assert_eq!(gen, 1);
+        }));
+        let res = inner
+            .clear_fault_for_epoch(Some(fault_ep))
+            .expect("post-commit concurrent E-stop returns Ok(EStop)");
+        assert_eq!(res, SafetyState::EStop);
+        assert_eq!(inner.estop_state.snapshot(), (1, true));
+        assert_eq!(inner.applied_estop_count, 1);
+        assert!(inner.safety.epoch_id() > fault_ep);
+    }
+}

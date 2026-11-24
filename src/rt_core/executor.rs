@@ -3181,7 +3181,7 @@ pub(crate) fn spawn_executor(
     hooks: PersistTestHooks,
 ) -> Result<(RtExecutorHandle, Arc<OffThreadSinks>), (Option<Box<SupervisorInner>>, String)> {
     let hub = core.core.hub().clone();
-    let e_stop_latched = core.e_stop_latched.clone();
+    let estop_state = core.estop_state.clone();
     let baseline_identity = BaselineIdentity {
         tool_id: core.config.active_tool.id.clone(),
         tool_config_digest: core.config.active_tool.config_digest.clone(),
@@ -3339,7 +3339,7 @@ pub(crate) fn spawn_executor(
                 persist_rep_tx,
                 offload_reclaim_tx,
                 persist_wake,
-                e_stop_latched,
+                estop_state,
                 hub_clone,
                 hooks,
             );
@@ -5449,7 +5449,7 @@ fn control_thread_main(
     persist_rep_tx: Producer<PersistReply>,
     offload_reclaim_tx: Producer<OffloadReclaim>,
     persist_wake: Thread,
-    e_stop_latched: Arc<AtomicBool>,
+    estop_state: Arc<crate::rt_core::urgent::EstopState>,
     hub: Arc<StateHub>,
     hooks: PersistTestHooks,
 ) {
@@ -6037,7 +6037,7 @@ fn control_thread_main(
 
         if let Err(err) = step_res {
             panicked = true;
-            e_stop_latched.store(true, Ordering::SeqCst);
+            estop_state.request_and_latch();
             tracing::error!("RT executor thread panicked during release: {:?}", err);
             let disable_timeout = state
                 .hooks

@@ -626,7 +626,7 @@ impl From<crate::safety::ClearFaultError> for ClearFaultWithAuthError {
 
 impl SupervisorInner {
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
-        driver.set_abort_flag(self.e_stop_latched.clone());
+        driver.set_estop_state(self.estop_state.clone());
         driver.set_estop_gate(self.estop_gate());
         driver.set_gripper_index(self.config.gripper_index());
         driver.set_strict_mode_handover(self.config.joint_tracking.as_ref().is_some_and(|jt| jt.enabled));
@@ -3531,6 +3531,7 @@ impl SupervisorInner {
                 .map_err(|r| ClearFaultWithAuthError::Clear(ClearFaultError::from(r)))?
         };
 
+        let clear_estop_gen = self.applied_estop_count;
         on_committed(self);
         if let Some(ref cand) = commit.candidate_limits {
             self.commit_driver_limits_bounded(cand);
@@ -3574,20 +3575,47 @@ impl SupervisorInner {
         self.bus_loss_instant = None;
         self.reset_gripper_stall();
         self.handover_settling_since = None;
-        if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
-            self.apply_stop_policy(StopPolicy::EStopLatch);
-            self.last_heartbeat = Instant::now();
-            self.last_motion_frame = Instant::now();
-            return Ok(self.safety.state().clone());
+        if let Some(hook) = self.before_estop_unlatch_hook.take() {
+            hook();
         }
-        self.e_stop_latched.store(false, Ordering::SeqCst);
-        self.shutdown_refused_unknown = false;
-        if self.consume_pending_estop() {
-            // A concurrent E-stop arrived strictly AFTER `clear_with_check` already committed;
-            // keep the newly applied E-stop state and return Ok(EStop) rather than Err after commit.
-            self.last_heartbeat = Instant::now();
-            self.last_motion_frame = Instant::now();
-            return Ok(self.safety.state().clone());
+        if !was_estop {
+            // Clearing a non-E-stop fault must never overwrite a prior or concurrent E-stop latch.
+            if self.consume_pending_estop() || self.estop_state.is_latched() {
+                if self.safety.state() != &SafetyState::EStop {
+                    self.apply_stop_policy(StopPolicy::EStopLatch);
+                }
+                self.last_heartbeat = Instant::now();
+                self.last_motion_frame = Instant::now();
+                return Ok(self.safety.state().clone());
+            }
+            self.shutdown_refused_unknown = false;
+        } else {
+            // Atomically clear bit 0 ONLY if no newer E-stop has advanced `generation` past
+            // `clear_estop_gen`. A concurrent newer E-stop causes CAS failure without ever
+            // transiently clearing the latch bit.
+            match self.estop_state.try_clear_if_generation(clear_estop_gen) {
+                Ok(()) => {
+                    self.shutdown_refused_unknown = false;
+                    if self.consume_pending_estop() {
+                        // A concurrent E-stop arrived strictly AFTER the CAS unlatched the prior
+                        // E-stop; keep the newly applied E-stop state and return Ok(EStop).
+                        self.last_heartbeat = Instant::now();
+                        self.last_motion_frame = Instant::now();
+                        return Ok(self.safety.state().clone());
+                    }
+                }
+                Err(_newer_gen) => {
+                    // A newer E-stop arrived before unlatch: latch bit stayed true throughout
+                    // (zero transient-false window). Apply the newer E-stop immediately.
+                    let _ = self.consume_pending_estop();
+                    if self.safety.state() != &SafetyState::EStop {
+                        self.apply_stop_policy(StopPolicy::EStopLatch);
+                    }
+                    self.last_heartbeat = Instant::now();
+                    self.last_motion_frame = Instant::now();
+                    return Ok(self.safety.state().clone());
+                }
+            }
         }
         if was_mit_lost {
             // Only after full clear passed: release MIT lost ownership and allow read-only polls.
@@ -4172,7 +4200,7 @@ impl SupervisorInner {
     /// Runs synchronously on the caller holding `&mut SupervisorInner` (preserving exclusive driver
     /// ownership) while logging timeout independently at `hard_deadline`.
     pub fn attempt_panic_disable(&mut self, timeout: Duration) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         self.disable_requested();
         let origin = Instant::now();
         let (coop_deadline, hard_deadline) = panic_disable_deadlines(origin, timeout);
@@ -4194,7 +4222,7 @@ impl SupervisorInner {
         hard_deadline: Instant,
         coop_budget: Duration,
     ) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         self.disable_requested();
         let Some(ref d) = self.driver else {
             self.disable_confirmed();

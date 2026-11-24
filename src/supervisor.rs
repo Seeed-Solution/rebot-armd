@@ -1062,9 +1062,15 @@ pub struct SupervisorInner {
     /// Vectors of the tick's workspace evaluators (`servo_step_workspace`).
     pub(crate) ws_eval_bufs: crate::chain::EvalBufs,
     pub bus_loss_instant: Option<Instant>,
-    pub e_stop_latched: Arc<AtomicBool>,
-    pub requested_estop_count: Arc<AtomicU64>,
+    /// Single authoritative atomic state packing `(generation << 1) | latched` for E-stop.
+    pub estop_state: Arc<crate::rt_core::urgent::EstopState>,
+    pub e_stop_latched: crate::rt_core::urgent::EstopLatchView,
+    pub requested_estop_count: crate::rt_core::urgent::EstopCounterView,
     pub applied_estop_count: u64,
+    /// Deterministic test hook fired strictly after `safety.clear_with_check` commits and
+    /// immediately before `estop_state.try_clear_if_generation` attempts to clear bit 0.
+    #[doc(hidden)]
+    pub before_estop_unlatch_hook: Option<Box<dyn FnOnce() + Send + Sync>>,
     /// `applied_estop_count` for the bus driver's E-stop gate (`crate::rt_core::urgent`).
     pub estop_applied: Arc<AtomicU64>,
     /// Monotonic stop generation incremented under the owner lock whenever a Stop applies.
@@ -1952,6 +1958,10 @@ impl SupervisorInner {
             + 16)
             .max(64);
 
+        let estop_state = Arc::new(crate::rt_core::urgent::EstopState::new());
+        let e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
+        let requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
+
         let mut inner = Self {
             config,
             safety: SafetyManager::new(),
@@ -2087,9 +2097,11 @@ impl SupervisorInner {
             scratch: crate::rt_core::scratch::TickScratch::with_dof(dof),
             ws_eval_bufs: Default::default(),
             bus_loss_instant: None,
-            e_stop_latched: Arc::new(AtomicBool::new(false)),
-            requested_estop_count: Arc::new(AtomicU64::new(0)),
+            estop_state,
+            e_stop_latched,
+            requested_estop_count,
             applied_estop_count: 0,
+            before_estop_unlatch_hook: None,
             estop_applied: Arc::new(AtomicU64::new(0)),
             stop_gen: Arc::new(AtomicU64::new(0)),
             lease_gen_mirror: Arc::new(AtomicU64::new(0)),
@@ -2229,8 +2241,7 @@ impl SupervisorInner {
     /// the synchronous RT executor; all legacy lock paths reject it when `detached == true`.
     pub(crate) fn detached_shell(
         config: &ArmConfig,
-        e_stop_latched: Arc<AtomicBool>,
-        requested_estop_count: Arc<AtomicU64>,
+        estop_state: Arc<crate::rt_core::urgent::EstopState>,
         stop_gen: Arc<AtomicU64>,
         lease_gen_mirror: Arc<AtomicU64>,
         shared_closed_bitset: Arc<crate::rt_core::requests::actions::ClosedBitset>,
@@ -2238,8 +2249,9 @@ impl SupervisorInner {
         pending_disconnect_hold: Arc<AtomicU64>,
     ) -> Self {
         let mut shell = Self::new(config.clone());
-        shell.e_stop_latched = e_stop_latched;
-        shell.requested_estop_count = requested_estop_count;
+        shell.e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
+        shell.requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
+        shell.estop_state = estop_state;
         shell.stop_gen = stop_gen;
         shell.lease_gen_mirror = lease_gen_mirror;
         shell.shared_closed_bitset = shared_closed_bitset;
@@ -2836,7 +2848,10 @@ impl SupervisorInner {
     /// The E-stop gate of this arm's bus driver: a request not yet applied by the tick
     /// (plus authorized-stop generations when attached to an RT executor).
     pub fn estop_gate(&self) -> crate::rt_core::urgent::EstopGate {
-        let gate = crate::rt_core::urgent::EstopGate::new(self.requested_estop_count.clone(), self.estop_applied.clone());
+        let gate = crate::rt_core::urgent::EstopGate::from_state(
+            self.estop_state.clone(),
+            self.estop_applied.clone(),
+        );
         match self.stop_requests.as_ref() {
             Some(stops) => gate.with_stops(stops.clone()),
             None => gate,
@@ -2858,7 +2873,7 @@ impl SupervisorInner {
     /// An E-stop request the tick has not applied yet (not the latch: hold output while
     /// latched still reaches the motors).
     pub(crate) fn estop_request_unapplied(&self) -> bool {
-        self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+        self.estop_state.requested_count() != self.applied_estop_count
     }
 
     /// True when either an E-stop request or an attached authorized-stop request has not
@@ -2869,7 +2884,8 @@ impl SupervisorInner {
     }
 
     pub(crate) fn estop_pending(&self) -> bool {
-        self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+        let (req, latched) = self.estop_state.snapshot();
+        latched || req != self.applied_estop_count
     }
 
     fn reset_gripper_stall(&mut self) {
@@ -3943,11 +3959,11 @@ impl SupervisorInner {
     }
 
     pub(crate) fn consume_pending_estop(&mut self) -> bool {
-        let req = self.requested_estop_count.load(Ordering::SeqCst);
+        let req = self.estop_state.requested_count();
         if req > self.applied_estop_count {
             let first_gen = self.applied_estop_count + 1;
             self.reset_hold_tx_joint_progress();
-            self.e_stop_latched.store(true, Ordering::SeqCst);
+            self.estop_state.latch();
             if matches!(self.torque_transition, Some(driver_transitions::TorqueTransition::Enable { .. })) {
                 if let Some(ref d) = self.driver {
                     if let Ok(mut drv) = d.lock() {
@@ -4203,7 +4219,7 @@ impl SupervisorInner {
         if self.driver.is_none() || self.shutdown_ready() {
             self.shutdown_refused_unknown = false;
             tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
-            self.e_stop_latched.store(true, Ordering::SeqCst);
+            self.estop_state.latch();
             return true;
         }
         if !self.safety.state().is_stopped() {
@@ -4222,7 +4238,7 @@ impl SupervisorInner {
             if self.shutdown_ready() {
                 self.shutdown_refused_unknown = false;
                 tracing::info!("shutdown: latching EStop so the control loop stops before exit (in memory only, not persisted; the next start is Idle)");
-                self.e_stop_latched.store(true, Ordering::SeqCst);
+                self.estop_state.latch();
                 return true;
             }
         }
@@ -4244,7 +4260,7 @@ impl SupervisorInner {
             return false;
         }
         self.shutdown_committed = true;
-        self.e_stop_latched.store(true, Ordering::SeqCst);
+        self.estop_state.latch();
         self.stop_motion();
         true
     }
@@ -9057,8 +9073,10 @@ pub struct ArmSupervisor {
     inner: Arc<SupervisorLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     terminals: Arc<TerminalBroadcaster>,
-    pub e_stop_latched: Arc<AtomicBool>,
-    pub requested_estop_count: Arc<AtomicU64>,
+    /// Single authoritative atomic state packing `(generation << 1) | latched` for E-stop.
+    pub estop_state: Arc<crate::rt_core::urgent::EstopState>,
+    pub e_stop_latched: crate::rt_core::urgent::EstopLatchView,
+    pub requested_estop_count: crate::rt_core::urgent::EstopCounterView,
     stop_gen: Arc<AtomicU64>,
     estop_epoch: Arc<AtomicU64>,
     lease_gen_mirror: Arc<AtomicU64>,
@@ -9366,8 +9384,9 @@ impl ArmSupervisor {
     pub fn new(config: ArmConfig) -> Self {
         let _ = init_process_identity();
         let (tx, _) = broadcast::channel(128);
-        let e_stop_latched = Arc::new(AtomicBool::new(false));
-        let requested_estop_count = Arc::new(AtomicU64::new(0));
+        let estop_state = Arc::new(crate::rt_core::urgent::EstopState::new());
+        let e_stop_latched = crate::rt_core::urgent::EstopLatchView::new(estop_state.clone());
+        let requested_estop_count = crate::rt_core::urgent::EstopCounterView::new(estop_state.clone());
         let stop_gen = Arc::new(AtomicU64::new(0));
         let lease_gen_mirror = Arc::new(AtomicU64::new(0));
         let closed_bitset = Arc::new(crate::rt_core::requests::actions::ClosedBitset::new());
@@ -9375,6 +9394,7 @@ impl ArmSupervisor {
         let pending_disconnect_hold = Arc::new(AtomicU64::new(0));
         let terminals = Arc::new(TerminalBroadcaster::default());
         let mut inner = SupervisorInner::new(config);
+        inner.estop_state = estop_state.clone();
         inner.e_stop_latched = e_stop_latched.clone();
         inner.requested_estop_count = requested_estop_count.clone();
         inner.stop_gen = stop_gen.clone();
@@ -9400,6 +9420,7 @@ impl ArmSupervisor {
             inner: Arc::new(SupervisorLock::new(inner)),
             telemetry_tx: tx,
             terminals,
+            estop_state,
             e_stop_latched,
             requested_estop_count,
             stop_gen,
@@ -9865,8 +9886,7 @@ impl ArmSupervisor {
         );
         let shell = SupervisorInner::detached_shell(
             &guard.config,
-            self.e_stop_latched.clone(),
-            self.requested_estop_count.clone(),
+            self.estop_state.clone(),
             self.stop_gen.clone(),
             self.lease_gen_mirror.clone(),
             self.closed_bitset.clone(),
@@ -10555,7 +10575,7 @@ impl ArmSupervisor {
     }
 
     pub async fn try_set_driver(&self, mut driver: Box<dyn ArmDriver>) -> Result<(), ArmError> {
-        driver.set_abort_flag(self.e_stop_latched.clone());
+        driver.set_estop_state(self.estop_state.clone());
         let mut inner = self.inner.write().await;
         self.check_legacy_under_guard(&inner)?;
         driver.set_estop_gate(inner.estop_gate());
@@ -10588,7 +10608,7 @@ impl ArmSupervisor {
     }
 
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
-        driver.set_abort_flag(self.e_stop_latched.clone());
+        driver.set_estop_state(self.estop_state.clone());
         if let Ok(mut inner) = self.inner.try_write() {
             if self.check_legacy_under_guard(&inner).is_ok() {
                 driver.set_estop_gate(inner.estop_gate());
@@ -12043,8 +12063,7 @@ impl ArmSupervisor {
     /// internal cooperative reserve so clean `Unconfirmed` exhaustion finishes logging, lock
     /// release, and channel handoff before `rx.recv_timeout` triggers `TimedOut`.
     pub fn attempt_legacy_panic_disable(&self, timeout: Duration) -> PanicDisableOutcome {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
-        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        self.estop_state.request_and_latch();
         let run_inline = |inner: Arc<SupervisorLock<SupervisorInner>>,
                           coop_deadline: Instant,
                           hard_deadline: Instant,
@@ -12200,8 +12219,7 @@ impl ArmSupervisor {
     /// obtain the applied `(SafetyState, epoch_id)`.
     pub(crate) fn begin_e_stop_checked(&self) -> CheckedEstopTicket {
         crate::rt_core::executor::assert_not_in_rt_release("ArmSupervisor::begin_e_stop_checked");
-        self.e_stop_latched.store(true, Ordering::SeqCst);
-        let req = self.requested_estop_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let req = self.estop_state.request_and_latch();
         let mode = self.owner_mode.load(Ordering::Acquire);
         CheckedEstopTicket { req, mode }
     }

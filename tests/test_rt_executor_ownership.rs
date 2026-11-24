@@ -307,6 +307,7 @@ struct CountingBus {
     clock: Option<MockClock>,
     clock_pauses: Arc<AtomicUsize>,
     estop_on_tx: Option<(Arc<std::sync::atomic::AtomicU64>, usize)>,
+    estop_state_on_tx: Option<(Arc<armd::rt_core::urgent::EstopState>, usize)>,
     tx_seen: Arc<AtomicUsize>,
 }
 
@@ -321,6 +322,7 @@ impl CountingBus {
             clock,
             clock_pauses: Arc::new(AtomicUsize::new(0)),
             estop_on_tx: None,
+            estop_state_on_tx: None,
             tx_seen: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -332,6 +334,11 @@ impl CanTransport for CountingBus {
         if let Some((req_count, after)) = &self.estop_on_tx {
             if n >= *after {
                 req_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if let Some((state, after)) = &self.estop_state_on_tx {
+            if n >= *after {
+                state.fetch_add_generation(1, Ordering::SeqCst);
             }
         }
         self.inner.transmit(frame)
@@ -2507,7 +2514,7 @@ fn estop_aborts_pending_damiao_enable_without_tx_and_preserves_torque_state() {
     inner_c2.register_live_connection(1).unwrap();
     inner_c2.rt_executor_owned = true;
     let mut bus_c2 = CountingBus::new(raw_bus_c2.clone(), Some(clock.clone()));
-    bus_c2.estop_on_tx = Some((inner_c2.requested_estop_count.clone(), 3));
+    bus_c2.estop_state_on_tx = Some((inner_c2.estop_state.clone(), 3));
     let mut drv_c2 = DamiaoArmDriver::new(bus_c2.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
@@ -2836,7 +2843,7 @@ fn damiao_mid_retry_and_mode_restore_estop_and_legacy_gravity_comp_exit() {
     inner_r.register_live_connection(1).unwrap();
     inner_r.rt_executor_owned = true;
     let mut bus_r = CountingBus::new(raw_bus_r.clone(), Some(clock.clone()));
-    bus_r.estop_on_tx = Some((inner_r.requested_estop_count.clone(), 9)); // 7 initial + 2 retries
+    bus_r.estop_state_on_tx = Some((inner_r.estop_state.clone(), 9)); // 7 initial + 2 retries
     let mut drv_r = DamiaoArmDriver::new(bus_r.clone(), vec![1, 2, 3, 4, 5, 6, 7])
         .with_joint_limits(dm_limits())
         .unwrap();
