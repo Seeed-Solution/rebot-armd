@@ -154,6 +154,7 @@ fn apply_failure_after_the_rename_reconciles() {
 fn a_held_reservation_refuses_rt_installs_and_leaves_motion_untouched() {
     let mut inner = SupervisorInner::new(ArmConfig { lease_timeout_ms: 600_000, ..ArmConfig::rebot_dm() });
     inner.lease_enabled = false;
+    inner.register_live_connection(1).unwrap();
     inner.tick(0.02);
     { let __s = inner.current_admission_stamp(); inner.check_admission(__s).and_then(|__a| armd::SupervisorInner::enable_torque(__a)) }.unwrap();
     let (mut fx, mut b, _tw, _stop) = ReleaseFixture::new(inner, BootId(7), Capacities { commands: 4, plans: 2, replies: 6 });

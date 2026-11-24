@@ -1769,6 +1769,7 @@ async fn r2_m6_executor_and_legacy_multiview_publish_measurement_before_terminal
             let s = inner.current_admission_stamp();
             let a = inner.check_admission(s).unwrap();
             armd::SupervisorInner::enable_torque(a).unwrap();
+            inner.register_live_connection(77).unwrap();
             inner.tick(0.02);
         }
         sup.start_dispatcher().unwrap();
